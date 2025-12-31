@@ -1,0 +1,35 @@
+[package]
+name = "stellar-core-herder"
+description = "SCP coordination and ledger close orchestration for rs-stellar-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-xdr.workspace = true
+stellar-core-common.workspace = true
+stellar-core-crypto.workspace = true
+stellar-core-scp.workspace = true
+stellar-core-overlay.workspace = true
+stellar-core-ledger.workspace = true
+stellar-core-tx.workspace = true
+
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Error handling
+thiserror.workspace = true
+tracing.workspace = true
+
+# Data structures
+dashmap.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

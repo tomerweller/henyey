@@ -1,0 +1,982 @@
+//! Main Herder implementation.
+//!
+//! The Herder is the central coordinator that drives consensus and manages
+//! the transition between ledgers. It integrates with:
+//!
+//! - SCP for consensus
+//! - Overlay for network communication
+//! - Ledger for state management
+//! - Transaction processing
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use parking_lot::RwLock;
+use tracing::{debug, info, warn, error};
+
+use stellar_core_common::Hash256;
+use stellar_core_crypto::{PublicKey, SecretKey};
+use stellar_core_ledger::LedgerManager;
+use stellar_core_scp::{SCP, SlotIndex};
+use stellar_xdr::curr::{
+    NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, StellarValue, TimePoint, TransactionEnvelope,
+    UpgradeType, Value, WriteXdr, Limits,
+};
+
+use crate::error::HerderError;
+use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult};
+use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig, ValueValidation};
+use crate::state::HerderState;
+use crate::tx_queue::{TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult};
+pub use crate::tx_queue::TransactionSet as TxSet;
+use crate::Result;
+
+/// Result of receiving an SCP envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeState {
+    /// Envelope was processed successfully.
+    Valid,
+    /// Envelope is for a future slot and was buffered.
+    Pending,
+    /// Envelope is a duplicate.
+    Duplicate,
+    /// Envelope is for an old slot.
+    TooOld,
+    /// Envelope has invalid signature.
+    InvalidSignature,
+    /// Envelope is invalid.
+    Invalid,
+}
+
+/// Configuration for the Herder.
+#[derive(Debug, Clone)]
+pub struct HerderConfig {
+    /// Maximum number of pending transactions.
+    pub max_pending_transactions: usize,
+    /// Whether this node should participate in consensus as a validator.
+    pub is_validator: bool,
+    /// Target ledger close time in seconds.
+    pub ledger_close_time: u32,
+    /// Our node's public key.
+    pub node_public_key: PublicKey,
+    /// Network ID hash.
+    pub network_id: Hash256,
+    /// Maximum number of slots to keep externalized values for.
+    pub max_externalized_slots: usize,
+    /// Pending envelope configuration.
+    pub pending_config: PendingConfig,
+    /// Transaction queue configuration.
+    pub tx_queue_config: TxQueueConfig,
+    /// Local quorum set configuration.
+    pub local_quorum_set: Option<ScpQuorumSet>,
+    /// Maximum transactions per transaction set.
+    pub max_tx_set_size: usize,
+}
+
+impl Default for HerderConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_transactions: 1000,
+            is_validator: false,
+            ledger_close_time: 5,
+            node_public_key: PublicKey::from_bytes(&[0u8; 32]).unwrap(),
+            network_id: Hash256::ZERO,
+            max_externalized_slots: 12,
+            pending_config: PendingConfig::default(),
+            tx_queue_config: TxQueueConfig::default(),
+            local_quorum_set: None,
+            max_tx_set_size: 1000,
+        }
+    }
+}
+
+/// The main Herder that coordinates consensus.
+///
+/// This is the central component that:
+/// - Receives transactions from the network
+/// - Receives SCP envelopes from the network
+/// - Drives consensus for ledger close
+/// - Tracks externalized values
+pub struct Herder {
+    /// Configuration.
+    config: HerderConfig,
+    /// Current state.
+    state: RwLock<HerderState>,
+    /// Transaction queue.
+    tx_queue: TransactionQueue,
+    /// Pending envelopes for future slots.
+    pending_envelopes: PendingEnvelopes,
+    /// SCP driver for consensus callbacks.
+    scp_driver: Arc<ScpDriver>,
+    /// SCP consensus protocol instance.
+    scp: Option<SCP<HerderScpCallback>>,
+    /// Current tracking slot (ledger sequence as u64).
+    tracking_slot: RwLock<u64>,
+    /// When we started tracking.
+    tracking_started_at: RwLock<Option<Instant>>,
+    /// Secret key for signing (if validator).
+    secret_key: Option<SecretKey>,
+    /// Ledger manager reference (optional, for validation).
+    ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
+    /// Previous externalized value (for priority calculation).
+    prev_value: RwLock<Value>,
+}
+
+impl Herder {
+    /// Create a new Herder.
+    pub fn new(config: HerderConfig) -> Self {
+        let scp_driver_config = ScpDriverConfig {
+            node_id: config.node_public_key.clone(),
+            max_tx_set_cache: 100,
+            max_time_drift: 60,
+            local_quorum_set: config.local_quorum_set.clone(),
+        };
+
+        let scp_driver = Arc::new(ScpDriver::new(scp_driver_config, config.network_id));
+        let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
+        let pending_envelopes = PendingEnvelopes::new(config.pending_config.clone());
+
+        // SCP is None for non-validators (they just observe)
+        Self {
+            config,
+            state: RwLock::new(HerderState::Booting),
+            tx_queue,
+            pending_envelopes,
+            scp_driver,
+            scp: None,
+            tracking_slot: RwLock::new(0),
+            tracking_started_at: RwLock::new(None),
+            secret_key: None,
+            ledger_manager: RwLock::new(None),
+            prev_value: RwLock::new(Value::default()),
+        }
+    }
+
+    /// Create a new Herder with a secret key for validation.
+    pub fn with_secret_key(config: HerderConfig, secret_key: SecretKey) -> Self {
+        let scp_driver_config = ScpDriverConfig {
+            node_id: config.node_public_key.clone(),
+            max_tx_set_cache: 100,
+            max_time_drift: 60,
+            local_quorum_set: config.local_quorum_set.clone(),
+        };
+
+        let scp_driver = Arc::new(ScpDriver::with_secret_key(
+            scp_driver_config,
+            config.network_id,
+            secret_key.clone(),
+        ));
+
+        let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
+        let pending_envelopes = PendingEnvelopes::new(config.pending_config.clone());
+
+        // Create SCP instance for validators
+        let scp = if config.is_validator {
+            if let Some(ref quorum_set) = config.local_quorum_set {
+                let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::curr::Uint256(*config.node_public_key.as_bytes()),
+                ));
+                let callback = HerderScpCallback::new(Arc::clone(&scp_driver));
+                Some(SCP::new(
+                    node_id,
+                    true, // is_validator
+                    quorum_set.clone(),
+                    Arc::new(callback),
+                ))
+            } else {
+                warn!("Validator mode requested but no quorum set configured");
+                None
+            }
+        } else {
+            None
+        };
+
+        Self {
+            config,
+            state: RwLock::new(HerderState::Booting),
+            tx_queue,
+            pending_envelopes,
+            scp_driver,
+            scp,
+            tracking_slot: RwLock::new(0),
+            tracking_started_at: RwLock::new(None),
+            secret_key: Some(secret_key),
+            ledger_manager: RwLock::new(None),
+            prev_value: RwLock::new(Value::default()),
+        }
+    }
+
+    /// Set the ledger manager reference.
+    pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
+        *self.ledger_manager.write() = Some(manager);
+    }
+
+    /// Get the current state of the Herder.
+    pub fn state(&self) -> HerderState {
+        *self.state.read()
+    }
+
+    /// Get the current tracking slot.
+    pub fn tracking_slot(&self) -> u64 {
+        *self.tracking_slot.read()
+    }
+
+    /// Check if the herder is tracking consensus.
+    pub fn is_tracking(&self) -> bool {
+        self.state().is_tracking()
+    }
+
+    /// Check if this node is a validator.
+    pub fn is_validator(&self) -> bool {
+        self.config.is_validator && self.secret_key.is_some()
+    }
+
+    /// Bootstrap the Herder after catchup.
+    ///
+    /// This transitions the Herder from Syncing to Tracking state,
+    /// setting the current ledger sequence as the tracking slot.
+    pub fn bootstrap(&self, ledger_seq: u32) {
+        let slot = ledger_seq as u64;
+
+        info!("Bootstrapping Herder at ledger {}", ledger_seq);
+
+        // Update tracking slot
+        *self.tracking_slot.write() = slot;
+        *self.tracking_started_at.write() = Some(Instant::now());
+
+        // Update pending envelopes current slot
+        self.pending_envelopes.set_current_slot(slot);
+
+        // Transition to tracking state
+        *self.state.write() = HerderState::Tracking;
+
+        // Release any pending envelopes for this slot and previous
+        let pending = self.pending_envelopes.release_up_to(slot);
+        for (pending_slot, envelopes) in pending {
+            debug!(
+                "Released {} pending envelopes for slot {}",
+                envelopes.len(),
+                pending_slot
+            );
+            for envelope in envelopes {
+                // Process released envelopes (ignore result as they may be old)
+                let _ = self.process_scp_envelope(envelope);
+            }
+        }
+
+        info!("Herder now tracking at slot {}", slot);
+    }
+
+    /// Start syncing (called when catchup begins).
+    pub fn start_syncing(&self) {
+        info!("Herder entering syncing state");
+        *self.state.write() = HerderState::Syncing;
+    }
+
+    /// Receive an SCP envelope from the network.
+    pub fn receive_scp_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
+        let state = self.state();
+        let slot = envelope.statement.slot_index;
+        let current_slot = self.tracking_slot();
+        let pending_slot = self.pending_envelopes.current_slot();
+
+        // Check if we can receive SCP messages
+        if !state.can_receive_scp() {
+            debug!("Ignoring SCP envelope in {:?} state", state);
+            return EnvelopeState::Invalid;
+        }
+
+        // Verify envelope signature
+        if let Err(e) = self.scp_driver.verify_envelope(&envelope) {
+            debug!(slot, error = %e, "Invalid SCP envelope signature");
+            return EnvelopeState::InvalidSignature;
+        }
+
+        // Special handling for EXTERNALIZE messages - they can fast-forward our state
+        // even if from future slots, as they represent network consensus
+        if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) = &envelope.statement.pledges {
+            // Extract tx set hash from the externalized value and request it immediately
+            // This ensures we request tx sets as soon as we learn about them, not after externalization
+            if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
+                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                // Request this tx set immediately - don't wait for ledger close
+                if self.scp_driver.request_tx_set(tx_set_hash, slot) {
+                    info!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
+                }
+            }
+
+            if slot > current_slot {
+                // Fast-forward to this slot using the externalized value
+                info!(
+                    slot,
+                    current_slot,
+                    "Fast-forwarding using EXTERNALIZE from network"
+                );
+
+                let value = ext.commit.value.clone();
+                self.scp_driver.record_externalized(slot, value.clone());
+
+                // Store for reference
+                *self.prev_value.write() = value;
+
+                // Advance tracking slot
+                self.advance_tracking_slot(slot);
+
+                return EnvelopeState::Valid;
+            }
+        }
+
+        // Check if this is for a future slot
+        if slot > current_slot {
+            // Buffer for later
+            match self.pending_envelopes.add(slot, envelope) {
+                PendingResult::Added => {
+                    debug!("Buffered envelope for future slot {}", slot);
+                    return EnvelopeState::Pending;
+                }
+                PendingResult::Duplicate => {
+                    return EnvelopeState::Duplicate;
+                }
+                PendingResult::SlotTooFar => {
+                    debug!(
+                        slot,
+                        current_slot,
+                        pending_slot,
+                        "Envelope rejected: slot too far ahead"
+                    );
+                    return EnvelopeState::Invalid;
+                }
+                PendingResult::SlotTooOld => {
+                    return EnvelopeState::TooOld;
+                }
+                PendingResult::BufferFull => {
+                    warn!("Pending envelope buffer full");
+                    return EnvelopeState::Invalid;
+                }
+            }
+        }
+
+        // Process the envelope
+        self.process_scp_envelope(envelope)
+    }
+
+    /// Process an SCP envelope (internal).
+    fn process_scp_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
+        let slot = envelope.statement.slot_index;
+
+        debug!(
+            "Processing SCP envelope for slot {} from {:?}",
+            slot, envelope.statement.node_id
+        );
+
+        // If we have SCP (validator mode), process through consensus
+        if let Some(ref scp) = self.scp {
+            let result = scp.receive_envelope(envelope.clone());
+
+            match result {
+                stellar_core_scp::EnvelopeState::Invalid => {
+                    return EnvelopeState::Invalid;
+                }
+                stellar_core_scp::EnvelopeState::Valid => {
+                    // Valid but not new
+                    return EnvelopeState::Duplicate;
+                }
+                stellar_core_scp::EnvelopeState::ValidNew => {
+                    // Check if this slot is now externalized
+                    if scp.is_slot_externalized(slot) {
+                        if let Some(value) = scp.get_externalized_value(slot) {
+                            info!(slot, "Slot externalized via SCP consensus");
+                            self.scp_driver.record_externalized(slot, value.clone());
+
+                            // Store for next round's priority calculation
+                            *self.prev_value.write() = value;
+
+                            // Advance tracking slot
+                            self.advance_tracking_slot(slot);
+                        }
+                    }
+                    return EnvelopeState::Valid;
+                }
+            }
+        }
+
+        // Non-validator mode: just track externalized values from network
+        if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
+            &envelope.statement.pledges
+        {
+            let value = ext.commit.value.clone();
+            self.scp_driver.record_externalized(slot, value.clone());
+
+            // Store for reference
+            *self.prev_value.write() = value;
+
+            // Advance tracking slot
+            self.advance_tracking_slot(slot);
+        }
+
+        EnvelopeState::Valid
+    }
+
+    /// Advance tracking slot after externalization.
+    fn advance_tracking_slot(&self, externalized_slot: u64) {
+        let mut tracking = self.tracking_slot.write();
+        if externalized_slot >= *tracking {
+            *tracking = externalized_slot + 1;
+            self.pending_envelopes.set_current_slot(externalized_slot + 1);
+
+            // Release any pending envelopes for the new slot
+            drop(tracking);
+            let pending = self.pending_envelopes.release(externalized_slot + 1);
+            for env in pending {
+                let _ = self.process_scp_envelope(env);
+            }
+        }
+    }
+
+    /// Receive a transaction from the network.
+    pub fn receive_transaction(&self, tx: TransactionEnvelope) -> TxQueueResult {
+        let state = self.state();
+
+        if !state.can_receive_transactions() {
+            debug!("Ignoring transaction in {:?} state", state);
+            return TxQueueResult::Invalid;
+        }
+
+        // Add to transaction queue
+        let result = self.tx_queue.try_add(tx);
+
+        match result {
+            TxQueueResult::Added => {
+                debug!(
+                    "Added transaction to queue, size: {}",
+                    self.tx_queue.len()
+                );
+            }
+            TxQueueResult::Duplicate => {
+                debug!("Duplicate transaction ignored");
+            }
+            TxQueueResult::QueueFull => {
+                warn!("Transaction queue full");
+            }
+            TxQueueResult::FeeTooLow => {
+                debug!("Transaction fee too low");
+            }
+            TxQueueResult::Invalid => {
+                debug!("Invalid transaction rejected");
+            }
+        }
+
+        result
+    }
+
+    /// Trigger consensus for the next ledger (for validators).
+    ///
+    /// This is called periodically by the consensus timer.
+    pub async fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<()> {
+        if !self.is_validator() {
+            return Err(HerderError::NotValidating);
+        }
+
+        if !self.is_tracking() {
+            return Err(HerderError::NotValidating);
+        }
+
+        let scp = match &self.scp {
+            Some(scp) => scp,
+            None => return Err(HerderError::NotValidating),
+        };
+
+        let slot = ledger_seq as u64;
+        info!("Triggering consensus for ledger {}", ledger_seq);
+
+        // Get the previous ledger hash
+        let previous_hash = if let Some(manager) = self.ledger_manager.read().as_ref() {
+            Hash256::from_bytes(manager.current_header().previous_ledger_hash.0)
+        } else {
+            Hash256::ZERO
+        };
+
+        // Create transaction set from queue
+        // Use max_tx_set_size from network config (default 1000)
+        let max_txs = self.config.max_tx_set_size;
+        let tx_set = self.tx_queue.get_transaction_set(previous_hash, max_txs);
+
+        info!(
+            "Proposing transaction set with {} transactions, hash: {}",
+            tx_set.len(),
+            tx_set.hash
+        );
+
+        // Cache the transaction set
+        self.scp_driver.cache_tx_set(tx_set.clone());
+
+        // Create StellarValue for nomination
+        let close_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set.hash.0),
+            close_time: TimePoint(close_time),
+            upgrades: vec![].try_into().unwrap(),
+            ext: stellar_xdr::curr::StellarValueExt::Basic,
+        };
+
+        // Encode to Value
+        let value_bytes = stellar_value
+            .to_xdr(Limits::none())
+            .map_err(|e| HerderError::Internal(format!("Failed to encode value: {}", e)))?;
+        let value = Value(value_bytes.try_into().map_err(|_| {
+            HerderError::Internal("Value too large".to_string())
+        })?);
+
+        // Get previous value for priority calculation
+        let prev_value = self.prev_value.read().clone();
+
+        // Start SCP nomination
+        if scp.nominate(slot, value, &prev_value) {
+            info!(slot, "Started SCP nomination for ledger");
+        } else {
+            debug!(slot, "Nomination already in progress or slot already externalized");
+        }
+
+        Ok(())
+    }
+
+    /// Get the SCP driver.
+    pub fn scp_driver(&self) -> &Arc<ScpDriver> {
+        &self.scp_driver
+    }
+
+    /// Set the envelope broadcast callback.
+    ///
+    /// This is called when SCP needs to send an envelope to the network.
+    pub fn set_envelope_sender<F>(&self, sender: F)
+    where
+        F: Fn(ScpEnvelope) + Send + Sync + 'static,
+    {
+        self.scp_driver.set_envelope_sender(sender);
+    }
+
+    /// Get the SCP instance (if validator).
+    pub fn scp(&self) -> Option<&SCP<HerderScpCallback>> {
+        self.scp.as_ref()
+    }
+
+    /// Check if a ledger close is ready and return the close info.
+    ///
+    /// This is called by the application to check if consensus has been
+    /// reached and the ledger should be closed.
+    pub fn check_ledger_close(&self, slot: SlotIndex) -> Option<LedgerCloseInfo> {
+        // Check if we have externalized this slot
+        let externalized = self.scp_driver.get_externalized(slot)?;
+
+        // Parse the StellarValue
+        let stellar_value = match StellarValue::from_xdr(&externalized.value, Limits::none()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(slot, error = %e, "Failed to parse externalized StellarValue");
+                return None;
+            }
+        };
+
+        // Get the transaction set
+        let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
+        let tx_set = self.scp_driver.get_tx_set(&tx_set_hash);
+
+        if tx_set.is_none() {
+            // Register this as a pending tx set request
+            self.scp_driver.request_tx_set(tx_set_hash, slot);
+        }
+
+        Some(LedgerCloseInfo {
+            slot,
+            close_time: stellar_value.close_time.0,
+            tx_set_hash,
+            tx_set,
+            upgrades: stellar_value.upgrades.to_vec(),
+        })
+    }
+
+    /// Mark a ledger as closed and clean up.
+    ///
+    /// Called after the application has applied the ledger.
+    pub fn ledger_closed(&self, slot: SlotIndex, applied_tx_hashes: &[Hash256]) {
+        info!(slot, txs = applied_tx_hashes.len(), "Ledger closed");
+
+        // Remove applied transactions from queue
+        self.tx_queue.remove_applied(applied_tx_hashes);
+
+        // Clean up old SCP state
+        if let Some(ref scp) = self.scp {
+            scp.purge_slots(slot.saturating_sub(10));
+        }
+
+        // Clean up old data
+        self.cleanup();
+    }
+
+    /// Handle nomination timeout.
+    ///
+    /// Called when the nomination timer expires. Re-nominates with the same
+    /// value to try to make progress.
+    pub fn handle_nomination_timeout(&self, slot: SlotIndex) {
+        if let Some(ref scp) = self.scp {
+            let prev_value = self.prev_value.read().clone();
+            let value = self.create_nomination_value(slot);
+
+            if let Some(value) = value {
+                if scp.nominate_timeout(slot, value, &prev_value) {
+                    debug!(slot, "Re-nominated after timeout");
+                }
+            }
+        }
+    }
+
+    /// Handle ballot timeout.
+    ///
+    /// Called when the ballot timer expires. Bumps the ballot counter to
+    /// try to make progress.
+    pub fn handle_ballot_timeout(&self, slot: SlotIndex) {
+        if let Some(ref scp) = self.scp {
+            if scp.bump_ballot(slot) {
+                debug!(slot, "Bumped ballot after timeout");
+            }
+        }
+    }
+
+    /// Get the current nomination timeout.
+    pub fn get_nomination_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
+        if let Some(ref scp) = self.scp {
+            if let Some(state) = scp.get_slot_state(slot) {
+                return Some(scp.get_nomination_timeout(state.nomination_round));
+            }
+        }
+        None
+    }
+
+    /// Get the current ballot timeout.
+    pub fn get_ballot_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
+        if let Some(ref scp) = self.scp {
+            if let Some(state) = scp.get_slot_state(slot) {
+                // Use same timeout calculation as nomination
+                return Some(scp.get_ballot_timeout(state.nomination_round));
+            }
+        }
+        None
+    }
+
+    /// Create a nomination value for a slot.
+    fn create_nomination_value(&self, _slot: SlotIndex) -> Option<Value> {
+        // Get the previous ledger hash from our current ledger state
+        let previous_hash = if let Some(manager) = self.ledger_manager.read().as_ref() {
+            // Use the hash of the current ledger header (which becomes previous for next)
+            let header = manager.current_header();
+            Hash256::hash_xdr(&header).unwrap_or(Hash256::ZERO)
+        } else {
+            Hash256::ZERO
+        };
+
+        // Build GeneralizedTransactionSet with proper hash computation
+        let max_txs = 100;
+        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set(previous_hash, max_txs);
+
+        info!(
+            hash = %tx_set.hash,
+            tx_count = tx_set.transactions.len(),
+            "Proposing transaction set"
+        );
+
+        // Cache the tx set so we can respond to GetTxSet requests
+        self.scp_driver.cache_tx_set(tx_set.clone());
+
+        // Create StellarValue with the GeneralizedTransactionSet hash
+        let close_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set.hash.0),
+            close_time: TimePoint(close_time),
+            upgrades: vec![].try_into().unwrap(),
+            ext: stellar_xdr::curr::StellarValueExt::Basic,
+        };
+
+        // Encode to Value
+        let value_bytes = stellar_value.to_xdr(Limits::none()).ok()?;
+        let value = Value(value_bytes.try_into().ok()?);
+        Some(value)
+    }
+
+    /// Get the transaction queue.
+    pub fn tx_queue(&self) -> &TransactionQueue {
+        &self.tx_queue
+    }
+
+    /// Get the pending envelope manager.
+    pub fn pending_envelopes(&self) -> &PendingEnvelopes {
+        &self.pending_envelopes
+    }
+
+    /// Get the latest externalized slot.
+    pub fn latest_externalized_slot(&self) -> Option<u64> {
+        self.scp_driver.latest_externalized_slot()
+    }
+
+    /// Get an externalized value.
+    pub fn get_externalized(&self, slot: u64) -> Option<crate::scp_driver::ExternalizedSlot> {
+        self.scp_driver.get_externalized(slot)
+    }
+
+    /// Get SCP state envelopes for responding to peers.
+    ///
+    /// Returns SCP envelopes for slots starting from `from_slot`, along with
+    /// our local quorum set if configured.
+    pub fn get_scp_state(&self, from_slot: u64) -> (Vec<ScpEnvelope>, Option<ScpQuorumSet>) {
+        let envelopes = if let Some(ref scp) = self.scp {
+            scp.get_scp_state(from_slot)
+        } else {
+            vec![]
+        };
+
+        let quorum_set = self.scp_driver.get_local_quorum_set();
+
+        (envelopes, quorum_set)
+    }
+
+    /// Remove applied transactions from the queue.
+    pub fn remove_applied_transactions(&self, tx_hashes: &[Hash256]) {
+        self.tx_queue.remove_applied(tx_hashes);
+    }
+
+    /// Clean up old data.
+    pub fn cleanup(&self) {
+        // Clean up old externalized slots
+        self.scp_driver
+            .cleanup_externalized(self.config.max_externalized_slots);
+
+        // Clean up expired pending envelopes
+        self.pending_envelopes.evict_expired();
+
+        // Clean up expired transactions
+        self.tx_queue.evict_expired();
+
+        // Clean up old pending tx set requests (by time and by slot)
+        self.scp_driver.cleanup_pending_tx_sets(10); // 10 seconds - be aggressive
+        let tracking = self.tracking_slot();
+        let removed = self.scp_driver.cleanup_old_pending_slots(tracking);
+        if removed > 0 {
+            debug!(tracking, removed, "Cleaned up old pending tx set requests");
+        }
+    }
+
+    /// Get pending transaction set hashes that need to be fetched from peers.
+    pub fn get_pending_tx_set_hashes(&self) -> Vec<Hash256> {
+        self.scp_driver.get_pending_tx_set_hashes()
+    }
+
+    /// Check if we need a transaction set.
+    pub fn needs_tx_set(&self, hash: &Hash256) -> bool {
+        self.scp_driver.needs_tx_set(hash)
+    }
+
+    /// Receive a transaction set from the network.
+    /// Returns the slot it was needed for, if any.
+    pub fn receive_tx_set(&self, tx_set: TransactionSet) -> Option<SlotIndex> {
+        self.scp_driver.receive_tx_set(tx_set)
+    }
+
+    /// Cache a transaction set directly.
+    pub fn cache_tx_set(&self, tx_set: TransactionSet) {
+        self.scp_driver.cache_tx_set(tx_set);
+    }
+
+    /// Check if a transaction set is cached.
+    pub fn has_tx_set(&self, hash: &Hash256) -> bool {
+        self.scp_driver.has_tx_set(hash)
+    }
+
+    /// Get a cached transaction set by hash.
+    pub fn get_tx_set(&self, hash: &Hash256) -> Option<TransactionSet> {
+        self.scp_driver.get_tx_set(hash)
+    }
+
+    /// Get statistics about the Herder.
+    pub fn stats(&self) -> HerderStats {
+        HerderStats {
+            state: self.state(),
+            tracking_slot: self.tracking_slot(),
+            pending_transactions: self.tx_queue.len(),
+            pending_envelopes: self.pending_envelopes.len(),
+            pending_envelope_slots: self.pending_envelopes.slot_count(),
+            cached_tx_sets: self.scp_driver.tx_set_cache_size(),
+            is_validator: self.is_validator(),
+        }
+    }
+}
+
+/// Information about a ledger ready to close.
+#[derive(Debug, Clone)]
+pub struct LedgerCloseInfo {
+    /// The slot/ledger sequence.
+    pub slot: SlotIndex,
+    /// Close time from consensus.
+    pub close_time: u64,
+    /// Transaction set hash.
+    pub tx_set_hash: Hash256,
+    /// Transaction set (if available in cache).
+    pub tx_set: Option<TransactionSet>,
+    /// Protocol upgrades.
+    pub upgrades: Vec<UpgradeType>,
+}
+
+/// Statistics about the Herder.
+#[derive(Debug, Clone)]
+pub struct HerderStats {
+    /// Current state.
+    pub state: HerderState,
+    /// Current tracking slot.
+    pub tracking_slot: u64,
+    /// Number of pending transactions.
+    pub pending_transactions: usize,
+    /// Number of pending SCP envelopes.
+    pub pending_envelopes: usize,
+    /// Number of slots with pending envelopes.
+    pub pending_envelope_slots: usize,
+    /// Number of cached transaction sets.
+    pub cached_tx_sets: usize,
+    /// Whether this node is a validator.
+    pub is_validator: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        ScpStatement, ScpStatementPledges, ScpNomination, ScpBallot,
+        ScpStatementExternalize, NodeId as XdrNodeId, Uint64, Value,
+        Signature as XdrSignature, WriteXdr, Limits,
+    };
+    use stellar_core_crypto::SecretKey;
+
+    fn make_test_herder() -> Herder {
+        let config = HerderConfig::default();
+        Herder::new(config)
+    }
+
+    /// Creates a test envelope with a valid signature for the given herder's network.
+    fn make_signed_test_envelope(slot: u64, herder: &Herder) -> ScpEnvelope {
+        // Generate a test keypair
+        let secret = SecretKey::from_seed(&[1u8; 32]);
+        let public = secret.public_key();
+
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        ));
+
+        let statement = ScpStatement {
+            node_id: node_id.clone(),
+            slot_index: slot,
+            pledges: ScpStatementPledges::Nominate(ScpNomination {
+                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                votes: vec![].try_into().unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            }),
+        };
+
+        // Sign the statement with network ID + ENVELOPE_TYPE_SCP prefix
+        // (same format as verify_envelope expects)
+        let statement_bytes = statement.to_xdr(Limits::none()).unwrap();
+        let mut data = herder.scp_driver.network_id().0.to_vec();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP = 1
+        data.extend_from_slice(&statement_bytes);
+
+        let signature = secret.sign(&data);
+        let sig_bytes: Vec<u8> = signature.as_bytes().to_vec();
+
+        ScpEnvelope {
+            statement,
+            signature: XdrSignature(sig_bytes.try_into().unwrap()),
+        }
+    }
+
+    fn make_test_envelope(slot: u64) -> ScpEnvelope {
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([0u8; 32]),
+        ));
+
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn test_initial_state() {
+        let herder = make_test_herder();
+        assert_eq!(herder.state(), HerderState::Booting);
+        assert!(!herder.is_tracking());
+    }
+
+    #[test]
+    fn test_bootstrap() {
+        let herder = make_test_herder();
+
+        herder.start_syncing();
+        assert_eq!(herder.state(), HerderState::Syncing);
+
+        herder.bootstrap(100);
+        assert_eq!(herder.state(), HerderState::Tracking);
+        assert_eq!(herder.tracking_slot(), 100);
+        assert!(herder.is_tracking());
+    }
+
+    #[test]
+    fn test_receive_envelope_before_tracking() {
+        let herder = make_test_herder();
+
+        let envelope = make_test_envelope(100);
+        let result = herder.receive_scp_envelope(envelope);
+
+        // Should be invalid because we're not syncing or tracking
+        assert_eq!(result, EnvelopeState::Invalid);
+    }
+
+    #[test]
+    fn test_receive_envelope_while_syncing() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+
+        // Syncing but not yet tracking, envelopes go to pending
+        // Use signed envelope to pass signature verification
+        let envelope = make_signed_test_envelope(100, &herder);
+
+        // We need to set a current slot first
+        herder.pending_envelopes.set_current_slot(95);
+
+        let result = herder.receive_scp_envelope(envelope);
+        assert_eq!(result, EnvelopeState::Pending);
+    }
+
+    #[test]
+    fn test_stats() {
+        let herder = make_test_herder();
+        herder.bootstrap(50);
+
+        let stats = herder.stats();
+        assert_eq!(stats.state, HerderState::Tracking);
+        assert_eq!(stats.tracking_slot, 50);
+        assert_eq!(stats.pending_transactions, 0);
+        assert!(!stats.is_validator);
+    }
+}

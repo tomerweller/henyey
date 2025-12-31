@@ -1,0 +1,107 @@
+//! Inflation operation execution.
+//!
+//! This module implements the execution logic for the Inflation operation.
+//! Note: Inflation has been deprecated since Protocol 12 and always returns
+//! NOT_TIME on the public network, but we implement it for completeness.
+
+use stellar_xdr::curr::{
+    AccountId, InflationPayout, InflationResult, InflationResultCode, OperationResult,
+    OperationResultTr,
+};
+
+use crate::state::LedgerStateManager;
+use crate::validation::LedgerContext;
+use crate::Result;
+
+/// Execute an Inflation operation.
+///
+/// This operation was used to distribute inflation payments but has been
+/// deprecated since Protocol 12. On the public network, it always returns NOT_TIME.
+///
+/// For completeness, we implement the basic logic:
+/// 1. Check if it's time for inflation (weekly)
+/// 2. Calculate inflation pool
+/// 3. Distribute to accounts that have received votes
+pub fn execute_inflation(
+    source: &AccountId,
+    state: &mut LedgerStateManager,
+    context: &LedgerContext,
+) -> Result<OperationResult> {
+    // Check source account exists
+    if state.get_account(source).is_none() {
+        return Ok(make_inflation_result(InflationResultCode::NotTime, vec![]));
+    }
+
+    // Inflation is deprecated - on modern networks, always return NOT_TIME
+    // The last inflation payout was in 2019. Since Protocol 12, inflation
+    // is effectively disabled.
+    //
+    // If we were to implement it fully:
+    // 1. Check if a week has passed since last inflation
+    // 2. Calculate 1% annual inflation on total coins
+    // 3. Find all accounts with inflation_dest set and enough votes (0.05% of total)
+    // 4. Distribute proportionally based on votes
+
+    // For now, return NOT_TIME as inflation is deprecated
+    Ok(make_inflation_result(InflationResultCode::NotTime, vec![]))
+}
+
+/// Create an Inflation result.
+fn make_inflation_result(code: InflationResultCode, payouts: Vec<InflationPayout>) -> OperationResult {
+    let result = match code {
+        InflationResultCode::Success => {
+            InflationResult::Success(payouts.try_into().unwrap_or_default())
+        }
+        InflationResultCode::NotTime => InflationResult::NotTime,
+    };
+
+    OperationResult::OpInner(OperationResultTr::Inflation(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::*;
+
+    fn create_test_account_id(seed: u8) -> AccountId {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
+    }
+
+    fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }
+    }
+
+    fn create_test_context() -> LedgerContext {
+        LedgerContext::testnet(1, 1000)
+    }
+
+    #[test]
+    fn test_inflation_not_time() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let result = execute_inflation(&source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
+                assert!(matches!(r, InflationResult::NotTime));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+}

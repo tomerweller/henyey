@@ -1,0 +1,43 @@
+[package]
+name = "stellar-core-history"
+description = "History archive and catchup for rs-stellar-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-xdr.workspace = true
+stellar-core-common.workspace = true
+stellar-core-crypto.workspace = true
+stellar-core-db.workspace = true
+stellar-core-bucket.workspace = true
+
+# HTTP client
+reqwest.workspace = true
+url.workspace = true
+
+# Compression
+flate2.workspace = true
+
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+tracing.workspace = true
+
+# Utilities
+bytes.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

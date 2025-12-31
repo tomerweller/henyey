@@ -1,0 +1,63 @@
+[node]
+name = "rs-stellar-core-validator"
+is_validator = true
+node_seed = "SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA"
+
+# Trust the SDF testnet validators
+[node.quorum_set]
+threshold_percent = 66
+validators = [
+    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
+    "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
+    "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z",
+]
+inner_sets = []
+
+[network]
+passphrase = "Test SDF Network ; September 2015"
+base_fee = 100
+base_reserve = 5000000
+max_protocol_version = 22
+
+[database]
+path = "/home/tomer/rs-stellar-core/data/stellar.db"
+pool_size = 10
+
+[buckets]
+directory = "/home/tomer/rs-stellar-core/data/buckets"
+cache_size = 256
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+get_enabled = true
+put_enabled = false
+
+[[history.archives]]
+name = "sdf2"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_002"
+get_enabled = true
+put_enabled = false
+
+[[history.archives]]
+name = "sdf3"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_003"
+get_enabled = true
+put_enabled = false
+
+[overlay]
+peer_port = 11625
+max_inbound_peers = 64
+max_outbound_peers = 8
+target_outbound_peers = 8
+known_peers = [
+    "core-testnet1.stellar.org:11625",
+    "core-testnet2.stellar.org:11625",
+    "core-testnet3.stellar.org:11625",
+]
+preferred_peers = []
+
+[logging]
+level = "info"
+format = "text"
+colors = true
