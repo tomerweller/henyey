@@ -91,18 +91,36 @@ impl Bucket {
 
     /// Create a bucket from uncompressed XDR bytes.
     pub fn from_xdr_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::from_xdr_bytes_internal(bytes, true)
+    }
+
+    /// Create a bucket from uncompressed XDR bytes without building the key index.
+    ///
+    /// This is much more memory efficient for large buckets and should be used
+    /// during catchup when key lookups are not needed.
+    pub fn from_xdr_bytes_without_index(bytes: &[u8]) -> Result<Self> {
+        Self::from_xdr_bytes_internal(bytes, false)
+    }
+
+    /// Internal method to create a bucket with optional key index building.
+    fn from_xdr_bytes_internal(bytes: &[u8], build_index: bool) -> Result<Self> {
         let entries = Self::parse_entries(bytes)?;
 
-        // Build key index
-        let mut key_index = BTreeMap::new();
-        for (idx, entry) in entries.iter().enumerate() {
-            if let Some(key) = entry.key() {
-                let key_bytes = key
-                    .to_xdr(Limits::none())
-                    .map_err(|e| BucketError::Serialization(format!("Failed to serialize key: {}", e)))?;
-                key_index.insert(key_bytes, idx);
+        // Build key index only if requested (skip during catchup for memory efficiency)
+        let key_index = if build_index {
+            let mut index = BTreeMap::new();
+            for (idx, entry) in entries.iter().enumerate() {
+                if let Some(key) = entry.key() {
+                    let key_bytes = key
+                        .to_xdr(Limits::none())
+                        .map_err(|e| BucketError::Serialization(format!("Failed to serialize key: {}", e)))?;
+                    index.insert(key_bytes, idx);
+                }
             }
-        }
+            index
+        } else {
+            BTreeMap::new()
+        };
 
         // Compute hash from raw bytes (including record marks)
         // This matches the bucket file hash used in history archives

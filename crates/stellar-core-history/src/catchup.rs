@@ -287,27 +287,22 @@ impl CatchupManager {
     }
 
     /// Download all buckets referenced in the HAS.
+    ///
+    /// Note: This method now skips pre-downloading buckets since apply_buckets
+    /// downloads them on-demand. This reduces peak memory usage for mainnet
+    /// where buckets total many GB.
     async fn download_buckets(
         &mut self,
         hashes: &[Hash256],
     ) -> Result<Vec<(Hash256, Vec<u8>)>> {
-        let mut buckets = Vec::with_capacity(hashes.len());
-
-        for (i, hash) in hashes.iter().enumerate() {
-            let data = self.download_bucket(hash).await?;
-            verify::verify_bucket_hash(&data, hash)?;
-            buckets.push((*hash, data));
-
-            self.progress.buckets_downloaded = (i + 1) as u32;
-            debug!(
-                "Downloaded bucket {}/{}: {}",
-                i + 1,
-                hashes.len(),
-                hash
-            );
-        }
-
-        Ok(buckets)
+        // Skip pre-downloading - buckets will be downloaded on-demand in apply_buckets
+        // This reduces peak memory usage significantly for mainnet
+        info!(
+            "Skipping pre-download of {} buckets (will download on-demand)",
+            hashes.len()
+        );
+        self.progress.buckets_total = hashes.len() as u32;
+        Ok(Vec::new())
     }
 
     /// Download a single bucket.
@@ -327,44 +322,75 @@ impl CatchupManager {
 
     /// Apply downloaded buckets to build the initial bucket list state.
     /// Returns (live_bucket_list, hot_archive_bucket_list).
+    ///
+    /// Note: This method ignores the pre-downloaded buckets parameter and downloads
+    /// buckets on-demand to reduce peak memory usage. For mainnet with 33 buckets
+    /// totaling many GB, holding all raw data in memory causes OOM.
     async fn apply_buckets(
         &self,
         has: &HistoryArchiveState,
-        buckets: &[(Hash256, Vec<u8>)],
+        _buckets: &[(Hash256, Vec<u8>)],  // Ignored - we download on-demand
     ) -> Result<(BucketList, Option<BucketList>)> {
         use std::collections::HashMap;
+        use std::sync::Mutex;
         use stellar_core_bucket::Bucket;
 
         info!(
-            "Applying {} buckets to build state at ledger {}",
-            buckets.len(),
+            "Applying buckets to build state at ledger {}",
             has.current_ledger
         );
 
-        // Build a map from hash to bucket data for fast lookup
-        // Note: The data is already decompressed by get_bucket()
-        let bucket_map: HashMap<Hash256, &[u8]> = buckets
-            .iter()
-            .map(|(hash, data)| (*hash, data.as_slice()))
-            .collect();
+        // Cache for buckets we've already loaded (to avoid re-downloading)
+        // Using Mutex for interior mutability in the closure
+        let bucket_cache: Mutex<HashMap<Hash256, Bucket>> = Mutex::new(HashMap::new());
 
-        // Helper to load a bucket from the map
+        // Clone archives for use in closure
+        let archives = self.archives.clone();
+
+        // Helper to load a bucket - downloads on-demand and caches
         let load_bucket = |hash: &Hash256| -> stellar_core_bucket::Result<Bucket> {
             // Zero hash means empty bucket
             if hash.is_zero() {
                 return Ok(Bucket::empty());
             }
 
-            // Find the bucket data (already decompressed)
-            let xdr_data = bucket_map.get(hash).ok_or_else(|| {
-                stellar_core_bucket::BucketError::NotFound(format!(
-                    "Bucket {} not found in downloaded data",
-                    hash
-                ))
-            })?;
+            // Check cache first
+            {
+                let cache = bucket_cache.lock().unwrap();
+                if let Some(bucket) = cache.get(hash) {
+                    return Ok(bucket.clone());
+                }
+            }
 
-            // Parse the bucket from XDR bytes (already decompressed by get_bucket)
-            let bucket = Bucket::from_xdr_bytes(xdr_data)?;
+            // Download the bucket (blocking - we're in a sync context)
+            let xdr_data = {
+                let hash = *hash;
+                let archives = archives.clone();
+
+                // Use tokio's block_in_place to run async code
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        for archive in &archives {
+                            match archive.get_bucket(&hash).await {
+                                Ok(data) => return Ok(data),
+                                Err(e) => {
+                                    warn!("Failed to download bucket {} from archive: {}", hash, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(stellar_core_bucket::BucketError::NotFound(format!(
+                            "Bucket {} not found in any archive",
+                            hash
+                        )))
+                    })
+                })?
+            };
+
+            // Parse the bucket from XDR bytes WITHOUT building key index.
+            // This is critical for mainnet which has buckets with 7+ million entries.
+            // Building the key_index would use ~500MB+ per large bucket.
+            let bucket = Bucket::from_xdr_bytes_without_index(&xdr_data)?;
 
             // Verify hash matches
             if bucket.hash() != *hash {
@@ -375,6 +401,13 @@ impl CatchupManager {
             }
 
             debug!("Loaded bucket {} with {} entries", hash, bucket.len());
+
+            // Cache the bucket (it might be referenced multiple times in the bucket list)
+            {
+                let mut cache = bucket_cache.lock().unwrap();
+                cache.insert(*hash, bucket.clone());
+            }
+
             Ok(bucket)
         };
 
