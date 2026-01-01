@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 1;
+pub const CURRENT_VERSION: i32 = 4;
 
 /// A database migration.
 struct Migration {
@@ -24,14 +24,47 @@ struct Migration {
 
 /// All available migrations.
 const MIGRATIONS: &[Migration] = &[
-    // Future migrations will be added here
-    // Example:
-    // Migration {
-    //     from_version: 1,
-    //     to_version: 2,
-    //     upgrade_sql: "ALTER TABLE accounts ADD COLUMN new_field TEXT;",
-    //     description: "Add new_field to accounts table",
-    // },
+    Migration {
+        from_version: 1,
+        to_version: 2,
+        upgrade_sql: r#"
+            CREATE TABLE IF NOT EXISTS txsets (
+                ledgerseq INTEGER PRIMARY KEY,
+                data BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS txresults (
+                ledgerseq INTEGER PRIMARY KEY,
+                data BLOB NOT NULL
+            );
+        "#,
+        description: "Add txsets and txresults tables for history publishing",
+    },
+    Migration {
+        from_version: 2,
+        to_version: 3,
+        upgrade_sql: r#"
+            CREATE TABLE IF NOT EXISTS bucketlist (
+                ledgerseq INTEGER NOT NULL,
+                level INTEGER NOT NULL,
+                currhash TEXT NOT NULL,
+                snaphash TEXT NOT NULL,
+                PRIMARY KEY (ledgerseq, level)
+            );
+            CREATE INDEX IF NOT EXISTS bucketlist_ledger ON bucketlist(ledgerseq);
+        "#,
+        description: "Add bucket list table for checkpoint snapshots",
+    },
+    Migration {
+        from_version: 3,
+        to_version: 4,
+        upgrade_sql: r#"
+            CREATE TABLE IF NOT EXISTS publishqueue (
+                ledgerseq INTEGER PRIMARY KEY,
+                state TEXT NOT NULL
+            );
+        "#,
+        description: "Add publish queue table for history publishing",
+    },
 ];
 
 /// Get the current schema version from the database.

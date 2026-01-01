@@ -120,6 +120,7 @@ let config = HerderConfig {
     pending_config: PendingConfig::default(),
     tx_queue_config: TxQueueConfig::default(),
     local_quorum_set: quorum_set,
+    proposed_upgrades: Vec::new(),
 };
 ```
 
@@ -137,7 +138,7 @@ let result = queue.add(tx);
 match result {
     TxQueueResult::Added => { /* Success */ }
     TxQueueResult::Duplicate => { /* Already have it */ }
-    TxQueueResult::Full => { /* Queue is full */ }
+    TxQueueResult::QueueFull => { /* Queue is full */ }
 }
 
 // Get transactions for a set
@@ -170,8 +171,9 @@ trait HerderCallback {
     async fn close_ledger(
         &self,
         ledger_seq: u32,
-        tx_set: Vec<TransactionEnvelope>,
+        tx_set: TransactionSet,
         close_time: u64,
+        upgrades: Vec<UpgradeType>,
     ) -> Result<Hash256>;
 
     async fn validate_tx_set(&self, tx_set_hash: &Hash256) -> bool;
@@ -208,10 +210,10 @@ A set of transactions for a ledger:
 ```rust
 use stellar_core_herder::TransactionSet;
 
-let tx_set = TransactionSet::new(transactions);
+let tx_set = TransactionSet::new(previous_ledger_hash, transactions);
 
 // Get the hash
-let hash = tx_set.hash();
+let hash = tx_set.hash;
 
 // Get transaction count
 let count = tx_set.len();

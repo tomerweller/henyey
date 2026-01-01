@@ -71,14 +71,17 @@
 mod error;
 mod herder;
 mod pending;
+mod quorum_tracker;
 mod scp_driver;
 mod state;
+mod surge_pricing;
 mod tx_queue;
 
 // Re-export main types
 pub use error::HerderError;
 pub use herder::{EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseInfo};
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
+pub use quorum_tracker::QuorumTracker;
 pub use scp_driver::{
     CachedTxSet, ExternalizedSlot, HerderScpCallback, PendingTxSet, ScpDriver, ScpDriverConfig,
     ValueValidation,
@@ -120,8 +123,9 @@ pub trait HerderCallback: Send + Sync {
     async fn close_ledger(
         &self,
         ledger_seq: u32,
-        tx_set: Vec<stellar_xdr::curr::TransactionEnvelope>,
+        tx_set: TransactionSet,
         close_time: u64,
+        upgrades: Vec<stellar_xdr::curr::UpgradeType>,
     ) -> Result<stellar_core_common::Hash256>;
 
     /// Called to validate a proposed transaction set.

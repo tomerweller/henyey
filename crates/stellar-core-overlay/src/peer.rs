@@ -16,6 +16,12 @@ use stellar_xdr::curr::{Auth, Hello, StellarMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+fn message_len(message: &StellarMessage) -> usize {
+    stellar_xdr::curr::WriteXdr::to_xdr(message, stellar_xdr::curr::Limits::none())
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
 /// Peer connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
@@ -54,6 +60,22 @@ pub struct PeerStats {
     pub bytes_sent: AtomicU64,
     /// Bytes received.
     pub bytes_received: AtomicU64,
+    /// Unique flood messages received.
+    pub unique_flood_messages_recv: AtomicU64,
+    /// Duplicate flood messages received.
+    pub duplicate_flood_messages_recv: AtomicU64,
+    /// Unique flood bytes received.
+    pub unique_flood_bytes_recv: AtomicU64,
+    /// Duplicate flood bytes received.
+    pub duplicate_flood_bytes_recv: AtomicU64,
+    /// Unique fetch messages received.
+    pub unique_fetch_messages_recv: AtomicU64,
+    /// Duplicate fetch messages received.
+    pub duplicate_fetch_messages_recv: AtomicU64,
+    /// Unique fetch bytes received.
+    pub unique_fetch_bytes_recv: AtomicU64,
+    /// Duplicate fetch bytes received.
+    pub duplicate_fetch_bytes_recv: AtomicU64,
 }
 
 impl PeerStats {
@@ -64,6 +86,18 @@ impl PeerStats {
             messages_received: self.messages_received.load(Ordering::Relaxed),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            unique_flood_messages_recv: self.unique_flood_messages_recv.load(Ordering::Relaxed),
+            duplicate_flood_messages_recv: self
+                .duplicate_flood_messages_recv
+                .load(Ordering::Relaxed),
+            unique_flood_bytes_recv: self.unique_flood_bytes_recv.load(Ordering::Relaxed),
+            duplicate_flood_bytes_recv: self.duplicate_flood_bytes_recv.load(Ordering::Relaxed),
+            unique_fetch_messages_recv: self.unique_fetch_messages_recv.load(Ordering::Relaxed),
+            duplicate_fetch_messages_recv: self
+                .duplicate_fetch_messages_recv
+                .load(Ordering::Relaxed),
+            unique_fetch_bytes_recv: self.unique_fetch_bytes_recv.load(Ordering::Relaxed),
+            duplicate_fetch_bytes_recv: self.duplicate_fetch_bytes_recv.load(Ordering::Relaxed),
         }
     }
 }
@@ -75,6 +109,14 @@ pub struct PeerStatsSnapshot {
     pub messages_received: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub unique_flood_messages_recv: u64,
+    pub duplicate_flood_messages_recv: u64,
+    pub unique_flood_bytes_recv: u64,
+    pub duplicate_flood_bytes_recv: u64,
+    pub unique_fetch_messages_recv: u64,
+    pub duplicate_fetch_messages_recv: u64,
+    pub unique_fetch_bytes_recv: u64,
+    pub duplicate_fetch_bytes_recv: u64,
 }
 
 /// Information about a connected peer.
@@ -298,6 +340,11 @@ impl Peer {
         self.info.version_string = version_string;
         self.info.overlay_version = hello.overlay_version;
         self.info.ledger_version = hello.ledger_version;
+        if hello.listening_port > 0 {
+            let port = hello.listening_port as u16;
+            let ip = self.info.address.ip();
+            self.info.address = SocketAddr::new(ip, port);
+        }
 
         debug!(
             "Received Hello from {} (version: {}, overlay: {})",
@@ -309,17 +356,21 @@ impl Peer {
 
     /// Send a raw message (before authentication, e.g., Hello).
     async fn send_raw(&mut self, message: StellarMessage) -> Result<()> {
+        let size = message_len(&message);
         let auth_msg = self.auth.wrap_unauthenticated(message);
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(size as u64, Ordering::Relaxed);
         Ok(())
     }
 
     /// Send an Auth message (with MAC but sequence 0).
     async fn send_auth(&mut self, message: StellarMessage) -> Result<()> {
+        let size = message_len(&message);
         let auth_msg = self.auth.wrap_auth_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(size as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -332,9 +383,11 @@ impl Peer {
         let msg_type = helpers::message_type_name(&message);
         trace!("Sending {} to {}", msg_type, self.info.peer_id);
 
+        let size = message_len(&message);
         let auth_msg = self.auth.wrap_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(size as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -417,6 +470,42 @@ impl Peer {
     /// Get statistics.
     pub fn stats(&self) -> Arc<PeerStats> {
         Arc::clone(&self.stats)
+    }
+
+    pub fn record_flood_stats(&self, unique: bool, bytes: u64) {
+        if unique {
+            self.stats
+                .unique_flood_messages_recv
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .unique_flood_bytes_recv
+                .fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.stats
+                .duplicate_flood_messages_recv
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .duplicate_flood_bytes_recv
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_fetch_stats(&self, unique: bool, bytes: u64) {
+        if unique {
+            self.stats
+                .unique_fetch_messages_recv
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .unique_fetch_bytes_recv
+                .fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.stats
+                .duplicate_fetch_messages_recv
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .duplicate_fetch_bytes_recv
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     /// Get remote address.

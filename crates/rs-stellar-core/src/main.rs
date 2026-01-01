@@ -24,6 +24,7 @@ mod catchup_cmd;
 mod config;
 mod logging;
 mod run_cmd;
+mod survey;
 
 use std::path::PathBuf;
 
@@ -548,9 +549,112 @@ async fn cmd_verify_history(
                             println!("    Header chain verification FAILED: {}", e);
                             error_count += 1;
                         }
+
+                        match archive.get_transactions(checkpoint).await {
+                            Ok(tx_entries) => {
+                                match archive.get_results(checkpoint).await {
+                                    Ok(tx_results) => {
+                                        let tx_map = tx_entries
+                                            .iter()
+                                            .map(|entry| (entry.ledger_seq, entry))
+                                            .collect::<std::collections::HashMap<_, _>>();
+                                        let result_map = tx_results
+                                            .iter()
+                                            .map(|entry| (entry.ledger_seq, entry))
+                                            .collect::<std::collections::HashMap<_, _>>();
+
+                                        for header in &headers {
+                                            let Some(tx_entry) = tx_map.get(&header.ledger_seq) else {
+                                                println!(
+                                                    "    Missing transaction history entry for ledger {}",
+                                                    header.ledger_seq
+                                                );
+                                                error_count += 1;
+                                                continue;
+                                            };
+                                            let Some(result_entry) = result_map.get(&header.ledger_seq) else {
+                                                println!(
+                                                    "    Missing transaction result entry for ledger {}",
+                                                    header.ledger_seq
+                                                );
+                                                error_count += 1;
+                                                continue;
+                                            };
+
+                                            let tx_set_xdr = match &tx_entry.ext {
+                                                stellar_xdr::curr::TransactionHistoryEntryExt::V1(generalized) => {
+                                                    generalized.to_xdr(stellar_xdr::curr::Limits::none())
+                                                }
+                                                stellar_xdr::curr::TransactionHistoryEntryExt::V0 => {
+                                                    tx_entry.tx_set.to_xdr(stellar_xdr::curr::Limits::none())
+                                                }
+                                            };
+                                            match tx_set_xdr {
+                                                Ok(bytes) => {
+                                                    if let Err(e) = verify::verify_tx_set(header, &bytes) {
+                                                        println!(
+                                                            "    Tx set hash verification FAILED (ledger {}): {}",
+                                                            header.ledger_seq, e
+                                                        );
+                                                        error_count += 1;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    println!(
+                                                        "    Failed to encode tx set for ledger {}: {}",
+                                                        header.ledger_seq, e
+                                                    );
+                                                    error_count += 1;
+                                                }
+                                            }
+
+                                            let result_xdr = result_entry
+                                                .tx_result_set
+                                                .to_xdr(stellar_xdr::curr::Limits::none());
+                                            match result_xdr {
+                                                Ok(bytes) => {
+                                                    if let Err(e) = verify::verify_tx_result_set(header, &bytes) {
+                                                        println!(
+                                                            "    Tx result hash verification FAILED (ledger {}): {}",
+                                                            header.ledger_seq, e
+                                                        );
+                                                        error_count += 1;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    println!(
+                                                        "    Failed to encode tx result set for ledger {}: {}",
+                                                        header.ledger_seq, e
+                                                    );
+                                                    error_count += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("    Warning: Could not verify tx results: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("    Warning: Could not verify transactions: {}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         println!("    Warning: Could not verify headers: {}", e);
+                    }
+                }
+
+                match archive.get_scp_history(checkpoint).await {
+                    Ok(entries) => {
+                        if let Err(e) = verify::verify_scp_history_entries(&entries) {
+                            println!("    SCP history verification FAILED: {}", e);
+                            error_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        println!("    Warning: Could not verify SCP history: {}", e);
                     }
                 }
             }
@@ -578,8 +682,18 @@ async fn cmd_verify_history(
 
 /// Publish history command handler.
 async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<()> {
-    use stellar_core_bucket::BucketManager;
-    use stellar_core_history::HistoryArchive;
+    use stellar_core_bucket::{BucketList, BucketManager};
+    use stellar_core_history::archive_state::HistoryArchiveState;
+    use stellar_core_history::checkpoint::{checkpoint_containing, next_checkpoint};
+    use stellar_core_history::paths::root_has_path;
+    use stellar_core_history::publish::{build_history_archive_state, PublishConfig, PublishManager};
+    use stellar_core_history::CHECKPOINT_FREQUENCY;
+    use stellar_core_ledger::header::compute_header_hash;
+    use stellar_core_common::Hash256;
+    use std::fs;
+    use std::path::PathBuf;
+    use url::Url;
+    use stellar_xdr::curr::TransactionHistoryEntryExt;
 
     if !config.node.is_validator {
         anyhow::bail!("Only validators can publish history");
@@ -589,7 +703,9 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     println!();
 
     // Check for writable archives
-    let writable_archives: Vec<_> = config.history.archives
+    let writable_archives: Vec<_> = config
+        .history
+        .archives
         .iter()
         .filter(|a| a.put_enabled)
         .collect();
@@ -598,9 +714,41 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
         anyhow::bail!("No writable history archives configured. Add 'put = true' to an archive config.");
     }
 
-    println!("Writable archives: {}", writable_archives.len());
+    let mut local_targets = Vec::new();
+    let mut command_targets = Vec::new();
     for archive in &writable_archives {
-        println!("  - {}", archive.url);
+        if let Some(put) = archive.put.clone() {
+            command_targets.push(CommandArchiveTarget {
+                name: archive.name.clone(),
+                put,
+                mkdir: archive.mkdir.clone(),
+            });
+            continue;
+        }
+
+        let path = match Url::parse(&archive.url) {
+            Ok(url) if url.scheme() == "file" => url
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", archive.url))?,
+            Ok(_) => {
+                tracing::warn!(archive = %archive.url, "Remote publish not supported (missing put command)");
+                continue;
+            }
+            Err(_) => PathBuf::from(&archive.url),
+        };
+        local_targets.push((archive.url.as_str(), path));
+    }
+
+    if local_targets.is_empty() && command_targets.is_empty() {
+        anyhow::bail!("No publish archives configured (local paths or put commands required).");
+    }
+
+    println!("Writable archives: {}", local_targets.len() + command_targets.len());
+    for (url, _) in &local_targets {
+        println!("  - {}", url);
+    }
+    for archive in &command_targets {
+        println!("  - {} (command)", archive.name);
     }
     println!();
 
@@ -619,76 +767,464 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
 
     println!("Latest publishable checkpoint: {}", latest_checkpoint);
 
-    // Check what's already published
-    let archive = HistoryArchive::new(&writable_archives[0].url)?;
-    let published_ledger = match archive.get_root_has().await {
-        Ok(has) => has.current_ledger,
-        Err(_) => 0, // Archive might be empty
-    };
+    let queued_checkpoints = db.load_publish_queue(None)?;
+    let mut queued_checkpoints = queued_checkpoints
+        .into_iter()
+        .filter(|checkpoint| *checkpoint <= latest_checkpoint)
+        .collect::<Vec<_>>();
+    queued_checkpoints.sort_unstable();
+
+    // Check what's already published across local archives.
+    let mut published_ledger = latest_checkpoint;
+    for (_, path) in &local_targets {
+        let root_path = path.join(root_has_path());
+        let ledger = if root_path.exists() {
+            let json = fs::read_to_string(&root_path)?;
+            let has = HistoryArchiveState::from_json(&json)?;
+            has.current_ledger()
+        } else {
+            0
+        };
+        published_ledger = published_ledger.min(ledger);
+    }
 
     println!("Already published up to: {}", published_ledger);
 
-    if published_ledger >= latest_checkpoint && !force {
+    if published_ledger >= latest_checkpoint && !force && queued_checkpoints.is_empty() {
         println!();
         println!("Archive is up to date. Use --force to republish.");
         return Ok(());
     }
 
-    // Calculate range to publish
-    let start_checkpoint = if published_ledger > 0 && !force {
-        stellar_core_history::checkpoint::next_checkpoint(published_ledger)
+    let mut checkpoints_to_publish = Vec::new();
+    if !queued_checkpoints.is_empty() && !force {
+        checkpoints_to_publish = queued_checkpoints;
     } else {
-        // Start from the first checkpoint we have
-        stellar_core_history::checkpoint::checkpoint_containing(1)
-    };
+        // Calculate range to publish
+        let start_checkpoint = if published_ledger > 0 && !force {
+            next_checkpoint(published_ledger)
+        } else {
+            // Start from the first checkpoint we have
+            checkpoint_containing(1)
+        };
 
-    if start_checkpoint > latest_checkpoint {
-        println!("Nothing new to publish.");
+        if start_checkpoint > latest_checkpoint {
+            println!("Nothing new to publish.");
+            return Ok(());
+        }
+
+        let mut checkpoint = start_checkpoint;
+        while checkpoint <= latest_checkpoint {
+            checkpoints_to_publish.push(checkpoint);
+            checkpoint = next_checkpoint(checkpoint);
+        }
+    }
+
+    if checkpoints_to_publish.is_empty() {
+        println!("Nothing queued to publish.");
         return Ok(());
     }
 
     println!();
-    println!("Publishing checkpoints {} to {}...", start_checkpoint, latest_checkpoint);
+    let first_checkpoint = *checkpoints_to_publish.first().unwrap();
+    let last_checkpoint = *checkpoints_to_publish.last().unwrap();
+    println!(
+        "Publishing checkpoints {} to {}...",
+        first_checkpoint, last_checkpoint
+    );
 
-    // Open bucket manager for future use when we implement full upload
-    let bucket_dir = config.database.path.parent()
-        .unwrap_or(&config.database.path)
-        .join("buckets");
-    let _bucket_manager = BucketManager::new(bucket_dir)?;
+    let bucket_manager = BucketManager::with_cache_size(
+        config.bucket.directory.clone(),
+        config.bucket.cache_size,
+    )?;
 
     let mut published_count = 0;
-    let mut checkpoint = start_checkpoint;
-
-    while checkpoint <= latest_checkpoint {
+    for checkpoint in checkpoints_to_publish {
         print!("  Publishing checkpoint {}... ", checkpoint);
 
-        // In a full implementation, this would:
-        // 1. Read ledger headers from the database for this checkpoint range
-        // 2. Read transaction sets and results
-        // 3. Serialize to XDR format
-        // 4. Upload to the writable archive(s)
+        let start_ledger = checkpoint.saturating_sub(CHECKPOINT_FREQUENCY - 1);
+        let start_ledger = if start_ledger == 0 { 1 } else { start_ledger };
+        let mut headers = Vec::new();
+        let mut tx_entries = Vec::new();
+        let mut tx_results = Vec::new();
 
-        // For now, we verify we have the data but don't actually upload
-        // since that requires write access implementation
-        let has_data = db.get_ledger_header(checkpoint)?.is_some();
+        for seq in start_ledger..=checkpoint {
+            let header = db
+                .get_ledger_header(seq)?
+                .ok_or_else(|| anyhow::anyhow!("Missing ledger header {}", seq))?;
+            let hash = compute_header_hash(&header)?;
+            headers.push(stellar_xdr::curr::LedgerHeaderHistoryEntry {
+                header,
+                hash: stellar_xdr::curr::Hash(hash.0),
+            });
 
-        if has_data {
-            println!("OK (data available)");
-            published_count += 1;
-        } else {
-            println!("SKIP (missing data)");
+            let tx_entry = db
+                .get_tx_history_entry(seq)?
+                .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
+            tx_entries.push(tx_entry);
+
+            let tx_result = db
+                .get_tx_result_entry(seq)?
+                .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
+            tx_results.push(tx_result);
         }
 
-        checkpoint = stellar_core_history::checkpoint::next_checkpoint(checkpoint);
+        let scp_entries = build_scp_history_entries(&db, start_ledger, checkpoint)?;
+
+        for idx in 0..headers.len() {
+            let header_entry = &headers[idx];
+            let tx_entry = &tx_entries[idx];
+            let tx_result_entry = &tx_results[idx];
+            let header = &header_entry.header;
+            let tx_set_hash = match &tx_entry.ext {
+                TransactionHistoryEntryExt::V1(generalized) => {
+                    Hash256::hash_xdr(generalized).unwrap_or(Hash256::ZERO)
+                }
+                TransactionHistoryEntryExt::V0 => {
+                    Hash256::hash_xdr(&tx_entry.tx_set).unwrap_or(Hash256::ZERO)
+                }
+            };
+            let expected_tx_set = Hash256::from(header.scp_value.tx_set_hash.0);
+            if tx_set_hash != expected_tx_set {
+                anyhow::bail!(
+                    "Tx set hash mismatch at {} (expected {}, got {})",
+                    header.ledger_seq,
+                    expected_tx_set.to_hex(),
+                    tx_set_hash.to_hex()
+                );
+            }
+
+            let tx_result_hash =
+                Hash256::hash_xdr(&tx_result_entry.tx_result_set).unwrap_or(Hash256::ZERO);
+            let expected_tx_result = Hash256::from(header.tx_set_result_hash.0);
+            if tx_result_hash != expected_tx_result {
+                anyhow::bail!(
+                    "Tx result hash mismatch at {} (expected {}, got {})",
+                    header.ledger_seq,
+                    expected_tx_result.to_hex(),
+                    tx_result_hash.to_hex()
+                );
+            }
+        }
+
+        let levels = db
+            .load_bucket_list(checkpoint)?
+            .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot {}", checkpoint))?;
+        let mut bucket_list = BucketList::new();
+        for (idx, (curr_hash, snap_hash)) in levels.iter().enumerate() {
+            let curr_bucket = bucket_manager.load_bucket(curr_hash)?;
+            let snap_bucket = bucket_manager.load_bucket(snap_hash)?;
+            let level = bucket_list
+                .level_mut(idx)
+                .ok_or_else(|| anyhow::anyhow!("Missing bucket level {}", idx))?;
+            level.set_curr((*curr_bucket).clone());
+            level.set_snap((*snap_bucket).clone());
+        }
+
+        let expected_hash = Hash256::from(headers.last().unwrap().header.bucket_list_hash.0);
+        let actual_hash = bucket_list.hash();
+        if expected_hash != actual_hash {
+            anyhow::bail!(
+                "Bucket list hash mismatch at {} (expected {}, got {})",
+                checkpoint,
+                expected_hash.to_hex(),
+                actual_hash.to_hex()
+            );
+        }
+
+        let command_publish_dir = if command_targets.is_empty() {
+            None
+        } else {
+            let sanitized_name = config
+                .node
+                .name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            let publish_dir = std::env::temp_dir().join(format!(
+                "rs-stellar-core-publish-{}-{}",
+                sanitized_name, checkpoint
+            ));
+            if publish_dir.exists() {
+                std::fs::remove_dir_all(&publish_dir)?;
+            }
+            std::fs::create_dir_all(&publish_dir)?;
+
+            let publish_config = PublishConfig {
+                local_path: publish_dir.clone(),
+                network_passphrase: Some(config.network.passphrase.clone()),
+                ..Default::default()
+            };
+            let manager = PublishManager::new(publish_config);
+            manager
+                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list)
+                .await?;
+
+            let has = build_history_archive_state(
+                checkpoint,
+                &bucket_list,
+                Some(config.network.passphrase.clone()),
+            )?;
+            let root_path = publish_dir.join(root_has_path());
+            if let Some(parent) = root_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&root_path, has.to_json()?)?;
+            Some(publish_dir)
+        };
+
+        let mut published_any = false;
+        for (url, path) in &local_targets {
+            let publish_config = PublishConfig {
+                local_path: path.clone(),
+                network_passphrase: Some(config.network.passphrase.clone()),
+                ..Default::default()
+            };
+            let manager = PublishManager::new(publish_config);
+            if !force && manager.is_published(checkpoint) {
+                continue;
+            }
+            manager
+                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list)
+                .await?;
+            write_scp_history_file(path, checkpoint, &scp_entries)?;
+            let has = build_history_archive_state(
+                checkpoint,
+                &bucket_list,
+                Some(config.network.passphrase.clone()),
+            )?;
+            let root_path = path.join(root_has_path());
+            if let Some(parent) = root_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&root_path, has.to_json()?)?;
+            println!("OK ({})", url);
+            published_any = true;
+        }
+
+        if let Some(ref publish_dir) = command_publish_dir {
+            write_scp_history_file(publish_dir, checkpoint, &scp_entries)?;
+            for archive in &command_targets {
+                upload_publish_directory(archive, publish_dir)?;
+                println!("OK (command: {})", archive.name);
+                published_any = true;
+            }
+        }
+
+        if let Some(publish_dir) = command_publish_dir {
+            if let Err(err) = std::fs::remove_dir_all(&publish_dir) {
+                tracing::warn!(
+                    path = %publish_dir.display(),
+                    error = %err,
+                    "Failed to remove publish temp directory"
+                );
+            }
+        }
+
+        if published_any {
+            published_count += 1;
+        } else {
+            println!("SKIP (already published)");
+        }
+
+        if let Err(err) = db.remove_publish(checkpoint) {
+            tracing::warn!(checkpoint, error = %err, "Failed to remove publish queue entry");
+        }
     }
 
     println!();
     println!("Publishing complete:");
     println!("  Checkpoints processed: {}", published_count);
     println!();
-    println!("Note: Full archive upload requires configuring archive write credentials.");
 
     Ok(())
+}
+
+fn build_scp_history_entries(
+    db: &stellar_core_db::Database,
+    start_ledger: u32,
+    checkpoint: u32,
+) -> anyhow::Result<Vec<stellar_xdr::curr::ScpHistoryEntry>> {
+    use std::collections::HashSet;
+    use stellar_core_common::Hash256;
+    use stellar_xdr::curr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
+
+    let mut entries = Vec::new();
+    for seq in start_ledger..=checkpoint {
+        let envelopes = db.load_scp_history(seq)?;
+        if envelopes.is_empty() {
+            continue;
+        }
+
+        let mut qset_hashes = HashSet::new();
+        for envelope in &envelopes {
+            if let Some(hash) = scp_quorum_set_hash(&envelope.statement) {
+                qset_hashes.insert(Hash256::from_bytes(hash.0));
+            }
+        }
+
+        let mut qset_hashes = qset_hashes.into_iter().collect::<Vec<_>>();
+        qset_hashes.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+
+        let mut qsets = Vec::new();
+        for hash in qset_hashes {
+            let qset = db
+                .load_scp_quorum_set(&hash)?
+                .ok_or_else(|| anyhow::anyhow!("Missing quorum set {}", hash.to_hex()))?;
+            qsets.push(qset);
+        }
+
+        let quorum_sets = qsets
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Too many quorum sets for ledger {}", seq))?;
+        let messages = envelopes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Too many SCP envelopes for ledger {}", seq))?;
+        let entry = ScpHistoryEntry::V0(ScpHistoryEntryV0 {
+            quorum_sets,
+            ledger_messages: LedgerScpMessages {
+                ledger_seq: seq,
+                messages,
+            },
+        });
+        entries.push(entry);
+    }
+
+    Ok(entries)
+}
+
+fn write_scp_history_file(
+    base_dir: &std::path::Path,
+    checkpoint: u32,
+    entries: &[stellar_xdr::curr::ScpHistoryEntry],
+) -> anyhow::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    use stellar_core_history::paths::checkpoint_path;
+    use stellar_xdr::curr::{Limits, WriteXdr};
+
+    let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(&path)?;
+    let mut encoder = GzEncoder::new(file, Compression::default());
+
+    for entry in entries {
+        let xdr = entry.to_xdr(Limits::none())?;
+        encoder.write_all(&xdr)?;
+    }
+    encoder.finish()?;
+    Ok(())
+}
+
+fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> Option<stellar_xdr::curr::Hash> {
+    match &statement.pledges {
+        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => {
+            Some(nom.quorum_set_hash.clone())
+        }
+        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => {
+            Some(prep.quorum_set_hash.clone())
+        }
+        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => {
+            Some(conf.quorum_set_hash.clone())
+        }
+        stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
+            Some(ext.commit_quorum_set_hash.clone())
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CommandArchiveTarget {
+    name: String,
+    put: String,
+    mkdir: Option<String>,
+}
+
+fn upload_publish_directory(
+    target: &CommandArchiveTarget,
+    publish_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    let mut files = collect_files(publish_dir)?;
+    files.sort();
+
+    let mut created_dirs = HashSet::new();
+    for file in files {
+        let rel = file
+            .strip_prefix(publish_dir)
+            .map_err(|e| anyhow::anyhow!("invalid publish path: {}", e))?;
+        let rel_str = path_to_unix_string(rel)?;
+
+        if let Some(ref mkdir_cmd) = target.mkdir {
+            if let Some(parent) = rel.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let remote_dir = path_to_unix_string(parent)?;
+                    if created_dirs.insert(remote_dir.clone()) {
+                        let cmd = render_mkdir_command(mkdir_cmd, &remote_dir);
+                        run_shell_command(&cmd)?;
+                    }
+                }
+            }
+        }
+
+        let cmd = render_put_command(&target.put, &file, &rel_str);
+        run_shell_command(&cmd)?;
+    }
+
+    Ok(())
+}
+
+fn collect_files(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+fn path_to_unix_string(path: &std::path::Path) -> anyhow::Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let part = component.as_os_str().to_string_lossy();
+        parts.push(part.to_string());
+    }
+    Ok(parts.join("/"))
+}
+
+fn render_put_command(template: &str, local_path: &std::path::Path, remote_path: &str) -> String {
+    template
+        .replace("{0}", local_path.to_string_lossy().as_ref())
+        .replace("{1}", remote_path)
+}
+
+fn render_mkdir_command(template: &str, remote_dir: &str) -> String {
+    template.replace("{0}", remote_dir)
+}
+
+fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
+    use std::process::Command;
+
+    let status = Command::new("sh").arg("-c").arg(cmd).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("command failed (exit {}): {}", status, cmd);
+    }
 }
 
 /// Sample config command handler.

@@ -95,6 +95,10 @@ archives = [
     "https://history.stellar.org/prd/core-testnet/core_testnet_003"
 ]
 
+[surge_pricing]
+classic_byte_allowance = 5242880
+soroban_byte_allowance = 5242880
+
 [peers]
 known = [
     "core-testnet1.stellar.org:11625",
@@ -131,6 +135,9 @@ COMMANDS:
     sample-config       Print sample configuration
     offline             Offline utilities
 ```
+
+Remote publishing uses `[[history.archives]]` entries with `put` and optional
+`mkdir` command templates (`{0}` = local path, `{1}` = remote path).
 
 ### Catchup Options
 
@@ -178,8 +185,21 @@ When running, the node exposes an HTTP API on the configured port (default: 1162
 | `/info` | GET | Node information (version, state, uptime) |
 | `/metrics` | GET | Prometheus-style metrics |
 | `/peers` | GET | Connected peers list |
+| `/connect` | POST | Connect to peer (query: `addr` or `peer`+`port`) |
+| `/droppeer` | POST | Disconnect peer (query: `peer_id` or `node`, optional `ban=1`) |
+| `/bans` | GET | List banned peers |
+| `/unban` | POST | Remove peer from ban list (query: `peer_id` or `node`) |
 | `/ledger` | GET | Current ledger information |
+| `/upgrades` | GET | Current + proposed upgrade settings |
+| `/self-check` | POST | Run ledger self-check |
+| `/survey` | GET | Survey report (local + collected peer responses) |
+| `/scp` | GET | SCP status summary (query: `limit`) |
+| `/survey/start` | POST | Start survey collecting (query: `nonce`) |
+| `/survey/stop` | POST | Stop survey collecting |
+| `/survey/topology` | POST | Queue survey topology request (query: `node`, `inbound_index`, `outbound_index`) |
+| `/survey/reporting/stop` | POST | Stop survey reporting |
 | `/tx` | POST | Submit a transaction (base64 XDR) |
+| `/shutdown` | POST | Request a graceful shutdown |
 | `/health` | GET | Health check endpoint |
 
 ### Example: Submit Transaction

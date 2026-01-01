@@ -1,0 +1,25 @@
+[package]
+name = "stellar-core-historywork"
+description = "History work items for rs-stellar-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-core-common.workspace = true
+stellar-core-history.workspace = true
+stellar-core-work.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+stellar-xdr.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+flate2.workspace = true
+stellar-core-bucket.workspace = true
+stellar-xdr.workspace = true
+tempfile.workspace = true

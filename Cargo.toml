@@ -12,6 +12,10 @@ members = [
     "crates/stellar-core-herder",
     "crates/stellar-core-ledger",
     "crates/stellar-core-tx",
+    "crates/stellar-core-work",
+    "crates/stellar-core-historywork",
+    "crates/stellar-core-invariant",
+    "crates/stellar-core-simulation",
 ]
 
 [workspace.package]
@@ -40,12 +44,17 @@ stellar-core-scp = { path = "crates/stellar-core-scp" }
 stellar-core-herder = { path = "crates/stellar-core-herder" }
 stellar-core-ledger = { path = "crates/stellar-core-ledger" }
 stellar-core-tx = { path = "crates/stellar-core-tx" }
+stellar-core-work = { path = "crates/stellar-core-work" }
+stellar-core-historywork = { path = "crates/stellar-core-historywork" }
+stellar-core-invariant = { path = "crates/stellar-core-invariant" }
+stellar-core-simulation = { path = "crates/stellar-core-simulation" }
 
 # Crypto - pure Rust implementations
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 hmac = "0.12"
+crypto_box = { version = "0.9", features = ["seal"] }
 
 # Random number generation - pure Rust
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
@@ -108,6 +117,7 @@ zeroize = { version = "1", features = ["derive"] }
 
 # URL handling
 url = "2"
+fs2 = "0.4"
 
 # Networking
 socket2 = "0.5"

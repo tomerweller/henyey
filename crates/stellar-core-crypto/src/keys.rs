@@ -43,6 +43,11 @@ impl PublicKey {
         Self::from_bytes(&bytes)
     }
 
+    /// Convert to Curve25519 (Montgomery) public key bytes for sealed box encryption.
+    pub fn to_curve25519_bytes(&self) -> [u8; 32] {
+        self.0.to_montgomery().to_bytes()
+    }
+
     /// Get the inner verifying key.
     pub(crate) fn inner(&self) -> &VerifyingKey {
         &self.0
@@ -134,6 +139,11 @@ impl SecretKey {
     pub fn from_strkey(s: &str) -> Result<Self, CryptoError> {
         let bytes = strkey::decode_secret_seed(s)?;
         Ok(Self::from_seed(&bytes))
+    }
+
+    /// Convert to Curve25519 scalar bytes for sealed box decryption.
+    pub fn to_curve25519_bytes(&self) -> [u8; 32] {
+        self.inner.to_scalar_bytes()
     }
 
     /// Get the raw seed bytes.

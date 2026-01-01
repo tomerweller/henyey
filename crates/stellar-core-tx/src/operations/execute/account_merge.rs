@@ -1,7 +1,8 @@
 //! AccountMerge operation execution.
 
 use stellar_xdr::curr::{
-    AccountId, AccountMergeResult, AccountMergeResultCode, MuxedAccount, OperationResult,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
+    AccountMergeResult, AccountMergeResultCode, Liabilities, MuxedAccount, OperationResult,
     OperationResultTr,
 };
 
@@ -23,6 +24,9 @@ pub fn execute_account_merge(
     if state.get_account(&dest_account_id).is_none() {
         return Ok(make_result(AccountMergeResultCode::NoAccount));
     }
+    if &dest_account_id == source {
+        return Ok(make_result(AccountMergeResultCode::Malformed));
+    }
 
     // Get source account
     let source_account = match state.get_account(source) {
@@ -30,8 +34,8 @@ pub fn execute_account_merge(
         None => return Err(TxError::SourceAccountNotFound),
     };
 
-    // Check source has no sub-entries
-    if source_account.num_sub_entries > 0 {
+    // Check source has no sub-entries besides signers
+    if source_account.num_sub_entries != source_account.signers.len() as u32 {
         return Ok(make_result(AccountMergeResultCode::HasSubEntries));
     }
 
@@ -42,6 +46,14 @@ pub fn execute_account_merge(
     }
 
     let source_balance = source_account.balance;
+
+    let dest_account = state
+        .get_account(&dest_account_id)
+        .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
+    let max_receive = i64::MAX - dest_account.balance - account_liabilities(dest_account).buying;
+    if max_receive < source_balance {
+        return Ok(make_result(AccountMergeResultCode::DestFull));
+    }
 
     // Transfer balance to destination
     if let Some(dest_acc) = state.get_account_mut(&dest_account_id) {
@@ -58,7 +70,7 @@ pub fn execute_account_merge(
 
 fn make_result(code: AccountMergeResultCode) -> OperationResult {
     let result = match code {
-        AccountMergeResultCode::Success => return OperationResult::OpNotSupported,
+        AccountMergeResultCode::Success => unreachable!("success handled in execute_account_merge"),
         AccountMergeResultCode::Malformed => AccountMergeResult::Malformed,
         AccountMergeResultCode::NoAccount => AccountMergeResult::NoAccount,
         AccountMergeResultCode::ImmutableSet => AccountMergeResult::ImmutableSet,
@@ -68,6 +80,16 @@ fn make_result(code: AccountMergeResultCode) -> OperationResult {
         AccountMergeResultCode::IsSponsor => AccountMergeResult::IsSponsor,
     };
     OperationResult::OpInner(OperationResultTr::AccountMerge(result))
+}
+
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -98,6 +120,20 @@ mod tests {
         }
     }
 
+    fn create_test_account_with_liabilities(
+        account_id: AccountId,
+        balance: i64,
+        buying: i64,
+        selling: i64,
+    ) -> AccountEntry {
+        let mut entry = create_test_account(account_id, balance);
+        entry.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities { buying, selling },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        entry
+    }
+
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
     }
@@ -119,12 +155,74 @@ mod tests {
             &mut state,
             &context,
         );
-        assert!(result.is_ok());
+        let result = result.expect("account merge");
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(AccountMergeResult::Success(amount))) => {
+                assert_eq!(amount, 100_000_000);
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
 
         // Source should be gone
         assert!(state.get_account(&source_id).is_none());
 
         // Dest should have combined balance
         assert_eq!(state.get_account(&dest_id).unwrap().balance, 150_000_000);
+    }
+
+    #[test]
+    fn test_account_merge_malformed_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let result = execute_account_merge(
+            &create_test_muxed_account(0),
+            &source_id,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(r)) => {
+                assert!(matches!(r, AccountMergeResult::Malformed));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_account_merge_dest_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        state.create_account(create_test_account(source_id.clone(), 100));
+        state.create_account(create_test_account_with_liabilities(
+            dest_id.clone(),
+            i64::MAX - 50,
+            60,
+            0,
+        ));
+
+        let result = execute_account_merge(
+            &create_test_muxed_account(1),
+            &source_id,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(r)) => {
+                assert!(matches!(r, AccountMergeResult::DestFull));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 }

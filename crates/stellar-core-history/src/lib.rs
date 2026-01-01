@@ -62,7 +62,9 @@ pub mod verify;
 // Re-export main types at crate root
 pub use archive::HistoryArchive;
 pub use archive_state::HistoryArchiveState;
-pub use catchup::{CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, LedgerData};
+pub use catchup::{
+    CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData, LedgerData,
+};
 pub use checkpoint::{
     checkpoint_containing, is_checkpoint_ledger, latest_checkpoint_before_or_at,
     CHECKPOINT_FREQUENCY,

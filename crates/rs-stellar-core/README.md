@@ -63,6 +63,9 @@ rs-stellar-core --testnet catchup current --mode minimal
 rs-stellar-core --testnet catchup current --parallelism 16
 ```
 
+The catchup command uses the historywork pipeline for checkpoint downloads
+when available, falling back to direct archive fetches on failure.
+
 #### new-db
 
 Create a new database:
@@ -149,10 +152,25 @@ When running, the node exposes an HTTP API:
 |----------|--------|-------------|
 | `/` | GET | API overview |
 | `/info` | GET | Node information |
+| `/status` | GET | Node status summary |
 | `/metrics` | GET | Prometheus metrics |
 | `/peers` | GET | Connected peers |
+| `/connect` | POST | Connect to peer (query: `addr` or `peer`+`port`) |
+| `/droppeer` | POST | Disconnect peer (query: `peer_id` or `node`, optional `ban=1`) |
+| `/bans` | GET | List banned peers |
+| `/unban` | POST | Remove peer from ban list (query: `peer_id` or `node`) |
 | `/ledger` | GET | Current ledger |
+| `/upgrades` | GET | Current + proposed upgrade settings |
+| `/self-check` | POST | Run ledger self-check |
+| `/quorum` | GET | Local quorum set summary |
+| `/survey` | GET | Survey report |
+| `/scp` | GET | SCP slot summary (query: `limit`) |
+| `/survey/start` | POST | Start survey collecting (query: `nonce`) |
+| `/survey/stop` | POST | Stop survey collecting |
+| `/survey/topology` | POST | Queue survey topology request |
+| `/survey/reporting/stop` | POST | Stop survey reporting |
 | `/tx` | POST | Submit transaction |
+| `/shutdown` | POST | Request graceful shutdown |
 | `/health` | GET | Health check |
 
 ### Submit Transaction

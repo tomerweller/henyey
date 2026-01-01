@@ -6,9 +6,9 @@
 
 use stellar_xdr::curr::{
     AccountId, Asset, LiquidityPoolDepositOp, LiquidityPoolDepositResult,
-    LiquidityPoolDepositResultCode, LiquidityPoolEntry, LiquidityPoolWithdrawOp,
+    LiquidityPoolDepositResultCode, LiquidityPoolWithdrawOp,
     LiquidityPoolWithdrawResult, LiquidityPoolWithdrawResultCode, OperationResult,
-    OperationResultTr, PoolId, TrustLineAsset,
+    OperationResultTr, PoolId, Price, TrustLineAsset, TrustLineFlags,
 };
 
 use crate::state::LedgerStateManager;
@@ -31,7 +31,18 @@ pub fn execute_liquidity_pool_deposit(
     }
 
     // Check min/max price bounds
-    if op.min_price.n <= 0 || op.min_price.d <= 0 || op.max_price.n <= 0 || op.max_price.d <= 0 {
+    if op.min_price.n <= 0
+        || op.min_price.d <= 0
+        || op.max_price.n <= 0
+        || op.max_price.d <= 0
+    {
+        return Ok(make_deposit_result(LiquidityPoolDepositResultCode::Malformed));
+    }
+
+    // minPrice must not exceed maxPrice
+    if (op.min_price.n as i128) * (op.max_price.d as i128)
+        > (op.min_price.d as i128) * (op.max_price.n as i128)
+    {
         return Ok(make_deposit_result(LiquidityPoolDepositResultCode::Malformed));
     }
 
@@ -60,52 +71,121 @@ pub fn execute_liquidity_pool_deposit(
 
     // Check source has pool share trustline
     let pool_share_asset = TrustLineAsset::PoolShare(op.liquidity_pool_id.clone());
-    if state
-        .get_trustline_by_trustline_asset(source, &pool_share_asset)
-        .is_none()
-    {
-        return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
-    }
+    let pool_share_trustline =
+        match state.get_trustline_by_trustline_asset(source, &pool_share_asset) {
+            Some(tl) => tl,
+            None => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
+            }
+        };
 
     // Check source has trustlines for both assets (unless native)
-    if !matches!(&asset_a, Asset::Native) {
-        if state.get_trustline(source, &asset_a).is_none() {
-            return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
-        }
-    }
-
-    if !matches!(&asset_b, Asset::Native) {
-        if state.get_trustline(source, &asset_b).is_none() {
-            return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
-        }
-    }
-
-    // Calculate deposit amounts based on current pool ratio
-    let (deposit_a, deposit_b, shares_received) = if total_shares == 0 {
-        // First deposit - use provided amounts directly
-        let shares = calculate_initial_shares(op.max_amount_a, op.max_amount_b);
-        (op.max_amount_a, op.max_amount_b, shares)
+    let trustline_a = if matches!(&asset_a, Asset::Native) {
+        None
     } else {
-        // Calculate based on existing pool ratio
-        calculate_deposit_amounts(
+        match state.get_trustline(source, &asset_a) {
+            Some(tl) => Some(tl),
+            None => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
+            }
+        }
+    };
+
+    let trustline_b = if matches!(&asset_b, Asset::Native) {
+        None
+    } else {
+        match state.get_trustline(source, &asset_b) {
+            Some(tl) => Some(tl),
+            None => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
+            }
+        }
+    };
+
+    if is_auth_required(&asset_a, state)
+        && trustline_a
+            .map(|tl| !is_trustline_authorized(tl.flags))
+            .unwrap_or(false)
+    {
+        return Ok(make_deposit_result(
+            LiquidityPoolDepositResultCode::NotAuthorized,
+        ));
+    }
+
+    if is_auth_required(&asset_b, state)
+        && trustline_b
+            .map(|tl| !is_trustline_authorized(tl.flags))
+            .unwrap_or(false)
+    {
+        return Ok(make_deposit_result(
+            LiquidityPoolDepositResultCode::NotAuthorized,
+        ));
+    }
+
+    let available_a = match &asset_a {
+        Asset::Native => available_native_balance(source, state),
+        _ => trustline_a.map(|tl| tl.balance).unwrap_or(0),
+    };
+    let available_b = match &asset_b {
+        Asset::Native => available_native_balance(source, state),
+        _ => trustline_b.map(|tl| tl.balance).unwrap_or(0),
+    };
+    let available_pool_share_limit = pool_share_trustline
+        .limit
+        .saturating_sub(pool_share_trustline.balance);
+
+    let (deposit_a, deposit_b, shares_received) = if total_shares == 0 {
+        match deposit_into_empty_pool(
+            op.max_amount_a,
+            op.max_amount_b,
+            available_a,
+            available_b,
+            available_pool_share_limit,
+            &op.min_price,
+            &op.max_price,
+        )? {
+            DepositOutcome::Success { a, b, shares } => (a, b, shares),
+            DepositOutcome::Underfunded => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::Underfunded));
+            }
+            DepositOutcome::BadPrice => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::BadPrice));
+            }
+            DepositOutcome::LineFull => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::LineFull));
+            }
+        }
+    } else {
+        match deposit_into_non_empty_pool(
+            op.max_amount_a,
+            op.max_amount_b,
+            available_a,
+            available_b,
+            available_pool_share_limit,
             reserve_a,
             reserve_b,
             total_shares,
-            op.max_amount_a,
-            op.max_amount_b,
-        )
+            &op.min_price,
+            &op.max_price,
+        )? {
+            DepositOutcome::Success { a, b, shares } => (a, b, shares),
+            DepositOutcome::Underfunded => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::Underfunded));
+            }
+            DepositOutcome::BadPrice => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::BadPrice));
+            }
+            DepositOutcome::LineFull => {
+                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::LineFull));
+            }
+        }
     };
 
-    // Check price bounds
-    let current_price_n = deposit_a as i128;
-    let current_price_d = deposit_b as i128;
-    let min_price_value = op.min_price.n as i128 * current_price_d;
-    let min_price_compare = current_price_n * op.min_price.d as i128;
-    let max_price_value = op.max_price.n as i128 * current_price_d;
-    let max_price_compare = current_price_n * op.max_price.d as i128;
-
-    if min_price_compare < min_price_value || max_price_compare > max_price_value {
-        return Ok(make_deposit_result(LiquidityPoolDepositResultCode::BadPrice));
+    if i64::MAX - reserve_a < deposit_a
+        || i64::MAX - reserve_b < deposit_b
+        || i64::MAX - total_shares < shares_received
+    {
+        return Ok(make_deposit_result(LiquidityPoolDepositResultCode::PoolFull));
     }
 
     // Deduct assets from source
@@ -228,45 +308,41 @@ pub fn execute_liquidity_pool_withdraw(
         ));
     }
 
-    // Calculate withdrawal amounts
-    let withdraw_a = (reserve_a as i128 * op.amount as i128 / total_shares as i128) as i64;
-    let withdraw_b = (reserve_b as i128 * op.amount as i128 / total_shares as i128) as i64;
+    let withdraw_a = get_pool_withdrawal_amount(op.amount, total_shares, reserve_a);
+    let withdraw_b = get_pool_withdrawal_amount(op.amount, total_shares, reserve_b);
 
-    // Check minimum amounts
     if withdraw_a < op.min_amount_a || withdraw_b < op.min_amount_b {
         return Ok(make_withdraw_result(
             LiquidityPoolWithdrawResultCode::UnderMinimum,
         ));
     }
 
+    match can_credit_asset(state, source, &asset_a, withdraw_a) {
+        WithdrawAssetCheck::Ok => {}
+        WithdrawAssetCheck::NoTrust => {
+            return Ok(make_withdraw_result(LiquidityPoolWithdrawResultCode::NoTrust));
+        }
+        WithdrawAssetCheck::LineFull => {
+            return Ok(make_withdraw_result(LiquidityPoolWithdrawResultCode::LineFull));
+        }
+    }
+
+    match can_credit_asset(state, source, &asset_b, withdraw_b) {
+        WithdrawAssetCheck::Ok => {}
+        WithdrawAssetCheck::NoTrust => {
+            return Ok(make_withdraw_result(LiquidityPoolWithdrawResultCode::NoTrust));
+        }
+        WithdrawAssetCheck::LineFull => {
+            return Ok(make_withdraw_result(LiquidityPoolWithdrawResultCode::LineFull));
+        }
+    }
+
+    credit_asset(state, source, &asset_a, withdraw_a);
+    credit_asset(state, source, &asset_b, withdraw_b);
+
     // Deduct pool shares from source
     if let Some(tl) = state.get_trustline_by_trustline_asset_mut(source, &pool_share_asset) {
         tl.balance -= op.amount;
-    }
-
-    // Credit assets to source
-    if matches!(&asset_a, Asset::Native) {
-        if let Some(account) = state.get_account_mut(source) {
-            account.balance += withdraw_a;
-        }
-    } else {
-        if let Some(tl) = state.get_trustline_mut(source, &asset_a) {
-            tl.balance += withdraw_a;
-        } else {
-            return Ok(make_withdraw_result(LiquidityPoolWithdrawResultCode::NoTrust));
-        }
-    }
-
-    if matches!(&asset_b, Asset::Native) {
-        if let Some(account) = state.get_account_mut(source) {
-            account.balance += withdraw_b;
-        }
-    } else {
-        if let Some(tl) = state.get_trustline_mut(source, &asset_b) {
-            tl.balance += withdraw_b;
-        } else {
-            return Ok(make_withdraw_result(LiquidityPoolWithdrawResultCode::NoTrust));
-        }
     }
 
     // Update pool reserves
@@ -283,39 +359,229 @@ pub fn execute_liquidity_pool_withdraw(
     Ok(make_withdraw_result(LiquidityPoolWithdrawResultCode::Success))
 }
 
-/// Calculate initial pool shares for first deposit.
-fn calculate_initial_shares(amount_a: i64, amount_b: i64) -> i64 {
-    // Use geometric mean for initial share calculation
-    let product = (amount_a as f64) * (amount_b as f64);
-    product.sqrt() as i64
+const AUTH_REQUIRED_FLAG: u32 = 0x1;
+const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
+const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
+    TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
+
+fn is_trustline_authorized(flags: u32) -> bool {
+    flags & AUTHORIZED_FLAG != 0
 }
 
-/// Calculate deposit amounts to maintain pool ratio.
-fn calculate_deposit_amounts(
+fn is_trustline_authorized_to_maintain_liabilities(flags: u32) -> bool {
+    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
+}
+
+fn is_auth_required(asset: &Asset, state: &LedgerStateManager) -> bool {
+    let issuer = match asset {
+        Asset::Native => return false,
+        Asset::CreditAlphanum4(a) => &a.issuer,
+        Asset::CreditAlphanum12(a) => &a.issuer,
+    };
+    state
+        .get_account(issuer)
+        .map(|account| account.flags & AUTH_REQUIRED_FLAG != 0)
+        .unwrap_or(false)
+}
+
+fn available_native_balance(source: &AccountId, state: &LedgerStateManager) -> i64 {
+    let Some(account) = state.get_account(source) else {
+        return 0;
+    };
+    let min_balance = state.minimum_balance(account.num_sub_entries);
+    account.balance.saturating_sub(min_balance)
+}
+
+fn is_bad_price(amount_a: i64, amount_b: i64, min_price: &Price, max_price: &Price) -> bool {
+    if amount_a == 0 || amount_b == 0 {
+        return true;
+    }
+
+    let amount_a = amount_a as i128;
+    let amount_b = amount_b as i128;
+    let min_n = min_price.n as i128;
+    let min_d = min_price.d as i128;
+    let max_n = max_price.n as i128;
+    let max_d = max_price.d as i128;
+
+    amount_a * min_d < amount_b * min_n || amount_a * max_d > amount_b * max_n
+}
+
+enum DepositOutcome {
+    Success { a: i64, b: i64, shares: i64 },
+    Underfunded,
+    BadPrice,
+    LineFull,
+}
+
+fn deposit_into_empty_pool(
+    max_amount_a: i64,
+    max_amount_b: i64,
+    available_a: i64,
+    available_b: i64,
+    available_pool_share_limit: i64,
+    min_price: &Price,
+    max_price: &Price,
+) -> Result<DepositOutcome> {
+    if available_a < max_amount_a || available_b < max_amount_b {
+        return Ok(DepositOutcome::Underfunded);
+    }
+
+    if is_bad_price(max_amount_a, max_amount_b, min_price, max_price) {
+        return Ok(DepositOutcome::BadPrice);
+    }
+
+    let shares = big_square_root(max_amount_a, max_amount_b);
+    if available_pool_share_limit < shares {
+        return Ok(DepositOutcome::LineFull);
+    }
+
+    Ok(DepositOutcome::Success {
+        a: max_amount_a,
+        b: max_amount_b,
+        shares,
+    })
+}
+
+fn deposit_into_non_empty_pool(
+    max_amount_a: i64,
+    max_amount_b: i64,
+    available_a: i64,
+    available_b: i64,
+    available_pool_share_limit: i64,
     reserve_a: i64,
     reserve_b: i64,
     total_shares: i64,
-    max_amount_a: i64,
-    max_amount_b: i64,
-) -> (i64, i64, i64) {
-    // Calculate based on maintaining constant product
-    let ratio_a = max_amount_a as i128 * reserve_b as i128;
-    let ratio_b = max_amount_b as i128 * reserve_a as i128;
+    min_price: &Price,
+    max_price: &Price,
+) -> Result<DepositOutcome> {
+    let shares_a = big_divide(total_shares, max_amount_a, reserve_a, Round::Down)?;
+    let shares_b = big_divide(total_shares, max_amount_b, reserve_b, Round::Down)?;
+    let pool_shares = shares_a.min(shares_b);
 
-    let (deposit_a, deposit_b) = if ratio_a <= ratio_b {
-        // Use all of max_amount_a
-        let deposit_b = (max_amount_a as i128 * reserve_b as i128 / reserve_a as i128) as i64;
-        (max_amount_a, deposit_b)
-    } else {
-        // Use all of max_amount_b
-        let deposit_a = (max_amount_b as i128 * reserve_a as i128 / reserve_b as i128) as i64;
-        (deposit_a, max_amount_b)
+    let amount_a = big_divide(pool_shares, reserve_a, total_shares, Round::Up)?;
+    let amount_b = big_divide(pool_shares, reserve_b, total_shares, Round::Up)?;
+
+    if available_a < amount_a || available_b < amount_b {
+        return Ok(DepositOutcome::Underfunded);
+    }
+
+    if is_bad_price(amount_a, amount_b, min_price, max_price) {
+        return Ok(DepositOutcome::BadPrice);
+    }
+
+    if available_pool_share_limit < pool_shares {
+        return Ok(DepositOutcome::LineFull);
+    }
+
+    Ok(DepositOutcome::Success {
+        a: amount_a,
+        b: amount_b,
+        shares: pool_shares,
+    })
+}
+
+fn get_pool_withdrawal_amount(amount: i64, total_shares: i64, reserve: i64) -> i64 {
+    big_divide(amount, reserve, total_shares, Round::Down).unwrap_or(0)
+}
+
+enum WithdrawAssetCheck {
+    Ok,
+    NoTrust,
+    LineFull,
+}
+
+fn can_credit_asset(
+    state: &LedgerStateManager,
+    source: &AccountId,
+    asset: &Asset,
+    amount: i64,
+) -> WithdrawAssetCheck {
+    if matches!(asset, Asset::Native) {
+        let Some(account) = state.get_account(source) else {
+            return WithdrawAssetCheck::NoTrust;
+        };
+        if i64::MAX - account.balance < amount {
+            return WithdrawAssetCheck::LineFull;
+        }
+        return WithdrawAssetCheck::Ok;
+    }
+
+    let Some(tl) = state.get_trustline(source, asset) else {
+        return WithdrawAssetCheck::NoTrust;
     };
+    if !is_trustline_authorized_to_maintain_liabilities(tl.flags) {
+        return WithdrawAssetCheck::LineFull;
+    }
+    if tl.limit - tl.balance < amount {
+        return WithdrawAssetCheck::LineFull;
+    }
+    WithdrawAssetCheck::Ok
+}
 
-    // Calculate shares received
-    let shares = (deposit_a as i128 * total_shares as i128 / reserve_a as i128) as i64;
+fn credit_asset(
+    state: &mut LedgerStateManager,
+    source: &AccountId,
+    asset: &Asset,
+    amount: i64,
+) {
+    if matches!(asset, Asset::Native) {
+        if let Some(account) = state.get_account_mut(source) {
+            account.balance += amount;
+        }
+        return;
+    }
 
-    (deposit_a, deposit_b, shares)
+    if let Some(tl) = state.get_trustline_mut(source, asset) {
+        tl.balance += amount;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Round {
+    Down,
+    Up,
+}
+
+fn big_divide(a: i64, b: i64, c: i64, round: Round) -> Result<i64> {
+    if c == 0 {
+        return Ok(0);
+    }
+    let numerator = (a as i128) * (b as i128);
+    let denominator = c as i128;
+    let result = match round {
+        Round::Down => numerator / denominator,
+        Round::Up => {
+            if numerator == 0 {
+                0
+            } else {
+                (numerator + denominator - 1) / denominator
+            }
+        }
+    };
+    if result > i64::MAX as i128 {
+        return Ok(0);
+    }
+    Ok(result as i64)
+}
+
+fn big_square_root(a: i64, b: i64) -> i64 {
+    let product = (a as i128) * (b as i128);
+    let mut low: i128 = 0;
+    let mut high: i128 = product;
+    while low <= high {
+        let mid = (low + high) / 2;
+        let sq = mid * mid;
+        if sq == product {
+            return mid as i64;
+        }
+        if sq < product {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    high.max(0) as i64
 }
 
 /// Create a LiquidityPoolDeposit result.
@@ -357,8 +623,49 @@ mod tests {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
     }
 
+    fn create_test_account(account_id: AccountId, balance: i64, flags: u32) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }
+    }
+
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
+    }
+
+    fn create_pool_entry(
+        pool_id: PoolId,
+        asset_a: Asset,
+        asset_b: Asset,
+        reserve_a: i64,
+        reserve_b: i64,
+        total_shares: i64,
+    ) -> LiquidityPoolEntry {
+        LiquidityPoolEntry {
+            liquidity_pool_id: pool_id,
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: LiquidityPoolConstantProductParameters {
+                        asset_a,
+                        asset_b,
+                        fee: 30,
+                    },
+                    reserve_a,
+                    reserve_b,
+                    total_pool_shares: total_shares,
+                    pool_shares_trust_line_count: 1,
+                },
+            ),
+        }
     }
 
     #[test]
@@ -409,6 +716,251 @@ mod tests {
                 assert!(matches!(r, LiquidityPoolWithdrawResult::NoTrust));
             }
             _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_liquidity_pool_deposit_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, AUTH_REQUIRED_FLAG));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([1u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            0,
+            0,
+            0,
+        ));
+
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 100,
+            max_amount_b: 100,
+            min_price: Price { n: 1, d: 1 },
+            max_price: Price { n: 1, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(matches!(r, LiquidityPoolDepositResult::NotAuthorized));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_liquidity_pool_deposit_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([2u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            0,
+            0,
+            0,
+        ));
+
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: 1,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 100,
+            max_amount_b: 100,
+            min_price: Price { n: 1, d: 1 },
+            max_price: Price { n: 1, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(matches!(r, LiquidityPoolDepositResult::LineFull));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_liquidity_pool_withdraw_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([3u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            100,
+            100,
+            100,
+        ));
+
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 10,
+            limit: 10,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 1_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 10,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id,
+            amount: 10,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(matches!(r, LiquidityPoolWithdrawResult::LineFull));
+            }
+            other => panic!("unexpected result: {:?}", other),
         }
     }
 }

@@ -12,6 +12,8 @@ stellar-core-common.workspace = true
 stellar-core-crypto.workspace = true
 stellar-core-db.workspace = true
 stellar-core-bucket.workspace = true
+stellar-core-ledger.workspace = true
+stellar-core-tx.workspace = true
 
 # HTTP client
 reqwest.workspace = true
@@ -41,3 +43,4 @@ sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true

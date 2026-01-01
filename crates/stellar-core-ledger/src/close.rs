@@ -179,6 +179,49 @@ impl TransactionSetVariant {
     pub fn transactions_owned(&self) -> Vec<TransactionEnvelope> {
         self.transactions().into_iter().cloned().collect()
     }
+
+    /// Get owned transactions with optional per-component base fee overrides.
+    pub fn transactions_with_base_fee(&self) -> Vec<(TransactionEnvelope, Option<u32>)> {
+        match self {
+            TransactionSetVariant::Classic(set) => {
+                set.txs.iter().cloned().map(|tx| (tx, None)).collect()
+            }
+            TransactionSetVariant::Generalized(set) => {
+                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let mut txs = Vec::new();
+                for phase in set_v1.phases.iter() {
+                    match phase {
+                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                            for comp in components.iter() {
+                                match comp {
+                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                                        let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                        txs.extend(c.txs.iter().cloned().map(|tx| (tx, base_fee)));
+                                    }
+                                }
+                            }
+                        }
+                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                            let base_fee =
+                                parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                            for stage in parallel.execution_stages.iter() {
+                                for cluster in stage.iter() {
+                                    txs.extend(
+                                        cluster
+                                            .0
+                                            .iter()
+                                            .cloned()
+                                            .map(|tx| (tx, base_fee)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                txs
+            }
+        }
+    }
 }
 
 /// Result of processing a ledger close.

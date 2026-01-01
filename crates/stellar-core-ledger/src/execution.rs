@@ -3,17 +3,24 @@
 //! This module integrates the transaction processing from stellar-core-tx
 //! with the ledger close process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_tx::{
-    operations::execute::execute_operation,
+    validation::{self, LedgerContext as ValidationContext},
     LedgerContext, LedgerStateManager, TransactionFrame, TxError,
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountId, DataEntry, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    OfferEntry, OperationBody, OperationResult, TransactionEnvelope, TransactionResult,
-    TransactionResultCode, TransactionResultResult, TrustLineEntry,
+    ContractEvent, DiagnosticEvent, ExtensionPoint, LedgerEntryChange, LedgerEntryChanges,
+    TransactionEvent, TransactionEventStage,
+    LedgerKey, OfferEntry, OperationBody, OperationMeta, OperationMetaV2, OperationResult,
+    Preconditions, SignerKey, SorobanTransactionMetaExt, SorobanTransactionMetaV2,
+    TransactionEnvelope, TransactionMeta, TransactionMetaV3, TransactionMetaV4, TransactionResult,
+    TransactionResultCode, TransactionResultExt, TransactionResultMetaV1, TransactionResultPair,
+    TransactionResultResult, TrustLineEntry, VecM, WriteXdr, Limits, InnerTransactionResult,
+    InnerTransactionResultExt,
+    InnerTransactionResultPair, InnerTransactionResultResult,
 };
 use tracing::{debug, info, warn};
 
@@ -32,6 +39,29 @@ pub struct TransactionExecutionResult {
     pub operation_results: Vec<OperationResult>,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Failure reason for mapping to XDR result codes.
+    pub failure: Option<ExecutionFailure>,
+    /// Transaction meta (for ledger close meta).
+    pub tx_meta: Option<TransactionMeta>,
+    /// Fee processing changes (for ledger close meta).
+    pub fee_changes: Option<LedgerEntryChanges>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionFailure {
+    Malformed,
+    MissingOperation,
+    InvalidSignature,
+    BadAuthExtra,
+    BadMinSeqAgeOrGap,
+    BadSequence,
+    InsufficientFee,
+    InsufficientBalance,
+    NoAccount,
+    TooEarly,
+    TooLate,
+    NotSupported,
+    OperationFailed,
 }
 
 /// Context for executing transactions during ledger close.
@@ -63,7 +93,10 @@ impl TransactionExecutor {
         base_reserve: u32,
         protocol_version: u32,
         network_id: NetworkId,
+        id_pool: u64,
     ) -> Self {
+        let mut state = LedgerStateManager::new(base_reserve as i64, ledger_seq);
+        state.set_id_pool(id_pool);
         Self {
             ledger_seq,
             close_time,
@@ -71,7 +104,7 @@ impl TransactionExecutor {
             base_reserve,
             protocol_version,
             network_id,
-            state: LedgerStateManager::new(base_reserve as i64, ledger_seq),
+            state,
             loaded_accounts: HashMap::new(),
         }
     }
@@ -130,22 +163,56 @@ impl TransactionExecutor {
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
     ) -> Result<TransactionExecutionResult> {
-        let frame = TransactionFrame::new(tx_envelope.clone());
-        let source_account_id = frame.source_account_id();
+        let mut frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
+        let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+        let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
+
+        if !frame.is_valid_structure() {
+            let failure = if frame.operations().is_empty() {
+                ExecutionFailure::MissingOperation
+            } else {
+                ExecutionFailure::Malformed
+            };
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Invalid transaction structure".into()),
+                failure: Some(failure),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
 
         // Load source account
-        if !self.load_account(snapshot, &source_account_id)? {
+        if !self.load_account(snapshot, &fee_source_id)? {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
                 operation_results: vec![],
                 error: Some("Source account not found".into()),
+                failure: Some(ExecutionFailure::NoAccount),
+                tx_meta: None,
+                fee_changes: None,
             });
         }
 
-        // Get source account for validation
-        let source_account = match self.state.get_account(&source_account_id) {
+        if !self.load_account(snapshot, &inner_source_id)? {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Source account not found".into()),
+                failure: Some(ExecutionFailure::NoAccount),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
+
+        // Get accounts for validation
+        let fee_source_account = match self.state.get_account(&fee_source_id) {
             Some(acc) => acc.clone(),
             None => {
                 return Ok(TransactionExecutionResult {
@@ -153,9 +220,194 @@ impl TransactionExecutor {
                     fee_charged: 0,
                     operation_results: vec![],
                     error: Some("Source account not found".into()),
+                    failure: Some(ExecutionFailure::NoAccount),
+                    tx_meta: None,
+                    fee_changes: None,
                 });
             }
         };
+
+        let source_account = match self.state.get_account(&inner_source_id) {
+            Some(acc) => acc.clone(),
+            None => {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    operation_results: vec![],
+                    error: Some("Source account not found".into()),
+                    failure: Some(ExecutionFailure::NoAccount),
+                    tx_meta: None,
+                    fee_changes: None,
+                });
+            }
+        };
+
+        let source_last_modified_seq = {
+            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: inner_source_id.clone(),
+            });
+            match snapshot.get_entry(&key)? {
+                Some(entry) => entry.last_modified_ledger_seq,
+                None => {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        operation_results: vec![],
+                        error: Some("Source account not found".into()),
+                        failure: Some(ExecutionFailure::NoAccount),
+                        tx_meta: None,
+                        fee_changes: None,
+                    });
+                }
+            }
+        };
+
+        // Validate fee
+        let required_fee = frame.operation_count() as u32 * base_fee;
+        if frame.is_fee_bump() {
+            if frame.inner_fee() < required_fee {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    operation_results: vec![],
+                    error: Some("Insufficient fee".into()),
+                    failure: Some(ExecutionFailure::InsufficientFee),
+                    tx_meta: None,
+                    fee_changes: None,
+                });
+            }
+            if frame.total_fee() < frame.inner_fee() as i64 {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    operation_results: vec![],
+                    error: Some("Insufficient fee".into()),
+                    failure: Some(ExecutionFailure::InsufficientFee),
+                    tx_meta: None,
+                    fee_changes: None,
+                });
+            }
+        } else if frame.fee() < required_fee {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Insufficient fee".into()),
+                failure: Some(ExecutionFailure::InsufficientFee),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
+
+        let validation_ctx = ValidationContext::new(
+            self.ledger_seq,
+            self.close_time,
+            base_fee,
+            self.base_reserve,
+            self.protocol_version,
+            self.network_id.clone(),
+        );
+
+        if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Time bounds invalid".into()),
+                failure: Some(match e {
+                    validation::ValidationError::TooEarly { .. } => ExecutionFailure::TooEarly,
+                    validation::ValidationError::TooLate { .. } => ExecutionFailure::TooLate,
+                    _ => ExecutionFailure::OperationFailed,
+                }),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
+
+        if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Ledger bounds invalid".into()),
+                failure: Some(match e {
+                    validation::ValidationError::BadLedgerBounds { min, max, current } => {
+                        if max > 0 && current > max {
+                            ExecutionFailure::TooLate
+                        } else if min > 0 && current < min {
+                            ExecutionFailure::TooEarly
+                        } else {
+                            ExecutionFailure::OperationFailed
+                        }
+                    }
+                    _ => ExecutionFailure::OperationFailed,
+                }),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
+
+        if let Preconditions::V2(cond) = frame.preconditions() {
+            if let Some(min_seq) = cond.min_seq_num {
+                if source_account.seq_num.0 < min_seq.0 {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        operation_results: vec![],
+                        error: Some("Minimum sequence number not met".into()),
+                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
+                        tx_meta: None,
+                        fee_changes: None,
+                    });
+                }
+            }
+
+            if cond.min_seq_age.0 > 0 {
+                let last_header = snapshot.get_ledger_header(source_last_modified_seq)?;
+                let last_close_time = match last_header {
+                    Some(header) => header.scp_value.close_time.0,
+                    None => {
+                        return Ok(TransactionExecutionResult {
+                            success: false,
+                            fee_charged: 0,
+                            operation_results: vec![],
+                            error: Some("Minimum sequence age unavailable".into()),
+                            failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
+                            tx_meta: None,
+                            fee_changes: None,
+                        });
+                    }
+                };
+
+                let age = self.close_time.saturating_sub(last_close_time);
+                if age < cond.min_seq_age.0 {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        operation_results: vec![],
+                        error: Some("Minimum sequence age not met".into()),
+                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
+                        tx_meta: None,
+                        fee_changes: None,
+                    });
+                }
+            }
+
+            if cond.min_seq_ledger_gap > 0 {
+                let gap = self.ledger_seq.saturating_sub(source_last_modified_seq);
+                if gap < cond.min_seq_ledger_gap {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        operation_results: vec![],
+                        error: Some("Minimum sequence ledger gap not met".into()),
+                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
+                        tx_meta: None,
+                        fee_changes: None,
+                    });
+                }
+            }
+        }
 
         // Validate sequence number
         let expected_seq = source_account.seq_num.0 + 1;
@@ -169,66 +421,219 @@ impl TransactionExecutor {
                     expected_seq,
                     frame.sequence_number()
                 )),
+                failure: Some(ExecutionFailure::BadSequence),
+                tx_meta: None,
+                fee_changes: None,
             });
         }
 
-        // Validate fee
+        // Basic signature validation (master key only).
+        if validation::validate_signatures(&frame, &validation_ctx).is_err() {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Invalid signature".into()),
+                failure: Some(ExecutionFailure::InvalidSignature),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
+
+        let outer_hash = frame
+            .hash(&self.network_id)
+            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+        let outer_threshold = threshold_low(&fee_source_account);
+        if !has_sufficient_signer_weight(
+            &outer_hash,
+            frame.signatures(),
+            &fee_source_account,
+            outer_threshold,
+        ) {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Invalid signature".into()),
+                failure: Some(ExecutionFailure::InvalidSignature),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
+
+        if frame.is_fee_bump() {
+            let inner_hash = fee_bump_inner_hash(&frame, &self.network_id)?;
+            let inner_threshold = threshold_medium(&source_account);
+            if !has_sufficient_signer_weight(
+                &inner_hash,
+                frame.inner_signatures(),
+                &source_account,
+                inner_threshold,
+            ) {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    operation_results: vec![],
+                    error: Some("Invalid inner signature".into()),
+                    failure: Some(ExecutionFailure::InvalidSignature),
+                    tx_meta: None,
+                    fee_changes: None,
+                });
+            }
+        }
+
+        let required_weight = threshold_medium(&source_account);
+        if !frame.is_fee_bump()
+            && !has_sufficient_signer_weight(
+                &outer_hash,
+                frame.signatures(),
+                &source_account,
+                required_weight,
+            )
+        {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Invalid signature".into()),
+                failure: Some(ExecutionFailure::InvalidSignature),
+                tx_meta: None,
+                fee_changes: None,
+            });
+        }
+
+        if let Preconditions::V2(cond) = frame.preconditions() {
+            if !cond.extra_signers.is_empty() {
+                let extra_hash = if frame.is_fee_bump() {
+                    fee_bump_inner_hash(&frame, &self.network_id)?
+                } else {
+                    outer_hash
+                };
+                let extra_signatures = if frame.is_fee_bump() {
+                    frame.inner_signatures()
+                } else {
+                    frame.signatures()
+                };
+                if !has_required_extra_signers(&extra_hash, extra_signatures, &cond.extra_signers) {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        operation_results: vec![],
+                        error: Some("Missing extra signer".into()),
+                        failure: Some(ExecutionFailure::BadAuthExtra),
+                        tx_meta: None,
+                        fee_changes: None,
+                    });
+                }
+            }
+        }
+
         let fee = frame.total_fee();
-        if source_account.balance < fee {
+        if fee_source_account.balance < fee {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
                 operation_results: vec![],
                 error: Some("Insufficient balance for fee".into()),
+                failure: Some(ExecutionFailure::InsufficientBalance),
+                tx_meta: None,
+                fee_changes: None,
             });
         }
 
+        let delta_before_fee = delta_snapshot(&self.state);
+
         // Deduct fee and increment sequence
-        if let Some(acc) = self.state.get_account_mut(&source_account_id) {
+        if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
             acc.balance -= fee;
+        }
+        if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
             acc.seq_num.0 += 1;
         }
+
+        let delta_after_fee = delta_snapshot(&self.state);
+        let (fee_created, fee_updated, fee_deleted) =
+            delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
+        let fee_changes = build_entry_changes(&fee_created, &fee_updated, &fee_deleted);
+
+        // Commit fee changes so rollback doesn't revert them.
+        self.state.commit();
 
         // Create ledger context for operation execution
         let ledger_context = LedgerContext::new(
             self.ledger_seq,
             self.close_time,
-            self.base_fee,
+            base_fee,
             self.base_reserve,
             self.protocol_version,
             self.network_id.clone(),
         );
 
+        let soroban_data = frame.soroban_data();
+
         // Execute operations
         let mut operation_results = Vec::new();
+        let mut op_changes = Vec::with_capacity(frame.operations().len());
+        let mut op_events: Vec<Vec<ContractEvent>> = Vec::with_capacity(frame.operations().len());
+        let mut diagnostic_events: Vec<DiagnosticEvent> = Vec::new();
+        let mut soroban_return_value = None;
         let mut all_success = true;
+        let mut failure = None;
 
         for op in frame.operations() {
+            let op_delta_before = delta_snapshot(&self.state);
+
             // Load any accounts needed for this operation
-            self.load_operation_accounts(snapshot, op, &source_account_id)?;
+            self.load_operation_accounts(snapshot, op, &inner_source_id)?;
 
             // Get operation source
             let op_source = op
                 .source_account
                 .as_ref()
                 .map(|m| stellar_core_tx::muxed_to_account_id(m))
-                .unwrap_or_else(|| source_account_id.clone());
+                .unwrap_or_else(|| inner_source_id.clone());
 
             // Execute the operation
-            let result = self.execute_single_operation(op, &op_source, &ledger_context);
+            let result =
+                self.execute_single_operation(op, &op_source, &ledger_context, soroban_data);
 
             match result {
-                Ok(op_result) => {
+                Ok(op_exec) => {
+                    let op_result = op_exec.result;
                     // Check if operation succeeded
                     if !is_operation_success(&op_result) {
                         all_success = false;
+                        if matches!(op_result, OperationResult::OpNotSupported) {
+                            failure = Some(ExecutionFailure::NotSupported);
+                        }
                     }
                     operation_results.push(op_result);
+
+                    if all_success {
+                        let op_delta_after = delta_snapshot(&self.state);
+                        let (created, updated, deleted) =
+                            delta_changes_between(self.state.delta(), op_delta_before, op_delta_after);
+                        op_changes.push(build_entry_changes(&created, &updated, &deleted));
+
+                        if let Some(meta) = op_exec.soroban_meta {
+                            op_events.push(meta.events.clone());
+                            diagnostic_events.extend(meta.diagnostic_events.into_iter());
+                            soroban_return_value = meta.return_value.or(soroban_return_value);
+                        } else {
+                            op_events.push(Vec::new());
+                        }
+                    } else {
+                        op_changes.push(empty_entry_changes());
+                        op_events.push(Vec::new());
+                    }
                 }
                 Err(e) => {
                     all_success = false;
                     warn!(error = %e, "Operation execution failed");
                     operation_results.push(OperationResult::OpNotSupported);
+                    op_changes.push(empty_entry_changes());
+                    op_events.push(Vec::new());
+                    failure = Some(ExecutionFailure::NotSupported);
                 }
             }
 
@@ -237,6 +642,29 @@ impl TransactionExecutor {
                 break;
             }
         }
+
+        if !all_success {
+            let remaining = frame.operations().len().saturating_sub(operation_results.len());
+            if remaining > 0 {
+                operation_results.extend(std::iter::repeat(OperationResult::OpNotSupported).take(remaining));
+            }
+            self.state.rollback();
+            restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
+            op_changes = vec![empty_entry_changes(); frame.operations().len()];
+            op_events = vec![Vec::new(); frame.operations().len()];
+            diagnostic_events.clear();
+            soroban_return_value = None;
+        } else {
+            self.state.commit();
+        }
+
+        let tx_meta = build_transaction_meta(
+            fee_changes.clone(),
+            op_changes,
+            op_events,
+            soroban_return_value,
+            diagnostic_events,
+        );
 
         Ok(TransactionExecutionResult {
             success: all_success,
@@ -247,6 +675,13 @@ impl TransactionExecutor {
             } else {
                 Some("One or more operations failed".into())
             },
+            failure: if all_success {
+                None
+            } else {
+                Some(failure.unwrap_or(ExecutionFailure::OperationFailed))
+            },
+            tx_meta: Some(tx_meta),
+            fee_changes: Some(fee_changes),
         })
     }
 
@@ -290,13 +725,25 @@ impl TransactionExecutor {
         op: &stellar_xdr::curr::Operation,
         source: &AccountId,
         context: &LedgerContext,
-    ) -> std::result::Result<OperationResult, TxError> {
+        soroban_data: Option<&stellar_xdr::curr::SorobanTransactionData>,
+    ) -> std::result::Result<stellar_core_tx::operations::execute::OperationExecutionResult, TxError>
+    {
         // Use the central operation dispatcher which handles all operation types
-        execute_operation(op, source, &mut self.state, context)
+        stellar_core_tx::operations::execute::execute_operation_with_soroban(
+            op,
+            source,
+            &mut self.state,
+            context,
+            soroban_data,
+        )
     }
 
     /// Apply all state changes to the delta.
-    pub fn apply_to_delta(&self, delta: &mut LedgerDelta) -> Result<()> {
+    pub fn apply_to_delta(
+        &self,
+        snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+    ) -> Result<()> {
         let state_delta = self.state.delta();
 
         // Apply created entries
@@ -306,15 +753,20 @@ impl TransactionExecutor {
 
         // Apply updated entries
         for entry in state_delta.updated_entries() {
-            // For updates, we need the previous entry too
-            // For now, just record as create (simplified)
-            delta.record_create(entry.clone())?;
+            let key = crate::delta::entry_to_key(entry)?;
+            if let Some(prev) = snapshot.get_entry(&key)? {
+                delta.record_update(prev, entry.clone())?;
+            } else {
+                delta.record_create(entry.clone())?;
+            }
         }
 
         // Apply deleted entries
         for key in state_delta.deleted_keys() {
             // We need the previous entry for deletion
-            // This is simplified - in practice we'd track the previous state
+            if let Some(prev) = snapshot.get_entry(key)? {
+                delta.record_delete(prev)?;
+            }
         }
 
         Ok(())
@@ -323,6 +775,11 @@ impl TransactionExecutor {
     /// Get total fees collected.
     pub fn total_fees(&self) -> i64 {
         self.state.delta().fee_charged()
+    }
+
+    /// Get the updated ID pool after execution.
+    pub fn id_pool(&self) -> u64 {
+        self.state.id_pool()
     }
 
     /// Get the state manager.
@@ -334,6 +791,260 @@ impl TransactionExecutor {
     pub fn state_mut(&mut self) -> &mut LedgerStateManager {
         &mut self.state
     }
+}
+
+#[derive(Clone, Copy)]
+struct DeltaSnapshot {
+    created: usize,
+    updated: usize,
+    deleted: usize,
+}
+
+fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
+    let delta = state.delta();
+    DeltaSnapshot {
+        created: delta.created_entries().len(),
+        updated: delta.updated_entries().len(),
+        deleted: delta.deleted_keys().len(),
+    }
+}
+
+fn delta_changes_between(
+    delta: &stellar_core_tx::LedgerDelta,
+    start: DeltaSnapshot,
+    end: DeltaSnapshot,
+) -> (Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>) {
+    let created = delta.created_entries()[start.created..end.created].to_vec();
+    let updated = delta.updated_entries()[start.updated..end.updated].to_vec();
+    let deleted = delta.deleted_keys()[start.deleted..end.deleted].to_vec();
+    (created, updated, deleted)
+}
+
+fn restore_delta_entries(
+    state: &mut LedgerStateManager,
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    deleted: &[LedgerKey],
+) {
+    let delta = state.delta_mut();
+    for entry in created {
+        delta.record_create(entry.clone());
+    }
+    for entry in updated {
+        delta.record_update(entry.clone());
+    }
+    for key in deleted {
+        delta.record_delete(key.clone());
+    }
+}
+
+fn build_entry_changes(
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    deleted: &[LedgerKey],
+) -> LedgerEntryChanges {
+    let mut changes: Vec<(Vec<u8>, LedgerEntryChange)> = Vec::new();
+
+    for entry in created {
+        let key_bytes = crate::delta::entry_to_key(entry)
+            .map(|key| key.to_xdr(Limits::none()).unwrap_or_default())
+            .unwrap_or_else(|_| entry.to_xdr(Limits::none()).unwrap_or_default());
+        changes.push((key_bytes, LedgerEntryChange::Created(entry.clone())));
+    }
+
+    for entry in updated {
+        let key_bytes = crate::delta::entry_to_key(entry)
+            .map(|key| key.to_xdr(Limits::none()).unwrap_or_default())
+            .unwrap_or_else(|_| entry.to_xdr(Limits::none()).unwrap_or_default());
+        changes.push((key_bytes, LedgerEntryChange::Updated(entry.clone())));
+    }
+
+    for key in deleted {
+        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+        changes.push((key_bytes, LedgerEntryChange::Removed(key.clone())));
+    }
+
+    changes.sort_by(|a, b| a.0.cmp(&b.0));
+    let ordered = changes.into_iter().map(|(_, change)| change);
+    LedgerEntryChanges(ordered.collect::<Vec<_>>().try_into().unwrap_or_default())
+}
+
+fn empty_entry_changes() -> LedgerEntryChanges {
+    LedgerEntryChanges(VecM::default())
+}
+
+fn build_transaction_meta(
+    tx_changes_before: LedgerEntryChanges,
+    op_changes: Vec<LedgerEntryChanges>,
+    op_events: Vec<Vec<ContractEvent>>,
+    soroban_return_value: Option<stellar_xdr::curr::ScVal>,
+    diagnostic_events: Vec<DiagnosticEvent>,
+) -> TransactionMeta {
+    let operations: Vec<OperationMetaV2> = op_changes
+        .into_iter()
+        .zip(op_events.into_iter())
+        .map(|(changes, events)| OperationMetaV2 {
+            ext: ExtensionPoint::V0,
+            changes,
+            events: events.try_into().unwrap_or_default(),
+        })
+        .collect();
+
+    let tx_events: Vec<TransactionEvent> = operations
+        .iter()
+        .flat_map(|op_meta| op_meta.events.iter().cloned())
+        .map(|event| TransactionEvent {
+            stage: TransactionEventStage::AfterTx,
+            event,
+        })
+        .collect();
+
+    let has_soroban = soroban_return_value.is_some() || !diagnostic_events.is_empty();
+    let soroban_meta = if has_soroban {
+        Some(SorobanTransactionMetaV2 {
+            ext: SorobanTransactionMetaExt::V0,
+            return_value: soroban_return_value,
+        })
+    } else {
+        None
+    };
+
+    TransactionMeta::V4(TransactionMetaV4 {
+        ext: ExtensionPoint::V0,
+        tx_changes_before,
+        operations: operations.try_into().unwrap_or_default(),
+        tx_changes_after: empty_entry_changes(),
+        soroban_meta,
+        events: tx_events.try_into().unwrap_or_default(),
+        diagnostic_events: diagnostic_events.try_into().unwrap_or_default(),
+    })
+}
+
+fn empty_transaction_meta(op_count: usize) -> TransactionMeta {
+    let mut op_changes = Vec::with_capacity(op_count);
+    let mut op_events = Vec::with_capacity(op_count);
+    for _ in 0..op_count {
+        op_changes.push(empty_entry_changes());
+        op_events.push(Vec::new());
+    }
+    build_transaction_meta(empty_entry_changes(), op_changes, op_events, None, Vec::new())
+}
+
+fn map_failure_to_result(
+    failure: &ExecutionFailure,
+) -> TransactionResultResult {
+    match failure {
+        ExecutionFailure::Malformed => TransactionResultResult::TxMalformed,
+        ExecutionFailure::MissingOperation => TransactionResultResult::TxMissingOperation,
+        ExecutionFailure::InvalidSignature => TransactionResultResult::TxBadAuth,
+        ExecutionFailure::BadAuthExtra => TransactionResultResult::TxBadAuthExtra,
+        ExecutionFailure::BadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
+        ExecutionFailure::TooEarly => TransactionResultResult::TxTooEarly,
+        ExecutionFailure::TooLate => TransactionResultResult::TxTooLate,
+        ExecutionFailure::BadSequence => TransactionResultResult::TxBadSeq,
+        ExecutionFailure::InsufficientFee => TransactionResultResult::TxInsufficientFee,
+        ExecutionFailure::InsufficientBalance => TransactionResultResult::TxInsufficientBalance,
+        ExecutionFailure::NoAccount => TransactionResultResult::TxNoAccount,
+        ExecutionFailure::NotSupported => TransactionResultResult::TxNotSupported,
+        ExecutionFailure::OperationFailed => TransactionResultResult::TxFailed(Vec::new().try_into().unwrap()),
+    }
+}
+
+fn map_failure_to_inner_result(
+    failure: &ExecutionFailure,
+    op_results: &[OperationResult],
+) -> InnerTransactionResultResult {
+    match failure {
+        ExecutionFailure::Malformed => InnerTransactionResultResult::TxMalformed,
+        ExecutionFailure::MissingOperation => InnerTransactionResultResult::TxMissingOperation,
+        ExecutionFailure::InvalidSignature => InnerTransactionResultResult::TxBadAuth,
+        ExecutionFailure::BadAuthExtra => InnerTransactionResultResult::TxBadAuthExtra,
+        ExecutionFailure::BadMinSeqAgeOrGap => InnerTransactionResultResult::TxBadMinSeqAgeOrGap,
+        ExecutionFailure::TooEarly => InnerTransactionResultResult::TxTooEarly,
+        ExecutionFailure::TooLate => InnerTransactionResultResult::TxTooLate,
+        ExecutionFailure::BadSequence => InnerTransactionResultResult::TxBadSeq,
+        ExecutionFailure::InsufficientFee => InnerTransactionResultResult::TxInsufficientFee,
+        ExecutionFailure::InsufficientBalance => InnerTransactionResultResult::TxInsufficientBalance,
+        ExecutionFailure::NoAccount => InnerTransactionResultResult::TxNoAccount,
+        ExecutionFailure::NotSupported => InnerTransactionResultResult::TxNotSupported,
+        ExecutionFailure::OperationFailed => {
+            InnerTransactionResultResult::TxFailed(op_results.to_vec().try_into().unwrap_or_default())
+        }
+    }
+}
+
+pub fn build_tx_result_pair(
+    frame: &TransactionFrame,
+    network_id: &NetworkId,
+    exec: &TransactionExecutionResult,
+) -> Result<TransactionResultPair> {
+    let tx_hash = frame
+        .hash(network_id)
+        .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+    let op_results: Vec<OperationResult> = exec.operation_results.clone();
+
+    let result = if frame.is_fee_bump() {
+        let inner_hash = fee_bump_inner_hash(frame, network_id)?;
+        let inner_result = if exec.success {
+            InnerTransactionResultResult::TxSuccess(op_results.clone().try_into().unwrap_or_default())
+        } else if let Some(failure) = &exec.failure {
+            map_failure_to_inner_result(failure, &op_results)
+        } else {
+            InnerTransactionResultResult::TxFailed(op_results.clone().try_into().unwrap_or_default())
+        };
+
+        let inner_pair = InnerTransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash(inner_hash.0),
+            result: InnerTransactionResult {
+                fee_charged: frame.inner_fee() as i64,
+                result: inner_result,
+                ext: InnerTransactionResultExt::V0,
+            },
+        };
+
+        let result = if exec.success {
+            TransactionResultResult::TxFeeBumpInnerSuccess(inner_pair)
+        } else {
+            TransactionResultResult::TxFeeBumpInnerFailed(inner_pair)
+        };
+
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result,
+            ext: TransactionResultExt::V0,
+        }
+    } else if exec.success {
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result: TransactionResultResult::TxSuccess(
+                op_results.try_into().unwrap_or_default(),
+            ),
+            ext: TransactionResultExt::V0,
+        }
+    } else if let Some(failure) = &exec.failure {
+        let result = match failure {
+            ExecutionFailure::OperationFailed => {
+                TransactionResultResult::TxFailed(op_results.try_into().unwrap_or_default())
+            }
+            _ => map_failure_to_result(failure),
+        };
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result,
+            ext: TransactionResultExt::V0,
+        }
+    } else {
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result: TransactionResultResult::TxFailed(op_results.try_into().unwrap_or_default()),
+            ext: TransactionResultExt::V0,
+        }
+    };
+
+    Ok(TransactionResultPair {
+        transaction_hash: stellar_xdr::curr::Hash(tx_hash.0),
+        result,
+    })
 }
 
 /// Convert AccountId to key bytes.
@@ -438,10 +1149,184 @@ fn is_operation_success(result: &OperationResult) -> bool {
     }
 }
 
+fn has_sufficient_signer_weight(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    account: &AccountEntry,
+    required_weight: u32,
+) -> bool {
+    let mut total = 0u32;
+    let mut counted: HashSet<Hash256> = HashSet::new();
+
+    // Master key signer.
+    if let Ok(pk) = stellar_core_crypto::PublicKey::try_from(&account.account_id.0) {
+        let master_weight = account.thresholds.0[0] as u32;
+        if master_weight > 0 {
+            if has_ed25519_signature(tx_hash, signatures, &pk) {
+                let id = signer_key_id(&SignerKey::Ed25519(stellar_xdr::curr::Uint256(*pk.as_bytes())));
+                if counted.insert(id) {
+                    total = total.saturating_add(master_weight);
+                }
+            }
+        }
+    }
+
+    for signer in account.signers.iter() {
+        if signer.weight == 0 {
+            continue;
+        }
+        let key = &signer.key;
+        let id = signer_key_id(key);
+
+        if counted.contains(&id) {
+            continue;
+        }
+
+        match key {
+            SignerKey::Ed25519(key) => {
+                if let Ok(pk) = stellar_core_crypto::PublicKey::from_bytes(&key.0) {
+                    if has_ed25519_signature(tx_hash, signatures, &pk) {
+                        if counted.insert(id) {
+                            total = total.saturating_add(signer.weight as u32);
+                        }
+                    }
+                }
+            }
+            SignerKey::PreAuthTx(key) => {
+                if key.0 == tx_hash.0 {
+                    if counted.insert(id) {
+                        total = total.saturating_add(signer.weight as u32);
+                    }
+                }
+            }
+            SignerKey::HashX(key) => {
+                if has_hashx_signature(signatures, key) {
+                    if counted.insert(id) {
+                        total = total.saturating_add(signer.weight as u32);
+                    }
+                }
+            }
+            SignerKey::Ed25519SignedPayload(payload) => {
+                if has_signed_payload_signature(tx_hash, signatures, payload) {
+                    if counted.insert(id) {
+                        total = total.saturating_add(signer.weight as u32);
+                    }
+                }
+            }
+        }
+
+        if total >= required_weight && total > 0 {
+            return true;
+        }
+    }
+
+    total >= required_weight && total > 0
+}
+
+fn has_required_extra_signers(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    extra_signers: &[SignerKey],
+) -> bool {
+    extra_signers.iter().all(|signer| match signer {
+        SignerKey::Ed25519(key) => {
+            if let Ok(pk) = stellar_core_crypto::PublicKey::from_bytes(&key.0) {
+                has_ed25519_signature(tx_hash, signatures, &pk)
+            } else {
+                false
+            }
+        }
+        SignerKey::PreAuthTx(key) => key.0 == tx_hash.0,
+        SignerKey::HashX(key) => has_hashx_signature(signatures, key),
+        SignerKey::Ed25519SignedPayload(payload) => {
+            has_signed_payload_signature(tx_hash, signatures, payload)
+        }
+    })
+}
+
+fn fee_bump_inner_hash(frame: &TransactionFrame, network_id: &NetworkId) -> Result<Hash256> {
+    match frame.envelope() {
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                let inner_env = TransactionEnvelope::Tx(inner.clone());
+                let inner_frame = TransactionFrame::with_network(inner_env, *network_id);
+                inner_frame
+                    .hash(network_id)
+                    .map_err(|e| LedgerError::Internal(format!("inner tx hash error: {}", e)))
+            }
+        },
+        _ => frame
+            .hash(network_id)
+            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e))),
+    }
+}
+
+fn threshold_low(account: &AccountEntry) -> u32 {
+    account.thresholds.0[1] as u32
+}
+
+fn threshold_medium(account: &AccountEntry) -> u32 {
+    account.thresholds.0[2] as u32
+}
+
+fn signer_key_id(key: &SignerKey) -> Hash256 {
+    let bytes = key
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .unwrap_or_default();
+    Hash256::hash(&bytes)
+}
+
+fn has_ed25519_signature(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    pk: &stellar_core_crypto::PublicKey,
+) -> bool {
+    signatures
+        .iter()
+        .any(|sig| validation::verify_signature_with_key(tx_hash, sig, pk))
+}
+
+fn has_hashx_signature(
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    key: &stellar_xdr::curr::Uint256,
+) -> bool {
+    signatures.iter().any(|sig| {
+        if sig.signature.0.len() != 32 {
+            return false;
+        }
+        let expected_hint = [key.0[28], key.0[29], key.0[30], key.0[31]];
+        if sig.hint.0 != expected_hint {
+            return false;
+        }
+        let hash = Hash256::hash(&sig.signature.0);
+        hash.0 == key.0
+    })
+}
+
+fn has_signed_payload_signature(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+) -> bool {
+    let pk = match stellar_core_crypto::PublicKey::from_bytes(&payload.ed25519.0) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    let mut data = Vec::with_capacity(32 + payload.payload.len());
+    data.extend_from_slice(&tx_hash.0);
+    data.extend_from_slice(&payload.payload);
+    let payload_hash = Hash256::hash(&data);
+
+    signatures
+        .iter()
+        .any(|sig| validation::verify_signature_with_key(&payload_hash, sig, &pk))
+}
+
 /// Execute a full transaction set.
 pub fn execute_transaction_set(
     snapshot: &SnapshotHandle,
-    transactions: &[TransactionEnvelope],
+    transactions: &[(TransactionEnvelope, Option<u32>)],
     ledger_seq: u32,
     close_time: u64,
     base_fee: u32,
@@ -449,7 +1334,13 @@ pub fn execute_transaction_set(
     protocol_version: u32,
     network_id: NetworkId,
     delta: &mut LedgerDelta,
-) -> Result<Vec<TransactionExecutionResult>> {
+) -> Result<(
+    Vec<TransactionExecutionResult>,
+    Vec<TransactionResultPair>,
+    Vec<TransactionResultMetaV1>,
+    u64,
+)> {
+    let id_pool = snapshot.header().id_pool;
     let mut executor = TransactionExecutor::new(
         ledger_seq,
         close_time,
@@ -457,12 +1348,33 @@ pub fn execute_transaction_set(
         base_reserve,
         protocol_version,
         network_id,
+        id_pool,
     );
 
     let mut results = Vec::with_capacity(transactions.len());
+    let mut tx_results = Vec::with_capacity(transactions.len());
+    let mut tx_result_metas = Vec::with_capacity(transactions.len());
 
-    for tx in transactions {
-        let result = executor.execute_transaction(snapshot, tx)?;
+    for (tx, tx_base_fee) in transactions {
+        let tx_fee = tx_base_fee.unwrap_or(base_fee);
+        let result = executor.execute_transaction(snapshot, tx, tx_fee)?;
+        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
+        let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result)?;
+        let tx_meta = result
+            .tx_meta
+            .clone()
+            .unwrap_or_else(|| empty_transaction_meta(frame.operations().len()));
+        let fee_changes = result
+            .fee_changes
+            .clone()
+            .unwrap_or_else(empty_entry_changes);
+        let tx_result_meta = TransactionResultMetaV1 {
+            ext: ExtensionPoint::V0,
+            result: tx_result.clone(),
+            fee_processing: fee_changes,
+            tx_apply_processing: tx_meta,
+            post_tx_apply_fee_processing: empty_entry_changes(),
+        };
 
         info!(
             success = result.success,
@@ -472,16 +1384,18 @@ pub fn execute_transaction_set(
         );
 
         results.push(result);
+        tx_results.push(tx_result);
+        tx_result_metas.push(tx_result_meta);
     }
 
     // Apply all changes to the delta
-    executor.apply_to_delta(delta)?;
+    executor.apply_to_delta(snapshot, delta)?;
 
     // Add fees to fee pool
     let total_fees = executor.total_fees();
     delta.record_fee_pool_delta(total_fees);
 
-    Ok(results)
+    Ok((results, tx_results, tx_result_metas, executor.id_pool()))
 }
 
 #[cfg(test)]
@@ -497,6 +1411,7 @@ mod tests {
             5_000_000,
             21,
             NetworkId::testnet(),
+            0,
         );
 
         assert_eq!(executor.ledger_seq, 100);

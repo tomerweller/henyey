@@ -27,11 +27,18 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use axum::extract::Query;
 use serde::{Deserialize, Serialize};
+use stellar_core_crypto::{self, PublicKey as CryptoPublicKey};
+use stellar_core_scp::hash_quorum_set;
+use stellar_core_common::NetworkId;
+use stellar_core_tx::TransactionFrame;
+use stellar_core_overlay::{PeerAddress, PeerId};
+use stellar_xdr::curr::LedgerUpgrade;
 use tokio::signal;
 use tokio::sync::broadcast;
 
-use crate::app::{App, AppState, CatchupTarget};
+use crate::app::{App, AppState, CatchupTarget, SurveyReport};
 use crate::config::AppConfig;
 
 /// Node running mode.
@@ -323,12 +330,15 @@ impl NodeRunner {
 
     /// Get the current node status.
     pub async fn status(&self) -> NodeStatus {
+        let (ledger_seq, ledger_hash, _close_time, _protocol_version) = self.app.ledger_info();
+        let stats = self.app.herder_stats();
+        let peer_count = self.app.peer_snapshots().await.len();
         NodeStatus {
-            ledger_seq: 0, // Would query from app
-            ledger_hash: None,
-            peer_count: 0,
-            consensus_state: "tracking".to_string(),
-            pending_tx_count: 0,
+            ledger_seq,
+            ledger_hash: Some(ledger_hash.to_hex()),
+            peer_count,
+            consensus_state: stats.state.to_string(),
+            pending_tx_count: stats.pending_transactions as u64,
             uptime_secs: self.start_time.elapsed().as_secs(),
             state: format!("{}", self.app.state().await),
         }
@@ -363,8 +373,21 @@ struct ServerState {
 /// - GET /info - node information
 /// - GET /metrics - prometheus-style metrics
 /// - GET /peers - connected peers
+/// - POST /connect - connect to peer (query param `addr`)
+/// - POST /droppeer - disconnect peer (query param `peer_id`)
+/// - GET /bans - list banned peers
+/// - POST /unban - remove peer from ban list (query param `peer_id`)
 /// - GET /ledger - current ledger info
+/// - GET /upgrades - current/proposed upgrades
+/// - POST /self-check - run self-check validation
+/// - GET /survey - survey report (local + peer responses)
+/// - GET /scp - SCP status summary (query param `limit`)
+/// - POST /survey/start - start survey collecting (query param `nonce`)
+/// - POST /survey/stop - stop survey collecting
+/// - POST /survey/topology - queue a topology request (query param `node`)
+/// - POST /survey/reporting/stop - stop survey reporting
 /// - POST /tx - submit transactions
+/// - POST /shutdown - request a graceful shutdown
 pub struct StatusServer {
     port: u16,
     app: Arc<App>,
@@ -388,13 +411,30 @@ impl StatusServer {
             start_time: self.start_time,
         });
 
+        let mut shutdown_rx = state.app.subscribe_shutdown();
+
         let app = Router::new()
             .route("/", get(root_handler))
             .route("/info", get(info_handler))
+            .route("/status", get(status_handler))
             .route("/metrics", get(metrics_handler))
             .route("/peers", get(peers_handler))
+            .route("/connect", post(connect_handler))
+            .route("/droppeer", post(droppeer_handler))
+            .route("/bans", get(bans_handler))
+            .route("/unban", post(unban_handler))
             .route("/ledger", get(ledger_handler))
+            .route("/upgrades", get(upgrades_handler))
+            .route("/self-check", post(self_check_handler))
+            .route("/quorum", get(quorum_handler))
+            .route("/survey", get(survey_handler))
+            .route("/scp", get(scp_handler))
+            .route("/survey/start", post(start_survey_collecting_handler))
+            .route("/survey/stop", post(stop_survey_collecting_handler))
+            .route("/survey/topology", post(survey_topology_handler))
+            .route("/survey/reporting/stop", post(stop_survey_reporting_handler))
             .route("/tx", post(submit_tx_handler))
+            .route("/shutdown", post(shutdown_handler))
             .route("/health", get(health_handler))
             .with_state(state);
 
@@ -402,7 +442,11 @@ impl StatusServer {
         tracing::info!(port = self.port, "Starting HTTP status server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await?;
 
         Ok(())
     }
@@ -467,6 +511,61 @@ struct LedgerResponse {
     protocol_version: u32,
 }
 
+/// Response for the /upgrades endpoint.
+#[derive(Serialize)]
+struct UpgradesResponse {
+    current: UpgradeState,
+    proposed: Vec<UpgradeItem>,
+}
+
+#[derive(Serialize)]
+struct UpgradeState {
+    protocol_version: u32,
+    base_fee: u32,
+    base_reserve: u32,
+    max_tx_set_size: u32,
+}
+
+#[derive(Serialize)]
+struct UpgradeItem {
+    r#type: String,
+    value: u32,
+}
+
+/// Response for the /quorum endpoint.
+#[derive(Serialize)]
+struct QuorumResponse {
+    local: Option<QuorumSetResponse>,
+}
+
+/// Response for the /scp endpoint.
+#[derive(Serialize)]
+struct ScpInfoResponse {
+    node: String,
+    slots: Vec<ScpSlotInfo>,
+}
+
+/// Summary of SCP slot state.
+#[derive(Serialize)]
+struct ScpSlotInfo {
+    slot_index: u64,
+    is_externalized: bool,
+    is_nominating: bool,
+    ballot_phase: String,
+    nomination_round: u32,
+    ballot_round: Option<u32>,
+    envelope_count: usize,
+}
+
+/// JSON representation of a quorum set.
+#[derive(Serialize)]
+struct QuorumSetResponse {
+    hash: String,
+    threshold: u32,
+    validators: Vec<String>,
+    inner_sets: Vec<QuorumSetResponse>,
+}
+
 /// Request for submitting a transaction.
 #[derive(Deserialize)]
 struct SubmitTxRequest {
@@ -490,6 +589,71 @@ struct HealthResponse {
     peer_count: usize,
 }
 
+/// Response for the /bans endpoint.
+#[derive(Serialize)]
+struct BansResponse {
+    bans: Vec<String>,
+}
+
+/// Response for the /self-check endpoint.
+#[derive(Serialize)]
+struct SelfCheckResponse {
+    ok: bool,
+    checked_ledgers: u32,
+    last_checked_ledger: Option<u32>,
+    message: Option<String>,
+}
+
+/// Query parameters for starting survey collecting.
+#[derive(Deserialize)]
+struct StartSurveyParams {
+    nonce: u32,
+}
+
+/// Query parameters for requesting topology from a peer.
+#[derive(Deserialize)]
+struct SurveyTopologyParams {
+    node: String,
+    inbound_index: Option<u32>,
+    outbound_index: Option<u32>,
+}
+
+/// Query parameters for connecting to a peer.
+#[derive(Deserialize)]
+struct ConnectParams {
+    addr: Option<String>,
+    peer: Option<String>,
+    port: Option<u16>,
+}
+
+/// Query parameters for dropping a peer.
+#[derive(Deserialize)]
+struct DropPeerParams {
+    peer_id: Option<String>,
+    node: Option<String>,
+    ban: Option<u8>,
+}
+
+/// Query parameters for unbanning a peer.
+#[derive(Deserialize)]
+struct UnbanParams {
+    peer_id: Option<String>,
+    node: Option<String>,
+}
+
+/// Query parameters for the /scp endpoint.
+#[derive(Deserialize)]
+struct ScpParams {
+    limit: Option<usize>,
+}
+
+/// Response for survey command endpoints.
+#[derive(Serialize)]
+struct SurveyCommandResponse {
+    success: bool,
+    message: String,
+}
+
 // ============================================================================
 // HTTP Handlers
 // ============================================================================
@@ -500,10 +664,25 @@ async fn root_handler() -> Json<RootResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         endpoints: vec![
             "/info".to_string(),
+            "/status".to_string(),
             "/metrics".to_string(),
             "/peers".to_string(),
+            "/connect".to_string(),
+            "/droppeer".to_string(),
+            "/bans".to_string(),
+            "/unban".to_string(),
             "/ledger".to_string(),
+            "/upgrades".to_string(),
+            "/self-check".to_string(),
+            "/quorum".to_string(),
+            "/survey".to_string(),
+            "/scp".to_string(),
+            "/survey/start".to_string(),
+            "/survey/stop".to_string(),
+            "/survey/topology".to_string(),
+            "/survey/reporting/stop".to_string(),
             "/tx".to_string(),
+            "/shutdown".to_string(),
             "/health".to_string(),
         ],
     })
@@ -525,15 +704,33 @@ async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<InfoRespons
     })
 }
 
+async fn status_handler(State(state): State<Arc<ServerState>>) -> Json<NodeStatus> {
+    let (ledger_seq, ledger_hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let stats = state.app.herder_stats();
+    let peer_count = state.app.peer_snapshots().await.len();
+    Json(NodeStatus {
+        ledger_seq,
+        ledger_hash: Some(ledger_hash.to_hex()),
+        peer_count,
+        consensus_state: stats.state.to_string(),
+        pending_tx_count: stats.pending_transactions as u64,
+        uptime_secs: state.start_time.elapsed().as_secs(),
+        state: format!("{}", state.app.state().await),
+    })
+}
+
 async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let app_state = state.app.state().await;
     let uptime = state.start_time.elapsed().as_secs();
+    let (ledger_seq, _hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let peer_count = state.app.peer_snapshots().await.len();
+    let pending_transactions = state.app.pending_transaction_count() as u64;
 
     // Get metrics from herder (we don't have direct access, so use available info)
     let metrics = MetricsResponse {
-        ledger_seq: 0, // Would need access to current ledger
-        peer_count: 0, // Would need access to overlay
-        pending_transactions: 0,
+        ledger_seq,
+        peer_count,
+        pending_transactions,
         uptime_seconds: uptime,
         state: format!("{}", app_state),
         is_validator: state.app.info().is_validator,
@@ -570,26 +767,482 @@ async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResp
     )
 }
 
-async fn peers_handler(State(_state): State<Arc<ServerState>>) -> Json<PeersResponse> {
-    // Would need access to overlay manager to get actual peer info
+async fn peers_handler(State(state): State<Arc<ServerState>>) -> Json<PeersResponse> {
+    let mut peers = state
+        .app
+        .peer_snapshots()
+        .await
+        .into_iter()
+        .map(|snapshot| PeerInfo {
+            id: snapshot.info.peer_id.to_hex(),
+            address: snapshot.info.address.to_string(),
+            direction: match snapshot.info.direction {
+                stellar_core_overlay::ConnectionDirection::Inbound => "inbound",
+                stellar_core_overlay::ConnectionDirection::Outbound => "outbound",
+            }
+            .to_string(),
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by(|a, b| a.id.cmp(&b.id));
     Json(PeersResponse {
-        count: 0,
-        peers: vec![],
+        count: peers.len(),
+        peers,
     })
 }
 
-async fn ledger_handler(State(_state): State<Arc<ServerState>>) -> Json<LedgerResponse> {
-    // Would need access to ledger manager
+async fn connect_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<ConnectParams>,
+) -> impl IntoResponse {
+    let addr = match parse_connect_params(&params) {
+        Ok(addr) => addr,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SurveyCommandResponse {
+                    success: false,
+                    message,
+                }),
+            );
+        }
+    };
+
+    match state.app.connect_peer(addr).await {
+        Ok(peer_id) => (
+            StatusCode::OK,
+            Json(SurveyCommandResponse {
+                success: true,
+                message: format!("Connected to peer {}", peer_id),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: format!("Failed to connect: {}", err),
+            }),
+        ),
+    }
+}
+
+async fn droppeer_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<DropPeerParams>,
+) -> impl IntoResponse {
+    let peer_id = match parse_peer_id_params(&params.peer_id, &params.node) {
+        Ok(peer_id) => peer_id,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SurveyCommandResponse {
+                    success: false,
+                    message,
+                }),
+            );
+        }
+    };
+
+    let ban_requested = params.ban.unwrap_or(0) == 1;
+    if !state.app.disconnect_peer(&peer_id).await {
+        (
+            StatusCode::NOT_FOUND,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: "Peer not found".to_string(),
+            }),
+        )
+    } else {
+        if ban_requested {
+            if let Err(err) = state.app.ban_peer(peer_id.clone()).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SurveyCommandResponse {
+                        success: false,
+                        message: format!("Failed to ban peer: {}", err),
+                    }),
+                );
+            }
+        }
+        let message = if ban_requested {
+            format!("Disconnected and banned peer {}", peer_id)
+        } else {
+            format!("Disconnected peer {}", peer_id)
+        };
+        (
+            StatusCode::OK,
+            Json(SurveyCommandResponse {
+                success: true,
+                message,
+            }),
+        )
+    }
+}
+
+async fn ledger_handler(State(state): State<Arc<ServerState>>) -> Json<LedgerResponse> {
+    let (sequence, hash, close_time, protocol_version) = state.app.ledger_info();
     Json(LedgerResponse {
-        sequence: 0,
-        hash: "0".repeat(64),
-        close_time: 0,
-        protocol_version: 21,
+        sequence,
+        hash: hash.to_hex(),
+        close_time,
+        protocol_version,
     })
+}
+
+async fn upgrades_handler(State(state): State<Arc<ServerState>>) -> Json<UpgradesResponse> {
+    let (protocol_version, base_fee, base_reserve, max_tx_set_size) = state.app.current_upgrade_state();
+    let proposed = state
+        .app
+        .proposed_upgrades()
+        .into_iter()
+        .filter_map(map_upgrade_item)
+        .collect::<Vec<_>>();
+
+    Json(UpgradesResponse {
+        current: UpgradeState {
+            protocol_version,
+            base_fee,
+            base_reserve,
+            max_tx_set_size,
+        },
+        proposed,
+    })
+}
+
+async fn self_check_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    match state.app.self_check(32) {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(SelfCheckResponse {
+                ok: result.ok,
+                checked_ledgers: result.checked_ledgers,
+                last_checked_ledger: result.last_checked_ledger,
+                message: None,
+            }),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SelfCheckResponse {
+                ok: false,
+                checked_ledgers: 0,
+                last_checked_ledger: None,
+                message: Some(err.to_string()),
+            }),
+        ),
+    }
+}
+
+async fn bans_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    match state.app.banned_peers().await {
+        Ok(bans) => {
+            let bans = bans
+                .into_iter()
+                .filter_map(peer_id_to_strkey)
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(BansResponse { bans }))
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: format!("Failed to read bans: {}", err),
+            }),
+        ),
+    }
+}
+
+async fn unban_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<UnbanParams>,
+) -> impl IntoResponse {
+    let peer_id = match parse_peer_id_params(&params.peer_id, &params.node) {
+        Ok(peer_id) => peer_id,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SurveyCommandResponse {
+                    success: false,
+                    message,
+                }),
+            );
+        }
+    };
+
+    match state.app.unban_peer(&peer_id).await {
+        Ok(removed) => {
+            let message = if removed {
+                format!("Unbanned peer {}", peer_id)
+            } else {
+                "Peer not found in ban list".to_string()
+            };
+            (
+                StatusCode::OK,
+                Json(SurveyCommandResponse {
+                    success: removed,
+                    message,
+                }),
+            )
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: format!("Failed to unban peer: {}", err),
+            }),
+        ),
+    }
+}
+
+async fn quorum_handler(State(state): State<Arc<ServerState>>) -> Json<QuorumResponse> {
+    let local = state
+        .app
+        .local_quorum_set()
+        .map(|qs| quorum_set_response(&qs));
+    Json(QuorumResponse { local })
+}
+
+fn quorum_set_response(quorum_set: &stellar_xdr::curr::ScpQuorumSet) -> QuorumSetResponse {
+    let hash = hash_quorum_set(quorum_set).to_hex();
+    let validators = quorum_set
+        .validators
+        .iter()
+        .filter_map(node_id_to_strkey)
+        .collect::<Vec<_>>();
+    let inner_sets = quorum_set
+        .inner_sets
+        .iter()
+        .map(quorum_set_response)
+        .collect::<Vec<_>>();
+    QuorumSetResponse {
+        hash,
+        threshold: quorum_set.threshold,
+        validators,
+        inner_sets,
+    }
+}
+
+fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<String> {
+    match &node_id.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+            CryptoPublicKey::from_bytes(&key.0).ok().map(|pk| pk.to_strkey())
+        }
+    }
+}
+
+fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
+    CryptoPublicKey::from_bytes(peer_id.as_bytes())
+        .ok()
+        .map(|pk| pk.to_strkey())
+}
+
+fn map_upgrade_item(upgrade: LedgerUpgrade) -> Option<UpgradeItem> {
+    match upgrade {
+        LedgerUpgrade::Version(value) => Some(UpgradeItem {
+            r#type: "protocol_version".to_string(),
+            value,
+        }),
+        LedgerUpgrade::BaseFee(value) => Some(UpgradeItem {
+            r#type: "base_fee".to_string(),
+            value,
+        }),
+        LedgerUpgrade::BaseReserve(value) => Some(UpgradeItem {
+            r#type: "base_reserve".to_string(),
+            value,
+        }),
+        LedgerUpgrade::MaxTxSetSize(value) => Some(UpgradeItem {
+            r#type: "max_tx_set_size".to_string(),
+            value,
+        }),
+        _ => None,
+    }
+}
+
+fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, String> {
+    if let Some(addr) = params.addr.as_ref() {
+        let (host, port) = addr
+            .split_once(':')
+            .ok_or_else(|| "addr must be host:port".to_string())?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| "invalid port".to_string())?;
+        return Ok(PeerAddress::new(host.to_string(), port));
+    }
+
+    let Some(peer) = params.peer.as_ref() else {
+        return Err("addr or peer/port must be provided".to_string());
+    };
+    let port = params.port.ok_or_else(|| "port must be provided".to_string())?;
+    Ok(PeerAddress::new(peer.to_string(), port))
+}
+
+fn parse_peer_id_params(
+    peer_id: &Option<String>,
+    node: &Option<String>,
+) -> Result<PeerId, String> {
+    let value = peer_id.as_ref().or(node.as_ref()).ok_or_else(|| {
+        "peer_id or node must be provided".to_string()
+    })?;
+    parse_peer_id(value)
+}
+
+fn parse_peer_id(value: &str) -> Result<PeerId, String> {
+    if let Ok(bytes) = hex::decode(value) {
+        if let Ok(raw) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            return Ok(PeerId::from_bytes(raw));
+        }
+    }
+
+    let key = CryptoPublicKey::from_strkey(value)
+        .map_err(|_| "invalid peer_id (expected 32-byte hex or strkey)".to_string())?;
+    Ok(PeerId::from_bytes(*key.as_bytes()))
+}
+
+async fn survey_handler(State(state): State<Arc<ServerState>>) -> Json<SurveyReport> {
+    let report = state.app.survey_report().await;
+    Json(report)
+}
+
+async fn scp_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<ScpParams>,
+) -> Json<ScpInfoResponse> {
+    let limit = params.limit.unwrap_or(2).min(20);
+    let slots = state
+        .app
+        .scp_slot_snapshots(limit)
+        .into_iter()
+        .map(ScpSlotInfo::from)
+        .collect();
+    Json(ScpInfoResponse {
+        node: state.app.info().public_key,
+        slots,
+    })
+}
+
+impl From<crate::app::ScpSlotSnapshot> for ScpSlotInfo {
+    fn from(snapshot: crate::app::ScpSlotSnapshot) -> Self {
+        Self {
+            slot_index: snapshot.slot_index,
+            is_externalized: snapshot.is_externalized,
+            is_nominating: snapshot.is_nominating,
+            ballot_phase: snapshot.ballot_phase,
+            nomination_round: snapshot.nomination_round,
+            ballot_round: snapshot.ballot_round,
+            envelope_count: snapshot.envelope_count,
+        }
+    }
+}
+
+async fn start_survey_collecting_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<StartSurveyParams>,
+) -> impl IntoResponse {
+    if !survey_booted(&state).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: "Application is not fully booted, try again later.".to_string(),
+            }),
+        );
+    }
+    let ok = state.app.start_survey_collecting(params.nonce).await;
+    let message = if ok {
+        "Requested network to start survey collecting."
+    } else {
+        "Failed to start survey collecting."
+    };
+    (StatusCode::OK, Json(SurveyCommandResponse { success: ok, message: message.to_string() }))
+}
+
+async fn stop_survey_collecting_handler(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    if !survey_booted(&state).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: "Application is not fully booted, try again later.".to_string(),
+            }),
+        );
+    }
+    let ok = state.app.stop_survey_collecting().await;
+    let message = if ok {
+        "Requested network to stop survey collecting."
+    } else {
+        "Failed to stop survey collecting."
+    };
+    (StatusCode::OK, Json(SurveyCommandResponse { success: ok, message: message.to_string() }))
+}
+
+async fn survey_topology_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<SurveyTopologyParams>,
+) -> impl IntoResponse {
+    if !survey_booted(&state).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: "Application is not fully booted, try again later.".to_string(),
+            }),
+        );
+    }
+    let pubkey = match stellar_core_crypto::PublicKey::from_strkey(&params.node) {
+        Ok(key) => key,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SurveyCommandResponse {
+                    success: false,
+                    message: "Invalid node public key".to_string(),
+                }),
+            );
+        }
+    };
+    let peer_id = stellar_core_overlay::PeerId::from_bytes(*pubkey.as_bytes());
+    let (Some(inbound), Some(outbound)) = (params.inbound_index, params.outbound_index) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SurveyCommandResponse {
+                success: false,
+                message: "Missing inbound_index or outbound_index".to_string(),
+            }),
+        );
+    };
+
+    let ok = state
+        .app
+        .survey_topology_timesliced(peer_id, inbound, outbound)
+        .await;
+    let message = if ok {
+        "Survey request queued."
+    } else {
+        "Survey request rejected."
+    };
+    (StatusCode::OK, Json(SurveyCommandResponse { success: ok, message: message.to_string() }))
+}
+
+async fn survey_booted(state: &ServerState) -> bool {
+    matches!(
+        state.app.state().await,
+        crate::app::AppState::Synced | crate::app::AppState::Validating
+    )
+}
+
+async fn stop_survey_reporting_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    state.app.stop_survey_reporting().await;
+    (
+        StatusCode::OK,
+        Json(SurveyCommandResponse {
+            success: true,
+            message: "Survey reporting stopped.".to_string(),
+        }),
+    )
 }
 
 async fn submit_tx_handler(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Json(request): Json<SubmitTxRequest>,
 ) -> impl IntoResponse {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -611,7 +1264,7 @@ async fn submit_tx_handler(
     };
 
     // Parse the transaction envelope
-    let _tx_env = match TransactionEnvelope::from_xdr(&tx_bytes, Limits::none()) {
+    let tx_env = match TransactionEnvelope::from_xdr(&tx_bytes, Limits::none()) {
         Ok(env) => env,
         Err(e) => {
             return (
@@ -625,18 +1278,44 @@ async fn submit_tx_handler(
         }
     };
 
-    // Compute transaction hash
-    let hash = stellar_core_common::Hash256::hash(&tx_bytes);
+    let network_id = NetworkId::from_passphrase(&state.app.info().network_passphrase);
+    let mut frame = TransactionFrame::with_network(tx_env.clone(), network_id);
+    let hash = frame.compute_hash(&network_id).ok();
+    let result = state.app.submit_transaction(tx_env);
 
-    // Would submit to herder's transaction queue here
-    // For now, return success with the hash
+    let (success, error) = match result {
+        stellar_core_herder::TxQueueResult::Added => (true, None),
+        stellar_core_herder::TxQueueResult::Duplicate => {
+            (true, Some("Transaction already in queue".to_string()))
+        }
+        stellar_core_herder::TxQueueResult::QueueFull => {
+            (false, Some("Transaction queue full".to_string()))
+        }
+        stellar_core_herder::TxQueueResult::FeeTooLow => {
+            (false, Some("Transaction fee too low".to_string()))
+        }
+        stellar_core_herder::TxQueueResult::Invalid => {
+            (false, Some("Transaction invalid".to_string()))
+        }
+    };
 
     (
         StatusCode::OK,
         Json(SubmitTxResponse {
+            success,
+            hash: hash.map(|value| value.to_hex()),
+            error,
+        }),
+    )
+}
+
+async fn shutdown_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    state.app.shutdown();
+    (
+        StatusCode::OK,
+        Json(SurveyCommandResponse {
             success: true,
-            hash: Some(hash.to_hex()),
-            error: None,
+            message: "Shutdown requested.".to_string(),
         }),
     )
 }
@@ -644,12 +1323,14 @@ async fn submit_tx_handler(
 async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let app_state = state.app.state().await;
     let is_healthy = matches!(app_state, AppState::Synced | AppState::Validating);
+    let (ledger_seq, _hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let peer_count = state.app.peer_snapshots().await.len();
 
     let response = HealthResponse {
         status: if is_healthy { "healthy" } else { "unhealthy" }.to_string(),
         state: format!("{}", app_state),
-        ledger_seq: 0,
-        peer_count: 0,
+        ledger_seq,
+        peer_count,
     };
 
     let status = if is_healthy {

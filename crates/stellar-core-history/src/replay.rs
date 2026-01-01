@@ -2,21 +2,22 @@
 //!
 //! This module handles replaying ledgers from history during catchup.
 //!
-//! Key insight: During catchup, we don't re-execute transactions. Instead, we:
-//! 1. Download the state at a checkpoint (bucket list)
-//! 2. Download ledger headers, transaction sets, and transaction results
-//! 3. Apply the *known* results from history to update ledger state
+//! Key approach: During catchup, we re-execute transactions against the current
+//! bucket list to reconstruct state changes, while still verifying history data.
+//! This keeps the bucket list consistent with transaction effects and lets us
+//! validate both the tx set hash and tx result set hash from the headers.
 //!
-//! This is safe because:
-//! - The bucket list hash in each header verifies the state is correct
-//! - The transaction result hash in each header verifies the results
-//! - We trust history archives that have been verified
+//! We still support a metadata-only replay path (`replay_ledger`) for tests and
+//! future alternative flows.
 
 use crate::{verify, HistoryError, Result};
-use stellar_core_common::Hash256;
+use stellar_core_common::{Hash256, NetworkId};
+use stellar_core_ledger::{
+    execution::execute_transaction_set, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
+};
 use stellar_xdr::curr::{
-    LedgerEntry, LedgerHeader, LedgerKey, TransactionMeta, TransactionResultPair,
-    TransactionSet, WriteXdr,
+    LedgerEntry, LedgerHeader, LedgerKey, TransactionEnvelope, TransactionMeta, TransactionResultPair,
+    TransactionResultSet, TransactionSet, WriteXdr,
 };
 
 /// The result of replaying a single ledger.
@@ -30,6 +31,10 @@ pub struct LedgerReplayResult {
     pub tx_count: u32,
     /// Number of operations in the ledger.
     pub op_count: u32,
+    /// Change in fee pool during the replayed ledger.
+    pub fee_pool_delta: i64,
+    /// Change in total coins during the replayed ledger.
+    pub total_coins_delta: i64,
     /// Changes to apply to the bucket list.
     pub live_entries: Vec<LedgerEntry>,
     /// Keys to mark as dead in the bucket list.
@@ -43,6 +48,8 @@ pub struct ReplayConfig {
     pub verify_results: bool,
     /// Whether to verify bucket list hashes.
     pub verify_bucket_list: bool,
+    /// Whether to enforce invariants during replay.
+    pub verify_invariants: bool,
 }
 
 impl Default for ReplayConfig {
@@ -50,6 +57,7 @@ impl Default for ReplayConfig {
         Self {
             verify_results: true,
             verify_bucket_list: true,
+            verify_invariants: true,
         }
     }
 }
@@ -73,7 +81,7 @@ impl Default for ReplayConfig {
 pub fn replay_ledger(
     header: &LedgerHeader,
     tx_set: &TransactionSet,
-    _tx_results: &[TransactionResultPair],
+    tx_results: &[TransactionResultPair],
     tx_metas: &[TransactionMeta],
     config: &ReplayConfig,
 ) -> Result<LedgerReplayResult> {
@@ -83,6 +91,17 @@ pub fn replay_ledger(
             .to_xdr(stellar_xdr::curr::Limits::none())
             .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx set: {}", e)))?;
         verify::verify_tx_set(header, &tx_set_xdr)?;
+
+        let result_set = TransactionResultSet {
+            results: tx_results
+                .to_vec()
+                .try_into()
+                .map_err(|_| HistoryError::CatchupFailed("tx result set too large".to_string()))?,
+        };
+        let xdr = result_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e)))?;
+        verify::verify_tx_result_set(header, &xdr)?;
     }
 
     // Extract ledger entry changes from transaction metadata
@@ -100,6 +119,103 @@ pub fn replay_ledger(
         ledger_hash,
         tx_count,
         op_count,
+        fee_pool_delta: 0,
+        total_coins_delta: 0,
+        live_entries,
+        dead_entries,
+    })
+}
+
+/// Replay a ledger by re-executing transactions against the current bucket list.
+pub fn replay_ledger_with_execution(
+    header: &LedgerHeader,
+    tx_set: &TransactionSet,
+    bucket_list: &mut stellar_core_bucket::BucketList,
+    network_id: &NetworkId,
+    config: &ReplayConfig,
+) -> Result<LedgerReplayResult> {
+    if config.verify_results {
+        let tx_set_xdr = tx_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx set: {}", e)))?;
+        verify::verify_tx_set(header, &tx_set_xdr)?;
+    }
+
+    let snapshot = LedgerSnapshot::empty(header.ledger_seq);
+    let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
+    let lookup_fn = std::sync::Arc::new(move |key: &LedgerKey| {
+        bucket_list_ref
+            .read()
+            .map_err(|_| LedgerError::Snapshot("bucket list lock poisoned".to_string()))?
+            .get(key)
+            .map_err(LedgerError::Bucket)
+    });
+    let snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+
+    let mut delta = LedgerDelta::new(header.ledger_seq);
+    let transactions: Vec<(TransactionEnvelope, Option<u32>)> = tx_set
+        .txs
+        .iter()
+        .cloned()
+        .map(|tx| (tx, None))
+        .collect();
+    let (results, tx_results, _tx_result_metas) = execute_transaction_set(
+        &snapshot,
+        &transactions,
+        header.ledger_seq,
+        header.scp_value.close_time.0,
+        header.base_fee,
+        header.base_reserve,
+        header.ledger_version,
+        *network_id,
+        &mut delta,
+    )
+    .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
+
+    if config.verify_results {
+        let result_set = TransactionResultSet {
+            results: tx_results
+                .clone()
+                .try_into()
+                .map_err(|_| HistoryError::CatchupFailed("tx result set too large".to_string()))?,
+        };
+        let xdr = result_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e)))?;
+        verify::verify_tx_result_set(header, &xdr)?;
+    }
+
+    let fee_pool_delta = delta.fee_pool_delta();
+    let total_coins_delta = delta.total_coins_delta();
+    let live_entries = delta.live_entries();
+    let dead_entries = delta.dead_entries();
+    bucket_list
+        .add_batch(header.ledger_seq, live_entries.clone(), dead_entries.clone())
+        .map_err(HistoryError::Bucket)?;
+    if config.verify_bucket_list {
+        let expected = Hash256::from(header.bucket_list_hash.0);
+        let actual = bucket_list.hash();
+        if actual != expected {
+            return Err(HistoryError::VerificationFailed(format!(
+                "bucket list hash mismatch at ledger {} (expected {}, got {})",
+                header.ledger_seq,
+                expected.to_hex(),
+                actual.to_hex()
+            )));
+        }
+    }
+
+    let tx_count = results.len() as u32;
+    let op_count: u32 = results.iter().map(|r| r.operation_results.len() as u32).sum();
+    let ledger_hash = verify::compute_header_hash(header)?;
+
+    Ok(LedgerReplayResult {
+        sequence: header.ledger_seq,
+        ledger_hash,
+        tx_count,
+        op_count,
+        fee_pool_delta,
+        total_coins_delta,
         live_entries,
         dead_entries,
     })
@@ -392,6 +508,7 @@ mod tests {
         let config = ReplayConfig {
             verify_results: false, // Skip verification for test
             verify_bucket_list: false,
+            verify_invariants: false,
         };
 
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config).unwrap();
@@ -428,5 +545,6 @@ mod tests {
         let config = ReplayConfig::default();
         assert!(config.verify_results);
         assert!(config.verify_bucket_list);
+        assert!(config.verify_invariants);
     }
 }

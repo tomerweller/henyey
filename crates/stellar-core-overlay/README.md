@@ -48,6 +48,9 @@ let config = OverlayConfig {
     known_peers: vec![
         PeerAddress::new("core-testnet1.stellar.org", 11625),
     ],
+    preferred_peers: vec![
+        PeerAddress::new("validator-a.example.com", 11625),
+    ],
     network_passphrase: "Test SDF Network ; September 2015".to_string(),
     auth_timeout_secs: 30,
     connect_timeout_secs: 10,
@@ -102,6 +105,9 @@ overlay.broadcast_scp(&scp_envelope).await?;
 // Get connected peers
 let peers = overlay.connected_peers().await;
 ```
+
+The connector loop keeps preferred peers connected and fills outbound slots up to
+`target_outbound_peers` using the known peer list.
 
 ### Handling Messages
 

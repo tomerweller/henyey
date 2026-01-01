@@ -11,6 +11,7 @@ The crypto module provides cryptographic primitives used throughout rs-stellar-c
 - Key management (Stellar key encoding/decoding)
 - Random number generation
 - Hex encoding utilities
+- Short hashing (SipHash-2-4)
 
 ## 2. stellar-core Reference
 
@@ -54,6 +55,9 @@ zeroize = { version = "1", features = ["derive"] }
 
 # Curve25519 for authentication keys - pure Rust
 x25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+
+# SipHash-2-4 short hashing - pure Rust
+siphasher = "0.3"
 ```
 
 **Note on Pure Rust Requirements**:
@@ -74,6 +78,7 @@ stellar-core-crypto/
 │   ├── strkey.rs        # Stellar key encoding (G..., S..., etc.)
 │   ├── random.rs        # Secure random generation
 │   ├── hex.rs           # Hex utilities
+│   ├── short_hash.rs    # SipHash-2-4 short hashing
 │   └── error.rs         # Error types
 └── tests/
     └── *.rs

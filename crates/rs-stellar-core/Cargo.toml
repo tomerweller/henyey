@@ -17,11 +17,13 @@ stellar-core-crypto.workspace = true
 stellar-core-db.workspace = true
 stellar-core-bucket.workspace = true
 stellar-core-history.workspace = true
+stellar-core-historywork.workspace = true
 stellar-core-overlay.workspace = true
 stellar-core-scp.workspace = true
 stellar-core-herder.workspace = true
 stellar-core-ledger.workspace = true
 stellar-core-tx.workspace = true
+stellar-core-work.workspace = true
 
 # Stellar XDR
 stellar-xdr.workspace = true
@@ -33,6 +35,8 @@ clap.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+x25519-dalek.workspace = true
+rand.workspace = true
 
 # HTTP server
 axum.workspace = true
@@ -58,6 +62,7 @@ base64.workspace = true
 
 # URL handling
 url.workspace = true
+fs2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

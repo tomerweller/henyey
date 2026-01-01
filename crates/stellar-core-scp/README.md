@@ -45,7 +45,7 @@ SCP guarantees safety (agreement) for any two nodes that share a quorum, and pro
 ### Basic SCP Operations
 
 ```rust
-use stellar_core_scp::{SCP, SCPDriver, EnvelopeState};
+use stellar_core_scp::{SCP, EnvelopeState};
 
 let scp = SCP::new(node_id, quorum_set, driver);
 
@@ -84,27 +84,11 @@ scp.nominate(slot_index, value, &prev_value);
 let state = scp.receive_envelope(envelope);
 ```
 
-### Quorum Configuration
-
-```rust
-use stellar_core_scp::{simple_quorum_set, is_valid_quorum_set};
-
-// Create a simple quorum set (threshold voting)
-let quorum_set = simple_quorum_set(
-    threshold,
-    &[node1, node2, node3],
-);
-
-// Validate quorum set
-assert!(is_valid_quorum_set(&quorum_set));
-```
-
 ### Quorum Utilities
 
 ```rust
 use stellar_core_scp::{
-    is_quorum, is_quorum_slice, is_v_blocking,
-    get_all_nodes, hash_quorum_set
+    hash_quorum_set, is_quorum, is_quorum_slice, is_v_blocking, normalize_quorum_set,
 };
 
 // Check if a set forms a quorum
@@ -116,11 +100,11 @@ let is_slice = is_quorum_slice(&nodes, &quorum_set);
 // Check if a set is v-blocking
 let is_vb = is_v_blocking(&nodes, &quorum_set);
 
-// Get all nodes in a quorum set
-let all_nodes = get_all_nodes(&quorum_set);
-
 // Hash a quorum set for comparison
 let hash = hash_quorum_set(&quorum_set);
+
+// Normalize quorum set ordering
+normalize_quorum_set(&mut quorum_set);
 ```
 
 ## Key Types
@@ -130,8 +114,8 @@ let hash = hash_quorum_set(&quorum_set);
 Main SCP state machine:
 
 ```rust
-let scp = SCP::new(node_id, quorum_set, driver);
-let state = scp.slot_state(slot_index);
+let scp = SCP::new(node_id, true, quorum_set, driver);
+let state = scp.get_slot_state(slot_index);
 ```
 
 ### SlotState
@@ -139,11 +123,10 @@ let state = scp.slot_state(slot_index);
 State of a consensus slot:
 
 ```rust
-match slot.state() {
-    SlotState::Nominating => { /* Still nominating */ }
-    SlotState::Preparing => { /* In ballot protocol */ }
-    SlotState::Confirming => { /* Confirming ballot */ }
-    SlotState::Externalized => { /* Consensus reached */ }
+if let Some(state) = scp.get_slot_state(slot_index) {
+    println!("nominating round: {}", state.nomination_round);
+    println!("ballot round: {:?}", state.ballot_round);
+    println!("phase: {:?}", state.ballot_phase);
 }
 ```
 
@@ -160,14 +143,24 @@ assert!(state.is_new());    // Caused state change
 
 ### SCPDriver
 
-Trait for SCP callbacks:
+Trait for SCP callbacks (abridged; see `crates/stellar-core-scp/src/driver.rs`):
 
 ```rust
 trait SCPDriver {
-    fn validate_value(&self, slot: SlotIndex, value: &Value) -> ValidationLevel;
-    fn combine_candidates(&self, slot: SlotIndex, candidates: &[Value]) -> Value;
-    fn emit_envelope(&self, envelope: ScpEnvelope);
+    fn validate_value(&self, slot: SlotIndex, value: &Value, nomination: bool) -> ValidationLevel;
+    fn combine_candidates(&self, slot: SlotIndex, candidates: &[Value]) -> Option<Value>;
+    fn extract_valid_value(&self, slot: SlotIndex, value: &Value) -> Option<Value>;
+    fn emit_envelope(&self, envelope: &ScpEnvelope);
+    fn get_quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet>;
+    fn nominating_value(&self, slot: SlotIndex, value: &Value);
     fn value_externalized(&self, slot: SlotIndex, value: &Value);
+    fn ballot_did_prepare(&self, slot: SlotIndex, ballot: &ScpBallot);
+    fn ballot_did_confirm(&self, slot: SlotIndex, ballot: &ScpBallot);
+    fn compute_hash_node(&self, slot: SlotIndex, prev: &Value, is_priority: bool, round: u32, node: &NodeId) -> u64;
+    fn compute_value_hash(&self, slot: SlotIndex, prev: &Value, round: u32, value: &Value) -> u64;
+    fn compute_timeout(&self, round: u32, is_nomination: bool) -> std::time::Duration;
+    fn sign_envelope(&self, envelope: &mut ScpEnvelope);
+    fn verify_envelope(&self, envelope: &ScpEnvelope) -> bool;
 }
 ```
 

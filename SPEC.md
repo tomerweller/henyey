@@ -21,12 +21,14 @@ rs-stellar-core is a Rust implementation of the Stellar Core node software. It a
 3. **Modular Architecture**: Each subsystem maps 1:1 to stellar-core for auditability
 4. **Rust Ecosystem Integration**: Leverage existing Stellar Rust crates
 5. **Research & Education**: Independent implementation for verification and learning
+6. **Deterministic Parity**: Observable behavior should be deterministic and identical to stellar-core v25
 
 ### 1.2 Non-Goals
 
 - Full history catchup from genesis (Protocol 1-22)
 - Custom Soroban host implementation (use `soroban-env-host`)
 - PostgreSQL support (SQLite only initially)
+- Full parity with stellar-core's extensive metrics reporting
 - Production deployment (research/education focus)
 
 ## 2. Architecture Overview

@@ -1,7 +1,7 @@
 //! Database schema definitions.
 
 /// Schema version.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// SQL to create the database schema.
 pub const CREATE_SCHEMA: &str = r#"
@@ -143,6 +143,28 @@ CREATE TABLE IF NOT EXISTS txhistory (
     txmeta BLOB
 );
 CREATE INDEX IF NOT EXISTS txhistory_ledger ON txhistory(ledgerseq);
+
+-- Transaction history entries (tx sets)
+CREATE TABLE IF NOT EXISTS txsets (
+    ledgerseq INTEGER PRIMARY KEY,
+    data BLOB NOT NULL
+);
+
+-- Transaction history result entries (tx results)
+CREATE TABLE IF NOT EXISTS txresults (
+    ledgerseq INTEGER PRIMARY KEY,
+    data BLOB NOT NULL
+);
+
+-- Bucket list snapshots (checkpoint ledgers only)
+CREATE TABLE IF NOT EXISTS bucketlist (
+    ledgerseq INTEGER NOT NULL,
+    level INTEGER NOT NULL,
+    currhash TEXT NOT NULL,
+    snaphash TEXT NOT NULL,
+    PRIMARY KEY (ledgerseq, level)
+);
+CREATE INDEX IF NOT EXISTS bucketlist_ledger ON bucketlist(ledgerseq);
 
 -- Transaction fee history
 CREATE TABLE IF NOT EXISTS txfeehistory (

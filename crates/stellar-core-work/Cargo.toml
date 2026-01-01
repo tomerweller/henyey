@@ -1,0 +1,16 @@
+[package]
+name = "stellar-core-work"
+description = "Work scheduler for rs-stellar-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

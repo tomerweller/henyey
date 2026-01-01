@@ -270,6 +270,19 @@ impl<D: SCPDriver> SCP<D> {
         self.slots.read().keys().copied().collect()
     }
 
+    /// Get all envelopes for a specific slot.
+    pub fn get_slot_envelopes(&self, slot_index: u64) -> Vec<ScpEnvelope> {
+        let slots = self.slots.read();
+        let Some(slot) = slots.get(&slot_index) else {
+            return Vec::new();
+        };
+
+        slot.get_envelopes()
+            .values()
+            .flat_map(|envs| envs.iter().cloned())
+            .collect()
+    }
+
     /// Get the highest externalized slot.
     pub fn highest_externalized_slot(&self) -> Option<u64> {
         self.slots
@@ -282,13 +295,12 @@ impl<D: SCPDriver> SCP<D> {
 
     /// Get the timeout duration for a nomination round.
     pub fn get_nomination_timeout(&self, round: u32) -> Duration {
-        self.driver.compute_timeout(round)
+        self.driver.compute_timeout(round, true)
     }
 
     /// Get the timeout duration for a ballot round.
     pub fn get_ballot_timeout(&self, round: u32) -> Duration {
-        // Ballot timeouts are typically the same as nomination timeouts
-        self.driver.compute_timeout(round)
+        self.driver.compute_timeout(round, false)
     }
 
     /// Cleanup old slots, keeping only the most recent ones.
@@ -315,6 +327,7 @@ impl<D: SCPDriver> SCP<D> {
             is_nominating: slot.is_nominating(),
             ballot_phase: slot.ballot_phase(),
             nomination_round: slot.nomination().round(),
+            ballot_round: slot.ballot_counter(),
         })
     }
 
@@ -355,6 +368,8 @@ pub struct SlotState {
     pub ballot_phase: crate::ballot::BallotPhase,
     /// Current nomination round.
     pub nomination_round: u32,
+    /// Current ballot round (ballot counter), if any.
+    pub ballot_round: Option<u32>,
 }
 
 #[cfg(test)]
@@ -441,7 +456,7 @@ mod tests {
             0
         }
 
-        fn compute_timeout(&self, round: u32) -> Duration {
+        fn compute_timeout(&self, round: u32, _is_nomination: bool) -> Duration {
             Duration::from_secs(1 + round as u64)
         }
 

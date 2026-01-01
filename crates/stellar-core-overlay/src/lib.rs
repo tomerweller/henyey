@@ -35,8 +35,9 @@ pub use codec::{helpers as message_helpers, MessageCodec, MessageFrame};
 pub use connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
 pub use error::OverlayError;
 pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
-pub use manager::{OverlayManager, OverlayMessage, OverlayStats};
+pub use manager::{OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
 pub use peer::{Peer, PeerInfo, PeerSender, PeerState, PeerStats, PeerStatsSnapshot};
+use tokio::sync::mpsc;
 
 /// Result type for overlay operations.
 pub type Result<T> = std::result::Result<T, OverlayError>;
@@ -68,6 +69,22 @@ pub struct OverlayConfig {
     pub listen_enabled: bool,
     /// Version info string for Hello messages.
     pub version_string: String,
+    /// Optional channel for peer connection events.
+    pub peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
+}
+
+/// Peer connection events emitted by the overlay.
+#[derive(Debug, Clone)]
+pub enum PeerEvent {
+    Connected(PeerAddress, PeerType),
+    Failed(PeerAddress, PeerType),
+}
+
+/// Peer type categories for connection events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerType {
+    Inbound,
+    Outbound,
 }
 
 impl Default for OverlayConfig {
@@ -85,6 +102,7 @@ impl Default for OverlayConfig {
             flood_ttl_secs: 300,
             listen_enabled: true,
             version_string: "rs-stellar-core/0.1.0".to_string(),
+            peer_event_tx: None,
         }
     }
 }

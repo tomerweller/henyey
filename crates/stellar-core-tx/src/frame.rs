@@ -1,13 +1,14 @@
 //! Transaction frame - wrapper around TransactionEnvelope.
 
-use stellar_core_common::{Hash256, NetworkId};
+use stellar_core_common::{Hash256, NetworkId, Resource};
 use stellar_core_crypto::sha256;
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, EnvelopeType, FeeBumpTransactionInnerTx, Hash,
-    InvokeHostFunctionOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
-    SorobanTransactionData, Transaction, TransactionEnvelope, TransactionExt,
+    InvokeHostFunctionOp, LedgerKey, Memo,
+    MuxedAccount, Operation, OperationBody, Preconditions, SorobanTransactionData,
+    SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
     TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
-    TransactionV1Envelope, Uint256, WriteXdr,
+    TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 use stellar_xdr::curr::Limits;
 
@@ -287,6 +288,20 @@ impl TransactionFrame {
         })
     }
 
+    /// Check if this transaction includes DEX-related operations.
+    pub fn has_dex_operations(&self) -> bool {
+        self.operations().iter().any(|op| {
+            matches!(
+                op.body,
+                OperationBody::ManageSellOffer(_)
+                    | OperationBody::ManageBuyOffer(_)
+                    | OperationBody::CreatePassiveSellOffer(_)
+                    | OperationBody::PathPaymentStrictSend(_)
+                    | OperationBody::PathPaymentStrictReceive(_)
+            )
+        })
+    }
+
     /// Get the Soroban transaction data (if present).
     pub fn soroban_data(&self) -> Option<&SorobanTransactionData> {
         match &self.envelope {
@@ -301,6 +316,62 @@ impl TransactionFrame {
                     TransactionExt::V1(data) => Some(data),
                 },
             },
+        }
+    }
+
+    fn is_restore_footprint_tx(&self) -> bool {
+        self.operations().iter().any(|op| {
+            matches!(op.body, OperationBody::RestoreFootprint(_))
+        })
+    }
+
+    /// Return the resource footprint used for surge pricing and limits.
+    pub fn resources(&self, use_byte_limit_in_classic: bool, ledger_version: u32) -> Resource {
+        let tx_size = self
+            .envelope
+            .to_xdr(Limits::none())
+            .map(|bytes| bytes.len() as i64)
+            .unwrap_or(0);
+
+        if self.is_soroban() {
+            let data = self.soroban_data();
+            let fallback_resources = stellar_xdr::curr::SorobanResources {
+                footprint: stellar_xdr::curr::LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            };
+            let resources = data
+                .map(|d| &d.resources)
+                .unwrap_or(&fallback_resources);
+
+            let op_count = 1i64;
+            let disk_read_entries = soroban_disk_read_entries(
+                resources,
+                data.map(|d| &d.ext),
+                self.is_restore_footprint_tx(),
+                ledger_version,
+            );
+            let write_entries = resources.footprint.read_write.len() as i64;
+
+            return Resource::new(vec![
+                op_count,
+                resources.instructions as i64,
+                tx_size,
+                resources.disk_read_bytes as i64,
+                resources.write_bytes as i64,
+                disk_read_entries,
+                write_entries,
+            ]);
+        }
+
+        if use_byte_limit_in_classic {
+            Resource::new(vec![self.operation_count() as i64, tx_size])
+        } else {
+            Resource::new(vec![self.operation_count() as i64])
         }
     }
 
@@ -372,9 +443,49 @@ pub fn muxed_to_ed25519(muxed: &MuxedAccount) -> &Uint256 {
     }
 }
 
+fn is_soroban_ledger_key(key: &LedgerKey) -> bool {
+    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
+}
+
+fn soroban_disk_read_entries(
+    resources: &stellar_xdr::curr::SorobanResources,
+    ext: Option<&SorobanTransactionDataExt>,
+    is_restore_footprint: bool,
+    ledger_version: u32,
+) -> i64 {
+    if is_restore_footprint {
+        return resources.footprint.read_write.len() as i64;
+    }
+
+    if ledger_version < 23 {
+        return (resources.footprint.read_only.len() + resources.footprint.read_write.len()) as i64;
+    }
+
+    let mut count = 0i64;
+    for key in resources.footprint.read_only.iter() {
+        if !is_soroban_ledger_key(key) {
+            count += 1;
+        }
+    }
+    for key in resources.footprint.read_write.iter() {
+        if !is_soroban_ledger_key(key) {
+            count += 1;
+        }
+    }
+
+    if ledger_version >= 23 {
+        if let Some(SorobanTransactionDataExt::V1(ext)) = ext {
+            count += ext.archived_soroban_entries.len() as i64;
+        }
+    }
+
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_core_common::ResourceType;
     use stellar_xdr::curr::*;
 
     fn create_test_transaction() -> TransactionEnvelope {
@@ -399,6 +510,75 @@ mod tests {
             memo: Memo::None,
             operations: vec![payment_op].try_into().unwrap(),
             ext: TransactionExt::V0,
+        };
+
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        })
+    }
+
+    fn create_soroban_transaction() -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        let function_name = ScSymbol(
+            StringM::<32>::try_from("test".to_string()).expect("symbol")
+        );
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                Uint256([3u8; 32]),
+            ))),
+            function_name,
+            args: VecM::<ScVal>::default(),
+        });
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function,
+                auth: VecM::default(),
+            }),
+        };
+
+        let read_only = vec![
+            LedgerKey::Account(LedgerKeyAccount {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32]))),
+            }),
+            LedgerKey::ContractData(LedgerKeyContractData {
+                contract: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                    Uint256([5u8; 32]),
+                ))),
+                key: ScVal::I32(0),
+                durability: ContractDataDurability::Persistent,
+            }),
+        ];
+        let read_write = vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([6u8; 32]),
+        })];
+        let footprint = LedgerFootprint {
+            read_only: read_only.try_into().unwrap(),
+            read_write: read_write.try_into().unwrap(),
+        };
+        let resources = SorobanResources {
+            footprint,
+            instructions: 100,
+            disk_read_bytes: 55,
+            write_bytes: 21,
+        };
+        let ext = SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+            archived_soroban_entries: vec![0u32, 1u32].try_into().unwrap(),
+        });
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext,
+                resources,
+                resource_fee: 0,
+            }),
         };
 
         TransactionEnvelope::Tx(TransactionV1Envelope {
@@ -435,6 +615,31 @@ mod tests {
         let mainnet_id = NetworkId::mainnet();
         let hash3 = frame.hash(&mainnet_id).unwrap();
         assert_ne!(hash, hash3);
+    }
+
+    #[test]
+    fn test_resources_classic_ops() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let resources = frame.resources(false, 25);
+
+        assert_eq!(resources.size(), 1);
+        assert_eq!(resources.get_val(ResourceType::Operations), 1);
+    }
+
+    #[test]
+    fn test_resources_soroban_disk_reads() {
+        let envelope = create_soroban_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let resources = frame.resources(false, 25);
+
+        assert_eq!(resources.size(), 7);
+        assert_eq!(resources.get_val(ResourceType::Operations), 1);
+        assert_eq!(resources.get_val(ResourceType::Instructions), 100);
+        assert_eq!(resources.get_val(ResourceType::DiskReadBytes), 55);
+        assert_eq!(resources.get_val(ResourceType::WriteBytes), 21);
+        assert_eq!(resources.get_val(ResourceType::ReadLedgerEntries), 3);
+        assert_eq!(resources.get_val(ResourceType::WriteLedgerEntries), 1);
     }
 
     #[test]

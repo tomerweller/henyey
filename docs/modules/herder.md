@@ -65,6 +65,7 @@ stellar-core-herder/
 │   ├── scp_driver.rs         # SCPDriver implementation
 │   ├── pending_envelopes.rs  # Envelope buffering
 │   ├── transaction_queue.rs  # Tx queue management
+│   ├── surge_pricing.rs      # Lane configs + priority queue helpers
 │   ├── tx_set_frame.rs       # Transaction set frames
 │   ├── quorum_tracker.rs     # Quorum set tracking
 │   ├── upgrades.rs           # Protocol upgrades
@@ -202,10 +203,10 @@ impl Herder {
         let slot = ledger_seq as u64 + 1;
         tracing::info!(slot = slot, "Triggering nomination");
 
-        // Build transaction set from queue
+        // Build transaction set from queue using the current ledger header max_tx_set_size
         let tx_set = self.build_transaction_set(ledger_seq);
 
-        // Create SCP value from transaction set
+        // Create SCP value from transaction set (includes configured upgrades)
         let value = self.create_scp_value(&tx_set, ledger_seq);
 
         // Get previous value for nomination
@@ -503,6 +504,19 @@ impl SCPDriver for HerderSCPDriver {
 ```
 
 ### 3.4 Transaction Queue
+
+The Rust transaction queue supports lane-aware limits for both tx set
+selection and queue admission. The config now includes:
+
+- `max_dex_ops`: optional DEX ops cap for tx set selection (classic lane).
+- `max_classic_bytes`: optional classic byte allowance for tx set selection.
+- DEX lane byte allowance always uses the classic byte allowance (MAX_CLASSIC_BYTE_ALLOWANCE).
+- `max_soroban_resources`: optional Soroban resource cap for tx set selection.
+- `max_soroban_bytes`: optional Soroban byte allowance for tx set selection (applied even if no other Soroban resource limits are set).
+- `max_queue_dex_ops`: optional DEX ops cap at queue admission with fee-based eviction.
+- `max_queue_soroban_resources`: optional Soroban resource cap at queue admission with fee-based eviction.
+- `max_queue_ops`: optional total ops cap at queue admission with fee-based eviction.
+- `max_queue_classic_bytes`: optional classic byte allowance for queue admission with fee-based eviction.
 
 ```rust
 use stellar_xdr::curr::TransactionEnvelope;

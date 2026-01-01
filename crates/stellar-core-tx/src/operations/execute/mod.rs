@@ -4,7 +4,8 @@
 //! Each operation type has its own submodule with the specific execution logic.
 
 use stellar_xdr::curr::{
-    AccountId, Operation, OperationBody, OperationResult, SorobanTransactionData,
+    AccountId, ContractEvent, DiagnosticEvent, Operation, OperationBody, OperationResult,
+    SorobanTransactionData,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -24,6 +25,7 @@ mod invoke_host_function;
 mod liquidity_pool;
 mod manage_data;
 mod manage_offer;
+mod offer_exchange;
 mod path_payment;
 mod payment;
 mod restore_footprint;
@@ -42,6 +44,7 @@ pub use manage_data::execute_manage_data;
 pub use manage_offer::{
     execute_create_passive_sell_offer, execute_manage_buy_offer, execute_manage_sell_offer,
 };
+pub use offer_exchange::{exchange_v10, ExchangeError, ExchangeResult, RoundingType};
 pub use path_payment::{execute_path_payment_strict_receive, execute_path_payment_strict_send};
 pub use payment::execute_payment;
 pub use restore_footprint::execute_restore_footprint;
@@ -70,12 +73,42 @@ pub use trust_flags::{execute_allow_trust, execute_set_trust_line_flags};
 /// # Returns
 ///
 /// Returns the operation result, which may indicate success or a specific failure code.
+pub struct SorobanOperationMeta {
+    /// Contract/system events emitted by the operation.
+    pub events: Vec<ContractEvent>,
+    /// Diagnostic events emitted during execution.
+    pub diagnostic_events: Vec<DiagnosticEvent>,
+    /// Return value for invoke host function (if any).
+    pub return_value: Option<stellar_xdr::curr::ScVal>,
+}
+
+pub struct OperationExecutionResult {
+    pub result: OperationResult,
+    pub soroban_meta: Option<SorobanOperationMeta>,
+}
+
+impl OperationExecutionResult {
+    fn new(result: OperationResult) -> Self {
+        Self {
+            result,
+            soroban_meta: None,
+        }
+    }
+
+    fn with_soroban_meta(result: OperationResult, meta: SorobanOperationMeta) -> Self {
+        Self {
+            result,
+            soroban_meta: Some(meta),
+        }
+    }
+}
+
 pub fn execute_operation(
     op: &Operation,
     source_account_id: &AccountId,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-) -> Result<OperationResult> {
+) -> Result<OperationExecutionResult> {
     execute_operation_with_soroban(op, source_account_id, state, context, None)
 }
 
@@ -88,7 +121,7 @@ pub fn execute_operation_with_soroban(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
-) -> Result<OperationResult> {
+) -> Result<OperationExecutionResult> {
     // Get the actual source for this operation
     // If the operation has an explicit source, use it; otherwise use the transaction source
     let op_source = op
@@ -99,25 +132,39 @@ pub fn execute_operation_with_soroban(
 
     match &op.body {
         OperationBody::CreateAccount(op_data) => {
-            create_account::execute_create_account(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                create_account::execute_create_account(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::Payment(op_data) => {
-            payment::execute_payment(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                payment::execute_payment(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::ChangeTrust(op_data) => {
-            change_trust::execute_change_trust(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                change_trust::execute_change_trust(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::ManageData(op_data) => {
-            manage_data::execute_manage_data(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                manage_data::execute_manage_data(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::BumpSequence(op_data) => {
-            bump_sequence::execute_bump_sequence(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                bump_sequence::execute_bump_sequence(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::AccountMerge(dest) => {
-            account_merge::execute_account_merge(dest, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                account_merge::execute_account_merge(dest, &op_source, state, context)?,
+            ))
         }
         OperationBody::SetOptions(op_data) => {
-            set_options::execute_set_options(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                set_options::execute_set_options(op_data, &op_source, state, context)?,
+            ))
         }
         // Soroban operations
         OperationBody::InvokeHostFunction(op_data) => {
@@ -130,74 +177,126 @@ pub fn execute_operation_with_soroban(
             )
         }
         OperationBody::ExtendFootprintTtl(op_data) => {
-            extend_footprint_ttl::execute_extend_footprint_ttl(
-                op_data,
-                &op_source,
-                state,
-                context,
-                soroban_data,
-            )
+            Ok(OperationExecutionResult::new(
+                extend_footprint_ttl::execute_extend_footprint_ttl(
+                    op_data,
+                    &op_source,
+                    state,
+                    context,
+                    soroban_data,
+                )?,
+            ))
         }
         OperationBody::RestoreFootprint(op_data) => {
-            restore_footprint::execute_restore_footprint(
-                op_data,
-                &op_source,
-                state,
-                context,
-                soroban_data,
-            )
+            Ok(OperationExecutionResult::new(
+                restore_footprint::execute_restore_footprint(
+                    op_data,
+                    &op_source,
+                    state,
+                    context,
+                    soroban_data,
+                )?,
+            ))
         }
         // DEX operations
         OperationBody::PathPaymentStrictReceive(op_data) => {
-            path_payment::execute_path_payment_strict_receive(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                path_payment::execute_path_payment_strict_receive(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
         OperationBody::PathPaymentStrictSend(op_data) => {
-            path_payment::execute_path_payment_strict_send(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                path_payment::execute_path_payment_strict_send(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
         OperationBody::ManageSellOffer(op_data) => {
-            manage_offer::execute_manage_sell_offer(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                manage_offer::execute_manage_sell_offer(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::ManageBuyOffer(op_data) => {
-            manage_offer::execute_manage_buy_offer(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                manage_offer::execute_manage_buy_offer(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::CreatePassiveSellOffer(op_data) => {
-            manage_offer::execute_create_passive_sell_offer(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                manage_offer::execute_create_passive_sell_offer(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
         OperationBody::AllowTrust(op_data) => {
-            trust_flags::execute_allow_trust(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                trust_flags::execute_allow_trust(op_data, &op_source, state, context)?,
+            ))
         }
-        OperationBody::Inflation => inflation::execute_inflation(&op_source, state, context),
+        OperationBody::Inflation => Ok(OperationExecutionResult::new(
+            inflation::execute_inflation(&op_source, state, context)?,
+        )),
         OperationBody::CreateClaimableBalance(op_data) => {
-            claimable_balance::execute_create_claimable_balance(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                claimable_balance::execute_create_claimable_balance(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
         OperationBody::ClaimClaimableBalance(op_data) => {
-            claimable_balance::execute_claim_claimable_balance(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                claimable_balance::execute_claim_claimable_balance(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
         OperationBody::BeginSponsoringFutureReserves(op_data) => {
-            sponsorship::execute_begin_sponsoring_future_reserves(
-                op_data, &op_source, state, context,
-            )
+            Ok(OperationExecutionResult::new(
+                sponsorship::execute_begin_sponsoring_future_reserves(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
         OperationBody::EndSponsoringFutureReserves => {
-            sponsorship::execute_end_sponsoring_future_reserves(&op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                sponsorship::execute_end_sponsoring_future_reserves(&op_source, state, context)?,
+            ))
         }
         OperationBody::RevokeSponsorship(op_data) => {
-            sponsorship::execute_revoke_sponsorship(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                sponsorship::execute_revoke_sponsorship(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::Clawback(op_data) => {
-            clawback::execute_clawback(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                clawback::execute_clawback(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::ClawbackClaimableBalance(op_data) => {
-            clawback::execute_clawback_claimable_balance(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                clawback::execute_clawback_claimable_balance(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::SetTrustLineFlags(op_data) => {
-            trust_flags::execute_set_trust_line_flags(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                trust_flags::execute_set_trust_line_flags(op_data, &op_source, state, context)?,
+            ))
         }
         OperationBody::LiquidityPoolDeposit(op_data) => {
-            liquidity_pool::execute_liquidity_pool_deposit(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                liquidity_pool::execute_liquidity_pool_deposit(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
         OperationBody::LiquidityPoolWithdraw(op_data) => {
-            liquidity_pool::execute_liquidity_pool_withdraw(op_data, &op_source, state, context)
+            Ok(OperationExecutionResult::new(
+                liquidity_pool::execute_liquidity_pool_withdraw(
+                    op_data, &op_source, state, context,
+                )?,
+            ))
         }
     }
 }
@@ -232,11 +331,11 @@ mod tests {
             body: OperationBody::Inflation,
         };
 
-        let result = execute_operation(&op, &source, &mut state, &context);
-        assert!(result.is_ok());
+        let result = execute_operation(&op, &source, &mut state, &context)
+            .expect("execute op");
 
         // Inflation is deprecated and returns NotTime
-        match result.unwrap() {
+        match result.result {
             OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
                 assert!(matches!(r, InflationResult::NotTime));
             }

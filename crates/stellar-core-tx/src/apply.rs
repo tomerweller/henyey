@@ -16,6 +16,7 @@ use crate::result::{TxApplyResult, TxResultWrapper};
 use crate::{Result, TxError};
 
 /// Delta type alias for state changes.
+#[derive(Clone)]
 pub struct LedgerDelta {
     /// Ledger sequence this delta applies to.
     ledger_seq: u32,

@@ -29,6 +29,10 @@ pub enum LedgerError {
     #[error("bucket error: {0}")]
     Bucket(#[from] stellar_core_bucket::BucketError),
 
+    /// Invariant error.
+    #[error("invariant error: {0}")]
+    Invariant(#[from] stellar_core_invariant::InvariantError),
+
     /// XDR serialization error.
     #[error("XDR error: {0}")]
     Xdr(#[from] stellar_xdr::curr::Error),

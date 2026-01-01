@@ -23,6 +23,8 @@ const MAX_ENTRIES: usize = 100_000;
 
 /// Cleanup interval in seconds.
 const CLEANUP_INTERVAL_SECS: u64 = 60;
+/// Default max messages per second (soft rate limit).
+const DEFAULT_RATE_LIMIT_PER_SEC: u64 = 1000;
 
 /// Entry for a seen message.
 struct SeenEntry {
@@ -64,6 +66,12 @@ pub struct FloodGate {
     messages_seen: AtomicU64,
     /// Total messages dropped (duplicates).
     messages_dropped: AtomicU64,
+    /// Max messages allowed per second.
+    rate_limit: u64,
+    /// Start time for the current rate window.
+    rate_window_start: RwLock<Instant>,
+    /// Count of messages seen in the current window.
+    rate_window_count: AtomicU64,
 }
 
 impl FloodGate {
@@ -80,6 +88,9 @@ impl FloodGate {
             last_cleanup: RwLock::new(Instant::now()),
             messages_seen: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
+            rate_limit: DEFAULT_RATE_LIMIT_PER_SEC,
+            rate_window_start: RwLock::new(Instant::now()),
+            rate_window_count: AtomicU64::new(0),
         }
     }
 
@@ -116,6 +127,21 @@ impl FloodGate {
         self.seen.insert(message_hash, entry);
         trace!("New message: {}", message_hash);
         true
+    }
+
+    /// Check if the current message rate is within limits.
+    pub fn allow_message(&self) -> bool {
+        let now = Instant::now();
+        {
+            let mut start = self.rate_window_start.write();
+            if now.duration_since(*start) >= Duration::from_secs(1) {
+                *start = now;
+                self.rate_window_count.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let count = self.rate_window_count.fetch_add(1, Ordering::Relaxed) + 1;
+        count <= self.rate_limit
     }
 
     /// Get peers to forward a message to (excluding peers that sent it to us).

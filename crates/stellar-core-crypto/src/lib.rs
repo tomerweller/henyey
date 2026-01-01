@@ -12,6 +12,8 @@ mod error;
 mod hash;
 mod keys;
 mod random;
+mod sealed_box;
+mod short_hash;
 mod signature;
 mod strkey;
 
@@ -19,6 +21,8 @@ pub use error::CryptoError;
 pub use hash::*;
 pub use keys::*;
 pub use random::*;
+pub use sealed_box::*;
+pub use short_hash::*;
 pub use signature::*;
 pub use strkey::*;
 

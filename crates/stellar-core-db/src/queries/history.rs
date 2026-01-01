@@ -1,6 +1,9 @@
 //! Transaction history queries.
 
 use rusqlite::{Connection, OptionalExtension, params};
+use stellar_xdr::curr::{
+    Limits, ReadXdr, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
+};
 
 use super::super::error::DbError;
 
@@ -36,6 +39,32 @@ pub trait HistoryQueries {
 
     /// Load a transaction by ID.
     fn load_transaction(&self, tx_id: &str) -> Result<Option<TxRecord>, DbError>;
+
+    /// Store a transaction history entry (tx set).
+    fn store_tx_history_entry(
+        &self,
+        ledger_seq: u32,
+        entry: &TransactionHistoryEntry,
+    ) -> Result<(), DbError>;
+
+    /// Load a transaction history entry (tx set).
+    fn load_tx_history_entry(
+        &self,
+        ledger_seq: u32,
+    ) -> Result<Option<TransactionHistoryEntry>, DbError>;
+
+    /// Store a transaction history result entry (tx results).
+    fn store_tx_result_entry(
+        &self,
+        ledger_seq: u32,
+        entry: &TransactionHistoryResultEntry,
+    ) -> Result<(), DbError>;
+
+    /// Load a transaction history result entry (tx results).
+    fn load_tx_result_entry(
+        &self,
+        ledger_seq: u32,
+    ) -> Result<Option<TransactionHistoryResultEntry>, DbError>;
 }
 
 impl HistoryQueries for Connection {
@@ -98,12 +127,82 @@ impl HistoryQueries for Connection {
             None => Ok(None),
         }
     }
+
+    fn store_tx_history_entry(
+        &self,
+        ledger_seq: u32,
+        entry: &TransactionHistoryEntry,
+    ) -> Result<(), DbError> {
+        let data = entry.to_xdr(Limits::none())?;
+        self.execute(
+            "INSERT OR REPLACE INTO txsets (ledgerseq, data) VALUES (?1, ?2)",
+            params![ledger_seq, data],
+        )?;
+        Ok(())
+    }
+
+    fn load_tx_history_entry(
+        &self,
+        ledger_seq: u32,
+    ) -> Result<Option<TransactionHistoryEntry>, DbError> {
+        let result: Option<Vec<u8>> = self
+            .query_row(
+                "SELECT data FROM txsets WHERE ledgerseq = ?1",
+                params![ledger_seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match result {
+            Some(data) => Ok(Some(TransactionHistoryEntry::from_xdr(
+                data.as_slice(),
+                Limits::none(),
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    fn store_tx_result_entry(
+        &self,
+        ledger_seq: u32,
+        entry: &TransactionHistoryResultEntry,
+    ) -> Result<(), DbError> {
+        let data = entry.to_xdr(Limits::none())?;
+        self.execute(
+            "INSERT OR REPLACE INTO txresults (ledgerseq, data) VALUES (?1, ?2)",
+            params![ledger_seq, data],
+        )?;
+        Ok(())
+    }
+
+    fn load_tx_result_entry(
+        &self,
+        ledger_seq: u32,
+    ) -> Result<Option<TransactionHistoryResultEntry>, DbError> {
+        let result: Option<Vec<u8>> = self
+            .query_row(
+                "SELECT data FROM txresults WHERE ledgerseq = ?1",
+                params![ledger_seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match result {
+            Some(data) => Ok(Some(TransactionHistoryResultEntry::from_xdr(
+                data.as_slice(),
+                Limits::none(),
+            )?)),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use stellar_xdr::curr::{
+        GeneralizedTransactionSet, Hash, TransactionHistoryEntryExt,
+        TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, VecM,
+    };
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -118,6 +217,14 @@ mod tests {
                 txmeta BLOB
             );
             CREATE INDEX txhistory_ledger ON txhistory(ledgerseq);
+            CREATE TABLE txsets (
+                ledgerseq INTEGER PRIMARY KEY,
+                data BLOB NOT NULL
+            );
+            CREATE TABLE txresults (
+                ledgerseq INTEGER PRIMARY KEY,
+                data BLOB NOT NULL
+            );
             "#,
         )
         .unwrap();
@@ -183,5 +290,42 @@ mod tests {
         assert_eq!(loaded.body, b"new_body".to_vec());
         assert_eq!(loaded.result, b"new_result".to_vec());
         assert_eq!(loaded.meta, Some(b"meta".to_vec()));
+    }
+
+    #[test]
+    fn test_store_and_load_tx_history_entry() {
+        let conn = setup_db();
+        let entry = TransactionHistoryEntry {
+            ledger_seq: 123,
+            tx_set: GeneralizedTransactionSet::V1(TransactionSet {
+                previous_ledger_hash: Hash::default(),
+                txs: VecM::default(),
+            }),
+            ext: TransactionHistoryEntryExt::V0,
+        };
+
+        conn.store_tx_history_entry(123, &entry).unwrap();
+        let loaded = conn.get_tx_history_entry(123).unwrap().unwrap();
+        assert_eq!(loaded.ledger_seq, 123);
+        assert_eq!(loaded.tx_set, entry.tx_set);
+        assert_eq!(loaded.ext, entry.ext);
+    }
+
+    #[test]
+    fn test_store_and_load_tx_result_entry() {
+        let conn = setup_db();
+        let entry = TransactionHistoryResultEntry {
+            ledger_seq: 456,
+            tx_result_set: TransactionResultSet {
+                results: VecM::default(),
+            },
+            ext: TransactionHistoryResultEntryExt::V0,
+        };
+
+        conn.store_tx_result_entry(456, &entry).unwrap();
+        let loaded = conn.get_tx_result_entry(456).unwrap().unwrap();
+        assert_eq!(loaded.ledger_seq, 456);
+        assert_eq!(loaded.tx_result_set, entry.tx_result_set);
+        assert_eq!(loaded.ext, entry.ext);
     }
 }

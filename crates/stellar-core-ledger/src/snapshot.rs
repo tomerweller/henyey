@@ -174,6 +174,7 @@ impl Clone for LedgerSnapshot {
 
 /// A callback for looking up entries not in the snapshot cache.
 pub type EntryLookupFn = Arc<dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync>;
+pub type LedgerHeaderLookupFn = Arc<dyn Fn(u32) -> Result<Option<LedgerHeader>> + Send + Sync>;
 
 /// A thread-safe handle to a ledger snapshot.
 ///
@@ -184,6 +185,8 @@ pub struct SnapshotHandle {
     inner: Arc<LedgerSnapshot>,
     /// Optional lookup function for entries not in cache (e.g., bucket list lookup).
     lookup_fn: Option<EntryLookupFn>,
+    /// Optional lookup function for historical ledger headers.
+    header_lookup_fn: Option<LedgerHeaderLookupFn>,
 }
 
 impl SnapshotHandle {
@@ -192,6 +195,7 @@ impl SnapshotHandle {
         Self {
             inner: Arc::new(snapshot),
             lookup_fn: None,
+            header_lookup_fn: None,
         }
     }
 
@@ -200,12 +204,31 @@ impl SnapshotHandle {
         Self {
             inner: Arc::new(snapshot),
             lookup_fn: Some(lookup_fn),
+            header_lookup_fn: None,
+        }
+    }
+
+    /// Create a new handle with lookup functions for entries and headers.
+    pub fn with_lookups(
+        snapshot: LedgerSnapshot,
+        lookup_fn: EntryLookupFn,
+        header_lookup_fn: LedgerHeaderLookupFn,
+    ) -> Self {
+        Self {
+            inner: Arc::new(snapshot),
+            lookup_fn: Some(lookup_fn),
+            header_lookup_fn: Some(header_lookup_fn),
         }
     }
 
     /// Set the lookup function.
     pub fn set_lookup(&mut self, lookup_fn: EntryLookupFn) {
         self.lookup_fn = Some(lookup_fn);
+    }
+
+    /// Set the ledger header lookup function.
+    pub fn set_header_lookup(&mut self, lookup_fn: LedgerHeaderLookupFn) {
+        self.header_lookup_fn = Some(lookup_fn);
     }
 
     /// Get the underlying snapshot.
@@ -221,6 +244,19 @@ impl SnapshotHandle {
     /// Get the header.
     pub fn header(&self) -> &LedgerHeader {
         &self.inner.header
+    }
+
+    /// Look up a ledger header by sequence number.
+    pub fn get_ledger_header(&self, seq: u32) -> Result<Option<LedgerHeader>> {
+        if seq == self.inner.ledger_seq {
+            return Ok(Some(self.inner.header.clone()));
+        }
+
+        if let Some(ref lookup_fn) = self.header_lookup_fn {
+            return lookup_fn(seq);
+        }
+
+        Ok(None)
     }
 
     /// Look up an entry.

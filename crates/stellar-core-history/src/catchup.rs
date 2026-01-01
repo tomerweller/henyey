@@ -15,13 +15,10 @@
 //!
 //! ## Key Insight
 //!
-//! During catchup, we don't re-execute transactions. Instead, we trust the
-//! history archives and apply the *known* results. This is safe because:
-//!
-//! - We verify bucket hashes match what's in the HAS
-//! - We verify the header chain is correctly linked
-//! - We verify bucket list hashes in headers match computed values
-//! - Transaction result hashes are verified against headers
+//! During catchup, we re-execute transactions against the bucket list state to
+//! reconstruct ledger changes while still verifying history data. This keeps
+//! bucket list evolution consistent with transaction effects and lets us check
+//! tx set and tx result hashes against the headers.
 
 use crate::{
     archive::HistoryArchive,
@@ -32,9 +29,19 @@ use crate::{
     verify, CatchupOutput, CatchupResult, HistoryError, Result,
 };
 use stellar_core_bucket::{BucketList, BucketManager};
-use stellar_core_common::Hash256;
+use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
-use stellar_xdr::curr::{LedgerHeader, TransactionMeta, TransactionResultPair, TransactionSet, WriteXdr};
+use stellar_core_invariant::{
+    BucketListHashMatchesHeader, CloseTimeNondecreasing, ConservationOfLumens, InvariantContext,
+    InvariantManager, LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerSeqIncrement,
+};
+use stellar_core_tx::TransactionFrame;
+use stellar_xdr::curr::{
+    LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
+    TransactionHistoryResultEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntryExt,
+    TransactionMeta, TransactionResultPair, TransactionResultSet, TransactionSet, WriteXdr,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -95,6 +102,17 @@ impl Default for CatchupProgress {
             message: String::new(),
         }
     }
+}
+
+/// Pre-downloaded checkpoint data for catchup.
+#[derive(Debug, Clone)]
+pub struct CheckpointData {
+    pub has: HistoryArchiveState,
+    pub buckets: HashMap<Hash256, Vec<u8>>,
+    pub headers: Vec<LedgerHeaderHistoryEntry>,
+    pub transactions: Vec<TransactionHistoryEntry>,
+    pub tx_results: Vec<TransactionHistoryResultEntry>,
+    pub scp_history: Vec<ScpHistoryEntry>,
 }
 
 /// Manager for catching up from history archives.
@@ -190,6 +208,12 @@ impl CatchupManager {
         verify::verify_has_structure(&has)?;
         verify::verify_has_checkpoint(&has, checkpoint_seq)?;
 
+        let scp_history = self.download_scp_history(checkpoint_seq).await?;
+        if !scp_history.is_empty() {
+            verify::verify_scp_history_entries(&scp_history)?;
+            self.persist_scp_history_entries(&scp_history)?;
+        }
+
         // Step 3: Download all buckets referenced in the HAS
         self.update_progress(CatchupStatus::DownloadingBuckets, 2, "Downloading bucket files");
         let bucket_hashes = has.unique_bucket_hashes();
@@ -200,6 +224,7 @@ impl CatchupManager {
         // Step 4: Apply buckets to build initial state
         self.update_progress(CatchupStatus::ApplyingBuckets, 3, "Applying buckets to build initial state");
         let (mut bucket_list, hot_archive_bucket_list) = self.apply_buckets(&has, &buckets).await?;
+        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         // Step 5: Download ledger data from checkpoint to target
         self.update_progress(CatchupStatus::DownloadingLedgers, 4, "Downloading ledger data");
@@ -208,6 +233,12 @@ impl CatchupManager {
         // Step 6: Verify the header chain
         self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
         self.verify_downloaded_data(&ledger_data)?;
+
+        let network_id = has
+            .network_passphrase
+            .as_ref()
+            .map(|p| NetworkId::from_passphrase(p))
+            .unwrap_or_else(NetworkId::testnet);
 
         // Step 7: Replay ledgers from checkpoint to target (if any)
         self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
@@ -220,7 +251,9 @@ impl CatchupManager {
             (checkpoint_header, header_hash, 0)
         } else {
             // Replay ledgers to reach target
-            let final_state = self.replay_ledgers(&mut bucket_list, ledger_data).await?;
+            let final_state = self
+                .replay_ledgers(&mut bucket_list, &ledger_data, network_id)
+                .await?;
             let ledgers_applied = target - checkpoint_seq;
             // Get the final header from replay
             let final_header = self.download_checkpoint_header(target).await
@@ -239,6 +272,11 @@ impl CatchupManager {
             // as the bucket list may not be fully updated yet
         }
 
+        self.persist_ledger_history(&ledger_data, &network_id)?;
+        if ledger_data.is_empty() {
+            self.persist_header_only(&final_header)?;
+        }
+
         // Complete!
         self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
 
@@ -253,6 +291,162 @@ impl CatchupManager {
                 ledger_hash: final_hash,
                 ledgers_applied,
                 buckets_downloaded: buckets_total,
+            },
+            bucket_list,
+            hot_archive_bucket_list,
+            header: final_header,
+        })
+    }
+
+    /// Catch up to a target ledger using pre-downloaded checkpoint data.
+    pub async fn catchup_to_ledger_with_checkpoint_data(
+        &mut self,
+        target: u32,
+        data: CheckpointData,
+    ) -> Result<CatchupOutput> {
+        info!("Starting catchup to ledger {} with checkpoint data", target);
+        self.progress.target_ledger = target;
+
+        let checkpoint_seq = checkpoint::latest_checkpoint_before_or_at(target).ok_or_else(|| {
+            HistoryError::CatchupFailed(format!(
+                "target ledger {} is before first checkpoint",
+                target
+            ))
+        })?;
+
+        if data.has.current_ledger != checkpoint_seq {
+            return Err(HistoryError::CatchupFailed(format!(
+                "checkpoint data ledger {} does not match target checkpoint {}",
+                data.has.current_ledger, checkpoint_seq
+            )));
+        }
+
+        // Step 2: Verify HAS
+        self.update_progress(
+            CatchupStatus::DownloadingHAS,
+            1,
+            "Using provided History Archive State",
+        );
+        verify::verify_has_structure(&data.has)?;
+        verify::verify_has_checkpoint(&data.has, checkpoint_seq)?;
+
+        // Step 3: Verify buckets
+        self.update_progress(
+            CatchupStatus::DownloadingBuckets,
+            2,
+            "Verifying bucket files",
+        );
+        let bucket_hashes = data.has.unique_bucket_hashes();
+        self.progress.buckets_total = bucket_hashes.len() as u32;
+        let mut buckets = Vec::with_capacity(bucket_hashes.len());
+        for (idx, hash) in bucket_hashes.iter().enumerate() {
+            let Some(bytes) = data.buckets.get(hash) else {
+                return Err(HistoryError::BucketNotFound(*hash));
+            };
+            verify::verify_bucket_hash(bytes, hash)?;
+            buckets.push((*hash, bytes.clone()));
+            self.progress.buckets_downloaded = (idx + 1) as u32;
+        }
+
+        // Step 4: Verify SCP history entries (if present)
+        if !data.scp_history.is_empty() {
+            verify::verify_scp_history_entries(&data.scp_history)?;
+            self.persist_scp_history_entries(&data.scp_history)?;
+        }
+
+        // Step 4: Apply buckets to build initial state
+        self.update_progress(
+            CatchupStatus::ApplyingBuckets,
+            3,
+            "Applying buckets to build initial state",
+        );
+        let (mut bucket_list, hot_archive_bucket_list) =
+            self.apply_buckets(&data.has, &buckets).await?;
+        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
+
+        // Step 5: Build ledger data from checkpoint files
+        self.update_progress(
+            CatchupStatus::DownloadingLedgers,
+            4,
+            "Using provided ledger data",
+        );
+        let mut header_map = HashMap::new();
+        for entry in &data.headers {
+            header_map.insert(entry.header.ledger_seq, entry.header.clone());
+        }
+        for entry in &data.tx_results {
+            if entry.ledger_seq <= checkpoint_seq || entry.ledger_seq > target {
+                continue;
+            }
+            if let Some(header) = header_map.get(&entry.ledger_seq) {
+                let xdr = entry
+                    .tx_result_set
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .map_err(|e| {
+                        HistoryError::CatchupFailed(format!(
+                            "failed to encode tx result set: {}",
+                            e
+                        ))
+                    })?;
+                verify::verify_tx_result_set(header, &xdr)?;
+            }
+        }
+        let (checkpoint_header, ledger_data) = ledger_data_from_checkpoint(
+            checkpoint_seq,
+            target,
+            &data.headers,
+            &data.transactions,
+            &data.tx_results,
+        )?;
+
+        // Step 6: Verify the header chain
+        self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
+        self.verify_downloaded_data(&ledger_data)?;
+
+        let network_id = data
+            .has
+            .network_passphrase
+            .as_ref()
+            .map(|p| NetworkId::from_passphrase(p))
+            .unwrap_or_else(NetworkId::testnet);
+
+        // Step 7: Replay ledgers from checkpoint to target (if any)
+        self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
+
+        let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
+            let header_hash = verify::compute_header_hash(&checkpoint_header)?;
+            (checkpoint_header, header_hash, 0)
+        } else {
+            let final_state = self
+                .replay_ledgers(&mut bucket_list, &ledger_data, network_id)
+                .await?;
+            let ledgers_applied = target - checkpoint_seq;
+            let final_header = data
+                .headers
+                .iter()
+                .find(|entry| entry.header.ledger_seq == target)
+                .map(|entry| entry.header.clone())
+                .unwrap_or(checkpoint_header);
+            (final_header, final_state.ledger_hash, ledgers_applied)
+        };
+
+        if let Err(e) = self.verify_final_state(&final_header, &bucket_list) {
+            warn!("Final state verification warning: {}", e);
+        }
+
+        self.persist_ledger_history(&ledger_data, &network_id)?;
+        if ledger_data.is_empty() {
+            self.persist_header_only(&final_header)?;
+        }
+
+        self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
+
+        Ok(CatchupOutput {
+            result: CatchupResult {
+                ledger_seq: final_header.ledger_seq,
+                ledger_hash: final_hash,
+                ledgers_applied,
+                buckets_downloaded: bucket_hashes.len() as u32,
             },
             bucket_list,
             hot_archive_bucket_list,
@@ -284,6 +478,31 @@ impl CatchupManager {
             "failed to download HAS for checkpoint {} from any archive",
             checkpoint_seq
         )))
+    }
+
+    async fn download_scp_history(&self, checkpoint_seq: u32) -> Result<Vec<ScpHistoryEntry>> {
+        for archive in &self.archives {
+            match archive.get_scp_history(checkpoint_seq).await {
+                Ok(entries) => return Ok(entries),
+                Err(HistoryError::NotFound(_)) => {
+                    debug!(
+                        archive = %archive.base_url(),
+                        checkpoint = checkpoint_seq,
+                        "SCP history not found"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        archive = %archive.base_url(),
+                        checkpoint = checkpoint_seq,
+                        error = %e,
+                        "Failed to download SCP history"
+                    );
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Download all buckets referenced in the HAS.
@@ -355,10 +574,15 @@ impl CatchupManager {
         let archives = self.archives.clone();
         let bucket_dir = bucket_dir.to_path_buf();
 
+        let empty_bucket_hash = Hash256::hash(&[]);
+
         // Helper to load a bucket - downloads on-demand, saves to disk, and caches
         let load_bucket = |hash: &Hash256| -> stellar_core_bucket::Result<Bucket> {
             // Zero hash means empty bucket
             if hash.is_zero() {
+                return Ok(Bucket::empty());
+            }
+            if *hash == empty_bucket_hash {
                 return Ok(Bucket::empty());
             }
 
@@ -390,24 +614,60 @@ impl CatchupManager {
                 let hash = *hash;
                 let archives = archives.clone();
 
-                // Use tokio's block_in_place to run async code
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        for archive in &archives {
-                            match archive.get_bucket(&hash).await {
-                                Ok(data) => return Ok(data),
-                                Err(e) => {
-                                    warn!("Failed to download bucket {} from archive: {}", hash, e);
-                                    continue;
-                                }
+                let download = async move {
+                    for archive in &archives {
+                        match archive.get_bucket(&hash).await {
+                            Ok(data) => return Ok(data),
+                            Err(e) => {
+                                warn!("Failed to download bucket {} from archive: {}", hash, e);
+                                continue;
                             }
                         }
-                        Err(stellar_core_bucket::BucketError::NotFound(format!(
-                            "Bucket {} not found in any archive",
-                            hash
-                        )))
-                    })
-                })?
+                    }
+                    Err(stellar_core_bucket::BucketError::NotFound(format!(
+                        "Bucket {} not found in any archive",
+                        hash
+                    )))
+                };
+
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    if matches!(
+                        handle.runtime_flavor(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    ) {
+                        tokio::task::block_in_place(|| handle.block_on(download))?
+                    } else {
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|e| {
+                                    stellar_core_bucket::BucketError::NotFound(format!(
+                                        "failed to build runtime: {}",
+                                        e
+                                    ))
+                                })?;
+                            rt.block_on(download)
+                        })
+                        .join()
+                        .map_err(|_| {
+                            stellar_core_bucket::BucketError::NotFound(
+                                "bucket download thread panicked".to_string(),
+                            )
+                        })??
+                    }
+                } else {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            stellar_core_bucket::BucketError::NotFound(format!(
+                                "failed to build runtime: {}",
+                                e
+                            ))
+                        })?;
+                    rt.block_on(download)?
+                }
             };
 
             info!(
@@ -568,21 +828,34 @@ impl CatchupManager {
 
         // Download transactions for this checkpoint
         let tx_entries = archive.get_transactions(seq).await?;
+        let tx_history_entry = tx_entries.into_iter().find(|t| t.ledger_seq == seq);
 
-        // Find transactions for this ledger
-        let tx_set = tx_entries
-            .into_iter()
-            .find(|t| t.ledger_seq == seq)
-            .map(|t| t.tx_set)
+        let tx_set = tx_history_entry
+            .as_ref()
+            .map(|entry| entry.tx_set.clone())
             .unwrap_or_else(|| TransactionSet {
                 previous_ledger_hash: header.previous_ledger_hash.clone(),
                 txs: Default::default(),
             });
 
-        // Transaction results and metadata are computed during replay, not downloaded.
-        // During catchup we only need to verify the transactions can be applied
-        // to produce the expected ledger hash.
-        let tx_results = Vec::new();
+        // Download transaction results for this checkpoint
+        let tx_result_entries = archive.get_results(seq).await?;
+        let tx_result_entry = tx_result_entries
+            .into_iter()
+            .find(|entry| entry.ledger_seq == seq);
+        let tx_results = tx_result_entry
+            .as_ref()
+            .map(|entry| entry.tx_result_set.results.iter().cloned().collect())
+            .unwrap_or_else(Vec::new);
+        if let Some(entry) = tx_result_entry.as_ref() {
+            let xdr = entry
+                .tx_result_set
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx results: {}", e)))?;
+            verify::verify_tx_result_set(&header, &xdr)?;
+        }
+
+        // Transaction metadata is not available in history archives.
         let tx_metas = Vec::new();
 
         Ok(LedgerData {
@@ -590,6 +863,8 @@ impl CatchupManager {
             tx_set,
             tx_results,
             tx_metas,
+            tx_history_entry,
+            tx_result_entry,
         })
     }
 
@@ -614,6 +889,19 @@ impl CatchupManager {
                     // Continue - tx sets may be empty for some ledgers
                 }
             }
+            if !data.tx_results.is_empty() {
+                let result_set = TransactionResultSet {
+                    results: data.tx_results.clone().try_into().unwrap_or_default(),
+                };
+                if let Ok(xdr) = result_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+                    if let Err(e) = verify::verify_tx_result_set(&data.header, &xdr) {
+                        warn!(
+                            "Transaction result set verification failed for ledger {}: {}",
+                            data.header.ledger_seq, e
+                        );
+                    }
+                }
+            }
         }
 
         info!("Verified header chain for {} ledgers", headers.len());
@@ -633,6 +921,154 @@ impl CatchupManager {
             "Verified bucket list hash at ledger {}: {}",
             header.ledger_seq, computed_hash
         );
+        Ok(())
+    }
+
+    fn persist_ledger_history(
+        &self,
+        ledger_data: &[LedgerData],
+        network_id: &NetworkId,
+    ) -> Result<()> {
+        if ledger_data.is_empty() {
+            return Ok(());
+        }
+
+        self.db
+            .transaction(|conn| {
+                use stellar_core_db::error::DbError;
+                use stellar_core_db::queries::{HistoryQueries, LedgerQueries};
+
+                for data in ledger_data {
+                    let header_xdr = data.header.to_xdr(stellar_xdr::curr::Limits::none())?;
+                    conn.store_ledger_header(&data.header, &header_xdr)?;
+
+                    let tx_history_entry = data.tx_history_entry.clone().unwrap_or_else(|| {
+                        TransactionHistoryEntry {
+                            ledger_seq: data.header.ledger_seq,
+                            tx_set: data.tx_set.clone(),
+                            ext: TransactionHistoryEntryExt::V0,
+                        }
+                    });
+                    conn.store_tx_history_entry(data.header.ledger_seq, &tx_history_entry)?;
+
+                    let tx_result_entry = data.tx_result_entry.clone().unwrap_or_else(|| {
+                        let results = data.tx_results.clone().try_into().unwrap_or_default();
+                        TransactionHistoryResultEntry {
+                            ledger_seq: data.header.ledger_seq,
+                            tx_result_set: TransactionResultSet { results },
+                            ext: TransactionHistoryResultEntryExt::default(),
+                        }
+                    });
+                    conn.store_tx_result_entry(data.header.ledger_seq, &tx_result_entry)?;
+
+                    let tx_results: Vec<TransactionResultPair> = tx_result_entry
+                        .tx_result_set
+                        .results
+                        .iter()
+                        .cloned()
+                        .collect();
+                    let tx_count = data.tx_set.txs.len().min(tx_results.len());
+
+                    for (idx, tx) in data.tx_set.txs.iter().take(tx_count).enumerate() {
+                        let tx_result = &tx_results[idx];
+
+                        let frame = TransactionFrame::with_network(tx.clone(), *network_id);
+                        let tx_hash = frame
+                            .hash(network_id)
+                            .map_err(|e| DbError::Integrity(e.to_string()))?;
+                        let tx_id = tx_hash.to_hex();
+
+                        let tx_body = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
+                        let tx_result_xdr =
+                            tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
+
+                        conn.store_transaction(
+                            data.header.ledger_seq,
+                            idx as u32,
+                            &tx_id,
+                            &tx_body,
+                            &tx_result_xdr,
+                            None,
+                        )?;
+                    }
+                }
+
+                Ok(())
+            })
+            .map_err(|err| {
+                HistoryError::CatchupFailed(format!("failed to persist history: {}", err))
+            })?;
+
+        Ok(())
+    }
+
+    fn persist_scp_history_entries(&self, entries: &[ScpHistoryEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        self.db
+            .transaction(|conn| {
+                use stellar_core_db::queries::ScpQueries;
+
+                for entry in entries {
+                    let ScpHistoryEntry::V0(v0) = entry;
+                    let ledger_seq = v0.ledger_messages.ledger_seq;
+                    let envelopes: Vec<_> = v0.ledger_messages.messages.iter().cloned().collect();
+
+                    conn.store_scp_history(ledger_seq, &envelopes)?;
+
+                    for qset in v0.quorum_sets.iter() {
+                        let hash = Hash256::hash_xdr(qset).map_err(HistoryError::from)?;
+                        conn.store_scp_quorum_set(&hash, ledger_seq, qset)?;
+                    }
+                }
+
+                Ok(())
+            })
+            .map_err(|err| {
+                HistoryError::CatchupFailed(format!("failed to persist scp history: {}", err))
+            })?;
+
+        Ok(())
+    }
+
+    fn persist_bucket_list_snapshot(
+        &self,
+        ledger_seq: u32,
+        bucket_list: &BucketList,
+    ) -> Result<()> {
+        let levels = bucket_list
+            .levels()
+            .iter()
+            .map(|level| (level.curr.hash(), level.snap.hash()))
+            .collect::<Vec<_>>();
+        self.db
+            .with_connection(|conn| {
+                use stellar_core_db::queries::BucketListQueries;
+                conn.store_bucket_list(ledger_seq, &levels)?;
+                Ok(())
+            })
+            .map_err(|err| {
+                HistoryError::CatchupFailed(format!(
+                    "failed to persist bucket list for ledger {}: {}",
+                    ledger_seq, err
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn persist_header_only(&self, header: &LedgerHeader) -> Result<()> {
+        self.db
+            .with_connection(|conn| {
+                use stellar_core_db::queries::LedgerQueries;
+                let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
+                conn.store_ledger_header(header, &header_xdr)?;
+                Ok(())
+            })
+            .map_err(|err| {
+                HistoryError::CatchupFailed(format!("failed to persist header: {}", err))
+            })?;
         Ok(())
     }
 
@@ -669,7 +1105,8 @@ impl CatchupManager {
     async fn replay_ledgers(
         &mut self,
         bucket_list: &mut BucketList,
-        ledger_data: Vec<LedgerData>,
+        ledger_data: &[LedgerData],
+        network_id: NetworkId,
     ) -> Result<ReplayedLedgerState> {
         if ledger_data.is_empty() {
             return Err(HistoryError::CatchupFailed(
@@ -680,20 +1117,50 @@ impl CatchupManager {
         let total = ledger_data.len();
         let mut last_result: Option<LedgerReplayResult> = None;
         let mut last_header: Option<LedgerHeader> = None;
+        let invariants = if self.replay_config.verify_invariants {
+            let mut manager = InvariantManager::new();
+            manager.add(LedgerSeqIncrement);
+            manager.add(CloseTimeNondecreasing);
+            if self.replay_config.verify_bucket_list {
+                manager.add(BucketListHashMatchesHeader);
+            }
+            manager.add(ConservationOfLumens);
+            manager.add(LedgerEntryIsValid);
+            manager.add(LastModifiedLedgerSeqMatchesHeader);
+            Some(manager)
+        } else {
+            None
+        };
 
-        for (i, data) in ledger_data.into_iter().enumerate() {
+        for (i, data) in ledger_data.iter().enumerate() {
             self.progress.current_ledger = data.header.ledger_seq;
 
-            let result = replay::replay_ledger(
+            let result = replay::replay_ledger_with_execution(
                 &data.header,
                 &data.tx_set,
-                &data.tx_results,
-                &data.tx_metas,
+                bucket_list,
+                &network_id,
                 &self.replay_config,
             )?;
-
-            // Apply changes to bucket list
-            replay::apply_replay_to_bucket_list(bucket_list, &result)?;
+            if let (Some(prev_header), Some(manager)) = (last_header.as_ref(), invariants.as_ref()) {
+                let bucket_list_hash = bucket_list.hash();
+                let ctx = InvariantContext {
+                    prev_header,
+                    curr_header: &data.header,
+                    bucket_list_hash,
+                    fee_pool_delta: result.fee_pool_delta,
+                    total_coins_delta: result.total_coins_delta,
+                    changed_entries: &result.live_entries,
+                };
+                manager
+                    .check_all(&ctx)
+                    .map_err(|err| {
+                        HistoryError::CatchupFailed(format!(
+                            "replay invariant failed at ledger {}: {}",
+                            data.header.ledger_seq, err
+                        ))
+                    })?;
+            }
 
             debug!(
                 "Replayed ledger {}/{}: {} txs, {} ops",
@@ -703,7 +1170,7 @@ impl CatchupManager {
                 result.op_count
             );
 
-            last_header = Some(data.header);
+            last_header = Some(data.header.clone());
             last_result = Some(result);
         }
 
@@ -720,6 +1187,69 @@ impl CatchupManager {
     }
 }
 
+fn ledger_data_from_checkpoint(
+    checkpoint_seq: u32,
+    target: u32,
+    headers: &[LedgerHeaderHistoryEntry],
+    transactions: &[TransactionHistoryEntry],
+    tx_results: &[TransactionHistoryResultEntry],
+) -> Result<(LedgerHeader, Vec<LedgerData>)> {
+    let mut header_map = HashMap::new();
+    for entry in headers {
+        header_map.insert(entry.header.ledger_seq, entry.header.clone());
+    }
+
+    let checkpoint_header = header_map.get(&checkpoint_seq).ok_or_else(|| {
+        HistoryError::CatchupFailed(format!(
+            "checkpoint header {} not found in headers",
+            checkpoint_seq
+        ))
+    })?;
+
+    let mut tx_entry_map = HashMap::new();
+    for entry in transactions {
+        tx_entry_map.insert(entry.ledger_seq, entry.clone());
+    }
+
+    let mut result_entry_map = HashMap::new();
+    for entry in tx_results {
+        result_entry_map.insert(entry.ledger_seq, entry.clone());
+    }
+
+    let mut data = Vec::new();
+    for seq in (checkpoint_seq + 1)..=target {
+        let header = header_map.get(&seq).ok_or_else(|| {
+            HistoryError::CatchupFailed(format!("ledger {} not found in headers", seq))
+        })?;
+
+        let tx_history_entry = tx_entry_map.get(&seq).cloned();
+        let tx_set = tx_history_entry
+            .as_ref()
+            .map(|entry| entry.tx_set.clone())
+            .unwrap_or_else(|| TransactionSet {
+                previous_ledger_hash: header.previous_ledger_hash.clone(),
+                txs: Default::default(),
+            });
+
+        let tx_result_entry = result_entry_map.get(&seq).cloned();
+        let tx_results_vec = tx_result_entry
+            .as_ref()
+            .map(|set| set.tx_result_set.results.iter().cloned().collect())
+            .unwrap_or_else(Vec::new);
+
+        data.push(LedgerData {
+            header: header.clone(),
+            tx_set,
+            tx_results: tx_results_vec,
+            tx_metas: Vec::new(),
+            tx_history_entry,
+            tx_result_entry,
+        });
+    }
+
+    Ok((checkpoint_header.clone(), data))
+}
+
 /// Data downloaded for a single ledger.
 #[derive(Debug, Clone)]
 pub struct LedgerData {
@@ -731,6 +1261,10 @@ pub struct LedgerData {
     pub tx_results: Vec<TransactionResultPair>,
     /// Transaction metadata.
     pub tx_metas: Vec<TransactionMeta>,
+    /// Transaction history entry (tx set) when available.
+    pub tx_history_entry: Option<TransactionHistoryEntry>,
+    /// Transaction result history entry when available.
+    pub tx_result_entry: Option<TransactionHistoryResultEntry>,
 }
 
 /// Options for catchup operations.
@@ -824,6 +1358,7 @@ impl CatchupManagerBuilder {
         manager.replay_config = ReplayConfig {
             verify_results: self.options.verify_headers,
             verify_bucket_list: self.options.verify_buckets,
+            verify_invariants: true,
         };
 
         Ok(manager)

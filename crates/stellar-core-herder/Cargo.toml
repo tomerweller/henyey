@@ -30,6 +30,7 @@ tracing.workspace = true
 # Data structures
 dashmap.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

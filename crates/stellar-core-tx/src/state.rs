@@ -8,7 +8,7 @@ use stellar_xdr::curr::{
     LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance,
     LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyData, LedgerKeyLiquidityPool,
     LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl, LiquidityPoolEntry, OfferEntry, PoolId,
-    PublicKey, ScAddress, ScVal, TrustLineAsset, TrustLineEntry, TtlEntry,
+    Price, PublicKey, ScAddress, ScVal, TrustLineAsset, TrustLineEntry, TtlEntry,
 };
 
 use crate::apply::LedgerDelta;
@@ -91,11 +91,14 @@ impl AssetKey {
 ///
 /// This provides read/write access to ledger entries during transaction
 /// execution, tracking all changes for later persistence.
+#[derive(Clone)]
 pub struct LedgerStateManager {
     /// Current ledger sequence.
     ledger_seq: u32,
     /// Base reserve in stroops (minimum balance per sub-entry).
     base_reserve: i64,
+    /// ID pool for generating offer IDs.
+    id_pool: u64,
     /// Account entries by account ID (32-byte public key).
     accounts: HashMap<[u8; 32], AccountEntry>,
     /// Trustline entries by (account, asset).
@@ -165,6 +168,7 @@ impl LedgerStateManager {
         Self {
             ledger_seq,
             base_reserve,
+            id_pool: 0,
             accounts: HashMap::new(),
             trustlines: HashMap::new(),
             offers: HashMap::new(),
@@ -214,6 +218,22 @@ impl LedgerStateManager {
     /// Get the base reserve.
     pub fn base_reserve(&self) -> i64 {
         self.base_reserve
+    }
+
+    /// Get the current ID pool.
+    pub fn id_pool(&self) -> u64 {
+        self.id_pool
+    }
+
+    /// Set the current ID pool.
+    pub fn set_id_pool(&mut self, id_pool: u64) {
+        self.id_pool = id_pool;
+    }
+
+    /// Generate the next ID from the pool.
+    pub fn next_id(&mut self) -> i64 {
+        self.id_pool = self.id_pool.checked_add(1).expect("id_pool overflow");
+        i64::try_from(self.id_pool).expect("id_pool exceeds i64::MAX")
     }
 
     /// Get the current ledger sequence.
@@ -526,6 +546,33 @@ impl LedgerStateManager {
         self.trustlines.remove(&key);
     }
 
+    /// Delete a trustline entry by trustline asset.
+    pub fn delete_trustline_by_trustline_asset(
+        &mut self,
+        account_id: &AccountId,
+        asset: &TrustLineAsset,
+    ) {
+        let account_key = account_id_to_bytes(account_id);
+        let asset_key = AssetKey::from_trustline_asset(asset);
+        let key = (account_key, asset_key.clone());
+
+        // Save snapshot if not already saved
+        if !self.trustline_snapshots.contains_key(&key) {
+            let snapshot = self.trustlines.get(&key).cloned();
+            self.trustline_snapshots.insert(key.clone(), snapshot);
+        }
+
+        // Record in delta
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: account_id.clone(),
+            asset: asset.clone(),
+        });
+        self.delta.record_delete(ledger_key);
+
+        // Remove from state
+        self.trustlines.remove(&key);
+    }
+
     // ==================== Offer Operations ====================
 
     /// Get an offer by seller and offer ID (read-only).
@@ -622,6 +669,33 @@ impl LedgerStateManager {
 
         // Remove from state
         self.offers.remove(&key);
+    }
+
+    /// Get the best offer for a buying/selling pair (lowest price, then offer ID).
+    pub fn best_offer(&self, buying: &Asset, selling: &Asset) -> Option<OfferEntry> {
+        self.offers
+            .values()
+            .filter(|offer| offer.buying == *buying && offer.selling == *selling)
+            .min_by(|a, b| compare_offer(a, b))
+            .cloned()
+    }
+
+    /// Get the best offer for a buying/selling pair with an additional filter.
+    pub fn best_offer_filtered<F>(
+        &self,
+        buying: &Asset,
+        selling: &Asset,
+        mut keep: F,
+    ) -> Option<OfferEntry>
+    where
+        F: FnMut(&OfferEntry) -> bool,
+    {
+        self.offers
+            .values()
+            .filter(|offer| offer.buying == *buying && offer.selling == *selling)
+            .filter(|offer| keep(offer))
+            .min_by(|a, b| compare_offer(a, b))
+            .cloned()
     }
 
     // ==================== Data Entry Operations ====================
@@ -1249,6 +1323,11 @@ impl LedgerStateManager {
         &self.delta
     }
 
+    /// Get the current delta (mutable).
+    pub fn delta_mut(&mut self) -> &mut LedgerDelta {
+        &mut self.delta
+    }
+
     /// Consume self and return the delta.
     pub fn take_delta(self) -> LedgerDelta {
         self.delta
@@ -1530,6 +1609,16 @@ fn claimable_balance_id_to_bytes(balance_id: &ClaimableBalanceId) -> [u8; 32] {
 /// Convert a PoolId to its raw bytes.
 fn pool_id_to_bytes(pool_id: &PoolId) -> [u8; 32] {
     pool_id.0.0
+}
+
+fn compare_offer(lhs: &OfferEntry, rhs: &OfferEntry) -> std::cmp::Ordering {
+    compare_price(&lhs.price, &rhs.price).then_with(|| lhs.offer_id.cmp(&rhs.offer_id))
+}
+
+fn compare_price(lhs: &Price, rhs: &Price) -> std::cmp::Ordering {
+    let lhs_value = i128::from(lhs.n) * i128::from(rhs.d);
+    let rhs_value = i128::from(rhs.n) * i128::from(lhs.d);
+    lhs_value.cmp(&rhs_value)
 }
 
 #[cfg(test)]

@@ -129,11 +129,11 @@ pub trait SCPDriver: Send + Sync {
         value: &Value,
     ) -> u64;
 
-    /// Compute timeout for a nomination round.
+    /// Compute timeout for a nomination or ballot round.
     ///
     /// Timeouts typically increase with round number to allow more
     /// time for consensus when the network is unstable.
-    fn compute_timeout(&self, round: u32) -> Duration;
+    fn compute_timeout(&self, round: u32, is_nomination: bool) -> Duration;
 
     /// Sign an envelope before sending.
     ///

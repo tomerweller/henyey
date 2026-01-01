@@ -1,0 +1,88 @@
+use std::sync::Arc;
+
+use stellar_core_bucket::{BucketList, BucketManager};
+use stellar_core_common::Hash256;
+use stellar_core_db::Database;
+use stellar_core_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
+use stellar_xdr::curr::{
+    Hash, LedgerCloseMeta, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt,
+    TimePoint, TransactionResultSet, TransactionSet, VecM,
+};
+
+fn make_genesis_header() -> LedgerHeader {
+    LedgerHeader {
+        ledger_version: 25,
+        previous_ledger_hash: Hash([0u8; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0u8; 32]),
+            close_time: TimePoint(0),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0u8; 32]),
+        bucket_list_hash: Hash([0u8; 32]),
+        ledger_seq: 0,
+        total_coins: 1_000_000,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 100,
+        max_tx_set_size: 100,
+        skip_list: [
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+        ],
+        ext: LedgerHeaderExt::V0,
+    }
+}
+
+#[test]
+fn test_ledger_close_with_empty_tx_set() {
+    let db = Database::open_in_memory().expect("db");
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager = BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket mgr");
+
+    let ledger = LedgerManager::new(db, Arc::new(bucket_manager), "Test Network".to_string());
+
+    let bucket_list = BucketList::new();
+    let header = make_genesis_header();
+    ledger
+        .initialize_from_buckets_skip_verify(bucket_list, header)
+        .expect("init");
+
+    let close_data = LedgerCloseData::new(
+        1,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: VecM::default(),
+        }),
+        1,
+        ledger.current_header_hash(),
+    );
+
+    let mut ctx = ledger.begin_close(close_data).expect("begin close");
+    let results = ctx.apply_transactions().expect("apply txs");
+    assert!(results.is_empty());
+
+    let result = ctx.commit().expect("commit");
+    assert_eq!(result.header.ledger_seq, 1);
+    assert_eq!(ledger.current_ledger_seq(), 1);
+    assert_ne!(ledger.current_header_hash(), Hash256::ZERO);
+
+    let empty_results = TransactionResultSet {
+        results: VecM::default(),
+    };
+    let expected_hash = Hash256::hash_xdr(&empty_results).expect("result hash");
+    assert_eq!(Hash256::from(result.header.tx_set_result_hash), expected_hash);
+
+    let meta = result.meta.expect("ledger close meta");
+    match meta {
+        LedgerCloseMeta::V2(v2) => {
+            assert_eq!(v2.tx_processing.len(), 0);
+        }
+        other => panic!("unexpected ledger close meta: {:?}", other),
+    }
+}

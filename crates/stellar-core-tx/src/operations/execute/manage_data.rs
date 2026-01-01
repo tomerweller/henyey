@@ -31,7 +31,7 @@ pub fn execute_manage_data(
     // Validate data name
     let data_name = op.data_name.to_string();
     if data_name.is_empty() || data_name.len() > MAX_DATA_NAME_LENGTH {
-        return Ok(make_result(ManageDataResultCode::NameNotFound));
+        return Ok(make_result(ManageDataResultCode::InvalidName));
     }
 
     // Validate data value if present
@@ -61,8 +61,9 @@ pub fn execute_manage_data(
                         account.num_sub_entries -= 1;
                     }
                 }
+            } else {
+                return Ok(make_result(ManageDataResultCode::NameNotFound));
             }
-            // If entry doesn't exist, deletion is a no-op (success)
         }
         Some(value) => {
             if existing_entry.is_some() {
@@ -204,6 +205,30 @@ mod tests {
 
         // Verify sub-entries decreased
         assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 0);
+    }
+
+    #[test]
+    fn test_manage_data_delete_missing() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageDataOp {
+            data_name: make_string64("missing_key"),
+            data_value: None,
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::NameNotFound));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 
     #[test]

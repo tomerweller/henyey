@@ -13,10 +13,10 @@ use tracing::{debug, info, warn};
 
 use stellar_core_common::Hash256;
 use stellar_core_crypto::{PublicKey, SecretKey, Signature};
-use stellar_core_scp::{SCPDriver, SlotIndex, ValidationLevel};
+use stellar_core_ledger::LedgerManager;
+use stellar_core_scp::{hash_quorum_set, SCPDriver, SlotIndex, ValidationLevel};
 use stellar_xdr::curr::{
-    ScpEnvelope, ScpQuorumSet, ScpStatement,
-    StellarValue, Value, ReadXdr, WriteXdr,
+    LedgerUpgrade, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatement, StellarValue, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -107,6 +107,17 @@ pub struct PendingTxSet {
     pub request_count: u32,
 }
 
+/// Pending quorum set request.
+#[derive(Debug, Clone)]
+pub struct PendingQuorumSet {
+    /// The hash of the quorum set.
+    pub hash: Hash256,
+    /// When we first requested this quorum set.
+    pub requested_at: std::time::Instant,
+    /// Number of times we've requested this.
+    pub request_count: u32,
+}
+
 /// SCP driver that integrates consensus with the Herder.
 ///
 /// This manages:
@@ -124,6 +135,8 @@ pub struct ScpDriver {
     tx_set_cache: DashMap<Hash256, CachedTxSet>,
     /// Pending transaction set requests (hashes we need but don't have).
     pending_tx_sets: DashMap<Hash256, PendingTxSet>,
+    /// Pending quorum set requests (hashes we need but don't have).
+    pending_quorum_sets: DashMap<Hash256, PendingQuorumSet>,
     /// Externalized slots.
     externalized: RwLock<HashMap<SlotIndex, ExternalizedSlot>>,
     /// Latest externalized slot.
@@ -134,25 +147,40 @@ pub struct ScpDriver {
     network_id: Hash256,
     /// Quorum sets by node ID (key is 32-byte public key).
     quorum_sets: DashMap<[u8; 32], ScpQuorumSet>,
+    /// Quorum sets by quorum set hash.
+    quorum_sets_by_hash: DashMap<[u8; 32], ScpQuorumSet>,
     /// Our local quorum set.
     local_quorum_set: RwLock<Option<ScpQuorumSet>>,
+    /// Ledger manager for network configuration lookups.
+    ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
 }
 
 impl ScpDriver {
     /// Create a new SCP driver.
     pub fn new(config: ScpDriverConfig, network_id: Hash256) -> Self {
         let local_quorum_set = config.local_quorum_set.clone();
+        let quorum_sets = DashMap::new();
+        let quorum_sets_by_hash = DashMap::new();
+
+        if let Some(ref quorum_set) = local_quorum_set {
+            let hash = hash_quorum_set(quorum_set);
+            quorum_sets_by_hash.insert(hash.0, quorum_set.clone());
+            quorum_sets.insert(*config.node_id.as_bytes(), quorum_set.clone());
+        }
         Self {
             config,
             secret_key: None,
             tx_set_cache: DashMap::new(),
             pending_tx_sets: DashMap::new(),
+            pending_quorum_sets: DashMap::new(),
             externalized: RwLock::new(HashMap::new()),
             latest_externalized: RwLock::new(None),
             envelope_sender: RwLock::new(None),
             network_id,
-            quorum_sets: DashMap::new(),
+            quorum_sets,
+            quorum_sets_by_hash,
             local_quorum_set: RwLock::new(local_quorum_set),
+            ledger_manager: RwLock::new(None),
         }
     }
 
@@ -173,6 +201,11 @@ impl ScpDriver {
         F: Fn(ScpEnvelope) + Send + Sync + 'static,
     {
         *self.envelope_sender.write() = Some(Box::new(sender));
+    }
+
+    /// Provide ledger manager access for network configuration lookups.
+    pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
+        *self.ledger_manager.write() = Some(manager);
     }
 
     /// Cache a transaction set.
@@ -236,6 +269,37 @@ impl ScpDriver {
         );
         info!(%hash, slot, "Registered pending tx set request");
         true
+    }
+
+    /// Register a pending quorum set request.
+    /// Returns true if this is a new request, false if already pending or known.
+    pub fn request_quorum_set(&self, hash: Hash256) -> bool {
+        if self.quorum_sets_by_hash.contains_key(&hash.0) {
+            return false;
+        }
+
+        if self.pending_quorum_sets.contains_key(&hash) {
+            if let Some(mut entry) = self.pending_quorum_sets.get_mut(&hash) {
+                entry.request_count += 1;
+            }
+            return false;
+        }
+
+        self.pending_quorum_sets.insert(
+            hash,
+            PendingQuorumSet {
+                hash,
+                requested_at: std::time::Instant::now(),
+                request_count: 1,
+            },
+        );
+        info!(%hash, "Registered pending quorum set request");
+        true
+    }
+
+    /// Clear a quorum set request once it has been satisfied.
+    pub fn clear_quorum_set_request(&self, hash: &Hash256) {
+        self.pending_quorum_sets.remove(hash);
     }
 
     /// Get all pending tx set hashes that need to be fetched.
@@ -337,6 +401,15 @@ impl ScpDriver {
         if !self.has_tx_set(&tx_set_hash) {
             debug!("Missing transaction set: {}", tx_set_hash);
             return ValueValidation::MaybeValid;
+        }
+
+        for upgrade in stellar_value.upgrades.iter() {
+            if LedgerUpgrade::from_xdr(upgrade.0.as_slice(), stellar_xdr::curr::Limits::none())
+                .is_err()
+            {
+                debug!("Invalid ledger upgrade encountered");
+                return ValueValidation::Invalid;
+            }
         }
 
         ValueValidation::Valid
@@ -500,6 +573,13 @@ impl ScpDriver {
     /// Set our local quorum set.
     pub fn set_local_quorum_set(&self, quorum_set: ScpQuorumSet) {
         *self.local_quorum_set.write() = Some(quorum_set);
+        if let Some(local) = self.local_quorum_set.read().clone() {
+            let hash = hash_quorum_set(&local);
+            self.quorum_sets_by_hash.insert(hash.0, local.clone());
+            self.quorum_sets
+                .insert(*self.config.node_id.as_bytes(), local);
+            self.pending_quorum_sets.remove(&Hash256::from_bytes(hash.0));
+        }
     }
 
     /// Store a quorum set for a node.
@@ -507,7 +587,10 @@ impl ScpDriver {
         let key: [u8; 32] = match &node_id.0 {
             stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
         };
-        self.quorum_sets.insert(key, quorum_set);
+        let hash = hash_quorum_set(&quorum_set);
+        self.quorum_sets.insert(key, quorum_set.clone());
+        self.quorum_sets_by_hash.insert(hash.0, quorum_set);
+        self.pending_quorum_sets.remove(&Hash256::from_bytes(hash.0));
     }
 
     /// Get a quorum set for a node.
@@ -523,6 +606,16 @@ impl ScpDriver {
         }
 
         self.quorum_sets.get(&key).map(|v| v.clone())
+    }
+
+    /// Get a quorum set by its hash.
+    pub fn get_quorum_set_by_hash(&self, hash: &[u8; 32]) -> Option<ScpQuorumSet> {
+        self.quorum_sets_by_hash.get(hash).map(|v| v.clone())
+    }
+
+    /// Whether we already have a quorum set with the given hash.
+    pub fn has_quorum_set_hash(&self, hash: &Hash256) -> bool {
+        self.quorum_sets_by_hash.contains_key(&hash.0)
     }
 
     /// Get our node ID.
@@ -542,6 +635,31 @@ impl HerderScpCallback {
     /// Create a new callback wrapper.
     pub fn new(driver: Arc<ScpDriver>) -> Self {
         Self { driver }
+    }
+
+    fn hash_helper<F>(&self, slot_index: u64, prev_value: &Value, extra: F) -> u64
+    where
+        F: FnOnce(&mut Vec<Vec<u8>>),
+    {
+        let mut values = Vec::new();
+        values.push(Self::xdr_bytes(&slot_index));
+        values.push(Self::xdr_bytes(prev_value));
+        extra(&mut values);
+
+        let mut data = Vec::new();
+        for value in values {
+            data.extend_from_slice(&value);
+        }
+        let hash = Hash256::hash(&data);
+        let mut result = 0u64;
+        for byte in &hash.as_bytes()[0..8] {
+            result = (result << 8) | (*byte as u64);
+        }
+        result
+    }
+
+    fn xdr_bytes<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Vec<u8> {
+        value.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default()
     }
 }
 
@@ -574,14 +692,16 @@ impl SCPDriver for HerderScpCallback {
 
     fn extract_valid_value(
         &self,
-        _slot_index: u64,
+        slot_index: u64,
         value: &Value,
     ) -> Option<Value> {
-        // For now, just return the value as-is if it's non-empty
         if value.0.is_empty() {
-            None
-        } else {
-            Some(value.clone())
+            return None;
+        }
+
+        match self.driver.validate_value_impl(slot_index, value) {
+            ValueValidation::Invalid => None,
+            ValueValidation::MaybeValid | ValueValidation::Valid => Some(value.clone()),
         }
     }
 
@@ -612,42 +732,57 @@ impl SCPDriver for HerderScpCallback {
     fn compute_hash_node(
         &self,
         slot_index: u64,
-        _prev_value: &Value,
-        _is_priority: bool,
+        prev_value: &Value,
+        is_priority: bool,
         round: u32,
         node_id: &stellar_xdr::curr::NodeId,
     ) -> u64 {
-        // Simple hash combining slot, round, and node_id
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
-        slot_index.hash(&mut hasher);
-        round.hash(&mut hasher);
-        match &node_id.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0.hash(&mut hasher),
-        };
-        hasher.finish()
+        const HASH_N: u32 = 1;
+        const HASH_P: u32 = 2;
+        self.hash_helper(slot_index, prev_value, |values| {
+            let tag = if is_priority { HASH_P } else { HASH_N };
+            values.push(Self::xdr_bytes(&tag));
+            values.push(Self::xdr_bytes(&round));
+            values.push(Self::xdr_bytes(node_id));
+        })
     }
 
     fn compute_value_hash(
         &self,
         slot_index: u64,
-        _prev_value: &Value,
+        prev_value: &Value,
         round: u32,
         value: &Value,
     ) -> u64 {
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
-        slot_index.hash(&mut hasher);
-        round.hash(&mut hasher);
-        value.0.as_slice().hash(&mut hasher);
-        hasher.finish()
+        const HASH_K: u32 = 3;
+        self.hash_helper(slot_index, prev_value, |values| {
+            values.push(Self::xdr_bytes(&HASH_K));
+            values.push(Self::xdr_bytes(&round));
+            values.push(Self::xdr_bytes(value));
+        })
     }
 
-    fn compute_timeout(&self, round: u32) -> std::time::Duration {
-        // Exponential backoff starting at 1 second
-        std::time::Duration::from_secs(1 << round.min(5))
+    fn compute_timeout(&self, round: u32, is_nomination: bool) -> std::time::Duration {
+        const MAX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+        let mut initial_ms: u64 = 1000;
+        let mut increment_ms: u64 = 1000;
+        if let Some(manager) = self.driver.ledger_manager.read().as_ref() {
+            let header = manager.current_header();
+            if header.ledger_version >= 23 {
+                if let Some(timing) = manager.scp_timing() {
+                    if is_nomination {
+                        initial_ms = timing.nomination_timeout_initial_milliseconds as u64;
+                        increment_ms = timing.nomination_timeout_increment_milliseconds as u64;
+                    } else {
+                        initial_ms = timing.ballot_timeout_initial_milliseconds as u64;
+                        increment_ms = timing.ballot_timeout_increment_milliseconds as u64;
+                    }
+                }
+            }
+        }
+        let round = round.max(1) as u64;
+        let timeout_ms = initial_ms.saturating_add((round - 1).saturating_mul(increment_ms));
+        std::time::Duration::from_millis(timeout_ms.min(MAX_TIMEOUT_MS))
     }
 
     fn sign_envelope(&self, envelope: &mut ScpEnvelope) {
@@ -664,6 +799,7 @@ impl SCPDriver for HerderScpCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, UpgradeType};
 
     fn make_test_driver() -> ScpDriver {
         let config = ScpDriverConfig::default();
@@ -736,5 +872,37 @@ mod tests {
 
         let result = driver.combine_candidates_impl(1, &[]);
         assert_eq!(result, Value::default());
+    }
+
+    #[test]
+    fn test_invalid_upgrade_rejected() {
+        let driver = make_test_driver();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let invalid_upgrade = UpgradeType(vec![0u8; 1].try_into().unwrap());
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: vec![invalid_upgrade].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let value = Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .expect("xdr")
+                .try_into()
+                .unwrap(),
+        );
+
+        assert_eq!(driver.validate_value_impl(1, &value), ValueValidation::Invalid);
     }
 }

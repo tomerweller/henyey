@@ -8,6 +8,7 @@
 //! - Ledger for state management
 //! - Transaction processing
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,9 +26,12 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult};
+use crate::quorum_tracker::QuorumTracker;
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig, ValueValidation};
 use crate::state::HerderState;
-use crate::tx_queue::{TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult};
+use crate::tx_queue::{
+    account_key_from_account_id, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
+};
 pub use crate::tx_queue::TransactionSet as TxSet;
 use crate::Result;
 
@@ -71,6 +75,8 @@ pub struct HerderConfig {
     pub local_quorum_set: Option<ScpQuorumSet>,
     /// Maximum transactions per transaction set.
     pub max_tx_set_size: usize,
+    /// Proposed protocol upgrades to include in nominations.
+    pub proposed_upgrades: Vec<stellar_xdr::curr::LedgerUpgrade>,
 }
 
 impl Default for HerderConfig {
@@ -86,6 +92,7 @@ impl Default for HerderConfig {
             tx_queue_config: TxQueueConfig::default(),
             local_quorum_set: None,
             max_tx_set_size: 1000,
+            proposed_upgrades: Vec::new(),
         }
     }
 }
@@ -120,6 +127,8 @@ pub struct Herder {
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
     /// Previous externalized value (for priority calculation).
     prev_value: RwLock<Value>,
+    /// Quorum tracker for quorum/heard-from metrics.
+    quorum_tracker: RwLock<QuorumTracker>,
 }
 
 impl Herder {
@@ -137,6 +146,11 @@ impl Herder {
         let pending_envelopes = PendingEnvelopes::new(config.pending_config.clone());
 
         // SCP is None for non-validators (they just observe)
+        let quorum_tracker = QuorumTracker::new(
+            config.local_quorum_set.clone(),
+            config.max_externalized_slots.max(1),
+        );
+
         Self {
             config,
             state: RwLock::new(HerderState::Booting),
@@ -149,6 +163,7 @@ impl Herder {
             secret_key: None,
             ledger_manager: RwLock::new(None),
             prev_value: RwLock::new(Value::default()),
+            quorum_tracker: RwLock::new(quorum_tracker),
         }
     }
 
@@ -191,6 +206,11 @@ impl Herder {
             None
         };
 
+        let quorum_tracker = QuorumTracker::new(
+            config.local_quorum_set.clone(),
+            config.max_externalized_slots.max(1),
+        );
+
         Self {
             config,
             state: RwLock::new(HerderState::Booting),
@@ -203,11 +223,13 @@ impl Herder {
             secret_key: Some(secret_key),
             ledger_manager: RwLock::new(None),
             prev_value: RwLock::new(Value::default()),
+            quorum_tracker: RwLock::new(quorum_tracker),
         }
     }
 
     /// Set the ledger manager reference.
     pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
+        self.scp_driver.set_ledger_manager(Arc::clone(&manager));
         *self.ledger_manager.write() = Some(manager);
     }
 
@@ -221,6 +243,42 @@ impl Herder {
         *self.tracking_slot.read()
     }
 
+    /// Get the configured target ledger close time in seconds.
+    pub fn ledger_close_time(&self) -> u32 {
+        self.config.ledger_close_time
+    }
+
+    /// Get the maximum size of a transaction set (ops).
+    pub fn max_tx_set_size(&self) -> usize {
+        self.config.max_tx_set_size
+    }
+
+    /// Get the maximum queue size in ops for demand sizing.
+    pub fn max_queue_size_ops(&self) -> usize {
+        self.config.max_pending_transactions
+    }
+
+    /// Return the set of node IDs from the local quorum set (if configured).
+    pub fn local_quorum_nodes(&self) -> std::collections::HashSet<stellar_xdr::curr::NodeId> {
+        fn collect_nodes(
+            quorum_set: &stellar_xdr::curr::ScpQuorumSet,
+            acc: &mut std::collections::HashSet<stellar_xdr::curr::NodeId>,
+        ) {
+            for validator in quorum_set.validators.iter() {
+                acc.insert(validator.clone());
+            }
+            for inner in quorum_set.inner_sets.iter() {
+                collect_nodes(inner, acc);
+            }
+        }
+
+        let mut nodes = std::collections::HashSet::new();
+        if let Some(qs) = &self.config.local_quorum_set {
+            collect_nodes(qs, &mut nodes);
+        }
+        nodes
+    }
+
     /// Check if the herder is tracking consensus.
     pub fn is_tracking(&self) -> bool {
         self.state().is_tracking()
@@ -229,6 +287,43 @@ impl Herder {
     /// Check if this node is a validator.
     pub fn is_validator(&self) -> bool {
         self.config.is_validator && self.secret_key.is_some()
+    }
+
+    /// Store a quorum set for a peer node.
+    pub fn store_quorum_set(&self, node_id: &NodeId, quorum_set: ScpQuorumSet) {
+        self.scp_driver.store_quorum_set(node_id, quorum_set);
+    }
+
+    /// Get a quorum set by hash if available.
+    pub fn get_quorum_set_by_hash(&self, hash: &[u8; 32]) -> Option<ScpQuorumSet> {
+        self.scp_driver.get_quorum_set_by_hash(hash)
+    }
+
+    /// Whether we already have a quorum set with the given hash.
+    pub fn has_quorum_set_hash(&self, hash: &Hash256) -> bool {
+        self.scp_driver.has_quorum_set_hash(hash)
+    }
+
+    /// Register a quorum set request if needed.
+    pub fn request_quorum_set(&self, hash: Hash256) -> bool {
+        self.scp_driver.request_quorum_set(hash)
+    }
+
+    /// Clear a quorum set request.
+    pub fn clear_quorum_set_request(&self, hash: &Hash256) {
+        self.scp_driver.clear_quorum_set_request(hash);
+    }
+
+    /// Check whether we've heard from quorum for a slot.
+    pub fn heard_from_quorum(&self, slot: SlotIndex) -> bool {
+        self.quorum_tracker.read().has_quorum(slot, |node_id| {
+            self.scp_driver.get_quorum_set(node_id)
+        })
+    }
+
+    /// Check whether we have a v-blocking set for a slot.
+    pub fn is_v_blocking(&self, slot: SlotIndex) -> bool {
+        self.quorum_tracker.read().is_v_blocking(slot)
     }
 
     /// Bootstrap the Herder after catchup.
@@ -291,6 +386,10 @@ impl Herder {
             debug!(slot, error = %e, "Invalid SCP envelope signature");
             return EnvelopeState::InvalidSignature;
         }
+
+        self.quorum_tracker
+            .write()
+            .record_envelope(slot, envelope.statement.node_id.clone());
 
         // Special handling for EXTERNALIZE messages - they can fast-forward our state
         // even if from future slots, as they represent network consensus
@@ -382,6 +481,9 @@ impl Herder {
                     return EnvelopeState::Duplicate;
                 }
                 stellar_core_scp::EnvelopeState::ValidNew => {
+                    if self.heard_from_quorum(slot) {
+                        debug!(slot, "Heard from quorum");
+                    }
                     // Check if this slot is now externalized
                     if scp.is_slot_externalized(slot) {
                         if let Some(value) = scp.get_externalized_value(slot) {
@@ -404,6 +506,9 @@ impl Herder {
         if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
             &envelope.statement.pledges
         {
+            if self.heard_from_quorum(slot) {
+                debug!(slot, "Heard from quorum (observer)");
+            }
             let value = ext.commit.value.clone();
             self.scp_driver.record_externalized(slot, value.clone());
 
@@ -495,11 +600,24 @@ impl Herder {
         } else {
             Hash256::ZERO
         };
+        let starting_seq = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .and_then(|manager| self.build_starting_seq_map(manager));
 
-        // Create transaction set from queue
-        // Use max_tx_set_size from network config (default 1000)
-        let max_txs = self.config.max_tx_set_size;
-        let tx_set = self.tx_queue.get_transaction_set(previous_hash, max_txs);
+        // Create transaction set from queue using the current ledger limit when available.
+        let max_txs = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|manager| manager.current_header().max_tx_set_size as usize)
+            .unwrap_or(self.config.max_tx_set_size);
+        let tx_set = self.tx_queue.get_transaction_set_with_starting_seq(
+            previous_hash,
+            max_txs,
+            starting_seq.as_ref(),
+        );
 
         info!(
             "Proposing transaction set with {} transactions, hash: {}",
@@ -516,10 +634,18 @@ impl Herder {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
+        let upgrades: Vec<UpgradeType> = self
+            .config
+            .proposed_upgrades
+            .iter()
+            .filter_map(|upgrade| upgrade.to_xdr(Limits::none()).ok())
+            .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
+            .collect();
+
         let stellar_value = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set.hash.0),
             close_time: TimePoint(close_time),
-            upgrades: vec![].try_into().unwrap(),
+            upgrades: upgrades.try_into().unwrap_or_default(),
             ext: stellar_xdr::curr::StellarValueExt::Basic,
         };
 
@@ -660,8 +786,9 @@ impl Herder {
     pub fn get_ballot_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
         if let Some(ref scp) = self.scp {
             if let Some(state) = scp.get_slot_state(slot) {
-                // Use same timeout calculation as nomination
-                return Some(scp.get_ballot_timeout(state.nomination_round));
+                if let Some(round) = state.ballot_round {
+                    return Some(scp.get_ballot_timeout(round));
+                }
             }
         }
         None
@@ -670,17 +797,24 @@ impl Herder {
     /// Create a nomination value for a slot.
     fn create_nomination_value(&self, _slot: SlotIndex) -> Option<Value> {
         // Get the previous ledger hash from our current ledger state
-        let previous_hash = if let Some(manager) = self.ledger_manager.read().as_ref() {
-            // Use the hash of the current ledger header (which becomes previous for next)
+        let (previous_hash, max_txs, starting_seq) =
+            if let Some(manager) = self.ledger_manager.read().as_ref() {
             let header = manager.current_header();
-            Hash256::hash_xdr(&header).unwrap_or(Hash256::ZERO)
+            let max = header.max_tx_set_size as usize;
+            let starting_seq = self.build_starting_seq_map(manager);
+            (manager.current_header_hash(), max, starting_seq)
         } else {
-            Hash256::ZERO
+            (Hash256::ZERO, self.config.max_tx_set_size, None)
         };
 
         // Build GeneralizedTransactionSet with proper hash computation
-        let max_txs = 100;
-        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set(previous_hash, max_txs);
+        let (tx_set, _gen_tx_set) = self
+            .tx_queue
+            .build_generalized_tx_set_with_starting_seq(
+                previous_hash,
+                max_txs,
+                starting_seq.as_ref(),
+            );
 
         info!(
             hash = %tx_set.hash,
@@ -697,10 +831,18 @@ impl Herder {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
+        let upgrades: Vec<UpgradeType> = self
+            .config
+            .proposed_upgrades
+            .iter()
+            .filter_map(|upgrade| upgrade.to_xdr(Limits::none()).ok())
+            .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
+            .collect();
+
         let stellar_value = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set.hash.0),
             close_time: TimePoint(close_time),
-            upgrades: vec![].try_into().unwrap(),
+            upgrades: upgrades.try_into().unwrap_or_default(),
             ext: stellar_xdr::curr::StellarValueExt::Basic,
         };
 
@@ -708,6 +850,20 @@ impl Herder {
         let value_bytes = stellar_value.to_xdr(Limits::none()).ok()?;
         let value = Value(value_bytes.try_into().ok()?);
         Some(value)
+    }
+
+    fn build_starting_seq_map(
+        &self,
+        manager: &Arc<LedgerManager>,
+    ) -> Option<HashMap<Vec<u8>, i64>> {
+        let snapshot = manager.create_snapshot().ok()?;
+        let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
+        for account in self.tx_queue.pending_accounts() {
+            if let Ok(Some(entry)) = snapshot.get_account(&account) {
+                map.insert(account_key_from_account_id(&account), entry.seq_num.0);
+            }
+        }
+        Some(map)
     }
 
     /// Get the transaction queue.
@@ -744,6 +900,20 @@ impl Herder {
         let quorum_set = self.scp_driver.get_local_quorum_set();
 
         (envelopes, quorum_set)
+    }
+
+    /// Get all SCP envelopes recorded for a slot.
+    pub fn get_scp_envelopes(&self, slot: u64) -> Vec<ScpEnvelope> {
+        if let Some(ref scp) = self.scp {
+            scp.get_slot_envelopes(slot)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get the local quorum set if configured.
+    pub fn local_quorum_set(&self) -> Option<ScpQuorumSet> {
+        self.scp_driver.get_local_quorum_set()
     }
 
     /// Remove applied transactions from the queue.

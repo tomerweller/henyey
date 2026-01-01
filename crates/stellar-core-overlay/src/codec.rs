@@ -188,6 +188,10 @@ pub mod helpers {
                 | StellarMessage::ScpMessage(_)
                 | StellarMessage::FloodAdvert(_)
                 | StellarMessage::FloodDemand(_)
+                | StellarMessage::TimeSlicedSurveyRequest(_)
+                | StellarMessage::TimeSlicedSurveyResponse(_)
+                | StellarMessage::TimeSlicedSurveyStartCollecting(_)
+                | StellarMessage::TimeSlicedSurveyStopCollecting(_)
         )
     }
 

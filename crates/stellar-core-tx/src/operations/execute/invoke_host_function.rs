@@ -4,15 +4,16 @@
 //! which executes Soroban smart contract functions.
 
 use stellar_xdr::curr::{
-    AccountId, ContractCodeEntry, ContractCodeEntryExt, ContractDataDurability, Hash,
-    HostFunction, InvokeHostFunctionOp, InvokeHostFunctionResult, InvokeHostFunctionResultCode,
-    LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits, OperationResult,
-    OperationResultTr, ScAddress, ScVal, SorobanTransactionData, TtlEntry, WriteXdr,
+    AccountId, ContractCodeEntry, ContractCodeEntryExt, ContractDataDurability, ContractEventType,
+    DiagnosticEvent, Hash, HostFunction, InvokeHostFunctionOp, InvokeHostFunctionResult,
+    InvokeHostFunctionResultCode, LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits,
+    OperationResult, OperationResultTr, ScAddress, ScVal, SorobanTransactionData, TtlEntry, WriteXdr,
 };
 
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
+use super::{OperationExecutionResult, SorobanOperationMeta};
 
 /// Default TTL for newly created contract entries (in ledgers).
 const DEFAULT_CONTRACT_TTL: u32 = 518400; // ~30 days at 5-second ledger close
@@ -42,15 +43,15 @@ pub fn execute_invoke_host_function(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
-) -> Result<OperationResult> {
+) -> Result<OperationExecutionResult> {
     // Validate we have Soroban data for footprint
     let soroban_data = match soroban_data {
         Some(data) => data,
         None => {
-            return Ok(make_result(
+            return Ok(OperationExecutionResult::new(make_result(
                 InvokeHostFunctionResultCode::Malformed,
                 Hash([0u8; 32]),
-            ));
+            )));
         }
     };
 
@@ -76,7 +77,7 @@ fn execute_contract_invocation(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
-) -> Result<OperationResult> {
+) -> Result<OperationExecutionResult> {
     use crate::soroban::execute_host_function;
     use sha2::{Digest, Sha256};
 
@@ -93,35 +94,8 @@ fn execute_contract_invocation(
         soroban_data,
     ) {
         Ok(result) => {
-            // Apply storage changes back to our state
-            for change in result.storage_changes {
-                if let Some(entry) = change.new_entry {
-                    // Apply the entry based on its type
-                    match &entry.data {
-                        stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                            state.create_contract_data(cd.clone());
-                        }
-                        stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
-                            state.create_contract_code(cc.clone());
-                        }
-                        stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
-                            state.create_ttl(ttl.clone());
-                        }
-                        _ => {}
-                    }
-
-                    // Apply TTL if present for contract entries
-                    if let Some(live_until) = change.live_until {
-                        let key_hash = compute_key_hash(&change.key);
-                        let ttl = TtlEntry {
-                            key_hash,
-                            live_until_ledger_seq: live_until,
-                        };
-                        state.create_ttl(ttl);
-                    }
-                }
-                // For deleted entries, we would remove from state (not yet implemented)
-            }
+            // Apply storage changes back to our state.
+            apply_soroban_storage_changes(state, &result.storage_changes);
 
             // Compute result hash from return value
             let result_hash = compute_return_value_hash(&result.return_value);
@@ -132,7 +106,10 @@ fn execute_contract_invocation(
                 "Soroban contract executed successfully"
             );
 
-            Ok(make_result(InvokeHostFunctionResultCode::Success, result_hash))
+            Ok(OperationExecutionResult::with_soroban_meta(
+                make_result(InvokeHostFunctionResultCode::Success, result_hash),
+                build_soroban_operation_meta(&result),
+            ))
         }
         Err(host_error) => {
             tracing::warn!(
@@ -141,10 +118,10 @@ fn execute_contract_invocation(
             );
 
             // Map host error to appropriate result code
-            Ok(make_result(
+            Ok(OperationExecutionResult::new(make_result(
                 InvokeHostFunctionResultCode::Trapped,
                 Hash([0u8; 32]),
-            ))
+            )))
         }
     }
 }
@@ -155,7 +132,7 @@ fn execute_upload_wasm(
     _source: &AccountId,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-) -> Result<OperationResult> {
+) -> Result<OperationExecutionResult> {
     use sha2::{Digest, Sha256};
 
     // Hash the WASM code
@@ -166,7 +143,10 @@ fn execute_upload_wasm(
     // Check if this code already exists
     if state.get_contract_code(&code_hash).is_some() {
         // Code already exists, just return success with the hash
-        return Ok(make_result(InvokeHostFunctionResultCode::Success, code_hash));
+        return Ok(OperationExecutionResult::new(make_result(
+            InvokeHostFunctionResultCode::Success,
+            code_hash,
+        )));
     }
 
     // Create the contract code entry
@@ -186,7 +166,10 @@ fn execute_upload_wasm(
     state.create_ttl(ttl_entry);
 
     // Return success with the code hash
-    Ok(make_result(InvokeHostFunctionResultCode::Success, code_hash))
+    Ok(OperationExecutionResult::new(make_result(
+        InvokeHostFunctionResultCode::Success,
+        code_hash,
+    )))
 }
 
 /// Compute the hash of a ledger key for TTL lookup.
@@ -209,6 +192,103 @@ fn compute_return_value_hash(value: &ScVal) -> Hash {
         hasher.update(&bytes);
     }
     Hash(hasher.finalize().into())
+}
+
+fn build_soroban_operation_meta(
+    result: &crate::soroban::SorobanExecutionResult,
+) -> SorobanOperationMeta {
+    let mut events = Vec::new();
+    let mut diagnostic_events = Vec::new();
+
+    for host_event in result.events.0.iter() {
+        let event = host_event.event.clone();
+        if matches!(event.type_, ContractEventType::Contract | ContractEventType::System) {
+            events.push(event.clone());
+        }
+        diagnostic_events.push(DiagnosticEvent {
+            in_successful_contract_call: !host_event.failed_call,
+            event,
+        });
+    }
+
+    SorobanOperationMeta {
+        events,
+        diagnostic_events,
+        return_value: Some(result.return_value.clone()),
+    }
+}
+
+fn apply_soroban_storage_changes(
+    state: &mut LedgerStateManager,
+    changes: &[crate::soroban::StorageChange],
+) {
+    for change in changes {
+        apply_soroban_storage_change(state, change);
+    }
+}
+
+fn apply_soroban_storage_change(
+    state: &mut LedgerStateManager,
+    change: &crate::soroban::StorageChange,
+) {
+    if let Some(entry) = &change.new_entry {
+        // Handle contract data and code entries.
+        match &entry.data {
+            stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                if state.get_contract_data(&cd.contract, &cd.key, cd.durability.clone()).is_some() {
+                    state.update_contract_data(cd.clone());
+                } else {
+                    state.create_contract_data(cd.clone());
+                }
+            }
+            stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                if state.get_contract_code(&cc.hash).is_some() {
+                    state.update_contract_code(cc.clone());
+                } else {
+                    state.create_contract_code(cc.clone());
+                }
+            }
+            stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                if state.get_ttl(&ttl.key_hash).is_some() {
+                    state.update_ttl(ttl.clone());
+                } else {
+                    state.create_ttl(ttl.clone());
+                }
+            }
+            _ => {}
+        }
+
+        // Apply TTL if present for contract entries.
+        if let Some(live_until) = change.live_until {
+            let key_hash = compute_key_hash(&change.key);
+            let ttl = TtlEntry {
+                key_hash,
+                live_until_ledger_seq: live_until,
+            };
+            if state.get_ttl(&ttl.key_hash).is_some() {
+                state.update_ttl(ttl);
+            } else {
+                state.create_ttl(ttl);
+            }
+        }
+    } else {
+        match &change.key {
+            LedgerKey::ContractData(key) => {
+                state.delete_contract_data(&key.contract, &key.key, key.durability.clone());
+                let key_hash = compute_key_hash(&change.key);
+                state.delete_ttl(&key_hash);
+            }
+            LedgerKey::ContractCode(key) => {
+                state.delete_contract_code(&key.hash);
+                let key_hash = compute_key_hash(&change.key);
+                state.delete_ttl(&key_hash);
+            }
+            LedgerKey::Ttl(key) => {
+                state.delete_ttl(&key.key_hash);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Compute the hash of a contract code key for TTL lookup.
@@ -247,6 +327,7 @@ fn make_result(code: InvokeHostFunctionResultCode, success_hash: Hash) -> Operat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::soroban::StorageChange;
     use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {
@@ -268,10 +349,10 @@ mod tests {
             auth: vec![].try_into().unwrap(),
         };
 
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, None);
-        assert!(result.is_ok());
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, None)
+            .expect("invoke host function");
 
-        match result.unwrap() {
+        match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
                 assert!(matches!(r, InvokeHostFunctionResult::Malformed));
             }
@@ -311,14 +392,69 @@ mod tests {
         };
 
         let result =
-            execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data));
-        assert!(result.is_ok());
+            execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data))
+                .expect("invoke host function");
 
-        match result.unwrap() {
+        match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
                 assert!(matches!(r, InvokeHostFunctionResult::Success(_)));
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    #[test]
+    fn test_apply_soroban_storage_change_deletes() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([1u8; 32])));
+        let contract_key = ScVal::U32(7);
+        let durability = ContractDataDurability::Persistent;
+
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::I32(1),
+        };
+
+        let ledger_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(cd_entry.clone()),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+        });
+
+        let change = StorageChange {
+            key: key.clone(),
+            new_entry: Some(ledger_entry),
+            live_until: Some(200),
+        };
+
+        apply_soroban_storage_change(&mut state, &change);
+        assert!(state
+            .get_contract_data(&contract_id, &contract_key, durability.clone())
+            .is_some());
+
+        let ttl_key = compute_key_hash(&key);
+        assert!(state.get_ttl(&ttl_key).is_some());
+
+        let delete_change = StorageChange {
+            key,
+            new_entry: None,
+            live_until: None,
+        };
+
+        apply_soroban_storage_change(&mut state, &delete_change);
+        assert!(state
+            .get_contract_data(&contract_id, &contract_key, durability)
+            .is_none());
+        assert!(state.get_ttl(&ttl_key).is_none());
     }
 }

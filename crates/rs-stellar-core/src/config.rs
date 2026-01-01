@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use stellar_core_crypto;
 
 /// Main application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,10 @@ pub struct AppConfig {
     /// Network configuration.
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Proposed protocol upgrades.
+    #[serde(default)]
+    pub upgrades: UpgradeConfig,
 
     /// Database configuration.
     #[serde(default)]
@@ -40,6 +45,10 @@ pub struct AppConfig {
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
+
+    /// Surge pricing configuration.
+    #[serde(default)]
+    pub surge_pricing: SurgePricingConfig,
 }
 
 /// Node identity and behavior configuration.
@@ -153,6 +162,64 @@ pub struct NetworkConfig {
     pub max_protocol_version: u32,
 }
 
+/// Surge pricing configuration (lane byte allowances and caps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurgePricingConfig {
+    /// Classic tx byte allowance for tx set selection.
+    #[serde(default = "default_classic_byte_allowance")]
+    pub classic_byte_allowance: u32,
+
+    /// Soroban tx byte allowance for tx set selection.
+    #[serde(default = "default_soroban_byte_allowance")]
+    pub soroban_byte_allowance: u32,
+
+    /// Optional max DEX operations for classic lane selection.
+    #[serde(default)]
+    pub max_dex_tx_operations: Option<u32>,
+}
+
+impl Default for SurgePricingConfig {
+    fn default() -> Self {
+        Self {
+            classic_byte_allowance: default_classic_byte_allowance(),
+            soroban_byte_allowance: default_soroban_byte_allowance(),
+            max_dex_tx_operations: None,
+        }
+    }
+}
+
+/// Proposed protocol upgrades configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpgradeConfig {
+    /// Proposed protocol version upgrade.
+    pub protocol_version: Option<u32>,
+    /// Proposed base fee upgrade.
+    pub base_fee: Option<u32>,
+    /// Proposed base reserve upgrade.
+    pub base_reserve: Option<u32>,
+    /// Proposed max tx set size upgrade.
+    pub max_tx_set_size: Option<u32>,
+}
+
+impl UpgradeConfig {
+    pub fn to_ledger_upgrades(&self) -> Vec<stellar_xdr::curr::LedgerUpgrade> {
+        let mut upgrades = Vec::new();
+        if let Some(version) = self.protocol_version {
+            upgrades.push(stellar_xdr::curr::LedgerUpgrade::Version(version));
+        }
+        if let Some(fee) = self.base_fee {
+            upgrades.push(stellar_xdr::curr::LedgerUpgrade::BaseFee(fee));
+        }
+        if let Some(reserve) = self.base_reserve {
+            upgrades.push(stellar_xdr::curr::LedgerUpgrade::BaseReserve(reserve));
+        }
+        if let Some(max_tx_set_size) = self.max_tx_set_size {
+            upgrades.push(stellar_xdr::curr::LedgerUpgrade::MaxTxSetSize(max_tx_set_size));
+        }
+        upgrades
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self::testnet()
@@ -247,6 +314,16 @@ pub struct HistoryArchiveEntry {
     /// Whether this archive can be used for writing (validators only).
     #[serde(default)]
     pub put_enabled: bool,
+
+    /// Optional command template for publishing files to a remote archive.
+    /// Uses {0} = local path, {1} = remote path.
+    #[serde(default)]
+    pub put: Option<String>,
+
+    /// Optional command template to create remote directories.
+    /// Uses {0} = remote directory path.
+    #[serde(default)]
+    pub mkdir: Option<String>,
 }
 
 /// Overlay network configuration.
@@ -275,6 +352,38 @@ pub struct OverlayConfig {
     /// Preferred peers that should always be connected.
     #[serde(default)]
     pub preferred_peers: Vec<String>,
+
+    /// Allowed surveyor node public keys (G...); empty means follow quorum/defaults.
+    #[serde(default)]
+    pub surveyor_keys: Vec<String>,
+
+    /// Enable automatic survey scheduling (non-upstream behavior).
+    #[serde(default)]
+    pub auto_survey: bool,
+
+    /// Target fraction of max ops to flood per ledger for classic transactions.
+    #[serde(default = "default_flood_op_rate_per_ledger")]
+    pub flood_op_rate_per_ledger: f64,
+
+    /// Target fraction of max ops to flood per ledger for Soroban transactions.
+    #[serde(default = "default_flood_soroban_rate_per_ledger")]
+    pub flood_soroban_rate_per_ledger: f64,
+
+    /// Period (ms) between tx demand cycles.
+    #[serde(default = "default_flood_demand_period_ms")]
+    pub flood_demand_period_ms: u64,
+
+    /// Period (ms) between tx advert flushes.
+    #[serde(default = "default_flood_advert_period_ms")]
+    pub flood_advert_period_ms: u64,
+
+    /// Backoff delay (ms) between repeated demands for the same tx.
+    #[serde(default = "default_flood_demand_backoff_delay_ms")]
+    pub flood_demand_backoff_delay_ms: u64,
+
+    /// Maximum peer failures allowed before pruning.
+    #[serde(default = "default_peer_max_failures")]
+    pub peer_max_failures: u32,
 }
 
 impl Default for OverlayConfig {
@@ -286,8 +395,20 @@ impl Default for OverlayConfig {
             target_outbound_peers: default_target_outbound(),
             known_peers: Vec::new(),
             preferred_peers: Vec::new(),
+            surveyor_keys: Vec::new(),
+            auto_survey: false,
+            flood_op_rate_per_ledger: default_flood_op_rate_per_ledger(),
+            flood_soroban_rate_per_ledger: default_flood_soroban_rate_per_ledger(),
+            flood_demand_period_ms: default_flood_demand_period_ms(),
+            flood_advert_period_ms: default_flood_advert_period_ms(),
+            flood_demand_backoff_delay_ms: default_flood_demand_backoff_delay_ms(),
+            peer_max_failures: default_peer_max_failures(),
         }
     }
+}
+
+fn default_peer_max_failures() -> u32 {
+    120
 }
 
 /// Logging configuration.
@@ -404,6 +525,26 @@ fn default_target_outbound() -> usize {
     8
 }
 
+fn default_flood_op_rate_per_ledger() -> f64 {
+    1.0
+}
+
+fn default_flood_soroban_rate_per_ledger() -> f64 {
+    1.0
+}
+
+fn default_flood_demand_period_ms() -> u64 {
+    200
+}
+
+fn default_flood_advert_period_ms() -> u64 {
+    100
+}
+
+fn default_flood_demand_backoff_delay_ms() -> u64 {
+    500
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -414,6 +555,14 @@ fn default_log_format() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_classic_byte_allowance() -> u32 {
+    5 * 1024 * 1024
+}
+
+fn default_soroban_byte_allowance() -> u32 {
+    5 * 1024 * 1024
 }
 
 impl Default for AppConfig {
@@ -428,6 +577,7 @@ impl AppConfig {
         Self {
             node: NodeConfig::default(),
             network: NetworkConfig::testnet(),
+            upgrades: UpgradeConfig::default(),
             database: DatabaseConfig::default(),
             buckets: BucketConfig::default(),
             history: HistoryConfig {
@@ -438,6 +588,8 @@ impl AppConfig {
                             .to_string(),
                         get_enabled: true,
                         put_enabled: false,
+                        put: None,
+                        mkdir: None,
                     },
                     HistoryArchiveEntry {
                         name: "sdf2".to_string(),
@@ -445,6 +597,8 @@ impl AppConfig {
                             .to_string(),
                         get_enabled: true,
                         put_enabled: false,
+                        put: None,
+                        mkdir: None,
                     },
                     HistoryArchiveEntry {
                         name: "sdf3".to_string(),
@@ -452,6 +606,8 @@ impl AppConfig {
                             .to_string(),
                         get_enabled: true,
                         put_enabled: false,
+                        put: None,
+                        mkdir: None,
                     },
                 ],
             },
@@ -465,6 +621,7 @@ impl AppConfig {
             },
             logging: LoggingConfig::default(),
             http: HttpConfig::default(),
+            surge_pricing: SurgePricingConfig::default(),
         }
     }
 
@@ -473,6 +630,7 @@ impl AppConfig {
         Self {
             node: NodeConfig::default(),
             network: NetworkConfig::mainnet(),
+            upgrades: UpgradeConfig::default(),
             database: DatabaseConfig::default(),
             buckets: BucketConfig::default(),
             history: HistoryConfig {
@@ -482,18 +640,24 @@ impl AppConfig {
                         url: "https://history.stellar.org/prd/core-live/core_live_001".to_string(),
                         get_enabled: true,
                         put_enabled: false,
+                        put: None,
+                        mkdir: None,
                     },
                     HistoryArchiveEntry {
                         name: "sdf2".to_string(),
                         url: "https://history.stellar.org/prd/core-live/core_live_002".to_string(),
                         get_enabled: true,
                         put_enabled: false,
+                        put: None,
+                        mkdir: None,
                     },
                     HistoryArchiveEntry {
                         name: "sdf3".to_string(),
                         url: "https://history.stellar.org/prd/core-live/core_live_003".to_string(),
                         get_enabled: true,
                         put_enabled: false,
+                        put: None,
+                        mkdir: None,
                     },
                 ],
             },
@@ -507,6 +671,7 @@ impl AppConfig {
             },
             logging: LoggingConfig::default(),
             http: HttpConfig::default(),
+            surge_pricing: SurgePricingConfig::default(),
         }
     }
 
@@ -595,6 +760,36 @@ impl AppConfig {
         // Must have at least one history archive for catchup
         if self.history.archives.is_empty() {
             anyhow::bail!("At least one history archive must be configured");
+        }
+
+        if self.overlay.flood_op_rate_per_ledger <= 0.0 {
+            anyhow::bail!("flood_op_rate_per_ledger must be > 0");
+        }
+        if self.overlay.flood_soroban_rate_per_ledger <= 0.0 {
+            anyhow::bail!("flood_soroban_rate_per_ledger must be > 0");
+        }
+        if self.overlay.flood_demand_period_ms == 0 {
+            anyhow::bail!("flood_demand_period_ms must be > 0");
+        }
+        if self.overlay.flood_advert_period_ms == 0 {
+            anyhow::bail!("flood_advert_period_ms must be > 0");
+        }
+        if self.overlay.flood_demand_backoff_delay_ms == 0 {
+            anyhow::bail!("flood_demand_backoff_delay_ms must be > 0");
+        }
+        if self.overlay.auto_survey {
+            anyhow::bail!("auto_survey is not supported; surveys are manual only");
+        }
+        for key in &self.overlay.surveyor_keys {
+            if stellar_core_crypto::PublicKey::from_strkey(key).is_err() {
+                anyhow::bail!("Invalid surveyor key: {}", key);
+            }
+        }
+
+        let total_bytes = self.surge_pricing.classic_byte_allowance
+            .saturating_add(self.surge_pricing.soroban_byte_allowance);
+        if total_bytes > 10 * 1024 * 1024 {
+            anyhow::bail!("surge_pricing byte allowances exceed 10MB total");
         }
 
         // Validate quorum set if validator
@@ -691,6 +886,8 @@ impl ConfigBuilder {
             url: url.into(),
             get_enabled: true,
             put_enabled: false,
+            put: None,
+            mkdir: None,
         });
         self
     }
@@ -719,6 +916,7 @@ mod tests {
             "Test SDF Network ; September 2015"
         );
         assert!(!config.node.is_validator);
+        assert!(config.upgrades.to_ledger_upgrades().is_empty());
     }
 
     #[test]

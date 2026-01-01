@@ -64,7 +64,7 @@ pub mod operations;
 mod result;
 pub mod soroban;
 pub mod state;
-mod validation;
+pub mod validation;
 
 // Re-export error types
 pub use error::TxError;
@@ -121,6 +121,10 @@ pub enum ValidationResult {
     TooLate,
     /// Transaction is not yet valid (time bounds).
     TooEarly,
+    /// Minimum sequence age or ledger gap not met.
+    BadMinSeqAgeOrGap,
+    /// Extra signer requirements not met.
+    BadAuthExtra,
     /// Other validation error.
     Invalid,
 }
@@ -137,11 +141,19 @@ impl From<ValidationError> for ValidationResult {
             ValidationError::InsufficientBalance => ValidationResult::InsufficientBalance,
             ValidationError::TooLate { .. } => ValidationResult::TooLate,
             ValidationError::TooEarly { .. } => ValidationResult::TooEarly,
-            ValidationError::BadLedgerBounds { .. } => ValidationResult::Invalid,
+            ValidationError::BadLedgerBounds { min, max, current } => {
+                if max > 0 && current > max {
+                    ValidationResult::TooLate
+                } else if min > 0 && current < min {
+                    ValidationResult::TooEarly
+                } else {
+                    ValidationResult::Invalid
+                }
+            }
             ValidationError::BadMinAccountSequence => ValidationResult::BadSequence,
-            ValidationError::BadMinAccountSequenceAge => ValidationResult::BadSequence,
-            ValidationError::BadMinAccountSequenceLedgerGap => ValidationResult::BadSequence,
-            ValidationError::ExtraSignersNotMet => ValidationResult::InvalidSignature,
+            ValidationError::BadMinAccountSequenceAge => ValidationResult::BadMinSeqAgeOrGap,
+            ValidationError::BadMinAccountSequenceLedgerGap => ValidationResult::BadMinSeqAgeOrGap,
+            ValidationError::ExtraSignersNotMet => ValidationResult::BadAuthExtra,
         }
     }
 }

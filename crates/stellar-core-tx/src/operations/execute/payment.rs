@@ -4,8 +4,10 @@
 //! which transfers assets between accounts.
 
 use stellar_xdr::curr::{
-    AccountId, Asset, OperationResult, OperationResultTr, PaymentOp, PaymentResult,
-    PaymentResultCode,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
+    Asset, Liabilities, OperationResult, OperationResultTr, PaymentOp, PaymentResult,
+    PaymentResultCode, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext,
+    TrustLineFlags,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -70,7 +72,8 @@ fn execute_native_payment(
 
     // Check source has sufficient available balance
     let source_min_balance = state.minimum_balance(source_account.num_sub_entries);
-    let available = source_account.balance - source_min_balance;
+    let available =
+        source_account.balance - source_min_balance - account_liabilities(source_account).selling;
     if available < amount {
         return Ok(make_result(PaymentResultCode::Underfunded));
     }
@@ -82,6 +85,13 @@ fn execute_native_payment(
     source_account_mut.balance -= amount;
 
     // Credit to destination
+    let dest_account = state
+        .get_account(dest)
+        .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
+    let max_receive = i64::MAX - dest_account.balance - account_liabilities(dest_account).buying;
+    if max_receive < amount {
+        return Ok(make_result(PaymentResultCode::LineFull));
+    }
     let dest_account_mut = state
         .get_account_mut(dest)
         .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
@@ -98,47 +108,104 @@ fn execute_credit_payment(
     amount: i64,
     state: &mut LedgerStateManager,
 ) -> Result<OperationResult> {
+    let issuer = match asset {
+        Asset::CreditAlphanum4(a) => &a.issuer,
+        Asset::CreditAlphanum12(a) => &a.issuer,
+        Asset::Native => return Ok(make_result(PaymentResultCode::Malformed)),
+    };
+
+    let issuer_account = match state.get_account(issuer) {
+        Some(account) => account,
+        None => return Ok(make_result(PaymentResultCode::NoIssuer)),
+    };
+
     // Check destination exists
-    if state.get_account(dest).is_none() {
+    if issuer != dest && state.get_account(dest).is_none() {
         return Ok(make_result(PaymentResultCode::NoDestination));
     }
 
     // Check source trustline exists
-    let source_trustline = match state.get_trustline(source, asset) {
-        Some(tl) => tl,
-        None => return Ok(make_result(PaymentResultCode::SrcNoTrust)),
-    };
+    let auth_required = issuer_account.flags & AUTH_REQUIRED_FLAG != 0;
+    if issuer != source {
+        let source_trustline = match state.get_trustline(source, asset) {
+            Some(tl) => tl,
+            None => return Ok(make_result(PaymentResultCode::SrcNoTrust)),
+        };
 
-    // Check source has sufficient balance
-    if source_trustline.balance < amount {
-        return Ok(make_result(PaymentResultCode::Underfunded));
+        if auth_required && !is_trustline_authorized(source_trustline.flags) {
+            return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
+        }
+
+        // Check source has sufficient balance
+        let available = source_trustline.balance - trustline_liabilities(source_trustline).selling;
+        if available < amount {
+            return Ok(make_result(PaymentResultCode::Underfunded));
+        }
     }
 
     // Check destination trustline exists
-    let dest_trustline = match state.get_trustline(dest, asset) {
-        Some(tl) => tl,
-        None => return Ok(make_result(PaymentResultCode::NoTrust)),
-    };
+    if issuer != dest {
+        let dest_trustline = match state.get_trustline(dest, asset) {
+            Some(tl) => tl,
+            None => return Ok(make_result(PaymentResultCode::NoTrust)),
+        };
 
-    // Check destination trustline has room (limit check)
-    let dest_available = dest_trustline.limit - dest_trustline.balance;
-    if dest_available < amount {
-        return Ok(make_result(PaymentResultCode::LineFull));
+        if auth_required && !is_trustline_authorized(dest_trustline.flags) {
+            return Ok(make_result(PaymentResultCode::NotAuthorized));
+        }
+
+        // Check destination trustline has room (limit check)
+        let dest_available =
+            dest_trustline.limit - dest_trustline.balance - trustline_liabilities(dest_trustline).buying;
+        if dest_available < amount {
+            return Ok(make_result(PaymentResultCode::LineFull));
+        }
     }
 
-    // Update source trustline balance
-    let source_trustline_mut = state
-        .get_trustline_mut(source, asset)
-        .ok_or_else(|| TxError::Internal("source trustline disappeared".into()))?;
-    source_trustline_mut.balance -= amount;
+    if issuer != source {
+        // Update source trustline balance
+        let source_trustline_mut = state
+            .get_trustline_mut(source, asset)
+            .ok_or_else(|| TxError::Internal("source trustline disappeared".into()))?;
+        source_trustline_mut.balance -= amount;
+    }
 
-    // Update destination trustline balance
-    let dest_trustline_mut = state
-        .get_trustline_mut(dest, asset)
-        .ok_or_else(|| TxError::Internal("destination trustline disappeared".into()))?;
-    dest_trustline_mut.balance += amount;
+    if issuer != dest {
+        // Update destination trustline balance
+        let dest_trustline_mut = state
+            .get_trustline_mut(dest, asset)
+            .ok_or_else(|| TxError::Internal("destination trustline disappeared".into()))?;
+        dest_trustline_mut.balance += amount;
+    }
 
     Ok(make_result(PaymentResultCode::Success))
+}
+
+const AUTH_REQUIRED_FLAG: u32 = 0x1;
+const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
+
+fn is_trustline_authorized(flags: u32) -> bool {
+    flags & AUTHORIZED_FLAG != 0
+}
+
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
+}
+
+fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
+    match &trustline.ext {
+        TrustLineEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
 }
 
 /// Create an OperationResult from a PaymentResultCode.
@@ -187,8 +254,61 @@ mod tests {
         }
     }
 
+    fn create_test_account_with_liabilities(
+        account_id: AccountId,
+        balance: i64,
+        buying: i64,
+        selling: i64,
+    ) -> AccountEntry {
+        let mut account = create_test_account(account_id, balance);
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities { buying, selling },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        account
+    }
+
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
+    }
+
+    fn create_test_trustline(
+        account_id: AccountId,
+        asset: TrustLineAsset,
+        balance: i64,
+        limit: i64,
+        flags: u32,
+    ) -> TrustLineEntry {
+        TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V0,
+        }
+    }
+
+    fn create_test_trustline_with_liabilities(
+        account_id: AccountId,
+        asset: TrustLineAsset,
+        balance: i64,
+        limit: i64,
+        flags: u32,
+        buying: i64,
+        selling: i64,
+    ) -> TrustLineEntry {
+        TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities { buying, selling },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        }
     }
 
     #[test]
@@ -272,6 +392,40 @@ mod tests {
     }
 
     #[test]
+    fn test_payment_underfunded_with_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        let min_balance = state.minimum_balance(0);
+        state.create_account(create_test_account_with_liabilities(
+            source_id.clone(),
+            min_balance + 1_000_000,
+            0,
+            900_000,
+        ));
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset: Asset::Native,
+            amount: 200_000,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Underfunded));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
     fn test_payment_malformed() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
@@ -291,6 +445,357 @@ mod tests {
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::Payment(r)) => {
                 assert!(matches!(r, PaymentResult::Malformed));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_payment_no_issuer() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset,
+            amount: 10,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::NoIssuer));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_payment_src_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state
+            .get_account_mut(&issuer_id)
+            .unwrap()
+            .flags = AUTH_REQUIRED_FLAG;
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            0,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset,
+            amount: 10,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::SrcNotAuthorized));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_payment_not_authorized_dest() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state
+            .get_account_mut(&issuer_id)
+            .unwrap()
+            .flags = AUTH_REQUIRED_FLAG;
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            0,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset,
+            amount: 10,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::NotAuthorized));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_payment_line_full_with_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline_with_liabilities(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            90,
+            100,
+            AUTHORIZED_FLAG,
+            10,
+            0,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset,
+            amount: 1,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::LineFull));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_payment_success_no_auth_required() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            0,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            0,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset,
+            amount: 10,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_payment_from_issuer_without_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            0,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset,
+            amount: 10,
+        };
+
+        let result = execute_payment(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_payment_to_issuer_without_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            0,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(9),
+            asset,
+            amount: 10,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Success));
             }
             _ => panic!("Unexpected result type"),
         }

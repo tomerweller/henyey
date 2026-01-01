@@ -196,6 +196,11 @@ impl Slot {
         self.envelopes.get(node_id).and_then(|v| v.last())
     }
 
+    /// Get the current ballot counter for this slot, if any.
+    pub fn ballot_counter(&self) -> Option<u32> {
+        self.ballot.current_ballot_counter()
+    }
+
     /// Process a nomination envelope.
     fn process_nomination_envelope<D: SCPDriver>(
         &mut self,

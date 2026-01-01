@@ -5,9 +5,10 @@
 //! - SetTrustLineFlags
 
 use stellar_xdr::curr::{
-    AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, OperationResult,
-    OperationResultTr, SetTrustLineFlagsOp, SetTrustLineFlagsResult, SetTrustLineFlagsResultCode,
-    TrustLineFlags,
+    AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, Liabilities,
+    OperationResult, OperationResultTr, SetTrustLineFlagsOp, SetTrustLineFlagsResult,
+    SetTrustLineFlagsResultCode, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
+    TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use crate::state::LedgerStateManager;
@@ -19,6 +20,7 @@ const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
     TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
 const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
+const AUTH_REQUIRED_FLAG: u32 = 0x1;
 
 /// Execute an AllowTrust operation (deprecated).
 ///
@@ -39,7 +41,6 @@ pub fn execute_allow_trust(
     };
 
     // Check if issuer has AUTH_REQUIRED flag
-    const AUTH_REQUIRED_FLAG: u32 = 0x1;
     if issuer.flags & AUTH_REQUIRED_FLAG == 0 {
         return Ok(make_allow_trust_result(AllowTrustResultCode::TrustNotRequired));
     }
@@ -90,6 +91,10 @@ pub fn execute_allow_trust(
             // Authorized to maintain liabilities
             new_flags |= AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
         }
+    }
+
+    if op.authorize == 0 && has_liabilities(&trustline) {
+        return Ok(make_allow_trust_result(AllowTrustResultCode::CantRevoke));
     }
 
     // Update the trustline
@@ -162,6 +167,10 @@ pub fn execute_set_trust_line_flags(
         new_flags &= !AUTHORIZED_FLAG;
     }
 
+    if !is_authorized_to_maintain_liabilities(new_flags) && has_liabilities(&trustline) {
+        return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::CantRevoke));
+    }
+
     // Update the trustline
     if let Some(tl) = state.get_trustline_mut(&op.trustor, &op.asset) {
         tl.flags = new_flags;
@@ -199,6 +208,21 @@ fn make_set_flags_result(code: SetTrustLineFlagsResultCode) -> OperationResult {
     OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(result))
 }
 
+fn has_liabilities(trustline: &TrustLineEntry) -> bool {
+    let liab = match &trustline.ext {
+        TrustLineEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
+    };
+    liab.buying != 0 || liab.selling != 0
+}
+
+fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
+    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +244,28 @@ mod tests {
             thresholds: Thresholds([1, 0, 0, 0]),
             signers: vec![].try_into().unwrap(),
             ext: AccountEntryExt::V0,
+        }
+    }
+
+    fn create_test_trustline_with_liabilities(
+        account_id: AccountId,
+        asset: TrustLineAsset,
+        balance: i64,
+        limit: i64,
+        flags: u32,
+        buying: i64,
+        selling: i64,
+    ) -> TrustLineEntry {
+        TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities { buying, selling },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
         }
     }
 
@@ -253,6 +299,93 @@ mod tests {
                 assert!(matches!(r, AllowTrustResult::TrustNotRequired));
             }
             _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_allow_trust_cant_revoke_with_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let trustor_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, AUTH_REQUIRED_FLAG));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(create_test_trustline_with_liabilities(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+            0,
+            1,
+        ));
+
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
+            authorize: 0,
+        };
+
+        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(matches!(r, AllowTrustResult::CantRevoke));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_set_trust_line_flags_cant_revoke_with_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let trustor_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(create_test_trustline_with_liabilities(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+            0,
+            1,
+        ));
+
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(matches!(r, SetTrustLineFlagsResult::CantRevoke));
+            }
+            other => panic!("unexpected result: {:?}", other),
         }
     }
 

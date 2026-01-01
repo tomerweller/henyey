@@ -18,7 +18,9 @@ use crate::{
 };
 use stellar_core_bucket::BucketList;
 use stellar_core_common::Hash256;
-use stellar_xdr::curr::{LedgerHeader, TransactionResultPair, TransactionSet, WriteXdr};
+use stellar_xdr::curr::{
+    LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
+};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -27,6 +29,8 @@ use tracing::{debug, info};
 pub struct PublishConfig {
     /// Local directory to write history files.
     pub local_path: PathBuf,
+    /// Network passphrase for HAS files.
+    pub network_passphrase: Option<String>,
     /// Whether to publish to remote archives.
     pub publish_remote: bool,
     /// Remote archive URLs for publishing (S3, GCS, etc.).
@@ -39,6 +43,7 @@ impl Default for PublishConfig {
     fn default() -> Self {
         Self {
             local_path: PathBuf::from("history"),
+            network_passphrase: None,
             publish_remote: false,
             remote_urls: Vec::new(),
             max_parallel_uploads: 4,
@@ -77,6 +82,32 @@ pub struct PublishManager {
     config: PublishConfig,
 }
 
+/// Build a history archive state from a bucket list snapshot.
+pub fn build_history_archive_state(
+    checkpoint_ledger: u32,
+    bucket_list: &BucketList,
+    network_passphrase: Option<String>,
+) -> Result<HistoryArchiveState> {
+    let current_buckets: Vec<HASBucketLevel> = bucket_list
+        .levels()
+        .iter()
+        .map(|level| HASBucketLevel {
+            curr: level.curr.hash().to_hex(),
+            snap: level.snap.hash().to_hex(),
+            next: HASBucketNext::default(),
+        })
+        .collect();
+
+    Ok(HistoryArchiveState {
+        version: 2,
+        server: Some("rs-stellar-core".to_string()),
+        current_ledger: checkpoint_ledger,
+        network_passphrase,
+        current_buckets,
+        hot_archive_buckets: None,
+    })
+}
+
 impl PublishManager {
     /// Create a new publish manager.
     pub fn new(config: PublishConfig) -> Self {
@@ -94,9 +125,9 @@ impl PublishManager {
     pub async fn publish_checkpoint(
         &self,
         checkpoint_ledger: u32,
-        headers: &[LedgerHeader],
-        tx_sets: &[(u32, TransactionSet)],
-        tx_results: &[(u32, Vec<TransactionResultPair>)],
+        headers: &[LedgerHeaderHistoryEntry],
+        tx_entries: &[TransactionHistoryEntry],
+        tx_results: &[TransactionHistoryResultEntry],
         bucket_list: &BucketList,
     ) -> Result<PublishState> {
         if !is_checkpoint_ledger(checkpoint_ledger) {
@@ -125,7 +156,7 @@ impl PublishManager {
 
         // Write transaction sets
         let txset_path = self.ledger_path(checkpoint_ledger, "transactions");
-        self.write_transaction_sets(&txset_path, tx_sets)?;
+        self.write_transaction_entries(&txset_path, tx_entries)?;
         state.files_written += 1;
 
         // Write transaction results
@@ -173,9 +204,14 @@ impl PublishManager {
     fn ensure_directories(&self, checkpoint_ledger: u32) -> Result<()> {
         let base = &self.config.local_path;
 
-        // Create ledger directories
-        let ledger_dir = base.join(paths::ledger_dir(checkpoint_ledger));
-        std::fs::create_dir_all(&ledger_dir)?;
+        // Create checkpoint directories for each category.
+        for category in ["ledger", "transactions", "results", "history", "scp"] {
+            let path = base.join(paths::checkpoint_file_path(checkpoint_ledger, category));
+            let dir = path.parent().ok_or_else(|| {
+                HistoryError::VerificationFailed("missing checkpoint directory".to_string())
+            })?;
+            std::fs::create_dir_all(dir)?;
+        }
 
         // Create bucket directories (organized by first 2 hex chars)
         let bucket_base = base.join("bucket");
@@ -206,7 +242,7 @@ impl PublishManager {
     }
 
     /// Write ledger headers to a file.
-    fn write_ledger_headers(&self, path: &Path, headers: &[LedgerHeader]) -> Result<()> {
+    fn write_ledger_headers(&self, path: &Path, headers: &[LedgerHeaderHistoryEntry]) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use std::io::Write;
@@ -227,10 +263,10 @@ impl PublishManager {
     }
 
     /// Write transaction sets to a file.
-    fn write_transaction_sets(
+    fn write_transaction_entries(
         &self,
         path: &Path,
-        tx_sets: &[(u32, TransactionSet)],
+        tx_entries: &[TransactionHistoryEntry],
     ) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
@@ -239,20 +275,15 @@ impl PublishManager {
         let file = std::fs::File::create(path.with_extension("xdr.gz"))?;
         let mut encoder = GzEncoder::new(file, Compression::default());
 
-        for (seq, tx_set) in tx_sets {
-            // Write sequence number (4 bytes big-endian)
-            encoder.write_all(&seq.to_be_bytes())?;
-            // Write XDR
-            let xdr = tx_set
+        for entry in tx_entries {
+            let xdr = entry
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-            // Write length (4 bytes big-endian)
-            encoder.write_all(&(xdr.len() as u32).to_be_bytes())?;
             encoder.write_all(&xdr)?;
         }
 
         encoder.finish()?;
-        debug!("Wrote {} transaction sets to {:?}", tx_sets.len(), path);
+        debug!("Wrote {} transaction entries to {:?}", tx_entries.len(), path);
         Ok(())
     }
 
@@ -260,7 +291,7 @@ impl PublishManager {
     fn write_transaction_results(
         &self,
         path: &Path,
-        results: &[(u32, Vec<TransactionResultPair>)],
+        results: &[TransactionHistoryResultEntry],
     ) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
@@ -269,16 +300,11 @@ impl PublishManager {
         let file = std::fs::File::create(path.with_extension("xdr.gz"))?;
         let mut encoder = GzEncoder::new(file, Compression::default());
 
-        for (seq, result_pairs) in results {
-            encoder.write_all(&seq.to_be_bytes())?;
-            encoder.write_all(&(result_pairs.len() as u32).to_be_bytes())?;
-            for pair in result_pairs {
-                let xdr = pair
-                    .to_xdr(stellar_xdr::curr::Limits::none())
-                    .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-                encoder.write_all(&(xdr.len() as u32).to_be_bytes())?;
-                encoder.write_all(&xdr)?;
-            }
+        for entry in results {
+            let xdr = entry
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+            encoder.write_all(&xdr)?;
         }
 
         encoder.finish()?;
@@ -337,25 +363,11 @@ impl PublishManager {
         _headers: &[LedgerHeader],
         bucket_list: &BucketList,
     ) -> Result<HistoryArchiveState> {
-        // Convert bucket list levels to HAS bucket levels
-        let current_buckets: Vec<HASBucketLevel> = bucket_list
-            .levels()
-            .iter()
-            .map(|level| HASBucketLevel {
-                curr: level.curr.hash().to_hex(),
-                snap: level.snap.hash().to_hex(),
-                next: HASBucketNext::default(),
-            })
-            .collect();
-
-        Ok(HistoryArchiveState {
-            version: 2,
-            server: Some("rs-stellar-core".to_string()),
-            current_ledger: checkpoint_ledger,
-            network_passphrase: None, // Will be set from config
-            current_buckets,
-            hot_archive_buckets: None,
-        })
+        build_history_archive_state(
+            checkpoint_ledger,
+            bucket_list,
+            self.config.network_passphrase.clone(),
+        )
     }
 
     /// Check if a checkpoint has been published.
@@ -374,21 +386,31 @@ impl PublishManager {
             return None;
         }
 
-        // Find the highest checkpoint with a HAS file
-        let mut latest: Option<u32> = None;
-
-        if let Ok(entries) = std::fs::read_dir(&has_dir) {
+        fn scan_dir(path: &Path, latest: &mut Option<u32>) {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(seq) = name.trim_end_matches(".json").parse::<u32>() {
-                        if is_checkpoint_ledger(seq) {
-                            latest = Some(latest.map_or(seq, |l| l.max(seq)));
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, latest);
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(hex) = name
+                        .strip_prefix("history-")
+                        .and_then(|n| n.strip_suffix(".json"))
+                    {
+                        if let Ok(seq) = u32::from_str_radix(hex, 16) {
+                            if is_checkpoint_ledger(seq) {
+                                *latest = Some(latest.map_or(seq, |l| l.max(seq)));
+                            }
                         }
                     }
                 }
             }
         }
 
+        let mut latest: Option<u32> = None;
+        scan_dir(&has_dir, &mut latest);
         latest
     }
 }
@@ -403,6 +425,7 @@ mod tests {
         let config = PublishConfig::default();
         assert!(!config.publish_remote);
         assert!(config.remote_urls.is_empty());
+        assert!(config.network_passphrase.is_none());
     }
 
     #[test]

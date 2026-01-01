@@ -20,9 +20,18 @@ use std::sync::Arc;
 use stellar_core_bucket::{BucketList, BucketManager};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
+use stellar_core_invariant::{
+    BucketListHashMatchesHeader, CloseTimeNondecreasing, ConservationOfLumens, Invariant,
+    InvariantContext, InvariantManager, LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid,
+    LedgerSeqIncrement,
+};
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, Limits,
-    WriteXdr,
+    AccountEntry, AccountId, ConfigSettingEntry, ConfigSettingId, ConfigSettingScpTiming,
+    GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaV2,
+    LedgerEntry, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
+    LedgerKey, LedgerKeyConfigSetting, Limits, ScpHistoryEntry, TransactionPhase,
+    TransactionResultMetaV1, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+    UpgradeEntryMeta, VecM, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -35,6 +44,9 @@ pub struct LedgerManagerConfig {
     /// Whether to validate bucket list hashes.
     pub validate_bucket_hash: bool,
 
+    /// Whether to validate invariants on ledger close.
+    pub validate_invariants: bool,
+
     /// Whether to persist to database.
     pub persist_to_db: bool,
 }
@@ -44,6 +56,7 @@ impl Default for LedgerManagerConfig {
         Self {
             max_snapshots: 10,
             validate_bucket_hash: true,
+            validate_invariants: true,
             persist_to_db: true,
         }
     }
@@ -92,6 +105,9 @@ pub struct LedgerManager {
     /// Snapshot manager.
     snapshots: SnapshotManager,
 
+    /// Invariant manager.
+    invariants: RwLock<InvariantManager>,
+
     /// Configuration.
     config: LedgerManagerConfig,
 }
@@ -117,6 +133,13 @@ impl LedgerManager {
         config: LedgerManagerConfig,
     ) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
+        let mut invariants = InvariantManager::new();
+        invariants.add(LedgerSeqIncrement);
+        invariants.add(CloseTimeNondecreasing);
+        invariants.add(BucketListHashMatchesHeader);
+        invariants.add(ConservationOfLumens);
+        invariants.add(LedgerEntryIsValid);
+        invariants.add(LastModifiedLedgerSeqMatchesHeader);
 
         Self {
             db,
@@ -131,6 +154,7 @@ impl LedgerManager {
             }),
             entry_cache: RwLock::new(HashMap::new()),
             snapshots: SnapshotManager::new(config.max_snapshots),
+            invariants: RwLock::new(invariants),
             config,
         }
     }
@@ -174,9 +198,38 @@ impl LedgerManager {
         self.state.read().header_hash
     }
 
+    /// Get the SCP timing configuration from the current ledger state.
+    pub fn scp_timing(&self) -> Option<ConfigSettingScpTiming> {
+        if !self.is_initialized() {
+            return None;
+        }
+
+        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ScpTiming,
+        });
+        let key_bytes = key.to_xdr(Limits::none()).ok()?;
+
+        if let Some(entry) = self.entry_cache.read().get(&key_bytes) {
+            return extract_scp_timing(entry);
+        }
+
+        let entry = self.bucket_list.read().get(&key).ok()??;
+        extract_scp_timing(&entry)
+    }
+
     /// Get the bucket list hash.
     pub fn bucket_list_hash(&self) -> Hash256 {
         self.bucket_list.read().hash()
+    }
+
+    /// Get bucket list level hashes (curr, snap) for persistence.
+    pub fn bucket_list_levels(&self) -> Vec<(Hash256, Hash256)> {
+        let bucket_list = self.bucket_list.read();
+        bucket_list
+            .levels()
+            .iter()
+            .map(|level| (level.curr.hash(), level.snap.hash()))
+            .collect()
     }
 
     /// Load a ledger entry by key.
@@ -431,6 +484,11 @@ impl LedgerManager {
         // Create snapshot of current state for reading during close
         let snapshot = self.create_snapshot()?;
 
+        let mut upgrade_ctx = UpgradeContext::new(state.header.ledger_version);
+        for upgrade in &close_data.upgrades {
+            upgrade_ctx.add_upgrade(upgrade.clone());
+        }
+
         Ok(LedgerCloseContext {
             manager: self,
             close_data,
@@ -439,7 +497,10 @@ impl LedgerManager {
             delta: LedgerDelta::new(expected_seq),
             snapshot,
             stats: LedgerCloseStats::new(),
-            upgrade_ctx: UpgradeContext::new(state.header.ledger_version),
+            upgrade_ctx,
+            id_pool: state.header.id_pool,
+            tx_results: Vec::new(),
+            tx_result_metas: Vec::new(),
         })
     }
 
@@ -463,7 +524,17 @@ impl LedgerManager {
             bucket_list.read().get(key).map_err(LedgerError::Bucket)
         });
 
-        Ok(SnapshotHandle::with_lookup(snapshot, lookup_fn))
+        // Create a lookup function that queries the ledger header table
+        let db = self.db.clone();
+        let header_lookup_fn: crate::snapshot::LedgerHeaderLookupFn = Arc::new(move |seq: u32| {
+            db.get_ledger_header(seq).map_err(LedgerError::from)
+        });
+
+        Ok(SnapshotHandle::with_lookups(
+            snapshot,
+            lookup_fn,
+            header_lookup_fn,
+        ))
     }
 
     /// Get a historical snapshot by sequence number.
@@ -535,6 +606,11 @@ impl LedgerManager {
             active_snapshots: self.snapshots.count(),
         }
     }
+
+    /// Register an additional invariant to enforce on ledger close.
+    pub fn add_invariant<I: Invariant + 'static>(&self, invariant: I) {
+        self.invariants.write().add(invariant);
+    }
 }
 
 /// Statistics about the ledger manager.
@@ -563,6 +639,9 @@ pub struct LedgerCloseContext<'a> {
     snapshot: SnapshotHandle,
     stats: LedgerCloseStats,
     upgrade_ctx: UpgradeContext,
+    id_pool: u64,
+    tx_results: Vec<stellar_xdr::curr::TransactionResultPair>,
+    tx_result_metas: Vec<stellar_xdr::curr::TransactionResultMetaV1>,
 }
 
 impl<'a> LedgerCloseContext<'a> {
@@ -652,13 +731,14 @@ impl<'a> LedgerCloseContext<'a> {
     /// This executes all transactions in order, recording state changes
     /// to the delta and collecting results.
     pub fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
-        let transactions = self.close_data.tx_set.transactions_owned();
+        let transactions = self.close_data.tx_set.transactions_with_base_fee();
 
         if transactions.is_empty() {
+            self.tx_results.clear();
             return Ok(vec![]);
         }
 
-        let results = execute_transaction_set(
+        let (results, tx_results, tx_result_metas, id_pool) = execute_transaction_set(
             &self.snapshot,
             &transactions,
             self.close_data.ledger_seq,
@@ -669,6 +749,9 @@ impl<'a> LedgerCloseContext<'a> {
             self.manager.network_id.clone(),
             &mut self.delta,
         )?;
+        self.id_pool = id_pool;
+        self.tx_results = tx_results;
+        self.tx_result_metas = tx_result_metas;
 
         // Update stats
         let tx_count = results.len();
@@ -687,7 +770,10 @@ impl<'a> LedgerCloseContext<'a> {
         let start = std::time::Instant::now();
 
         // Compute transaction result hash
-        let tx_result_hash = Hash256::ZERO; // Would be computed from actual results
+        let result_set = stellar_xdr::curr::TransactionResultSet {
+            results: self.tx_results.clone().try_into().unwrap_or_default(),
+        };
+        let tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
 
         // Apply delta to bucket list FIRST, then compute its hash
         // This ensures the bucket_list_hash in the header matches the actual state
@@ -721,8 +807,23 @@ impl<'a> LedgerCloseContext<'a> {
         // Apply upgrades
         self.upgrade_ctx.apply_to_header(&mut new_header);
 
+        new_header.id_pool = self.id_pool;
+
         // Compute header hash
         let header_hash = compute_header_hash(&new_header)?;
+
+        if self.manager.config.validate_invariants {
+            let changed_entries = self.delta.live_entries();
+            let ctx = InvariantContext {
+                prev_header: &self.prev_header,
+                curr_header: &new_header,
+                bucket_list_hash,
+                fee_pool_delta: self.delta.fee_pool_delta(),
+                total_coins_delta: self.delta.total_coins_delta(),
+                changed_entries: &changed_entries,
+            };
+            self.manager.invariants.read().check_all(&ctx)?;
+        }
 
         // Record stats
         let entries_created = self.delta.changes().filter(|c| c.is_created()).count();
@@ -742,7 +843,13 @@ impl<'a> LedgerCloseContext<'a> {
             "Ledger closed"
         );
 
-        Ok(LedgerCloseResult::new(new_header, header_hash))
+        let meta = build_ledger_close_meta(&self.close_data, &new_header, header_hash, &self.tx_result_metas);
+
+        Ok(
+            LedgerCloseResult::new(new_header, header_hash)
+                .with_tx_results(self.tx_results)
+                .with_meta(meta),
+        )
     }
 
     /// Abort the ledger close without committing.
@@ -753,6 +860,51 @@ impl<'a> LedgerCloseContext<'a> {
         );
         // Delta is dropped, no changes are committed
     }
+}
+
+fn build_generalized_tx_set(tx_set: &TransactionSetVariant) -> GeneralizedTransactionSet {
+    match tx_set {
+        TransactionSetVariant::Generalized(set) => set.clone(),
+        TransactionSetVariant::Classic(set) => {
+            let component = TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: None,
+                    txs: set.txs.clone(),
+                },
+            );
+            let phase = TransactionPhase::V0(vec![component].try_into().unwrap_or_default());
+            GeneralizedTransactionSet::V1(TransactionSetV1 {
+                previous_ledger_hash: set.previous_ledger_hash.clone(),
+                phases: vec![phase].try_into().unwrap_or_default(),
+            })
+        }
+    }
+}
+
+fn build_ledger_close_meta(
+    close_data: &LedgerCloseData,
+    header: &LedgerHeader,
+    header_hash: Hash256,
+    tx_result_metas: &[TransactionResultMetaV1],
+) -> LedgerCloseMeta {
+    let ledger_header = LedgerHeaderHistoryEntry {
+        hash: Hash::from(header_hash),
+        header: header.clone(),
+        ext: LedgerHeaderHistoryEntryExt::V0,
+    };
+
+    let tx_set = build_generalized_tx_set(&close_data.tx_set);
+
+    LedgerCloseMeta::V2(LedgerCloseMetaV2 {
+        ext: LedgerCloseMetaExt::V0,
+        ledger_header,
+        tx_set,
+        tx_processing: tx_result_metas.to_vec().try_into().unwrap_or_default(),
+        upgrades_processing: VecM::<UpgradeEntryMeta>::default(),
+        scp_info: VecM::<ScpHistoryEntry>::default(),
+        total_byte_size_of_live_soroban_state: 0,
+        evicted_keys: VecM::default(),
+    })
 }
 
 /// Create a genesis ledger header.
@@ -781,6 +933,15 @@ fn create_genesis_header() -> LedgerHeader {
     }
 }
 
+fn extract_scp_timing(entry: &LedgerEntry) -> Option<ConfigSettingScpTiming> {
+    match &entry.data {
+        LedgerEntryData::ConfigSetting(ConfigSettingEntry::ScpTiming(timing)) => {
+            Some(timing.clone())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +962,7 @@ mod tests {
         let config = LedgerManagerConfig::default();
         assert_eq!(config.max_snapshots, 10);
         assert!(config.validate_bucket_hash);
+        assert!(config.validate_invariants);
         assert!(config.persist_to_db);
     }
 }

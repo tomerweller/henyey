@@ -45,6 +45,10 @@ pub enum OverlayError {
     #[error("peer not found: {0}")]
     PeerNotFound(String),
 
+    /// Peer is banned.
+    #[error("peer is banned: {0}")]
+    PeerBanned(String),
+
     /// Already connected to peer.
     #[error("already connected to peer")]
     AlreadyConnected,

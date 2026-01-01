@@ -104,6 +104,13 @@ let result = catchup.run().await?;
 println!("Caught up to ledger {}", result.ledger_seq);
 ```
 
+For pre-downloaded checkpoint data (for example, via `stellar-core-historywork`),
+use `CheckpointData` with `catchup_to_ledger_with_checkpoint_data` (includes
+SCP history when available).
+
+Ledger replay currently re-executes transaction sets against the bucket list
+for post-checkpoint ledgers.
+
 ### Verification
 
 ```rust

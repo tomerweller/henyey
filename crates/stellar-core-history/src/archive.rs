@@ -7,7 +7,7 @@
 use reqwest::Client;
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{
-    LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry,
+    LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry,
 };
 use tracing::debug;
 use url::Url;
@@ -212,6 +212,18 @@ impl HistoryArchive {
         checkpoint: u32,
     ) -> Result<Vec<TransactionHistoryResultEntry>, HistoryError> {
         let path = checkpoint_path("results", checkpoint, "xdr.gz");
+        let data = self.download_xdr_gz(&path).await?;
+        parse_xdr_stream_auto(&data)
+    }
+
+    /// Download SCP history for a checkpoint.
+    ///
+    /// Returns SCP envelopes and quorum sets for the checkpoint.
+    pub async fn get_scp_history(
+        &self,
+        checkpoint: u32,
+    ) -> Result<Vec<ScpHistoryEntry>, HistoryError> {
+        let path = checkpoint_path("scp", checkpoint, "xdr.gz");
         let data = self.download_xdr_gz(&path).await?;
         parse_xdr_stream_auto(&data)
     }

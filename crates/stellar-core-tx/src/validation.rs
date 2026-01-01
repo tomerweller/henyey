@@ -4,9 +4,11 @@
 //! During catchup, we trust the historical results from the archive, so we only
 //! perform minimal validation to ensure data integrity.
 
-use stellar_core_common::NetworkId;
+use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_crypto::{verify_hash, PublicKey, Signature};
-use stellar_xdr::curr::{AccountEntry, DecoratedSignature, Preconditions};
+use stellar_xdr::curr::{
+    AccountEntry, DecoratedSignature, Preconditions, SignerKey, TransactionEnvelope,
+};
 
 use crate::frame::TransactionFrame;
 use crate::{Result, TxError};
@@ -192,6 +194,44 @@ pub fn validate_sequence(
     Ok(())
 }
 
+/// Validate preconditions (min sequence and extra signers).
+fn validate_min_seq_num(
+    frame: &TransactionFrame,
+    source_account: &AccountEntry,
+) -> std::result::Result<(), ValidationError> {
+    if let Preconditions::V2(cond) = frame.preconditions() {
+        if let Some(min_seq) = cond.min_seq_num {
+            if source_account.seq_num.0 < min_seq.0 {
+                return Err(ValidationError::BadMinAccountSequence);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_extra_signers(
+    frame: &TransactionFrame,
+    context: &LedgerContext,
+) -> std::result::Result<(), ValidationError> {
+    if let Preconditions::V2(cond) = frame.preconditions() {
+        if !cond.extra_signers.is_empty() {
+            let extra_hash = fee_bump_inner_hash(frame, &context.network_id)
+                .map_err(|e| ValidationError::InvalidStructure(e))?;
+            let extra_signatures = if frame.is_fee_bump() {
+                frame.inner_signatures()
+            } else {
+                frame.signatures()
+            };
+            if !has_required_extra_signers(&extra_hash, extra_signatures, &cond.extra_signers) {
+                return Err(ValidationError::ExtraSignersNotMet);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate transaction fee.
 ///
 /// Checks that the fee meets the minimum required fee based on operation count.
@@ -338,18 +378,35 @@ pub fn validate_full(
 ) -> std::result::Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
 
-    // Run basic validations first
-    if let Err(mut e) = validate_basic(frame, context) {
-        errors.append(&mut e);
+    if let Err(e) = validate_structure(frame) {
+        errors.push(e);
     }
 
-    // Validate sequence
+    if let Err(e) = validate_fee(frame, context) {
+        errors.push(e);
+    }
+
+    if let Err(e) = validate_time_bounds(frame, context) {
+        errors.push(e);
+    }
+
+    if let Err(e) = validate_ledger_bounds(frame, context) {
+        errors.push(e);
+    }
+
+    if let Err(e) = validate_min_seq_num(frame, source_account) {
+        errors.push(e);
+    }
+
     if let Err(e) = validate_sequence(frame, Some(source_account)) {
         errors.push(e);
     }
 
-    // Validate signatures
     if let Err(e) = validate_signatures(frame, context) {
+        errors.push(e);
+    }
+
+    if let Err(e) = validate_extra_signers(frame, context) {
         errors.push(e);
     }
 
@@ -365,6 +422,94 @@ pub fn validate_full(
     } else {
         Err(errors)
     }
+}
+
+fn fee_bump_inner_hash(
+    frame: &TransactionFrame,
+    network_id: &NetworkId,
+) -> std::result::Result<Hash256, String> {
+    match frame.envelope() {
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                let inner_env = TransactionEnvelope::Tx(inner.clone());
+                let inner_frame = TransactionFrame::with_network(inner_env, *network_id);
+                inner_frame
+                    .hash(network_id)
+                    .map_err(|e| format!("inner tx hash error: {}", e))
+            }
+        },
+        _ => frame
+            .hash(network_id)
+            .map_err(|e| format!("tx hash error: {}", e)),
+    }
+}
+
+fn has_required_extra_signers(
+    tx_hash: &Hash256,
+    signatures: &[DecoratedSignature],
+    extra_signers: &[SignerKey],
+) -> bool {
+    extra_signers.iter().all(|signer| match signer {
+        SignerKey::Ed25519(key) => {
+            if let Ok(pk) = PublicKey::from_bytes(&key.0) {
+                has_ed25519_signature(tx_hash, signatures, &pk)
+            } else {
+                false
+            }
+        }
+        SignerKey::PreAuthTx(key) => key.0 == tx_hash.0,
+        SignerKey::HashX(key) => has_hashx_signature(signatures, key),
+        SignerKey::Ed25519SignedPayload(payload) => {
+            has_signed_payload_signature(tx_hash, signatures, payload)
+        }
+    })
+}
+
+fn has_ed25519_signature(
+    tx_hash: &Hash256,
+    signatures: &[DecoratedSignature],
+    pk: &PublicKey,
+) -> bool {
+    signatures
+        .iter()
+        .any(|sig| verify_signature_with_key(tx_hash, sig, pk))
+}
+
+fn has_hashx_signature(
+    signatures: &[DecoratedSignature],
+    key: &stellar_xdr::curr::Uint256,
+) -> bool {
+    signatures.iter().any(|sig| {
+        if sig.signature.0.len() != 32 {
+            return false;
+        }
+        let expected_hint = [key.0[28], key.0[29], key.0[30], key.0[31]];
+        if sig.hint.0 != expected_hint {
+            return false;
+        }
+        let hash = Hash256::hash(&sig.signature.0);
+        hash.0 == key.0
+    })
+}
+
+fn has_signed_payload_signature(
+    tx_hash: &Hash256,
+    signatures: &[DecoratedSignature],
+    payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+) -> bool {
+    let pk = match PublicKey::from_bytes(&payload.ed25519.0) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    let mut data = Vec::with_capacity(32 + payload.payload.len());
+    data.extend_from_slice(&tx_hash.0);
+    data.extend_from_slice(&payload.payload);
+    let payload_hash = Hash256::hash(&data);
+
+    signatures
+        .iter()
+        .any(|sig| verify_signature_with_key(&payload_hash, sig, &pk))
 }
 
 /// Check if a signature is cryptographically valid.
@@ -411,7 +556,14 @@ pub fn verify_signature_with_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_core_crypto::{sign_hash, SecretKey};
+    use stellar_xdr::curr::{
+        AccountEntry, AccountEntryExt, AccountId, Asset, DecoratedSignature, Duration, ManageDataOp,
+        Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PreconditionsV2,
+        PublicKey as XdrPublicKey, SequenceNumber, Signature as XdrSignature, SignatureHint,
+        String32, String64, Thresholds, TimeBounds, TimePoint, Transaction, TransactionEnvelope,
+        TransactionExt, TransactionV1Envelope, Uint256, VecM,
+    };
 
     fn create_test_frame() -> TransactionFrame {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
@@ -442,6 +594,40 @@ mod tests {
         });
 
         TransactionFrame::new(envelope)
+    }
+
+    fn create_account_entry(account_id: AccountId, seq_num: i64) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance: 10_000_000,
+            seq_num: SequenceNumber(seq_num),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }
+    }
+
+    fn sign_envelope(
+        envelope: &TransactionEnvelope,
+        secret: &SecretKey,
+        network_id: &NetworkId,
+    ) -> DecoratedSignature {
+        let frame = TransactionFrame::with_network(envelope.clone(), *network_id);
+        let hash = frame.hash(network_id).expect("tx hash");
+        let signature = sign_hash(secret, &hash);
+
+        let public_key = secret.public_key();
+        let pk_bytes = public_key.as_bytes();
+        let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+
+        DecoratedSignature {
+            hint,
+            signature: XdrSignature(signature.0.to_vec().try_into().unwrap()),
+        }
     }
 
     #[test]
@@ -513,5 +699,153 @@ mod tests {
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(validate_basic(&frame, &context).is_ok());
+    }
+
+    #[test]
+    fn test_validate_full_min_seq_num() {
+        let secret = SecretKey::from_seed(&[9u8; 32]);
+        let account_id: AccountId = (&secret.public_key()).into();
+        let source = MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes()));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: String64::try_from(b"minseq".to_vec()).unwrap(),
+                data_value: Some(b"value".to_vec().try_into().unwrap()),
+            }),
+        };
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: Some(SequenceNumber(5)),
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: VecM::default(),
+        });
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(2),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        let context = LedgerContext::testnet(1, 1000);
+        let account = create_account_entry(account_id, 1);
+        let result = validate_full(&TransactionFrame::new(envelope), &context, &account);
+        assert!(matches!(
+            result,
+            Err(errors) if matches!(errors.first(), Some(ValidationError::BadMinAccountSequence))
+        ));
+    }
+
+    #[test]
+    fn test_validate_full_extra_signers_missing() {
+        let secret = SecretKey::from_seed(&[10u8; 32]);
+        let account_id: AccountId = (&secret.public_key()).into();
+        let source = MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes()));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: String64::try_from(b"extra".to_vec()).unwrap(),
+                data_value: Some(b"value".to_vec().try_into().unwrap()),
+            }),
+        };
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![SignerKey::Ed25519(Uint256([1u8; 32]))]
+                .try_into()
+                .unwrap(),
+        });
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(2),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        let context = LedgerContext::testnet(1, 1000);
+        let account = create_account_entry(account_id, 1);
+        let result = validate_full(&TransactionFrame::new(envelope), &context, &account);
+        assert!(matches!(
+            result,
+            Err(errors) if matches!(errors.first(), Some(ValidationError::ExtraSignersNotMet))
+        ));
+    }
+
+    #[test]
+    fn test_validate_full_extra_signers_satisfied() {
+        let extra_secret = SecretKey::from_seed(&[11u8; 32]);
+        let account_secret = SecretKey::from_seed(&[12u8; 32]);
+        let account_id: AccountId = (&account_secret.public_key()).into();
+        let source = MuxedAccount::Ed25519(Uint256(*account_secret.public_key().as_bytes()));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: String64::try_from(b"extra".to_vec()).unwrap(),
+                data_value: Some(b"value".to_vec().try_into().unwrap()),
+            }),
+        };
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![SignerKey::Ed25519(Uint256(*extra_secret.public_key().as_bytes()))]
+                .try_into()
+                .unwrap(),
+        });
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(2),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        let network_id = NetworkId::testnet();
+        let sig = sign_envelope(&envelope, &extra_secret, &network_id);
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.signatures = vec![sig].try_into().unwrap();
+        }
+
+        let context = LedgerContext::testnet(1, 1000);
+        let account = create_account_entry(account_id, 1);
+        assert!(validate_full(&TransactionFrame::new(envelope), &context, &account).is_ok());
     }
 }

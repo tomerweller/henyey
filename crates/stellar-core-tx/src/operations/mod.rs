@@ -450,6 +450,14 @@ fn validate_liquidity_pool_deposit(
     if op.max_amount_b <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.max_amount_b));
     }
+    if op.min_price.n <= 0 || op.min_price.d <= 0 || op.max_price.n <= 0 || op.max_price.d <= 0 {
+        return Err(OperationValidationError::InvalidPrice);
+    }
+    if (op.min_price.n as i128) * (op.max_price.d as i128)
+        > (op.min_price.d as i128) * (op.max_price.n as i128)
+    {
+        return Err(OperationValidationError::InvalidPrice);
+    }
     Ok(())
 }
 
@@ -459,6 +467,12 @@ fn validate_liquidity_pool_withdraw(
 ) -> std::result::Result<(), OperationValidationError> {
     if op.amount <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.amount));
+    }
+    if op.min_amount_a < 0 {
+        return Err(OperationValidationError::InvalidAmount(op.min_amount_a));
+    }
+    if op.min_amount_b < 0 {
+        return Err(OperationValidationError::InvalidAmount(op.min_amount_b));
     }
     Ok(())
 }
@@ -578,5 +592,55 @@ mod tests {
             OperationType::InvokeHostFunction.name(),
             "InvokeHostFunction"
         );
+    }
+
+    #[test]
+    fn test_validate_liquidity_pool_deposit() {
+        let valid = LiquidityPoolDepositOp {
+            liquidity_pool_id: PoolId(Hash([0u8; 32])),
+            max_amount_a: 100,
+            max_amount_b: 200,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 2, d: 1 },
+        };
+        assert!(validate_liquidity_pool_deposit(&valid).is_ok());
+
+        let invalid_amount = LiquidityPoolDepositOp {
+            max_amount_a: 0,
+            ..valid.clone()
+        };
+        assert!(validate_liquidity_pool_deposit(&invalid_amount).is_err());
+
+        let invalid_price = LiquidityPoolDepositOp {
+            min_price: Price { n: 2, d: 1 },
+            max_price: Price { n: 1, d: 1 },
+            ..valid
+        };
+        assert!(validate_liquidity_pool_deposit(&invalid_price).is_err());
+    }
+
+    #[test]
+    fn test_validate_liquidity_pool_withdraw() {
+        let valid = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: PoolId(Hash([0u8; 32])),
+            amount: 100,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+        assert!(validate_liquidity_pool_withdraw(&valid).is_ok());
+
+        let invalid_amount = LiquidityPoolWithdrawOp {
+            amount: 0,
+            ..valid.clone()
+        };
+        assert!(validate_liquidity_pool_withdraw(&invalid_amount).is_err());
+
+        let invalid_min = LiquidityPoolWithdrawOp {
+            amount: 100,
+            min_amount_a: -1,
+            min_amount_b: 0,
+            ..valid
+        };
+        assert!(validate_liquidity_pool_withdraw(&invalid_min).is_err());
     }
 }

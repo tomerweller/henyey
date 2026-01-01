@@ -510,6 +510,14 @@ impl CheckpointVerifier {
 
 ### 3.6 Publishing (for Validators)
 
+Publishing to remote archives uses `put`/`mkdir` command templates in
+`[[history.archives]]` (rs-stellar-core config). `put` uses `{0}` for the local
+path and `{1}` for the remote path; `mkdir` uses `{0}` for the remote directory.
+SCP checkpoint files are included when publishing if SCP history is available.
+Checkpoint ledgers are enqueued into the SQLite `publishqueue` table on close;
+the `publish-history` command consumes this queue to ensure publish work resumes
+after restarts.
+
 ```rust
 /// Publish checkpoints to history archive
 pub struct HistoryPublisher {

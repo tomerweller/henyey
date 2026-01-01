@@ -10,7 +10,7 @@
 
 use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
 use stellar_core_common::Hash256;
-use stellar_xdr::curr::{LedgerHeader, WriteXdr};
+use stellar_xdr::curr::{LedgerHeader, ScpHistoryEntry, ScpStatement, WriteXdr};
 
 /// Verify that a chain of ledger headers is correctly linked.
 ///
@@ -239,6 +239,48 @@ pub fn verify_has_checkpoint(has: &HistoryArchiveState, expected: u32) -> Result
         )));
     }
     Ok(())
+}
+
+/// Verify SCP history entries contain quorum sets for all referenced envelopes.
+pub fn verify_scp_history_entries(entries: &[ScpHistoryEntry]) -> Result<()> {
+    for entry in entries {
+        let ScpHistoryEntry::V0(v0) = entry;
+        let mut qset_hashes = std::collections::HashSet::new();
+        for qset in v0.quorum_sets.iter() {
+            qset_hashes.insert(Hash256::hash_xdr(qset)?);
+        }
+
+        for envelope in v0.ledger_messages.messages.iter() {
+            if let Some(hash) = scp_quorum_set_hash(&envelope.statement) {
+                let hash256 = Hash256::from_bytes(hash.0);
+                if !qset_hashes.contains(&hash256) {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "missing quorum set {} in scp history",
+                        hash256.to_hex()
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn scp_quorum_set_hash(statement: &ScpStatement) -> Option<stellar_xdr::curr::Hash> {
+    match &statement.pledges {
+        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => {
+            Some(nom.quorum_set_hash.clone())
+        }
+        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => {
+            Some(prep.quorum_set_hash.clone())
+        }
+        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => {
+            Some(conf.quorum_set_hash.clone())
+        }
+        stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
+            Some(ext.commit_quorum_set_hash.clone())
+        }
+    }
 }
 
 #[cfg(test)]

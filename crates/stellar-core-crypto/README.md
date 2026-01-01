@@ -8,8 +8,10 @@ This crate provides all cryptographic operations needed by Stellar Core:
 
 - **Ed25519 signatures** - Key generation, signing, and verification
 - **SHA-256 hashing** - Hash computation
+- **Short hashing (SipHash-2-4)** - Deterministic short hashes for XDR data
 - **Stellar key encoding** - StrKey format (G..., S..., etc.)
 - **Random number generation** - Cryptographically secure RNG
+- **Sealed box encryption** - Survey payload encryption/decryption (Curve25519)
 
 All implementations are pure Rust with no C/C++ dependencies.
 
@@ -105,6 +107,19 @@ use stellar_core_crypto::sha256;
 
 // Compute SHA-256 hash
 let hash = sha256(b"data to hash");
+```
+
+## Short Hashing
+
+```rust
+use stellar_core_crypto::{compute_hash, initialize, xdr_compute_hash};
+use stellar_xdr::curr::LedgerEntry;
+
+initialize();
+let short = compute_hash(b"payload");
+
+let entry = LedgerEntry::default();
+let short_xdr = xdr_compute_hash(&entry)?;
 ```
 
 ## Random Generation
