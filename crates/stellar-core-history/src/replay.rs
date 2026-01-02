@@ -12,6 +12,7 @@
 
 use crate::{verify, HistoryError, Result};
 use stellar_core_common::{Hash256, NetworkId};
+use stellar_core_invariant::LedgerEntryChange;
 use stellar_core_ledger::{
     execution::execute_transaction_set, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
     TransactionSetVariant,
@@ -40,6 +41,8 @@ pub struct LedgerReplayResult {
     pub live_entries: Vec<LedgerEntry>,
     /// Keys to mark as dead in the bucket list.
     pub dead_entries: Vec<LedgerKey>,
+    /// Detailed entry changes for invariants.
+    pub changes: Vec<LedgerEntryChange>,
 }
 
 /// Configuration for ledger replay.
@@ -121,6 +124,7 @@ pub fn replay_ledger(
         total_coins_delta: 0,
         live_entries,
         dead_entries,
+        changes: Vec::new(),
     })
 }
 
@@ -177,6 +181,27 @@ pub fn replay_ledger_with_execution(
 
     let fee_pool_delta = delta.fee_pool_delta();
     let total_coins_delta = delta.total_coins_delta();
+    let changes = delta
+        .changes()
+        .map(|change| match change {
+            stellar_core_ledger::EntryChange::Created(entry) => {
+                LedgerEntryChange::Created {
+                    current: entry.clone(),
+                }
+            }
+            stellar_core_ledger::EntryChange::Updated { previous, current } => {
+                LedgerEntryChange::Updated {
+                    previous: previous.clone(),
+                    current: current.clone(),
+                }
+            }
+            stellar_core_ledger::EntryChange::Deleted { previous } => {
+                LedgerEntryChange::Deleted {
+                    previous: previous.clone(),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
     let live_entries = delta.live_entries();
     let dead_entries = delta.dead_entries();
     bucket_list
@@ -208,6 +233,7 @@ pub fn replay_ledger_with_execution(
         total_coins_delta,
         live_entries,
         dead_entries,
+        changes,
     })
 }
 

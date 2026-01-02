@@ -144,6 +144,7 @@ impl BallotProtocol {
 
         self.current_ballot = Some(ballot.clone());
         self.value = Some(value);
+        self.heard_from_quorum = false;
 
         // Emit prepare statement
         self.emit_prepare(local_node_id, local_quorum_set, driver, slot_index);
@@ -165,6 +166,7 @@ impl BallotProtocol {
 
         if let Some(ref mut ballot) = self.current_ballot {
             ballot.counter += 1;
+            self.heard_from_quorum = false;
             self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
             true
         } else {
@@ -367,6 +369,10 @@ impl BallotProtocol {
 
             // Check if quorum has prepared
             if is_quorum(local_quorum_set, &preparers, get_qs) {
+                if !self.heard_from_quorum {
+                    self.heard_from_quorum = true;
+                    driver.ballot_did_hear_from_quorum(slot_index, current);
+                }
                 // Accept prepare
                 self.set_prepared(current.clone(), driver, slot_index);
 
@@ -378,6 +384,7 @@ impl BallotProtocol {
                 if is_quorum(local_quorum_set, &confirmers, get_qs) {
                     self.phase = BallotPhase::Confirm;
                     self.emit_confirm(local_node_id, local_quorum_set, driver, slot_index);
+                    driver.confirmed_ballot_prepared(slot_index, current);
                     driver.ballot_did_confirm(slot_index, current);
                 } else {
                     self.emit_prepare(local_node_id, local_quorum_set, driver, slot_index);
@@ -479,10 +486,12 @@ impl BallotProtocol {
             if ballot_compare(&ballot, current_prepared) == std::cmp::Ordering::Greater {
                 self.prepared_prime = self.prepared.take();
                 self.prepared = Some(ballot.clone());
+                driver.accepted_ballot_prepared(slot_index, &ballot);
                 driver.ballot_did_prepare(slot_index, &ballot);
             }
         } else {
             self.prepared = Some(ballot.clone());
+            driver.accepted_ballot_prepared(slot_index, &ballot);
             driver.ballot_did_prepare(slot_index, &ballot);
         }
     }
@@ -513,6 +522,9 @@ impl BallotProtocol {
                     counter: 1,
                     value: value.clone(),
                 });
+            }
+            if let Some(ref commit) = self.commit {
+                driver.accepted_commit(slot_index, commit);
             }
         }
 
@@ -875,6 +887,96 @@ mod tests {
         }
     }
 
+    struct QuorumCallbackDriver {
+        quorum_set: ScpQuorumSet,
+        heard_from_quorum: AtomicU32,
+    }
+
+    impl QuorumCallbackDriver {
+        fn new(quorum_set: ScpQuorumSet) -> Self {
+            Self {
+                quorum_set,
+                heard_from_quorum: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl SCPDriver for QuorumCallbackDriver {
+        fn validate_value(
+            &self,
+            _slot_index: u64,
+            _value: &Value,
+            _nomination: bool,
+        ) -> ValidationLevel {
+            ValidationLevel::FullyValidated
+        }
+
+        fn combine_candidates(
+            &self,
+            _slot_index: u64,
+            candidates: &[Value],
+        ) -> Option<Value> {
+            candidates.first().cloned()
+        }
+
+        fn extract_valid_value(
+            &self,
+            _slot_index: u64,
+            value: &Value,
+        ) -> Option<Value> {
+            Some(value.clone())
+        }
+
+        fn emit_envelope(&self, _envelope: &ScpEnvelope) {}
+
+        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+            Some(self.quorum_set.clone())
+        }
+
+        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
+
+        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
+
+        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {
+            self.heard_from_quorum.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn compute_hash_node(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _is_priority: bool,
+            _round: u32,
+            _node_id: &NodeId,
+        ) -> u64 {
+            1
+        }
+
+        fn compute_value_hash(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _round: u32,
+            value: &Value,
+        ) -> u64 {
+            value.iter().map(|b| *b as u64).sum()
+        }
+
+        fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
+            Duration::from_millis(1)
+        }
+
+        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
+
+        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
+            true
+        }
+    }
+
     fn make_node_id(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
@@ -973,6 +1075,35 @@ mod tests {
         let env = make_nomination_envelope(make_node_id(2), 1, &quorum_set);
         let state = ballot.process_envelope(&env, &node, &quorum_set, &driver, 1);
         assert_eq!(state, EnvelopeState::Invalid);
+    }
+
+    #[test]
+    fn test_ballot_heard_from_quorum_callback() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone(), node_c.clone()], 2);
+        let driver = Arc::new(QuorumCallbackDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+
+        let value = make_value(&[1, 2, 3]);
+        assert!(ballot.bump(
+            &node_a,
+            &quorum_set,
+            &driver,
+            1,
+            value.clone(),
+            false
+        ));
+
+        let current = ballot.current_ballot().expect("current ballot").clone();
+        let env_b = make_prepare_envelope(node_b, 1, &quorum_set, current.clone());
+        let env_c = make_prepare_envelope(node_c, 1, &quorum_set, current);
+
+        ballot.process_envelope(&env_b, &node_a, &quorum_set, &driver, 1);
+        ballot.process_envelope(&env_c, &node_a, &quorum_set, &driver, 1);
+
+        assert_eq!(driver.heard_from_quorum.load(Ordering::SeqCst), 1);
     }
 
     #[test]

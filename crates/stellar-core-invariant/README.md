@@ -6,7 +6,11 @@ Invariant framework for validating ledger transitions.
 
 - Invariant trait + registry (`InvariantManager`).
 - Basic invariants: ledger sequence increment, bucket list hash match,
-  conservation of lumens, and entry sanity checks.
+  conservation of lumens, and entry validity checks (ledger seq bounds,
+  account flags/signers/home domain/ext checks, trustline asset/limits/flags/
+  extensions, offer fields/assets, claimable balance sponsorship/assets/predicates,
+  data names, liquidity pool parameters/sponsorship, contract code hash),
+  sponsorship count, account subentry count, and constant product checks.
 - Hooked into ledger close when enabled.
 
 ## Status
@@ -18,4 +22,5 @@ replay hooks, and metrics are still missing.
 
 Register invariants via `LedgerManager::add_invariant()` or add to the
 `InvariantManager` directly in tests. The `InvariantContext` includes
-header transitions, deltas, and changed entries.
+header transitions, deltas, and entry changes (with previous/current data
+when available).

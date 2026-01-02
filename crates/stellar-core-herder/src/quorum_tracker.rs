@@ -1,20 +1,23 @@
-//! Quorum tracker for monitoring whether we've heard from quorum.
+//! Quorum tracking utilities.
+//!
+//! This module contains two trackers:
+//! - `SlotQuorumTracker` tracks heard-from-quorum/v-blocking per slot.
+//! - `QuorumTracker` tracks the transitive quorum map and closest validators.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use stellar_core_scp::{is_quorum, is_v_blocking};
+use stellar_core_scp::{is_quorum, is_v_blocking, SlotIndex};
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
-use stellar_core_scp::SlotIndex;
 
 /// Tracks quorum participation over recent slots.
 #[derive(Debug, Clone)]
-pub struct QuorumTracker {
+pub struct SlotQuorumTracker {
     local_quorum_set: Option<ScpQuorumSet>,
     max_slots: usize,
     slot_nodes: HashMap<SlotIndex, HashSet<NodeId>>,
 }
 
-impl QuorumTracker {
+impl SlotQuorumTracker {
     /// Create a new tracker.
     pub fn new(local_quorum_set: Option<ScpQuorumSet>, max_slots: usize) -> Self {
         Self {
@@ -83,5 +86,267 @@ impl QuorumTracker {
         for slot in slots.into_iter().take(remove_count) {
             self.slot_nodes.remove(&slot);
         }
+    }
+}
+
+/// Node metadata for transitive quorum tracking.
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    pub quorum_set: Option<ScpQuorumSet>,
+    pub distance: usize,
+    pub closest_validators: BTreeSet<NodeId>,
+}
+
+/// Errors returned by the transitive quorum tracker.
+#[derive(Debug, thiserror::Error)]
+pub enum QuorumTrackerError {
+    #[error("node missing from quorum map during rebuild")]
+    MissingNode,
+    #[error("quorum expansion failed during rebuild")]
+    ExpandFailed,
+}
+
+/// Tracks the transitive quorum map and closest validators.
+#[derive(Debug, Clone)]
+pub struct QuorumTracker {
+    local_node_id: NodeId,
+    quorum: HashMap<NodeId, NodeInfo>,
+}
+
+impl QuorumTracker {
+    /// Create a new tracker for the local node.
+    pub fn new(local_node_id: NodeId) -> Self {
+        let mut quorum = HashMap::new();
+        quorum.insert(
+            local_node_id.clone(),
+            NodeInfo {
+                quorum_set: None,
+                distance: 0,
+                closest_validators: BTreeSet::new(),
+            },
+        );
+        Self {
+            local_node_id,
+            quorum,
+        }
+    }
+
+    /// Returns true if the node is definitely in the transitive quorum.
+    pub fn is_node_definitely_in_quorum(&self, node_id: &NodeId) -> bool {
+        self.quorum.contains_key(node_id)
+    }
+
+    /// Expand the quorum map for a node using its quorum set.
+    pub fn expand(&mut self, node_id: &NodeId, quorum_set: ScpQuorumSet) -> bool {
+        let (node_distance, closest_validators) = {
+            let Some(node_info) = self.quorum.get_mut(node_id) else {
+                return false;
+            };
+
+            if let Some(ref existing) = node_info.quorum_set {
+                return existing == &quorum_set;
+            }
+
+            node_info.quorum_set = Some(quorum_set.clone());
+            (node_info.distance, node_info.closest_validators.clone())
+        };
+
+        let new_dist = node_distance + 1;
+
+        let mut ok = true;
+        for_each_quorum_node(&quorum_set, &mut |qnode| {
+            if !ok {
+                return;
+            }
+            let existed = self.quorum.contains_key(qnode);
+            let qnode_info = self.quorum.entry(qnode.clone()).or_insert_with(|| NodeInfo {
+                quorum_set: None,
+                distance: new_dist,
+                closest_validators: BTreeSet::new(),
+            });
+
+            if existed {
+                if qnode_info.distance < new_dist {
+                    return;
+                }
+                if qnode_info.quorum_set.is_some() {
+                    ok = false;
+                    return;
+                }
+                if new_dist < qnode_info.distance {
+                    qnode_info.closest_validators.clear();
+                    qnode_info.distance = new_dist;
+                }
+            }
+
+            if new_dist == 1 {
+                qnode_info.closest_validators.insert(qnode.clone());
+            } else {
+                qnode_info
+                    .closest_validators
+                    .extend(closest_validators.iter().cloned());
+            }
+        });
+
+        ok
+    }
+
+    /// Rebuild the transitive quorum using a quorum-set lookup function.
+    pub fn rebuild<F>(&mut self, lookup: F) -> Result<(), QuorumTrackerError>
+    where
+        F: Fn(&NodeId) -> Option<ScpQuorumSet>,
+    {
+        self.quorum.clear();
+        self.quorum.insert(
+            self.local_node_id.clone(),
+            NodeInfo {
+                quorum_set: None,
+                distance: 0,
+                closest_validators: BTreeSet::new(),
+            },
+        );
+
+        let mut backlog = VecDeque::new();
+        backlog.push_back(self.local_node_id.clone());
+
+        while let Some(node) = backlog.pop_front() {
+            let Some(info) = self.quorum.get(&node) else {
+                return Err(QuorumTrackerError::MissingNode);
+            };
+            if info.quorum_set.is_none() {
+                if let Some(qset) = lookup(&node) {
+                    for_each_quorum_node(&qset, &mut |member| {
+                        backlog.push_back(member.clone());
+                    });
+                    if !self.expand(&node, qset) {
+                        return Err(QuorumTrackerError::ExpandFailed);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Return the currently tracked quorum map.
+    pub fn quorum_map(&self) -> &HashMap<NodeId, NodeInfo> {
+        &self.quorum
+    }
+
+    /// Return the closest validators in the local quorum set for a node.
+    pub fn find_closest_validators(&self, node_id: &NodeId) -> Option<&BTreeSet<NodeId>> {
+        self.quorum.get(node_id).map(|info| &info.closest_validators)
+    }
+}
+
+fn for_each_quorum_node<F>(quorum_set: &ScpQuorumSet, f: &mut F)
+where
+    F: FnMut(&NodeId),
+{
+    for validator in quorum_set.validators.iter() {
+        f(validator);
+    }
+    for inner in quorum_set.inner_sets.iter() {
+        for_each_quorum_node(inner, f);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{PublicKey, Uint256};
+
+    fn make_node_id(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
+    }
+
+    fn make_quorum_set(validators: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
+        ScpQuorumSet {
+            threshold,
+            validators: validators.try_into().unwrap_or_default(),
+            inner_sets: vec![].try_into().unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_expand_tracks_closest_validators() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let qset = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 2);
+
+        let mut tracker = QuorumTracker::new(local.clone());
+        assert!(tracker.expand(&local, qset));
+
+        assert!(tracker.is_node_definitely_in_quorum(&local));
+        assert!(tracker.is_node_definitely_in_quorum(&node_b));
+        assert!(tracker.is_node_definitely_in_quorum(&node_c));
+
+        let closest_b = tracker.find_closest_validators(&node_b).unwrap();
+        assert!(closest_b.contains(&node_b));
+        let closest_c = tracker.find_closest_validators(&node_c).unwrap();
+        assert!(closest_c.contains(&node_c));
+    }
+
+    #[test]
+    fn test_rebuild_tracks_transitive_quorum() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+
+        let qset_a = make_quorum_set(vec![local.clone(), node_b.clone()], 2);
+        let qset_b = make_quorum_set(vec![node_b.clone(), node_c.clone()], 2);
+
+        let mut tracker = QuorumTracker::new(local.clone());
+        tracker
+            .rebuild(|node| {
+                if node == &local {
+                    Some(qset_a.clone())
+                } else if node == &node_b {
+                    Some(qset_b.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("rebuild");
+
+        assert!(tracker.is_node_definitely_in_quorum(&local));
+        assert!(tracker.is_node_definitely_in_quorum(&node_b));
+        assert!(tracker.is_node_definitely_in_quorum(&node_c));
+
+        let closest_c = tracker.find_closest_validators(&node_c).unwrap();
+        assert!(closest_c.contains(&node_b));
+    }
+
+    #[test]
+    fn test_expand_returns_false_on_conflicting_expansion() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+
+        let qset_local = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 2);
+        let qset_b = make_quorum_set(vec![node_b.clone(), node_c.clone()], 2);
+        let qset_conflict = make_quorum_set(vec![node_b.clone()], 1);
+
+        let mut tracker = QuorumTracker::new(local.clone());
+        assert!(tracker.expand(&local, qset_local));
+        assert!(tracker.expand(&node_b, qset_b));
+        assert!(!tracker.expand(&node_b, qset_conflict));
+    }
+
+    #[test]
+    fn test_expand_returns_true_on_same_quorum_set() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+
+        let qset_local = make_quorum_set(vec![local.clone(), node_b.clone()], 2);
+        let qset_b = make_quorum_set(vec![node_b.clone()], 1);
+
+        let mut tracker = QuorumTracker::new(local.clone());
+        assert!(tracker.expand(&local, qset_local));
+        assert!(tracker.expand(&node_b, qset_b.clone()));
+        assert!(tracker.expand(&node_b, qset_b));
     }
 }

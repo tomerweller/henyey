@@ -4,7 +4,7 @@ use std::time::Duration;
 use stellar_core_simulation::OverlaySimulation;
 
 async fn start_or_skip(count: usize) -> Result<Option<OverlaySimulation>> {
-    match OverlaySimulation::start(count).await {
+    match OverlaySimulation::start_with_seed(count, [7u8; 32]).await {
         Ok(sim) => Ok(Some(sim)),
         Err(err) if err.to_string().contains("tcp bind not permitted") => {
             eprintln!("skipping test: tcp bind not permitted in this environment");

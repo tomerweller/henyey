@@ -41,10 +41,10 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 ## Herder
 
 ### Functional Gaps
-- Quorum tracking parity beyond slot-level quorum/v-blocking (upstream fidelity incomplete).
+- None known at v25 parity baseline.
 
 ### Testing Gaps
-- Broader quorum tracker regression coverage.
+- Broader quorum tracker regression coverage (basic expansion/rebuild edge cases covered; broader graph scenarios still missing).
 - Tx set builder parity tests against upstream fixtures.
 
 ## Ledger / Close
@@ -92,7 +92,7 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 ## Invariants
 
 ### Functional Gaps
-- Full invariant set parity (bucket/ledger/db, sponsorship, order book, liabilities, events, constant product, etc.).
+- Partial parity: added ledger seq bounds, account sequence/signers/flags/home_domain/ext/num_sub_entries checks; trustline asset/limit/flags/extensions; offer assets/validity/flags; claimable balance sponsorship/asset/predicate/flag checks; data name validation; liquidity pool parameter/sponsorship checks; contract code hash validation; sponsorship count checks; account subentries count checks; and a ledger-close constant product check with pool-share decrease exemption. Full invariant set parity still missing (bucket/ledger/db, order book, liabilities, events, op-level constant product semantics, etc.).
 - Replay invariant failure handling parity (strict vs non-strict, reporting behavior).
 
 ### Testing Gaps
@@ -101,7 +101,7 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 ## Simulation
 
 ### Functional Gaps
-- Deterministic multi-node simulation runs.
+- Deterministic multi-node simulation runs (deterministic node keys supported; deterministic scheduling and full scenario scripts still missing).
 - Load/tx generators and scripted scenarios.
 
 ### Testing Gaps

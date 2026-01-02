@@ -21,9 +21,10 @@ use stellar_core_bucket::{BucketList, BucketManager};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
 use stellar_core_invariant::{
-    BucketListHashMatchesHeader, CloseTimeNondecreasing, ConservationOfLumens, Invariant,
-    InvariantContext, InvariantManager, LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid,
-    LedgerSeqIncrement,
+    AccountSubEntriesCountIsValid, BucketListHashMatchesHeader, CloseTimeNondecreasing,
+    ConservationOfLumens, ConstantProductInvariant, Invariant, InvariantContext, InvariantManager,
+    LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerEntryChange, LedgerSeqIncrement,
+    SponsorshipCountIsValid,
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountId, ConfigSettingEntry, ConfigSettingId, ConfigSettingScpTiming,
@@ -139,6 +140,9 @@ impl LedgerManager {
         invariants.add(BucketListHashMatchesHeader);
         invariants.add(ConservationOfLumens);
         invariants.add(LedgerEntryIsValid);
+        invariants.add(SponsorshipCountIsValid);
+        invariants.add(AccountSubEntriesCountIsValid);
+        invariants.add(ConstantProductInvariant);
         invariants.add(LastModifiedLedgerSeqMatchesHeader);
 
         Self {
@@ -875,14 +879,29 @@ impl<'a> LedgerCloseContext<'a> {
         let header_hash = compute_header_hash(&new_header)?;
 
         if self.manager.config.validate_invariants {
-            let changed_entries = self.delta.live_entries();
+            let changes = self
+                .delta
+                .changes()
+                .map(|change| match change {
+                    EntryChange::Created(entry) => LedgerEntryChange::Created {
+                        current: entry.clone(),
+                    },
+                    EntryChange::Updated { previous, current } => LedgerEntryChange::Updated {
+                        previous: previous.clone(),
+                        current: current.clone(),
+                    },
+                    EntryChange::Deleted { previous } => LedgerEntryChange::Deleted {
+                        previous: previous.clone(),
+                    },
+                })
+                .collect::<Vec<_>>();
             let ctx = InvariantContext {
                 prev_header: &self.prev_header,
                 curr_header: &new_header,
                 bucket_list_hash,
                 fee_pool_delta: self.delta.fee_pool_delta(),
                 total_coins_delta: self.delta.total_coins_delta(),
-                changed_entries: &changed_entries,
+                changes: &changes,
             };
             self.manager.invariants.read().check_all(&ctx)?;
         }

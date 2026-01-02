@@ -107,6 +107,18 @@ pub trait SCPDriver: Send + Sync {
     /// Called when a ballot is confirmed.
     fn ballot_did_confirm(&self, slot_index: u64, ballot: &ScpBallot);
 
+    /// Called when a ballot is accepted as prepared.
+    fn accepted_ballot_prepared(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+    /// Called when a ballot is confirmed as prepared.
+    fn confirmed_ballot_prepared(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+    /// Called when a ballot is accepted as commit.
+    fn accepted_commit(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+    /// Called when we heard from a quorum for the current ballot.
+    fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
     /// Compute hash for node priority in nomination.
     ///
     /// This is used to deterministically order nodes during nomination

@@ -1241,7 +1241,7 @@ impl CatchupManager {
                     bucket_list_hash,
                     fee_pool_delta: result.fee_pool_delta,
                     total_coins_delta: result.total_coins_delta,
-                    changed_entries: &result.live_entries,
+                    changes: &result.changes,
                 };
                 manager
                     .check_all(&ctx)

@@ -81,7 +81,7 @@ mod tx_queue;
 pub use error::HerderError;
 pub use herder::{EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseInfo};
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
-pub use quorum_tracker::QuorumTracker;
+pub use quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 pub use scp_driver::{
     CachedTxSet, ExternalizedSlot, HerderScpCallback, PendingTxSet, ScpDriver, ScpDriverConfig,
     ValueValidation,

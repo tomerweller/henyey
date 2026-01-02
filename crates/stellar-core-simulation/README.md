@@ -15,7 +15,8 @@ scenario assertions are not yet implemented.
 ## Usage
 
 The crate currently exposes an `OverlaySimulation` helper. Use
-`shutdown()` to stop spawned overlay managers in tests.
+`start_with_seed()` for deterministic node keys and `shutdown()` to
+stop spawned overlay managers in tests.
 
 See `crates/stellar-core-simulation/tests/overlay_simulation.rs` for a
 minimal integration example.

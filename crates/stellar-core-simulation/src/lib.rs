@@ -15,12 +15,17 @@ pub struct OverlaySimulation {
 
 impl OverlaySimulation {
     pub async fn start(node_count: usize) -> Result<Self> {
+        let seed = random_seed();
+        Self::start_with_seed(node_count, seed).await
+    }
+
+    pub async fn start_with_seed(node_count: usize, seed: [u8; 32]) -> Result<Self> {
         let mut managers = Vec::new();
         let mut peer_addrs = Vec::new();
 
-        for _ in 0..node_count {
+        for idx in 0..node_count {
             let port = allocate_port()?;
-            let secret = SecretKey::generate();
+            let secret = SecretKey::from_seed(&derive_seed(&seed, idx as u32));
             let local = LocalNode::new_testnet(secret);
 
             let mut config = OverlayConfig::testnet();
@@ -90,4 +95,34 @@ fn allocate_port() -> Result<u16> {
     };
     let addr = listener.local_addr()?;
     Ok(addr.port())
+}
+
+fn derive_seed(seed: &[u8; 32], index: u32) -> [u8; 32] {
+    let mut input = [0u8; 36];
+    input[..32].copy_from_slice(seed);
+    input[32..].copy_from_slice(&index.to_be_bytes());
+    let hash = stellar_core_crypto::sha256(&input);
+    *hash.as_bytes()
+}
+
+fn random_seed() -> [u8; 32] {
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    seed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_seed_is_stable() {
+        let seed = [7u8; 32];
+        let a = derive_seed(&seed, 1);
+        let b = derive_seed(&seed, 1);
+        let c = derive_seed(&seed, 2);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
 }

@@ -7,7 +7,7 @@ use stellar_core_simulation::OverlaySimulation;
 
 #[tokio::test]
 async fn test_overlay_broadcast_reaches_peers() -> Result<()> {
-    let sim = match OverlaySimulation::start(3).await {
+    let sim = match OverlaySimulation::start_with_seed(3, [7u8; 32]).await {
         Ok(sim) => sim,
         Err(err) if err.to_string().contains("tcp bind not permitted") => {
             eprintln!("skipping test: tcp bind not permitted in this environment");

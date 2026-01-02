@@ -26,7 +26,7 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult};
-use crate::quorum_tracker::QuorumTracker;
+use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig, ValueValidation};
 use crate::state::HerderState;
 use crate::tx_queue::{
@@ -129,7 +129,9 @@ pub struct Herder {
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
     /// Previous externalized value (for priority calculation).
     prev_value: RwLock<Value>,
-    /// Quorum tracker for quorum/heard-from metrics.
+    /// Slot-level quorum tracker for heard-from quorum/v-blocking checks.
+    slot_quorum_tracker: RwLock<SlotQuorumTracker>,
+    /// Transitive quorum tracker for the current quorum map.
     quorum_tracker: RwLock<QuorumTracker>,
 }
 
@@ -156,7 +158,13 @@ impl Herder {
         let pending_envelopes = PendingEnvelopes::new(pending_config);
 
         // SCP is None for non-validators (they just observe)
-        let quorum_tracker = QuorumTracker::new(config.local_quorum_set.clone(), max_slots);
+        let slot_quorum_tracker =
+            SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
+        let local_node_id = node_id_from_public_key(&config.node_public_key);
+        let mut quorum_tracker = QuorumTracker::new(local_node_id.clone());
+        if let Some(ref quorum_set) = config.local_quorum_set {
+            let _ = quorum_tracker.expand(&local_node_id, quorum_set.clone());
+        }
 
         Self {
             config,
@@ -170,6 +178,7 @@ impl Herder {
             secret_key: None,
             ledger_manager: RwLock::new(None),
             prev_value: RwLock::new(Value::default()),
+            slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
         }
     }
@@ -201,14 +210,12 @@ impl Herder {
         let pending_envelopes = PendingEnvelopes::new(pending_config);
 
         // Create SCP instance for validators
+        let node_id = node_id_from_public_key(&config.node_public_key);
         let scp = if config.is_validator {
             if let Some(ref quorum_set) = config.local_quorum_set {
-                let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    stellar_xdr::curr::Uint256(*config.node_public_key.as_bytes()),
-                ));
                 let callback = HerderScpCallback::new(Arc::clone(&scp_driver));
                 Some(SCP::new(
-                    node_id,
+                    node_id.clone(),
                     true, // is_validator
                     quorum_set.clone(),
                     Arc::new(callback),
@@ -221,7 +228,12 @@ impl Herder {
             None
         };
 
-        let quorum_tracker = QuorumTracker::new(config.local_quorum_set.clone(), max_slots);
+        let slot_quorum_tracker =
+            SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
+        let mut quorum_tracker = QuorumTracker::new(node_id.clone());
+        if let Some(ref quorum_set) = config.local_quorum_set {
+            let _ = quorum_tracker.expand(&node_id, quorum_set.clone());
+        }
 
         Self {
             config,
@@ -235,6 +247,7 @@ impl Herder {
             secret_key: Some(secret_key),
             ledger_manager: RwLock::new(None),
             prev_value: RwLock::new(Value::default()),
+            slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
         }
     }
@@ -323,7 +336,14 @@ impl Herder {
 
     /// Store a quorum set for a peer node.
     pub fn store_quorum_set(&self, node_id: &NodeId, quorum_set: ScpQuorumSet) {
-        self.scp_driver.store_quorum_set(node_id, quorum_set);
+        self.scp_driver
+            .store_quorum_set(node_id, quorum_set.clone());
+        let mut tracker = self.quorum_tracker.write();
+        if !tracker.expand(node_id, quorum_set) {
+            if let Err(err) = tracker.rebuild(|id| self.scp_driver.get_quorum_set(id)) {
+                warn!(error = %err, "Failed to rebuild quorum tracker");
+            }
+        }
     }
 
     /// Get a quorum set by hash if available.
@@ -348,14 +368,14 @@ impl Herder {
 
     /// Check whether we've heard from quorum for a slot.
     pub fn heard_from_quorum(&self, slot: SlotIndex) -> bool {
-        self.quorum_tracker.read().has_quorum(slot, |node_id| {
+        self.slot_quorum_tracker.read().has_quorum(slot, |node_id| {
             self.scp_driver.get_quorum_set(node_id)
         })
     }
 
     /// Check whether we have a v-blocking set for a slot.
     pub fn is_v_blocking(&self, slot: SlotIndex) -> bool {
-        self.quorum_tracker.read().is_v_blocking(slot)
+        self.slot_quorum_tracker.read().is_v_blocking(slot)
     }
 
     /// Bootstrap the Herder after catchup.
@@ -419,7 +439,7 @@ impl Herder {
             return EnvelopeState::InvalidSignature;
         }
 
-        self.quorum_tracker
+        self.slot_quorum_tracker
             .write()
             .record_envelope(slot, envelope.statement.node_id.clone());
 
@@ -1083,6 +1103,10 @@ pub struct HerderStats {
     pub cached_tx_sets: usize,
     /// Whether this node is a validator.
     pub is_validator: bool,
+}
+
+fn node_id_from_public_key(pk: &PublicKey) -> NodeId {
+    NodeId(pk.into())
 }
 
 #[cfg(test)]
