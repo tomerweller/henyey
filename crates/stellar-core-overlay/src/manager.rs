@@ -102,6 +102,8 @@ pub struct OverlayManager {
     banned_peers: Arc<RwLock<HashSet<PeerId>>>,
     /// Shutdown signal.
     shutdown_tx: Option<broadcast::Sender<()>>,
+    /// Cache of peer info for connected peers (lock-free access).
+    peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
 }
 
 impl OverlayManager {
@@ -130,6 +132,7 @@ impl OverlayManager {
             dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             shutdown_tx: Some(shutdown_tx),
+            peer_info_cache: Arc::new(DashMap::new()),
         })
     }
 
@@ -171,6 +174,7 @@ impl OverlayManager {
         let added_authenticated_peers = Arc::clone(&self.added_authenticated_peers);
         let dropped_authenticated_peers = Arc::clone(&self.dropped_authenticated_peers);
         let banned_peers = Arc::clone(&self.banned_peers);
+        let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let auth_timeout = self.config.auth_timeout_secs;
         let peer_event_tx = self.config.peer_event_tx.clone();
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
@@ -200,6 +204,7 @@ impl OverlayManager {
                                 let added_authenticated_peers = Arc::clone(&added_authenticated_peers);
                                 let dropped_authenticated_peers = Arc::clone(&dropped_authenticated_peers);
                                 let banned_peers = Arc::clone(&banned_peers);
+                                let peer_info_cache = Arc::clone(&peer_info_cache);
 
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
@@ -231,6 +236,7 @@ impl OverlayManager {
 
                                             let peer = Arc::new(TokioMutex::new(peer));
                                             peers.insert(peer_id.clone(), Arc::clone(&peer));
+                                            peer_info_cache.insert(peer_id.clone(), peer_info.clone());
                                             added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
 
                                             let outbound_snapshot =
@@ -270,6 +276,7 @@ impl OverlayManager {
 
                                             // Cleanup
                                             peers.remove(&peer_id);
+                                            peer_info_cache.remove(&peer_id);
                                             dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
                                             pool.release();
                                         }
@@ -331,6 +338,7 @@ impl OverlayManager {
         let added_authenticated_peers = Arc::clone(&self.added_authenticated_peers);
         let dropped_authenticated_peers = Arc::clone(&self.dropped_authenticated_peers);
         let banned_peers = Arc::clone(&self.banned_peers);
+        let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let preferred_peers = self.config.preferred_peers.clone();
         let target_outbound = self.config.target_outbound_peers;
         let max_outbound = self.config.max_outbound_peers;
@@ -413,6 +421,7 @@ impl OverlayManager {
                         Arc::clone(&dropped_authenticated_peers),
                         Arc::clone(&banned_peers),
                         peer_event_tx.clone(),
+                        Arc::clone(&peer_info_cache),
                     )
                     .await
                     {
@@ -487,6 +496,7 @@ impl OverlayManager {
                         Arc::clone(&dropped_authenticated_peers),
                         Arc::clone(&banned_peers),
                         peer_event_tx.clone(),
+                        Arc::clone(&peer_info_cache),
                     )
                     .await
                     {
@@ -679,6 +689,7 @@ impl OverlayManager {
             Arc::clone(&self.dropped_authenticated_peers),
             Arc::clone(&self.banned_peers),
             self.config.peer_event_tx.clone(),
+            Arc::clone(&self.peer_info_cache),
         )
         .await
     }
@@ -763,30 +774,15 @@ impl OverlayManager {
     }
 
     /// Get the number of connected peers.
-    /// Uses try_lock to avoid blocking; may undercount if peers are locked.
+    /// Uses the peer info cache for lock-free access.
     pub fn peer_count(&self) -> usize {
-        self.peers
-            .iter()
-            .filter(|entry| {
-                entry.value().try_lock()
-                    .map(|p| p.is_connected())
-                    .unwrap_or(true) // Assume connected if locked
-            })
-            .count()
+        self.peer_info_cache.len()
     }
 
     /// Get a list of connected peer IDs.
-    /// Uses try_lock to avoid blocking.
+    /// Uses the peer info cache for lock-free access.
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.peers
-            .iter()
-            .filter(|entry| {
-                entry.value().try_lock()
-                    .map(|p| p.is_connected())
-                    .unwrap_or(true)
-            })
-            .map(|entry| entry.key().clone())
-            .collect()
+        self.peer_info_cache.iter().map(|entry| entry.key().clone()).collect()
     }
 
     fn count_outbound_peers(peers: &DashMap<PeerId, Arc<TokioMutex<Peer>>>) -> usize {
@@ -843,6 +839,7 @@ impl OverlayManager {
         dropped_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
         peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
+        peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
     ) -> Result<PeerId> {
         let peer = match Peer::connect(addr, local_node, timeout_secs).await {
             Ok(peer) => peer,
@@ -868,8 +865,10 @@ impl OverlayManager {
 
         info!("Connected to peer: {} at {}", peer_id, addr);
 
+        let peer_info = peer.info().clone();
         let peer = Arc::new(TokioMutex::new(peer));
         peers.insert(peer_id.clone(), Arc::clone(&peer));
+        peer_info_cache.insert(peer_id.clone(), peer_info);
         added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
         if let Some(tx) = peer_event_tx {
             let _ = tx.send(PeerEvent::Connected(addr.clone(), PeerType::Outbound)).await;
@@ -894,10 +893,12 @@ impl OverlayManager {
         let message_tx = message_tx.clone();
         let flood_gate = Arc::clone(&flood_gate);
         let running = Arc::clone(&running);
+        let peer_info_cache_clone = Arc::clone(&peer_info_cache);
 
         let handle = tokio::spawn(async move {
             Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, flood_gate, running).await;
             peers_clone.remove(&peer_id_clone);
+            peer_info_cache_clone.remove(&peer_id_clone);
             dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
             pool_clone.release();
         });
@@ -1037,30 +1038,27 @@ impl OverlayManager {
     }
 
     /// Get info for all connected peers.
-    /// Uses try_lock to avoid blocking; skips peers that are locked.
+    /// Uses the peer info cache for lock-free access.
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
-        self.peers
-            .iter()
-            .filter_map(|entry| {
-                entry.value().try_lock()
-                    .ok()
-                    .filter(|p| p.is_connected())
-                    .map(|p| p.info().clone())
-            })
-            .collect()
+        self.peer_info_cache.iter().map(|entry| entry.value().clone()).collect()
     }
 
     /// Get snapshots for all connected peers.
-    /// Uses try_lock to avoid blocking; skips peers that are locked.
+    /// Uses the peer info cache for info, falls back to try_lock for stats.
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
-        self.peers
+        self.peer_info_cache
             .iter()
             .filter_map(|entry| {
-                entry.value().try_lock().ok().filter(|p| p.is_connected()).map(|p| {
-                    PeerSnapshot {
-                        info: p.info().clone(),
-                        stats: p.stats().snapshot(),
-                    }
+                let peer_id = entry.key();
+                let info = entry.value().clone();
+                // Try to get stats from the locked peer
+                self.peers.get(peer_id).and_then(|peer_entry| {
+                    peer_entry.value().try_lock().ok().map(|p| {
+                        PeerSnapshot {
+                            info,
+                            stats: p.stats().snapshot(),
+                        }
+                    })
                 })
             })
             .collect()
@@ -1186,6 +1184,7 @@ impl OverlayManager {
         let advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
         let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
         let peer_event_tx = self.config.peer_event_tx.clone();
+        let peer_info_cache = Arc::clone(&self.peer_info_cache);
 
         let peer_handle = tokio::spawn(async move {
             match Peer::connect(&addr, local_node, connect_timeout).await {
@@ -1199,8 +1198,10 @@ impl OverlayManager {
                             .await;
                     }
 
+                    let peer_info = peer.info().clone();
                     let peer = Arc::new(TokioMutex::new(peer));
                     peers.insert(peer_id.clone(), Arc::clone(&peer));
+                    peer_info_cache.insert(peer_id.clone(), peer_info);
 
                     let outbound_snapshot = advertised_outbound_peers.read().clone();
                     let inbound_snapshot = advertised_inbound_peers.read().clone();
@@ -1233,6 +1234,7 @@ impl OverlayManager {
 
                     // Cleanup
                     peers.remove(&peer_id);
+                    peer_info_cache.remove(&peer_id);
                     pool.release();
                 }
                 Err(e) => {
