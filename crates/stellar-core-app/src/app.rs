@@ -1761,7 +1761,7 @@ impl App {
     ) -> anyhow::Result<CheckpointData> {
         let state = Arc::new(tokio::sync::Mutex::new(HistoryWorkState::default()));
         let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
-            max_concurrency: 4,
+            max_concurrency: 16, // Match C++ MAX_CONCURRENT_SUBPROCESSES
             retry_delay: Duration::from_millis(200),
             event_tx: None,
         });

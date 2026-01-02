@@ -505,22 +505,116 @@ impl CatchupManager {
         Ok(Vec::new())
     }
 
-    /// Download all buckets referenced in the HAS.
+    /// Download all buckets referenced in the HAS to disk in parallel.
     ///
-    /// Note: This method now skips pre-downloading buckets since apply_buckets
-    /// downloads them on-demand. This reduces peak memory usage for mainnet
-    /// where buckets total many GB.
+    /// This pre-downloads buckets to disk (not memory) so apply_buckets can
+    /// load them quickly. Uses parallel downloads for speed while keeping
+    /// memory usage low by saving directly to disk.
     async fn download_buckets(
         &mut self,
         hashes: &[Hash256],
     ) -> Result<Vec<(Hash256, Vec<u8>)>> {
-        // Skip pre-downloading - buckets will be downloaded on-demand in apply_buckets
-        // This reduces peak memory usage significantly for mainnet
-        info!(
-            "Skipping pre-download of {} buckets (will download on-demand)",
-            hashes.len()
-        );
+        use futures::stream::{self, StreamExt};
+
+        let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
+        let empty_bucket_hash = Hash256::hash(&[]);
+
+        // Filter out zero/empty hashes and already-downloaded buckets
+        let to_download: Vec<_> = hashes
+            .iter()
+            .filter(|hash| {
+                if hash.is_zero() || **hash == empty_bucket_hash {
+                    return false;
+                }
+                let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                !bucket_path.exists()
+            })
+            .cloned()
+            .collect();
+
         self.progress.buckets_total = hashes.len() as u32;
+
+        if to_download.is_empty() {
+            info!(
+                "All {} buckets already cached on disk",
+                hashes.len()
+            );
+            return Ok(Vec::new());
+        }
+
+        info!(
+            "Pre-downloading {} buckets to disk ({} already cached) with {} parallel downloads",
+            to_download.len(),
+            hashes.len() - to_download.len(),
+            16 // MAX_CONCURRENT_SUBPROCESSES equivalent
+        );
+
+        let archives = self.archives.clone();
+        let bucket_dir = bucket_dir.clone();
+        let total_to_download = to_download.len();
+        let downloaded = std::sync::atomic::AtomicU32::new(0);
+
+        // Download buckets in parallel, saving directly to disk
+        let results: Vec<Result<()>> = stream::iter(to_download.into_iter())
+            .map(|hash| {
+                let archives = archives.clone();
+                let bucket_dir = bucket_dir.clone();
+                let downloaded = &downloaded;
+
+                async move {
+                    let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+
+                    // Try each archive until one succeeds
+                    for archive in &archives {
+                        match archive.get_bucket(&hash).await {
+                            Ok(data) => {
+                                // Save to disk
+                                if let Err(e) = std::fs::write(&bucket_path, &data) {
+                                    warn!("Failed to save bucket {} to disk: {}", hash, e);
+                                    continue;
+                                }
+                                let count = downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                if count % 5 == 0 || count == total_to_download as u32 {
+                                    info!("Downloaded {}/{} buckets", count, total_to_download);
+                                }
+                                debug!(
+                                    "Pre-downloaded bucket {} ({} bytes)",
+                                    hash,
+                                    data.len()
+                                );
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Failed to download bucket {} from {}: {}",
+                                    hash,
+                                    archive.base_url(),
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    Err(HistoryError::BucketNotFound(hash))
+                }
+            })
+            .buffer_unordered(16) // MAX_CONCURRENT_SUBPROCESSES equivalent
+            .collect()
+            .await;
+
+        // Check for any failures
+        for result in results {
+            result?;
+        }
+
+        self.progress.buckets_downloaded = hashes.len() as u32;
+        info!(
+            "Pre-downloaded all {} buckets to disk",
+            total_to_download
+        );
+
+        // Return empty - buckets are on disk, not in memory
         Ok(Vec::new())
     }
 

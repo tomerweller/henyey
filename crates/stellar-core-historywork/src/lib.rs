@@ -130,6 +130,8 @@ impl Work for DownloadBucketsWork {
     }
 
     async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+        use futures::stream::{self, StreamExt};
+
         set_progress(&self.state, HistoryWorkStage::DownloadBuckets, "downloading buckets").await;
         let has = {
             let guard = self.state.lock().await;
@@ -141,21 +143,44 @@ impl Work for DownloadBucketsWork {
         };
 
         let hashes = has.unique_bucket_hashes();
-        let mut buckets = HashMap::new();
+        let total = hashes.len();
+        let archive = self.archive.clone();
 
-        for hash in hashes {
-            match self.archive.get_bucket(&hash).await {
-                Ok(data) => {
-                    if let Err(err) = verify::verify_bucket_hash(&data, &hash) {
-                        return WorkOutcome::Failed(format!("bucket hash mismatch: {}", err));
+        // Download buckets in parallel (16 concurrent downloads, matching C++ MAX_CONCURRENT_SUBPROCESSES)
+        let results: Vec<Result<(Hash256, Vec<u8>), String>> = stream::iter(hashes)
+            .map(|hash| {
+                let archive = archive.clone();
+                async move {
+                    match archive.get_bucket(&hash).await {
+                        Ok(data) => {
+                            if let Err(err) = verify::verify_bucket_hash(&data, &hash) {
+                                Err(format!("bucket {} hash mismatch: {}", hash, err))
+                            } else {
+                                Ok((hash, data))
+                            }
+                        }
+                        Err(err) => Err(format!("failed to download bucket {}: {}", hash, err)),
                     }
+                }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+
+        // Check for failures and collect successful downloads
+        let mut buckets = HashMap::new();
+        for result in results {
+            match result {
+                Ok((hash, data)) => {
                     buckets.insert(hash, data);
                 }
                 Err(err) => {
-                    return WorkOutcome::Failed(format!("failed to download bucket {}: {}", hash, err));
+                    return WorkOutcome::Failed(err);
                 }
             }
         }
+
+        tracing::info!("Downloaded {} buckets in parallel", total);
 
         let mut guard = self.state.lock().await;
         guard.buckets = buckets;
