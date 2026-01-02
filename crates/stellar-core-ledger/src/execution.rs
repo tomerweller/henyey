@@ -7,15 +7,17 @@ use std::collections::{HashMap, HashSet};
 
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_tx::{
+    soroban::SorobanConfig,
     validation::{self, LedgerContext as ValidationContext},
     LedgerContext, LedgerStateManager, TransactionFrame, TxError,
 };
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, DataEntry, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    AccountEntry, AccountId, ConfigSettingEntry, ConfigSettingId, ContractCostParams,
+    DataEntry, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     ContractEvent, DiagnosticEvent, ExtensionPoint, LedgerEntryChange, LedgerEntryChanges,
     TransactionEvent, TransactionEventStage,
-    LedgerKey, OfferEntry, OperationBody, OperationMeta, OperationMetaV2, OperationResult,
-    Preconditions, SignerKey, SorobanTransactionMetaExt, SorobanTransactionMetaV2,
+    LedgerKey, LedgerKeyConfigSetting, OfferEntry, OperationBody, OperationMeta, OperationMetaV2,
+    OperationResult, Preconditions, SignerKey, SorobanTransactionMetaExt, SorobanTransactionMetaV2,
     TransactionEnvelope, TransactionMeta, TransactionMetaV3, TransactionMetaV4, TransactionResult,
     TransactionResultCode, TransactionResultExt, TransactionResultMetaV1, TransactionResultPair,
     TransactionResultResult, TrustLineEntry, VecM, WriteXdr, Limits, InnerTransactionResult,
@@ -27,6 +29,107 @@ use tracing::{debug, info, warn};
 use crate::delta::LedgerDelta;
 use crate::snapshot::SnapshotHandle;
 use crate::{LedgerError, Result};
+
+/// Load a ConfigSettingEntry from the snapshot by ID.
+fn load_config_setting(snapshot: &SnapshotHandle, id: ConfigSettingId) -> Option<ConfigSettingEntry> {
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: id,
+    });
+    match snapshot.get_entry(&key) {
+        Ok(Some(entry)) => {
+            if let LedgerEntryData::ConfigSetting(config) = entry.data {
+                Some(config)
+            } else {
+                None
+            }
+        }
+        Ok(None) => None,
+        Err(_) => None,
+    }
+}
+
+/// Load SorobanConfig from the ledger's ConfigSettingEntry entries.
+///
+/// This loads the cost parameters and limits from the ledger state,
+/// which are required for accurate Soroban transaction execution.
+/// If any required settings are missing, returns a default config.
+pub fn load_soroban_config(snapshot: &SnapshotHandle) -> SorobanConfig {
+    // Load CPU cost params
+    let cpu_cost_params = load_config_setting(snapshot, ConfigSettingId::ContractCostParamsCpuInstructions)
+        .and_then(|cs| {
+            if let ConfigSettingEntry::ContractCostParamsCpuInstructions(params) = cs {
+                Some(params)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| ContractCostParams(vec![].try_into().unwrap_or_default()));
+
+    // Load memory cost params
+    let mem_cost_params = load_config_setting(snapshot, ConfigSettingId::ContractCostParamsMemoryBytes)
+        .and_then(|cs| {
+            if let ConfigSettingEntry::ContractCostParamsMemoryBytes(params) = cs {
+                Some(params)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| ContractCostParams(vec![].try_into().unwrap_or_default()));
+
+    // Load compute limits
+    let (tx_max_instructions, tx_max_memory_bytes) = load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)
+        .and_then(|cs| {
+            if let ConfigSettingEntry::ContractComputeV0(compute) = cs {
+                Some((compute.tx_max_instructions as u64, compute.tx_memory_limit as u64))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((100_000_000, 40 * 1024 * 1024)); // Default limits
+
+    // Load state archival TTL settings
+    let (min_temp_entry_ttl, min_persistent_entry_ttl, max_entry_ttl) =
+        load_config_setting(snapshot, ConfigSettingId::StateArchival)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::StateArchival(archival) = cs {
+                    Some((
+                        archival.min_temporary_ttl,
+                        archival.min_persistent_ttl,
+                        archival.max_entry_ttl,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((16, 120960, 6312000)); // Default TTL values
+
+    let config = SorobanConfig {
+        cpu_cost_params,
+        mem_cost_params,
+        tx_max_instructions,
+        tx_max_memory_bytes,
+        min_temp_entry_ttl,
+        min_persistent_entry_ttl,
+        max_entry_ttl,
+    };
+
+    // Log whether we found valid cost params
+    if config.has_valid_cost_params() {
+        debug!(
+            cpu_cost_params_count = config.cpu_cost_params.0.len(),
+            mem_cost_params_count = config.mem_cost_params.0.len(),
+            tx_max_instructions = config.tx_max_instructions,
+            "Loaded Soroban config from ledger"
+        );
+    } else {
+        warn!(
+            "No Soroban cost parameters found in ledger - using defaults. \
+             Soroban transaction results may not match network."
+        );
+    }
+
+    config
+}
 
 /// Result of executing a transaction.
 #[derive(Debug, Clone)]
@@ -83,6 +186,8 @@ pub struct TransactionExecutor {
     state: LedgerStateManager,
     /// Accounts loaded from snapshot.
     loaded_accounts: HashMap<[u8; 32], bool>,
+    /// Soroban network configuration for contract execution.
+    soroban_config: SorobanConfig,
 }
 
 impl TransactionExecutor {
@@ -95,6 +200,7 @@ impl TransactionExecutor {
         protocol_version: u32,
         network_id: NetworkId,
         id_pool: u64,
+        soroban_config: SorobanConfig,
     ) -> Self {
         let mut state = LedgerStateManager::new(base_reserve as i64, ledger_seq);
         state.set_id_pool(id_pool);
@@ -107,6 +213,7 @@ impl TransactionExecutor {
             network_id,
             state,
             loaded_accounts: HashMap::new(),
+            soroban_config,
         }
     }
 
@@ -760,6 +867,7 @@ impl TransactionExecutor {
             &mut self.state,
             context,
             soroban_data,
+            Some(&self.soroban_config),
         )
     }
 
@@ -1361,6 +1469,7 @@ pub fn execute_transaction_set(
     protocol_version: u32,
     network_id: NetworkId,
     delta: &mut LedgerDelta,
+    soroban_config: SorobanConfig,
 ) -> Result<(
     Vec<TransactionExecutionResult>,
     Vec<TransactionResultPair>,
@@ -1376,6 +1485,7 @@ pub fn execute_transaction_set(
         protocol_version,
         network_id,
         id_pool,
+        soroban_config,
     );
 
     let mut results = Vec::with_capacity(transactions.len());
@@ -1439,6 +1549,7 @@ mod tests {
             21,
             NetworkId::testnet(),
             0,
+            SorobanConfig::default(),
         );
 
         assert_eq!(executor.ledger_seq, 100);

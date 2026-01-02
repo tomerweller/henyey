@@ -14,8 +14,8 @@ use crate::{verify, HistoryError, Result};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_invariant::LedgerEntryChange;
 use stellar_core_ledger::{
-    execution::execute_transaction_set, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
-    TransactionSetVariant,
+    execution::{execute_transaction_set, load_soroban_config},
+    LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle, TransactionSetVariant,
 };
 use stellar_xdr::curr::{
     LedgerEntry, LedgerHeader, LedgerKey, TransactionMeta, TransactionResultPair, TransactionResultSet,
@@ -153,6 +153,8 @@ pub fn replay_ledger_with_execution(
 
     let mut delta = LedgerDelta::new(header.ledger_seq);
     let transactions = tx_set.transactions_with_base_fee();
+    // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
+    let soroban_config = load_soroban_config(&snapshot);
     let (results, tx_results, _tx_result_metas, _total_fees) = execute_transaction_set(
         &snapshot,
         &transactions,
@@ -163,6 +165,7 @@ pub fn replay_ledger_with_execution(
         header.ledger_version,
         *network_id,
         &mut delta,
+        soroban_config,
     )
     .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 

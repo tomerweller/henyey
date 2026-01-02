@@ -3,6 +3,7 @@ use stellar_core_crypto::{sign_hash, SecretKey};
 use stellar_core_ledger::execution::{ExecutionFailure, TransactionExecutor};
 use stellar_core_ledger::execution::build_tx_result_pair;
 use stellar_core_ledger::{LedgerSnapshot, SnapshotBuilder, SnapshotHandle};
+use stellar_core_tx::soroban::SorobanConfig;
 use std::sync::Arc;
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountId, CreateAccountOp, CreateAccountResult,
@@ -83,7 +84,7 @@ fn test_execute_transaction_missing_operation() {
 
     let snapshot = LedgerSnapshot::empty(1);
     let snapshot = SnapshotHandle::new(snapshot);
-    let mut executor = TransactionExecutor::new(1, 1000, 100, 5_000_000, 25, NetworkId::testnet(), 0);
+    let mut executor = TransactionExecutor::new(1, 1000, 100, 5_000_000, 25, NetworkId::testnet(), 0, SorobanConfig::default());
 
     let result = executor.execute_transaction(&snapshot, &envelope, 100).expect("execute");
     assert_eq!(result.failure, Some(ExecutionFailure::MissingOperation));
@@ -134,7 +135,7 @@ fn test_execute_transaction_time_bounds_too_early() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0);
+    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0, SorobanConfig::default());
     let result = executor.execute_transaction(&snapshot, &envelope, 100).expect("execute");
 
     assert_eq!(result.failure, Some(ExecutionFailure::TooEarly));
@@ -191,7 +192,7 @@ fn test_execute_transaction_min_seq_num_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0);
+    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0, SorobanConfig::default());
     let result = executor.execute_transaction(&snapshot, &envelope, 100).expect("execute");
 
     assert_eq!(result.failure, Some(ExecutionFailure::BadMinSeqAgeOrGap));
@@ -262,7 +263,7 @@ fn test_execute_transaction_min_seq_age_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(10, 1_000, 100, 5_000_000, 25, network_id, 0);
+    let mut executor = TransactionExecutor::new(10, 1_000, 100, 5_000_000, 25, network_id, 0, SorobanConfig::default());
     let result = executor.execute_transaction(&snapshot, &envelope, 100).expect("execute");
 
     assert_eq!(result.failure, Some(ExecutionFailure::BadMinSeqAgeOrGap));
@@ -319,7 +320,7 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(10, 1_000, 100, 5_000_000, 25, network_id, 0);
+    let mut executor = TransactionExecutor::new(10, 1_000, 100, 5_000_000, 25, network_id, 0, SorobanConfig::default());
     let result = executor.execute_transaction(&snapshot, &envelope, 100).expect("execute");
 
     assert_eq!(result.failure, Some(ExecutionFailure::BadMinSeqAgeOrGap));
@@ -377,7 +378,7 @@ fn test_execute_transaction_extra_signers_missing() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0);
+    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0, SorobanConfig::default());
     let result = executor.execute_transaction(&snapshot, &envelope, 100).expect("execute");
 
     assert_eq!(result.failure, Some(ExecutionFailure::BadAuthExtra));
@@ -499,7 +500,7 @@ fn test_operation_failure_rolls_back_changes() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0);
+    let mut executor = TransactionExecutor::new(1, 1_000, 100, 5_000_000, 25, network_id, 0, SorobanConfig::default());
     let result = executor.execute_transaction(&snapshot, &envelope, 100).expect("execute");
 
     assert!(!result.success);

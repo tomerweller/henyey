@@ -10,6 +10,7 @@ use stellar_xdr::curr::{
     OperationResult, OperationResultTr, ScAddress, ScVal, SorobanTransactionData, TtlEntry, WriteXdr,
 };
 
+use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -32,6 +33,7 @@ const DEFAULT_CONTRACT_TTL: u32 = 518400; // ~30 days at 5-second ledger close
 /// * `state` - The ledger state manager
 /// * `context` - The ledger context
 /// * `soroban_data` - The Soroban transaction data
+/// * `soroban_config` - The Soroban network configuration with cost parameters
 ///
 /// # Returns
 ///
@@ -43,6 +45,7 @@ pub fn execute_invoke_host_function(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
+    soroban_config: &SorobanConfig,
 ) -> Result<OperationExecutionResult> {
     // Validate we have Soroban data for footprint
     let soroban_data = match soroban_data {
@@ -61,7 +64,7 @@ pub fn execute_invoke_host_function(
         | HostFunction::CreateContract(_)
         | HostFunction::CreateContractV2(_) => {
             // For contract operations, use soroban-env-host
-            execute_contract_invocation(op, source, state, context, soroban_data)
+            execute_contract_invocation(op, source, state, context, soroban_data, soroban_config)
         }
         HostFunction::UploadContractWasm(wasm) => {
             // WASM upload can be handled locally without full host
@@ -77,6 +80,7 @@ fn execute_contract_invocation(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
+    soroban_config: &SorobanConfig,
 ) -> Result<OperationExecutionResult> {
     use crate::soroban::execute_host_function;
     use sha2::{Digest, Sha256};
@@ -104,6 +108,7 @@ fn execute_contract_invocation(
         state,
         context,
         soroban_data,
+        soroban_config,
     ) {
         Ok(result) => {
             // Apply storage changes back to our state.
@@ -430,18 +435,23 @@ mod tests {
         LedgerContext::testnet(1, 1000)
     }
 
+    fn create_test_soroban_config() -> SorobanConfig {
+        SorobanConfig::default()
+    }
+
     #[test]
     fn test_invoke_host_function_no_soroban_data() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
+        let config = create_test_soroban_config();
 
         let op = InvokeHostFunctionOp {
             host_function: HostFunction::UploadContractWasm(vec![0u8; 100].try_into().unwrap()),
             auth: vec![].try_into().unwrap(),
         };
 
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, None)
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, None, &config)
             .expect("invoke host function");
 
         match result.result {
@@ -457,6 +467,7 @@ mod tests {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
+        let config = create_test_soroban_config();
 
         // Create minimal valid WASM
         let wasm_bytes: Vec<u8> = vec![
@@ -484,7 +495,7 @@ mod tests {
         };
 
         let result =
-            execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data))
+            execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data), &config)
                 .expect("invoke host function");
 
         match result.result {
@@ -500,6 +511,7 @@ mod tests {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
+        let config = create_test_soroban_config();
 
         let contract_id = ScAddress::Contract(ContractId(Hash([1u8; 32])));
         let contract_key = ScVal::U32(42);
@@ -551,7 +563,7 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data))
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data), &config)
             .expect("invoke host function");
 
         match result.result {
@@ -567,6 +579,7 @@ mod tests {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
+        let config = create_test_soroban_config();
 
         let contract_id = ScAddress::Contract(ContractId(Hash([2u8; 32])));
         let contract_key = ScVal::U32(5);
@@ -620,7 +633,7 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data))
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data), &config)
             .expect("invoke host function");
 
         match result.result {

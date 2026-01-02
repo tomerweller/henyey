@@ -2,6 +2,56 @@
 //!
 //! Tracks CPU instructions and memory usage for contract execution.
 
+use stellar_xdr::curr::ContractCostParams;
+
+/// Soroban network configuration for contract execution.
+///
+/// This contains the cost parameters and limits loaded from the network's
+/// ConfigSettingEntry entries. These must match the network to produce
+/// correct transaction results and ledger hashes.
+#[derive(Debug, Clone)]
+pub struct SorobanConfig {
+    /// CPU cost model parameters from ConfigSettingId::ContractCostParamsCpuInstructions.
+    pub cpu_cost_params: ContractCostParams,
+    /// Memory cost model parameters from ConfigSettingId::ContractCostParamsMemoryBytes.
+    pub mem_cost_params: ContractCostParams,
+    /// Maximum CPU instructions per transaction from ConfigSettingId::ContractComputeV0.
+    pub tx_max_instructions: u64,
+    /// Maximum memory bytes per transaction.
+    pub tx_max_memory_bytes: u64,
+    /// Minimum TTL for temporary entries.
+    pub min_temp_entry_ttl: u32,
+    /// Minimum TTL for persistent entries.
+    pub min_persistent_entry_ttl: u32,
+    /// Maximum TTL for any entry.
+    pub max_entry_ttl: u32,
+}
+
+impl Default for SorobanConfig {
+    fn default() -> Self {
+        // Default values matching protocol 21 testnet/mainnet
+        // These are placeholders - real values should be loaded from ConfigSettingEntry
+        Self {
+            cpu_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),
+            mem_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),
+            tx_max_instructions: 100_000_000,       // 100M instructions
+            tx_max_memory_bytes: 40 * 1024 * 1024,  // 40 MB
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 120960,       // ~7 days at 5s ledger close
+            max_entry_ttl: 6312000,                 // ~1 year
+        }
+    }
+}
+
+impl SorobanConfig {
+    /// Check if this config has valid cost parameters.
+    ///
+    /// Returns false if the cost params are empty (default/placeholder values).
+    pub fn has_valid_cost_params(&self) -> bool {
+        !self.cpu_cost_params.0.is_empty() && !self.mem_cost_params.0.is_empty()
+    }
+}
+
 /// Resource limits for Soroban execution.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceLimits {

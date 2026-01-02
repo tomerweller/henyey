@@ -21,7 +21,7 @@ mod events;
 mod host;
 mod storage;
 
-pub use budget::{SorobanBudget, ResourceLimits};
+pub use budget::{SorobanBudget, SorobanConfig, ResourceLimits};
 pub use events::{ContractEvent, ContractEvents, EventType};
 pub use host::{execute_host_function, SorobanExecutionResult, StorageChange};
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};

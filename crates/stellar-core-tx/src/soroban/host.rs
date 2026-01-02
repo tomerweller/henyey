@@ -24,6 +24,7 @@ use stellar_xdr::curr::{
 
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
+use super::SorobanConfig;
 
 /// Result of Soroban host function execution.
 pub struct SorobanExecutionResult {
@@ -185,6 +186,21 @@ pub fn build_storage_map(
 }
 
 /// Execute a Soroban host function using soroban-env-host.
+///
+/// # Arguments
+///
+/// * `host_function` - The host function to execute
+/// * `auth_entries` - Authorization entries for the invocation
+/// * `source` - Source account for the transaction
+/// * `state` - Ledger state manager for reading entries
+/// * `context` - Ledger context with sequence, close time, etc.
+/// * `soroban_data` - Soroban transaction data with footprint and resources
+/// * `soroban_config` - Network configuration with cost parameters
+///
+/// # Returns
+///
+/// Returns the execution result including return value, storage changes, and events.
+/// Returns an error if the host function fails or budget is exceeded.
 pub fn execute_host_function(
     host_function: &HostFunction,
     auth_entries: &[SorobanAuthorizationEntry],
@@ -192,9 +208,32 @@ pub fn execute_host_function(
     state: &LedgerStateManager,
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
+    soroban_config: &SorobanConfig,
 ) -> Result<SorobanExecutionResult, HostError> {
-    // Create budget with default cost models
-    let budget = Budget::default();
+    // Create budget with network cost parameters
+    // Use transaction-specified instruction limit, capped by network limit
+    let instruction_limit = std::cmp::min(
+        soroban_data.resources.instructions as u64,
+        soroban_config.tx_max_instructions,
+    );
+
+    let budget = if soroban_config.has_valid_cost_params() {
+        // Use network cost parameters for accurate metering
+        Budget::try_from_configs(
+            instruction_limit,
+            soroban_config.tx_max_memory_bytes,
+            soroban_config.cpu_cost_params.clone(),
+            soroban_config.mem_cost_params.clone(),
+        )?
+    } else {
+        // Fallback to default budget if no cost params available
+        // This will produce incorrect results but allows basic testing
+        tracing::warn!(
+            "Using default Soroban budget - cost parameters not loaded from network. \
+             Transaction results may not match network."
+        );
+        Budget::default()
+    };
 
     // Build footprint from transaction resources
     let footprint = build_footprint(&budget, &soroban_data.resources.footprint)?;
@@ -211,16 +250,16 @@ pub fn execute_host_function(
     // Create host
     let host = Host::with_storage_and_budget(storage, budget.clone());
 
-    // Set ledger info
+    // Set ledger info with TTL values from network config
     let ledger_info = LedgerInfo {
         protocol_version: context.protocol_version,
         sequence_number: context.sequence,
         timestamp: context.close_time,
         network_id: context.network_id.0.0,
         base_reserve: context.base_reserve,
-        min_temp_entry_ttl: 16,
-        min_persistent_entry_ttl: 120960, // ~7 days
-        max_entry_ttl: 6312000,           // ~1 year
+        min_temp_entry_ttl: soroban_config.min_temp_entry_ttl,
+        min_persistent_entry_ttl: soroban_config.min_persistent_entry_ttl,
+        max_entry_ttl: soroban_config.max_entry_ttl,
     };
     host.set_ledger_info(ledger_info)?;
 

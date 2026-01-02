@@ -9,6 +9,7 @@ use stellar_xdr::curr::{
 };
 
 use crate::frame::muxed_to_account_id;
+use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -118,12 +119,20 @@ pub fn execute_operation(
         state,
         context,
         None,
+        None,
     )
 }
 
 /// Execute a single operation with optional Soroban transaction data.
 ///
-/// This variant is used for Soroban operations that need access to the footprint.
+/// This variant is used for Soroban operations that need access to the footprint
+/// and network configuration.
+///
+/// # Arguments
+///
+/// * `soroban_config` - Optional Soroban config with cost parameters. Required for
+///   accurate Soroban transaction execution. If None, uses default config which may
+///   produce incorrect results.
 pub fn execute_operation_with_soroban(
     op: &Operation,
     source_account_id: &AccountId,
@@ -133,6 +142,7 @@ pub fn execute_operation_with_soroban(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
+    soroban_config: Option<&SorobanConfig>,
 ) -> Result<OperationExecutionResult> {
     // Get the actual source for this operation
     // If the operation has an explicit source, use it; otherwise use the transaction source
@@ -180,12 +190,16 @@ pub fn execute_operation_with_soroban(
         }
         // Soroban operations
         OperationBody::InvokeHostFunction(op_data) => {
+            // Use provided config or default for Soroban execution
+            let default_config = SorobanConfig::default();
+            let config = soroban_config.unwrap_or(&default_config);
             invoke_host_function::execute_invoke_host_function(
                 op_data,
                 &op_source,
                 state,
                 context,
                 soroban_data,
+                config,
             )
         }
         OperationBody::ExtendFootprintTtl(op_data) => {

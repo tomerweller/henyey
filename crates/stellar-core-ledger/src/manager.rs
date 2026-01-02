@@ -20,6 +20,7 @@ use std::sync::Arc;
 use stellar_core_bucket::{BucketList, BucketManager};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
+use stellar_core_tx::soroban::SorobanConfig;
 use stellar_core_invariant::{
     AccountSubEntriesCountIsValid, BucketListHashMatchesHeader, CloseTimeNondecreasing,
     ConservationOfLumens, ConstantProductInvariant, Invariant, InvariantContext, InvariantManager,
@@ -786,6 +787,8 @@ impl<'a> LedgerCloseContext<'a> {
             return Ok(vec![]);
         }
 
+        // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
+        let soroban_config = crate::execution::load_soroban_config(&self.snapshot);
         let (results, tx_results, tx_result_metas, id_pool) = execute_transaction_set(
             &self.snapshot,
             &transactions,
@@ -796,6 +799,7 @@ impl<'a> LedgerCloseContext<'a> {
             self.prev_header.ledger_version,
             self.manager.network_id.clone(),
             &mut self.delta,
+            soroban_config,
         )?;
         self.id_pool = id_pool;
         self.tx_results = tx_results;
