@@ -217,11 +217,14 @@ pub fn execute_host_function(
         soroban_config.tx_max_instructions,
     );
 
+    // SorobanResources does not include a per-transaction memory cap; enforce network limit.
+    let memory_limit = soroban_config.tx_max_memory_bytes;
+
     let budget = if soroban_config.has_valid_cost_params() {
         // Use network cost parameters for accurate metering
         Budget::try_from_configs(
             instruction_limit,
-            soroban_config.tx_max_memory_bytes,
+            memory_limit,
             soroban_config.cpu_cost_params.clone(),
             soroban_config.mem_cost_params.clone(),
         )?

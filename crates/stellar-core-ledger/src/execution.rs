@@ -636,7 +636,14 @@ impl TransactionExecutor {
             }
         }
 
-        let fee = frame.total_fee();
+        let required_fee =
+            base_fee as i64 * std::cmp::max(1, frame.operation_count() as i64);
+        let inclusion_fee = frame.inclusion_fee();
+        let fee = if frame.is_soroban() {
+            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
+        } else {
+            std::cmp::min(inclusion_fee, required_fee)
+        };
         if fee_source_account.balance < fee {
             return Ok(TransactionExecutionResult {
                 success: false,
@@ -828,6 +835,9 @@ impl TransactionExecutor {
         match &op.body {
             OperationBody::CreateAccount(op_data) => {
                 // Don't load destination - it shouldn't exist
+            }
+            OperationBody::BeginSponsoringFutureReserves(op_data) => {
+                self.load_account(snapshot, &op_data.sponsored_id)?;
             }
             OperationBody::Payment(op_data) => {
                 let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
