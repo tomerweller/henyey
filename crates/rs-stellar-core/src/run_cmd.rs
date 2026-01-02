@@ -18,7 +18,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::State,
@@ -218,9 +218,17 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         }
     }
 
-    // Start the main run loop
+    // Start the main run loop in the background so we can optionally wait for sync.
     tracing::info!("Starting main run loop");
-    app.run().await?;
+    let run_app = Arc::clone(&app);
+    let run_handle = tokio::spawn(async move { run_app.run().await });
+    if options.wait_for_sync {
+        wait_for_sync(&app).await;
+    }
+    match run_handle.await {
+        Ok(result) => result?,
+        Err(err) => anyhow::bail!("run loop task failed: {}", err),
+    }
 
     Ok(())
 }
@@ -231,10 +239,45 @@ async fn check_needs_catchup(app: &App, options: &RunOptions) -> anyhow::Result<
         return Ok(true);
     }
 
-    // Check current state in database
-    // For now, assume we always need catchup if there's no state
     let current_state = app.state().await;
-    Ok(current_state == AppState::Initializing)
+    if current_state == AppState::Initializing {
+        return Ok(true);
+    }
+
+    let (_seq, _hash, close_time, _protocol_version) = app.ledger_info();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let target_close_time = app.target_ledger_close_time() as u64;
+    let max_age_seconds = target_close_time.saturating_mul(options.max_ledger_age as u64);
+    Ok(is_ledger_too_old(close_time, now, max_age_seconds))
+}
+
+fn is_ledger_too_old(close_time: u64, now: u64, max_age_seconds: u64) -> bool {
+    if close_time == 0 {
+        return true;
+    }
+    if max_age_seconds == 0 {
+        return false;
+    }
+    now.saturating_sub(close_time) > max_age_seconds
+}
+
+async fn wait_for_sync(app: &App) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let state = app.state().await;
+        if matches!(state, AppState::Synced | AppState::Validating) {
+            tracing::info!(state = %state, "Node is synced");
+            break;
+        }
+        if state == AppState::ShuttingDown {
+            tracing::warn!("Shutdown requested before sync completed");
+            break;
+        }
+    }
 }
 
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM).
@@ -1391,5 +1434,13 @@ mod tests {
         assert!(display.contains("Ledger: 1000"));
         assert!(display.contains("Peers: 5"));
         assert!(display.contains("Uptime: 3600s"));
+    }
+
+    #[test]
+    fn test_is_ledger_too_old() {
+        assert!(is_ledger_too_old(0, 100, 10));
+        assert!(!is_ledger_too_old(100, 105, 10));
+        assert!(is_ledger_too_old(100, 111, 10));
+        assert!(!is_ledger_too_old(100, 1000, 0));
     }
 }

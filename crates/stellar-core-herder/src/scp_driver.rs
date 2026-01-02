@@ -310,6 +310,17 @@ impl ScpDriver {
             .collect()
     }
 
+    /// Get all pending tx sets with their slots.
+    pub fn get_pending_tx_sets(&self) -> Vec<(Hash256, SlotIndex)> {
+        self.pending_tx_sets
+            .iter()
+            .map(|entry| {
+                let pending = entry.value();
+                (pending.hash, pending.slot)
+            })
+            .collect()
+    }
+
     /// Check if we need a tx set.
     pub fn needs_tx_set(&self, hash: &Hash256) -> bool {
         self.pending_tx_sets.contains_key(hash) && !self.tx_set_cache.contains_key(hash)
@@ -319,6 +330,19 @@ impl ScpDriver {
     /// Returns the slot it was needed for, if any.
     pub fn receive_tx_set(&self, tx_set: TransactionSet) -> Option<SlotIndex> {
         let hash = tx_set.hash;
+        if let Some(recomputed) = tx_set.recompute_hash() {
+            if recomputed != hash {
+                warn!(
+                    expected = %hash,
+                    computed = %recomputed,
+                    "Rejecting tx set with mismatched hash"
+                );
+                return None;
+            }
+        } else {
+            warn!(%hash, "Rejecting tx set without recomputable hash");
+            return None;
+        }
 
         // Remove from pending
         let pending = self.pending_tx_sets.remove(&hash);
@@ -366,6 +390,19 @@ impl ScpDriver {
     /// Get an externalized slot.
     pub fn get_externalized(&self, slot: SlotIndex) -> Option<ExternalizedSlot> {
         self.externalized.read().get(&slot).cloned()
+    }
+
+    /// Find the slot for a given tx set hash in recent externalized values.
+    pub fn find_externalized_slot_by_tx_set_hash(&self, hash: &Hash256) -> Option<SlotIndex> {
+        self.externalized
+            .read()
+            .iter()
+            .find_map(|(slot, ext)| {
+                ext.tx_set_hash
+                    .as_ref()
+                    .filter(|tx_hash| *tx_hash == hash)
+                    .map(|_| *slot)
+            })
     }
 
     /// Validate an SCP value.
@@ -845,6 +882,7 @@ impl SCPDriver for HerderScpCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_core_common::NetworkId;
     use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, UpgradeType, VecM};
 
     fn make_test_driver() -> ScpDriver {

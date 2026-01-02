@@ -14,12 +14,15 @@ use crate::{
     archive_state::{HASBucketLevel, HASBucketNext, HistoryArchiveState},
     checkpoint::is_checkpoint_ledger,
     paths,
+    verify,
     HistoryError, Result,
 };
 use stellar_core_bucket::BucketList;
 use stellar_core_common::Hash256;
+use stellar_core_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
-    LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
+    LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntry, WriteXdr,
 };
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -138,6 +141,44 @@ impl PublishManager {
             checkpoint = checkpoint_ledger,
             "Publishing checkpoint to history"
         );
+
+        let header_chain: Vec<_> = headers.iter().map(|entry| entry.header.clone()).collect();
+        verify::verify_header_chain(&header_chain)?;
+
+        let tx_entry_map: std::collections::HashMap<_, _> = tx_entries
+            .iter()
+            .map(|entry| (entry.ledger_seq, entry))
+            .collect();
+        let tx_result_map: std::collections::HashMap<_, _> = tx_results
+            .iter()
+            .map(|entry| (entry.ledger_seq, entry))
+            .collect();
+
+        for header in &header_chain {
+            let entry = tx_entry_map.get(&header.ledger_seq).ok_or_else(|| {
+                HistoryError::VerificationFailed(format!(
+                    "missing tx history entry for ledger {}",
+                    header.ledger_seq
+                ))
+            })?;
+            let tx_set = match &entry.ext {
+                TransactionHistoryEntryExt::V0 => TransactionSetVariant::Classic(entry.tx_set.clone()),
+                TransactionHistoryEntryExt::V1(set) => TransactionSetVariant::Generalized(set.clone()),
+            };
+            verify::verify_tx_set(header, &tx_set)?;
+
+            let result_entry = tx_result_map.get(&header.ledger_seq).ok_or_else(|| {
+                HistoryError::VerificationFailed(format!(
+                    "missing tx result entry for ledger {}",
+                    header.ledger_seq
+                ))
+            })?;
+            let xdr = result_entry
+                .tx_result_set
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+            verify::verify_tx_result_set(header, &xdr)?;
+        }
 
         let mut state = PublishState {
             checkpoint_ledger,

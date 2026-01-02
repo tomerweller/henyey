@@ -31,15 +31,14 @@ use stellar_core_history::{
     CheckpointData, HistoryArchive, CHECKPOINT_FREQUENCY,
 };
 use stellar_core_historywork::{
-    get_buckets, get_has, get_headers, get_progress, get_scp_history, get_transactions,
-    get_tx_results, HistoryWorkBuilder, HistoryWorkState,
+    build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
 };
 use stellar_core_ledger::{
     LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
 };
 use stellar_core_overlay::{
-    LocalNode, OverlayConfig as OverlayManagerConfig, OverlayManager, OverlayMessage, PeerAddress,
-    PeerEvent, PeerId, PeerSnapshot, PeerType,
+    ConnectionDirection, LocalNode, OverlayConfig as OverlayManagerConfig, OverlayManager,
+    OverlayMessage, PeerAddress, PeerEvent, PeerId, PeerSnapshot, PeerType,
 };
 use stellar_core_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
 use stellar_core_common::{Hash256, NetworkId};
@@ -51,7 +50,7 @@ use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 use stellar_xdr::curr::{
     Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand, GeneralizedTransactionSet,
     Hash, LedgerCloseMeta, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope,
-    SignedTimeSlicedSurveyResponseMessage, StellarMessage, SurveyMessageCommandType,
+    SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue, SurveyMessageCommandType,
     SurveyRequestMessage, SurveyResponseBody, SurveyResponseMessage, TimeSlicedSurveyRequestMessage,
     TimeSlicedSurveyResponseMessage, TimeSlicedSurveyStartCollectingMessage,
     TimeSlicedSurveyStopCollectingMessage, TimeSlicedPeerDataList, TopologyResponseBodyV2,
@@ -74,6 +73,8 @@ const PEER_TYPE_OUTBOUND: i32 = 1;
 const PEER_TYPE_PREFERRED: i32 = 2;
 const PEER_TYPE_INBOUND: i32 = 0;
 const PEER_MAX_FAILURES_TO_SEND: u32 = 10;
+const TX_SET_REQUEST_WINDOW: u64 = 12;
+const MAX_TX_SET_REQUESTS_PER_TICK: usize = 32;
 
 fn build_generalized_tx_set(
     tx_set: &stellar_core_herder::TransactionSet,
@@ -210,6 +211,12 @@ pub struct App {
     catchup_in_progress: AtomicBool,
     /// Buffered externalized ledgers waiting to apply.
     syncing_ledgers: RwLock<BTreeMap<u32, stellar_core_herder::LedgerCloseInfo>>,
+    /// Latest externalized slot we've observed (for liveness checks).
+    last_externalized_slot: AtomicU64,
+    /// Time when we last observed an externalized slot.
+    last_externalized_at: RwLock<Instant>,
+    /// Last time we requested SCP state due to stalled externalization.
+    last_scp_state_request_at: RwLock<Instant>,
 
     /// Time-sliced survey data manager.
     survey_data: RwLock<SurveyDataManager>,
@@ -225,6 +232,10 @@ pub struct App {
     tx_demand_history: RwLock<HashMap<Hash256, TxDemandHistory>>,
     /// Pending demand hashes in FIFO order for retention.
     tx_pending_demands: RwLock<VecDeque<Hash256>>,
+    /// Per-txset DontHave tracking to avoid retrying peers that lack the set.
+    tx_set_dont_have: RwLock<HashMap<Hash256, HashSet<stellar_core_overlay::PeerId>>>,
+    /// Last time we requested a tx set by hash (throttling).
+    tx_set_last_request: RwLock<HashMap<Hash256, TxSetRequestState>>,
     /// SCP latency samples for surveys.
     scp_latency: RwLock<ScpLatencyTracker>,
 
@@ -292,6 +303,12 @@ impl TxAdvertHistory {
         self.entries.retain(|_, seq| *seq >= ledger_seq);
         self.order.retain(|(hash, seq)| *seq >= ledger_seq && self.entries.get(hash) == Some(seq));
     }
+}
+
+#[derive(Debug, Clone)]
+struct TxSetRequestState {
+    last_request: Instant,
+    next_peer_offset: usize,
 }
 
 #[derive(Debug)]
@@ -587,7 +604,7 @@ impl App {
             ledger_close_time: 5,
             node_public_key: keypair.public_key(),
             network_id: config.network_id(),
-            max_externalized_slots: 12,
+            max_externalized_slots: TX_SET_REQUEST_WINDOW as usize,
             max_tx_set_size: 1000,
             pending_config: Default::default(),
             tx_queue_config: TxQueueConfig {
@@ -608,6 +625,7 @@ impl App {
         } else {
             Arc::new(Herder::new(herder_config))
         };
+        herder.set_ledger_manager(ledger_manager.clone());
 
         if let Some(qs) = herder.local_quorum_set() {
             let hash = hash_quorum_set(&qs);
@@ -652,6 +670,9 @@ impl App {
             last_processed_slot: RwLock::new(0),
             catchup_in_progress: AtomicBool::new(false),
             syncing_ledgers: RwLock::new(BTreeMap::new()),
+            last_externalized_slot: AtomicU64::new(0),
+            last_externalized_at: RwLock::new(Instant::now()),
+            last_scp_state_request_at: RwLock::new(Instant::now()),
             survey_data: RwLock::new(SurveyDataManager::new(
                 is_validator,
                 max_inbound_peers,
@@ -662,6 +683,8 @@ impl App {
             tx_adverts_by_peer: RwLock::new(HashMap::new()),
             tx_demand_history: RwLock::new(HashMap::new()),
             tx_pending_demands: RwLock::new(VecDeque::new()),
+            tx_set_dont_have: RwLock::new(HashMap::new()),
+            tx_set_last_request: RwLock::new(HashMap::new()),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: RwLock::new(SurveyScheduler::new()),
             survey_nonce: RwLock::new(1),
@@ -892,6 +915,10 @@ impl App {
         (header.ledger_seq, hash, close_time, header.ledger_version)
     }
 
+    pub fn target_ledger_close_time(&self) -> u32 {
+        self.herder.ledger_close_time()
+    }
+
     pub fn current_upgrade_state(&self) -> (u32, u32, u32, u32) {
         let header = self.ledger_manager.current_header();
         (
@@ -1015,14 +1042,18 @@ impl App {
     fn persist_ledger_close(
         &self,
         header: &stellar_xdr::curr::LedgerHeader,
-        txs: &[stellar_xdr::curr::TransactionEnvelope],
+        tx_set_variant: &TransactionSetVariant,
         tx_results: &[TransactionResultPair],
         tx_metas: Option<&[TransactionMeta]>,
-        generalized_tx_set: Option<&GeneralizedTransactionSet>,
     ) -> anyhow::Result<()> {
         let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
         let network_id = NetworkId::from_passphrase(&self.config.network.passphrase);
-        let tx_count = txs.len().min(tx_results.len());
+        let ordered_txs: Vec<TransactionEnvelope> = tx_set_variant
+            .transactions_with_base_fee()
+            .into_iter()
+            .map(|(tx, _)| tx)
+            .collect();
+        let tx_count = ordered_txs.len().min(tx_results.len());
         let meta_count = tx_metas.map(|metas| metas.len()).unwrap_or(0);
         let scp_envelopes = self.herder.get_scp_envelopes(header.ledger_seq as u64);
         let mut scp_quorum_sets = Vec::new();
@@ -1037,9 +1068,9 @@ impl App {
             }
         }
 
-        if tx_results.len() != txs.len() {
+        if tx_results.len() != ordered_txs.len() {
             tracing::warn!(
-                tx_count = txs.len(),
+                tx_count = ordered_txs.len(),
                 result_count = tx_results.len(),
                 "Transaction count mismatch while persisting history"
             );
@@ -1054,28 +1085,24 @@ impl App {
             }
         }
 
-        let tx_set = if generalized_tx_set.is_some() {
-            TransactionSet {
-                previous_ledger_hash: header.previous_ledger_hash.clone(),
-                txs: VecM::default(),
-            }
-        } else {
-            TransactionSet {
-                previous_ledger_hash: header.previous_ledger_hash.clone(),
-                txs: txs
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap_or_default(),
+        let tx_set_entry = match tx_set_variant {
+            TransactionSetVariant::Classic(set) => set.clone(),
+            TransactionSetVariant::Generalized(set) => {
+                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                TransactionSet {
+                    previous_ledger_hash: set_v1.previous_ledger_hash.clone(),
+                    txs: VecM::default(),
+                }
             }
         };
         let tx_history_entry = TransactionHistoryEntry {
             ledger_seq: header.ledger_seq,
-            tx_set,
-            ext: match generalized_tx_set {
-                Some(set) => TransactionHistoryEntryExt::V1(set.clone()),
-                None => TransactionHistoryEntryExt::V0,
+            tx_set: tx_set_entry,
+            ext: match tx_set_variant {
+                TransactionSetVariant::Classic(_) => TransactionHistoryEntryExt::V0,
+                TransactionSetVariant::Generalized(set) => {
+                    TransactionHistoryEntryExt::V1(set.clone())
+                }
             },
         };
         let tx_result_set = TransactionResultSet {
@@ -1099,7 +1126,7 @@ impl App {
                 }
             }
             for index in 0..tx_count {
-                let tx = &txs[index];
+                let tx = &ordered_txs[index];
                 let tx_result = &tx_results[index];
                 let tx_meta = tx_metas.and_then(|metas| metas.get(index));
 
@@ -1547,14 +1574,25 @@ impl App {
         // Run catchup work
         let output = self.run_catchup_work(target_ledger, progress.clone()).await?;
 
-        // Initialize ledger manager with catchup results
-        // This validates that the bucket list hash matches the ledger header
-        self.ledger_manager.initialize_from_buckets(
-            output.bucket_list,
-            output.hot_archive_bucket_list,
-            output.header,
-        )
-            .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
+        // Initialize ledger manager with catchup results.
+        // This validates that the bucket list hash matches the ledger header.
+        if self.ledger_manager.is_initialized() {
+            self.ledger_manager
+                .reinitialize_from_buckets(
+                    output.bucket_list,
+                    output.hot_archive_bucket_list,
+                    output.header,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to reinitialize ledger manager: {}", e))?;
+        } else {
+            self.ledger_manager
+                .initialize_from_buckets(
+                    output.bucket_list,
+                    output.hot_archive_bucket_list,
+                    output.header,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
+        }
 
         tracing::info!(
             ledger_seq = output.result.ledger_seq,
@@ -1778,14 +1816,7 @@ impl App {
             }
         }
 
-        Ok(CheckpointData {
-            has: get_has(&state).await?,
-            buckets: get_buckets(&state).await?,
-            headers: get_headers(&state).await?,
-            transactions: get_transactions(&state).await?,
-            tx_results: get_tx_results(&state).await?,
-            scp_history: get_scp_history(&state).await?,
-        })
+        Ok(build_checkpoint_data(&state).await?)
     }
 
     /// Run the main event loop.
@@ -1808,6 +1839,7 @@ impl App {
 
         // Bootstrap herder with current ledger
         let ledger_seq = *self.current_ledger.read().await;
+        *self.last_processed_slot.write().await = ledger_seq as u64;
         self.herder.start_syncing();
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
@@ -1842,6 +1874,24 @@ impl App {
                 rx
             }
         };
+        let (overlay_tx, mut overlay_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                match message_rx.recv().await {
+                    Ok(overlay_msg) => {
+                        if overlay_tx.send(overlay_msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "Overlay receiver lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        });
 
         // Main run loop
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -1870,9 +1920,9 @@ impl App {
                 // NOTE: Removed biased; to ensure timers get fair polling
 
                 // Process overlay messages
-                msg = message_rx.recv() => {
+                msg = overlay_rx.recv() => {
                     match msg {
-                        Ok(overlay_msg) => {
+                        Some(overlay_msg) => {
                             let msg_type = match &overlay_msg.message {
                                 StellarMessage::ScpMessage(_) => "SCP",
                                 StellarMessage::Transaction(_) => "TX",
@@ -1886,10 +1936,7 @@ impl App {
                             tracing::debug!(msg_type, "Received overlay message");
                             self.handle_overlay_message(overlay_msg).await;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(skipped = n, "Message receiver lagged");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        None => {
                             tracing::info!("Overlay message channel closed");
                             break;
                         }
@@ -2012,6 +2059,24 @@ impl App {
                         peers,
                         "Heartbeat"
                     );
+
+                    // If externalization stalls, ask peers for fresh SCP state.
+                    if peers > 0 && self.herder.state().can_receive_scp() {
+                        let now = Instant::now();
+                        let last_ext = *self.last_externalized_at.read().await;
+                        let last_request = *self.last_scp_state_request_at.read().await;
+                        if now.duration_since(last_ext) > Duration::from_secs(20)
+                            && now.duration_since(last_request) > Duration::from_secs(10)
+                        {
+                            tracing::warn!(
+                                latest_ext,
+                                tracking_slot,
+                                "SCP externalization stalled; requesting SCP state"
+                            );
+                            *self.last_scp_state_request_at.write().await = now;
+                            self.request_scp_state_from_peers().await;
+                        }
+                    }
                 }
             }
         }
@@ -2142,6 +2207,18 @@ impl App {
                     &envelope.statement.pledges,
                     stellar_xdr::curr::ScpStatementPledges::Externalize(_)
                 );
+                let tx_set_hash = match &envelope.statement.pledges {
+                    stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
+                        match StellarValue::from_xdr(&ext.commit.value.0, stellar_xdr::curr::Limits::none()) {
+                            Ok(stellar_value) => Some(Hash256::from_bytes(stellar_value.tx_set_hash.0)),
+                            Err(err) => {
+                                tracing::warn!(slot, error = %err, "Failed to parse externalized StellarValue");
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
 
                 if let Some(hash) = Self::scp_quorum_set_hash(&envelope.statement) {
                     let hash256 = stellar_core_common::Hash256::from_bytes(hash.0);
@@ -2165,6 +2242,25 @@ impl App {
 
                         // For EXTERNALIZE messages, immediately try to close ledger and request tx set
                         if is_externalize {
+                            if let Some(tx_set_hash) = tx_set_hash {
+                                self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
+                                if self.herder.needs_tx_set(&tx_set_hash) {
+                                    let peer = msg.from_peer.clone();
+                                    let overlay = self.overlay.lock().await;
+                                    if let Some(ref overlay) = *overlay {
+                                        let request = StellarMessage::GetTxSet(
+                                            stellar_xdr::curr::Uint256(tx_set_hash.0),
+                                        );
+                                        if let Err(e) = overlay.send_to(&peer, request).await {
+                                            tracing::debug!(
+                                                peer = ?peer,
+                                                error = %e,
+                                                "Failed to request tx set from externalize peer"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             // First, process externalized slots to register pending tx set requests
                             self.process_externalized_slots().await;
                             // Then, immediately request any pending tx sets
@@ -2190,7 +2286,7 @@ impl App {
             }
 
             StellarMessage::Transaction(tx_env) => {
-                let tx_hash = Hash256::hash_xdr(&tx_env).ok();
+                let tx_hash = self.tx_hash(&tx_env);
                 match self.herder.receive_transaction(tx_env.clone()) {
                     stellar_core_herder::TxQueueResult::Added => {
                         tracing::debug!(peer = ?msg.from_peer, "Transaction added to queue");
@@ -2226,15 +2322,33 @@ impl App {
             }
 
             StellarMessage::DontHave(dont_have) => {
-                if matches!(dont_have.type_, stellar_xdr::curr::MessageType::TxSet) {
+                let is_tx_set = matches!(
+                    dont_have.type_,
+                    stellar_xdr::curr::MessageType::TxSet
+                        | stellar_xdr::curr::MessageType::GeneralizedTxSet
+                );
+                let is_ping = matches!(dont_have.type_, stellar_xdr::curr::MessageType::ScpQuorumset);
+                if is_tx_set {
                     tracing::info!(
                         peer = ?msg.from_peer,
                         hash = hex::encode(dont_have.req_hash.0),
                         "Peer reported DontHave for TxSet"
                     );
+                    let hash = Hash256::from_bytes(dont_have.req_hash.0);
+                    let mut map = self.tx_set_dont_have.write().await;
+                    map.entry(hash).or_default().insert(msg.from_peer.clone());
+                    if self.herder.needs_tx_set(&hash) {
+                        let mut last_request = self.tx_set_last_request.write().await;
+                        last_request.remove(&hash);
+                        drop(last_request);
+                        drop(map);
+                        self.request_pending_tx_sets().await;
+                    }
                 }
-                self.process_ping_response(&msg.from_peer, dont_have.req_hash.0)
-                    .await;
+                if is_ping {
+                    self.process_ping_response(&msg.from_peer, dont_have.req_hash.0)
+                        .await;
+                }
             }
 
             StellarMessage::GetScpState(ledger_seq) => {
@@ -2338,19 +2452,43 @@ impl App {
 
         tracing::debug!(latest_externalized, last_processed, "Need to process");
 
+        let prev_latest = self
+            .last_externalized_slot
+            .swap(latest_externalized, Ordering::Relaxed);
+        if latest_externalized != prev_latest {
+            *self.last_externalized_at.write().await = Instant::now();
+        }
+
+        let mut missing_tx_set = false;
+        let mut buffered_count = 0usize;
+        let mut advance_to = last_processed;
         {
             let mut buffer = self.syncing_ledgers.write().await;
             for slot in (last_processed + 1)..=latest_externalized {
                 if let Some(info) = self.herder.check_ledger_close(slot) {
+                    if info.tx_set.is_none() {
+                        missing_tx_set = true;
+                    }
                     buffer.entry(info.slot as u32).or_insert(info);
+                    buffered_count += 1;
+                    if slot == advance_to + 1 {
+                        advance_to = slot;
+                    }
                 }
             }
         }
 
-        *self.last_processed_slot.write().await = latest_externalized;
+        *self.last_processed_slot.write().await = advance_to;
 
+        if missing_tx_set {
+            self.request_pending_tx_sets().await;
+        }
         self.try_apply_buffered_ledgers().await;
         self.maybe_start_buffered_catchup().await;
+        if buffered_count == 0 {
+            self.maybe_start_externalized_catchup(latest_externalized)
+                .await;
+        }
     }
 
     fn first_ledger_in_checkpoint(ledger: u32) -> u32 {
@@ -2409,6 +2547,48 @@ impl App {
         } else {
             tracing::debug!(slot, "Received tx set for unbuffered slot");
         }
+    }
+
+    async fn attach_tx_set_by_hash(
+        &self,
+        tx_set: &stellar_core_herder::TransactionSet,
+    ) -> bool {
+        let mut buffer = self.syncing_ledgers.write().await;
+        for (slot, entry) in buffer.iter_mut() {
+            if entry.tx_set.is_none() && entry.tx_set_hash == tx_set.hash {
+                entry.tx_set = Some(tx_set.clone());
+                tracing::info!(slot, hash = %tx_set.hash, "Attached tx set to buffered slot");
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn buffer_externalized_tx_set(
+        &self,
+        tx_set: &stellar_core_herder::TransactionSet,
+    ) -> bool {
+        let Some(slot) = self
+            .herder
+            .find_externalized_slot_by_tx_set_hash(&tx_set.hash)
+        else {
+            return false;
+        };
+        let Some(info) = self.herder.check_ledger_close(slot) else {
+            return false;
+        };
+        {
+            let mut buffer = self.syncing_ledgers.write().await;
+            buffer.entry(info.slot as u32).or_insert(info);
+        }
+        self.update_buffered_tx_set(slot as u32, Some(tx_set.clone()))
+            .await;
+        tracing::info!(
+            slot,
+            hash = %tx_set.hash,
+            "Buffered tx set after externalized lookup"
+        );
+        true
     }
 
     async fn try_apply_buffered_ledgers(&self) {
@@ -2470,6 +2650,7 @@ impl App {
                         buffer.remove(&next_seq);
                     }
                     *self.current_ledger.write().await = next_seq;
+                    *self.last_processed_slot.write().await = next_seq as u64;
                     self.clear_tx_advert_history(next_seq).await;
                 }
                 Err(e) => {
@@ -2499,25 +2680,63 @@ impl App {
             }
         };
 
+        tracing::info!(
+            current_ledger,
+            first_buffered,
+            last_buffered,
+            "Evaluating buffered catchup"
+        );
+
         if first_buffered == current_ledger + 1 {
+            tracing::info!(
+                current_ledger,
+                first_buffered,
+                "Sequential ledger available; skipping buffered catchup"
+            );
             return;
         }
 
-        let required_first = if Self::is_first_ledger_in_checkpoint(first_buffered) {
-            first_buffered
+        let gap = first_buffered.saturating_sub(current_ledger);
+        let large_gap = gap >= CHECKPOINT_FREQUENCY && first_buffered > current_ledger + 1;
+        let (required_first, trigger) = if large_gap {
+            (0, 0)
+        } else if Self::is_first_ledger_in_checkpoint(first_buffered) {
+            let required_first = first_buffered;
+            (required_first, required_first.saturating_add(1))
         } else {
-            Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY)
+            let required_first =
+                Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY);
+            (required_first, required_first.saturating_add(1))
         };
-        let trigger = required_first.saturating_add(1);
-        if last_buffered < trigger {
+        let target = Self::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
+        if target.is_none() {
+            if !large_gap {
+                tracing::info!(
+                    current_ledger,
+                    first_buffered,
+                    last_buffered,
+                    required_first,
+                    trigger,
+                    "Waiting for buffered catchup trigger ledger"
+                );
+            }
             return;
+        }
+        let target = target.unwrap();
+        if large_gap {
+            tracing::info!(
+                current_ledger,
+                first_buffered,
+                gap,
+                "Buffered gap exceeds checkpoint; starting catchup"
+            );
         }
 
         if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
+            tracing::info!("Buffered catchup already in progress");
             return;
         }
 
-        let target = required_first.saturating_sub(1);
         if target == 0 || target <= current_ledger {
             self.catchup_in_progress.store(false, Ordering::SeqCst);
             return;
@@ -2537,8 +2756,16 @@ impl App {
         match catchup_result {
             Ok(result) => {
                 *self.current_ledger.write().await = result.ledger_seq;
+                *self.last_processed_slot.write().await = result.ledger_seq as u64;
                 self.clear_tx_advert_history(result.ledger_seq).await;
                 self.herder.bootstrap(result.ledger_seq);
+                let cleaned = self
+                    .herder
+                    .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
+                if cleaned > 0 {
+                    tracing::info!(cleaned, "Dropped stale pending tx set requests after catchup");
+                }
+                self.prune_tx_set_tracking().await;
                 if self.is_validator {
                     self.set_state(AppState::Validating).await;
                 } else {
@@ -2554,6 +2781,124 @@ impl App {
                 tracing::error!(error = %err, "Buffered catchup failed");
             }
         }
+    }
+
+    async fn maybe_start_externalized_catchup(&self, latest_externalized: u64) {
+        let current_ledger = match self.get_current_ledger().await {
+            Ok(seq) => seq,
+            Err(_) => return,
+        };
+        if latest_externalized <= current_ledger as u64 {
+            return;
+        }
+        let gap = latest_externalized.saturating_sub(current_ledger as u64);
+        if gap <= TX_SET_REQUEST_WINDOW {
+            return;
+        }
+
+        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
+            tracing::info!("Externalized catchup already in progress");
+            return;
+        }
+
+        let target = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
+        if target == 0 || target <= current_ledger {
+            self.catchup_in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        tracing::info!(
+            current_ledger,
+            latest_externalized,
+            target,
+            "Starting externalized catchup"
+        );
+
+        let catchup_result = self.catchup(CatchupTarget::Ledger(target)).await;
+        self.catchup_in_progress.store(false, Ordering::SeqCst);
+
+        match catchup_result {
+            Ok(result) => {
+                *self.current_ledger.write().await = result.ledger_seq;
+                *self.last_processed_slot.write().await = result.ledger_seq as u64;
+                self.clear_tx_advert_history(result.ledger_seq).await;
+                self.herder.bootstrap(result.ledger_seq);
+                let cleaned = self
+                    .herder
+                    .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
+                if cleaned > 0 {
+                    tracing::info!(cleaned, "Dropped stale pending tx set requests after catchup");
+                }
+                self.prune_tx_set_tracking().await;
+                if self.is_validator {
+                    self.set_state(AppState::Validating).await;
+                } else {
+                    self.set_state(AppState::Synced).await;
+                }
+                tracing::info!(
+                    ledger_seq = result.ledger_seq,
+                    "Externalized catchup complete"
+                );
+                self.try_apply_buffered_ledgers().await;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "Externalized catchup failed");
+            }
+        }
+    }
+
+    fn buffered_catchup_target(
+        current_ledger: u32,
+        first_buffered: u32,
+        last_buffered: u32,
+    ) -> Option<u32> {
+        if first_buffered <= current_ledger + 1 {
+            return None;
+        }
+
+        let gap = first_buffered.saturating_sub(current_ledger);
+        if gap >= CHECKPOINT_FREQUENCY {
+            let target = first_buffered.saturating_sub(1);
+            return if target == 0 { None } else { Some(target) };
+        }
+
+        let required_first = if Self::is_first_ledger_in_checkpoint(first_buffered) {
+            first_buffered
+        } else {
+            Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY)
+        };
+        let trigger = required_first.saturating_add(1);
+        if last_buffered < trigger {
+            return None;
+        }
+        let target = required_first.saturating_sub(1);
+        if target == 0 {
+            None
+        } else {
+            Some(target)
+        }
+    }
+
+    async fn prune_tx_set_tracking(&self) {
+        let pending: HashSet<Hash256> = self
+            .herder
+            .get_pending_tx_sets()
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect();
+        let mut dont_have = self.tx_set_dont_have.write().await;
+        dont_have.retain(|hash, _| pending.contains(hash));
+        let mut last_request = self.tx_set_last_request.write().await;
+        last_request.retain(|hash, _| pending.contains(hash));
+    }
+
+    fn tx_set_start_index(hash: &Hash256, peers_len: usize, peer_offset: usize) -> usize {
+        if peers_len == 0 {
+            return 0;
+        }
+        let start = u64::from_le_bytes(hash.0[0..8].try_into().unwrap_or([0; 8]));
+        let base = (start as usize) % peers_len;
+        (base + (peer_offset % peers_len)) % peers_len
     }
 
     /// Try to trigger consensus for the next ledger (validators only).
@@ -2657,8 +3002,8 @@ impl App {
             return;
         }
 
-        // Request SCP state from our current ledger
-        let ledger_seq = self.ledger_manager.current_ledger_seq();
+        // Request SCP state from a low watermark similar to upstream behavior.
+        let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
         match overlay.request_scp_state(ledger_seq).await {
             Ok(count) => {
                 tracing::info!(
@@ -3264,13 +3609,14 @@ impl App {
         }
     }
 
+    fn tx_hash(&self, tx_env: &stellar_xdr::curr::TransactionEnvelope) -> Option<Hash256> {
+        Hash256::hash_xdr(tx_env).ok()
+    }
+
     async fn enqueue_tx_advert(&self, tx_env: &stellar_xdr::curr::TransactionEnvelope) {
-        let hash = match Hash256::hash_xdr(tx_env) {
-            Ok(hash) => hash,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to hash transaction for advert");
-                return;
-            }
+        let Some(hash) = self.tx_hash(tx_env) else {
+            tracing::debug!("Failed to hash transaction for advert");
+            return;
         };
 
         let mut set = self.tx_advert_set.write().await;
@@ -4419,24 +4765,28 @@ impl App {
     /// Handle a TxSet message from the network.
     async fn handle_tx_set(&self, tx_set: stellar_xdr::curr::TransactionSet) {
         use stellar_core_herder::TransactionSet;
-        use stellar_xdr::curr::WriteXdr;
 
-        // For legacy TransactionSet, hash is SHA-256 of XDR-encoded set
-        let xdr_bytes = match tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to encode TxSet to XDR");
+        // For legacy TransactionSet, hash is SHA-256 of previous_ledger_hash + tx XDR blobs
+        let transactions: Vec<_> = tx_set.txs.to_vec();
+        let prev_hash = stellar_core_common::Hash256::from_bytes(tx_set.previous_ledger_hash.0);
+        let hash = match TransactionSet::compute_non_generalized_hash(prev_hash, &transactions) {
+            Some(hash) => hash,
+            None => {
+                tracing::error!("Failed to compute legacy TxSet hash");
                 return;
             }
         };
-        let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
-
-        // Convert transactions
-        let transactions: Vec<_> = tx_set.txs.to_vec();
-        let prev_hash = stellar_core_common::Hash256::from_bytes(tx_set.previous_ledger_hash.0);
 
         // Create our internal TransactionSet with correct hash
         let internal_tx_set = TransactionSet::with_hash(prev_hash, hash, transactions);
+        {
+            let mut map = self.tx_set_dont_have.write().await;
+            map.remove(&internal_tx_set.hash);
+        }
+        {
+            let mut map = self.tx_set_last_request.write().await;
+            map.remove(&internal_tx_set.hash);
+        }
 
         tracing::info!(
             hash = %internal_tx_set.hash,
@@ -4448,11 +4798,14 @@ impl App {
             tracing::info!(hash = %internal_tx_set.hash, "TxSet not pending");
         }
 
-        // Give it to the herder
-        if let Some(slot) = self.herder.receive_tx_set(internal_tx_set) {
+        let received_slot = self.herder.receive_tx_set(internal_tx_set.clone());
+        if let Some(slot) = received_slot {
             tracing::info!(slot, "Received pending TxSet, attempting ledger close");
-            // Retry ledger close now that we have the tx set
             self.process_externalized_slots().await;
+        } else if self.attach_tx_set_by_hash(&internal_tx_set).await
+            || self.buffer_externalized_tx_set(&internal_tx_set).await
+        {
+            self.try_apply_buffered_ledgers().await;
         }
     }
 
@@ -4522,7 +4875,10 @@ impl App {
         let phase_check = match &gen_tx_set {
             GeneralizedTransactionSet::V1(v1) => {
                 let classic_ok = matches!(v1.phases[0], TransactionPhase::V0(_));
-                let soroban_ok = matches!(v1.phases[1], TransactionPhase::V1(_));
+                let soroban_ok = matches!(
+                    v1.phases[1],
+                    TransactionPhase::V1(_) | TransactionPhase::V0(_)
+                );
                 if !classic_ok || !soroban_ok {
                     tracing::warn!(hash = %hash, "Invalid GeneralizedTxSet phase types");
                 }
@@ -4547,7 +4903,10 @@ impl App {
                     TransactionPhase::V1(parallel) => {
                         parallel.base_fee.map_or(true, |fee| fee >= base_fee_limit)
                     }
-                    _ => false,
+                    TransactionPhase::V0(components) => components.iter().all(|component| {
+                        let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
+                        comp.base_fee.map_or(true, |fee| fee >= base_fee_limit)
+                    }),
                 };
                 classic_ok && soroban_ok
             }
@@ -4591,7 +4950,12 @@ impl App {
                                 .sum::<usize>()
                         })
                         .sum(),
-                    _ => 0,
+                    TransactionPhase::V0(components) => components
+                        .iter()
+                        .map(|component| match component {
+                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => comp.txs.len(),
+                        })
+                        .sum(),
                 };
                 (classic_phase_count, soroban_phase_count)
             }
@@ -4611,13 +4975,23 @@ impl App {
         // Create internal tx set with the correct hash and retain generalized set
         let internal_tx_set =
             TransactionSet::with_generalized(prev_hash, hash, transactions, gen_tx_set);
+        {
+            let mut map = self.tx_set_dont_have.write().await;
+            map.remove(&internal_tx_set.hash);
+        }
+        {
+            let mut map = self.tx_set_last_request.write().await;
+            map.remove(&internal_tx_set.hash);
+        }
 
-        // Give it to the herder
-        if let Some(slot) = self.herder.receive_tx_set(internal_tx_set) {
+        let received_slot = self.herder.receive_tx_set(internal_tx_set.clone());
+        if let Some(slot) = received_slot {
             tracing::info!(slot, "Received pending GeneralizedTxSet, attempting ledger close");
-            // Close this specific slot directly - don't use process_externalized_slots
-            // which might fast-forward past this slot
             self.try_close_slot_directly(slot).await;
+        } else if self.attach_tx_set_by_hash(&internal_tx_set).await
+            || self.buffer_externalized_tx_set(&internal_tx_set).await
+        {
+            self.try_apply_buffered_ledgers().await;
         }
     }
 
@@ -4632,8 +5006,14 @@ impl App {
                 tracing::debug!(hash = hex::encode(hash), peer = ?peer_id, "TxSet not found in cache");
                 let overlay = self.overlay.lock().await;
                 if let Some(ref overlay) = *overlay {
+                    let ledger_version = self.ledger_manager.current_header().ledger_version;
+                    let message_type = if ledger_version >= 20 {
+                        stellar_xdr::curr::MessageType::GeneralizedTxSet
+                    } else {
+                        stellar_xdr::curr::MessageType::TxSet
+                    };
                     let msg = StellarMessage::DontHave(stellar_xdr::curr::DontHave {
-                        type_: stellar_xdr::curr::MessageType::TxSet,
+                        type_: message_type,
                         req_hash: stellar_xdr::curr::Uint256(*hash),
                     });
                     if let Err(e) = overlay.send_to(peer_id, msg).await {
@@ -4695,15 +5075,23 @@ impl App {
 
     /// Request pending transaction sets from peers.
     async fn request_pending_tx_sets(&self) {
-        let pending_hashes = self.herder.get_pending_tx_set_hashes();
+        let current_ledger = match self.get_current_ledger().await {
+            Ok(seq) => seq,
+            Err(_) => return,
+        };
+        let min_slot = current_ledger.saturating_add(1) as u64;
+        let window_end = current_ledger as u64 + TX_SET_REQUEST_WINDOW;
+        let mut pending = self.herder.get_pending_tx_sets();
+        pending.sort_by_key(|(_, slot)| *slot);
+        let pending_hashes: Vec<Hash256> = pending
+            .into_iter()
+            .filter(|(_, slot)| *slot >= min_slot && *slot <= window_end)
+            .map(|(hash, _)| hash)
+            .take(MAX_TX_SET_REQUESTS_PER_TICK)
+            .collect();
         if pending_hashes.is_empty() {
             return;
         }
-
-        tracing::info!(
-            count = pending_hashes.len(),
-            "Requesting pending tx sets"
-        );
 
         let overlay = self.overlay.lock().await;
         let overlay = match overlay.as_ref() {
@@ -4714,16 +5102,106 @@ impl App {
             }
         };
 
-        let peer_count = overlay.peer_count();
-        if peer_count == 0 {
+        let peer_infos = overlay.peer_infos();
+        if peer_infos.is_empty() {
             tracing::warn!("No peers connected, cannot request tx sets");
             return;
         }
+        let mut peers = Vec::new();
+        let mut fallback = Vec::new();
+        for info in peer_infos {
+            fallback.push(info.peer_id.clone());
+            let is_outbound = matches!(info.direction, ConnectionDirection::Outbound);
+            let is_preferred = if is_outbound {
+                true
+            } else {
+                let host = info.address.ip().to_string();
+                let port = info.address.port();
+                match self.db.load_peer(&host, port) {
+                    Ok(Some(record)) => {
+                        record.peer_type == PEER_TYPE_PREFERRED
+                            || record.peer_type == PEER_TYPE_OUTBOUND
+                    }
+                    _ => false,
+                }
+            };
+            if is_outbound || is_preferred {
+                peers.push(info.peer_id);
+            }
+        }
+        if peers.is_empty() {
+            peers = fallback;
+        }
+        peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
-        for hash in &pending_hashes {
-            tracing::info!(hash = %hash, "Requesting tx set from peers");
-            if let Err(e) = overlay.request_tx_set(&hash.0).await {
-                tracing::warn!(hash = %hash, error = %e, "Failed to request TxSet");
+        let now = Instant::now();
+        let requests: Vec<(Hash256, stellar_core_overlay::PeerId)> = {
+            let mut dont_have = self.tx_set_dont_have.write().await;
+            let pending_set: HashSet<Hash256> = pending_hashes.iter().copied().collect();
+            dont_have.retain(|hash, _| pending_set.contains(hash));
+            let mut last_request = self.tx_set_last_request.write().await;
+            last_request.retain(|hash, _| pending_set.contains(hash));
+
+            pending_hashes
+                .iter()
+                .filter_map(|hash| {
+                    if !self.herder.needs_tx_set(hash) {
+                        return None;
+                    }
+                    let throttle = std::time::Duration::from_millis(200);
+                    let mut request_state = last_request.get(hash).cloned().unwrap_or(
+                        TxSetRequestState {
+                            last_request: now
+                                .checked_sub(throttle)
+                                .unwrap_or(now),
+                            next_peer_offset: 0,
+                        },
+                    );
+                    if now.duration_since(request_state.last_request) < throttle {
+                        return None;
+                    }
+                    let start_idx = Self::tx_set_start_index(
+                        hash,
+                        peers.len(),
+                        request_state.next_peer_offset,
+                    );
+                    let eligible_peer = match dont_have.get_mut(hash) {
+                        Some(set) => {
+                            let mut found = None;
+                            for offset in 0..peers.len() {
+                                let idx = (start_idx + offset) % peers.len();
+                                let peer = &peers[idx];
+                                if !set.contains(peer) {
+                                    found = Some(peer);
+                                    break;
+                                }
+                            }
+                            found.or_else(|| {
+                                set.clear();
+                                peers.get(start_idx)
+                            })
+                        }
+                        None => peers.get(start_idx),
+                    };
+
+                    eligible_peer
+                        .cloned()
+                        .map(|peer_id| {
+                            request_state.last_request = now;
+                            request_state.next_peer_offset =
+                                request_state.next_peer_offset.saturating_add(1);
+                            last_request.insert(*hash, request_state);
+                            (*hash, peer_id)
+                        })
+                })
+                .collect()
+        };
+
+        for (hash, peer_id) in requests {
+            tracing::info!(hash = %hash, peer = ?peer_id, "Requesting tx set");
+            let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
+            if let Err(e) = overlay.send_to(&peer_id, request).await {
+                tracing::warn!(hash = %hash, peer = ?peer_id, error = %e, "Failed to request TxSet");
             }
         }
     }
@@ -5037,10 +5515,12 @@ impl HerderCallback for App {
         close_time: u64,
         upgrades: Vec<UpgradeType>,
     ) -> stellar_core_herder::Result<stellar_core_common::Hash256> {
+        let tx_summary = tx_set.summary();
         tracing::info!(
             ledger_seq,
             tx_count = tx_set.transactions.len(),
             close_time,
+            summary = %tx_summary,
             "Closing ledger"
         );
 
@@ -5062,7 +5542,7 @@ impl HerderCallback for App {
         // Create close data
         let mut close_data = LedgerCloseData::new(
             ledger_seq,
-            tx_set_variant,
+            tx_set_variant.clone(),
             close_time,
             prev_hash,
         );
@@ -5098,10 +5578,9 @@ impl HerderCallback for App {
         let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
         if let Err(err) = self.persist_ledger_close(
             &result.header,
-            &tx_set.transactions,
+            &tx_set_variant,
             &result.tx_results,
             tx_metas.as_deref(),
-            tx_set.generalized_tx_set.as_ref(),
         ) {
             tracing::warn!(error = %err, "Failed to persist ledger close data");
         }
@@ -5109,7 +5588,7 @@ impl HerderCallback for App {
         let applied_hashes: Vec<stellar_core_common::Hash256> = tx_set
             .transactions
             .iter()
-            .filter_map(|tx| stellar_core_common::Hash256::hash_xdr(tx).ok())
+            .filter_map(|tx| self.tx_hash(tx))
             .collect();
         self.herder
             .ledger_closed(ledger_seq as u64, &applied_hashes);
@@ -5154,11 +5633,14 @@ impl HerderCallback for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile;
 
     #[tokio::test]
     async fn test_app_creation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
-            .database_path("/tmp/rs-stellar-test.db")
+            .database_path(db_path)
             .build();
 
         let app = App::new(config).await.unwrap();
@@ -5167,9 +5649,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_app_info() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
             .node_name("test-node")
-            .database_path("/tmp/rs-stellar-test.db")
+            .database_path(db_path)
             .build();
 
         let app = App::new(config).await.unwrap();
@@ -5192,5 +5676,37 @@ mod tests {
         let display = format!("{}", result);
         assert!(display.contains("1000"));
         assert!(display.contains("22 buckets"));
+    }
+
+    #[test]
+    fn test_buffered_catchup_target_large_gap() {
+        let current = 100;
+        let first_buffered = current + CHECKPOINT_FREQUENCY + 5;
+        let target = App::buffered_catchup_target(current, first_buffered, first_buffered);
+        assert_eq!(target, Some(first_buffered - 1));
+    }
+
+    #[test]
+    fn test_buffered_catchup_target_requires_trigger() {
+        let current = 100;
+        let first_buffered = 120;
+        let last_buffered = 120;
+        let target = App::buffered_catchup_target(current, first_buffered, last_buffered);
+        assert_eq!(target, None);
+
+        let last_buffered = 130;
+        let target = App::buffered_catchup_target(current, first_buffered, last_buffered);
+        assert_eq!(target, Some(127));
+    }
+
+    #[test]
+    fn test_tx_set_start_index_rotation() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        let hash = Hash256::from_bytes(bytes);
+        assert_eq!(App::tx_set_start_index(&hash, 3, 0), 1);
+        assert_eq!(App::tx_set_start_index(&hash, 3, 1), 2);
+        assert_eq!(App::tx_set_start_index(&hash, 3, 2), 0);
+        assert_eq!(App::tx_set_start_index(&hash, 3, 3), 1);
     }
 }

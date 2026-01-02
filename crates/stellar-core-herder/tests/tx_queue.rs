@@ -186,6 +186,10 @@ fn account_key_from_envelope(envelope: &TransactionEnvelope) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+fn full_hash(envelope: &TransactionEnvelope) -> Hash256 {
+    Hash256::hash_xdr(envelope).expect("hash tx")
+}
+
 #[test]
 fn test_dex_lane_limit_deterministic_selection() {
     let config = TxQueueConfig {
@@ -208,13 +212,13 @@ fn test_dex_lane_limit_deterministic_selection() {
     let set = queue.get_transaction_set(Hash256::ZERO, 10);
     assert_eq!(set.len(), 2);
 
-    let hash_dex_a = Hash256::hash_xdr(&dex_a).unwrap();
-    let hash_dex_b = Hash256::hash_xdr(&dex_b).unwrap();
-    let hash_classic = Hash256::hash_xdr(&classic).unwrap();
+    let hash_dex_a = full_hash(&dex_a);
+    let hash_dex_b = full_hash(&dex_b);
+    let hash_classic = full_hash(&classic);
     let hashes: Vec<_> = set
         .transactions
         .iter()
-        .map(|tx| Hash256::hash_xdr(tx).unwrap())
+        .map(full_hash)
         .collect();
     assert!(hashes.contains(&hash_classic));
     assert!(hashes.contains(&hash_dex_a) || hashes.contains(&hash_dex_b));
@@ -235,8 +239,8 @@ fn test_classic_queue_limit_eviction() {
     set_source(&mut low, 21);
     set_source(&mut high, 22);
 
-    let low_hash = Hash256::hash_xdr(&low).unwrap();
-    let high_hash = Hash256::hash_xdr(&high).unwrap();
+    let low_hash = full_hash(&low);
+    let high_hash = full_hash(&high);
 
     assert_eq!(queue.try_add(low), stellar_core_herder::TxQueueResult::Added);
     assert_eq!(queue.try_add(high), stellar_core_herder::TxQueueResult::Added);
@@ -259,8 +263,8 @@ fn test_dex_queue_limit_eviction() {
     set_source(&mut dex_low, 31);
     set_source(&mut dex_high, 32);
 
-    let low_hash = Hash256::hash_xdr(&dex_low).unwrap();
-    let high_hash = Hash256::hash_xdr(&dex_high).unwrap();
+    let low_hash = full_hash(&dex_low);
+    let high_hash = full_hash(&dex_high);
 
     assert_eq!(queue.try_add(dex_low), stellar_core_herder::TxQueueResult::Added);
     assert_eq!(queue.try_add(dex_high), stellar_core_herder::TxQueueResult::Added);
@@ -285,8 +289,8 @@ fn test_soroban_queue_limit_eviction() {
     set_source(&mut low_fee, 71);
     set_source(&mut high_fee, 72);
 
-    let low_hash = Hash256::hash_xdr(&low_fee).unwrap();
-    let high_hash = Hash256::hash_xdr(&high_fee).unwrap();
+    let low_hash = full_hash(&low_fee);
+    let high_hash = full_hash(&high_fee);
 
     assert_eq!(queue.try_add(low_fee), stellar_core_herder::TxQueueResult::Added);
     assert_eq!(queue.try_add(high_fee), stellar_core_herder::TxQueueResult::Added);
@@ -332,8 +336,8 @@ fn test_duplicate_sequence_prefers_higher_fee() {
     set_seq(&mut low, 5);
     set_seq(&mut high, 5);
 
-    let low_hash = Hash256::hash_xdr(&low).unwrap();
-    let high_hash = Hash256::hash_xdr(&high).unwrap();
+    let low_hash = full_hash(&low);
+    let high_hash = full_hash(&high);
 
     queue.try_add(low);
     queue.try_add(high);
@@ -342,7 +346,7 @@ fn test_duplicate_sequence_prefers_higher_fee() {
     let hashes: Vec<_> = set
         .transactions
         .iter()
-        .map(|tx| Hash256::hash_xdr(tx).unwrap())
+        .map(full_hash)
         .collect();
     assert!(!hashes.contains(&low_hash));
     assert!(hashes.contains(&high_hash));

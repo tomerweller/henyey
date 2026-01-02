@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 stellar-core-common.workspace = true
 stellar-core-history.workspace = true
+stellar-core-ledger.workspace = true
 stellar-core-work.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

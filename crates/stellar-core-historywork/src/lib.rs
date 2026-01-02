@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use flate2::{write::GzEncoder, Compression};
 use tokio::sync::Mutex;
@@ -15,11 +15,13 @@ use stellar_core_history::{
     archive_state::HistoryArchiveState,
     paths::{bucket_path, checkpoint_path},
     verify,
+    CheckpointData,
 };
+use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_work::{Work, WorkContext, WorkId, WorkOutcome, WorkScheduler};
 use stellar_xdr::curr::{
-    LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry,
-    WriteXdr,
+    LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntry, WriteXdr,
 };
 
 /// Shared state between history work items.
@@ -188,6 +190,10 @@ impl Work for DownloadLedgerHeadersWork {
         set_progress(&self.state, HistoryWorkStage::DownloadHeaders, "downloading headers").await;
         match self.archive.get_ledger_headers(self.checkpoint).await {
             Ok(headers) => {
+                let header_chain: Vec<_> = headers.iter().map(|entry| entry.header.clone()).collect();
+                if let Err(err) = verify::verify_header_chain(&header_chain) {
+                    return WorkOutcome::Failed(format!("header chain verification failed: {}", err));
+                }
                 let mut guard = self.state.lock().await;
                 guard.headers = headers;
                 WorkOutcome::Success
@@ -224,6 +230,25 @@ impl Work for DownloadTransactionsWork {
         set_progress(&self.state, HistoryWorkStage::DownloadTransactions, "downloading transactions").await;
         match self.archive.get_transactions(self.checkpoint).await {
             Ok(entries) => {
+                let headers = {
+                    let guard = self.state.lock().await;
+                    guard.headers.clone()
+                };
+                for entry in &entries {
+                    if let Some(header) = headers.iter().find(|h| h.header.ledger_seq == entry.ledger_seq) {
+                        let tx_set = match &entry.ext {
+                            TransactionHistoryEntryExt::V0 => {
+                                TransactionSetVariant::Classic(entry.tx_set.clone())
+                            }
+                            TransactionHistoryEntryExt::V1(set) => {
+                                TransactionSetVariant::Generalized(set.clone())
+                            }
+                        };
+                        if let Err(err) = verify::verify_tx_set(&header.header, &tx_set) {
+                            return WorkOutcome::Failed(format!("tx set hash mismatch: {}", err));
+                        }
+                    }
+                }
                 let mut guard = self.state.lock().await;
                 guard.transactions = entries;
                 WorkOutcome::Success
@@ -903,4 +928,22 @@ pub async fn get_scp_history(state: &SharedHistoryState) -> Result<Vec<ScpHistor
 pub async fn get_progress(state: &SharedHistoryState) -> HistoryWorkProgress {
     let guard = state.lock().await;
     guard.progress.clone()
+}
+
+/// Build checkpoint data for catchup from the shared history work state.
+pub async fn build_checkpoint_data(state: &SharedHistoryState) -> Result<CheckpointData> {
+    let guard = state.lock().await;
+    let has = guard
+        .has
+        .clone()
+        .ok_or_else(|| anyhow!("missing History Archive State"))?;
+
+    Ok(CheckpointData {
+        has,
+        buckets: guard.buckets.clone(),
+        headers: guard.headers.clone(),
+        transactions: guard.transactions.clone(),
+        tx_results: guard.tx_results.clone(),
+        scp_history: guard.scp_history.clone(),
+    })
 }

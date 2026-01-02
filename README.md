@@ -132,6 +132,7 @@ COMMANDS:
     info                Print node information
     verify-history      Verify history archives
     publish-history     Publish history to archives (validators only)
+    check-quorum-intersection  Check quorum intersection from JSON
     sample-config       Print sample configuration
     offline             Offline utilities
 ```
@@ -173,6 +174,9 @@ rs-stellar-core offline encode-xdr --type Asset "USD:GDKXE2OZMJIPOSLNA6N6F2BVCI3
 
 # Bucket information
 rs-stellar-core offline bucket-info /path/to/buckets
+
+# Check quorum intersection JSON (upstream format)
+rs-stellar-core check-quorum-intersection /path/to/quorum.json
 ```
 
 ## HTTP API

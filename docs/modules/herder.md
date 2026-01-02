@@ -226,6 +226,7 @@ impl Herder {
         let close_time = current_time();
 
         let stellar_value = StellarValue {
+            // Classic tx sets use the legacy contents hash (prev hash + tx XDRs).
             tx_set_hash: tx_set.hash(),
             close_time: TimePoint(close_time),
             upgrades: Vec::new().try_into().unwrap(),

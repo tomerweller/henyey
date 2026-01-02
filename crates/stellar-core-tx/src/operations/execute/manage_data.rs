@@ -384,4 +384,167 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    #[test]
+    fn test_manage_data_max_value_length() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(8);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageDataOp {
+            data_name: make_string64("test_key"),
+            data_value: Some(vec![1u8; MAX_DATA_VALUE_LENGTH].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::Success));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_data_empty_name() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(9);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageDataOp {
+            data_name: String64::try_from(Vec::<u8>::new()).unwrap(),
+            data_value: Some(vec![1, 2, 3].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::InvalidName));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_data_update_existing() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(10);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageDataOp {
+            data_name: make_string64("test_key"),
+            data_value: Some(vec![1, 2, 3].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::Success));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        let initial_sub_entries = state.get_account(&source_id).unwrap().num_sub_entries;
+
+        let update_op = ManageDataOp {
+            data_name: make_string64("test_key"),
+            data_value: Some(vec![9, 9, 9].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&update_op, &source_id, &mut state, &context)
+            .expect("manage data");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::Success));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        let entry = state.get_data(&source_id, "test_key").unwrap();
+        assert_eq!(entry.data_value.as_slice(), &[9, 9, 9]);
+        assert_eq!(
+            state.get_account(&source_id).unwrap().num_sub_entries,
+            initial_sub_entries
+        );
+    }
+
+    #[test]
+    fn test_manage_data_sponsorship_success() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(11);
+        let source_id = create_test_account_id(12);
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+        state.create_account(create_test_account(source_id.clone(), 10_000_000));
+
+        state.push_sponsorship(sponsor_id.clone(), source_id.clone());
+
+        let op = ManageDataOp {
+            data_name: make_string64("test_key"),
+            data_value: Some(vec![1, 2, 3, 4].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::Success));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        let key = LedgerKey::Data(LedgerKeyData {
+            account_id: source_id.clone(),
+            data_name: op.data_name.clone(),
+        });
+        assert_eq!(state.entry_sponsor(&key), Some(&sponsor_id));
+
+        let counts = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(counts.0, 1);
+        let counts = state.sponsorship_counts_for_account(&source_id).unwrap();
+        assert_eq!(counts.1, 1);
+    }
+
+    #[test]
+    fn test_manage_data_sponsorship_low_reserve() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(13);
+        let source_id = create_test_account_id(14);
+        state.create_account(create_test_account(sponsor_id.clone(), 10_000_000));
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        state.push_sponsorship(sponsor_id.clone(), source_id.clone());
+
+        let op = ManageDataOp {
+            data_name: make_string64("test_key"),
+            data_value: Some(vec![1, 2, 3, 4].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::LowReserve));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

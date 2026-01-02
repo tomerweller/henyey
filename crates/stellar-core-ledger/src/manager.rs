@@ -361,6 +361,20 @@ impl LedgerManager {
         Ok(())
     }
 
+    /// Reinitialize the ledger from bucket list state.
+    ///
+    /// This is used when catchup needs to reset state while the ledger manager
+    /// was already initialized (e.g., after falling behind in live mode).
+    pub fn reinitialize_from_buckets(
+        &self,
+        bucket_list: BucketList,
+        hot_archive_bucket_list: Option<BucketList>,
+        header: LedgerHeader,
+    ) -> Result<()> {
+        self.reset_for_catchup();
+        self.initialize_from_buckets(bucket_list, hot_archive_bucket_list, header)
+    }
+
     /// Initialize the ledger from bucket list state, skipping hash verification.
     ///
     /// This is a temporary workaround for debugging hash mismatches.
@@ -397,6 +411,17 @@ impl LedgerManager {
         );
 
         Ok(())
+    }
+
+    fn reset_for_catchup(&self) {
+        *self.bucket_list.write() = BucketList::default();
+        self.entry_cache.write().clear();
+        self.snapshots.clear();
+
+        let mut state = self.state.write();
+        state.header = create_genesis_header();
+        state.header_hash = Hash256::ZERO;
+        state.initialized = false;
     }
 
     /// Apply a ledger from history (replay mode).
@@ -731,7 +756,10 @@ impl<'a> LedgerCloseContext<'a> {
     /// This executes all transactions in order, recording state changes
     /// to the delta and collecting results.
     pub fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
-        let transactions = self.close_data.tx_set.transactions_with_base_fee();
+        let transactions = self
+            .close_data
+            .tx_set
+            .transactions_with_base_fee();
 
         if transactions.is_empty() {
             self.tx_results.clear();

@@ -35,6 +35,7 @@ use stellar_core_invariant::{
     BucketListHashMatchesHeader, CloseTimeNondecreasing, ConservationOfLumens, InvariantContext,
     InvariantManager, LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerSeqIncrement,
 };
+use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::{
     LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
@@ -774,6 +775,7 @@ impl CatchupManager {
         to_ledger: u32,
     ) -> Result<Vec<LedgerData>> {
         let mut data = Vec::new();
+        let mut checkpoint_cache: HashMap<u32, CheckpointLedgerData> = HashMap::new();
 
         // We need to download data for ledgers (from_checkpoint+1) to to_ledger
         // The checkpoint ledger's state is already in the bucket list
@@ -786,91 +788,126 @@ impl CatchupManager {
 
         for seq in start..=to_ledger {
             self.progress.current_ledger = seq;
+            let checkpoint = checkpoint::latest_checkpoint_before_or_at(seq).ok_or_else(|| {
+                HistoryError::CatchupFailed(format!(
+                    "ledger {} is before first checkpoint",
+                    seq
+                ))
+            })?;
 
-            let ledger_data = self.download_ledger(seq).await?;
-            data.push(ledger_data);
+            if !checkpoint_cache.contains_key(&checkpoint) {
+                let downloaded = self.download_checkpoint_ledger_data(checkpoint).await?;
+                checkpoint_cache.insert(checkpoint, downloaded);
+            }
+
+            let cache = checkpoint_cache
+                .get(&checkpoint)
+                .ok_or_else(|| {
+                    HistoryError::CatchupFailed(format!(
+                        "missing checkpoint cache for {}",
+                        checkpoint
+                    ))
+                })?;
+
+            let header = cache
+                .headers
+                .iter()
+                .find(|h| h.header.ledger_seq == seq)
+                .ok_or_else(|| {
+                    HistoryError::CatchupFailed(format!(
+                        "ledger {} not found in checkpoint headers",
+                        seq
+                    ))
+                })?
+                .header
+                .clone();
+
+            let tx_history_entry = cache
+                .tx_entries
+                .iter()
+                .find(|entry| entry.ledger_seq == seq)
+                .cloned();
+            let tx_set = tx_history_entry
+                .as_ref()
+                .map(|entry| match &entry.ext {
+                    TransactionHistoryEntryExt::V0 => {
+                        TransactionSetVariant::Classic(entry.tx_set.clone())
+                    }
+                    TransactionHistoryEntryExt::V1(set) => {
+                        TransactionSetVariant::Generalized(set.clone())
+                    }
+                })
+                .unwrap_or_else(|| {
+                    TransactionSetVariant::Classic(TransactionSet {
+                        previous_ledger_hash: header.previous_ledger_hash.clone(),
+                        txs: Default::default(),
+                    })
+                });
+
+            let tx_result_entry = cache
+                .result_entries
+                .iter()
+                .find(|entry| entry.ledger_seq == seq)
+                .cloned();
+            let tx_results = tx_result_entry
+                .as_ref()
+                .map(|entry| entry.tx_result_set.results.iter().cloned().collect())
+                .unwrap_or_else(Vec::new);
+
+            let tx_metas = Vec::new();
+            data.push(LedgerData {
+                header,
+                tx_set,
+                tx_results,
+                tx_metas,
+                tx_history_entry,
+                tx_result_entry,
+            });
         }
 
         Ok(data)
     }
 
-    /// Download data for a single ledger.
-    async fn download_ledger(&self, seq: u32) -> Result<LedgerData> {
+    /// Download ledger headers, transactions, and results for a checkpoint.
+    async fn download_checkpoint_ledger_data(
+        &self,
+        checkpoint: u32,
+    ) -> Result<CheckpointLedgerData> {
         // Try each archive until one succeeds
         for archive in &self.archives {
-            match self.try_download_ledger(archive, seq).await {
+            match self.try_download_checkpoint(archive, checkpoint).await {
                 Ok(data) => return Ok(data),
                 Err(e) => {
-                    warn!("Failed to download ledger {} from archive {}: {}", seq, archive.base_url(), e);
+                    warn!(
+                        "Failed to download checkpoint {} from archive {}: {}",
+                        checkpoint,
+                        archive.base_url(),
+                        e
+                    );
                     continue;
                 }
             }
         }
 
         Err(HistoryError::CatchupFailed(format!(
-            "failed to download ledger {} from any archive",
-            seq
+            "failed to download checkpoint {} from any archive",
+            checkpoint
         )))
     }
 
-    /// Try to download ledger data from a specific archive.
-    async fn try_download_ledger(
+    /// Try to download checkpoint data from a specific archive.
+    async fn try_download_checkpoint(
         &self,
         archive: &HistoryArchive,
-        seq: u32,
-    ) -> Result<LedgerData> {
-        // Download headers for the checkpoint containing this ledger
-        let headers = archive.get_ledger_headers(seq).await?;
-
-        // Find the header for this specific ledger
-        let header = headers
-            .into_iter()
-            .find(|h| h.header.ledger_seq == seq)
-            .ok_or_else(|| HistoryError::CatchupFailed(format!(
-                "ledger {} not found in checkpoint headers",
-                seq
-            )))?
-            .header;
-
-        // Download transactions for this checkpoint
-        let tx_entries = archive.get_transactions(seq).await?;
-        let tx_history_entry = tx_entries.into_iter().find(|t| t.ledger_seq == seq);
-
-        let tx_set = tx_history_entry
-            .as_ref()
-            .map(|entry| entry.tx_set.clone())
-            .unwrap_or_else(|| TransactionSet {
-                previous_ledger_hash: header.previous_ledger_hash.clone(),
-                txs: Default::default(),
-            });
-
-        // Download transaction results for this checkpoint
-        let tx_result_entries = archive.get_results(seq).await?;
-        let tx_result_entry = tx_result_entries
-            .into_iter()
-            .find(|entry| entry.ledger_seq == seq);
-        let tx_results = tx_result_entry
-            .as_ref()
-            .map(|entry| entry.tx_result_set.results.iter().cloned().collect())
-            .unwrap_or_else(Vec::new);
-        if let Some(entry) = tx_result_entry.as_ref() {
-            let xdr = entry
-                .tx_result_set
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx results: {}", e)))?;
-            verify::verify_tx_result_set(&header, &xdr)?;
-        }
-
-        // Transaction metadata is not available in history archives.
-        let tx_metas = Vec::new();
-
-        Ok(LedgerData {
-            header,
-            tx_set,
-            tx_results,
-            tx_metas,
-            tx_history_entry,
-            tx_result_entry,
+        checkpoint: u32,
+    ) -> Result<CheckpointLedgerData> {
+        let headers = archive.get_ledger_headers(checkpoint).await?;
+        let tx_entries = archive.get_transactions(checkpoint).await?;
+        let result_entries = archive.get_results(checkpoint).await?;
+        Ok(CheckpointLedgerData {
+            headers,
+            tx_entries,
+            result_entries,
         })
     }
 
@@ -886,8 +923,16 @@ impl CatchupManager {
 
         // Verify transaction sets match header hashes
         for data in ledger_data {
-            if let Ok(tx_set_xdr) = data.tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-                if let Err(e) = verify::verify_tx_set(&data.header, &tx_set_xdr) {
+            if let Some(entry) = data.tx_history_entry.as_ref() {
+                let tx_set = match &entry.ext {
+                    TransactionHistoryEntryExt::V0 => {
+                        TransactionSetVariant::Classic(entry.tx_set.clone())
+                    }
+                    TransactionHistoryEntryExt::V1(set) => {
+                        TransactionSetVariant::Generalized(set.clone())
+                    }
+                };
+                if let Err(e) = verify::verify_tx_set(&data.header, &tx_set) {
                     warn!(
                         "Transaction set verification failed for ledger {}: {}",
                         data.header.ledger_seq, e
@@ -895,11 +940,11 @@ impl CatchupManager {
                     // Continue - tx sets may be empty for some ledgers
                 }
             }
-            if !data.tx_results.is_empty() {
-                let result_set = TransactionResultSet {
-                    results: data.tx_results.clone().try_into().unwrap_or_default(),
-                };
-                if let Ok(xdr) = result_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+            if let Some(entry) = data.tx_result_entry.as_ref() {
+                if let Ok(xdr) = entry
+                    .tx_result_set
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                {
                     if let Err(e) = verify::verify_tx_result_set(&data.header, &xdr) {
                         warn!(
                             "Transaction result set verification failed for ledger {}: {}",
@@ -970,10 +1015,23 @@ impl CatchupManager {
                     conn.store_ledger_header(&data.header, &header_xdr)?;
 
                     let tx_history_entry = data.tx_history_entry.clone().unwrap_or_else(|| {
-                        TransactionHistoryEntry {
-                            ledger_seq: data.header.ledger_seq,
-                            tx_set: data.tx_set.clone(),
-                            ext: TransactionHistoryEntryExt::V0,
+                        match &data.tx_set {
+                            TransactionSetVariant::Classic(set) => TransactionHistoryEntry {
+                                ledger_seq: data.header.ledger_seq,
+                                tx_set: set.clone(),
+                                ext: TransactionHistoryEntryExt::V0,
+                            },
+                            TransactionSetVariant::Generalized(set) => {
+                                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                                TransactionHistoryEntry {
+                                    ledger_seq: data.header.ledger_seq,
+                                    tx_set: TransactionSet {
+                                        previous_ledger_hash: set_v1.previous_ledger_hash.clone(),
+                                        txs: Default::default(),
+                                    },
+                                    ext: TransactionHistoryEntryExt::V1(set.clone()),
+                                }
+                            }
                         }
                     });
                     conn.store_tx_history_entry(data.header.ledger_seq, &tx_history_entry)?;
@@ -994,9 +1052,15 @@ impl CatchupManager {
                         .iter()
                         .cloned()
                         .collect();
-                    let tx_count = data.tx_set.txs.len().min(tx_results.len());
+                    let transactions = data
+                        .tx_set
+                        .transactions_with_base_fee()
+                        .into_iter()
+                        .map(|(tx, _)| tx)
+                        .collect::<Vec<_>>();
+                    let tx_count = transactions.len().min(tx_results.len());
 
-                    for (idx, tx) in data.tx_set.txs.iter().take(tx_count).enumerate() {
+                    for (idx, tx) in transactions.iter().take(tx_count).enumerate() {
                         let tx_result = &tx_results[idx];
 
                         let frame = TransactionFrame::with_network(tx.clone(), *network_id);
@@ -1238,7 +1302,7 @@ pub struct LedgerData {
     /// The ledger header.
     pub header: LedgerHeader,
     /// The transaction set.
-    pub tx_set: TransactionSet,
+    pub tx_set: TransactionSetVariant,
     /// Transaction results.
     pub tx_results: Vec<TransactionResultPair>,
     /// Transaction metadata.
@@ -1262,6 +1326,13 @@ pub struct CatchupOptions {
     pub verify_headers: bool,
     /// Number of parallel bucket downloads.
     pub parallel_downloads: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointLedgerData {
+    headers: Vec<LedgerHeaderHistoryEntry>,
+    tx_entries: Vec<TransactionHistoryEntry>,
+    result_entries: Vec<TransactionHistoryResultEntry>,
 }
 
 impl Default for CatchupOptions {

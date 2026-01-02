@@ -495,6 +495,8 @@ impl CheckpointVerifier {
         results: &[TransactionHistoryResultEntry],
     ) -> Result<(), HistoryError> {
         // Build transaction set and compute hash
+        // Classic tx sets use SHA-256(previous_ledger_hash || tx XDRs) for protocol 19 and earlier.
+        // Generalized tx sets use SHA-256 of the XDR-encoded set.
         let tx_set_hash = compute_tx_set_hash(txs)?;
 
         if header.scp_value.tx_set_hash != tx_set_hash {
@@ -517,6 +519,8 @@ SCP checkpoint files are included when publishing if SCP history is available.
 Checkpoint ledgers are enqueued into the SQLite `publishqueue` table on close;
 the `publish-history` command consumes this queue to ensure publish work resumes
 after restarts.
+Publish verifies header chains along with tx set/result hashes before writing
+checkpoint files to disk.
 
 ```rust
 /// Publish checkpoints to history archive

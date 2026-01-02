@@ -160,6 +160,25 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_containing_matches_upstream() {
+        for seq in 0..=63 {
+            assert_eq!(checkpoint_containing(seq), 63);
+        }
+        for seq in 64..=127 {
+            assert_eq!(checkpoint_containing(seq), 127);
+        }
+        for seq in 128..=191 {
+            assert_eq!(checkpoint_containing(seq), 191);
+        }
+        for seq in 192..=255 {
+            assert_eq!(checkpoint_containing(seq), 255);
+        }
+        for seq in 256..=258 {
+            assert_eq!(checkpoint_containing(seq), 319);
+        }
+    }
+
+    #[test]
     fn test_checkpoint_range() {
         assert_eq!(checkpoint_range(63), (0, 63));
         assert_eq!(checkpoint_range(127), (64, 127));

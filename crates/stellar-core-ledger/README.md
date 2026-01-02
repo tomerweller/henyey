@@ -84,6 +84,8 @@ ctx.record_delete(key)?;
 let result = ctx.commit()?;
 println!("Closed ledger {} with hash {}", result.sequence, result.hash);
 ```
+Classic transaction set hashes use the legacy contents hash
+(previous ledger hash concatenated with each transaction’s XDR).
 
 ## Key Types
 

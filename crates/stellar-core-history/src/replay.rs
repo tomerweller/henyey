@@ -14,10 +14,11 @@ use crate::{verify, HistoryError, Result};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_ledger::{
     execution::execute_transaction_set, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
+    TransactionSetVariant,
 };
 use stellar_xdr::curr::{
-    LedgerEntry, LedgerHeader, LedgerKey, TransactionEnvelope, TransactionMeta, TransactionResultPair,
-    TransactionResultSet, TransactionSet, WriteXdr,
+    LedgerEntry, LedgerHeader, LedgerKey, TransactionMeta, TransactionResultPair, TransactionResultSet,
+    WriteXdr,
 };
 
 /// The result of replaying a single ledger.
@@ -80,17 +81,14 @@ impl Default for ReplayConfig {
 /// A `LedgerReplayResult` containing the changes to apply to ledger state.
 pub fn replay_ledger(
     header: &LedgerHeader,
-    tx_set: &TransactionSet,
+    tx_set: &TransactionSetVariant,
     tx_results: &[TransactionResultPair],
     tx_metas: &[TransactionMeta],
     config: &ReplayConfig,
 ) -> Result<LedgerReplayResult> {
     // Verify the transaction set hash matches the header
     if config.verify_results {
-        let tx_set_xdr = tx_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx set: {}", e)))?;
-        verify::verify_tx_set(header, &tx_set_xdr)?;
+        verify::verify_tx_set(header, tx_set)?;
 
         let result_set = TransactionResultSet {
             results: tx_results
@@ -108,7 +106,7 @@ pub fn replay_ledger(
     let (live_entries, dead_entries) = extract_ledger_changes(tx_metas)?;
 
     // Count transactions and operations
-    let tx_count = tx_set.txs.len() as u32;
+    let tx_count = tx_set.num_transactions() as u32;
     let op_count = count_operations(tx_set);
 
     // Compute the ledger hash
@@ -129,16 +127,13 @@ pub fn replay_ledger(
 /// Replay a ledger by re-executing transactions against the current bucket list.
 pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
-    tx_set: &TransactionSet,
+    tx_set: &TransactionSetVariant,
     bucket_list: &mut stellar_core_bucket::BucketList,
     network_id: &NetworkId,
     config: &ReplayConfig,
 ) -> Result<LedgerReplayResult> {
     if config.verify_results {
-        let tx_set_xdr = tx_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx set: {}", e)))?;
-        verify::verify_tx_set(header, &tx_set_xdr)?;
+        verify::verify_tx_set(header, tx_set)?;
     }
 
     let snapshot = LedgerSnapshot::empty(header.ledger_seq);
@@ -153,12 +148,7 @@ pub fn replay_ledger_with_execution(
     let snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
 
     let mut delta = LedgerDelta::new(header.ledger_seq);
-    let transactions: Vec<(TransactionEnvelope, Option<u32>)> = tx_set
-        .txs
-        .iter()
-        .cloned()
-        .map(|tx| (tx, None))
-        .collect();
+    let transactions = tx_set.transactions_with_base_fee();
     let (results, tx_results, _tx_result_metas, _total_fees) = execute_transaction_set(
         &snapshot,
         &transactions,
@@ -337,10 +327,10 @@ fn process_ledger_entry_change(
 }
 
 /// Count the total number of operations in a transaction set.
-fn count_operations(tx_set: &TransactionSet) -> u32 {
+fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
     let mut count = 0;
 
-    for tx_env in tx_set.txs.iter() {
+    for tx_env in tx_set.transactions().into_iter() {
         use stellar_xdr::curr::TransactionEnvelope;
         match tx_env {
             TransactionEnvelope::TxV0(tx) => {
@@ -374,7 +364,7 @@ fn count_operations(tx_set: &TransactionSet) -> u32 {
 /// * `config` - Replay configuration
 /// * `progress_callback` - Optional callback for progress updates
 pub fn replay_ledgers<F>(
-    ledgers: &[(LedgerHeader, TransactionSet, Vec<TransactionResultPair>, Vec<TransactionMeta>)],
+    ledgers: &[(LedgerHeader, TransactionSetVariant, Vec<TransactionResultPair>, Vec<TransactionMeta>)],
     config: &ReplayConfig,
     mut progress_callback: Option<F>,
 ) -> Result<Vec<LedgerReplayResult>>
@@ -464,7 +454,12 @@ impl ReplayedLedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, StellarValue, TimePoint, VecM, WriteXdr};
+    use stellar_core_bucket::BucketList;
+    use stellar_core_common::NetworkId;
+    use stellar_xdr::curr::{
+        GeneralizedTransactionSet, Hash, StellarValue, TimePoint, TransactionResultSet, TransactionSet,
+        TransactionSetV1, VecM, WriteXdr,
+    };
 
     fn make_test_header(seq: u32) -> LedgerHeader {
         LedgerHeader {
@@ -512,7 +507,7 @@ mod tests {
     #[test]
     fn test_replay_empty_ledger() {
         let header = make_test_header(100);
-        let tx_set = make_empty_tx_set();
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
         let tx_results = vec![];
         let tx_metas = vec![];
 
@@ -533,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_count_operations_empty() {
-        let tx_set = make_empty_tx_set();
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
         assert_eq!(count_operations(&tx_set), 0);
     }
 
@@ -561,14 +556,11 @@ mod tests {
 
     #[test]
     fn test_replay_ledger_rejects_tx_set_hash_mismatch() {
-        let tx_set = make_empty_tx_set();
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
         let tx_results = vec![];
         let tx_metas = vec![];
 
-        let tx_set_xdr = tx_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .expect("tx set xdr");
-        let tx_set_hash = Hash256::hash(&tx_set_xdr);
+        let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
         let header = make_header_with_hashes(
             100,
             Hash([1u8; 32]),
@@ -582,14 +574,11 @@ mod tests {
 
     #[test]
     fn test_replay_ledger_rejects_tx_result_hash_mismatch() {
-        let tx_set = make_empty_tx_set();
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
         let tx_results = vec![];
         let tx_metas = vec![];
 
-        let tx_set_xdr = tx_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .expect("tx set xdr");
-        let tx_set_hash = Hash256::hash(&tx_set_xdr);
+        let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
 
         let header = make_header_with_hashes(
             100,
@@ -599,6 +588,114 @@ mod tests {
 
         let config = ReplayConfig::default();
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);
+        assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
+    }
+
+    #[test]
+    fn test_replay_ledger_accepts_generalized_tx_set() {
+        let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: VecM::default(),
+        });
+        let tx_set = TransactionSetVariant::Generalized(gen_set);
+        let tx_results = vec![];
+        let tx_metas = vec![];
+
+        let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
+
+        let result_set = TransactionResultSet {
+            results: VecM::default(),
+        };
+        let result_xdr = result_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("tx result set xdr");
+        let result_hash = Hash256::hash(&result_xdr);
+
+        let header = make_header_with_hashes(
+            100,
+            Hash(*tx_set_hash.as_bytes()),
+            Hash(*result_hash.as_bytes()),
+        );
+
+        let config = ReplayConfig::default();
+        let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config).unwrap();
+        assert_eq!(result.tx_count, 0);
+        assert_eq!(result.op_count, 0);
+    }
+
+    #[test]
+    fn test_replay_ledger_with_execution_bucket_hash_mismatch() {
+        let mut header = make_test_header(100);
+        header.bucket_list_hash = Hash([1u8; 32]);
+
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
+        let mut bucket_list = BucketList::new();
+
+        let config = ReplayConfig {
+            verify_results: false,
+            verify_bucket_list: true,
+            verify_invariants: false,
+        };
+
+        let result = replay_ledger_with_execution(
+            &header,
+            &tx_set,
+            &mut bucket_list,
+            &NetworkId::testnet(),
+            &config,
+        );
+
+        assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
+    }
+
+    #[test]
+    fn test_replay_ledger_with_execution_tx_set_hash_mismatch() {
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
+        let mut header = make_test_header(100);
+        header.scp_value.tx_set_hash = Hash([2u8; 32]);
+
+        let mut bucket_list = BucketList::new();
+        let config = ReplayConfig {
+            verify_results: true,
+            verify_bucket_list: false,
+            verify_invariants: false,
+        };
+
+        let result = replay_ledger_with_execution(
+            &header,
+            &tx_set,
+            &mut bucket_list,
+            &NetworkId::testnet(),
+            &config,
+        );
+
+        assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
+    }
+
+    #[test]
+    fn test_replay_ledger_with_execution_tx_result_hash_mismatch() {
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
+        let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
+
+        let mut header = make_test_header(100);
+        header.scp_value.tx_set_hash = Hash(*tx_set_hash.as_bytes());
+        header.tx_set_result_hash = Hash([3u8; 32]);
+
+        let mut bucket_list = BucketList::new();
+        let config = ReplayConfig {
+            verify_results: true,
+            verify_bucket_list: false,
+            verify_invariants: false,
+        };
+
+        let result = replay_ledger_with_execution(
+            &header,
+            &tx_set,
+            &mut bucket_list,
+            &NetworkId::testnet(),
+            &config,
+        );
+
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
     }
 }

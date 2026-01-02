@@ -18,6 +18,7 @@ use stellar_core_history::{
     paths::{checkpoint_path},
     verify,
 };
+use stellar_core_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     StellarValue, StellarValueExt, TimePoint, TransactionResultSet, TransactionSet, VecM, WriteXdr,
@@ -104,8 +105,9 @@ async fn test_catchup_replay_bucket_hash_verification() {
         previous_ledger_hash: Hash(*header63_hash.as_bytes()),
         txs: VecM::default(),
     };
-    let tx_set_xdr = tx_set.to_xdr(stellar_xdr::curr::Limits::none()).expect("tx set xdr");
-    let tx_set_hash = Hash256::hash(&tx_set_xdr);
+    let tx_set_hash =
+        verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
+            .expect("tx set hash");
 
     let result_set = TransactionResultSet {
         results: VecM::default(),
@@ -169,15 +171,15 @@ async fn test_catchup_replay_bucket_hash_verification() {
         has.to_json().unwrap().into_bytes(),
     );
     fixtures.insert(
-        checkpoint_path("ledger", target, "xdr.gz"),
+        checkpoint_path("ledger", checkpoint, "xdr.gz"),
         gzip_bytes(&headers_xdr),
     );
     fixtures.insert(
-        checkpoint_path("transactions", target, "xdr.gz"),
+        checkpoint_path("transactions", checkpoint, "xdr.gz"),
         gzip_bytes(&[]),
     );
     fixtures.insert(
-        checkpoint_path("results", target, "xdr.gz"),
+        checkpoint_path("results", checkpoint, "xdr.gz"),
         gzip_bytes(&[]),
     );
 
@@ -187,7 +189,8 @@ async fn test_catchup_replay_bucket_hash_verification() {
             "/*path",
             get(
                 |Path(path): Path<String>, State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
-                    if let Some(body) = state.get(&path) {
+                    let key = path.trim_start_matches('/');
+                    if let Some(body) = state.get(key) {
                         (StatusCode::OK, body.clone())
                     } else {
                         (StatusCode::NOT_FOUND, Vec::new())

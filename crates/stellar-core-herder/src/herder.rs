@@ -79,6 +79,8 @@ pub struct HerderConfig {
     pub proposed_upgrades: Vec<stellar_xdr::curr::LedgerUpgrade>,
 }
 
+const DEFAULT_MAX_EXTERNALIZED_SLOTS: usize = 12;
+
 impl Default for HerderConfig {
     fn default() -> Self {
         Self {
@@ -87,7 +89,7 @@ impl Default for HerderConfig {
             ledger_close_time: 5,
             node_public_key: PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             network_id: Hash256::ZERO,
-            max_externalized_slots: 12,
+            max_externalized_slots: DEFAULT_MAX_EXTERNALIZED_SLOTS,
             pending_config: PendingConfig::default(),
             tx_queue_config: TxQueueConfig::default(),
             local_quorum_set: None,
@@ -134,22 +136,27 @@ pub struct Herder {
 impl Herder {
     /// Create a new Herder.
     pub fn new(config: HerderConfig) -> Self {
+        let mut pending_config = config.pending_config.clone();
+        let max_slots = config.max_externalized_slots.max(1);
+        pending_config.max_slots = pending_config.max_slots.min(max_slots);
+        pending_config.max_slot_distance =
+            pending_config.max_slot_distance.min(max_slots as u64);
+
+        let max_time_drift = (max_slots as u64).saturating_add(2)
+            .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key.clone(),
             max_tx_set_cache: 100,
-            max_time_drift: 60,
+            max_time_drift,
             local_quorum_set: config.local_quorum_set.clone(),
         };
 
         let scp_driver = Arc::new(ScpDriver::new(scp_driver_config, config.network_id));
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
-        let pending_envelopes = PendingEnvelopes::new(config.pending_config.clone());
+        let pending_envelopes = PendingEnvelopes::new(pending_config);
 
         // SCP is None for non-validators (they just observe)
-        let quorum_tracker = QuorumTracker::new(
-            config.local_quorum_set.clone(),
-            config.max_externalized_slots.max(1),
-        );
+        let quorum_tracker = QuorumTracker::new(config.local_quorum_set.clone(), max_slots);
 
         Self {
             config,
@@ -169,10 +176,18 @@ impl Herder {
 
     /// Create a new Herder with a secret key for validation.
     pub fn with_secret_key(config: HerderConfig, secret_key: SecretKey) -> Self {
+        let mut pending_config = config.pending_config.clone();
+        let max_slots = config.max_externalized_slots.max(1);
+        pending_config.max_slots = pending_config.max_slots.min(max_slots);
+        pending_config.max_slot_distance =
+            pending_config.max_slot_distance.min(max_slots as u64);
+
+        let max_time_drift = (max_slots as u64).saturating_add(2)
+            .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key.clone(),
             max_tx_set_cache: 100,
-            max_time_drift: 60,
+            max_time_drift,
             local_quorum_set: config.local_quorum_set.clone(),
         };
 
@@ -183,7 +198,7 @@ impl Herder {
         ));
 
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
-        let pending_envelopes = PendingEnvelopes::new(config.pending_config.clone());
+        let pending_envelopes = PendingEnvelopes::new(pending_config);
 
         // Create SCP instance for validators
         let scp = if config.is_validator {
@@ -206,10 +221,7 @@ impl Herder {
             None
         };
 
-        let quorum_tracker = QuorumTracker::new(
-            config.local_quorum_set.clone(),
-            config.max_externalized_slots.max(1),
-        );
+        let quorum_tracker = QuorumTracker::new(config.local_quorum_set.clone(), max_slots);
 
         Self {
             config,
@@ -241,6 +253,26 @@ impl Herder {
     /// Get the current tracking slot.
     pub fn tracking_slot(&self) -> u64 {
         *self.tracking_slot.read()
+    }
+
+    /// Compute the minimum ledger sequence to ask peers for SCP state.
+    pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
+        let lcl = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|manager| manager.current_ledger_seq())
+            .unwrap_or_else(|| self.tracking_slot().min(u32::MAX as u64) as u32);
+        let mut low = lcl.saturating_add(1);
+        let max_slots = self.config.max_externalized_slots.max(1) as u32;
+        let extra = 3u32;
+        let window = max_slots.min(extra);
+        if low > window {
+            low = low.saturating_sub(window);
+        } else {
+            low = 1;
+        }
+        low
     }
 
     /// Get the configured target ledger close time in seconds.
@@ -414,6 +446,8 @@ impl Herder {
 
                 let value = ext.commit.value.clone();
                 self.scp_driver.record_externalized(slot, value.clone());
+                self.scp_driver
+                    .cleanup_externalized(self.config.max_externalized_slots);
 
                 // Store for reference
                 *self.prev_value.write() = value;
@@ -489,6 +523,8 @@ impl Herder {
                         if let Some(value) = scp.get_externalized_value(slot) {
                             info!(slot, "Slot externalized via SCP consensus");
                             self.scp_driver.record_externalized(slot, value.clone());
+                            self.scp_driver
+                                .cleanup_externalized(self.config.max_externalized_slots);
 
                             // Store for next round's priority calculation
                             *self.prev_value.write() = value;
@@ -511,6 +547,8 @@ impl Herder {
             }
             let value = ext.commit.value.clone();
             self.scp_driver.record_externalized(slot, value.clone());
+            self.scp_driver
+                .cleanup_externalized(self.config.max_externalized_slots);
 
             // Store for reference
             *self.prev_value.write() = value;
@@ -596,7 +634,7 @@ impl Herder {
 
         // Get the previous ledger hash
         let previous_hash = if let Some(manager) = self.ledger_manager.read().as_ref() {
-            Hash256::from_bytes(manager.current_header().previous_ledger_hash.0)
+            manager.current_header_hash()
         } else {
             Hash256::ZERO
         };
@@ -733,6 +771,9 @@ impl Herder {
 
         // Remove applied transactions from queue
         self.tx_queue.remove_applied(applied_tx_hashes);
+
+        // Drop pending tx set requests for slots older than the next slot.
+        let _ = self.scp_driver.cleanup_old_pending_slots(slot.saturating_add(1));
 
         // Clean up old SCP state
         if let Some(ref scp) = self.scp {
@@ -898,6 +939,11 @@ impl Herder {
         self.scp_driver.get_externalized(slot)
     }
 
+    /// Find an externalized slot for a given tx set hash.
+    pub fn find_externalized_slot_by_tx_set_hash(&self, hash: &Hash256) -> Option<SlotIndex> {
+        self.scp_driver.find_externalized_slot_by_tx_set_hash(hash)
+    }
+
     /// Get SCP state envelopes for responding to peers.
     ///
     /// Returns SCP envelopes for slots starting from `from_slot`, along with
@@ -953,6 +999,16 @@ impl Herder {
     /// Get pending transaction set hashes that need to be fetched from peers.
     pub fn get_pending_tx_set_hashes(&self) -> Vec<Hash256> {
         self.scp_driver.get_pending_tx_set_hashes()
+    }
+
+    /// Get pending transaction sets with their slots.
+    pub fn get_pending_tx_sets(&self) -> Vec<(Hash256, SlotIndex)> {
+        self.scp_driver.get_pending_tx_sets()
+    }
+
+    /// Drop pending tx set requests for slots older than the given slot.
+    pub fn cleanup_old_pending_tx_sets(&self, current_slot: SlotIndex) -> usize {
+        self.scp_driver.cleanup_old_pending_slots(current_slot)
     }
 
     /// Check if we need a transaction set.

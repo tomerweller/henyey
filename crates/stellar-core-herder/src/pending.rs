@@ -31,9 +31,9 @@ impl Default for PendingConfig {
     fn default() -> Self {
         Self {
             max_per_slot: 100,
-            max_slots: 200,
+            max_slots: 12,
             max_age: Duration::from_secs(300),
-            max_slot_distance: 200,
+            max_slot_distance: 12,
         }
     }
 }

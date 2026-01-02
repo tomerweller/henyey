@@ -23,13 +23,33 @@ Items marked complete are implemented in this repo; unchecked items remain.
 - [x] SCP value validation enforces monotonic close time vs last externalized.
 - [x] SCP value validation enforces upgrade ordering.
 - [x] SCP value validation checks cached tx set hash integrity.
+- [x] Pending envelope buffer limits align to MAX_SLOTS_TO_REMEMBER to avoid excess future-slot backlog.
+- [x] Externalized slot retention aligns to MAX_SLOTS_TO_REMEMBER.
+  - [x] Externalized slot cleanup runs on externalize events to avoid unbounded growth during stall.
+  - [x] Pending envelope config clamped to MAX_SLOTS_TO_REMEMBER for slot distance/retention.
+- [x] SCP max close-time drift derived from MAX_SLOTS_TO_REMEMBER and ledger close time.
+  - [x] Herder configured with MAX_SLOTS_TO_REMEMBER and ledger manager wired.
+- [x] SCP state requests use low watermark (LCL+1-MAX_SLOTS_TO_REMEMBER) to align with upstream peer sync.
+  - [x] SCP state requests cap lookback to SCP_EXTRA_LOOKBACK_LEDGERS (3) to match upstream.
+- [x] Tx set construction uses current ledger header hash for previous_ledger_hash.
 
 ## Overlay / Network
 
 - [x] Authenticated overlay handshake (Curve25519) with flow control.
 - [x] Flood gate + rate limiting + duplicate suppression.
 - [x] TxSet/GeneralizedTxSet request/response handling with DontHave.
-  - [ ] Externalized-slot tx set retrieval when behind within a checkpoint (buffered catchup to avoid missing tx sets).
+  - [x] Legacy TxSet hash uses upstream non-generalized contents hash.
+  - [x] Externalized-slot tx set retrieval when behind within a checkpoint (buffered catchup to avoid missing tx sets).
+  - [x] DontHave handling treats generalized tx sets the same as classic tx sets (upstream parity).
+  - [x] DontHave response uses GeneralizedTxSet type for protocol >=20 (matches upstream behavior).
+  - [x] TxSet requester rotates peers per hash to avoid repeatedly querying the same peer.
+  - [x] TxSet requester prioritizes near-term slots to avoid flooding peers with far-future hashes.
+  - [x] TxSet handler backfills buffered slots via externalized hash lookup when pending state is missing.
+  - [x] Externalized catchup triggers when recent slot metadata is unavailable (gap > MAX_SLOTS_TO_REMEMBER), targeting `latest_externalized - MAX_SLOTS_TO_REMEMBER`.
+  - [x] Overlay message ingestion decoupled to avoid broadcast lag dropping tx set responses.
+  - [x] Last processed slot initialized to current ledger after catchup to avoid scanning from genesis.
+  - [x] Last processed slot advances on successful ledger close to keep externalized scan tight.
+  - [x] TxSet requester prefers outbound/preferred peers with fallback to all peers.
 - [x] Generalized tx set ingestion enforces classic/Soroban phase structure.
 - [x] Generalized tx set ingestion enforces base fee >= ledger base fee.
 - [x] Peer connector maintains preferred/target outbound peers.
@@ -84,18 +104,18 @@ Items marked complete are implemented in this repo; unchecked items remain.
 
 ## Ledger Close / Transactions
 
-- [ ] Ledger txn layering parity and replay semantics.
+- [x] Ledger txn layering parity and replay semantics.
   - [x] Tx queue tie-breaker ordering is deterministic for equal fees.
   - [x] Nomination tx set size respects ledger header max_tx_set_size.
   - [x] Deterministic per-account layered selection by fee per op.
-  - [ ] Per-account sequence layering and surge pricing parity.
+  - [x] Per-account sequence layering and surge pricing parity.
     - [x] Per-account selection respects ledger starting sequence when snapshot is available.
     - [x] Per-account sequence ordering enforced across classic/Soroban phase split.
     - [x] Tx selection enforces max ops and classic surge base fee override.
     - [x] Classic ops limit applies only to classic phase; Soroban uses resource limits.
     - [x] Resource accounting for surge pricing (classic ops + Soroban disk reads).
     - [x] Starting sequence number uses ledgerSeq<<32 for new accounts and merge seqnum-too-far checks.
-    - [ ] Surge pricing lane config + eviction parity (classic, Soroban, DEX lanes).
+    - [x] Surge pricing lane config + eviction parity (classic, Soroban, DEX lanes).
       - [x] Queue admission tracks per-lane eviction inclusion thresholds (classic/Soroban/global).
       - [x] Lane-limit evictions flagged correctly for inclusion fee thresholds.
       - [x] Classic queue byte-limit eviction selects higher-fee tx.
@@ -109,6 +129,7 @@ Items marked complete are implemented in this repo; unchecked items remain.
       - [x] DEX ops cap enforced during selection when configured.
       - [x] DEX lane byte limit uses classic byte allowance (MAX_CLASSIC_BYTE_ALLOWANCE parity).
       - [x] Generalized tx set groups classic DEX txs with discounted base fee when limited.
+      - [x] Generalized tx set groups classic components by base fee (not lane) to match upstream ordering.
       - [x] Classic base fee in generalized tx sets triggers when classic ops overflow.
       - [x] Soroban byte limit enforced even without explicit Soroban resource limits.
       - [x] Generalized tx set base fees default to ledger base fee when not limited.
@@ -127,7 +148,7 @@ Items marked complete are implemented in this repo; unchecked items remain.
       - [x] Tie-breaker seeding uses randomized seed in non-test builds.
   - [x] Soroban/classic phase splitting in generalized tx sets.
 - [x] Transaction meta hash parity with golden vectors.
-- [ ] Full operation coverage parity (classic + Soroban edge cases).
+- [x] Full operation coverage parity (classic + Soroban edge cases).
   - [x] Minimum balance checks include sponsorship counts (protocol >=14).
   - [x] Sponsorship operations (begin/end/revoke) parity.
   - [x] Payment: credit issuer existence and trustline authorization checks.
@@ -161,17 +182,20 @@ Items marked complete are implemented in this repo; unchecked items remain.
 
 ## History / Catchup
 
-- [ ] Production-grade catchup/replay parity (buckets, historywork integration).
+- [x] Production-grade catchup/replay parity (buckets, historywork integration).
   - [x] Replay verifies per-ledger bucket list hash when enabled.
   - [x] Replay verifies tx result set hash when enabled.
+  - [x] Replay execution uses apply-order sorting for classic/generalized tx sets.
   - [x] Catchup persists ledger headers and tx history/results into SQLite.
   - [x] Catchup persists SCP history and quorum sets when available.
   - [x] Externalized-slot gap handling triggers catchup (no ledger fast-forward without state).
+  - [x] Buffered catchup triggers on large externalized gaps (avoid stalling on missing slots).
 - [x] History publish parity (validators only) and robustness checks.
   - [x] Ledger headers + tx history persisted to SQLite.
   - [x] Tx set + tx result history entries persisted to SQLite.
   - [x] Bucket list snapshots persisted for checkpoint ledgers.
   - [x] SCP history envelopes/quorum sets persisted and published.
+  - [x] Publish verifies header chain and tx set/result hashes before writing.
   - [x] Publish command writes checkpoint files + root HAS to local archives.
   - [x] Publish command supports put/mkdir command templates for remote archives.
   - [x] Publish verifies tx set/result hashes before writing.
@@ -221,7 +245,7 @@ Items marked complete are implemented in this repo; unchecked items remain.
 
 ## Readiness Path (Ordered, With Next Tests)
 
-  - [ ] Ledger tx layering + surge pricing parity (blocker).
+  - [x] Ledger tx layering + surge pricing parity (blocker).
   - [x] Per-account sequence layering parity (tx selection honors strict sequence gaps).
     - [x] Duplicate sequence chooses higher fee per op.
     - Files: `crates/stellar-core-herder/src/tx_queue.rs`, `crates/stellar-core-herder/src/herder.rs`.
@@ -233,8 +257,8 @@ Items marked complete are implemented in this repo; unchecked items remain.
     - Files: `crates/stellar-core-herder/src/tx_queue.rs`.
     - Next tests: deterministic ordering tests in `crates/stellar-core-herder/tests/`.
 
-- [ ] Full operation coverage parity (blocker).
-  - [ ] Remaining classic op edge cases vs v25 (Offer/ClaimableBalance/Merge/Trustline).
+- [x] Full operation coverage parity (blocker).
+  - [x] Remaining classic op edge cases vs v25 (Offer/ClaimableBalance/Merge/Trustline).
     - [x] Offer auth-to-maintain-liabilities treated as not authorized (sell/buy/update) + delete allowed.
     - [x] Offer crossing uses correct book direction (swap buying/selling) + cross-self test.
     - [x] ManageBuyOffer cross-self parity test.
@@ -246,9 +270,10 @@ Items marked complete are implemented in this repo; unchecked items remain.
     - [x] ChangeTrust delete with non-zero balance is invalid.
     - [x] ClaimClaimableBalance enforces NoTrust, NotAuthorized, and LineFull (native + trustline).
     - [x] AccountMerge returns IsSponsor when num_sponsoring > 0 (protocol >=14).
+    - [x] ManageData: empty name invalid, max value length allowed, sponsorship uses sponsor balance.
     - Files: `crates/stellar-core-tx/src/operations/execute/*`.
     - Next tests: extend per-op unit tests in `crates/stellar-core-tx/src/operations/execute/*`.
-  - [ ] Soroban op/footprint edge cases for protocol 25.
+  - [x] Soroban op/footprint edge cases for protocol 25.
     - Files: `crates/stellar-core-tx/src/soroban/*`, `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs`.
     - Next tests: add/extend tests in `crates/stellar-core-tx/src/soroban/*`.
     - [x] ExtendFootprintTtl: read-write footprint rejected, non-TTL keys rejected, extend_to max bound enforced.
@@ -257,14 +282,18 @@ Items marked complete are implemented in this repo; unchecked items remain.
     - [x] InvokeHostFunction: host error resource limit mapping.
     - [x] Soroban tx validation: archived_soroban_entries sorted/unique/in-bounds + persistent-only.
 
-- [ ] Production-grade catchup/replay parity (blocker).
-  - [ ] Bucket apply + historywork integration parity with v25.
+- [x] Production-grade catchup/replay parity (blocker).
+  - [x] Bucket apply + historywork integration parity with v25.
     - Files: `crates/stellar-core-historywork/*`, `crates/stellar-core-history/src/catchup.rs`.
     - Next tests: expand `crates/stellar-core-history/tests/` + `crates/stellar-core-historywork/tests/`.
     - [x] Catchup uses pre-downloaded bucket data when provided (historywork integration).
+    - [x] Historywork exports `CheckpointData` for catchup integration.
   - [x] Replay rejects mismatched tx set / tx result hashes (unit tests).
   - [x] End-to-end replay integration test with bucket hash verification.
-  - [ ] Replay semantics parity for bucket/tx result verification.
+  - [x] Replay semantics parity for bucket/tx result verification.
+    - [x] Replay with execution rejects bucket list hash mismatch (unit test).
+    - [x] Replay with execution rejects tx set hash mismatch (unit test).
+    - [x] Replay with execution rejects tx result hash mismatch (unit test).
     - Files: `crates/stellar-core-history/src/replay.rs`, `crates/stellar-core-ledger/src/manager.rs`.
     - Next tests: add end-to-end replay test in `crates/stellar-core-history/tests/`.
 
@@ -272,6 +301,7 @@ Items marked complete are implemented in this repo; unchecked items remain.
   - [ ] Catchup to recent ledger, run close loop, and validate invariants enabled.
     - Files: `crates/rs-stellar-core/src/run_cmd.rs`, `configs/validator-testnet.toml`.
     - Next tests: integration test (or scripted run) using testnet configs.
+    - [x] Catchup triggers when last closed ledger exceeds max_ledger_age threshold.
 
 ## Mainnet Validator Readiness (Post-Testnet)
 

@@ -7,8 +7,10 @@ use axum::{
     routing::get,
     Router,
 };
-use flate2::{write::GzEncoder, Compression};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use stellar_core_common::Hash256;
+use stellar_core_history::verify;
+use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_history::{
     archive::HistoryArchive,
     archive_state::{HASBucketLevel, HistoryArchiveState},
@@ -29,6 +31,14 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
     encoder.write_all(data).expect("gzip write");
     encoder.finish().expect("gzip finish")
+}
+
+fn gunzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(data);
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).expect("gunzip read");
+    output
 }
 
 fn make_header(
@@ -76,10 +86,9 @@ async fn test_history_work_chain() {
         previous_ledger_hash: Hash([0u8; 32]),
         txs: VecM::default(),
     };
-    let tx_set_xdr = tx_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .expect("tx set xdr");
-    let tx_set_hash = Hash256::hash(&tx_set_xdr);
+    let tx_set_hash =
+        verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
+            .expect("tx set hash");
 
     let tx_result_set = TransactionResultSet {
         results: VecM::default(),
@@ -226,4 +235,24 @@ async fn test_history_work_chain() {
     assert!(transactions_file.exists());
     assert!(results_file.exists());
     assert!(scp_file.exists());
+
+    let has_payload = std::fs::read_to_string(&has_path).expect("read has");
+    let parsed_has = HistoryArchiveState::from_json(&has_payload).expect("parse has");
+    assert_eq!(parsed_has.current_ledger, checkpoint);
+    assert_eq!(parsed_has.current_buckets.len(), 1);
+
+    let bucket_payload = std::fs::read(&bucket_file).expect("read bucket");
+    assert_eq!(gunzip_bytes(&bucket_payload), bucket_data);
+
+    let headers_payload = std::fs::read(&headers_file).expect("read ledger headers");
+    assert_eq!(gunzip_bytes(&headers_payload), header_xdr);
+
+    let transactions_payload = std::fs::read(&transactions_file).expect("read transactions");
+    assert_eq!(gunzip_bytes(&transactions_payload), tx_entry_xdr);
+
+    let results_payload = std::fs::read(&results_file).expect("read results");
+    assert_eq!(gunzip_bytes(&results_payload), tx_result_entry_xdr);
+
+    let scp_payload = std::fs::read(&scp_file).expect("read scp");
+    assert_eq!(gunzip_bytes(&scp_payload), scp_entry_xdr);
 }

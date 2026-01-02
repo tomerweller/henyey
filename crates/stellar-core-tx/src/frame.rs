@@ -195,6 +195,29 @@ impl TransactionFrame {
         }
     }
 
+    /// Get the declared Soroban resource fee (0 for non-Soroban).
+    pub fn declared_soroban_resource_fee(&self) -> i64 {
+        if !self.is_soroban() {
+            return 0;
+        }
+        self.soroban_data()
+            .map(|data| data.resource_fee)
+            .unwrap_or(0)
+    }
+
+    /// Get the inclusion fee (total fee minus Soroban resource fee).
+    pub fn inclusion_fee(&self) -> i64 {
+        if self.is_soroban() {
+            let resource_fee = self.declared_soroban_resource_fee();
+            if resource_fee < 0 {
+                panic!("TransactionFrame::inclusion_fee: negative resource fee");
+            }
+            return self.total_fee() - resource_fee;
+        }
+
+        self.total_fee()
+    }
+
     /// Get the inner transaction's original fee (for fee bump).
     pub fn inner_fee(&self) -> u32 {
         match &self.envelope {
@@ -519,6 +542,10 @@ mod tests {
     }
 
     fn create_soroban_transaction() -> TransactionEnvelope {
+        create_soroban_transaction_with_fees(0, 100)
+    }
+
+    fn create_soroban_transaction_with_fees(resource_fee: i64, total_fee: u32) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
         let function_name = ScSymbol(
             StringM::<32>::try_from("test".to_string()).expect("symbol")
@@ -569,7 +596,7 @@ mod tests {
 
         let tx = Transaction {
             source_account: source,
-            fee: 100,
+            fee: total_fee,
             seq_num: SequenceNumber(1),
             cond: Preconditions::None,
             memo: Memo::None,
@@ -577,13 +604,37 @@ mod tests {
             ext: TransactionExt::V1(SorobanTransactionData {
                 ext,
                 resources,
-                resource_fee: 0,
+                resource_fee,
             }),
         };
 
         TransactionEnvelope::Tx(TransactionV1Envelope {
             tx,
             signatures: vec![].try_into().unwrap(),
+        })
+    }
+
+    fn create_fee_bump_soroban(
+        inner_fee: u32,
+        resource_fee: i64,
+        outer_fee: i64,
+    ) -> TransactionEnvelope {
+        let inner = create_soroban_transaction_with_fees(resource_fee, inner_fee);
+        let inner_env = match inner {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected inner tx"),
+        };
+
+        let fee_bump = FeeBumpTransaction {
+            fee_source: MuxedAccount::Ed25519(Uint256([3u8; 32])),
+            fee: outer_fee,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump,
+            signatures: VecM::default(),
         })
     }
 
@@ -647,5 +698,29 @@ mod tests {
         let envelope = create_test_transaction();
         let frame = TransactionFrame::new(envelope);
         assert!(frame.is_valid_structure());
+    }
+
+    #[test]
+    fn test_inclusion_fee_classic() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.declared_soroban_resource_fee(), 0);
+        assert_eq!(frame.inclusion_fee(), frame.total_fee());
+    }
+
+    #[test]
+    fn test_inclusion_fee_soroban() {
+        let envelope = create_soroban_transaction_with_fees(200, 1000);
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.declared_soroban_resource_fee(), 200);
+        assert_eq!(frame.inclusion_fee(), 800);
+    }
+
+    #[test]
+    fn test_inclusion_fee_fee_bump_soroban() {
+        let envelope = create_fee_bump_soroban(600, 150, 900);
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.declared_soroban_resource_fee(), 150);
+        assert_eq!(frame.inclusion_fee(), 750);
     }
 }

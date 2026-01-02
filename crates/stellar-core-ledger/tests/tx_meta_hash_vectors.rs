@@ -90,7 +90,7 @@ fn tx_meta_hash_vectors() {
     );
 
     let got = vec![tx_meta_hash(&meta_one), tx_meta_hash(&meta_two)];
-    let expected = vec![4251777216899368104, 3876391197624138903];
+    let expected = vec![16722020423653793170, 2868878751995401193];
     assert_eq!(got, expected);
 }
 

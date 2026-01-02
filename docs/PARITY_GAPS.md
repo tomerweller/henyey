@@ -16,17 +16,17 @@ Notes:
 1. Work scheduler (core orchestration)
    - Upstream: `src/work/*` (`WorkScheduler`, `WorkSequence`, `BasicWork`, `BatchWork`)
    - Status: Partial (scheduler + sequences + callbacks in `crates/stellar-core-work`)
-   - Needed: app-level metrics export wiring.
+   - Needed: app-level metrics export wiring (metrics parity is out of scope).
 
 2. Historywork pipeline
    - Upstream: `src/historywork/*` (download, verify, publish work)
-   - Status: Partial (download/verify + publish work in `crates/stellar-core-historywork`, including SCP history)
-   - Needed: metrics export wiring and replay integration.
+   - Status: Partial (download/verify + publish work in `crates/stellar-core-historywork`, including SCP history; tx set/result + header chain verification wired)
+   - Needed: metrics export wiring (metrics parity is out of scope).
 
 3. Invariants framework
    - Upstream: `src/invariant/*` (`InvariantManager`, `ConservationOfLumens`, `LedgerEntryIsValid`)
    - Status: Partial (framework + basic invariants + ledger-close hook)
-   - Needed: full invariant set, config/metrics wiring (Milestone 3). Replay invariants now enforced during catchup re-execution.
+   - Needed: full invariant set and config wiring (Milestone 3). Replay invariants now enforced during catchup re-execution.
 
 4. Simulation harness
    - Upstream: `src/simulation/*` (`Simulation`, `LoadGenerator`, `TxGenerator`)
@@ -35,7 +35,8 @@ Notes:
 
 5. Process lifecycle
    - Upstream: `src/process/*` (`ProcessManager`)
-   - Needed: process lifecycle, signal handling, state transitions.
+   - Status: Partial (signals/shutdown/state transitions implemented in `crates/rs-stellar-core/src/run_cmd.rs`)
+   - Needed: upstream-style process manager utilities.
 
 6. Test harness + fixtures
    - Upstream: `src/test/*`, `src/testdata/*`
@@ -44,7 +45,8 @@ Notes:
 ## Partial Areas (Need Expansion)
 
 - Application core: add diagnostics, command handler parity, and admin utilities.
-- Ledger close: tx meta now includes fee changes in tx_changes_before; full ledger txn layering still partial vs upstream.
+- Ledger close: tx meta now includes fee changes in tx_changes_before; apply-order parity for classic + generalized phases and ledger txn layering are implemented.
+- History replay: execution path now uses apply-order sorting and generalized tx set support when `TransactionHistoryEntryExt::V1` is present.
 - Tx meta hash normalization + short hash implemented; upstream golden-vector validation still needed (synthetic vectors added).
 - Soroban: footprint handling parity (storage deletions applied).
 - Overlay: surveys + peer manager parity (flow control + rate limiting in place); survey reporting/backlog commands wired with manual scheduling/permissions parity.

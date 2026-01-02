@@ -5,11 +5,14 @@
 //! and any protocol upgrades.
 
 use stellar_core_common::Hash256;
+use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerHeader, LedgerUpgrade,
     TransactionEnvelope, TransactionResult, TransactionResultPair, TransactionResultSet,
-    TransactionSet, UpgradeType,
+    TransactionSet, UpgradeType, WriteXdr, Limits,
 };
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// Data needed to close a ledger.
 ///
@@ -124,7 +127,16 @@ impl TransactionSetVariant {
     pub fn hash(&self) -> Hash256 {
         match self {
             TransactionSetVariant::Classic(set) => {
-                Hash256::hash_xdr(set).unwrap_or(Hash256::ZERO)
+                let mut hasher = Sha256Hasher::new();
+                hasher.update(&set.previous_ledger_hash.0);
+                for tx in set.txs.iter() {
+                    let bytes = match tx.to_xdr(Limits::none()) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return Hash256::ZERO,
+                    };
+                    hasher.update(&bytes);
+                }
+                hasher.finalize()
             }
             TransactionSetVariant::Generalized(set) => {
                 Hash256::hash_xdr(set).unwrap_or(Hash256::ZERO)
@@ -182,9 +194,12 @@ impl TransactionSetVariant {
 
     /// Get owned transactions with optional per-component base fee overrides.
     pub fn transactions_with_base_fee(&self) -> Vec<(TransactionEnvelope, Option<u32>)> {
+        let set_hash = self.hash();
         match self {
             TransactionSetVariant::Classic(set) => {
-                set.txs.iter().cloned().map(|tx| (tx, None)).collect()
+                let txs: Vec<(TransactionEnvelope, Option<u32>)> =
+                    set.txs.iter().cloned().map(|tx| (tx, None)).collect();
+                sorted_for_apply_sequential(txs, set_hash)
             }
             TransactionSetVariant::Generalized(set) => {
                 let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
@@ -192,29 +207,25 @@ impl TransactionSetVariant {
                 for phase in set_v1.phases.iter() {
                     match phase {
                         stellar_xdr::curr::TransactionPhase::V0(components) => {
+                            let mut phase_txs = Vec::new();
                             for comp in components.iter() {
                                 match comp {
                                     stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
                                         let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
-                                        txs.extend(c.txs.iter().cloned().map(|tx| (tx, base_fee)));
+                                        phase_txs.extend(c.txs.iter().cloned().map(|tx| (tx, base_fee)));
                                     }
                                 }
                             }
+                            txs.extend(sorted_for_apply_sequential(phase_txs, set_hash));
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                             let base_fee =
                                 parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
-                            for stage in parallel.execution_stages.iter() {
-                                for cluster in stage.iter() {
-                                    txs.extend(
-                                        cluster
-                                            .0
-                                            .iter()
-                                            .cloned()
-                                            .map(|tx| (tx, base_fee)),
-                                    );
-                                }
-                            }
+                            txs.extend(sorted_for_apply_parallel(
+                                parallel.execution_stages.as_slice(),
+                                set_hash,
+                                base_fee,
+                            ));
                         }
                     }
                 }
@@ -222,6 +233,147 @@ impl TransactionSetVariant {
             }
         }
     }
+}
+
+fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
+    Hash256::hash_xdr(tx).unwrap_or(Hash256::ZERO)
+}
+
+fn less_than_xored(left: &Hash256, right: &Hash256, x: &Hash256) -> bool {
+    for i in 0..left.0.len() {
+        let v1 = x.0[i] ^ left.0[i];
+        let v2 = x.0[i] ^ right.0[i];
+        if v1 != v2 {
+            return v1 < v2;
+        }
+    }
+    false
+}
+
+fn apply_sort_cmp(a: &TransactionEnvelope, b: &TransactionEnvelope, set_hash: &Hash256) -> Ordering {
+    let left = tx_hash(a);
+    let right = tx_hash(b);
+    if left == right {
+        return Ordering::Equal;
+    }
+    if less_than_xored(&left, &right, set_hash) {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
+}
+
+fn tx_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
+    match tx {
+        TransactionEnvelope::TxV0(env) => {
+            stellar_core_tx::muxed_to_account_id(&stellar_xdr::curr::MuxedAccount::Ed25519(
+                env.tx.source_account_ed25519.clone(),
+            ))
+        }
+        TransactionEnvelope::Tx(env) => stellar_core_tx::muxed_to_account_id(&env.tx.source_account),
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                stellar_core_tx::muxed_to_account_id(&inner.tx.source_account)
+            }
+        },
+    }
+}
+
+fn tx_sequence_number(tx: &TransactionEnvelope) -> i64 {
+    match tx {
+        TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
+        TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+        },
+    }
+}
+
+fn sorted_for_apply_sequential(
+    txs: Vec<(TransactionEnvelope, Option<u32>)>,
+    set_hash: Hash256,
+) -> Vec<(TransactionEnvelope, Option<u32>)> {
+    if txs.len() <= 1 {
+        return txs;
+    }
+
+    let mut by_account: HashMap<[u8; 32], Vec<(TransactionEnvelope, Option<u32>)>> = HashMap::new();
+    for (tx, base_fee) in txs {
+        let account_id = tx_source_id(&tx);
+        let key = stellar_core_tx::account_id_to_key(&account_id);
+        by_account.entry(key).or_default().push((tx, base_fee));
+    }
+
+    let mut queues: Vec<std::collections::VecDeque<(TransactionEnvelope, Option<u32>)>> =
+        by_account
+            .into_values()
+            .map(|mut txs| {
+                txs.sort_by(|a, b| tx_sequence_number(&a.0).cmp(&tx_sequence_number(&b.0)));
+                txs.into_iter().collect()
+            })
+            .collect();
+
+    let mut result = Vec::new();
+    while queues.iter().any(|q| !q.is_empty()) {
+        let mut batch = Vec::new();
+        for queue in queues.iter_mut() {
+            if let Some(item) = queue.pop_front() {
+                batch.push(item);
+            }
+        }
+        batch.sort_by(|a, b| apply_sort_cmp(&a.0, &b.0, &set_hash));
+        result.extend(batch);
+    }
+    result
+}
+
+fn sorted_for_apply_parallel(
+    stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
+    set_hash: Hash256,
+    base_fee: Option<u32>,
+) -> Vec<(TransactionEnvelope, Option<u32>)> {
+    let mut stage_vec: Vec<Vec<Vec<TransactionEnvelope>>> = stages
+        .iter()
+        .map(|stage| {
+            stage
+                .0
+                .iter()
+                .map(|cluster| cluster.0.to_vec())
+                .collect()
+        })
+        .collect();
+
+    for stage in stage_vec.iter_mut() {
+        for cluster in stage.iter_mut() {
+            cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
+        }
+        stage.sort_by(|a, b| {
+            if a.is_empty() || b.is_empty() {
+                return a.len().cmp(&b.len());
+            }
+            apply_sort_cmp(&a[0], &b[0], &set_hash)
+        });
+    }
+
+    stage_vec.sort_by(|a, b| {
+        if a.is_empty() || b.is_empty() {
+            return a.len().cmp(&b.len());
+        }
+        if a[0].is_empty() || b[0].is_empty() {
+            return a[0].len().cmp(&b[0].len());
+        }
+        apply_sort_cmp(&a[0][0], &b[0][0], &set_hash)
+    });
+
+    let mut result = Vec::new();
+    for stage in stage_vec {
+        for cluster in stage {
+            for tx in cluster {
+                result.push((tx, base_fee));
+            }
+        }
+    }
+    result
 }
 
 /// Result of processing a ledger close.
@@ -460,6 +612,214 @@ impl LedgerCloseStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use stellar_core_crypto::Sha256Hasher;
+    use stellar_xdr::curr::{
+        DependentTxCluster, FeeBumpTransaction, FeeBumpTransactionEnvelope,
+        FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, Memo, MuxedAccount,
+        ParallelTxExecutionStage, ParallelTxsComponent, Preconditions, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionPhase, TransactionSetV1,
+        TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM,
+        Limits, WriteXdr,
+    };
+
+    fn make_tx(seed: u8, seq: i64) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: stellar_xdr::curr::SequenceNumber(seq),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: VecM::default(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        })
+    }
+
+    fn make_fee_bump(fee_seed: u8, inner_seed: u8, seq: i64) -> TransactionEnvelope {
+        let inner = match make_tx(inner_seed, seq) {
+            TransactionEnvelope::Tx(inner) => inner,
+            _ => unreachable!("inner must be v1"),
+        };
+        let fee_source = MuxedAccount::Ed25519(Uint256([fee_seed; 32]));
+        let fee_bump = FeeBumpTransaction {
+            fee_source,
+            fee: 200,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner),
+            ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        };
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump,
+            signatures: VecM::default(),
+        })
+    }
+
+    fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
+        Hash256::hash_xdr(tx).unwrap_or(Hash256::ZERO)
+    }
+
+    #[test]
+    fn classic_tx_set_hash_uses_contents_hash() {
+        let tx_a = make_tx(1, 1);
+        let tx_b = make_tx(2, 2);
+        let txs: VecM<TransactionEnvelope> = vec![tx_a, tx_b].try_into().expect("tx vec");
+        let set = TransactionSet {
+            previous_ledger_hash: Hash([3u8; 32]),
+            txs,
+        };
+        let mut hasher = Sha256Hasher::new();
+        hasher.update(&set.previous_ledger_hash.0);
+        for tx in set.txs.iter() {
+            let bytes = tx.to_xdr(Limits::none()).expect("tx xdr");
+            hasher.update(&bytes);
+        }
+        let expected = hasher.finalize();
+        let variant = TransactionSetVariant::Classic(set);
+        assert_eq!(variant.hash(), expected);
+    }
+
+    fn less_than_xored(left: &Hash256, right: &Hash256, x: &Hash256) -> bool {
+        for i in 0..left.0.len() {
+            let v1 = x.0[i] ^ left.0[i];
+            let v2 = x.0[i] ^ right.0[i];
+            if v1 != v2 {
+                return v1 < v2;
+            }
+        }
+        false
+    }
+
+    fn apply_sort_cmp(a: &TransactionEnvelope, b: &TransactionEnvelope, set_hash: &Hash256) -> Ordering {
+        let left = tx_hash(a);
+        let right = tx_hash(b);
+        if left == right {
+            return Ordering::Equal;
+        }
+        if less_than_xored(&left, &right, set_hash) {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }
+
+    fn fee_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
+        match tx {
+            TransactionEnvelope::TxV0(env) => {
+                stellar_core_tx::muxed_to_account_id(&MuxedAccount::Ed25519(
+                    env.tx.source_account_ed25519.clone(),
+                ))
+            }
+            TransactionEnvelope::Tx(env) => stellar_core_tx::muxed_to_account_id(&env.tx.source_account),
+            TransactionEnvelope::TxFeeBump(env) => {
+                stellar_core_tx::muxed_to_account_id(&env.tx.fee_source)
+            }
+        }
+    }
+
+    fn inner_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
+        match tx {
+            TransactionEnvelope::TxV0(env) => {
+                stellar_core_tx::muxed_to_account_id(&MuxedAccount::Ed25519(
+                    env.tx.source_account_ed25519.clone(),
+                ))
+            }
+            TransactionEnvelope::Tx(env) => stellar_core_tx::muxed_to_account_id(&env.tx.source_account),
+            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => {
+                    stellar_core_tx::muxed_to_account_id(&inner.tx.source_account)
+                }
+            },
+        }
+    }
+
+    fn seq_num(tx: &TransactionEnvelope) -> i64 {
+        match tx {
+            TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
+            TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
+            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+            },
+        }
+    }
+
+    fn expected_apply_order(
+        txs: Vec<TransactionEnvelope>,
+        set_hash: Hash256,
+        use_fee_source: bool,
+    ) -> Vec<Hash256> {
+        let mut by_account: HashMap<[u8; 32], Vec<TransactionEnvelope>> = HashMap::new();
+        for tx in txs {
+            let account_id = if use_fee_source {
+                fee_source_id(&tx)
+            } else {
+                inner_source_id(&tx)
+            };
+            let key = stellar_core_tx::account_id_to_key(&account_id);
+            by_account.entry(key).or_default().push(tx);
+        }
+
+        let mut queues: Vec<std::collections::VecDeque<TransactionEnvelope>> = by_account
+            .into_values()
+            .map(|mut txs| {
+                txs.sort_by(|a, b| seq_num(a).cmp(&seq_num(b)));
+                txs.into_iter().collect()
+            })
+            .collect();
+
+        let mut result = Vec::new();
+        while queues.iter().any(|q| !q.is_empty()) {
+            let mut batch = Vec::new();
+            for queue in queues.iter_mut() {
+                if let Some(item) = queue.pop_front() {
+                    batch.push(item);
+                }
+            }
+            batch.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
+            result.extend(batch.into_iter().map(|tx| tx_hash(&tx)));
+        }
+        result
+    }
+
+    fn expected_parallel_order(
+        stages: Vec<Vec<Vec<TransactionEnvelope>>>,
+        set_hash: Hash256,
+    ) -> Vec<Hash256> {
+        let mut stage_vec = stages;
+        for stage in stage_vec.iter_mut() {
+            for cluster in stage.iter_mut() {
+                cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
+            }
+            stage.sort_by(|a, b| {
+                if a.is_empty() || b.is_empty() {
+                    return a.len().cmp(&b.len());
+                }
+                apply_sort_cmp(&a[0], &b[0], &set_hash)
+            });
+        }
+        stage_vec.sort_by(|a, b| {
+            if a.is_empty() || b.is_empty() {
+                return a.len().cmp(&b.len());
+            }
+            if a[0].is_empty() || b[0].is_empty() {
+                return a[0].len().cmp(&b[0].len());
+            }
+            apply_sort_cmp(&a[0][0], &b[0][0], &set_hash)
+        });
+
+        let mut result = Vec::new();
+        for stage in stage_vec {
+            for cluster in stage {
+                for tx in cluster {
+                    result.push(tx_hash(&tx));
+                }
+            }
+        }
+        result
+    }
 
     #[test]
     fn test_ledger_close_data() {
@@ -504,5 +864,102 @@ mod tests {
         assert_eq!(stats.tx_failed_count, 1);
         assert_eq!(stats.op_count, 5);
         assert_eq!(stats.total_fees, 600);
+    }
+
+    #[test]
+    fn fee_bump_apply_order_uses_inner_source() {
+        let mut chosen = None;
+        'search: for inner_a in 1u8..=8 {
+            for inner_b in 9u8..=16 {
+                for classic_seed in 17u8..=24 {
+                    let fee_bump_a = make_fee_bump(9, inner_a, 1);
+                    let fee_bump_b = make_fee_bump(9, inner_b, 1);
+                    let classic = make_tx(classic_seed, 1);
+                    let txs = vec![fee_bump_a.clone(), classic.clone(), fee_bump_b.clone()];
+                    let set = stellar_xdr::curr::TransactionSet {
+                        previous_ledger_hash: Hash::from(Hash256::ZERO),
+                        txs: txs.clone().try_into().unwrap(),
+                    };
+                    let set_hash = TransactionSetVariant::Classic(set.clone()).hash();
+                    let expected = expected_apply_order(txs.clone(), set_hash, false);
+                    let wrong = expected_apply_order(txs, set_hash, true);
+                    if expected != wrong {
+                        chosen = Some((set, expected, wrong));
+                        break 'search;
+                    }
+                }
+            }
+        }
+
+        let (set, expected, wrong) = chosen.expect("distinct apply order case");
+        assert_ne!(expected, wrong, "test should distinguish inner vs fee source");
+
+        let variant = TransactionSetVariant::Classic(set);
+        let actual: Vec<Hash256> = variant
+            .transactions_with_base_fee()
+            .into_iter()
+            .map(|(tx, _)| tx_hash(&tx))
+            .collect();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generalized_tx_set_apply_order_uses_xor_sort() {
+        let classic_a = make_tx(10, 1);
+        let classic_b = make_tx(11, 1);
+        let soroban_a = make_tx(20, 1);
+        let soroban_b = make_tx(21, 1);
+        let soroban_c = make_tx(22, 1);
+        let soroban_d = make_tx(23, 1);
+
+        let classic_component = TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+            TxSetComponentTxsMaybeDiscountedFee {
+                base_fee: None,
+                txs: vec![classic_b.clone(), classic_a.clone()]
+                    .try_into()
+                    .unwrap(),
+            },
+        );
+        let classic_phase = TransactionPhase::V0(vec![classic_component].try_into().unwrap());
+
+        let cluster_a = DependentTxCluster(
+            vec![soroban_b.clone(), soroban_a.clone()]
+                .try_into()
+                .unwrap(),
+        );
+        let cluster_b = DependentTxCluster(vec![soroban_c.clone()].try_into().unwrap());
+        let cluster_c = DependentTxCluster(vec![soroban_d.clone()].try_into().unwrap());
+        let stage_one = ParallelTxExecutionStage(vec![cluster_b, cluster_a].try_into().unwrap());
+        let stage_two = ParallelTxExecutionStage(vec![cluster_c].try_into().unwrap());
+        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: vec![stage_two, stage_one].try_into().unwrap(),
+        });
+
+        let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash::from(Hash256::ZERO),
+            phases: vec![classic_phase, soroban_phase].try_into().unwrap(),
+        });
+
+        let set_hash = Hash256::hash_xdr(&gen_set).unwrap_or(Hash256::ZERO);
+        let classic_expected = expected_apply_order(vec![classic_a, classic_b], set_hash, false);
+        let soroban_expected = expected_parallel_order(
+            vec![vec![vec![soroban_a, soroban_b], vec![soroban_c]], vec![vec![soroban_d]]],
+            set_hash,
+        );
+        let expected: Vec<Hash256> = classic_expected
+            .into_iter()
+            .chain(soroban_expected.into_iter())
+            .collect();
+
+        let variant = TransactionSetVariant::Generalized(gen_set);
+        let actual: Vec<Hash256> = variant
+            .transactions_with_base_fee()
+            .into_iter()
+            .map(|(tx, _)| tx_hash(&tx))
+            .collect();
+
+        assert_eq!(actual, expected);
     }
 }

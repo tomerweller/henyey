@@ -2,7 +2,7 @@
 
 Scope: SQLite only; Protocol 23+ only; no production hardening.
 Milestones: testnet validator -> mainnet validator -> full parity (v25.x). Full invariant parity is Milestone 3.
-Baseline: `/Users/tomer/dev/stellar-core` @ v25.0.1
+Baseline: `.upstream-v25` @ v25.0.1
 
 Legend: Present / Partial / Missing
 
@@ -11,21 +11,21 @@ Legend: Present / Partial / Missing
 | Upstream | Key files (v25) | rs-stellar-core mapping | Status | Notes |
 | --- | --- | --- | --- | --- |
 | main | `Application.*`, `CommandHandler.*`, `Config.*`, `QueryServer.*`, `Diagnostics.*` | `crates/rs-stellar-core` | Partial | CLI + config + HTTP endpoints present; application lifecycle + diagnostics + command handler parity missing. |
-| process | `ProcessManager.*` | (none) | Missing | No process lifecycle manager. |
+| process | `ProcessManager.*` | `crates/rs-stellar-core/src/run_cmd.rs` | Partial | Signal handling, shutdown, and state transitions are implemented; no dedicated process manager or full upstream utility surface. |
 | util | `src/util/*` | `crates/stellar-core-common` | Partial | Basic types/utils only; upstream util covers more runtime utilities. |
 
 ## Work Scheduling
 
 | Upstream | Key files (v25) | rs-stellar-core mapping | Status | Notes |
 | --- | --- | --- | --- | --- |
-| work | `WorkScheduler.*`, `Work.*`, `WorkSequence.*` | `crates/stellar-core-work` | Partial | Scheduler, cancellation, metrics, and graph introspection implemented; app metrics export wiring still missing. |
-| historywork | `GetHistoryArchiveStateWork.*`, `DownloadBucketsWork.*`, `VerifyBucketWork.*`, `PublishWork.*` | `crates/stellar-core-historywork` | Partial | Download/verify + publish work implemented with progress polling (HAS/buckets/headers/tx/results/SCP); metrics export wiring and replay integration pending. |
+| work | `WorkScheduler.*`, `Work.*`, `WorkSequence.*` | `crates/stellar-core-work` | Partial | Scheduler, cancellation, metrics, and graph introspection implemented; app metrics export wiring is out of scope. |
+| historywork | `GetHistoryArchiveStateWork.*`, `DownloadBucketsWork.*`, `VerifyBucketWork.*`, `PublishWork.*` | `crates/stellar-core-historywork` | Partial | Download/verify + publish work implemented with progress polling (HAS/buckets/headers/tx/results/SCP), including tx set/result hash verification; metrics export wiring is out of scope. |
 
 ## Ledger / Transactions
 
 | Upstream | Key files (v25) | rs-stellar-core mapping | Status | Notes |
 | --- | --- | --- | --- | --- |
-| ledger | `LedgerManager.*`, `LedgerTxn.*`, `LedgerCloseMetaFrame.*`, `LedgerHeaderUtils.*` | `crates/stellar-core-ledger` | Partial | Ledger close pipeline present; tx result hash computed; fee-bump results handled; generalized tx set base-fee overrides honored; ledger close meta v2 + per-op/tx meta produced; ledger txn layering still partial. |
+| ledger | `LedgerManager.*`, `LedgerTxn.*`, `LedgerCloseMetaFrame.*`, `LedgerHeaderUtils.*` | `crates/stellar-core-ledger` | Partial | Ledger close pipeline present; tx result hash computed; fee-bump results handled; generalized tx set base-fee overrides honored; ledger close meta v2 + per-op/tx meta produced; ledger txn layering parity implemented. |
 | transactions | `TransactionFrame.*`, `OperationFrame.*`, `ParallelApply*`, `TransactionMeta.*` | `crates/stellar-core-tx` | Partial | Core ops implemented; signature/fee/sequence/time/ledger-bounds validation; signer weight checks for Ed25519, preauth, hashX, signed payload; preconditions V2 min-seq/age/gap/extra signers supported; tx meta hash normalization + short hash implemented, golden vectors pending. |
 | herder | `Herder.*`, `TxQueue*`, `Upgrades.*`, `QuorumTracker.*` | `crates/stellar-core-herder` | Partial | Tx queue + SCP coordination present; generalized tx set caching/responses wired into ledger close; SCP upgrades now fed into ledger close with proposal support; quorum set exchange + on-demand requests wired; basic quorum tracker wired (slot-level quorum/v-blocking), full parity pending. |
 

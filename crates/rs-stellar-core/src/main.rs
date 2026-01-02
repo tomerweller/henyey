@@ -23,6 +23,7 @@ mod app;
 mod catchup_cmd;
 mod config;
 mod logging;
+mod quorum_intersection;
 mod run_cmd;
 mod survey;
 
@@ -162,6 +163,12 @@ enum Commands {
         force: bool,
     },
 
+    /// Check quorum intersection from a JSON file
+    CheckQuorumIntersection {
+        /// Path to the JSON file
+        path: PathBuf,
+    },
+
     /// Print sample configuration
     SampleConfig,
 
@@ -254,6 +261,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::VerifyHistory { from, to } => cmd_verify_history(config, from, to).await,
 
         Commands::PublishHistory { force } => cmd_publish_history(config, force).await,
+
+        Commands::CheckQuorumIntersection { path } => cmd_check_quorum_intersection(&path),
 
         Commands::SampleConfig => cmd_sample_config(),
 
@@ -468,6 +477,7 @@ async fn cmd_verify_history(
     to: Option<u32>,
 ) -> anyhow::Result<()> {
     use stellar_core_history::{HistoryArchive, verify};
+    use stellar_core_ledger::TransactionSetVariant;
 
     println!("Verifying history archives...");
     println!();
@@ -582,31 +592,20 @@ async fn cmd_verify_history(
                                                 continue;
                                             };
 
-                                            let tx_set_xdr = match &tx_entry.ext {
+                                            let tx_set = match &tx_entry.ext {
                                                 stellar_xdr::curr::TransactionHistoryEntryExt::V1(generalized) => {
-                                                    generalized.to_xdr(stellar_xdr::curr::Limits::none())
+                                                    TransactionSetVariant::Generalized(generalized.clone())
                                                 }
                                                 stellar_xdr::curr::TransactionHistoryEntryExt::V0 => {
-                                                    tx_entry.tx_set.to_xdr(stellar_xdr::curr::Limits::none())
+                                                    TransactionSetVariant::Classic(tx_entry.tx_set.clone())
                                                 }
                                             };
-                                            match tx_set_xdr {
-                                                Ok(bytes) => {
-                                                    if let Err(e) = verify::verify_tx_set(header, &bytes) {
-                                                        println!(
-                                                            "    Tx set hash verification FAILED (ledger {}): {}",
-                                                            header.ledger_seq, e
-                                                        );
-                                                        error_count += 1;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    println!(
-                                                        "    Failed to encode tx set for ledger {}: {}",
-                                                        header.ledger_seq, e
-                                                    );
-                                                    error_count += 1;
-                                                }
+                                            if let Err(e) = verify::verify_tx_set(header, &tx_set) {
+                                                println!(
+                                                    "    Tx set hash verification FAILED (ledger {}): {}",
+                                                    header.ledger_seq, e
+                                                );
+                                                error_count += 1;
                                             }
 
                                             let result_xdr = result_entry
@@ -688,8 +687,10 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     use stellar_core_history::checkpoint::{checkpoint_containing, next_checkpoint};
     use stellar_core_history::paths::root_has_path;
     use stellar_core_history::publish::{build_history_archive_state, PublishConfig, PublishManager};
+    use stellar_core_history::verify;
     use stellar_core_history::CHECKPOINT_FREQUENCY;
     use stellar_core_ledger::compute_header_hash;
+    use stellar_core_ledger::TransactionSetVariant;
     use stellar_core_common::Hash256;
     use std::fs;
     use std::path::PathBuf;
@@ -878,14 +879,13 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             let tx_entry = &tx_entries[idx];
             let tx_result_entry = &tx_results[idx];
             let header = &header_entry.header;
-            let tx_set_hash = match &tx_entry.ext {
+            let tx_set = match &tx_entry.ext {
                 TransactionHistoryEntryExt::V1(generalized) => {
-                    Hash256::hash_xdr(generalized).unwrap_or(Hash256::ZERO)
+                    TransactionSetVariant::Generalized(generalized.clone())
                 }
-                TransactionHistoryEntryExt::V0 => {
-                    Hash256::hash_xdr(&tx_entry.tx_set).unwrap_or(Hash256::ZERO)
-                }
+                TransactionHistoryEntryExt::V0 => TransactionSetVariant::Classic(tx_entry.tx_set.clone()),
             };
+            let tx_set_hash = verify::compute_tx_set_hash(&tx_set).unwrap_or(Hash256::ZERO);
             let expected_tx_set = Hash256::from(header.scp_value.tx_set_hash.0);
             if tx_set_hash != expected_tx_set {
                 anyhow::bail!(
@@ -1472,6 +1472,17 @@ fn bucket_info(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check quorum intersection from JSON.
+fn cmd_check_quorum_intersection(path: &PathBuf) -> anyhow::Result<()> {
+    let enjoys = quorum_intersection::check_quorum_intersection_from_json(path.as_path())?;
+    if enjoys {
+        println!("network enjoys quorum intersection");
+        Ok(())
+    } else {
+        anyhow::bail!("quorum sets do not have intersection");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,5 +1522,16 @@ mod tests {
         let cli = Cli::parse_from(["rs-stellar-core", "--verbose", "--mainnet", "info"]);
         assert!(cli.verbose);
         assert!(cli.mainnet);
+    }
+
+    #[test]
+    fn test_cli_check_quorum_intersection() {
+        let cli = Cli::parse_from(["rs-stellar-core", "check-quorum-intersection", "foo.json"]);
+        match cli.command {
+            Commands::CheckQuorumIntersection { path } => {
+                assert_eq!(path, PathBuf::from("foo.json"));
+            }
+            _ => panic!("Expected check-quorum-intersection command"),
+        }
     }
 }

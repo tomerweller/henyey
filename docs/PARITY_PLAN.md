@@ -24,10 +24,10 @@ See `docs/PARITY_MATRIX.md` for the validated matrix and status notes.
 - Output: validated matrix + issue list with ownership and acceptance criteria.
 
 ### Phase 1: Work Scheduler Core (work/)
-- Introduce a work engine crate (or module) with job queue, dependencies, retries, and metrics.
+- Introduce a work engine crate (or module) with job queue, dependencies, retries (metrics parity is out of scope).
 - Define work traits for history, overlay, ledger close, and publish.
 - Wire into rs-stellar-core app lifecycle.
-- Output: scheduler tests; basic metrics; deterministic shutdown.
+- Output: scheduler tests; deterministic shutdown.
 
 ### Phase 2: Historywork Pipeline
 - Implement catchup/publish work items driven by scheduler.
@@ -39,7 +39,7 @@ See `docs/PARITY_MATRIX.md` for the validated matrix and status notes.
 - Define invariant traits + registry.
 - Implement core v25 invariants (bucket list hash, entry consistency, balance invariants).
 - Integrate into ledger close and replay paths.
-- Output: invariant failures surfaced in logs/metrics, gating in tests.
+- Output: invariant failures surfaced in logs, gating in tests (metrics parity is out of scope).
 
 ### Phase 4: Simulation + Regression Harness
 - Add deterministic multi-node simulation support (overlay + SCP + herder + ledger).

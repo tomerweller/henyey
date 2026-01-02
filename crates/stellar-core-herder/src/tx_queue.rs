@@ -12,9 +12,10 @@ use std::time::Instant;
 use stellar_core_common::{
     any_greater, Hash256, NetworkId, Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES,
 };
+use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash,
-    Limits, Preconditions, SignerKey, TransactionEnvelope,
+    Limits, Preconditions, SignerKey, TransactionEnvelope, TransactionPhase, TxSetComponent,
 };
 use stellar_xdr::curr::WriteXdr;
 
@@ -336,16 +337,26 @@ pub struct TransactionSet {
 }
 
 impl TransactionSet {
+    /// Compute the legacy TransactionSet contents hash (non-generalized).
+    pub fn compute_non_generalized_hash(
+        previous_ledger_hash: Hash256,
+        transactions: &[TransactionEnvelope],
+    ) -> Option<Hash256> {
+        let mut hasher = Sha256Hasher::new();
+        hasher.update(&previous_ledger_hash.0);
+        for tx in transactions {
+            let bytes = tx.to_xdr(Limits::none()).ok()?;
+            hasher.update(&bytes);
+        }
+        Some(hasher.finalize())
+    }
+
     /// Create a new transaction set with computed hash (for legacy TransactionSet).
     pub fn new(previous_ledger_hash: Hash256, transactions: Vec<TransactionEnvelope>) -> Self {
-        // Compute set hash for legacy format: hash of prev_hash + txs
-        let mut data = previous_ledger_hash.0.to_vec();
-        for tx in &transactions {
-            if let Ok(bytes) = tx.to_xdr(stellar_xdr::curr::Limits::none()) {
-                data.extend_from_slice(&bytes);
-            }
-        }
-        let hash = Hash256::hash(&data);
+        let mut transactions = transactions;
+        sort_txs_by_hash(&mut transactions);
+        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions)
+            .unwrap_or_default();
 
         Self {
             hash,
@@ -400,15 +411,124 @@ impl TransactionSet {
             let bytes = gen.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
             return Some(Hash256::hash(&bytes));
         }
-
-        let txs: Vec<TransactionEnvelope> = self.transactions.clone();
-        let tx_set = stellar_xdr::curr::TransactionSet {
-            previous_ledger_hash: Hash::from(self.previous_ledger_hash),
-            txs: txs.try_into().ok()?,
-        };
-        let bytes = tx_set.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
-        Some(Hash256::hash(&bytes))
+        Self::compute_non_generalized_hash(self.previous_ledger_hash, &self.transactions)
     }
+
+    /// Summarize the transaction set for logging/debugging.
+    pub fn summary(&self) -> String {
+        if self.transactions.is_empty() {
+            return "empty tx set".to_string();
+        }
+
+        if let Some(gen) = &self.generalized_tx_set {
+            return summary_generalized_tx_set(gen);
+        }
+
+        let tx_count = self.transactions.len();
+        let op_count: i64 = self
+            .transactions
+            .iter()
+            .map(tx_operation_count)
+            .sum();
+        let base_fee = self
+            .transactions
+            .iter()
+            .map(tx_inclusion_fee)
+            .zip(self.transactions.iter().map(tx_operation_count))
+            .filter(|(_, ops)| *ops > 0)
+            .map(|(fee, ops)| fee / ops)
+            .min()
+            .unwrap_or(0);
+
+        format!("txs:{}, ops:{}, base_fee:{}", tx_count, op_count, base_fee)
+    }
+}
+
+fn tx_operation_count(envelope: &TransactionEnvelope) -> i64 {
+    match envelope {
+        TransactionEnvelope::TxV0(env) => env.tx.operations.len() as i64,
+        TransactionEnvelope::Tx(env) => env.tx.operations.len() as i64,
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                inner.tx.operations.len() as i64
+            }
+        },
+    }
+}
+
+fn tx_inclusion_fee(envelope: &TransactionEnvelope) -> i64 {
+    match envelope {
+        TransactionEnvelope::TxV0(env) => env.tx.fee as i64,
+        TransactionEnvelope::Tx(env) => env.tx.fee as i64,
+        TransactionEnvelope::TxFeeBump(env) => env.tx.fee,
+    }
+}
+
+fn summary_generalized_tx_set(gen: &GeneralizedTransactionSet) -> String {
+    use std::collections::BTreeMap;
+
+    let GeneralizedTransactionSet::V1(tx_set) = gen;
+    if tx_set.phases.is_empty() {
+        return "empty tx set".to_string();
+    }
+
+    let mut parts = Vec::new();
+    for (phase_idx, phase) in tx_set.phases.iter().enumerate() {
+        let mut component_stats: BTreeMap<Option<i64>, (i64, i64)> = BTreeMap::new();
+        match phase {
+            TransactionPhase::V0(components) => {
+                for component in components.iter() {
+                    let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
+                    let base_fee = comp.base_fee;
+                    for tx in comp.txs.iter() {
+                        let entry = component_stats.entry(base_fee).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += tx_operation_count(tx);
+                    }
+                }
+            }
+            TransactionPhase::V1(parallel) => {
+                let base_fee = parallel.base_fee;
+                for stage in parallel.execution_stages.iter() {
+                    for cluster in stage.iter() {
+                        for tx in cluster.0.iter() {
+                            let entry = component_stats.entry(base_fee).or_insert((0, 0));
+                            entry.0 += 1;
+                            entry.1 += tx_operation_count(tx);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut component_parts = Vec::new();
+        for (fee, stats) in component_stats.iter() {
+            if let Some(base_fee) = fee {
+                component_parts.push(format!(
+                    "{{discounted txs:{}, ops:{}, base_fee:{}}}",
+                    stats.0, stats.1, base_fee
+                ));
+            } else {
+                component_parts.push(format!(
+                    "{{non-discounted txs:{}, ops:{}}}",
+                    stats.0, stats.1
+                ));
+            }
+        }
+        let phase_name = match phase_idx {
+            0 => "classic",
+            1 => "soroban",
+            _ => "unknown",
+        };
+        parts.push(format!(
+            "{} phase: {} component(s): [{}]",
+            phase_name,
+            component_stats.len(),
+            component_parts.join(", ")
+        ));
+    }
+
+    parts.join(", ")
 }
 
 /// Queue of pending transactions.
@@ -915,61 +1035,66 @@ impl TransactionQueue {
             }
         }
 
-        soroban_txs.sort_by(|a, b| {
-            let hash_a = Hash256::hash_xdr(a).unwrap_or_default();
-            let hash_b = Hash256::hash_xdr(b).unwrap_or_default();
-            hash_a.0.cmp(&hash_b.0)
-        });
-
-        let classic_base_fee = if classic_limited {
-            classic_txs
-                .iter()
-                .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
-                .min()
-                .or(Some(base_fee))
-        } else if classic_txs.is_empty() {
-            None
-        } else {
-            Some(base_fee)
-        };
-        let dex_base_fee = if dex_limited {
-            classic_txs
-                .iter()
-                .filter(|tx| {
-                    let frame = stellar_core_tx::TransactionFrame::with_network(
-                        (*tx).clone(),
-                        self.config.network_id,
-                    );
-                    frame.has_dex_operations()
-                })
-                .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
-                .min()
-                .or(Some(base_fee))
-        } else {
-            classic_base_fee
-        };
+        sort_txs_by_hash(&mut soroban_txs);
 
         let mut classic_components: Vec<TxSetComponent> = Vec::new();
         if !classic_txs.is_empty() {
-            let mut grouped: BTreeMap<Option<i64>, Vec<TransactionEnvelope>> = BTreeMap::new();
-            for tx in classic_txs {
+            let has_dex_lane = self.config.max_dex_ops.is_some();
+            let lane_count = if has_dex_lane { 2 } else { 1 };
+            let mut lowest_lane_fee = vec![i64::MAX; lane_count];
+            let mut lane_for_tx = Vec::with_capacity(classic_txs.len());
+
+            for tx in &classic_txs {
                 let frame = stellar_core_tx::TransactionFrame::with_network(
                     tx.clone(),
                     self.config.network_id,
                 );
-                let fee = if frame.has_dex_operations() {
-                    dex_base_fee.or(classic_base_fee)
+                let lane = if has_dex_lane && frame.has_dex_operations() {
+                    crate::surge_pricing::DEX_LANE
                 } else {
-                    classic_base_fee
+                    GENERIC_LANE
                 };
-                grouped.entry(fee).or_default().push(tx);
+                if let Some((per_op, _, _)) = envelope_fee_per_op(tx) {
+                    let lane_fee = &mut lowest_lane_fee[lane];
+                    let fee = per_op as i64;
+                    if fee < *lane_fee {
+                        *lane_fee = fee;
+                    }
+                }
+                lane_for_tx.push(lane);
             }
-            for (fee, mut txs) in grouped {
+
+            let min_lane_fee = lowest_lane_fee
+                .iter()
+                .copied()
+                .filter(|fee| *fee != i64::MAX)
+                .min()
+                .unwrap_or(base_fee);
+            let mut lane_base_fee = vec![base_fee; lane_count];
+            if classic_limited {
+                for fee in &mut lane_base_fee {
+                    *fee = min_lane_fee;
+                }
+            }
+            if has_dex_lane && dex_limited {
+                let dex_fee = lowest_lane_fee[crate::surge_pricing::DEX_LANE];
+                if dex_fee != i64::MAX {
+                    lane_base_fee[crate::surge_pricing::DEX_LANE] = dex_fee;
+                }
+            }
+
+            let mut components_by_fee: BTreeMap<i64, Vec<TransactionEnvelope>> = BTreeMap::new();
+            for (tx, lane) in classic_txs.into_iter().zip(lane_for_tx.into_iter()) {
+                let fee = lane_base_fee[lane];
+                components_by_fee.entry(fee).or_default().push(tx);
+            }
+
+            for (fee, mut txs) in components_by_fee {
                 sort_txs_by_hash(&mut txs);
                 classic_components.push(
                     TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
                         TxSetComponentTxsMaybeDiscountedFee {
-                            base_fee: fee,
+                            base_fee: Some(fee),
                             txs: txs.try_into().unwrap_or_default(),
                         },
                     ),
@@ -1735,6 +1860,10 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn full_hash(envelope: &TransactionEnvelope) -> Hash256 {
+        Hash256::hash_xdr(envelope).expect("hash tx")
+    }
+
     fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
         let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
         match envelope {
@@ -1792,24 +1921,30 @@ mod tests {
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 3);
 
-        let fees: Vec<u64> = set
+        let mut fees: Vec<u64> = set
             .transactions
             .iter()
             .map(envelope_fee)
             .collect();
+        fees.sort_by(|a, b| b.cmp(a));
         assert_eq!(fees, vec![300, 200, 100]);
     }
 
     #[test]
     fn test_tie_breaker_is_deterministic() {
         let queue = TransactionQueue::with_defaults();
+        let network_id = NetworkId::testnet();
 
         let mut tx_a = make_test_envelope(200, 1);
         let mut tx_b = make_test_envelope(200, 1);
         set_source(&mut tx_a, 4);
         set_source(&mut tx_b, 5);
-        let hash_a = Hash256::hash_xdr(&tx_a).expect("hash tx_a");
-        let hash_b = Hash256::hash_xdr(&tx_b).expect("hash tx_b");
+        let hash_a = stellar_core_tx::TransactionFrame::with_network(tx_a.clone(), network_id)
+            .hash(&network_id)
+            .expect("hash tx_a");
+        let hash_b = stellar_core_tx::TransactionFrame::with_network(tx_b.clone(), network_id)
+            .hash(&network_id)
+            .expect("hash tx_b");
 
         queue.try_add(tx_a);
         queue.try_add(tx_b);
@@ -1825,7 +1960,11 @@ mod tests {
         let got: Vec<Hash256> = set
             .transactions
             .iter()
-            .map(|tx| Hash256::hash_xdr(tx).expect("hash tx"))
+            .map(|tx| {
+                stellar_core_tx::TransactionFrame::with_network(tx.clone(), network_id)
+                    .hash(&network_id)
+                    .expect("hash tx")
+            })
             .collect();
         assert_eq!(got, expected);
     }
@@ -1868,7 +2007,8 @@ mod tests {
         queue.try_add(tx_b);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
-        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        seqs.sort();
         assert_eq!(seqs, vec![1, 2]);
     }
 
@@ -1897,7 +2037,8 @@ mod tests {
         queue.try_add(classic_late);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
-        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        seqs.sort();
         assert_eq!(seqs, vec![1, 2]);
     }
 
@@ -1926,7 +2067,8 @@ mod tests {
         queue.try_add(soroban_b);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
-        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        seqs.sort();
         assert_eq!(seqs, vec![1, 2, 3]);
     }
 
@@ -1951,7 +2093,8 @@ mod tests {
         starting.insert(account_key_from_account_id(&account_id), 5);
 
         let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
-        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        seqs.sort();
         assert_eq!(seqs, vec![6]);
     }
 
@@ -1977,8 +2120,27 @@ mod tests {
         starting.insert(account_key_from_account_id(&account_id), starting_seq);
 
         let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
-        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        seqs.sort();
         assert_eq!(seqs, vec![starting_seq + 1]);
+    }
+
+    #[test]
+    fn test_transaction_set_hash_matches_recompute() {
+        let mut tx_a = make_test_envelope(200, 1);
+        let mut tx_b = make_test_envelope(300, 1);
+        set_source(&mut tx_a, 40);
+        set_source(&mut tx_b, 41);
+        if let TransactionEnvelope::Tx(env) = &mut tx_a {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        if let TransactionEnvelope::Tx(env) = &mut tx_b {
+            env.tx.seq_num = SequenceNumber(2);
+        }
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx_a, tx_b]);
+        let recomputed = tx_set.recompute_hash().expect("recompute hash");
+        assert_eq!(tx_set.hash, recomputed);
     }
 
     #[test]
@@ -2031,6 +2193,23 @@ mod tests {
             }
             _ => panic!("expected soroban phase"),
         }
+    }
+
+    #[test]
+    fn test_generalized_tx_set_hash_matches_recompute() {
+        let queue = TransactionQueue::with_defaults();
+
+        let classic = make_test_envelope(200, 1);
+        let soroban = make_soroban_envelope(200);
+        queue.try_add(classic);
+        queue.try_add(soroban);
+
+        let (tx_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+        let recomputed = tx_set.recompute_hash().expect("recompute hash");
+        assert_eq!(tx_set.hash, recomputed);
+
+        let gen_hash = Hash256::hash_xdr(&gen).expect("hash generalized");
+        assert_eq!(tx_set.hash, gen_hash);
     }
 
     #[test]
@@ -2098,10 +2277,7 @@ mod tests {
         };
 
         assert_eq!(txs.len(), 2);
-        let hashes: Vec<_> = txs
-            .iter()
-            .map(|tx| Hash256::hash_xdr(tx).expect("hash"))
-            .collect();
+        let hashes: Vec<_> = txs.iter().map(full_hash).collect();
         assert!(hashes[0].0 <= hashes[1].0);
     }
 
@@ -2133,10 +2309,7 @@ mod tests {
         }
 
         assert_eq!(txs.len(), 2);
-        let hashes: Vec<_> = txs
-            .iter()
-            .map(|tx| Hash256::hash_xdr(tx).expect("hash"))
-            .collect();
+        let hashes: Vec<_> = txs.iter().map(full_hash).collect();
         assert!(hashes[0].0 <= hashes[1].0);
     }
 
@@ -2234,8 +2407,8 @@ mod tests {
         assert_eq!(queue.try_add(tx_low.clone()), TxQueueResult::Added);
         assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
 
-        let low_hash = Hash256::hash_xdr(&tx_low).unwrap();
-        let high_hash = Hash256::hash_xdr(&tx_high).unwrap();
+        let low_hash = full_hash(&tx_low);
+        let high_hash = full_hash(&tx_high);
         assert!(!queue.contains(&low_hash));
         assert!(queue.contains(&high_hash));
         assert_eq!(queue.len(), 1);
@@ -2321,9 +2494,9 @@ mod tests {
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 2);
 
-        let hash_dex_a = Hash256::hash_xdr(&dex_a).unwrap();
-        let hash_dex_b = Hash256::hash_xdr(&dex_b).unwrap();
-        let hash_classic = Hash256::hash_xdr(&classic).unwrap();
+        let hash_dex_a = full_hash(&dex_a);
+        let hash_dex_b = full_hash(&dex_b);
+        let hash_classic = full_hash(&classic);
         let included_dex = if hash_dex_a.0 <= hash_dex_b.0 {
             hash_dex_a
         } else {
@@ -2332,11 +2505,7 @@ mod tests {
 
         let mut expected = vec![hash_classic, included_dex];
         expected.sort_by(|a, b| a.0.cmp(&b.0));
-        let hashes: Vec<_> = set
-            .transactions
-            .iter()
-            .map(|tx| Hash256::hash_xdr(tx).unwrap())
-            .collect();
+        let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
         assert_eq!(hashes, expected);
     }
 
@@ -2389,9 +2558,9 @@ mod tests {
         set_source(&mut dex_low, 101);
         set_source(&mut dex_high, 102);
 
-        let non_dex_hash = Hash256::hash_xdr(&non_dex).unwrap();
-        let dex_low_hash = Hash256::hash_xdr(&dex_low).unwrap();
-        let dex_high_hash = Hash256::hash_xdr(&dex_high).unwrap();
+        let non_dex_hash = full_hash(&non_dex);
+        let dex_low_hash = full_hash(&dex_low);
+        let dex_high_hash = full_hash(&dex_high);
 
         assert_eq!(queue.try_add(non_dex), TxQueueResult::Added);
         assert_eq!(queue.try_add(dex_low), TxQueueResult::Added);
@@ -2425,11 +2594,11 @@ mod tests {
         set_source(&mut non_dex_mid, 113);
         set_source(&mut dex_new, 114);
 
-        let dex_hash = Hash256::hash_xdr(&dex).unwrap();
-        let non_dex_high_hash = Hash256::hash_xdr(&non_dex_high).unwrap();
-        let non_dex_low_hash = Hash256::hash_xdr(&non_dex_low).unwrap();
-        let non_dex_mid_hash = Hash256::hash_xdr(&non_dex_mid).unwrap();
-        let dex_new_hash = Hash256::hash_xdr(&dex_new).unwrap();
+        let dex_hash = full_hash(&dex);
+        let non_dex_high_hash = full_hash(&non_dex_high);
+        let non_dex_low_hash = full_hash(&non_dex_low);
+        let non_dex_mid_hash = full_hash(&non_dex_mid);
+        let dex_new_hash = full_hash(&dex_new);
 
         assert_eq!(queue.try_add(dex), TxQueueResult::Added);
         assert_eq!(queue.try_add(non_dex_high), TxQueueResult::Added);
@@ -2467,11 +2636,11 @@ mod tests {
         set_source(&mut non_dex_mid, 123);
         set_source(&mut dex_new, 124);
 
-        let dex_hash = Hash256::hash_xdr(&dex).unwrap();
-        let non_dex_high_hash = Hash256::hash_xdr(&non_dex_high).unwrap();
-        let non_dex_low_hash = Hash256::hash_xdr(&non_dex_low).unwrap();
-        let non_dex_mid_hash = Hash256::hash_xdr(&non_dex_mid).unwrap();
-        let dex_new_hash = Hash256::hash_xdr(&dex_new).unwrap();
+        let dex_hash = full_hash(&dex);
+        let non_dex_high_hash = full_hash(&non_dex_high);
+        let non_dex_low_hash = full_hash(&non_dex_low);
+        let non_dex_mid_hash = full_hash(&non_dex_mid);
+        let dex_new_hash = full_hash(&dex_new);
 
         assert_eq!(queue.try_add(dex), TxQueueResult::Added);
         assert_eq!(queue.try_add(non_dex_high), TxQueueResult::Added);
@@ -2614,10 +2783,10 @@ mod tests {
         set_source(&mut dex_b, 132);
         set_source(&mut non_dex_b, 133);
 
-        let dex_a_hash = Hash256::hash_xdr(&dex_a).unwrap();
-        let non_dex_a_hash = Hash256::hash_xdr(&non_dex_a).unwrap();
-        let dex_b_hash = Hash256::hash_xdr(&dex_b).unwrap();
-        let non_dex_b_hash = Hash256::hash_xdr(&non_dex_b).unwrap();
+        let dex_a_hash = full_hash(&dex_a);
+        let non_dex_a_hash = full_hash(&non_dex_a);
+        let dex_b_hash = full_hash(&dex_b);
+        let non_dex_b_hash = full_hash(&non_dex_b);
 
         assert_eq!(queue.try_add(dex_a), TxQueueResult::Added);
         assert_eq!(queue.try_add(non_dex_a), TxQueueResult::Added);
@@ -2661,8 +2830,8 @@ mod tests {
         assert_eq!(queue.try_add(dex_low.clone()), TxQueueResult::Added);
         assert_eq!(queue.try_add(dex_high.clone()), TxQueueResult::Added);
 
-        let low_hash = Hash256::hash_xdr(&dex_low).unwrap();
-        let high_hash = Hash256::hash_xdr(&dex_high).unwrap();
+        let low_hash = full_hash(&dex_low);
+        let high_hash = full_hash(&dex_high);
         assert!(!queue.contains(&low_hash));
         assert!(queue.contains(&high_hash));
         assert_eq!(queue.len(), 1);
@@ -2732,9 +2901,9 @@ mod tests {
         assert_eq!(queue.try_add(tx_mid.clone()), TxQueueResult::Added);
         assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
 
-        let low_hash = Hash256::hash_xdr(&tx_low).unwrap();
-        let mid_hash = Hash256::hash_xdr(&tx_mid).unwrap();
-        let high_hash = Hash256::hash_xdr(&tx_high).unwrap();
+        let low_hash = full_hash(&tx_low);
+        let mid_hash = full_hash(&tx_mid);
+        let high_hash = full_hash(&tx_high);
         assert!(!queue.contains(&low_hash));
         assert!(queue.contains(&mid_hash));
         assert!(queue.contains(&high_hash));
@@ -2780,9 +2949,9 @@ mod tests {
         set_source(&mut tx_high, 53);
         set_source(&mut tx_mid, 54);
 
-        let low_hash = Hash256::hash_xdr(&tx_low).unwrap();
-        let high_hash = Hash256::hash_xdr(&tx_high).unwrap();
-        let mid_hash = Hash256::hash_xdr(&tx_mid).unwrap();
+        let low_hash = full_hash(&tx_low);
+        let high_hash = full_hash(&tx_high);
+        let mid_hash = full_hash(&tx_mid);
 
         assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
         assert_eq!(queue.try_add(tx_high), TxQueueResult::Added);
@@ -2920,8 +3089,8 @@ mod tests {
         assert_eq!(queue.try_add(low_fee.clone()), TxQueueResult::Added);
         assert_eq!(queue.try_add(high_fee.clone()), TxQueueResult::Added);
 
-        let low_hash = Hash256::hash_xdr(&low_fee).unwrap();
-        let high_hash = Hash256::hash_xdr(&high_fee).unwrap();
+        let low_hash = full_hash(&low_fee);
+        let high_hash = full_hash(&high_fee);
         assert!(!queue.contains(&low_hash));
         assert!(queue.contains(&high_hash));
         assert_eq!(queue.len(), 1);
@@ -3103,8 +3272,8 @@ mod tests {
         set_source(&mut low, 21);
         set_source(&mut high, 22);
 
-        let low_hash = Hash256::hash_xdr(&low).unwrap();
-        let high_hash = Hash256::hash_xdr(&high).unwrap();
+        let low_hash = full_hash(&low);
+        let high_hash = full_hash(&high);
 
         assert_eq!(queue.try_add(low), TxQueueResult::Added);
         assert_eq!(queue.try_add(high), TxQueueResult::Added);
@@ -3119,7 +3288,7 @@ mod tests {
         let tx = make_test_envelope(200, 1);
         queue.try_add(tx.clone());
 
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = full_hash(&tx);
         assert!(queue.contains(&hash));
 
         queue.remove_applied(&[hash]);

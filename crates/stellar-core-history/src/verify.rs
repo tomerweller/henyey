@@ -10,7 +10,9 @@
 
 use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
 use stellar_core_common::Hash256;
-use stellar_xdr::curr::{LedgerHeader, ScpHistoryEntry, ScpStatement, WriteXdr};
+use stellar_core_crypto::Sha256Hasher;
+use stellar_core_ledger::TransactionSetVariant;
+use stellar_xdr::curr::{LedgerHeader, Limits, ScpHistoryEntry, ScpStatement, WriteXdr};
 
 /// Verify that a chain of ledger headers is correctly linked.
 ///
@@ -138,6 +140,29 @@ pub fn verify_tx_result_set(header: &LedgerHeader, tx_result_set_xdr: &[u8]) -> 
     Ok(())
 }
 
+/// Compute the transaction set hash according to protocol rules.
+pub fn compute_tx_set_hash(tx_set: &TransactionSetVariant) -> Result<Hash256> {
+    match tx_set {
+        TransactionSetVariant::Classic(set) => {
+            let mut hasher = Sha256Hasher::new();
+            hasher.update(&set.previous_ledger_hash.0);
+            for tx in set.txs.iter() {
+                let bytes = tx.to_xdr(Limits::none()).map_err(|e| {
+                    HistoryError::CatchupFailed(format!("failed to encode tx: {}", e))
+                })?;
+                hasher.update(&bytes);
+            }
+            Ok(hasher.finalize())
+        }
+        TransactionSetVariant::Generalized(set) => {
+            let bytes = set.to_xdr(Limits::none()).map_err(|e| {
+                HistoryError::CatchupFailed(format!("failed to encode tx set: {}", e))
+            })?;
+            Ok(Hash256::hash(&bytes))
+        }
+    }
+}
+
 /// Verify a transaction set against the ledger header.
 ///
 /// The hash of the transaction set must match what's in the header.
@@ -145,9 +170,9 @@ pub fn verify_tx_result_set(header: &LedgerHeader, tx_result_set_xdr: &[u8]) -> 
 /// # Arguments
 ///
 /// * `header` - The ledger header
-/// * `tx_set_xdr` - XDR-encoded transaction set
-pub fn verify_tx_set(header: &LedgerHeader, tx_set_xdr: &[u8]) -> Result<()> {
-    let actual_hash = Hash256::hash(tx_set_xdr);
+/// * `tx_set` - Transaction set variant
+pub fn verify_tx_set(header: &LedgerHeader, tx_set: &TransactionSetVariant) -> Result<()> {
+    let actual_hash = compute_tx_set_hash(tx_set)?;
     // The scpValue contains the tx set hash
     let expected_hash = Hash256::from(header.scp_value.tx_set_hash.clone());
 

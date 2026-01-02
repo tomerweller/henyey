@@ -480,16 +480,30 @@ fn parse_ledger_header(value: &JsonValue) -> LedgerHeader {
     }
 }
 
-#[test]
-fn ledger_close_meta_header_hash_vectors() {
-    let files = [
+fn v2_ledger_close_meta_files() -> &'static [&'static str] {
+    &[
+        "ledger-close-meta-v2-protocol-23.json",
+        "ledger-close-meta-v2-protocol-23-soroban.json",
+        "ledger-close-meta-v2-protocol-24.json",
+        "ledger-close-meta-v2-protocol-24-soroban.json",
         "ledger-close-meta-v2-protocol-25.json",
         "ledger-close-meta-v2-protocol-25-soroban.json",
+        "ledger-close-meta-v2-protocol-26.json",
+        "ledger-close-meta-v2-protocol-26-soroban.json",
+        "ledger-close-meta-enable-classic-events-v2-protocol-23.json",
+        "ledger-close-meta-enable-classic-events-v2-protocol-23-soroban.json",
+        "ledger-close-meta-enable-classic-events-v2-protocol-24.json",
+        "ledger-close-meta-enable-classic-events-v2-protocol-24-soroban.json",
         "ledger-close-meta-enable-classic-events-v2-protocol-25.json",
         "ledger-close-meta-enable-classic-events-v2-protocol-25-soroban.json",
-    ];
+        "ledger-close-meta-enable-classic-events-v2-protocol-26.json",
+        "ledger-close-meta-enable-classic-events-v2-protocol-26-soroban.json",
+    ]
+}
 
-    for name in files {
+#[test]
+fn ledger_close_meta_header_hash_vectors() {
+    for name in v2_ledger_close_meta_files() {
         let root = load_json(name);
         let meta = root
             .get("LedgerCloseMeta")
@@ -529,14 +543,7 @@ fn ledger_close_meta_header_hash_vectors() {
 
 #[test]
 fn ledger_close_meta_tx_result_hash_vectors() {
-    let files = [
-        "ledger-close-meta-v2-protocol-25.json",
-        "ledger-close-meta-v2-protocol-25-soroban.json",
-        "ledger-close-meta-enable-classic-events-v2-protocol-25.json",
-        "ledger-close-meta-enable-classic-events-v2-protocol-25-soroban.json",
-    ];
-
-    for name in files {
+    for name in v2_ledger_close_meta_files() {
         let root = load_json(name);
         let meta = root
             .get("LedgerCloseMeta")
