@@ -266,7 +266,7 @@ impl CatchupManager {
         };
 
         // Verify the final state matches expected bucket list hash
-        if let Err(e) = self.verify_final_state(&final_header, &bucket_list) {
+        if let Err(e) = self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list) {
             warn!("Final state verification warning: {}", e);
             // Don't fail on verification mismatch during catchup
             // as the bucket list may not be fully updated yet
@@ -429,7 +429,7 @@ impl CatchupManager {
             (final_header, final_state.ledger_hash, ledgers_applied)
         };
 
-        if let Err(e) = self.verify_final_state(&final_header, &bucket_list) {
+        if let Err(e) = self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list) {
             warn!("Final state verification warning: {}", e);
         }
 
@@ -915,12 +915,33 @@ impl CatchupManager {
     }
 
     /// Verify the final ledger state matches the expected bucket list hash.
+    ///
+    /// For Protocol 23+, the bucket list hash in the header is:
+    /// SHA256(live_bucket_list.hash() || hot_archive_bucket_list.hash())
     fn verify_final_state(
         &self,
         header: &LedgerHeader,
         bucket_list: &BucketList,
+        hot_archive_bucket_list: &Option<BucketList>,
     ) -> Result<()> {
-        let computed_hash = bucket_list.hash();
+        use sha2::{Digest, Sha256};
+
+        let computed_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
+            // Protocol 23+: combine live and hot archive bucket list hashes
+            let live_hash = bucket_list.hash();
+            let hot_hash = hot_archive.hash();
+            let mut hasher = Sha256::new();
+            hasher.update(live_hash.as_bytes());
+            hasher.update(hot_hash.as_bytes());
+            let result = hasher.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&result);
+            Hash256::from_bytes(bytes)
+        } else {
+            // Pre-protocol 23: just the live bucket list hash
+            bucket_list.hash()
+        };
+
         verify::verify_ledger_hash(header, &computed_hash)?;
 
         info!(
