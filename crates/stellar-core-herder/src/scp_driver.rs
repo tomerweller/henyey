@@ -395,6 +395,17 @@ impl ScpDriver {
             );
             return ValueValidation::Invalid;
         }
+        if let Some(latest) = *self.latest_externalized.read() {
+            if let Some(externalized) = self.externalized.read().get(&latest) {
+                if close_time <= externalized.close_time {
+                    debug!(
+                        "Close time {} not after last externalized {}",
+                        close_time, externalized.close_time
+                    );
+                    return ValueValidation::Invalid;
+                }
+            }
+        }
 
         // Check if we have the transaction set
         let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
@@ -402,14 +413,49 @@ impl ScpDriver {
             debug!("Missing transaction set: {}", tx_set_hash);
             return ValueValidation::MaybeValid;
         }
+        if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
+            match tx_set.tx_set.recompute_hash() {
+                Some(computed) if computed == tx_set_hash => {}
+                Some(computed) => {
+                    debug!(
+                        "Tx set hash mismatch: expected {}, computed {}",
+                        tx_set_hash, computed
+                    );
+                    return ValueValidation::Invalid;
+                }
+                None => {
+                    debug!("Failed to recompute tx set hash");
+                    return ValueValidation::Invalid;
+                }
+            }
+        }
 
+        let mut last_upgrade_order = None;
         for upgrade in stellar_value.upgrades.iter() {
-            if LedgerUpgrade::from_xdr(upgrade.0.as_slice(), stellar_xdr::curr::Limits::none())
-                .is_err()
-            {
+            let upgrade = match LedgerUpgrade::from_xdr(
+                upgrade.0.as_slice(),
+                stellar_xdr::curr::Limits::none(),
+            ) {
+                Ok(upgrade) => upgrade,
+                Err(_) => {
+                    debug!("Invalid ledger upgrade encountered");
+                    return ValueValidation::Invalid;
+                }
+            };
+            let order = match upgrade {
+                LedgerUpgrade::Version(_) => 0,
+                LedgerUpgrade::BaseFee(_) => 1,
+                LedgerUpgrade::MaxTxSetSize(_) => 2,
+                LedgerUpgrade::BaseReserve(_) => 3,
+                LedgerUpgrade::Flags(_) => 4,
+                LedgerUpgrade::Config(_) => 5,
+                LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
+            };
+            if last_upgrade_order.map_or(false, |prev| order <= prev) {
                 debug!("Invalid ledger upgrade encountered");
                 return ValueValidation::Invalid;
             }
+            last_upgrade_order = Some(order);
         }
 
         ValueValidation::Valid
@@ -799,7 +845,7 @@ impl SCPDriver for HerderScpCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, UpgradeType};
+    use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, UpgradeType, VecM};
 
     fn make_test_driver() -> ScpDriver {
         let config = ScpDriverConfig::default();
@@ -892,6 +938,120 @@ mod tests {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
             close_time: TimePoint(now),
             upgrades: vec![invalid_upgrade].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let value = Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .expect("xdr")
+                .try_into()
+                .unwrap(),
+        );
+
+        assert_eq!(driver.validate_value_impl(1, &value), ValueValidation::Invalid);
+    }
+
+    #[test]
+    fn test_tx_set_hash_mismatch_rejected() {
+        let driver = make_test_driver();
+
+        let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let value = Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .expect("xdr")
+                .try_into()
+                .unwrap(),
+        );
+
+        assert_eq!(driver.validate_value_impl(1, &value), ValueValidation::Invalid);
+    }
+
+    #[test]
+    fn test_close_time_must_increase() {
+        let driver = make_test_driver();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let base_close_time = 100;
+        let ext_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(base_close_time),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let ext = Value(
+            ext_value
+                .to_xdr(Limits::none())
+                .expect("xdr")
+                .try_into()
+                .unwrap(),
+        );
+        driver.record_externalized(1, ext);
+
+        let candidate = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(base_close_time),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = Value(
+            candidate
+                .to_xdr(Limits::none())
+                .expect("xdr")
+                .try_into()
+                .unwrap(),
+        );
+
+        assert_eq!(driver.validate_value_impl(2, &value), ValueValidation::Invalid);
+    }
+
+    #[test]
+    fn test_invalid_upgrade_order_rejected() {
+        let driver = make_test_driver();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let base_fee = LedgerUpgrade::BaseFee(200)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let version = LedgerUpgrade::Version(25)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let upgrades = vec![
+            UpgradeType(base_fee.try_into().unwrap()),
+            UpgradeType(version.try_into().unwrap()),
+        ];
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: upgrades.try_into().unwrap(),
             ext: StellarValueExt::Basic,
         };
 

@@ -530,34 +530,38 @@ impl SurgePricingPriorityQueue {
         let tx_account = tx.account_key();
 
         while needed_total.any_positive() || needed_lane.any_positive() {
-            let mut best: Option<(usize, QueueEntry)> = None;
-            for cursor in cursors.iter() {
-                if let Some(entry) = cursor.current() {
-                    match &best {
-                        None => best = Some((cursor.lane, entry.clone())),
-                        Some((_, best_entry)) => {
-                            if entry < best_entry {
-                                best = Some((cursor.lane, entry.clone()));
+            let mut evicted_due_to_lane_limit = false;
+            let (evict_lane, entry) = loop {
+                let mut best: Option<(usize, QueueEntry)> = None;
+                for cursor in cursors.iter() {
+                    if let Some(entry) = cursor.current() {
+                        match &best {
+                            None => best = Some((cursor.lane, entry.clone())),
+                            Some((_, best_entry)) => {
+                                if entry < best_entry {
+                                    best = Some((cursor.lane, entry.clone()));
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            let Some((evict_lane, entry)) = best else {
-                return None;
-            };
+                let Some((evict_lane, entry)) = best else {
+                    return None;
+                };
 
-            let can_evict = lane == GENERIC_LANE
-                || lane == evict_lane
-                || any_greater(&needed_total, &needed_lane);
-            let evicted_due_to_lane_limit = !can_evict;
-            if !can_evict {
-                if let Some(cursor) = cursors.get_mut(evict_lane) {
-                    cursor.drop_lane();
+                let can_evict = lane == GENERIC_LANE
+                    || lane == evict_lane
+                    || any_greater(&needed_total, &needed_lane);
+                if !can_evict {
+                    evicted_due_to_lane_limit = true;
+                    if let Some(cursor) = cursors.get_mut(evict_lane) {
+                        cursor.drop_lane();
+                    }
+                    continue;
                 }
-                continue;
-            }
+                break (evict_lane, entry);
+            };
 
             if fee_rate_cmp(
                 entry.total_fee,

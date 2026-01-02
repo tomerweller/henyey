@@ -109,7 +109,16 @@ pub fn execute_operation(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationExecutionResult> {
-    execute_operation_with_soroban(op, source_account_id, state, context, None)
+    execute_operation_with_soroban(
+        op,
+        source_account_id,
+        source_account_id,
+        0,
+        0,
+        state,
+        context,
+        None,
+    )
 }
 
 /// Execute a single operation with optional Soroban transaction data.
@@ -118,6 +127,9 @@ pub fn execute_operation(
 pub fn execute_operation_with_soroban(
     op: &Operation,
     source_account_id: &AccountId,
+    tx_source_id: &AccountId,
+    tx_seq: i64,
+    op_index: u32,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
@@ -241,7 +253,7 @@ pub fn execute_operation_with_soroban(
         OperationBody::CreateClaimableBalance(op_data) => {
             Ok(OperationExecutionResult::new(
                 claimable_balance::execute_create_claimable_balance(
-                    op_data, &op_source, state, context,
+                    op_data, &op_source, tx_source_id, tx_seq, op_index, state, context,
                 )?,
             ))
         }

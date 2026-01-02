@@ -159,7 +159,7 @@ pub fn replay_ledger_with_execution(
         .cloned()
         .map(|tx| (tx, None))
         .collect();
-    let (results, tx_results, _tx_result_metas) = execute_transaction_set(
+    let (results, tx_results, _tx_result_metas, _total_fees) = execute_transaction_set(
         &snapshot,
         &transactions,
         header.ledger_seq,
@@ -464,7 +464,7 @@ impl ReplayedLedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, StellarValue, TimePoint, VecM};
+    use stellar_xdr::curr::{Hash, StellarValue, TimePoint, VecM, WriteXdr};
 
     fn make_test_header(seq: u32) -> LedgerHeader {
         LedgerHeader {
@@ -489,6 +489,17 @@ mod tests {
             skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
             ext: stellar_xdr::curr::LedgerHeaderExt::V0,
         }
+    }
+
+    fn make_header_with_hashes(
+        seq: u32,
+        tx_set_hash: Hash,
+        tx_result_hash: Hash,
+    ) -> LedgerHeader {
+        let mut header = make_test_header(seq);
+        header.scp_value.tx_set_hash = tx_set_hash;
+        header.tx_set_result_hash = tx_result_hash;
+        header
     }
 
     fn make_empty_tx_set() -> TransactionSet {
@@ -546,5 +557,48 @@ mod tests {
         assert!(config.verify_results);
         assert!(config.verify_bucket_list);
         assert!(config.verify_invariants);
+    }
+
+    #[test]
+    fn test_replay_ledger_rejects_tx_set_hash_mismatch() {
+        let tx_set = make_empty_tx_set();
+        let tx_results = vec![];
+        let tx_metas = vec![];
+
+        let tx_set_xdr = tx_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("tx set xdr");
+        let tx_set_hash = Hash256::hash(&tx_set_xdr);
+        let header = make_header_with_hashes(
+            100,
+            Hash([1u8; 32]),
+            Hash(*tx_set_hash.as_bytes()),
+        );
+
+        let config = ReplayConfig::default();
+        let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);
+        assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
+    }
+
+    #[test]
+    fn test_replay_ledger_rejects_tx_result_hash_mismatch() {
+        let tx_set = make_empty_tx_set();
+        let tx_results = vec![];
+        let tx_metas = vec![];
+
+        let tx_set_xdr = tx_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("tx set xdr");
+        let tx_set_hash = Hash256::hash(&tx_set_xdr);
+
+        let header = make_header_with_hashes(
+            100,
+            Hash(*tx_set_hash.as_bytes()),
+            Hash([2u8; 32]),
+        );
+
+        let config = ReplayConfig::default();
+        let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);
+        assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
     }
 }

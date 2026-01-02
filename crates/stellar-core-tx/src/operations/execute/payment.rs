@@ -35,7 +35,7 @@ pub fn execute_payment(
     op: &PaymentOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     let dest = muxed_to_account_id(&op.destination);
 
@@ -45,7 +45,7 @@ pub fn execute_payment(
     }
 
     match &op.asset {
-        Asset::Native => execute_native_payment(source, &dest, op.amount, state),
+        Asset::Native => execute_native_payment(source, &dest, op.amount, state, context),
         Asset::CreditAlphanum4(_) | Asset::CreditAlphanum12(_) => {
             execute_credit_payment(source, &dest, &op.asset, op.amount, state)
         }
@@ -58,6 +58,7 @@ fn execute_native_payment(
     dest: &AccountId,
     amount: i64,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check destination exists
     if state.get_account(dest).is_none() {
@@ -71,7 +72,8 @@ fn execute_native_payment(
     };
 
     // Check source has sufficient available balance
-    let source_min_balance = state.minimum_balance(source_account.num_sub_entries);
+    let source_min_balance =
+        state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
     let available =
         source_account.balance - source_min_balance - account_liabilities(source_account).selling;
     if available < amount {
@@ -399,7 +401,9 @@ mod tests {
         let source_id = create_test_account_id(0);
         let dest_id = create_test_account_id(1);
 
-        let min_balance = state.minimum_balance(0);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
         state.create_account(create_test_account_with_liabilities(
             source_id.clone(),
             min_balance + 1_000_000,

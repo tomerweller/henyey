@@ -3,6 +3,15 @@
 Baseline: stellar-core v25.0.1
 Scope constraints: SQLite only; protocol 23+ only; no production hardening; no Postgres.
 
+## Milestones
+
+1. Join public testnet as a validator.
+2. Join public mainnet as a validator.
+3. Full parity with stellar-core C++ (v25.x).
+
+Notes:
+- Full invariant coverage (all v25 invariants + strict failure handling) is deferred to Milestone 3.
+
 ## Parity Matrix (v25.0.1)
 
 See `docs/PARITY_MATRIX.md` for the validated matrix and status notes.

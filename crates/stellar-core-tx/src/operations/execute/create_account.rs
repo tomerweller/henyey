@@ -2,8 +2,8 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountId, CreateAccountOp, CreateAccountResult,
-    CreateAccountResultCode, OperationResult, OperationResultTr, SequenceNumber, Thresholds,
-    String32,
+    CreateAccountResultCode, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr,
+    SequenceNumber, String32, Thresholds,
 };
 
 use crate::state::LedgerStateManager;
@@ -15,10 +15,22 @@ pub fn execute_create_account(
     op: &CreateAccountOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
+    let sponsor = state.active_sponsor_for(&op.destination);
+    let account_multiplier = 2i64;
+
     // Check starting balance meets minimum
-    let min_balance = state.minimum_balance(0);
+    let min_balance = if sponsor.is_some() {
+        state.minimum_balance_with_counts(
+            context.protocol_version,
+            0,
+            0,
+            account_multiplier,
+        )?
+    } else {
+        state.minimum_balance_with_counts(context.protocol_version, 0, 0, 0)?
+    };
     if op.starting_balance < min_balance {
         return Ok(make_result(CreateAccountResultCode::LowReserve));
     }
@@ -35,10 +47,29 @@ pub fn execute_create_account(
     };
 
     // Check source has sufficient available balance
-    let source_min_balance = state.minimum_balance(source_account.num_sub_entries);
+    let source_min_balance =
+        state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
     let available = source_account.balance - source_min_balance;
     if available < op.starting_balance {
         return Ok(make_result(CreateAccountResultCode::Underfunded));
+    }
+
+    if let Some(sponsor) = &sponsor {
+        let sponsor_account = state
+            .get_account(sponsor)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        let (num_sponsoring, num_sponsored) = state
+            .sponsorship_counts_for_account(sponsor)
+            .unwrap_or((0, 0));
+        let sponsor_min_balance = state.minimum_balance_with_counts(
+            context.protocol_version,
+            sponsor_account.num_sub_entries as i64,
+            num_sponsoring + account_multiplier,
+            num_sponsored,
+        )?;
+        if sponsor_account.balance < sponsor_min_balance {
+            return Ok(make_result(CreateAccountResultCode::LowReserve));
+        }
     }
 
     // Deduct from source
@@ -47,11 +78,13 @@ pub fn execute_create_account(
         .ok_or(TxError::SourceAccountNotFound)?;
     source_account_mut.balance -= op.starting_balance;
 
+    let starting_seq = state.starting_sequence_number()?;
+
     // Create new account
     let new_account = AccountEntry {
         account_id: op.destination.clone(),
         balance: op.starting_balance,
-        seq_num: SequenceNumber(0),
+        seq_num: SequenceNumber(starting_seq),
         num_sub_entries: 0,
         inflation_dest: None,
         flags: 0,
@@ -60,6 +93,15 @@ pub fn execute_create_account(
         signers: vec![].try_into().unwrap(),
         ext: AccountEntryExt::V0,
     };
+
+    let mut new_account = new_account;
+    if let Some(sponsor) = sponsor {
+        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: op.destination.clone(),
+        });
+        state.set_entry_sponsor(ledger_key, sponsor.clone());
+        state.apply_account_entry_sponsorship(&mut new_account, &sponsor, account_multiplier)?;
+    }
 
     state.create_account(new_account);
 
@@ -126,7 +168,9 @@ mod tests {
         // Verify destination was created
         let dest_acc = state.get_account(&dest_id);
         assert!(dest_acc.is_some());
-        assert_eq!(dest_acc.unwrap().balance, 20_000_000);
+        let dest_acc = dest_acc.unwrap();
+        assert_eq!(dest_acc.balance, 20_000_000);
+        assert_eq!(dest_acc.seq_num.0, (100_i64) << 32);
 
         // Verify source was deducted
         assert_eq!(state.get_account(&source_id).unwrap().balance, 80_000_000);

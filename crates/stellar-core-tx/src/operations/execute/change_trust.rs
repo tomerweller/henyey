@@ -5,7 +5,7 @@ use stellar_xdr::curr::{
     Liabilities, LiquidityPoolEntry, LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
     LiquidityPoolParameters, OperationResult, OperationResultTr, TrustLineAsset, TrustLineEntry,
     TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags,
+    TrustLineEntryV1Ext, TrustLineFlags, LedgerKey, LedgerKeyTrustLine,
 };
 
 use crate::apply::account_id_to_key;
@@ -18,7 +18,7 @@ pub fn execute_change_trust(
     op: &ChangeTrustOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Validate limit
     if op.limit < 0 {
@@ -34,6 +34,7 @@ pub fn execute_change_trust(
         ChangeTrustAsset::PoolShare(params) => (None, Some(params)),
     };
     let is_pool_share = pool_params.is_some();
+    let multiplier: i64 = if is_pool_share { 2 } else { 1 };
     let tl_asset = changeTrustAssetToTrustLineAsset(&op.line);
 
     // Check not trusting self
@@ -43,7 +44,11 @@ pub fn execute_change_trust(
             let source_key = account_id_to_key(source);
             let issuer_key = account_id_to_key(&issuer_id);
             if source_key == issuer_key {
-                return Ok(make_result(ChangeTrustResultCode::SelfNotAllowed));
+                return Ok(make_result(if context.protocol_version >= 16 {
+                    ChangeTrustResultCode::Malformed
+                } else {
+                    ChangeTrustResultCode::SelfNotAllowed
+                }));
             }
         }
     }
@@ -65,6 +70,9 @@ pub fn execute_change_trust(
             // Can't remove trustline with balance
             return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
         }
+        if trustline_liabilities(tl).buying > 0 {
+            return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
+        }
 
         if !is_pool_share && liquidity_pool_use_count(tl) != 0 {
             return Ok(make_result(ChangeTrustResultCode::CannotDelete));
@@ -79,18 +87,35 @@ pub fn execute_change_trust(
             decrement_pool_use_counts(state, source, params)?;
         }
 
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: source.clone(),
+            asset: tl_asset.clone(),
+        });
+        if state.entry_sponsor(&ledger_key).is_some() {
+            state.remove_entry_sponsorship_and_update_counts(
+                &ledger_key,
+                source,
+                multiplier,
+            )?;
+        }
+
         state.delete_trustline_by_trustline_asset(source, &tl_asset);
 
         // Decrease sub-entries
         if let Some(account) = state.get_account_mut(source) {
-            if account.num_sub_entries > 0 {
-                account.num_sub_entries -= 1;
+            if account.num_sub_entries >= multiplier as u32 {
+                account.num_sub_entries -= multiplier as u32;
+            } else {
+                return Err(TxError::Internal(
+                    "negative subentry count while deleting trustline".to_string(),
+                ));
             }
         }
     } else if existing.is_some() {
         // Updating existing trustline
         let existing_balance = existing.map(|tl| tl.balance).unwrap_or(0);
-        if op.limit < existing_balance {
+        let existing_buying_liab = existing.map(trustline_liabilities).map(|l| l.buying).unwrap_or(0);
+        if op.limit < existing_balance.saturating_add(existing_buying_liab) {
             return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
         }
 
@@ -126,12 +151,33 @@ pub fn execute_change_trust(
         }
 
         // Check source can afford new sub-entry
-        let source_account = state
-            .get_account(source)
-            .ok_or(TxError::SourceAccountNotFound)?;
-        let new_min_balance = state.minimum_balance(source_account.num_sub_entries + 1);
-        if source_account.balance < new_min_balance {
-            return Ok(make_result(ChangeTrustResultCode::LowReserve));
+        let sponsor = state.active_sponsor_for(source);
+        if let Some(sponsor) = &sponsor {
+            let sponsor_account = state
+                .get_account(sponsor)
+                .ok_or(TxError::SourceAccountNotFound)?;
+            let new_min_balance = state.minimum_balance_for_account_with_deltas(
+                sponsor_account,
+                context.protocol_version,
+                0,
+                multiplier,
+                0,
+            )?;
+            if sponsor_account.balance < new_min_balance {
+                return Ok(make_result(ChangeTrustResultCode::LowReserve));
+            }
+        } else {
+            let source_account = state
+                .get_account(source)
+                .ok_or(TxError::SourceAccountNotFound)?;
+            let new_min_balance = state.minimum_balance_for_account(
+                source_account,
+                context.protocol_version,
+                multiplier,
+            )?;
+            if source_account.balance < new_min_balance {
+                return Ok(make_result(ChangeTrustResultCode::LowReserve));
+            }
         }
 
         // Create trustline
@@ -145,6 +191,13 @@ pub fn execute_change_trust(
         };
 
         state.create_trustline(trustline);
+        if sponsor.is_some() {
+            let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                account_id: source.clone(),
+                asset: tl_asset.clone(),
+            });
+            state.apply_entry_sponsorship(ledger_key, source, multiplier)?;
+        }
 
         if is_pool_share {
             let params = pool_params.expect("pool params must exist");
@@ -153,7 +206,7 @@ pub fn execute_change_trust(
 
         // Increase sub-entries
         if let Some(account) = state.get_account_mut(source) {
-            account.num_sub_entries += 1;
+            account.num_sub_entries += multiplier as u32;
         }
     }
 
@@ -224,6 +277,16 @@ fn build_trustline_flags(asset: Option<&Asset>, state: &LedgerStateManager) -> u
 
 fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
     flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
+}
+
+fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
+    match &trustline.ext {
+        TrustLineEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
 }
 
 fn validate_pool_share_trustlines(
@@ -451,6 +514,7 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::*;
     use sha2::{Digest, Sha256};
+    use crate::operations::execute::manage_offer::execute_manage_sell_offer;
 
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
@@ -516,6 +580,23 @@ mod tests {
                     ext: TrustLineEntryExtensionV2Ext::V0,
                 }),
             }),
+        }
+    }
+
+    fn create_test_trustline(
+        account_id: AccountId,
+        asset: TrustLineAsset,
+        balance: i64,
+        limit: i64,
+        flags: u32,
+    ) -> TrustLineEntry {
+        TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V0,
         }
     }
 
@@ -598,6 +679,205 @@ mod tests {
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
                 assert!(matches!(r, ChangeTrustResult::NoIssuer));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_change_trust_self_issuer_malformed_protocol_16_plus() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 23;
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: source_id.clone(),
+        };
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(matches!(r, ChangeTrustResult::Malformed));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_change_trust_self_issuer_not_allowed_pre_16() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 15;
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: source_id.clone(),
+        };
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(matches!(r, ChangeTrustResult::SelfNotAllowed));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_change_trust_limit_below_buying_liabilities_or_delete() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
+        state.create_account(create_test_account(
+            source_id.clone(),
+            min_balance + 20_000_000,
+        ));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"IDR\0"),
+            issuer: issuer_id.clone(),
+        };
+        let trust_asset = Asset::CreditAlphanum4(asset.clone());
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(asset.clone()),
+            0,
+            1_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        let offer = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: trust_asset.clone(),
+            amount: 500,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+        let offer_result =
+            execute_manage_sell_offer(&offer, &source_id, &mut state, &context).unwrap();
+        match offer_result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::Success(_)), "{r:?}");
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        let reduce_ok = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset.clone()),
+            limit: 500,
+        };
+        let reduce_ok_res = execute_change_trust(&reduce_ok, &source_id, &mut state, &context);
+        match reduce_ok_res.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(matches!(r, ChangeTrustResult::Success));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        let reduce_bad = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset.clone()),
+            limit: 499,
+        };
+        let reduce_bad_res = execute_change_trust(&reduce_bad, &source_id, &mut state, &context);
+        match reduce_bad_res.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(matches!(r, ChangeTrustResult::InvalidLimit));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        let delete_bad = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 0,
+        };
+        let delete_bad_res = execute_change_trust(&delete_bad, &source_id, &mut state, &context);
+        match delete_bad_res.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(matches!(r, ChangeTrustResult::InvalidLimit));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_change_trust_native_asset_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::Native,
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(matches!(r, ChangeTrustResult::Malformed));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_change_trust_delete_with_balance_invalid() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        };
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(asset.clone()),
+            100,
+            1_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 0,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(matches!(r, ChangeTrustResult::InvalidLimit));
             }
             other => panic!("unexpected result: {:?}", other),
         }

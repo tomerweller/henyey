@@ -13,15 +13,15 @@ use stellar_core_common::{
     any_greater, Hash256, NetworkId, Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES,
 };
 use stellar_xdr::curr::{
-    AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Limits,
-    Preconditions, SignerKey, TransactionEnvelope,
+    AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash,
+    Limits, Preconditions, SignerKey, TransactionEnvelope,
 };
 use stellar_xdr::curr::WriteXdr;
 
 use crate::error::HerderError;
 use crate::surge_pricing::{
     DexLimitingLaneConfig, OpsOnlyLaneConfig, SorobanGenericLaneConfig,
-    SurgePricingPriorityQueue, GENERIC_LANE,
+    SurgePricingLaneConfig, SurgePricingPriorityQueue, GENERIC_LANE,
 };
 use crate::Result;
 use rand::Rng;
@@ -112,6 +112,8 @@ pub struct ValidationContext {
     pub close_time: u64,
     /// Protocol version.
     pub protocol_version: u32,
+    /// Current ledger base fee (stroops per op).
+    pub base_fee: u32,
 }
 
 impl Default for ValidationContext {
@@ -123,6 +125,7 @@ impl Default for ValidationContext {
                 .unwrap_or_default()
                 .as_secs(),
             protocol_version: 21,
+            base_fee: 100,
         }
     }
 }
@@ -243,6 +246,28 @@ fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> b
         Ordering::Greater => true,
         Ordering::Less => false,
         Ordering::Equal => new_tx.hash.0 < old_tx.hash.0,
+    }
+}
+
+fn compute_better_fee(evicted_fee: u64, evicted_ops: u32, tx_ops: u32) -> u64 {
+    if evicted_ops == 0 {
+        return 0;
+    }
+    let numerator = (evicted_fee as u128).saturating_mul(tx_ops as u128);
+    let denominator = evicted_ops as u128;
+    let base = numerator / denominator;
+    let candidate = base.saturating_add(1);
+    u64::try_from(candidate).unwrap_or(u64::MAX)
+}
+
+fn min_inclusion_fee_to_beat(evicted: (u64, u32), tx: &QueuedTransaction) -> u64 {
+    if evicted.1 == 0 {
+        return 0;
+    }
+    if fee_rate_cmp(evicted.0, evicted.1, tx.total_fee, tx.op_count) != Ordering::Less {
+        compute_better_fee(evicted.0, evicted.1, tx.op_count)
+    } else {
+        0
     }
 }
 
@@ -368,6 +393,22 @@ impl TransactionSet {
     pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
+
+    /// Recompute the transaction set hash from its contents.
+    pub fn recompute_hash(&self) -> Option<Hash256> {
+        if let Some(gen) = &self.generalized_tx_set {
+            let bytes = gen.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
+            return Some(Hash256::hash(&bytes));
+        }
+
+        let txs: Vec<TransactionEnvelope> = self.transactions.clone();
+        let tx_set = stellar_xdr::curr::TransactionSet {
+            previous_ledger_hash: Hash::from(self.previous_ledger_hash),
+            txs: txs.try_into().ok()?,
+        };
+        let bytes = tx_set.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
+        Some(Hash256::hash(&bytes))
+    }
 }
 
 /// Queue of pending transactions.
@@ -382,16 +423,27 @@ pub struct TransactionQueue {
     seen: RwLock<HashSet<Hash256>>,
     /// Validation context (ledger state info for validation).
     validation_context: RwLock<ValidationContext>,
+    /// Lane eviction thresholds for classic queue admission.
+    classic_lane_evicted_inclusion_fee: RwLock<Vec<(u64, u32)>>,
+    /// Lane eviction thresholds for Soroban queue admission.
+    soroban_lane_evicted_inclusion_fee: RwLock<Vec<(u64, u32)>>,
+    /// Eviction threshold for global queue limits.
+    global_evicted_inclusion_fee: RwLock<(u64, u32)>,
 }
 
 impl TransactionQueue {
     /// Create a new transaction queue.
     pub fn new(config: TxQueueConfig) -> Self {
+        let mut ctx = ValidationContext::default();
+        ctx.base_fee = config.min_fee_per_op;
         Self {
             config,
             by_hash: RwLock::new(HashMap::new()),
             seen: RwLock::new(HashSet::new()),
-            validation_context: RwLock::new(ValidationContext::default()),
+            validation_context: RwLock::new(ctx),
+            classic_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
+            soroban_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
+            global_evicted_inclusion_fee: RwLock::new((0, 0)),
         }
     }
 
@@ -409,11 +461,18 @@ impl TransactionQueue {
     }
 
     /// Update the validation context (should be called when ledger closes).
-    pub fn update_validation_context(&self, ledger_seq: u32, close_time: u64, protocol_version: u32) {
+    pub fn update_validation_context(
+        &self,
+        ledger_seq: u32,
+        close_time: u64,
+        protocol_version: u32,
+        base_fee: u32,
+    ) {
         let mut ctx = self.validation_context.write();
         ctx.ledger_seq = ledger_seq;
         ctx.close_time = close_time;
         ctx.protocol_version = protocol_version;
+        ctx.base_fee = base_fee;
     }
 
     /// Validate a transaction before queueing.
@@ -425,6 +484,7 @@ impl TransactionQueue {
 
         let frame = TransactionFrame::with_network(envelope.clone(), self.config.network_id);
         let ctx = self.validation_context.read();
+        let base_fee = ctx.base_fee.max(self.config.min_fee_per_op);
 
         // Validate basic structure
         if !frame.is_valid_structure() {
@@ -436,7 +496,7 @@ impl TransactionQueue {
             let ledger_ctx = LedgerContext::new(
                 ctx.ledger_seq,
                 ctx.close_time,
-                self.config.min_fee_per_op,
+                base_fee,
                 5_000_000, // base reserve
                 ctx.protocol_version,
                 self.config.network_id.clone(),
@@ -456,7 +516,7 @@ impl TransactionQueue {
             let ledger_ctx = LedgerContext::new(
                 ctx.ledger_seq,
                 ctx.close_time,
-                self.config.min_fee_per_op,
+                base_fee,
                 5_000_000, // base reserve
                 ctx.protocol_version,
                 self.config.network_id.clone(),
@@ -488,7 +548,7 @@ impl TransactionQueue {
         exclude: &HashSet<Hash256>,
         filter: F,
         seed: u64,
-    ) -> Option<Vec<Hash256>>
+    ) -> Option<Vec<(QueuedTransaction, bool)>>
     where
         F: Fn(&QueuedTransaction) -> bool,
     {
@@ -503,7 +563,7 @@ impl TransactionQueue {
         }
         queue
             .can_fit_with_eviction(queued, None, &self.config.network_id, ledger_version)
-            .map(|evictions| evictions.into_iter().map(|(tx, _)| tx.hash).collect())
+            .map(|evictions| evictions.into_iter().collect())
     }
 
     /// Try to add a transaction to the queue.
@@ -525,7 +585,11 @@ impl TransactionQueue {
         }
 
         // Check fee
-        if queued.fee_per_op < self.config.min_fee_per_op as u64 {
+        let min_fee_per_op = {
+            let ctx = self.validation_context.read();
+            ctx.base_fee.max(self.config.min_fee_per_op) as u64
+        };
+        if queued.fee_per_op < min_fee_per_op {
             return TxQueueResult::FeeTooLow;
         }
 
@@ -542,6 +606,7 @@ impl TransactionQueue {
         }
 
         let mut pending_evictions: HashSet<Hash256> = HashSet::new();
+        let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
         let seed = if cfg!(test) { 0 } else { rand::thread_rng().gen() };
 
         if !queued_is_soroban
@@ -564,7 +629,75 @@ impl TransactionQueue {
                     Resource::new(vec![dex_ops as i64])
                 }
             });
-            let lane_config = DexLimitingLaneConfig::new(generic_limit, dex_limit);
+            let lane_config = DexLimitingLaneConfig::new(generic_limit.clone(), dex_limit.clone());
+            let lane = lane_config.get_lane(&queued_frame);
+            {
+                let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
+                if lane_fees.len() != lane_config.lane_limits().len() {
+                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                }
+                let global_fee = *self.global_evicted_inclusion_fee.read();
+                let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], &queued);
+                min_fee = min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], &queued));
+                if self.config.max_queue_ops.is_some() {
+                    min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, &queued));
+                }
+                if min_fee > 0 {
+                    return TxQueueResult::FeeTooLow;
+                }
+            }
+        }
+
+        if queued_is_soroban {
+            if let Some(limit) = &self.config.max_queue_soroban_resources {
+                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
+                let lane = lane_config.get_lane(&queued_frame);
+                {
+                    let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
+                    if lane_fees.len() != lane_config.lane_limits().len() {
+                        lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                    }
+                    let global_fee = *self.global_evicted_inclusion_fee.read();
+                    let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], &queued);
+                    min_fee = min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], &queued));
+                    if self.config.max_queue_ops.is_some() {
+                        min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, &queued));
+                    }
+                    if min_fee > 0 {
+                        return TxQueueResult::FeeTooLow;
+                    }
+                }
+            }
+        }
+
+        if self.config.max_queue_ops.is_some() {
+            let global_fee = *self.global_evicted_inclusion_fee.read();
+            if min_inclusion_fee_to_beat(global_fee, &queued) > 0 {
+                return TxQueueResult::FeeTooLow;
+            }
+        }
+
+        if !queued_is_soroban
+            && (self.config.max_queue_classic_bytes.is_some()
+                || self.config.max_queue_dex_ops.is_some())
+        {
+            let use_bytes = self.config.max_queue_classic_bytes.is_some();
+            let ops_limit = i64::MAX;
+            let generic_limit = if use_bytes {
+                let bytes_limit = self.config.max_queue_classic_bytes.unwrap_or(u32::MAX) as i64;
+                Resource::new(vec![ops_limit, bytes_limit])
+            } else {
+                Resource::new(vec![ops_limit])
+            };
+            let dex_limit = self.config.max_queue_dex_ops.map(|dex_ops| {
+                if use_bytes {
+                    // Upstream uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
+                    Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
+                } else {
+                    Resource::new(vec![dex_ops as i64])
+                }
+            });
+            let lane_config = DexLimitingLaneConfig::new(generic_limit.clone(), dex_limit.clone());
             let filter = |tx: &QueuedTransaction| {
                 let frame = stellar_core_tx::TransactionFrame::with_network(
                     tx.envelope.clone(),
@@ -583,7 +716,27 @@ impl TransactionQueue {
             ) else {
                 return TxQueueResult::QueueFull;
             };
-            pending_evictions.extend(evictions);
+            let lane_config = DexLimitingLaneConfig::new(generic_limit, dex_limit);
+            for (evicted, evicted_due_to_lane_limit) in evictions {
+                if !pending_evictions.insert(evicted.hash) {
+                    continue;
+                }
+                pending_eviction_list.push(evicted.clone());
+                let frame = stellar_core_tx::TransactionFrame::with_network(
+                    evicted.envelope.clone(),
+                    self.config.network_id,
+                );
+                let lane = lane_config.get_lane(&frame);
+                let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
+                if lane_fees.len() != lane_config.lane_limits().len() {
+                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                }
+                if evicted_due_to_lane_limit {
+                    lane_fees[lane] = (evicted.total_fee, evicted.op_count);
+                } else {
+                    lane_fees[GENERIC_LANE] = (evicted.total_fee, evicted.op_count);
+                }
+            }
         }
 
         if queued_is_soroban {
@@ -607,7 +760,27 @@ impl TransactionQueue {
                 ) else {
                     return TxQueueResult::QueueFull;
                 };
-                pending_evictions.extend(evictions);
+                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
+                for (evicted, evicted_due_to_lane_limit) in evictions {
+                    if !pending_evictions.insert(evicted.hash) {
+                        continue;
+                    }
+                    pending_eviction_list.push(evicted.clone());
+                    let frame = stellar_core_tx::TransactionFrame::with_network(
+                        evicted.envelope.clone(),
+                        self.config.network_id,
+                    );
+                    let lane = lane_config.get_lane(&frame);
+                    let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
+                    if lane_fees.len() != lane_config.lane_limits().len() {
+                        lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                    }
+                    if evicted_due_to_lane_limit {
+                        lane_fees[lane] = (evicted.total_fee, evicted.op_count);
+                    } else {
+                        lane_fees[GENERIC_LANE] = (evicted.total_fee, evicted.op_count);
+                    }
+                }
             }
         }
 
@@ -625,11 +798,18 @@ impl TransactionQueue {
             ) else {
                 return TxQueueResult::QueueFull;
             };
-            pending_evictions.extend(evictions);
+            for (evicted, _evicted_due_to_lane_limit) in evictions {
+                if !pending_evictions.insert(evicted.hash) {
+                    continue;
+                }
+                pending_eviction_list.push(evicted.clone());
+                let mut global_fee = self.global_evicted_inclusion_fee.write();
+                *global_fee = (evicted.total_fee, evicted.op_count);
+            }
         }
 
-        for hash in pending_evictions {
-            by_hash.remove(&hash);
+        for evicted in pending_eviction_list {
+            by_hash.remove(&evicted.hash);
         }
 
         // Check queue size
@@ -720,6 +900,7 @@ impl TransactionQueue {
             dex_limited,
             classic_limited,
         } = self.select_transactions_with_starting_seq(max_ops, starting_seq);
+        let base_fee = self.validation_context.read().base_fee as i64;
         let mut classic_txs = Vec::new();
         let mut soroban_txs = Vec::new();
         for tx in &transactions {
@@ -745,8 +926,11 @@ impl TransactionQueue {
                 .iter()
                 .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
                 .min()
-        } else {
+                .or(Some(base_fee))
+        } else if classic_txs.is_empty() {
             None
+        } else {
+            Some(base_fee)
         };
         let dex_base_fee = if dex_limited {
             classic_txs
@@ -760,8 +944,9 @@ impl TransactionQueue {
                 })
                 .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
                 .min()
+                .or(Some(base_fee))
         } else {
-            None
+            classic_base_fee
         };
 
         let mut classic_components: Vec<TxSetComponent> = Vec::new();
@@ -800,8 +985,11 @@ impl TransactionQueue {
                 .iter()
                 .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
                 .min()
-        } else {
+                .or(Some(base_fee))
+        } else if soroban_txs.is_empty() {
             None
+        } else {
+            Some(base_fee)
         };
 
         let soroban_phase = if soroban_txs.is_empty() {
@@ -937,18 +1125,31 @@ impl TransactionQueue {
         accounts.sort();
         for account in accounts {
             if let Some(txs) = layered.get(&account) {
+                let mut seen_soroban = false;
                 for tx in txs {
                     let frame = stellar_core_tx::TransactionFrame::with_network(
                         tx.envelope.clone(),
                         self.config.network_id,
                     );
-                    if frame.is_soroban() {
-                        soroban_accounts
-                            .entry(account.clone())
-                            .or_default()
-                            .push(tx.clone());
+                    let is_soroban = frame.is_soroban();
+                    if !seen_soroban {
+                        if is_soroban {
+                            seen_soroban = true;
+                            soroban_accounts
+                                .entry(account.clone())
+                                .or_default()
+                                .push(tx.clone());
+                        } else {
+                            classic_accounts
+                                .entry(account.clone())
+                                .or_default()
+                                .push(tx.clone());
+                        }
                     } else {
-                        classic_accounts
+                        if !is_soroban {
+                            break;
+                        }
+                        soroban_accounts
                             .entry(account.clone())
                             .or_default()
                             .push(tx.clone());
@@ -1176,6 +1377,12 @@ impl TransactionQueue {
         let mut by_hash = self.by_hash.write();
         let max_age = self.config.max_age_secs;
         by_hash.retain(|_, tx| !tx.is_expired(max_age));
+
+        // Mirror upstream: clear eviction thresholds after aging to avoid
+        // carrying stale min-fee requirements.
+        self.classic_lane_evicted_inclusion_fee.write().clear();
+        self.soroban_lane_evicted_inclusion_fee.write().clear();
+        *self.global_evicted_inclusion_fee.write() = (0, 0);
     }
 
     /// Clear all transactions.
@@ -1440,22 +1647,28 @@ mod tests {
     }
 
     fn make_dex_envelope(fee: u32) -> TransactionEnvelope {
+        make_dex_envelope_with_ops(fee, 1)
+    }
+
+    fn make_dex_envelope_with_ops(fee: u32, ops: usize) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([10u8; 32]));
         let selling = Asset::Native;
         let buying = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4(*b"USDC"),
             issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([11u8; 32]))),
         });
-        let op = Operation {
-            source_account: None,
-            body: OperationBody::ManageSellOffer(ManageSellOfferOp {
-                selling,
-                buying,
-                amount: 1,
-                price: Price { n: 1, d: 1 },
-                offer_id: 0,
-            }),
-        };
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::ManageSellOffer(ManageSellOfferOp {
+                    selling: selling.clone(),
+                    buying: buying.clone(),
+                    amount: 1,
+                    price: Price { n: 1, d: 1 },
+                    offer_id: 0,
+                }),
+            })
+            .collect();
 
         let tx = Transaction {
             source_account: source,
@@ -1463,7 +1676,7 @@ mod tests {
             seq_num: SequenceNumber(1),
             cond: Preconditions::None,
             memo: Memo::None,
-            operations: vec![op].try_into().unwrap(),
+            operations: operations.try_into().unwrap(),
             ext: TransactionExt::V0,
         };
 
@@ -1660,6 +1873,64 @@ mod tests {
     }
 
     #[test]
+    fn test_sequence_blocks_classic_after_soroban() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut classic = make_test_envelope(250, 1);
+        let mut soroban = make_soroban_envelope(200);
+        let mut classic_late = make_test_envelope(200, 1);
+        set_source(&mut classic, 7);
+        set_source(&mut soroban, 7);
+        set_source(&mut classic_late, 7);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        if let TransactionEnvelope::Tx(env) = &mut soroban {
+            env.tx.seq_num = SequenceNumber(2);
+        }
+        if let TransactionEnvelope::Tx(env) = &mut classic_late {
+            env.tx.seq_num = SequenceNumber(3);
+        }
+
+        queue.try_add(classic);
+        queue.try_add(soroban);
+        queue.try_add(classic_late);
+
+        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_sequence_allows_soroban_suffix() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut classic = make_test_envelope(200, 1);
+        let mut soroban_a = make_soroban_envelope(200);
+        let mut soroban_b = make_soroban_envelope(200);
+        set_source(&mut classic, 7);
+        set_source(&mut soroban_a, 7);
+        set_source(&mut soroban_b, 7);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        if let TransactionEnvelope::Tx(env) = &mut soroban_a {
+            env.tx.seq_num = SequenceNumber(2);
+        }
+        if let TransactionEnvelope::Tx(env) = &mut soroban_b {
+            env.tx.seq_num = SequenceNumber(3);
+        }
+
+        queue.try_add(classic);
+        queue.try_add(soroban_a);
+        queue.try_add(soroban_b);
+
+        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn test_sequence_respects_starting_seq() {
         let queue = TransactionQueue::with_defaults();
 
@@ -1682,6 +1953,32 @@ mod tests {
         let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
         let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         assert_eq!(seqs, vec![6]);
+    }
+
+    #[test]
+    fn test_starting_sequence_boundary() {
+        let queue = TransactionQueue::with_defaults();
+
+        let starting_seq = (4_i64) << 32;
+        let mut tx_starting = make_test_envelope(200, 1);
+        let mut tx_next = make_test_envelope(200, 1);
+        if let TransactionEnvelope::Tx(env) = &mut tx_starting {
+            env.tx.seq_num = SequenceNumber(starting_seq);
+        }
+        if let TransactionEnvelope::Tx(env) = &mut tx_next {
+            env.tx.seq_num = SequenceNumber(starting_seq + 1);
+        }
+
+        queue.try_add(tx_starting);
+        queue.try_add(tx_next);
+
+        let account_id = account_id_from_envelope(&make_test_envelope(200, 1));
+        let mut starting = std::collections::HashMap::new();
+        starting.insert(account_key_from_account_id(&account_id), starting_seq);
+
+        let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
+        let seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        assert_eq!(seqs, vec![starting_seq + 1]);
     }
 
     #[test]
@@ -1734,6 +2031,126 @@ mod tests {
             }
             _ => panic!("expected soroban phase"),
         }
+    }
+
+    #[test]
+    fn test_classic_base_fee_defaults_to_min_fee() {
+        let queue = TransactionQueue::with_defaults();
+        let expected_base_fee = queue.validation_context.read().base_fee as i64;
+
+        queue.try_add(make_test_envelope(200, 1));
+        queue.try_add(make_test_envelope(300, 1));
+
+        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let base_fee = match &v1.phases[0] {
+            stellar_xdr::curr::TransactionPhase::V0(components) => {
+                let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) =
+                    &components[0];
+                comp.base_fee
+            }
+            _ => None,
+        };
+
+        assert_eq!(base_fee, Some(expected_base_fee));
+    }
+
+    #[test]
+    fn test_soroban_base_fee_defaults_to_min_fee() {
+        let queue = TransactionQueue::with_defaults();
+        let expected_base_fee = queue.validation_context.read().base_fee as i64;
+
+        queue.try_add(make_soroban_envelope(200));
+        queue.try_add(make_soroban_envelope(300));
+
+        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let base_fee = match &v1.phases[1] {
+            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel.base_fee,
+            _ => None,
+        };
+
+        assert_eq!(base_fee, Some(expected_base_fee));
+    }
+
+    #[test]
+    fn test_classic_component_orders_by_hash() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx_a = make_test_envelope(200, 1);
+        let mut tx_b = make_test_envelope(200, 1);
+        set_source(&mut tx_a, 11);
+        set_source(&mut tx_b, 12);
+
+        queue.try_add(tx_b.clone());
+        queue.try_add(tx_a.clone());
+
+        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+
+        let txs = match &v1.phases[0] {
+            stellar_xdr::curr::TransactionPhase::V0(components) => {
+                let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) =
+                    &components[0];
+                comp.txs.to_vec()
+            }
+            _ => panic!("expected classic phase"),
+        };
+
+        assert_eq!(txs.len(), 2);
+        let hashes: Vec<_> = txs
+            .iter()
+            .map(|tx| Hash256::hash_xdr(tx).expect("hash"))
+            .collect();
+        assert!(hashes[0].0 <= hashes[1].0);
+    }
+
+    #[test]
+    fn test_soroban_component_orders_by_hash() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx_a = make_soroban_envelope(200);
+        let mut tx_b = make_soroban_envelope(200);
+        set_source(&mut tx_a, 21);
+        set_source(&mut tx_b, 22);
+
+        queue.try_add(tx_b.clone());
+        queue.try_add(tx_a.clone());
+
+        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+
+        let mut txs = Vec::new();
+        match &v1.phases[1] {
+            stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                for stage in parallel.execution_stages.iter() {
+                    for cluster in stage.iter() {
+                        txs.extend(cluster.0.iter().cloned());
+                    }
+                }
+            }
+            _ => panic!("expected soroban phase"),
+        }
+
+        assert_eq!(txs.len(), 2);
+        let hashes: Vec<_> = txs
+            .iter()
+            .map(|tx| Hash256::hash_xdr(tx).expect("hash"))
+            .collect();
+        assert!(hashes[0].0 <= hashes[1].0);
+    }
+
+    #[test]
+    fn test_queue_rejects_below_current_base_fee() {
+        let queue = TransactionQueue::with_defaults();
+
+        queue.update_validation_context(1, 0, 25, 500);
+
+        let low_fee = make_test_envelope(200, 1);
+        let high_fee = make_test_envelope(600, 1);
+
+        assert_eq!(queue.try_add(low_fee), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.try_add(high_fee), TxQueueResult::Added);
     }
 
     #[test]
@@ -1800,6 +2217,54 @@ mod tests {
     }
 
     #[test]
+    fn test_queue_classic_byte_limit_eviction() {
+        let mut tx_low = make_test_envelope(200, 1);
+        let mut tx_high = make_test_envelope(400, 1);
+        set_source(&mut tx_low, 62);
+        set_source(&mut tx_high, 63);
+
+        let byte_limit = envelope_size(&tx_high) as u32;
+        let config = TxQueueConfig {
+            max_queue_classic_bytes: Some(byte_limit),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        assert_eq!(queue.try_add(tx_low.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
+
+        let low_hash = Hash256::hash_xdr(&tx_low).unwrap();
+        let high_hash = Hash256::hash_xdr(&tx_high).unwrap();
+        assert!(!queue.contains(&low_hash));
+        assert!(queue.contains(&high_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_queue_classic_byte_limit_sets_min_fee_after_eviction() {
+        let mut tx_low = make_test_envelope(200, 1);
+        let mut tx_high = make_test_envelope(400, 1);
+        let mut tx_lower = make_test_envelope(100, 1);
+        set_source(&mut tx_low, 64);
+        set_source(&mut tx_high, 65);
+        set_source(&mut tx_lower, 66);
+
+        let byte_limit = envelope_size(&tx_high) as u32;
+        let config = TxQueueConfig {
+            max_queue_classic_bytes: Some(byte_limit),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_lower), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
     fn test_dex_ops_limit() {
         let config = TxQueueConfig {
             max_dex_ops: Some(1),
@@ -1835,6 +2300,351 @@ mod tests {
     }
 
     #[test]
+    fn test_dex_lane_limit_deterministic_selection() {
+        let config = TxQueueConfig {
+            max_dex_ops: Some(1),
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex_a = make_dex_envelope(200);
+        let mut dex_b = make_dex_envelope(200);
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut dex_a, 201);
+        set_source(&mut dex_b, 202);
+        set_source(&mut classic, 203);
+
+        queue.try_add(dex_a.clone());
+        queue.try_add(dex_b.clone());
+        queue.try_add(classic.clone());
+
+        let set = queue.get_transaction_set(Hash256::ZERO, 10);
+        assert_eq!(set.len(), 2);
+
+        let hash_dex_a = Hash256::hash_xdr(&dex_a).unwrap();
+        let hash_dex_b = Hash256::hash_xdr(&dex_b).unwrap();
+        let hash_classic = Hash256::hash_xdr(&classic).unwrap();
+        let included_dex = if hash_dex_a.0 <= hash_dex_b.0 {
+            hash_dex_a
+        } else {
+            hash_dex_b
+        };
+
+        let mut expected = vec![hash_classic, included_dex];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let hashes: Vec<_> = set
+            .transactions
+            .iter()
+            .map(|tx| Hash256::hash_xdr(tx).unwrap())
+            .collect();
+        assert_eq!(hashes, expected);
+    }
+
+    #[test]
+    fn test_dex_limit_sets_only_dex_limited_flag() {
+        let config = TxQueueConfig {
+            max_dex_ops: Some(1),
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex_a = make_dex_envelope(400);
+        let mut dex_b = make_dex_envelope(300);
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut dex_a, 16);
+        set_source(&mut dex_b, 17);
+        set_source(&mut classic, 18);
+
+        queue.try_add(dex_a);
+        queue.try_add(dex_b);
+        queue.try_add(classic);
+
+        let SelectedTxs {
+            dex_limited,
+            classic_limited,
+            transactions,
+            ..
+        } = queue.select_transactions(10);
+
+        assert!(dex_limited);
+        assert!(!classic_limited);
+        assert_eq!(transactions.len(), 2);
+    }
+
+    #[test]
+    fn test_dex_evicts_non_dex_when_lane_insufficient() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(9),
+            max_queue_dex_ops: Some(3),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut non_dex = make_test_envelope(100 * 8, 8);
+        let mut dex_low = make_dex_envelope(200);
+        let mut dex_high = make_dex_envelope_with_ops(10000 * 3, 3);
+        set_source(&mut non_dex, 100);
+        set_source(&mut dex_low, 101);
+        set_source(&mut dex_high, 102);
+
+        let non_dex_hash = Hash256::hash_xdr(&non_dex).unwrap();
+        let dex_low_hash = Hash256::hash_xdr(&dex_low).unwrap();
+        let dex_high_hash = Hash256::hash_xdr(&dex_high).unwrap();
+
+        assert_eq!(queue.try_add(non_dex), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_high), TxQueueResult::Added);
+
+        assert!(!queue.contains(&non_dex_hash));
+        assert!(!queue.contains(&dex_low_hash));
+        assert!(queue.contains(&dex_high_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_dex_eviction_with_global_limit_only() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(9),
+            max_queue_dex_ops: Some(3),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex = make_dex_envelope_with_ops(200, 1);
+        let mut non_dex_high = make_test_envelope(400 * 6, 6);
+        let mut non_dex_low = make_test_envelope(100, 1);
+        let mut non_dex_mid = make_test_envelope(300, 1);
+        let mut dex_new = make_dex_envelope_with_ops(301 * 3, 3);
+        set_source(&mut dex, 110);
+        set_source(&mut non_dex_high, 111);
+        set_source(&mut non_dex_low, 112);
+        set_source(&mut non_dex_mid, 113);
+        set_source(&mut dex_new, 114);
+
+        let dex_hash = Hash256::hash_xdr(&dex).unwrap();
+        let non_dex_high_hash = Hash256::hash_xdr(&non_dex_high).unwrap();
+        let non_dex_low_hash = Hash256::hash_xdr(&non_dex_low).unwrap();
+        let non_dex_mid_hash = Hash256::hash_xdr(&non_dex_mid).unwrap();
+        let dex_new_hash = Hash256::hash_xdr(&dex_new).unwrap();
+
+        assert_eq!(queue.try_add(dex), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_mid), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_new), TxQueueResult::Added);
+
+        assert!(!queue.contains(&dex_hash));
+        assert!(queue.contains(&non_dex_high_hash));
+        assert!(!queue.contains(&non_dex_low_hash));
+        assert!(!queue.contains(&non_dex_mid_hash));
+        assert!(queue.contains(&dex_new_hash));
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_dex_eviction_with_global_and_dex_limits() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(9),
+            max_queue_dex_ops: Some(3),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex = make_dex_envelope_with_ops(200 * 2, 2);
+        let mut non_dex_high = make_test_envelope(400 * 5, 5);
+        let mut non_dex_low = make_test_envelope(100, 1);
+        let mut non_dex_mid = make_test_envelope(150, 1);
+        let mut dex_new = make_dex_envelope_with_ops(201 * 3, 3);
+        set_source(&mut dex, 120);
+        set_source(&mut non_dex_high, 121);
+        set_source(&mut non_dex_low, 122);
+        set_source(&mut non_dex_mid, 123);
+        set_source(&mut dex_new, 124);
+
+        let dex_hash = Hash256::hash_xdr(&dex).unwrap();
+        let non_dex_high_hash = Hash256::hash_xdr(&non_dex_high).unwrap();
+        let non_dex_low_hash = Hash256::hash_xdr(&non_dex_low).unwrap();
+        let non_dex_mid_hash = Hash256::hash_xdr(&non_dex_mid).unwrap();
+        let dex_new_hash = Hash256::hash_xdr(&dex_new).unwrap();
+
+        assert_eq!(queue.try_add(dex), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_mid), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_new), TxQueueResult::Added);
+
+        assert!(!queue.contains(&dex_hash));
+        assert!(queue.contains(&non_dex_high_hash));
+        assert!(!queue.contains(&non_dex_low_hash));
+        assert!(queue.contains(&non_dex_mid_hash));
+        assert!(queue.contains(&dex_new_hash));
+        assert_eq!(queue.len(), 3);
+    }
+
+    #[test]
+    fn test_dex_only_min_fee_threshold_after_eviction() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(9),
+            max_queue_dex_ops: Some(3),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex_low_a = make_dex_envelope_with_ops(100, 1);
+        let mut dex_mid = make_dex_envelope_with_ops(150 * 2, 2);
+        let mut dex_evicted = make_dex_envelope_with_ops(200 * 2, 2);
+        let mut dex_low = make_dex_envelope_with_ops(100, 1);
+        let mut dex_high = make_dex_envelope_with_ops(201 * 3, 3);
+        set_source(&mut dex_low_a, 140);
+        set_source(&mut dex_mid, 141);
+        set_source(&mut dex_evicted, 142);
+        set_source(&mut dex_low, 143);
+        set_source(&mut dex_high, 144);
+
+        assert_eq!(queue.try_add(dex_low_a), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_mid), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_evicted), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_low), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.try_add(dex_high), TxQueueResult::Added);
+    }
+
+    #[test]
+    fn test_non_dex_only_min_fee_threshold_after_eviction() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(6),
+            max_queue_dex_ops: Some(3),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut non_dex_a = make_test_envelope(100, 1);
+        let mut non_dex_b = make_test_envelope(150 * 5, 5);
+        let mut non_dex_evict = make_test_envelope(200 * 5, 5);
+        let mut non_dex_low = make_test_envelope(100, 1);
+        let mut non_dex_high = make_test_envelope(201 * 2, 2);
+        set_source(&mut non_dex_a, 150);
+        set_source(&mut non_dex_b, 151);
+        set_source(&mut non_dex_evict, 152);
+        set_source(&mut non_dex_low, 153);
+        set_source(&mut non_dex_high, 154);
+
+        assert_eq!(queue.try_add(non_dex_a), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_b), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_evict), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_low), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.try_add(non_dex_high), TxQueueResult::Added);
+    }
+
+    #[test]
+    fn test_classic_components_group_by_discounted_base_fee() {
+        let mut dex_a = make_dex_envelope(300);
+        let mut dex_b = make_dex_envelope(200);
+        let mut classic_high = make_test_envelope(250, 1);
+        let mut classic_low = make_test_envelope(100, 1);
+        set_source(&mut dex_a, 160);
+        set_source(&mut dex_b, 161);
+        set_source(&mut classic_high, 162);
+        set_source(&mut classic_low, 163);
+
+        let byte_limit =
+            (envelope_size(&dex_a) + envelope_size(&classic_high)) as u32;
+        let config = TxQueueConfig {
+            max_dex_ops: Some(1),
+            max_classic_bytes: Some(byte_limit),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        queue.try_add(dex_a.clone());
+        queue.try_add(dex_b.clone());
+        queue.try_add(classic_high.clone());
+        queue.try_add(classic_low.clone());
+
+        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(tx_set) = gen;
+        let phases = &tx_set.phases;
+        let components = match &phases[0] {
+            stellar_xdr::curr::TransactionPhase::V0(components) => components,
+            _ => panic!("expected classic phase"),
+        };
+        assert_eq!(components.len(), 2);
+
+        let mut base_fees = Vec::new();
+        let mut tx_counts = Vec::new();
+        for comp in components.iter() {
+            let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = comp;
+            base_fees.push(comp.base_fee);
+            tx_counts.push(comp.txs.len());
+        }
+        base_fees.sort();
+        tx_counts.sort();
+        assert_eq!(base_fees, vec![Some(250), Some(300)]);
+        assert_eq!(tx_counts, vec![1, 1]);
+    }
+
+    #[test]
+    fn test_dex_and_non_dex_min_fee_thresholds_after_evictions() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(9),
+            max_queue_dex_ops: Some(3),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex_a = make_dex_envelope_with_ops(200 * 2, 2);
+        let mut non_dex_a = make_test_envelope(100 * 3, 3);
+        let mut dex_b = make_dex_envelope_with_ops(300 * 2, 2);
+        let mut non_dex_b = make_test_envelope(250 * 5, 5);
+        set_source(&mut dex_a, 130);
+        set_source(&mut non_dex_a, 131);
+        set_source(&mut dex_b, 132);
+        set_source(&mut non_dex_b, 133);
+
+        let dex_a_hash = Hash256::hash_xdr(&dex_a).unwrap();
+        let non_dex_a_hash = Hash256::hash_xdr(&non_dex_a).unwrap();
+        let dex_b_hash = Hash256::hash_xdr(&dex_b).unwrap();
+        let non_dex_b_hash = Hash256::hash_xdr(&non_dex_b).unwrap();
+
+        assert_eq!(queue.try_add(dex_a), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_a), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_b), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_b), TxQueueResult::Added);
+
+        assert!(!queue.contains(&dex_a_hash));
+        assert!(!queue.contains(&non_dex_a_hash));
+        assert!(queue.contains(&dex_b_hash));
+        assert!(queue.contains(&non_dex_b_hash));
+
+        let mut dex_low = make_dex_envelope_with_ops(200, 1);
+        let mut non_dex_low = make_test_envelope(100, 1);
+        let mut dex_high = make_dex_envelope_with_ops(201, 1);
+        let mut non_dex_high = make_test_envelope(101, 1);
+        set_source(&mut dex_low, 134);
+        set_source(&mut non_dex_low, 135);
+        set_source(&mut dex_high, 136);
+        set_source(&mut non_dex_high, 137);
+
+        assert_eq!(queue.try_add(dex_low), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.try_add(non_dex_low), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.try_add(dex_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(non_dex_high), TxQueueResult::Added);
+    }
+
+    #[test]
     fn test_dex_queue_limit_eviction() {
         let config = TxQueueConfig {
             max_queue_dex_ops: Some(1),
@@ -1855,6 +2665,50 @@ mod tests {
         let high_hash = Hash256::hash_xdr(&dex_high).unwrap();
         assert!(!queue.contains(&low_hash));
         assert!(queue.contains(&high_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_dex_queue_limit_sets_min_fee_after_eviction() {
+        let config = TxQueueConfig {
+            max_queue_dex_ops: Some(1),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex_low = make_dex_envelope(200);
+        let mut dex_high = make_dex_envelope(400);
+        let mut dex_lower = make_dex_envelope(150);
+        set_source(&mut dex_low, 31);
+        set_source(&mut dex_high, 32);
+        set_source(&mut dex_lower, 33);
+
+        assert_eq!(queue.try_add(dex_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_lower), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_dex_lane_min_fee_blocks_classic() {
+        let config = TxQueueConfig {
+            max_queue_dex_ops: Some(1),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex_low = make_dex_envelope(200);
+        let mut dex_high = make_dex_envelope(400);
+        let mut classic_low = make_test_envelope(100, 1);
+        set_source(&mut dex_low, 34);
+        set_source(&mut dex_high, 35);
+        set_source(&mut classic_low, 36);
+
+        assert_eq!(queue.try_add(dex_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(dex_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(classic_low), TxQueueResult::FeeTooLow);
         assert_eq!(queue.len(), 1);
     }
 
@@ -1885,6 +2739,100 @@ mod tests {
         assert!(queue.contains(&mid_hash));
         assert!(queue.contains(&high_hash));
         assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_queue_ops_limit_sets_min_fee_after_eviction() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(2),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx_low = make_test_envelope(100, 1);
+        let mut tx_high = make_test_envelope(400, 1);
+        let mut tx_lower = make_test_envelope(80, 1);
+        set_source(&mut tx_low, 41);
+        set_source(&mut tx_high, 42);
+        set_source(&mut tx_lower, 43);
+
+        assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_lower), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_queue_ops_limit_accepts_higher_fee_after_eviction() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(2),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx_low = make_test_envelope(100, 1);
+        let mut tx_high = make_test_envelope(400, 1);
+        let mut tx_mid = make_test_envelope(150, 1);
+        set_source(&mut tx_low, 52);
+        set_source(&mut tx_high, 53);
+        set_source(&mut tx_mid, 54);
+
+        let low_hash = Hash256::hash_xdr(&tx_low).unwrap();
+        let high_hash = Hash256::hash_xdr(&tx_high).unwrap();
+        let mid_hash = Hash256::hash_xdr(&tx_mid).unwrap();
+
+        assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_mid), TxQueueResult::Added);
+
+        assert!(!queue.contains(&low_hash));
+        assert!(queue.contains(&high_hash));
+        assert!(queue.contains(&mid_hash));
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_eviction_thresholds_reset_after_age_eviction() {
+        let config = TxQueueConfig {
+            max_queue_ops: Some(1),
+            max_size: 10,
+            max_age_secs: 1,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx_low = make_test_envelope(100, 1);
+        let mut tx_high = make_test_envelope(200, 1);
+        let mut tx_lower = make_test_envelope(80, 1);
+        let mut tx_new = make_test_envelope(80, 1);
+        set_source(&mut tx_low, 90);
+        set_source(&mut tx_high, 91);
+        set_source(&mut tx_lower, 92);
+        set_source(&mut tx_new, 93);
+
+        assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_lower), TxQueueResult::FeeTooLow);
+        assert_eq!(queue.len(), 1);
+
+        {
+            let mut by_hash = queue.by_hash.write();
+            for tx in by_hash.values_mut() {
+                tx.received_at = tx
+                    .received_at
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|| Instant::now() - std::time::Duration::from_secs(10));
+            }
+        }
+        queue.evict_expired();
+        assert!(queue.is_empty());
+
+        assert_eq!(queue.try_add(tx_new), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
@@ -1919,6 +2867,7 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
+        let base_fee = queue.validation_context.read().base_fee as i64;
 
         let mut dex_high = make_dex_envelope(500);
         let mut dex_low = make_dex_envelope(300);
@@ -1939,17 +2888,17 @@ mod tests {
         };
 
         let mut has_dex_fee = false;
-        let mut has_none_fee = false;
+        let mut has_classic_fee = false;
         for comp in components.iter() {
             let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = comp;
             match comp.base_fee {
                 Some(500) => has_dex_fee = true,
-                None => has_none_fee = true,
+                Some(fee) if fee == base_fee => has_classic_fee = true,
                 _ => {}
             }
         }
         assert!(has_dex_fee);
-        assert!(has_none_fee);
+        assert!(has_classic_fee);
     }
 
     #[test]
@@ -1975,6 +2924,30 @@ mod tests {
         let high_hash = Hash256::hash_xdr(&high_fee).unwrap();
         assert!(!queue.contains(&low_hash));
         assert!(queue.contains(&high_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_soroban_queue_limit_sets_min_fee_after_eviction() {
+        let mut limit = Resource::new(vec![i64::MAX; NUM_SOROBAN_TX_RESOURCES]);
+        limit.set_val(ResourceType::Instructions, 100);
+        let config = TxQueueConfig {
+            max_queue_soroban_resources: Some(limit),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut low_fee = make_soroban_envelope_with_resources(4000, 80);
+        let mut high_fee = make_soroban_envelope_with_resources(8000, 80);
+        let mut lower_fee = make_soroban_envelope_with_resources(2000, 80);
+        set_source(&mut low_fee, 81);
+        set_source(&mut high_fee, 82);
+        set_source(&mut lower_fee, 83);
+
+        assert_eq!(queue.try_add(low_fee), TxQueueResult::Added);
+        assert_eq!(queue.try_add(high_fee), TxQueueResult::Added);
+        assert_eq!(queue.try_add(lower_fee), TxQueueResult::FeeTooLow);
         assert_eq!(queue.len(), 1);
     }
 

@@ -857,10 +857,22 @@ impl Herder {
         manager: &Arc<LedgerManager>,
     ) -> Option<HashMap<Vec<u8>, i64>> {
         let snapshot = manager.create_snapshot().ok()?;
+        let ledger_seq = manager.current_ledger_seq();
+        if ledger_seq > i32::MAX as u32 {
+            return None;
+        }
+        let starting_seq = (ledger_seq as i64) << 32;
         let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
         for account in self.tx_queue.pending_accounts() {
-            if let Ok(Some(entry)) = snapshot.get_account(&account) {
-                map.insert(account_key_from_account_id(&account), entry.seq_num.0);
+            let key = account_key_from_account_id(&account);
+            match snapshot.get_account(&account) {
+                Ok(Some(entry)) => {
+                    map.insert(key, entry.seq_num.0);
+                }
+                Ok(None) => {
+                    map.insert(key, starting_seq);
+                }
+                Err(_) => {}
             }
         }
         Some(map)
@@ -933,13 +945,9 @@ impl Herder {
         // Clean up expired transactions
         self.tx_queue.evict_expired();
 
-        // Clean up old pending tx set requests (by time and by slot)
-        self.scp_driver.cleanup_pending_tx_sets(10); // 10 seconds - be aggressive
-        let tracking = self.tracking_slot();
-        let removed = self.scp_driver.cleanup_old_pending_slots(tracking);
-        if removed > 0 {
-            debug!(tracking, removed, "Cleaned up old pending tx set requests");
-        }
+        // Clean up old pending tx set requests (by time).
+        // Keep them longer to allow lagging nodes to fetch historical sets.
+        self.scp_driver.cleanup_pending_tx_sets(120);
     }
 
     /// Get pending transaction set hashes that need to be fetched from peers.

@@ -13,7 +13,7 @@ use stellar_xdr::curr::{
     PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultCode,
     PathPaymentStrictSendResultSuccess, PoolId, Price, SimplePaymentResult, TrustLineEntry,
     TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, WriteXdr, Limits,
-    LIQUIDITY_POOL_FEE_V18,
+    LIQUIDITY_POOL_FEE_V18, LedgerKey, LedgerKeyOffer,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -30,7 +30,7 @@ pub fn execute_path_payment_strict_receive(
     op: &PathPaymentStrictReceiveOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     let dest = muxed_to_account_id(&op.destination);
 
@@ -110,6 +110,7 @@ pub fn execute_path_payment_strict_receive(
             RoundingType::PathPaymentStrictReceive,
             &mut offer_trail,
             state,
+            context,
         )?;
 
         if convert_res == ConvertResult::FilterStopCrossSelf {
@@ -144,6 +145,7 @@ pub fn execute_path_payment_strict_receive(
         max_amount_recv,
         bypass_issuer_check,
         state,
+        context,
     ) {
         return Ok(make_strict_receive_result_with_asset(
             err.code,
@@ -167,7 +169,7 @@ pub fn execute_path_payment_strict_send(
     op: &PathPaymentStrictSendOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     let dest = muxed_to_account_id(&op.destination);
 
@@ -194,6 +196,7 @@ pub fn execute_path_payment_strict_send(
         op.send_amount,
         bypass_issuer_check,
         state,
+        context,
     ) {
         return Ok(make_strict_send_result_with_asset(
             convert_receive_to_send_code(err.code),
@@ -237,6 +240,7 @@ pub fn execute_path_payment_strict_send(
             RoundingType::PathPaymentStrictSend,
             &mut offer_trail,
             state,
+            context,
         )?;
 
         if convert_res == ConvertResult::FilterStopCrossSelf {
@@ -329,13 +333,19 @@ fn update_source_balance(
     amount: i64,
     bypass_issuer_check: bool,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> std::result::Result<(), TransferError> {
     if matches!(asset, Asset::Native) {
         let source_account = state.get_account(source).ok_or(TransferError {
             code: PathPaymentStrictReceiveResultCode::Underfunded,
             no_issuer_asset: None,
         })?;
-        let min_balance = state.minimum_balance(source_account.num_sub_entries);
+        let min_balance = state
+            .minimum_balance_for_account(source_account, context.protocol_version, 0)
+            .map_err(|_| TransferError {
+                code: PathPaymentStrictReceiveResultCode::Malformed,
+                no_issuer_asset: None,
+            })?;
         let available =
             source_account.balance - min_balance - account_liabilities(source_account).selling;
         if available < amount {
@@ -499,6 +509,7 @@ fn convert_with_offers_and_pools(
     round: RoundingType,
     offer_trail: &mut Vec<ClaimAtom>,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> Result<ConvertResult> {
     if round == RoundingType::Normal {
         return convert_with_offers(
@@ -512,6 +523,7 @@ fn convert_with_offers_and_pools(
             round,
             offer_trail,
             state,
+            context,
         );
     }
 
@@ -536,6 +548,7 @@ fn convert_with_offers_and_pools(
             round,
             offer_trail,
             state,
+            context,
         );
     }
 
@@ -554,6 +567,7 @@ fn convert_with_offers_and_pools(
         round,
         &mut book_offer_trail,
         &mut temp_state,
+        context,
     )?;
 
     let pool_exchange = pool_exchange.unwrap();
@@ -605,6 +619,7 @@ fn convert_with_offers_and_pools(
         round,
         offer_trail,
         state,
+        context,
     )
 }
 
@@ -619,6 +634,7 @@ fn convert_with_offers(
     round: RoundingType,
     offer_trail: &mut Vec<ClaimAtom>,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> Result<ConvertResult> {
     offer_trail.clear();
     *amount_send = 0;
@@ -644,6 +660,7 @@ fn convert_with_offers(
             round,
             offer_trail,
             state,
+            context,
         )?;
 
         if recv == 0 && send == 0 {
@@ -677,6 +694,7 @@ fn cross_offer_v10(
     round: RoundingType,
     offer_trail: &mut Vec<ClaimAtom>,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> Result<(i64, i64, bool)> {
     let sheep = offer.buying.clone();
     let wheat = offer.selling.clone();
@@ -692,7 +710,8 @@ fn cross_offer_v10(
         state,
     )?;
 
-    let max_wheat_send = offer.amount.min(can_sell_at_most(&seller, &wheat, state));
+    let max_wheat_send =
+        offer.amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
     let exchange = exchange_v10(
         offer.price.clone(),
@@ -723,6 +742,13 @@ fn cross_offer_v10(
     }
 
     if new_amount == 0 {
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: seller.clone(),
+            offer_id: offer.offer_id,
+        });
+        if state.entry_sponsor(&ledger_key).is_some() {
+            state.remove_entry_sponsorship_and_update_counts(&ledger_key, &seller, 1)?;
+        }
         state.delete_offer(&seller, offer.offer_id);
         if let Some(account) = state.get_account_mut(&seller) {
             if account.num_sub_entries > 0 {
@@ -760,28 +786,34 @@ fn cross_offer_v10(
     Ok((num_wheat_received, num_sheep_send, wheat_stays))
 }
 
-fn can_sell_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {
+fn can_sell_at_most(
+    source: &AccountId,
+    asset: &Asset,
+    state: &LedgerStateManager,
+    context: &LedgerContext,
+) -> Result<i64> {
     if matches!(asset, Asset::Native) {
         let Some(account) = state.get_account(source) else {
-            return 0;
+            return Ok(0);
         };
-        let min_balance = state.minimum_balance(account.num_sub_entries);
+        let min_balance =
+            state.minimum_balance_for_account(account, context.protocol_version, 0)?;
         let available = account.balance - min_balance - account_liabilities(account).selling;
-        return available.max(0);
+        return Ok(available.max(0));
     }
 
     if issuer_for_asset(asset) == Some(source) {
-        return i64::MAX;
+        return Ok(i64::MAX);
     }
 
     let Some(trustline) = state.get_trustline(source, asset) else {
-        return 0;
+        return Ok(0);
     };
     if !is_authorized_to_maintain_liabilities(trustline.flags) {
-        return 0;
+        return Ok(0);
     }
     let available = trustline.balance - trustline_liabilities(trustline).selling;
-    available.max(0)
+    Ok(available.max(0))
 }
 
 fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {

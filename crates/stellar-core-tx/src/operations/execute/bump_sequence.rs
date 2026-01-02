@@ -16,6 +16,10 @@ pub fn execute_bump_sequence(
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
+    if op.bump_to.0 < 0 {
+        return Ok(make_result(BumpSequenceResultCode::BadSeq));
+    }
+
     // Get source account
     let source_account = state
         .get_account_mut(source)
@@ -101,5 +105,28 @@ mod tests {
 
         // Verify sequence was NOT changed
         assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, 100);
+    }
+
+    #[test]
+    fn test_bump_sequence_bad_seq() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 100));
+
+        let op = BumpSequenceOp {
+            bump_to: SequenceNumber(-1),
+        };
+
+        let result = execute_bump_sequence(&op, &source_id, &mut state, &context)
+            .expect("bump sequence result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::BumpSequence(r)) => {
+                assert!(matches!(r, BumpSequenceResult::BadSeq));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 }

@@ -2,6 +2,15 @@
 
 Scope constraints: SQLite only; Protocol 23+ only; no production hardening.
 
+## Milestones
+
+1. Join public testnet as a validator.
+2. Join public mainnet as a validator.
+3. Full parity with stellar-core C++ (v25.x).
+
+Notes:
+- Full invariant coverage is deferred to Milestone 3.
+
 ## Missing Subsystems (Must Add)
 
 1. Work scheduler (core orchestration)
@@ -17,7 +26,7 @@ Scope constraints: SQLite only; Protocol 23+ only; no production hardening.
 3. Invariants framework
    - Upstream: `src/invariant/*` (`InvariantManager`, `ConservationOfLumens`, `LedgerEntryIsValid`)
    - Status: Partial (framework + basic invariants + ledger-close hook)
-   - Needed: full invariant set, config/metrics wiring. Replay invariants now enforced during catchup re-execution.
+   - Needed: full invariant set, config/metrics wiring (Milestone 3). Replay invariants now enforced during catchup re-execution.
 
 4. Simulation harness
    - Upstream: `src/simulation/*` (`Simulation`, `LoadGenerator`, `TxGenerator`)
@@ -50,8 +59,6 @@ Scope constraints: SQLite only; Protocol 23+ only; no production hardening.
 
 ## Suggested Milestones
 
-M1: Work scheduler expansion + historywork integration (catchup/publish).
-M2: Invariants + ledger close hash parity.
-M3: Simulation harness + multi-node SCP/overlay tests (overlay-only so far).
-M4: Overlay/herder transaction pipeline parity.
-M5: Regression suite with golden vectors.
+M1 (Testnet validator): ledger tx layering parity, full op coverage, catchup/replay parity, basic invariants enabled.
+M2 (Mainnet validator): performance/soak validation, operational runbooks/config hygiene, mainnet-specific config validation.
+M3 (Full parity): full invariant set, simulation harness, regression suite + golden vectors, remaining util/process parity.

@@ -13,7 +13,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::{seq::SliceRandom, Rng};
@@ -28,7 +28,7 @@ use stellar_core_herder::{
 };
 use stellar_core_history::{
     is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupOutput,
-    CheckpointData, HistoryArchive,
+    CheckpointData, HistoryArchive, CHECKPOINT_FREQUENCY,
 };
 use stellar_core_historywork::{
     get_buckets, get_has, get_headers, get_progress, get_scp_history, get_transactions,
@@ -43,7 +43,9 @@ use stellar_core_overlay::{
 };
 use stellar_core_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
 use stellar_core_common::{Hash256, NetworkId};
-use stellar_core_db::{BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries};
+use stellar_core_db::{
+    BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
+};
 use stellar_core_scp::hash_quorum_set;
 use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 use stellar_xdr::curr::{
@@ -62,7 +64,7 @@ use stellar_core_tx::TransactionFrame;
 use crate::config::AppConfig;
 use crate::logging::CatchupProgress;
 use crate::survey::{SurveyDataManager, SurveyMessageLimiter, SurveyPhase};
-use stellar_core_ledger::header::{
+use stellar_core_ledger::{
     close_time as ledger_close_time, compute_header_hash, verify_header_chain, verify_skip_list,
 };
 use stellar_xdr::curr::TransactionEnvelope;
@@ -204,6 +206,10 @@ pub struct App {
 
     /// Last processed externalized slot (for ledger close triggering).
     last_processed_slot: RwLock<u64>,
+    /// Prevent concurrent catchup runs when we fall behind.
+    catchup_in_progress: AtomicBool,
+    /// Buffered externalized ledgers waiting to apply.
+    syncing_ledgers: RwLock<BTreeMap<u32, stellar_core_herder::LedgerCloseInfo>>,
 
     /// Time-sliced survey data manager.
     survey_data: RwLock<SurveyDataManager>,
@@ -644,6 +650,8 @@ impl App {
             scp_envelope_tx,
             scp_envelope_rx: TokioMutex::new(scp_envelope_rx),
             last_processed_slot: RwLock::new(0),
+            catchup_in_progress: AtomicBool::new(false),
+            syncing_ledgers: RwLock::new(BTreeMap::new()),
             survey_data: RwLock::new(SurveyDataManager::new(
                 is_validator,
                 max_inbound_peers,
@@ -2218,6 +2226,13 @@ impl App {
             }
 
             StellarMessage::DontHave(dont_have) => {
+                if matches!(dont_have.type_, stellar_xdr::curr::MessageType::TxSet) {
+                    tracing::info!(
+                        peer = ?msg.from_peer,
+                        hash = hex::encode(dont_have.req_hash.0),
+                        "Peer reported DontHave for TxSet"
+                    );
+                }
                 self.process_ping_response(&msg.from_peer, dont_have.req_hash.0)
                     .await;
             }
@@ -2286,17 +2301,9 @@ impl App {
     }
 
     /// Try to close a specific slot directly when we receive its tx set.
-    /// This bypasses gap detection since we're processing a specific slot we have data for.
-    /// Note: This can close slots that were previously "skipped" if we now have the tx set.
+    /// This feeds the buffered ledger pipeline and attempts sequential apply.
     async fn try_close_slot_directly(&self, slot: u64) {
         tracing::info!(slot, "Attempting to close specific slot directly");
-
-        // Note: We intentionally don't check last_processed_slot here because
-        // process_externalized_slots marks slots as "processed" even when skipped.
-        // This function is called when we receive the tx set, so we should
-        // attempt to close regardless.
-
-        // Get ledger close info from herder for this specific slot
         let close_info = match self.herder.check_ledger_close(slot) {
             Some(info) => info,
             None => {
@@ -2305,65 +2312,8 @@ impl App {
             }
         };
 
-        let ledger_seq = slot as u32;
-
-        // Get transactions from the tx set
-        let tx_set = match close_info.tx_set {
-            Some(tx_set) => tx_set,
-            None => {
-                tracing::debug!(slot, "Tx set still not available for slot");
-                return;
-            }
-        };
-
-        tracing::info!(
-            ledger_seq,
-            tx_count = tx_set.transactions.len(),
-            close_time = close_info.close_time,
-            "Closing specific slot with received tx set"
-        );
-
-        // Update ledger manager to the previous sequence so the close works
-        let current_ledger = self.ledger_manager.current_ledger_seq();
-        if current_ledger != ledger_seq - 1 {
-            tracing::info!(
-                current_ledger,
-                expected = ledger_seq - 1,
-                "Adjusting ledger sequence before close"
-            );
-            self.ledger_manager.set_ledger_sequence(ledger_seq - 1);
-            *self.current_ledger.write().await = ledger_seq - 1;
-        }
-
-        // Close the ledger using the HerderCallback implementation
-        match HerderCallback::close_ledger(
-            self,
-            ledger_seq,
-            tx_set,
-            close_info.close_time,
-            close_info.upgrades.clone(),
-        ).await {
-            Ok(hash) => {
-                tracing::info!(
-                    ledger_seq,
-                    hash = %hash.to_hex(),
-                    "Successfully closed specific slot"
-                );
-
-                // Update last processed
-                *self.last_processed_slot.write().await = slot;
-                *self.current_ledger.write().await = ledger_seq;
-
-                // Clean up applied transactions from the queue
-            }
-            Err(e) => {
-                tracing::error!(
-                    ledger_seq,
-                    error = %e,
-                    "Failed to close specific slot"
-                );
-            }
-        }
+        self.update_buffered_tx_set(slot as u32, close_info.tx_set).await;
+        self.try_apply_buffered_ledgers().await;
     }
 
     /// Process any externalized slots that need ledger close.
@@ -2383,119 +2333,225 @@ impl App {
         let last_processed = *self.last_processed_slot.read().await;
         if latest_externalized <= last_processed {
             tracing::debug!(latest_externalized, last_processed, "Already processed");
-            return; // Already processed
+            return;
         }
 
         tracing::debug!(latest_externalized, last_processed, "Need to process");
 
-        // Get the current ledger from ledger manager
-        let current_ledger = match self.get_current_ledger().await {
-            Ok(seq) => seq,
-            Err(_) => return, // Can't determine current ledger
-        };
-
-        // Check if we need to fast-forward the ledger state
-        // This happens when we've been fast-forwarded by EXTERNALIZE messages
-        // Any gap > 1 means we missed ledgers and need to skip to the current state
-        if latest_externalized as u32 > current_ledger + 1 {
-            let gap = latest_externalized as u32 - current_ledger;
-            tracing::info!(
-                current_ledger,
-                latest_externalized,
-                gap,
-                "Gap detected - fast-forwarding ledger state"
-            );
-
-            // Update the ledger manager to the slot before latest_externalized
-            // so the next close will work for that slot
-            let new_seq = (latest_externalized - 1) as u32;
-            self.ledger_manager.set_ledger_sequence(new_seq);
-
-            // Update our internal tracking
-            *self.current_ledger.write().await = new_seq;
-            self.clear_tx_advert_history(new_seq).await;
-
-            // Skip trying to close all the missed ledgers - update last_processed to skip them
-            *self.last_processed_slot.write().await = latest_externalized - 1;
-            tracing::info!(
-                skipped_to = latest_externalized - 1,
-                "Skipped missed ledgers during fast-forward, will try to close latest"
-            );
-            // Don't return - continue to try closing the latest externalized slot
-            // This ensures we register pending tx set requests
+        {
+            let mut buffer = self.syncing_ledgers.write().await;
+            for slot in (last_processed + 1)..=latest_externalized {
+                if let Some(info) = self.herder.check_ledger_close(slot) {
+                    buffer.entry(info.slot as u32).or_insert(info);
+                }
+            }
         }
 
-        // Re-read last_processed after potential update
-        let last_processed = *self.last_processed_slot.read().await;
-        if latest_externalized <= last_processed {
+        *self.last_processed_slot.write().await = latest_externalized;
+
+        self.try_apply_buffered_ledgers().await;
+        self.maybe_start_buffered_catchup().await;
+    }
+
+    fn first_ledger_in_checkpoint(ledger: u32) -> u32 {
+        (ledger / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY
+    }
+
+    fn is_first_ledger_in_checkpoint(ledger: u32) -> bool {
+        ledger % CHECKPOINT_FREQUENCY == 0
+    }
+
+    fn trim_syncing_ledgers(
+        buffer: &mut BTreeMap<u32, stellar_core_herder::LedgerCloseInfo>,
+        current_ledger: u32,
+    ) {
+        let min_keep = current_ledger.saturating_add(1);
+        buffer.retain(|seq, _| *seq >= min_keep);
+        if buffer.is_empty() {
             return;
         }
 
-        // Get ledger close info from herder
-        let close_info = match self.herder.check_ledger_close(latest_externalized) {
-            Some(info) => info,
-            None => {
-                tracing::debug!(slot = latest_externalized, "No ledger close info yet");
+        let last_buffered = *buffer.keys().next_back().unwrap();
+        let trim_before = if Self::is_first_ledger_in_checkpoint(last_buffered) {
+            if last_buffered == 0 {
                 return;
             }
+            let prev = last_buffered - 1;
+            Self::first_ledger_in_checkpoint(prev)
+        } else {
+            Self::first_ledger_in_checkpoint(last_buffered)
         };
 
-        let ledger_seq = latest_externalized as u32;
+        buffer.retain(|seq, _| *seq >= trim_before);
+    }
 
-        // Get transactions from the tx set
-        // If we don't have the tx set, we can't close the ledger properly
-        // This happens when we joined the network mid-consensus
-        let tx_set = match close_info.tx_set {
-            Some(tx_set) => tx_set,
-            None => {
-                // We don't have the transaction set, so we can't properly close this ledger
-                // Mark it as processed and move on - the tx set might arrive via try_close_slot_directly
-                // but if the network has moved on, we need to keep up
-                tracing::info!(
-                    ledger_seq,
-                    "Skipping ledger close - waiting for tx set (will retry if received)"
+    async fn update_buffered_tx_set(
+        &self,
+        slot: u32,
+        tx_set: Option<stellar_core_herder::TransactionSet>,
+    ) {
+        let Some(tx_set) = tx_set else {
+            return;
+        };
+        let mut buffer = self.syncing_ledgers.write().await;
+        if let Some(entry) = buffer.get_mut(&slot) {
+            if tx_set.hash != entry.tx_set_hash {
+                tracing::warn!(
+                    slot,
+                    expected = %entry.tx_set_hash.to_hex(),
+                    found = %tx_set.hash.to_hex(),
+                    "Buffered tx set hash mismatch (dropping)"
                 );
-                *self.last_processed_slot.write().await = latest_externalized;
-                *self.current_ledger.write().await = ledger_seq;
-                self.clear_tx_advert_history(ledger_seq).await;
-                self.ledger_manager.set_ledger_sequence(ledger_seq);
                 return;
             }
+            entry.tx_set = Some(tx_set);
+            tracing::info!(slot, "Buffered tx set attached");
+        } else {
+            tracing::debug!(slot, "Received tx set for unbuffered slot");
+        }
+    }
+
+    async fn try_apply_buffered_ledgers(&self) {
+        loop {
+            let current_ledger = match self.get_current_ledger().await {
+                Ok(seq) => seq,
+                Err(_) => return,
+            };
+            let next_seq = current_ledger.saturating_add(1);
+
+            let close_info = {
+                let mut buffer = self.syncing_ledgers.write().await;
+                Self::trim_syncing_ledgers(&mut buffer, current_ledger);
+                match buffer.get(&next_seq) {
+                    Some(info) if info.tx_set.is_some() => info.clone(),
+                    Some(_) => return,
+                    None => return,
+                }
+            };
+
+            let tx_set = close_info.tx_set.clone().expect("tx set present");
+            if tx_set.hash != close_info.tx_set_hash {
+                tracing::error!(
+                    ledger_seq = next_seq,
+                    expected = %close_info.tx_set_hash.to_hex(),
+                    found = %tx_set.hash.to_hex(),
+                    "Buffered tx set hash mismatch"
+                );
+                let mut buffer = self.syncing_ledgers.write().await;
+                if let Some(entry) = buffer.get_mut(&next_seq) {
+                    entry.tx_set = None;
+                }
+                return;
+            }
+            tracing::info!(
+                ledger_seq = next_seq,
+                tx_count = tx_set.transactions.len(),
+                close_time = close_info.close_time,
+                "Applying buffered ledger"
+            );
+
+            match HerderCallback::close_ledger(
+                self,
+                next_seq,
+                tx_set,
+                close_info.close_time,
+                close_info.upgrades.clone(),
+            )
+            .await
+            {
+                Ok(hash) => {
+                    tracing::info!(
+                        ledger_seq = next_seq,
+                        hash = %hash.to_hex(),
+                        "Applied buffered ledger"
+                    );
+                    {
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        buffer.remove(&next_seq);
+                    }
+                    *self.current_ledger.write().await = next_seq;
+                    self.clear_tx_advert_history(next_seq).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        ledger_seq = next_seq,
+                        error = %e,
+                        "Failed to apply buffered ledger"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn maybe_start_buffered_catchup(&self) {
+        let current_ledger = match self.get_current_ledger().await {
+            Ok(seq) => seq,
+            Err(_) => return,
         };
+
+        let (first_buffered, last_buffered) = {
+            let mut buffer = self.syncing_ledgers.write().await;
+            Self::trim_syncing_ledgers(&mut buffer, current_ledger);
+            match (buffer.keys().next().copied(), buffer.keys().next_back().copied()) {
+                (Some(first), Some(last)) => (first, last),
+                _ => return,
+            }
+        };
+
+        if first_buffered == current_ledger + 1 {
+            return;
+        }
+
+        let required_first = if Self::is_first_ledger_in_checkpoint(first_buffered) {
+            first_buffered
+        } else {
+            Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY)
+        };
+        let trigger = required_first.saturating_add(1);
+        if last_buffered < trigger {
+            return;
+        }
+
+        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let target = required_first.saturating_sub(1);
+        if target == 0 || target <= current_ledger {
+            self.catchup_in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
 
         tracing::info!(
-            ledger_seq,
-            tx_count = tx_set.transactions.len(),
-            close_time = close_info.close_time,
-            "Processing externalized slot"
+            current_ledger,
+            target,
+            first_buffered,
+            last_buffered,
+            "Starting buffered catchup"
         );
 
-        // Close the ledger using the HerderCallback implementation
-        match HerderCallback::close_ledger(
-            self,
-            ledger_seq,
-            tx_set,
-            close_info.close_time,
-            close_info.upgrades.clone(),
-        ).await {
-            Ok(hash) => {
+        let catchup_result = self.catchup(CatchupTarget::Ledger(target)).await;
+        self.catchup_in_progress.store(false, Ordering::SeqCst);
+
+        match catchup_result {
+            Ok(result) => {
+                *self.current_ledger.write().await = result.ledger_seq;
+                self.clear_tx_advert_history(result.ledger_seq).await;
+                self.herder.bootstrap(result.ledger_seq);
+                if self.is_validator {
+                    self.set_state(AppState::Validating).await;
+                } else {
+                    self.set_state(AppState::Synced).await;
+                }
                 tracing::info!(
-                    ledger_seq,
-                    hash = %hash.to_hex(),
-                    "Successfully closed ledger"
+                    ledger_seq = result.ledger_seq,
+                    "Buffered catchup complete"
                 );
-
-                // Update last processed
-                *self.last_processed_slot.write().await = latest_externalized;
-
-                // Clean up applied transactions from the queue
+                self.try_apply_buffered_ledgers().await;
             }
-            Err(e) => {
-                tracing::error!(
-                    ledger_seq,
-                    error = %e,
-                    "Failed to close ledger"
-                );
+            Err(err) => {
+                tracing::error!(error = %err, "Buffered catchup failed");
             }
         }
     }
@@ -2938,7 +2994,7 @@ impl App {
         peer_id: &stellar_core_overlay::PeerId,
         signed: SignedTimeSlicedSurveyResponseMessage,
     ) {
-        let response_message = signed.response;
+        let response_message = signed.response.clone();
         let response_bytes = match response_message.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -3023,7 +3079,7 @@ impl App {
                 .or_insert_with(|| body.clone());
             Self::merge_topology_response(entry, &body);
             (entry.inbound_peers.0.len(), entry.outbound_peers.0.len())
-        }
+        };
         tracing::debug!(
             peer = ?peer_id,
             inbound = body.inbound_peers.0.len(),
@@ -3038,7 +3094,7 @@ impl App {
                 let next_inbound = inbound_len as u32;
                 let next_outbound = outbound_len as u32;
                 let _ = self
-                    .survey_topology_timesliced(peer_id, next_inbound, next_outbound)
+                    .survey_topology_timesliced(peer_id.clone(), next_inbound, next_outbound)
                     .await;
             }
         }
@@ -4388,6 +4444,10 @@ impl App {
             "Processing TxSet"
         );
 
+        if !self.herder.needs_tx_set(&internal_tx_set.hash) {
+            tracing::info!(hash = %internal_tx_set.hash, "TxSet not pending");
+        }
+
         // Give it to the herder
         if let Some(slot) = self.herder.receive_tx_set(internal_tx_set) {
             tracing::info!(slot, "Received pending TxSet, attempting ledger close");
@@ -4419,25 +4479,34 @@ impl App {
             }
         };
         let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> = match &gen_tx_set {
-            GeneralizedTransactionSet::V1(v1) => v1
-                .phases
-                .iter()
-                .flat_map(|phase| match phase {
-                    TransactionPhase::V0(components) => components
-                        .iter()
-                        .flat_map(|component| match component {
-                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
-                                comp.txs.to_vec()
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                    TransactionPhase::V1(parallel) => parallel
-                        .execution_stages
-                        .iter()
-                        .flat_map(|stage| stage.0.iter().flat_map(|cluster| cluster.0.to_vec()))
-                        .collect(),
-                })
-                .collect(),
+            GeneralizedTransactionSet::V1(v1) => {
+                if v1.phases.len() != 2 {
+                    tracing::warn!(
+                        hash = %hash,
+                        phases = v1.phases.len(),
+                        "Invalid GeneralizedTxSet phase count"
+                    );
+                    return;
+                }
+                v1.phases
+                    .iter()
+                    .flat_map(|phase| match phase {
+                        TransactionPhase::V0(components) => components
+                            .iter()
+                            .flat_map(|component| match component {
+                                TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                                    comp.txs.to_vec()
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        TransactionPhase::V1(parallel) => parallel
+                            .execution_stages
+                            .iter()
+                            .flat_map(|stage| stage.0.iter().flat_map(|cluster| cluster.0.to_vec()))
+                            .collect(),
+                    })
+                    .collect()
+            }
         };
 
         tracing::info!(
@@ -4446,8 +4515,102 @@ impl App {
             "Processing GeneralizedTxSet"
         );
 
-        // Create internal tx set with the correct hash
-        let internal_tx_set = TransactionSet::with_hash(prev_hash, hash, transactions);
+        if !self.herder.needs_tx_set(&hash) {
+            tracing::info!(hash = %hash, "GeneralizedTxSet not pending");
+        }
+
+        let phase_check = match &gen_tx_set {
+            GeneralizedTransactionSet::V1(v1) => {
+                let classic_ok = matches!(v1.phases[0], TransactionPhase::V0(_));
+                let soroban_ok = matches!(v1.phases[1], TransactionPhase::V1(_));
+                if !classic_ok || !soroban_ok {
+                    tracing::warn!(hash = %hash, "Invalid GeneralizedTxSet phase types");
+                }
+                classic_ok && soroban_ok
+            }
+        };
+        if !phase_check {
+            return;
+        }
+
+        let base_fee_limit = self.ledger_manager.current_header().base_fee as i64;
+        let base_fee_ok = match &gen_tx_set {
+            GeneralizedTransactionSet::V1(v1) => {
+                let classic_ok = match &v1.phases[0] {
+                    TransactionPhase::V0(components) => components.iter().all(|component| {
+                        let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
+                        comp.base_fee.map_or(true, |fee| fee >= base_fee_limit)
+                    }),
+                    _ => false,
+                };
+                let soroban_ok = match &v1.phases[1] {
+                    TransactionPhase::V1(parallel) => {
+                        parallel.base_fee.map_or(true, |fee| fee >= base_fee_limit)
+                    }
+                    _ => false,
+                };
+                classic_ok && soroban_ok
+            }
+        };
+        if !base_fee_ok {
+            tracing::warn!(hash = %hash, base_fee = base_fee_limit, "GeneralizedTxSet base fee below ledger base fee");
+            return;
+        }
+
+        let network_id = NetworkId(self.network_id());
+        let mut classic_count = 0usize;
+        let mut soroban_count = 0usize;
+        for env in &transactions {
+            let frame = stellar_core_tx::TransactionFrame::with_network(env.clone(), network_id);
+            if frame.is_soroban() {
+                soroban_count += 1;
+            } else {
+                classic_count += 1;
+            }
+        }
+        let phase_sizes = match &gen_tx_set {
+            GeneralizedTransactionSet::V1(v1) => {
+                let classic_phase_count: usize = match &v1.phases[0] {
+                    TransactionPhase::V0(components) => components
+                        .iter()
+                        .map(|component| match component {
+                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => comp.txs.len(),
+                        })
+                        .sum(),
+                    _ => 0,
+                };
+                let soroban_phase_count: usize = match &v1.phases[1] {
+                    TransactionPhase::V1(parallel) => parallel
+                        .execution_stages
+                        .iter()
+                        .map(|stage| {
+                            stage
+                                .0
+                                .iter()
+                                .map(|cluster| cluster.0.len())
+                                .sum::<usize>()
+                        })
+                        .sum(),
+                    _ => 0,
+                };
+                (classic_phase_count, soroban_phase_count)
+            }
+        };
+        if classic_count != phase_sizes.0 || soroban_count != phase_sizes.1 {
+            tracing::warn!(
+                hash = %hash,
+                classic = classic_count,
+                soroban = soroban_count,
+                classic_phase = phase_sizes.0,
+                soroban_phase = phase_sizes.1,
+                "GeneralizedTxSet phase tx type mismatch"
+            );
+            return;
+        }
+
+        // Create internal tx set with the correct hash and retain generalized set
+        let internal_tx_set =
+            TransactionSet::with_generalized(prev_hash, hash, transactions, gen_tx_set);
 
         // Give it to the herder
         if let Some(slot) = self.herder.receive_tx_set(internal_tx_set) {
@@ -4890,7 +5053,7 @@ impl HerderCallback for App {
         } else {
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: Hash::from(prev_hash),
-                txs: tx_set.transactions.try_into().map_err(|_| {
+                txs: tx_set.transactions.clone().try_into().map_err(|_| {
                     stellar_core_herder::HerderError::Internal("Failed to create tx set".into())
                 })?,
             })
@@ -4954,6 +5117,7 @@ impl HerderCallback for App {
             ledger_seq,
             result.header.scp_value.close_time.0,
             result.header.ledger_version,
+            result.header.base_fee,
         );
 
         // Update current ledger tracking

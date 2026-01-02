@@ -45,6 +45,10 @@ pub fn execute_allow_trust(
         return Ok(make_allow_trust_result(AllowTrustResultCode::TrustNotRequired));
     }
 
+    if &op.trustor == source {
+        return Ok(make_allow_trust_result(AllowTrustResultCode::SelfNotAllowed));
+    }
+
     // Convert the asset code to a full Asset
     let asset = match &op.asset {
         stellar_xdr::curr::AssetCode::CreditAlphanum4(code) => {
@@ -340,6 +344,34 @@ mod tests {
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(matches!(r, AllowTrustResult::CantRevoke));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_allow_trust_self_not_allowed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG,
+        ));
+
+        let op = AllowTrustOp {
+            trustor: issuer_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
+            authorize: 1,
+        };
+
+        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context)
+            .expect("allow trust");
+        match result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(matches!(r, AllowTrustResult::SelfNotAllowed));
             }
             other => panic!("unexpected result: {:?}", other),
         }

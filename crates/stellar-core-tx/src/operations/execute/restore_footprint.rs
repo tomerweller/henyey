@@ -46,6 +46,16 @@ pub fn execute_restore_footprint(
         }
     };
 
+    if !footprint.read_only.is_empty() {
+        return Ok(make_result(RestoreFootprintResultCode::Malformed));
+    }
+
+    for key in footprint.read_write.iter() {
+        if !is_persistent_entry(key) {
+            return Ok(make_result(RestoreFootprintResultCode::Malformed));
+        }
+    }
+
     // Calculate the new TTL for restored entries
     let current_ledger = context.sequence;
     let new_ttl = current_ledger.saturating_add(DEFAULT_RESTORE_TTL);
@@ -59,6 +69,14 @@ pub fn execute_restore_footprint(
     }
 
     Ok(make_result(RestoreFootprintResultCode::Success))
+}
+
+fn is_persistent_entry(key: &LedgerKey) -> bool {
+    match key {
+        LedgerKey::ContractCode(_) => true,
+        LedgerKey::ContractData(cd) => matches!(cd.durability, stellar_xdr::curr::ContractDataDurability::Persistent),
+        _ => false,
+    }
 }
 
 /// Restore a single ledger entry.
@@ -207,6 +225,88 @@ mod tests {
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
                 assert!(matches!(r, RestoreFootprintResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_restore_footprint_rejects_read_only() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_restore_footprint(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                assert!(matches!(r, RestoreFootprintResult::Malformed));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_restore_footprint_rejects_non_persistent_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let temp_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([2u8; 32]))),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Temporary,
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![temp_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_restore_footprint(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                assert!(matches!(r, RestoreFootprintResult::Malformed));
             }
             _ => panic!("Unexpected result type"),
         }

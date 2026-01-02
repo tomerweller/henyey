@@ -334,6 +334,66 @@ pub fn validate_structure(frame: &TransactionFrame) -> std::result::Result<(), V
     Ok(())
 }
 
+fn validate_soroban_resources(
+    frame: &TransactionFrame,
+    context: &LedgerContext,
+) -> std::result::Result<(), ValidationError> {
+    if !frame.is_soroban() {
+        return Ok(());
+    }
+
+    if frame.soroban_data().is_none() {
+        return Err(ValidationError::InvalidStructure(
+            "missing soroban transaction data".to_string(),
+        ));
+    }
+
+    let Some(data) = frame.soroban_data() else {
+        return Ok(());
+    };
+
+    let footprint = &data.resources.footprint;
+    if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resource_ext) = &data.ext {
+        let mut prev: Option<u32> = None;
+        for index in resource_ext.archived_soroban_entries.iter() {
+            if let Some(prev_index) = prev {
+                if index <= &prev_index {
+                    return Err(ValidationError::InvalidStructure(
+                        "archived soroban entry indices must be sorted and unique".to_string(),
+                    ));
+                }
+            }
+            prev = Some(*index);
+
+            let idx = *index as usize;
+            let Some(key) = footprint.read_write.get(idx) else {
+                return Err(ValidationError::InvalidStructure(
+                    "archived soroban entry index out of bounds".to_string(),
+                ));
+            };
+
+            if !is_archivable_soroban_key(key) {
+                return Err(ValidationError::InvalidStructure(
+                    "archived soroban entry must be a persistent contract entry".to_string(),
+                ));
+            }
+        }
+    }
+
+    let _ = context;
+    Ok(())
+}
+
+fn is_archivable_soroban_key(key: &stellar_xdr::curr::LedgerKey) -> bool {
+    use stellar_xdr::curr::{ContractDataDurability, LedgerKey};
+
+    match key {
+        LedgerKey::ContractData(cd) => cd.durability == ContractDataDurability::Persistent,
+        LedgerKey::ContractCode(_) => true,
+        _ => false,
+    }
+}
+
 /// Perform all basic validations.
 ///
 /// This is a convenience function that runs all basic checks suitable for catchup.
@@ -357,6 +417,10 @@ pub fn validate_basic(
     }
 
     if let Err(e) = validate_ledger_bounds(frame, context) {
+        errors.push(e);
+    }
+
+    if let Err(e) = validate_soroban_resources(frame, context) {
         errors.push(e);
     }
 
@@ -407,6 +471,10 @@ pub fn validate_full(
     }
 
     if let Err(e) = validate_extra_signers(frame, context) {
+        errors.push(e);
+    }
+
+    if let Err(e) = validate_soroban_resources(frame, context) {
         errors.push(e);
     }
 
@@ -558,11 +626,14 @@ mod tests {
     use super::*;
     use stellar_core_crypto::{sign_hash, SecretKey};
     use stellar_xdr::curr::{
-        AccountEntry, AccountEntryExt, AccountId, Asset, DecoratedSignature, Duration, ManageDataOp,
-        Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PreconditionsV2,
-        PublicKey as XdrPublicKey, SequenceNumber, Signature as XdrSignature, SignatureHint,
-        String32, String64, Thresholds, TimeBounds, TimePoint, Transaction, TransactionEnvelope,
-        TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        AccountEntry, AccountEntryExt, AccountId, Asset, ContractDataDurability, ContractId,
+        DecoratedSignature, Duration, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+        LedgerFootprint, LedgerKey, LedgerKeyContractData, ManageDataOp, Memo, MuxedAccount,
+        Operation, OperationBody, PaymentOp, Preconditions, PreconditionsV2, PublicKey as XdrPublicKey,
+        ScAddress, ScSymbol, ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint,
+        SorobanResources, SorobanResourcesExtV0, SorobanTransactionData, SorobanTransactionDataExt,
+        String32, String64, StringM, Thresholds, TimeBounds, TimePoint, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
 
     fn create_test_frame() -> TransactionFrame {
@@ -609,6 +680,65 @@ mod tests {
             signers: VecM::default(),
             ext: AccountEntryExt::V0,
         }
+    }
+
+    fn create_soroban_envelope(
+        read_write: Vec<LedgerKey>,
+        archived_indices: Option<Vec<u32>>,
+        with_data: bool,
+    ) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+            function_name: ScSymbol(StringM::<32>::try_from("noop".to_string()).unwrap()),
+            args: VecM::<ScVal>::default(),
+        });
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function,
+                auth: VecM::default(),
+            }),
+        };
+
+        let mut tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        if with_data {
+            let footprint = LedgerFootprint {
+                read_only: VecM::default(),
+                read_write: read_write.try_into().unwrap(),
+            };
+            let ext = match archived_indices {
+                Some(indices) => SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                    archived_soroban_entries: indices.try_into().unwrap(),
+                }),
+                None => SorobanTransactionDataExt::V0,
+            };
+            tx.ext = TransactionExt::V1(SorobanTransactionData {
+                ext,
+                resources: SorobanResources {
+                    footprint,
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 0,
+            });
+        }
+
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        })
     }
 
     fn sign_envelope(
@@ -699,6 +829,50 @@ mod tests {
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(validate_basic(&frame, &context).is_ok());
+    }
+
+    #[test]
+    fn test_validate_soroban_missing_data() {
+        let envelope = create_soroban_envelope(Vec::new(), None, false);
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+
+        assert!(matches!(
+            validate_basic(&frame, &context),
+            Err(errors) if matches!(errors.first(), Some(ValidationError::InvalidStructure(_)))
+        ));
+    }
+
+    #[test]
+    fn test_validate_soroban_archived_index_out_of_bounds() {
+        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([3u8; 32]),
+        });
+        let envelope = create_soroban_envelope(vec![key], Some(vec![1]), true);
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+
+        assert!(matches!(
+            validate_basic(&frame, &context),
+            Err(errors) if matches!(errors.first(), Some(ValidationError::InvalidStructure(_)))
+        ));
+    }
+
+    #[test]
+    fn test_validate_soroban_archived_key_must_be_persistent() {
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([4u8; 32]))),
+            key: ScVal::I32(1),
+            durability: ContractDataDurability::Temporary,
+        });
+        let envelope = create_soroban_envelope(vec![key], Some(vec![0]), true);
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+
+        assert!(matches!(
+            validate_basic(&frame, &context),
+            Err(errors) if matches!(errors.first(), Some(ValidationError::InvalidStructure(_)))
+        ));
     }
 
     #[test]

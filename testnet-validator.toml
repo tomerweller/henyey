@@ -17,14 +17,14 @@ inner_sets = []
 passphrase = "Test SDF Network ; September 2015"
 base_fee = 100
 base_reserve = 5000000
-max_protocol_version = 22
+max_protocol_version = 25
 
 [database]
-path = "/home/tomer/rs-stellar-core/data/stellar.db"
+path = "data/stellar.db"
 pool_size = 10
 
 [buckets]
-directory = "/home/tomer/rs-stellar-core/data/buckets"
+directory = "data/buckets"
 cache_size = 256
 
 [[history.archives]]

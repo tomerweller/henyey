@@ -12,7 +12,7 @@ use stellar_xdr::curr::{
     ManageOfferSuccessResult, ManageOfferSuccessResultOffer, ManageSellOfferOp,
     ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt, OfferEntryFlags,
     OperationResult, OperationResultTr, Price, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags,
+    TrustLineEntryV1Ext, TrustLineFlags, LedgerKey, LedgerKeyOffer,
 };
 
 use crate::state::LedgerStateManager;
@@ -82,23 +82,43 @@ fn execute_manage_offer(
         ));
     }
 
-    if let Some(issuer) = issuer_for_asset(selling) {
-        if state.get_account(issuer).is_none() {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::SellNoIssuer,
-                None,
-            ));
+    if context.protocol_version < 13 {
+        if let Some(issuer) = issuer_for_asset(selling) {
+            if state.get_account(issuer).is_none() {
+                return Ok(make_sell_offer_result(
+                    ManageSellOfferResultCode::SellNoIssuer,
+                    None,
+                ));
+            }
+        }
+
+        if let Some(issuer) = issuer_for_asset(buying) {
+            if state.get_account(issuer).is_none() {
+                return Ok(make_sell_offer_result(
+                    ManageSellOfferResultCode::BuyNoIssuer,
+                    None,
+                ));
+            }
         }
     }
 
-    if let Some(issuer) = issuer_for_asset(buying) {
-        if state.get_account(issuer).is_none() {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::BuyNoIssuer,
-                None,
-            ));
-        }
+    let old_offer = if offer_id != 0 {
+        state.get_offer(source, offer_id).cloned()
+    } else {
+        None
+    };
+    if offer_id != 0 && old_offer.is_none() {
+        return Ok(make_sell_offer_result(
+            ManageSellOfferResultCode::NotFound,
+            None,
+        ));
     }
+    let sponsor = if old_offer.is_none() {
+        state.active_sponsor_for(source)
+    } else {
+        None
+    };
+    let reserve_subentry = old_offer.is_none() && sponsor.is_none();
 
     // For selling non-native assets, check trustline exists and has balance
     if !matches!(selling, Asset::Native) {
@@ -115,7 +135,7 @@ fn execute_manage_offer(
             }
         };
 
-        if issuer_requires_auth(selling, state) && !is_trustline_authorized(trustline.flags) {
+        if !is_trustline_authorized(trustline.flags) {
             return Ok(make_sell_offer_result(
                 ManageSellOfferResultCode::SellNotAuthorized,
                 None,
@@ -125,7 +145,11 @@ fn execute_manage_offer(
     } else {
         // For native asset, check account exists
         let account = state.get_account(source).unwrap();
-        let min_balance = state.minimum_balance(account.num_sub_entries + 1);
+        let min_balance = state.minimum_balance_for_account(
+            account,
+            context.protocol_version,
+            if reserve_subentry { 1 } else { 0 },
+        )?;
         if account.balance < min_balance {
             return Ok(make_sell_offer_result(
                 ManageSellOfferResultCode::Underfunded,
@@ -149,7 +173,7 @@ fn execute_manage_offer(
             }
         };
 
-        if issuer_requires_auth(buying, state) && !is_trustline_authorized(trustline.flags) {
+        if !is_trustline_authorized(trustline.flags) {
             return Ok(make_sell_offer_result(
                 ManageSellOfferResultCode::BuyNotAuthorized,
                 None,
@@ -158,21 +182,27 @@ fn execute_manage_offer(
         }
     }
 
-    let old_offer = if offer_id != 0 {
-        state.get_offer(source, offer_id).cloned()
-    } else {
-        None
-    };
-    if offer_id != 0 && old_offer.is_none() {
-        return Ok(make_sell_offer_result(
-            ManageSellOfferResultCode::NotFound,
-            None,
-        ));
-    }
-
     if old_offer.is_none() {
-        if let Some(account) = state.get_account(source) {
-            let min_balance = state.minimum_balance(account.num_sub_entries + 1);
+        if let Some(sponsor) = &sponsor {
+            let sponsor_account = state
+                .get_account(sponsor)
+                .ok_or(TxError::SourceAccountNotFound)?;
+            let min_balance = state.minimum_balance_for_account_with_deltas(
+                sponsor_account,
+                context.protocol_version,
+                0,
+                1,
+                0,
+            )?;
+            if sponsor_account.balance < min_balance {
+                return Ok(make_sell_offer_result(
+                    ManageSellOfferResultCode::LowReserve,
+                    None,
+                ));
+            }
+        } else if let Some(account) = state.get_account(source) {
+            let min_balance =
+                state.minimum_balance_for_account(account, context.protocol_version, 1)?;
             if account.balance < min_balance {
                 return Ok(make_sell_offer_result(
                     ManageSellOfferResultCode::LowReserve,
@@ -206,7 +236,6 @@ fn execute_manage_offer(
     }
 
     let (selling_liab, buying_liab) = offer_kind.offer_liabilities(price)?;
-    let reserve_subentry = old_offer.is_none();
     if !has_selling_capacity(
         source,
         selling,
@@ -214,7 +243,8 @@ fn execute_manage_offer(
         0,
         reserve_subentry,
         state,
-    ) {
+        context,
+    )? {
         return Ok(make_sell_offer_result(
             ManageSellOfferResultCode::Underfunded,
             None,
@@ -228,7 +258,7 @@ fn execute_manage_offer(
         ));
     }
 
-    let mut max_sheep_send = can_sell_at_most(source, selling, state);
+    let mut max_sheep_send = can_sell_at_most(source, selling, state, context)?;
     let mut max_wheat_receive = can_buy_at_most(source, buying, state);
     offer_kind.apply_limits(&mut max_sheep_send, 0, &mut max_wheat_receive, 0);
     if max_wheat_receive == 0 {
@@ -260,6 +290,7 @@ fn execute_manage_offer(
         &max_wheat_price,
         &mut offer_trail,
         state,
+        context,
     )?;
 
     let sheep_stays = match convert_res {
@@ -286,7 +317,7 @@ fn execute_manage_offer(
     }
 
     let amount = if sheep_stays {
-        let mut sheep_limit = can_sell_at_most(source, selling, state);
+        let mut sheep_limit = can_sell_at_most(source, selling, state, context)?;
         let mut wheat_limit = can_buy_at_most(source, buying, state);
         offer_kind.apply_limits(
             &mut sheep_limit,
@@ -322,6 +353,18 @@ fn execute_manage_offer(
             if let Some(account) = state.get_account_mut(source) {
                 account.num_sub_entries += 1;
             }
+            if let Some(sponsor) = sponsor {
+                let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+                    seller_id: source.clone(),
+                    offer_id,
+                });
+                state.apply_entry_sponsorship_with_sponsor(
+                    ledger_key,
+                    &sponsor,
+                    Some(source),
+                    1,
+                )?;
+            }
             ManageOfferSuccessResultOffer::Created(create_offer_entry(
                 source, offer_id, selling, buying, amount, price,
             ))
@@ -333,6 +376,13 @@ fn execute_manage_offer(
         }
     } else {
         if old_offer.is_some() {
+            let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+                seller_id: source.clone(),
+                offer_id,
+            });
+            if state.entry_sponsor(&ledger_key).is_some() {
+                state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 1)?;
+            }
             state.delete_offer(source, offer_id);
             if let Some(account) = state.get_account_mut(source) {
                 if account.num_sub_entries > 0 {
@@ -508,15 +558,6 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
     }
 }
 
-fn issuer_requires_auth(asset: &Asset, state: &LedgerStateManager) -> bool {
-    let Some(issuer) = issuer_for_asset(asset) else {
-        return false;
-    };
-    state
-        .get_account(issuer)
-        .map(|account| account.flags & AUTH_REQUIRED_FLAG != 0)
-        .unwrap_or(false)
-}
 
 /// Create a new offer.
 fn create_offer(
@@ -528,8 +569,27 @@ fn create_offer(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationResult> {
-    if let Some(account) = state.get_account(source) {
-        let min_balance = state.minimum_balance(account.num_sub_entries + 1);
+    let sponsor = state.active_sponsor_for(source);
+    if let Some(sponsor) = &sponsor {
+        let sponsor_account = state
+            .get_account(sponsor)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        let min_balance = state.minimum_balance_for_account_with_deltas(
+            sponsor_account,
+            context.protocol_version,
+            0,
+            1,
+            0,
+        )?;
+        if sponsor_account.balance < min_balance {
+            return Ok(make_sell_offer_result(
+                ManageSellOfferResultCode::LowReserve,
+                None,
+            ));
+        }
+    } else if let Some(account) = state.get_account(source) {
+        let min_balance =
+            state.minimum_balance_for_account(account, context.protocol_version, 1)?;
         if account.balance < min_balance {
             return Ok(make_sell_offer_result(
                 ManageSellOfferResultCode::LowReserve,
@@ -562,6 +622,13 @@ fn create_offer(
     // Increment the source account's sub-entries
     if let Some(account) = state.get_account_mut(source) {
         account.num_sub_entries += 1;
+    }
+    if let Some(sponsor) = sponsor {
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: source.clone(),
+            offer_id,
+        });
+        state.apply_entry_sponsorship_with_sponsor(ledger_key, &sponsor, Some(source), 1)?;
     }
 
     let success = ManageOfferSuccessResult {
@@ -648,6 +715,14 @@ fn delete_offer(
         state,
     )?;
 
+    let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+        seller_id: source.clone(),
+        offer_id,
+    });
+    if state.entry_sponsor(&ledger_key).is_some() {
+        state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 1)?;
+    }
+
     state.delete_offer(source, offer_id);
 
     // Decrement the source account's sub-entries
@@ -713,29 +788,34 @@ fn has_selling_capacity(
     old_selling_liab: i64,
     reserve_subentry: bool,
     state: &LedgerStateManager,
-) -> bool {
+    context: &LedgerContext,
+) -> Result<bool> {
     if matches!(selling, Asset::Native) {
         let Some(account) = state.get_account(source) else {
-            return false;
+            return Ok(false);
         };
-        let min_balance = state.minimum_balance(account.num_sub_entries + if reserve_subentry { 1 } else { 0 });
+        let min_balance = state.minimum_balance_for_account(
+            account,
+            context.protocol_version,
+            if reserve_subentry { 1 } else { 0 },
+        )?;
         let current_liab = account_liabilities(account).selling;
         let effective_liab = current_liab.saturating_sub(old_selling_liab);
         let available = account.balance - min_balance - effective_liab;
-        return available >= selling_liab;
+        return Ok(available >= selling_liab);
     }
 
     if issuer_for_asset(selling) == Some(source) {
-        return true;
+        return Ok(true);
     }
 
     let Some(trustline) = state.get_trustline(source, selling) else {
-        return false;
+        return Ok(false);
     };
     let current_liab = trustline_liabilities(trustline).selling;
     let effective_liab = current_liab.saturating_sub(old_selling_liab);
     let available = trustline.balance - effective_liab;
-    available >= selling_liab
+    Ok(available >= selling_liab)
 }
 
 fn has_buying_capacity(
@@ -768,28 +848,34 @@ fn has_buying_capacity(
     available >= buying_liab
 }
 
-fn can_sell_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {
+fn can_sell_at_most(
+    source: &AccountId,
+    asset: &Asset,
+    state: &LedgerStateManager,
+    context: &LedgerContext,
+) -> Result<i64> {
     if matches!(asset, Asset::Native) {
         let Some(account) = state.get_account(source) else {
-            return 0;
+            return Ok(0);
         };
-        let min_balance = state.minimum_balance(account.num_sub_entries);
+        let min_balance =
+            state.minimum_balance_for_account(account, context.protocol_version, 0)?;
         let available = account.balance - min_balance - account_liabilities(account).selling;
-        return available.max(0);
+        return Ok(available.max(0));
     }
 
     if issuer_for_asset(asset) == Some(source) {
-        return i64::MAX;
+        return Ok(i64::MAX);
     }
 
     let Some(trustline) = state.get_trustline(source, asset) else {
-        return 0;
+        return Ok(0);
     };
     if !is_authorized_to_maintain_liabilities(trustline.flags) {
-        return 0;
+        return Ok(0);
     }
     let available = trustline.balance - trustline_liabilities(trustline).selling;
-    available.max(0)
+    Ok(available.max(0))
 }
 
 fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {
@@ -887,6 +973,7 @@ fn convert_with_offers(
     max_wheat_price: &Price,
     offer_trail: &mut Vec<ClaimAtom>,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> Result<ConvertResult> {
     offer_trail.clear();
     *sheep_sent = 0;
@@ -898,7 +985,7 @@ fn convert_with_offers(
     let mut ignored = HashSet::new();
 
     while need_more {
-        let offer = state.best_offer_filtered(buying, selling, |offer| {
+        let offer = state.best_offer_filtered(selling, buying, |offer| {
             if offer.seller_id == *source && offer.offer_id == updating_offer_id {
                 return false;
             }
@@ -926,6 +1013,7 @@ fn convert_with_offers(
             round,
             offer_trail,
             state,
+            context,
         )?;
         if num_wheat_received == 0 && num_sheep_send == 0 {
             return Ok(ConvertResult::Partial);
@@ -977,6 +1065,7 @@ fn cross_offer_v10(
     round: RoundingType,
     offer_trail: &mut Vec<ClaimAtom>,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> Result<(i64, i64, bool)> {
     let sheep = offer.buying.clone();
     let wheat = offer.selling.clone();
@@ -992,7 +1081,8 @@ fn cross_offer_v10(
         state,
     )?;
 
-    let max_wheat_send = offer.amount.min(can_sell_at_most(&seller, &wheat, state));
+    let max_wheat_send =
+        offer.amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
     let exchange = exchange_v10(
         offer.price.clone(),
@@ -1373,7 +1463,9 @@ mod tests {
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
-        let min_balance = state.minimum_balance(0);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
         state.create_account(create_test_account(issuer_id.clone(), min_balance + 10_000_000));
 
         let selling = Asset::CreditAlphanum4(AlphaNum4 {
@@ -1404,7 +1496,9 @@ mod tests {
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
-        let min_balance = state.minimum_balance(0);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
         state.create_account(create_test_account(issuer_id.clone(), min_balance + 10_000_000));
 
         let buying = Asset::CreditAlphanum4(AlphaNum4 {
@@ -1432,7 +1526,8 @@ mod tests {
     #[test]
     fn test_manage_sell_offer_sell_no_issuer() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let context = create_test_context();
+        let mut context = create_test_context();
+        context.protocol_version = 12;
 
         let source_id = create_test_account_id(0);
         let issuer_id = create_test_account_id(1);
@@ -1468,9 +1563,49 @@ mod tests {
     }
 
     #[test]
+    fn test_manage_sell_offer_sell_missing_issuer_protocol_13_ok() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 13;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageSellOfferOp {
+            selling: asset,
+            buying: Asset::Native,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::Success(_)));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
     fn test_manage_sell_offer_buy_no_issuer() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let context = create_test_context();
+        let mut context = create_test_context();
+        context.protocol_version = 12;
 
         let source_id = create_test_account_id(0);
         let issuer_id = create_test_account_id(1);
@@ -1506,6 +1641,45 @@ mod tests {
     }
 
     #[test]
+    fn test_manage_sell_offer_buy_missing_issuer_protocol_13_ok() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 13;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: asset,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::Success(_)));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
     fn test_manage_sell_offer_sell_not_authorized() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
@@ -1529,6 +1703,50 @@ mod tests {
             100,
             1_000_000,
             0,
+        ));
+
+        let op = ManageSellOfferOp {
+            selling: asset,
+            buying: Asset::Native,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::SellNotAuthorized));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_manage_sell_offer_sell_authorized_to_maintain_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 13;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state
+            .get_account_mut(&issuer_id)
+            .unwrap()
+            .flags = AUTH_REQUIRED_FLAG;
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
         ));
 
         let op = ManageSellOfferOp {
@@ -1592,13 +1810,554 @@ mod tests {
     }
 
     #[test]
+    fn test_manage_sell_offer_buy_authorized_to_maintain_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 13;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state
+            .get_account_mut(&issuer_id)
+            .unwrap()
+            .flags = AUTH_REQUIRED_FLAG;
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
+        ));
+
+        let op = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: asset,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::BuyNotAuthorized));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_manage_sell_offer_update_denied_when_selling_maintain_only() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 13;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state
+            .get_account_mut(&issuer_id)
+            .unwrap()
+            .flags = AUTH_REQUIRED_FLAG;
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let create = ManageSellOfferOp {
+            selling: asset.clone(),
+            buying: Asset::Native,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+        let created = execute_manage_sell_offer(&create, &source_id, &mut state, &context).unwrap();
+        let offer_id = match created {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
+                ManageOfferSuccessResult { offer, .. },
+            ))) => match offer {
+                ManageOfferSuccessResultOffer::Created(entry) => entry.offer_id,
+                _ => panic!("expected created offer"),
+            },
+            _ => panic!("unexpected result type"),
+        };
+
+        let tl = state
+            .get_trustline_by_trustline_asset_mut(
+                &source_id,
+                &TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                    issuer: issuer_id.clone(),
+                }),
+            )
+            .expect("trustline exists");
+        tl.flags = AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
+
+        let update = ManageSellOfferOp {
+            selling: asset,
+            buying: Asset::Native,
+            amount: 11,
+            price: Price { n: 1, d: 1 },
+            offer_id,
+        };
+
+        let result = execute_manage_sell_offer(&update, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::SellNotAuthorized));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_manage_sell_offer_update_denied_when_buying_maintain_only() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 13;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state
+            .get_account_mut(&issuer_id)
+            .unwrap()
+            .flags = AUTH_REQUIRED_FLAG;
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let create = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: asset.clone(),
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+        let created = execute_manage_sell_offer(&create, &source_id, &mut state, &context).unwrap();
+        let offer_id = match created {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
+                ManageOfferSuccessResult { offer, .. },
+            ))) => match offer {
+                ManageOfferSuccessResultOffer::Created(entry) => entry.offer_id,
+                _ => panic!("expected created offer"),
+            },
+            _ => panic!("unexpected result type"),
+        };
+
+        let tl = state
+            .get_trustline_by_trustline_asset_mut(
+                &source_id,
+                &TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                    issuer: issuer_id.clone(),
+                }),
+            )
+            .expect("trustline exists");
+        tl.flags = AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
+
+        let update = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: asset,
+            amount: 11,
+            price: Price { n: 1, d: 1 },
+            offer_id,
+        };
+
+        let result = execute_manage_sell_offer(&update, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::BuyNotAuthorized));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_manage_sell_offer_delete_allowed_when_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 13;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state
+            .get_account_mut(&issuer_id)
+            .unwrap()
+            .flags = AUTH_REQUIRED_FLAG;
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let create = ManageSellOfferOp {
+            selling: asset.clone(),
+            buying: Asset::Native,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+        let created = execute_manage_sell_offer(&create, &source_id, &mut state, &context).unwrap();
+        let offer_id = match created {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
+                ManageOfferSuccessResult { offer, .. },
+            ))) => match offer {
+                ManageOfferSuccessResultOffer::Created(entry) => entry.offer_id,
+                _ => panic!("expected created offer"),
+            },
+            _ => panic!("unexpected result type"),
+        };
+
+        let tl = state
+            .get_trustline_by_trustline_asset_mut(
+                &source_id,
+                &TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                    issuer: issuer_id.clone(),
+                }),
+            )
+            .expect("trustline exists");
+        tl.flags = AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
+
+        let delete = ManageSellOfferOp {
+            selling: asset,
+            buying: Asset::Native,
+            amount: 0,
+            price: Price { n: 1, d: 1 },
+            offer_id,
+        };
+
+        let result = execute_manage_sell_offer(&delete, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
+                ManageOfferSuccessResult { offer, .. },
+            ))) => assert!(matches!(offer, ManageOfferSuccessResultOffer::Deleted)),
+            _ => panic!("Unexpected result type"),
+        }
+        assert!(state.get_offer(&source_id, offer_id).is_none());
+    }
+
+    #[test]
+    fn test_manage_sell_offer_cross_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+            issuer: issuer_id.clone(),
+        });
+        let idr = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        state.create_offer(OfferEntry {
+            seller_id: source_id.clone(),
+            offer_id: 1,
+            selling: idr.clone(),
+            buying: usd.clone(),
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        let op = ManageSellOfferOp {
+            selling: usd,
+            buying: idr,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(matches!(r, ManageSellOfferResult::CrossSelf), "{r:?}");
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_cross_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+            issuer: issuer_id.clone(),
+        });
+        let idr = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        state.create_offer(OfferEntry {
+            seller_id: source_id.clone(),
+            offer_id: 1,
+            selling: idr.clone(),
+            buying: usd.clone(),
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        let op = ManageBuyOfferOp {
+            selling: usd,
+            buying: idr,
+            buy_amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(matches!(r, ManageBuyOfferResult::CrossSelf));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    fn manage_buy_offer_amount(price: Price, buy_amount: i64) -> i64 {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let selling = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'C', b'U', b'R', b'1']),
+            issuer: issuer_id.clone(),
+        });
+        let buying = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'C', b'U', b'R', b'2']),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'C', b'U', b'R', b'1']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            100,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'C', b'U', b'R', b'2']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            100,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageBuyOfferOp {
+            selling,
+            buying,
+            buy_amount,
+            price,
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(ManageBuyOfferResult::Success(
+                ManageOfferSuccessResult { offer, .. },
+            ))) => match offer {
+                ManageOfferSuccessResultOffer::Created(entry) => entry.amount,
+                _ => panic!("expected created offer"),
+            },
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    fn manage_sell_offer_amount(price: Price, amount: i64, seed: u8) -> i64 {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(seed);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let selling = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'C', b'U', b'R', b'3']),
+            issuer: issuer_id.clone(),
+        });
+        let buying = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'C', b'U', b'R', b'4']),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'C', b'U', b'R', b'3']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            100,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'C', b'U', b'R', b'4']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            100,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageSellOfferOp {
+            selling,
+            buying,
+            amount,
+            price,
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
+                ManageOfferSuccessResult { offer, .. },
+            ))) => match offer {
+                ManageOfferSuccessResultOffer::Created(entry) => entry.amount,
+                _ => panic!("expected created offer"),
+            },
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_amount_matches_sell_offer() {
+        let cases = [
+            (Price { n: 2, d: 5 }, 20, Price { n: 5, d: 2 }, 8),
+            (Price { n: 1, d: 2 }, 20, Price { n: 2, d: 1 }, 10),
+            (Price { n: 1, d: 1 }, 20, Price { n: 1, d: 1 }, 20),
+            (Price { n: 2, d: 1 }, 20, Price { n: 1, d: 2 }, 40),
+            (Price { n: 5, d: 2 }, 20, Price { n: 2, d: 5 }, 50),
+            (Price { n: 2, d: 5 }, 21, Price { n: 5, d: 2 }, 8),
+            (Price { n: 1, d: 2 }, 21, Price { n: 2, d: 1 }, 10),
+            (Price { n: 2, d: 1 }, 21, Price { n: 1, d: 2 }, 42),
+            (Price { n: 5, d: 2 }, 21, Price { n: 2, d: 5 }, 53),
+        ];
+
+        for (buy_price, buy_amount, sell_price, sell_amount) in cases {
+            let buy_offer = manage_buy_offer_amount(buy_price, buy_amount);
+            let sell_offer = manage_sell_offer_amount(sell_price, sell_amount, 2);
+            assert_eq!(buy_offer, sell_offer);
+        }
+    }
+
+    #[test]
     fn test_manage_sell_offer_low_reserve() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
         let issuer_id = create_test_account_id(1);
-        let min_balance = state.minimum_balance(0);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
         state.create_account(create_test_account(source_id.clone(), min_balance));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
 

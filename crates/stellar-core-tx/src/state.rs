@@ -3,15 +3,19 @@
 use std::collections::HashMap;
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, Asset, ClaimableBalanceEntry, ClaimableBalanceId,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
+    AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountId, Asset, ClaimableBalanceEntry,
+    ClaimableBalanceId,
     ContractCodeEntry, ContractDataDurability, ContractDataEntry, DataEntry, Hash, LedgerEntry,
-    LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance,
-    LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyData, LedgerKeyLiquidityPool,
-    LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl, LiquidityPoolEntry, OfferEntry, PoolId,
-    Price, PublicKey, ScAddress, ScVal, TrustLineAsset, TrustLineEntry, TtlEntry,
+    LedgerEntryData, LedgerEntryExt, LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext, LedgerKey,
+    LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyContractData,
+    LedgerKeyData, LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl,
+    Liabilities, LiquidityPoolEntry, OfferEntry, PoolId, Price, PublicKey, ScAddress, ScVal,
+    SponsorshipDescriptor, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
 };
 
 use crate::apply::LedgerDelta;
+use crate::{Result, TxError};
 
 /// Trait for reading ledger entries from storage.
 pub trait LedgerReader {
@@ -117,6 +121,10 @@ pub struct LedgerStateManager {
     claimable_balances: HashMap<[u8; 32], ClaimableBalanceEntry>,
     /// Liquidity pool entries by pool ID.
     liquidity_pools: HashMap<[u8; 32], LiquidityPoolEntry>,
+    /// Sponsoring account IDs for ledger entries (only when sponsored).
+    entry_sponsorships: HashMap<LedgerKey, AccountId>,
+    /// Active sponsorship stack for the current transaction.
+    sponsorship_stack: Vec<SponsorshipContext>,
     /// Changes made during execution.
     delta: LedgerDelta,
     /// Track which entries have been modified for rollback.
@@ -155,6 +163,14 @@ pub struct LedgerStateManager {
     claimable_balance_snapshots: HashMap<[u8; 32], Option<ClaimableBalanceEntry>>,
     /// Snapshot of liquidity pool entries for rollback.
     liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
+    /// Snapshot of entry sponsorships for rollback.
+    entry_sponsorship_snapshots: HashMap<LedgerKey, Option<AccountId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SponsorshipContext {
+    pub sponsoring: AccountId,
+    pub sponsored: AccountId,
 }
 
 impl LedgerStateManager {
@@ -178,6 +194,8 @@ impl LedgerStateManager {
             ttl_entries: HashMap::new(),
             claimable_balances: HashMap::new(),
             liquidity_pools: HashMap::new(),
+            entry_sponsorships: HashMap::new(),
+            sponsorship_stack: Vec::new(),
             delta: LedgerDelta::new(ledger_seq),
             modified_accounts: Vec::new(),
             modified_trustlines: Vec::new(),
@@ -197,22 +215,100 @@ impl LedgerStateManager {
             ttl_snapshots: HashMap::new(),
             claimable_balance_snapshots: HashMap::new(),
             liquidity_pool_snapshots: HashMap::new(),
+            entry_sponsorship_snapshots: HashMap::new(),
         }
     }
 
-    /// Calculate the minimum balance required for an account with the given number of sub-entries.
-    ///
-    /// The formula is: (2 + num_sub_entries) * base_reserve
-    ///
-    /// # Arguments
-    ///
-    /// * `num_sub_entries` - Number of sub-entries (trustlines, offers, signers, data entries)
-    ///
-    /// # Returns
-    ///
-    /// The minimum balance in stroops.
-    pub fn minimum_balance(&self, num_sub_entries: u32) -> i64 {
-        (2 + num_sub_entries as i64) * self.base_reserve
+    /// Compute the starting sequence number for new accounts.
+    pub fn starting_sequence_number(&self) -> crate::Result<i64> {
+        if self.ledger_seq > i32::MAX as u32 {
+            return Err(crate::TxError::Internal(
+                "overflowed starting sequence number".to_string(),
+            ));
+        }
+        Ok((self.ledger_seq as i64) << 32)
+    }
+
+    /// Calculate the minimum balance required for an account.
+    pub fn minimum_balance_for_account(
+        &self,
+        account: &AccountEntry,
+        protocol_version: u32,
+        additional_subentries: i64,
+    ) -> Result<i64> {
+        let num_sub_entries = account.num_sub_entries as i64 + additional_subentries;
+        if num_sub_entries < 0 {
+            return Err(TxError::Internal(
+                "negative subentry count while computing minimum balance".to_string(),
+            ));
+        }
+        let (num_sponsoring, num_sponsored) = sponsorship_counts(account);
+        self.minimum_balance_with_counts(
+            protocol_version,
+            num_sub_entries,
+            num_sponsoring,
+            num_sponsored,
+        )
+    }
+
+    /// Calculate the minimum balance for an account with sponsorship deltas.
+    pub fn minimum_balance_for_account_with_deltas(
+        &self,
+        account: &AccountEntry,
+        protocol_version: u32,
+        additional_subentries: i64,
+        delta_sponsoring: i64,
+        delta_sponsored: i64,
+    ) -> Result<i64> {
+        let num_sub_entries = account.num_sub_entries as i64 + additional_subentries;
+        if num_sub_entries < 0 {
+            return Err(TxError::Internal(
+                "negative subentry count while computing minimum balance".to_string(),
+            ));
+        }
+        let (num_sponsoring, num_sponsored) = sponsorship_counts(account);
+        let num_sponsoring = num_sponsoring + delta_sponsoring;
+        let num_sponsored = num_sponsored + delta_sponsored;
+        if num_sponsoring < 0 || num_sponsored < 0 {
+            return Err(TxError::Internal(
+                "negative sponsorship count while computing minimum balance".to_string(),
+            ));
+        }
+        self.minimum_balance_with_counts(
+            protocol_version,
+            num_sub_entries,
+            num_sponsoring,
+            num_sponsored,
+        )
+    }
+
+    /// Calculate the minimum balance for a hypothetical account state.
+    pub fn minimum_balance_with_counts(
+        &self,
+        protocol_version: u32,
+        num_sub_entries: i64,
+        num_sponsoring: i64,
+        num_sponsored: i64,
+    ) -> Result<i64> {
+        if protocol_version < 14 && (num_sponsoring != 0 || num_sponsored != 0) {
+            return Err(TxError::Internal(
+                "unexpected sponsorship state for protocol < 14".to_string(),
+            ));
+        }
+
+        let effective_entries = if protocol_version < 9 {
+            2 + num_sub_entries
+        } else {
+            2 + num_sub_entries + num_sponsoring - num_sponsored
+        };
+
+        if effective_entries < 0 {
+            return Err(TxError::Internal(
+                "unexpected account state while computing minimum balance".to_string(),
+            ));
+        }
+
+        Ok(effective_entries * self.base_reserve)
     }
 
     /// Get the base reserve.
@@ -241,6 +337,236 @@ impl LedgerStateManager {
         self.ledger_seq
     }
 
+    /// Clear active sponsorship state (start of a new transaction).
+    pub fn clear_sponsorship_stack(&mut self) {
+        self.sponsorship_stack.clear();
+    }
+
+    /// Check if there is any pending sponsorship.
+    pub fn has_pending_sponsorship(&self) -> bool {
+        !self.sponsorship_stack.is_empty()
+    }
+
+    /// Return the active sponsor for a sponsored account, if any.
+    pub fn active_sponsor_for(&self, sponsored: &AccountId) -> Option<AccountId> {
+        self.sponsorship_stack
+            .iter()
+            .rev()
+            .find(|ctx| ctx.sponsored == *sponsored)
+            .map(|ctx| ctx.sponsoring.clone())
+    }
+
+    /// Return true if an account is currently being sponsored.
+    pub fn is_sponsored(&self, account_id: &AccountId) -> bool {
+        self.sponsorship_stack
+            .iter()
+            .any(|ctx| ctx.sponsored == *account_id)
+    }
+
+    /// Return true if an account is currently sponsoring someone else.
+    pub fn is_sponsoring(&self, account_id: &AccountId) -> bool {
+        self.sponsorship_stack
+            .iter()
+            .any(|ctx| ctx.sponsoring == *account_id)
+    }
+
+    /// Push a new sponsorship context onto the stack.
+    pub fn push_sponsorship(&mut self, sponsoring: AccountId, sponsored: AccountId) {
+        self.sponsorship_stack.push(SponsorshipContext {
+            sponsoring,
+            sponsored,
+        });
+    }
+
+    /// Pop the latest sponsorship context.
+    pub fn pop_sponsorship(&mut self) -> Option<SponsorshipContext> {
+        self.sponsorship_stack.pop()
+    }
+
+    /// Remove the most recent sponsorship for a sponsored account.
+    pub fn remove_sponsorship_for(&mut self, sponsored: &AccountId) -> Option<SponsorshipContext> {
+        if let Some(pos) = self
+            .sponsorship_stack
+            .iter()
+            .rposition(|ctx| &ctx.sponsored == sponsored)
+        {
+            return Some(self.sponsorship_stack.remove(pos));
+        }
+        None
+    }
+
+    /// Return the sponsor for a ledger entry, if any.
+    pub fn entry_sponsor(&self, key: &LedgerKey) -> Option<&AccountId> {
+        self.entry_sponsorships.get(key)
+    }
+
+    /// Set the sponsor for a ledger entry.
+    pub fn set_entry_sponsor(&mut self, key: LedgerKey, sponsor: AccountId) {
+        if !self.entry_sponsorship_snapshots.contains_key(&key) {
+            self.entry_sponsorship_snapshots
+                .insert(key.clone(), self.entry_sponsorships.get(&key).cloned());
+        }
+        self.entry_sponsorships.insert(key, sponsor);
+    }
+
+    /// Remove and return the sponsor for a ledger entry, if any.
+    pub fn remove_entry_sponsor(&mut self, key: &LedgerKey) -> Option<AccountId> {
+        if !self.entry_sponsorship_snapshots.contains_key(key) {
+            self.entry_sponsorship_snapshots
+                .insert(key.clone(), self.entry_sponsorships.get(key).cloned());
+        }
+        self.entry_sponsorships.remove(key)
+    }
+
+    /// Apply sponsorship to a newly created ledger entry owned by `sponsored`.
+    pub fn apply_entry_sponsorship(
+        &mut self,
+        key: LedgerKey,
+        sponsored: &AccountId,
+        multiplier: i64,
+    ) -> Result<Option<AccountId>> {
+        let Some(sponsor) = self.active_sponsor_for(sponsored) else {
+            return Ok(None);
+        };
+        self.apply_entry_sponsorship_with_sponsor(key, &sponsor, Some(sponsored), multiplier)?;
+        Ok(Some(sponsor))
+    }
+
+    /// Apply sponsorship for a ledger entry with a known sponsor.
+    pub fn apply_entry_sponsorship_with_sponsor(
+        &mut self,
+        key: LedgerKey,
+        sponsor: &AccountId,
+        sponsored: Option<&AccountId>,
+        multiplier: i64,
+    ) -> Result<()> {
+        if multiplier < 0 {
+            return Err(TxError::Internal(
+                "negative sponsorship multiplier".to_string(),
+            ));
+        }
+        self.set_entry_sponsor(key, sponsor.clone());
+        self.update_num_sponsoring(sponsor, multiplier)?;
+        if let Some(sponsored) = sponsored {
+            self.update_num_sponsored(sponsored, multiplier)?;
+        }
+        Ok(())
+    }
+
+    /// Apply sponsorship to a newly created account entry (account not yet in state).
+    pub fn apply_account_entry_sponsorship(
+        &mut self,
+        account: &mut AccountEntry,
+        sponsor: &AccountId,
+        multiplier: i64,
+    ) -> Result<()> {
+        if multiplier < 0 {
+            return Err(TxError::Internal(
+                "negative sponsorship multiplier".to_string(),
+            ));
+        }
+        let ext = ensure_account_ext_v2(account);
+        let updated = ext.num_sponsored as i64 + multiplier;
+        if updated < 0 || updated > u32::MAX as i64 {
+            return Err(TxError::Internal(
+                "num_sponsored out of range".to_string(),
+            ));
+        }
+        ext.num_sponsored = updated as u32;
+        self.update_num_sponsoring(sponsor, multiplier)?;
+        Ok(())
+    }
+
+    /// Remove sponsorship for a ledger entry and update account counts.
+    pub fn remove_entry_sponsorship_and_update_counts(
+        &mut self,
+        key: &LedgerKey,
+        sponsored: &AccountId,
+        multiplier: i64,
+    ) -> Result<Option<AccountId>> {
+        let Some(sponsor) = self.remove_entry_sponsor(key) else {
+            return Ok(None);
+        };
+        if multiplier < 0 {
+            return Err(TxError::Internal(
+                "negative sponsorship multiplier".to_string(),
+            ));
+        }
+        self.update_num_sponsoring(&sponsor, -multiplier)?;
+        self.update_num_sponsored(sponsored, -multiplier)?;
+        Ok(Some(sponsor))
+    }
+
+    /// Remove sponsorship for a ledger entry with optional sponsored account.
+    pub fn remove_entry_sponsorship_with_sponsor_counts(
+        &mut self,
+        key: &LedgerKey,
+        sponsored: Option<&AccountId>,
+        multiplier: i64,
+    ) -> Result<Option<AccountId>> {
+        let Some(sponsor) = self.remove_entry_sponsor(key) else {
+            return Ok(None);
+        };
+        if multiplier < 0 {
+            return Err(TxError::Internal(
+                "negative sponsorship multiplier".to_string(),
+            ));
+        }
+        self.update_num_sponsoring(&sponsor, -multiplier)?;
+        if let Some(sponsored) = sponsored {
+            self.update_num_sponsored(sponsored, -multiplier)?;
+        }
+        Ok(Some(sponsor))
+    }
+
+    /// Update num_sponsoring for an account.
+    pub fn update_num_sponsoring(&mut self, account_id: &AccountId, delta: i64) -> Result<()> {
+        let account = self
+            .get_account_mut(account_id)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        let ext = ensure_account_ext_v2(account);
+        let updated = ext.num_sponsoring as i64 + delta;
+        if updated < 0 || updated > u32::MAX as i64 {
+            return Err(TxError::Internal(
+                "num_sponsoring out of range".to_string(),
+            ));
+        }
+        ext.num_sponsoring = updated as u32;
+        Ok(())
+    }
+
+    /// Update num_sponsored for an account.
+    pub fn update_num_sponsored(&mut self, account_id: &AccountId, delta: i64) -> Result<()> {
+        let account = self
+            .get_account_mut(account_id)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        let ext = ensure_account_ext_v2(account);
+        let updated = ext.num_sponsored as i64 + delta;
+        if updated < 0 || updated > u32::MAX as i64 {
+            return Err(TxError::Internal(
+                "num_sponsored out of range".to_string(),
+            ));
+        }
+        ext.num_sponsored = updated as u32;
+        Ok(())
+    }
+
+    /// Get sponsorship counts (num_sponsoring, num_sponsored) for an account.
+    pub fn sponsorship_counts_for_account(&self, account_id: &AccountId) -> Option<(i64, i64)> {
+        self.get_account(account_id).map(sponsorship_counts)
+    }
+
+    fn ledger_entry_ext_for(&self, key: &LedgerKey) -> LedgerEntryExt {
+        if let Some(sponsor) = self.entry_sponsorships.get(key) {
+            LedgerEntryExt::V1(LedgerEntryExtensionV1 {
+                sponsoring_id: SponsorshipDescriptor(Some(sponsor.clone())),
+                ext: LedgerEntryExtensionV1Ext::V0,
+            })
+        } else {
+            LedgerEntryExt::V0
+        }
+    }
+
     /// Load initial state from a ledger reader.
     pub fn load_from_reader<R: LedgerReader>(&mut self, reader: &R, keys: &[LedgerKey]) {
         for key in keys {
@@ -252,24 +578,52 @@ impl LedgerStateManager {
 
     /// Load a single entry into the state manager.
     pub fn load_entry(&mut self, entry: LedgerEntry) {
+        let sponsor = sponsorship_from_entry_ext(&entry);
         match entry.data {
             LedgerEntryData::Account(account) => {
                 let key = account_id_to_bytes(&account.account_id);
+                let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+                    account_id: account.account_id.clone(),
+                });
                 self.accounts.insert(key, account);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::Trustline(trustline) => {
                 let account_key = account_id_to_bytes(&trustline.account_id);
                 let asset_key = AssetKey::from_trustline_asset(&trustline.asset);
+                let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: trustline.account_id.clone(),
+                    asset: trustline.asset.clone(),
+                });
                 self.trustlines.insert((account_key, asset_key), trustline);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::Offer(offer) => {
                 let seller_key = account_id_to_bytes(&offer.seller_id);
+                let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+                    seller_id: offer.seller_id.clone(),
+                    offer_id: offer.offer_id,
+                });
                 self.offers.insert((seller_key, offer.offer_id), offer);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::Data(data) => {
                 let account_key = account_id_to_bytes(&data.account_id);
                 let name = data_name_to_string(&data.data_name);
+                let ledger_key = LedgerKey::Data(LedgerKeyData {
+                    account_id: data.account_id.clone(),
+                    data_name: data.data_name.clone(),
+                });
                 self.data_entries.insert((account_key, name), data);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::ContractData(contract_data) => {
                 let key = ContractDataKey::new(
@@ -277,23 +631,55 @@ impl LedgerStateManager {
                     contract_data.key.clone(),
                     contract_data.durability.clone(),
                 );
+                let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+                    contract: contract_data.contract.clone(),
+                    key: contract_data.key.clone(),
+                    durability: contract_data.durability.clone(),
+                });
                 self.contract_data.insert(key, contract_data);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::ContractCode(contract_code) => {
                 let key = contract_code.hash.0;
+                let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+                    hash: contract_code.hash.clone(),
+                });
                 self.contract_code.insert(key, contract_code);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::Ttl(ttl) => {
                 let key = ttl.key_hash.0;
+                let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
+                    key_hash: ttl.key_hash.clone(),
+                });
                 self.ttl_entries.insert(key, ttl);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::ClaimableBalance(cb) => {
                 let key = claimable_balance_id_to_bytes(&cb.balance_id);
+                let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                    balance_id: cb.balance_id.clone(),
+                });
                 self.claimable_balances.insert(key, cb);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             LedgerEntryData::LiquidityPool(lp) => {
                 let key = pool_id_to_bytes(&lp.liquidity_pool_id);
+                let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+                    liquidity_pool_id: lp.liquidity_pool_id.clone(),
+                });
                 self.liquidity_pools.insert(key, lp);
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
             }
             _ => {}
         }
@@ -1195,6 +1581,29 @@ impl LedgerStateManager {
         self.claimable_balances.remove(&key);
     }
 
+    /// Update an existing claimable balance entry.
+    pub fn update_claimable_balance(&mut self, entry: ClaimableBalanceEntry) {
+        let key = claimable_balance_id_to_bytes(&entry.balance_id);
+
+        // Save snapshot if not already saved
+        if !self.claimable_balance_snapshots.contains_key(&key) {
+            let snapshot = self.claimable_balances.get(&key).cloned();
+            self.claimable_balance_snapshots.insert(key, snapshot);
+        }
+
+        // Record in delta
+        let ledger_entry = self.claimable_balance_to_ledger_entry(&entry);
+        self.delta.record_update(ledger_entry);
+
+        // Update state
+        self.claimable_balances.insert(key, entry);
+
+        // Track modification
+        if !self.modified_claimable_balances.contains(&key) {
+            self.modified_claimable_balances.push(key);
+        }
+    }
+
     // ==================== Liquidity Pool Operations ====================
 
     /// Get a liquidity pool by ID (read-only).
@@ -1452,6 +1861,18 @@ impl LedgerStateManager {
             }
         }
 
+        // Restore entry sponsorship snapshots
+        for (key, snapshot) in self.entry_sponsorship_snapshots.drain() {
+            match snapshot {
+                Some(entry) => {
+                    self.entry_sponsorships.insert(key, entry);
+                }
+                None => {
+                    self.entry_sponsorships.remove(&key);
+                }
+            }
+        }
+
         // Clear modification tracking
         self.modified_accounts.clear();
         self.modified_trustlines.clear();
@@ -1479,6 +1900,7 @@ impl LedgerStateManager {
         self.ttl_snapshots.clear();
         self.claimable_balance_snapshots.clear();
         self.liquidity_pool_snapshots.clear();
+        self.entry_sponsorship_snapshots.clear();
 
         // Clear modification tracking
         self.modified_accounts.clear();
@@ -1496,82 +1918,114 @@ impl LedgerStateManager {
 
     /// Convert an AccountEntry to a LedgerEntry.
     fn account_to_ledger_entry(&self, entry: &AccountEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: entry.account_id.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::Account(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert a TrustLineEntry to a LedgerEntry.
     fn trustline_to_ledger_entry(&self, entry: &TrustLineEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: entry.account_id.clone(),
+            asset: entry.asset.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::Trustline(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert an OfferEntry to a LedgerEntry.
     fn offer_to_ledger_entry(&self, entry: &OfferEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: entry.seller_id.clone(),
+            offer_id: entry.offer_id,
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::Offer(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert a DataEntry to a LedgerEntry.
     fn data_to_ledger_entry(&self, entry: &DataEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::Data(LedgerKeyData {
+            account_id: entry.account_id.clone(),
+            data_name: entry.data_name.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::Data(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert a ContractDataEntry to a LedgerEntry.
     fn contract_data_to_ledger_entry(&self, entry: &ContractDataEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: entry.contract.clone(),
+            key: entry.key.clone(),
+            durability: entry.durability.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::ContractData(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert a ContractCodeEntry to a LedgerEntry.
     fn contract_code_to_ledger_entry(&self, entry: &ContractCodeEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: entry.hash.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::ContractCode(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert a TtlEntry to a LedgerEntry.
     fn ttl_to_ledger_entry(&self, entry: &TtlEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: entry.key_hash.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::Ttl(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert a ClaimableBalanceEntry to a LedgerEntry.
     fn claimable_balance_to_ledger_entry(&self, entry: &ClaimableBalanceEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: entry.balance_id.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::ClaimableBalance(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 
     /// Convert a LiquidityPoolEntry to a LedgerEntry.
     fn liquidity_pool_to_ledger_entry(&self, entry: &LiquidityPoolEntry) -> LedgerEntry {
+        let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: entry.liquidity_pool_id.clone(),
+        });
         LedgerEntry {
             last_modified_ledger_seq: self.ledger_seq,
             data: LedgerEntryData::LiquidityPool(entry.clone()),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: self.ledger_entry_ext_for(&ledger_key),
         }
     }
 }
@@ -1621,6 +2075,83 @@ fn compare_price(lhs: &Price, rhs: &Price) -> std::cmp::Ordering {
     lhs_value.cmp(&rhs_value)
 }
 
+fn sponsorship_counts(account: &AccountEntry) -> (i64, i64) {
+    match &account.ext {
+        AccountEntryExt::V0 => (0, 0),
+        AccountEntryExt::V1(v1) => match &v1.ext {
+            AccountEntryExtensionV1Ext::V0 => (0, 0),
+            AccountEntryExtensionV1Ext::V2(v2) => {
+                (v2.num_sponsoring as i64, v2.num_sponsored as i64)
+            }
+        },
+    }
+}
+
+fn sponsorship_from_entry_ext(entry: &LedgerEntry) -> Option<AccountId> {
+    match &entry.ext {
+        LedgerEntryExt::V0 => None,
+        LedgerEntryExt::V1(v1) => v1.sponsoring_id.0.clone(),
+    }
+}
+
+pub(crate) fn ensure_account_ext_v2(account: &mut AccountEntry) -> &mut AccountEntryExtensionV2 {
+    let liabilities = match &account.ext {
+        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+        AccountEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+    };
+
+    match &account.ext {
+        AccountEntryExt::V0 => {
+            account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities,
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored: 0,
+                    num_sponsoring: 0,
+                    signer_sponsoring_i_ds: build_signer_sponsoring_ids(account.signers.len()),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            });
+        }
+        AccountEntryExt::V1(v1) => {
+            if matches!(v1.ext, AccountEntryExtensionV1Ext::V0) {
+                account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+                    liabilities,
+                    ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                        num_sponsored: 0,
+                        num_sponsoring: 0,
+                        signer_sponsoring_i_ds: build_signer_sponsoring_ids(account.signers.len()),
+                        ext: AccountEntryExtensionV2Ext::V0,
+                    }),
+                });
+            }
+        }
+    }
+
+    if let AccountEntryExt::V1(v1) = &mut account.ext {
+        if let AccountEntryExtensionV1Ext::V2(v2) = &mut v1.ext {
+            ensure_signer_sponsoring_ids(v2, account.signers.len());
+            return v2;
+        }
+    }
+
+    unreachable!("account ext v2 should exist after ensure_account_ext_v2")
+}
+
+fn build_signer_sponsoring_ids(count: usize) -> VecM<SponsorshipDescriptor, 20> {
+    let ids = vec![SponsorshipDescriptor(None); count];
+    ids.try_into().unwrap_or_default()
+}
+
+fn ensure_signer_sponsoring_ids(v2: &mut AccountEntryExtensionV2, signer_count: usize) {
+    let mut ids: Vec<SponsorshipDescriptor> = v2.signer_sponsoring_i_ds.iter().cloned().collect();
+    if ids.len() < signer_count {
+        ids.extend(std::iter::repeat(SponsorshipDescriptor(None)).take(signer_count - ids.len()));
+    } else if ids.len() > signer_count {
+        ids.truncate(signer_count);
+    }
+    v2.signer_sponsoring_i_ds = ids.try_into().unwrap_or_default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1656,10 +2187,23 @@ mod tests {
     #[test]
     fn test_minimum_balance() {
         let manager = LedgerStateManager::new(5_000_000, 100);
+        let account = create_test_account_entry(1);
         // 0 sub-entries: (2 + 0) * 5_000_000 = 10_000_000
-        assert_eq!(manager.minimum_balance(0), 10_000_000);
+        assert_eq!(
+            manager
+                .minimum_balance_for_account(&account, 25, 0)
+                .unwrap(),
+            10_000_000
+        );
         // 3 sub-entries: (2 + 3) * 5_000_000 = 25_000_000
-        assert_eq!(manager.minimum_balance(3), 25_000_000);
+        let mut account_with_subentries = account;
+        account_with_subentries.num_sub_entries = 3;
+        assert_eq!(
+            manager
+                .minimum_balance_for_account(&account_with_subentries, 25, 0)
+                .unwrap(),
+            25_000_000
+        );
     }
 
     #[test]

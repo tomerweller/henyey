@@ -5,6 +5,8 @@
 
 pub mod execute;
 
+use std::collections::HashSet;
+
 use stellar_xdr::curr::{
     AllowTrustOp, BeginSponsoringFutureReservesOp, BumpSequenceOp, ChangeTrustOp,
     ClaimClaimableBalanceOp, ClawbackClaimableBalanceOp, ClawbackOp, CreateAccountOp,
@@ -12,7 +14,7 @@ use stellar_xdr::curr::{
     InvokeHostFunctionOp, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
     ManageDataOp, ManageSellOfferOp, MuxedAccount, Operation, OperationBody,
     PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp,
-    SetOptionsOp, SetTrustLineFlagsOp,
+    SetOptionsOp, SetTrustLineFlagsOp, ClaimPredicate, Claimant,
 };
 
 /// Enumeration of all operation types in Stellar.
@@ -397,7 +399,42 @@ fn validate_create_claimable_balance(
     if op.claimants.is_empty() {
         return Err(OperationValidationError::InvalidClaimant);
     }
+    let mut destinations = HashSet::new();
+    for claimant in op.claimants.iter() {
+        let Claimant::ClaimantTypeV0(cv0) = claimant;
+        if !destinations.insert(cv0.destination.clone()) {
+            return Err(OperationValidationError::InvalidClaimant);
+        }
+        if !validate_claim_predicate(&cv0.predicate, 1) {
+            return Err(OperationValidationError::InvalidClaimant);
+        }
+    }
     Ok(())
+}
+
+fn validate_claim_predicate(predicate: &ClaimPredicate, depth: u32) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    match predicate {
+        ClaimPredicate::Unconditional => true,
+        ClaimPredicate::And(predicates) => {
+            predicates.len() == 2
+                && validate_claim_predicate(&predicates[0], depth + 1)
+                && validate_claim_predicate(&predicates[1], depth + 1)
+        }
+        ClaimPredicate::Or(predicates) => {
+            predicates.len() == 2
+                && validate_claim_predicate(&predicates[0], depth + 1)
+                && validate_claim_predicate(&predicates[1], depth + 1)
+        }
+        ClaimPredicate::Not(predicate) => predicate
+            .as_ref()
+            .map(|inner| validate_claim_predicate(inner, depth + 1))
+            .unwrap_or(false),
+        ClaimPredicate::BeforeAbsoluteTime(time) => *time >= 0,
+        ClaimPredicate::BeforeRelativeTime(time) => *time >= 0,
+    }
 }
 
 /// Validate ClaimClaimableBalance operation.
@@ -642,5 +679,38 @@ mod tests {
             ..valid
         };
         assert!(validate_liquidity_pool_withdraw(&invalid_min).is_err());
+    }
+
+    #[test]
+    fn test_validate_create_claimable_balance_duplicate_claimants() {
+        let claimant_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id,
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        let op = CreateClaimableBalanceOp {
+            asset: Asset::Native,
+            amount: 100,
+            claimants: vec![claimant.clone(), claimant].try_into().unwrap(),
+        };
+
+        assert!(validate_create_claimable_balance(&op).is_err());
+    }
+
+    #[test]
+    fn test_validate_create_claimable_balance_invalid_predicate() {
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+            predicate: ClaimPredicate::Not(None),
+        });
+
+        let op = CreateClaimableBalanceOp {
+            asset: Asset::Native,
+            amount: 100,
+            claimants: vec![claimant].try_into().unwrap(),
+        };
+
+        assert!(validate_create_claimable_balance(&op).is_err());
     }
 }

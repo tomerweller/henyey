@@ -23,7 +23,7 @@ pub fn execute_liquidity_pool_deposit(
     op: &LiquidityPoolDepositOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Validate amounts
     if op.max_amount_a <= 0 || op.max_amount_b <= 0 {
@@ -123,11 +123,11 @@ pub fn execute_liquidity_pool_deposit(
     }
 
     let available_a = match &asset_a {
-        Asset::Native => available_native_balance(source, state),
+        Asset::Native => available_native_balance(source, state, context)?,
         _ => trustline_a.map(|tl| tl.balance).unwrap_or(0),
     };
     let available_b = match &asset_b {
-        Asset::Native => available_native_balance(source, state),
+        Asset::Native => available_native_balance(source, state, context)?,
         _ => trustline_b.map(|tl| tl.balance).unwrap_or(0),
     };
     let available_pool_share_limit = pool_share_trustline
@@ -256,7 +256,7 @@ pub fn execute_liquidity_pool_withdraw(
     op: &LiquidityPoolWithdrawOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Validate amounts
     if op.amount <= 0 {
@@ -384,12 +384,17 @@ fn is_auth_required(asset: &Asset, state: &LedgerStateManager) -> bool {
         .unwrap_or(false)
 }
 
-fn available_native_balance(source: &AccountId, state: &LedgerStateManager) -> i64 {
+fn available_native_balance(
+    source: &AccountId,
+    state: &LedgerStateManager,
+    context: &LedgerContext,
+) -> Result<i64> {
     let Some(account) = state.get_account(source) else {
-        return 0;
+        return Ok(0);
     };
-    let min_balance = state.minimum_balance(account.num_sub_entries);
-    account.balance.saturating_sub(min_balance)
+    let min_balance =
+        state.minimum_balance_for_account(account, context.protocol_version, 0)?;
+    Ok(account.balance.saturating_sub(min_balance))
 }
 
 fn is_bad_price(amount_a: i64, amount_b: i64, min_price: &Price, max_price: &Price) -> bool {

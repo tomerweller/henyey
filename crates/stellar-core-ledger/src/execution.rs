@@ -61,6 +61,7 @@ pub enum ExecutionFailure {
     TooEarly,
     TooLate,
     NotSupported,
+    BadSponsorship,
     OperationFailed,
 }
 
@@ -570,6 +571,7 @@ impl TransactionExecutor {
         );
 
         let soroban_data = frame.soroban_data();
+        self.state.clear_sponsorship_stack();
 
         // Execute operations
         let mut operation_results = Vec::new();
@@ -580,7 +582,8 @@ impl TransactionExecutor {
         let mut all_success = true;
         let mut failure = None;
 
-        for op in frame.operations() {
+        let tx_seq = frame.sequence_number();
+        for (op_index, op) in frame.operations().iter().enumerate() {
             let op_delta_before = delta_snapshot(&self.state);
 
             // Load any accounts needed for this operation
@@ -594,8 +597,16 @@ impl TransactionExecutor {
                 .unwrap_or_else(|| inner_source_id.clone());
 
             // Execute the operation
-            let result =
-                self.execute_single_operation(op, &op_source, &ledger_context, soroban_data);
+            let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
+            let result = self.execute_single_operation(
+                op,
+                &op_source,
+                &inner_source_id,
+                tx_seq,
+                op_index,
+                &ledger_context,
+                soroban_data,
+            );
 
             match result {
                 Ok(op_exec) => {
@@ -641,6 +652,14 @@ impl TransactionExecutor {
             if !all_success {
                 break;
             }
+        }
+
+        if all_success
+            && self.protocol_version >= 14
+            && self.state.has_pending_sponsorship()
+        {
+            all_success = false;
+            failure = Some(ExecutionFailure::BadSponsorship);
         }
 
         if !all_success {
@@ -724,6 +743,9 @@ impl TransactionExecutor {
         &mut self,
         op: &stellar_xdr::curr::Operation,
         source: &AccountId,
+        tx_source: &AccountId,
+        tx_seq: i64,
+        op_index: u32,
         context: &LedgerContext,
         soroban_data: Option<&stellar_xdr::curr::SorobanTransactionData>,
     ) -> std::result::Result<stellar_core_tx::operations::execute::OperationExecutionResult, TxError>
@@ -732,6 +754,9 @@ impl TransactionExecutor {
         stellar_core_tx::operations::execute::execute_operation_with_soroban(
             op,
             source,
+            tx_source,
+            tx_seq,
+            op_index,
             &mut self.state,
             context,
             soroban_data,
@@ -946,6 +971,7 @@ fn map_failure_to_result(
         ExecutionFailure::InsufficientBalance => TransactionResultResult::TxInsufficientBalance,
         ExecutionFailure::NoAccount => TransactionResultResult::TxNoAccount,
         ExecutionFailure::NotSupported => TransactionResultResult::TxNotSupported,
+        ExecutionFailure::BadSponsorship => TransactionResultResult::TxBadSponsorship,
         ExecutionFailure::OperationFailed => TransactionResultResult::TxFailed(Vec::new().try_into().unwrap()),
     }
 }
@@ -967,6 +993,7 @@ fn map_failure_to_inner_result(
         ExecutionFailure::InsufficientBalance => InnerTransactionResultResult::TxInsufficientBalance,
         ExecutionFailure::NoAccount => InnerTransactionResultResult::TxNoAccount,
         ExecutionFailure::NotSupported => InnerTransactionResultResult::TxNotSupported,
+        ExecutionFailure::BadSponsorship => InnerTransactionResultResult::TxBadSponsorship,
         ExecutionFailure::OperationFailed => {
             InnerTransactionResultResult::TxFailed(op_results.to_vec().try_into().unwrap_or_default())
         }

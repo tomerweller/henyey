@@ -25,6 +25,7 @@
 
 - Any observable behavior must be deterministic and identical to stellar-core (v25.x / p25).
 - Align behavior by comparing against upstream test vectors and edge cases; do not introduce new semantics.
+- For protocol or consensus behavior, consult `.upstream-v25/` to mirror upstream decisions and sequencing.
 
 ## Testing Guidelines
 
@@ -43,3 +44,4 @@
 
 - SQLite is the only supported database backend.
 - Protocol support is 23+ only; do not add legacy protocol behavior.
+- The Stellar Core v25 C++ upstream is available locally under `.upstream-v25/` for parity checks.

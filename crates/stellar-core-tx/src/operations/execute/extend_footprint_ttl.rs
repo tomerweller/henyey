@@ -12,6 +12,9 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 
+/// Max TTL extension for entries (in ledgers).
+const MAX_ENTRY_TTL: u32 = 6_312_000; // ~1 year at 5-second ledger close
+
 /// Execute an ExtendFootprintTtl operation.
 ///
 /// This operation extends the TTL of all entries in the transaction's footprint
@@ -40,6 +43,10 @@ pub fn execute_extend_footprint_ttl(
         return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
     }
 
+    if op.extend_to > MAX_ENTRY_TTL.saturating_sub(1) {
+        return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
+    }
+
     // Get the footprint from Soroban transaction data
     let footprint = match soroban_data {
         Some(data) => &data.resources.footprint,
@@ -47,6 +54,16 @@ pub fn execute_extend_footprint_ttl(
             return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
         }
     };
+
+    if !footprint.read_write.is_empty() {
+        return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
+    }
+
+    for key in footprint.read_only.iter() {
+        if !is_ttl_entry(key) {
+            return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
+        }
+    }
 
     // Calculate the target TTL ledger sequence
     let current_ledger = context.sequence;
@@ -68,6 +85,10 @@ pub fn execute_extend_footprint_ttl(
     }
 
     Ok(make_result(ExtendFootprintTtlResultCode::Success))
+}
+
+fn is_ttl_entry(key: &LedgerKey) -> bool {
+    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
 /// Extend the TTL of a single ledger entry.
@@ -166,6 +187,125 @@ mod tests {
 
         // No Soroban data provided
         let result = execute_extend_footprint_ttl(&op, &source, &mut state, &context, None);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(matches!(r, ExtendFootprintTtlResult::Malformed));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_extend_footprint_ttl_rejects_read_write() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000,
+        };
+
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![contract_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(matches!(r, ExtendFootprintTtlResult::Malformed));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_extend_footprint_ttl_rejects_non_ttl_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000,
+        };
+
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: create_test_account_id(1),
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![account_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(matches!(r, ExtendFootprintTtlResult::Malformed));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_extend_footprint_ttl_rejects_large_extend_to() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: MAX_ENTRY_TTL,
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
         assert!(result.is_ok());
 
         match result.unwrap() {

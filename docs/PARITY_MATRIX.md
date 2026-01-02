@@ -1,6 +1,7 @@
 # Parity Matrix: stellar-core v25.0.1 vs rs-stellar-core
 
 Scope: SQLite only; Protocol 23+ only; no production hardening.
+Milestones: testnet validator -> mainnet validator -> full parity (v25.x). Full invariant parity is Milestone 3.
 Baseline: `/Users/tomer/dev/stellar-core` @ v25.0.1
 
 Legend: Present / Partial / Missing
@@ -40,7 +41,7 @@ Legend: Present / Partial / Missing
 
 | Upstream | Key files (v25) | rs-stellar-core mapping | Status | Notes |
 | --- | --- | --- | --- | --- |
-| invariant | `InvariantManager.*`, `ConservationOfLumens.*`, `LedgerEntryIsValid.*` | `crates/stellar-core-invariant` | Partial | Framework + basic invariants wired to ledger close and replay; missing full invariant set + advanced checks. |
+| invariant | `InvariantManager.*`, `ConservationOfLumens.*`, `LedgerEntryIsValid.*` | `crates/stellar-core-invariant` | Partial | Framework + basic invariants wired to ledger close and replay; full invariant set + advanced checks deferred to Milestone 3. |
 | simulation | `Simulation.*`, `LoadGenerator.*`, `TxGenerator.*` | `crates/stellar-core-simulation` | Partial | Overlay simulation harness + basic test; load/tx generators missing. |
 | test | `src/test/*` | (none) | Missing | No upstream-style test harness or fixtures. |
 

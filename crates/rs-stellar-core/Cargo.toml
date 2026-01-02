@@ -59,6 +59,7 @@ thiserror.workspace = true
 # Encoding
 hex.workspace = true
 base64.workspace = true
+flate2.workspace = true
 
 # URL handling
 url.workspace = true

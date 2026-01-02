@@ -4,8 +4,8 @@
 //! which allows accounts to attach arbitrary key-value data.
 
 use stellar_xdr::curr::{
-    AccountId, DataEntry, DataEntryExt, ManageDataOp, ManageDataResult, ManageDataResultCode,
-    OperationResult, OperationResultTr,
+    AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData, ManageDataOp, ManageDataResult,
+    ManageDataResultCode, OperationResult, OperationResultTr,
 };
 
 use crate::state::LedgerStateManager;
@@ -26,11 +26,20 @@ pub fn execute_manage_data(
     op: &ManageDataOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
+    if context.protocol_version < 2 {
+        return Ok(make_result(ManageDataResultCode::NotSupportedYet));
+    }
+
     // Validate data name
     let data_name = op.data_name.to_string();
     if data_name.is_empty() || data_name.len() > MAX_DATA_NAME_LENGTH {
+        return Ok(make_result(ManageDataResultCode::InvalidName));
+    }
+    let data_name_bytes: &Vec<u8> =
+        <stellar_xdr::curr::String64 as AsRef<Vec<u8>>>::as_ref(&op.data_name);
+    if !is_string_valid(data_name_bytes) {
         return Ok(make_result(ManageDataResultCode::InvalidName));
     }
 
@@ -48,11 +57,20 @@ pub fn execute_manage_data(
 
     // Check if data entry exists
     let existing_entry = state.get_data(source, &data_name);
+    let sponsor = state.active_sponsor_for(source);
 
     match &op.data_value {
         None => {
             // Deleting data entry
             if existing_entry.is_some() {
+                let ledger_key = LedgerKey::Data(LedgerKeyData {
+                    account_id: source.clone(),
+                    data_name: op.data_name.clone(),
+                });
+                if state.entry_sponsor(&ledger_key).is_some() {
+                    state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 1)?;
+                }
+
                 state.delete_data(source, &data_name);
 
                 // Decrease sub-entry count
@@ -73,12 +91,32 @@ pub fn execute_manage_data(
                 }
             } else {
                 // Check source can afford new sub-entry
-                let source_account = state
-                    .get_account(source)
-                    .ok_or(TxError::SourceAccountNotFound)?;
-                let new_min_balance = state.minimum_balance(source_account.num_sub_entries + 1);
-                if source_account.balance < new_min_balance {
-                    return Ok(make_result(ManageDataResultCode::LowReserve));
+                if let Some(sponsor) = &sponsor {
+                    let sponsor_account = state
+                        .get_account(sponsor)
+                        .ok_or(TxError::SourceAccountNotFound)?;
+                    let new_min_balance = state.minimum_balance_for_account_with_deltas(
+                        sponsor_account,
+                        context.protocol_version,
+                        0,
+                        1,
+                        0,
+                    )?;
+                    if sponsor_account.balance < new_min_balance {
+                        return Ok(make_result(ManageDataResultCode::LowReserve));
+                    }
+                } else {
+                    let source_account = state
+                        .get_account(source)
+                        .ok_or(TxError::SourceAccountNotFound)?;
+                    let new_min_balance = state.minimum_balance_for_account(
+                        source_account,
+                        context.protocol_version,
+                        1,
+                    )?;
+                    if source_account.balance < new_min_balance {
+                        return Ok(make_result(ManageDataResultCode::LowReserve));
+                    }
                 }
 
                 // Create new data entry
@@ -90,6 +128,18 @@ pub fn execute_manage_data(
                 };
 
                 state.create_data(new_entry);
+                if let Some(sponsor) = sponsor {
+                    let ledger_key = LedgerKey::Data(LedgerKeyData {
+                        account_id: source.clone(),
+                        data_name: op.data_name.clone(),
+                    });
+                    state.apply_entry_sponsorship_with_sponsor(
+                        ledger_key,
+                        &sponsor,
+                        Some(source),
+                        1,
+                    )?;
+                }
 
                 // Increase sub-entry count
                 if let Some(account) = state.get_account_mut(source) {
@@ -113,6 +163,12 @@ fn make_result(code: ManageDataResultCode) -> OperationResult {
     };
 
     OperationResult::OpInner(OperationResultTr::ManageData(result))
+}
+
+fn is_string_valid(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
 }
 
 #[cfg(test)]
@@ -170,6 +226,79 @@ mod tests {
 
         // Verify sub-entries increased
         assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 1);
+    }
+
+    #[test]
+    fn test_manage_data_not_supported_pre_v2() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 1;
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageDataOp {
+            data_name: make_string64("test_key"),
+            data_value: Some(vec![1, 2, 3].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::NotSupportedYet));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_data_invalid_name_non_ascii() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageDataOp {
+            data_name: String64::try_from(vec![0x80]).unwrap(),
+            data_value: Some(vec![1, 2].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::InvalidName));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_data_invalid_name_control() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageDataOp {
+            data_name: String64::try_from(vec![0x1b]).unwrap(),
+            data_value: Some(vec![1, 2].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::InvalidName));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 
     #[test]

@@ -391,13 +391,12 @@ impl CatchupManager {
                 verify::verify_tx_result_set(header, &xdr)?;
             }
         }
-        let (checkpoint_header, ledger_data) = ledger_data_from_checkpoint(
-            checkpoint_seq,
-            target,
-            &data.headers,
-            &data.transactions,
-            &data.tx_results,
-        )?;
+        let checkpoint_header = checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
+        let ledger_data = if target == checkpoint_seq {
+            Vec::new()
+        } else {
+            self.download_ledger_data(checkpoint_seq, target).await?
+        };
 
         // Step 6: Verify the header chain
         self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
@@ -552,7 +551,7 @@ impl CatchupManager {
     async fn apply_buckets(
         &self,
         has: &HistoryArchiveState,
-        _buckets: &[(Hash256, Vec<u8>)],  // Ignored - we download on-demand
+        buckets: &[(Hash256, Vec<u8>)],
     ) -> Result<(BucketList, Option<BucketList>)> {
         use std::collections::HashMap;
         use std::sync::Mutex;
@@ -566,9 +565,10 @@ impl CatchupManager {
         // Get bucket storage directory from the bucket manager
         let bucket_dir = self.bucket_manager.bucket_dir();
 
-        // Cache for buckets we've already loaded (to avoid re-downloading)
-        // Using Mutex for interior mutability in the closure
+        // Cache for buckets we've already loaded (to avoid re-downloading).
         let bucket_cache: Mutex<HashMap<Hash256, Bucket>> = Mutex::new(HashMap::new());
+        let preloaded_buckets: Mutex<HashMap<Hash256, Vec<u8>>> =
+            Mutex::new(buckets.iter().cloned().collect());
 
         // Clone archives and bucket_dir for use in closure
         let archives = self.archives.clone();
@@ -609,8 +609,14 @@ impl CatchupManager {
                 return Ok(bucket);
             }
 
-            // Download the bucket (blocking - we're in a sync context)
-            let xdr_data = {
+            // Use preloaded bucket data if available, otherwise download.
+            let xdr_data = if let Some(data) = {
+                let mut preloaded = preloaded_buckets.lock().unwrap();
+                preloaded.remove(hash)
+            } {
+                data
+            } else {
+                // Download the bucket (blocking - we're in a sync context)
                 let hash = *hash;
                 let archives = archives.clone();
 
@@ -1019,7 +1025,7 @@ impl CatchupManager {
                     conn.store_scp_history(ledger_seq, &envelopes)?;
 
                     for qset in v0.quorum_sets.iter() {
-                        let hash = Hash256::hash_xdr(qset).map_err(HistoryError::from)?;
+                        let hash = Hash256::hash_xdr(qset)?;
                         conn.store_scp_quorum_set(&hash, ledger_seq, qset)?;
                     }
                 }
@@ -1187,13 +1193,10 @@ impl CatchupManager {
     }
 }
 
-fn ledger_data_from_checkpoint(
+fn checkpoint_header_from_headers(
     checkpoint_seq: u32,
-    target: u32,
     headers: &[LedgerHeaderHistoryEntry],
-    transactions: &[TransactionHistoryEntry],
-    tx_results: &[TransactionHistoryResultEntry],
-) -> Result<(LedgerHeader, Vec<LedgerData>)> {
+) -> Result<LedgerHeader> {
     let mut header_map = HashMap::new();
     for entry in headers {
         header_map.insert(entry.header.ledger_seq, entry.header.clone());
@@ -1205,49 +1208,7 @@ fn ledger_data_from_checkpoint(
             checkpoint_seq
         ))
     })?;
-
-    let mut tx_entry_map = HashMap::new();
-    for entry in transactions {
-        tx_entry_map.insert(entry.ledger_seq, entry.clone());
-    }
-
-    let mut result_entry_map = HashMap::new();
-    for entry in tx_results {
-        result_entry_map.insert(entry.ledger_seq, entry.clone());
-    }
-
-    let mut data = Vec::new();
-    for seq in (checkpoint_seq + 1)..=target {
-        let header = header_map.get(&seq).ok_or_else(|| {
-            HistoryError::CatchupFailed(format!("ledger {} not found in headers", seq))
-        })?;
-
-        let tx_history_entry = tx_entry_map.get(&seq).cloned();
-        let tx_set = tx_history_entry
-            .as_ref()
-            .map(|entry| entry.tx_set.clone())
-            .unwrap_or_else(|| TransactionSet {
-                previous_ledger_hash: header.previous_ledger_hash.clone(),
-                txs: Default::default(),
-            });
-
-        let tx_result_entry = result_entry_map.get(&seq).cloned();
-        let tx_results_vec = tx_result_entry
-            .as_ref()
-            .map(|set| set.tx_result_set.results.iter().cloned().collect())
-            .unwrap_or_else(Vec::new);
-
-        data.push(LedgerData {
-            header: header.clone(),
-            tx_set,
-            tx_results: tx_results_vec,
-            tx_metas: Vec::new(),
-            tx_history_entry,
-            tx_result_entry,
-        });
-    }
-
-    Ok((checkpoint_header.clone(), data))
+    Ok(checkpoint_header.clone())
 }
 
 /// Data downloaded for a single ledger.

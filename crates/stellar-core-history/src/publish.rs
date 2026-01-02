@@ -360,7 +360,7 @@ impl PublishManager {
     fn create_has(
         &self,
         checkpoint_ledger: u32,
-        _headers: &[LedgerHeader],
+        _headers: &[LedgerHeaderHistoryEntry],
         bucket_list: &BucketList,
     ) -> Result<HistoryArchiveState> {
         build_history_archive_state(

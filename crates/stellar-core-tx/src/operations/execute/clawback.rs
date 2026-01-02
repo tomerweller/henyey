@@ -7,7 +7,7 @@
 use stellar_xdr::curr::{
     AccountId, Asset, ClawbackClaimableBalanceOp, ClawbackClaimableBalanceResult,
     ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult, ClawbackResultCode,
-    OperationResult, OperationResultTr,
+    LedgerKey, LedgerKeyClaimableBalance, OperationResult, OperationResultTr,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -149,6 +149,18 @@ pub fn execute_clawback_claimable_balance(
         return Ok(make_clawback_cb_result(
             ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
         ));
+    }
+
+    let sponsorship_multiplier = entry.claimants.len() as i64;
+    let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: entry.balance_id.clone(),
+    });
+    if state.entry_sponsor(&ledger_key).is_some() {
+        state.remove_entry_sponsorship_with_sponsor_counts(
+            &ledger_key,
+            None,
+            sponsorship_multiplier,
+        )?;
     }
 
     // Delete the claimable balance (clawed back entirely)

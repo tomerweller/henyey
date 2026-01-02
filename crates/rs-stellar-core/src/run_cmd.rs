@@ -23,7 +23,7 @@ use std::time::Instant;
 use axum::{
     extract::State,
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -267,12 +267,12 @@ async fn wait_for_shutdown_signal() {
 }
 
 /// Node metrics and status.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct NodeStatus {
     /// Current ledger sequence.
     pub ledger_seq: u32,
     /// Current ledger hash.
-    pub ledger_hash: Option<stellar_core_common::Hash256>,
+    pub ledger_hash: Option<String>,
     /// Number of connected peers.
     pub peer_count: usize,
     /// Current consensus state.
@@ -338,7 +338,7 @@ impl NodeRunner {
             ledger_hash: Some(ledger_hash.to_hex()),
             peer_count,
             consensus_state: stats.state.to_string(),
-            pending_tx_count: stats.pending_transactions as u64,
+            pending_tx_count: stats.pending_transactions,
             uptime_secs: self.start_time.elapsed().as_secs(),
             state: format!("{}", self.app.state().await),
         }
@@ -713,7 +713,7 @@ async fn status_handler(State(state): State<Arc<ServerState>>) -> Json<NodeStatu
         ledger_hash: Some(ledger_hash.to_hex()),
         peer_count,
         consensus_state: stats.state.to_string(),
-        pending_tx_count: stats.pending_transactions as u64,
+        pending_tx_count: stats.pending_transactions,
         uptime_secs: state.start_time.elapsed().as_secs(),
         state: format!("{}", state.app.state().await),
     })
@@ -931,14 +931,14 @@ async fn self_check_handler(State(state): State<Arc<ServerState>>) -> impl IntoR
     }
 }
 
-async fn bans_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+async fn bans_handler(State(state): State<Arc<ServerState>>) -> Response {
     match state.app.banned_peers().await {
         Ok(bans) => {
             let bans = bans
                 .into_iter()
                 .filter_map(peer_id_to_strkey)
                 .collect::<Vec<_>>();
-            (StatusCode::OK, Json(BansResponse { bans }))
+            (StatusCode::OK, Json(BansResponse { bans })).into_response()
         }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -946,7 +946,8 @@ async fn bans_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespons
                 success: false,
                 message: format!("Failed to read bans: {}", err),
             }),
-        ),
+        )
+            .into_response(),
     }
 }
 

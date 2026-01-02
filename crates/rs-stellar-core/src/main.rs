@@ -29,6 +29,7 @@ mod survey;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use stellar_xdr::curr::WriteXdr;
 
 use crate::app::App;
 use crate::catchup_cmd::{CatchupMode as CatchupModeInternal, CatchupOptions};
@@ -688,7 +689,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     use stellar_core_history::paths::root_has_path;
     use stellar_core_history::publish::{build_history_archive_state, PublishConfig, PublishManager};
     use stellar_core_history::CHECKPOINT_FREQUENCY;
-    use stellar_core_ledger::header::compute_header_hash;
+    use stellar_core_ledger::compute_header_hash;
     use stellar_core_common::Hash256;
     use std::fs;
     use std::path::PathBuf;
@@ -834,8 +835,8 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     );
 
     let bucket_manager = BucketManager::with_cache_size(
-        config.bucket.directory.clone(),
-        config.bucket.cache_size,
+        config.buckets.directory.clone(),
+        config.buckets.cache_size,
     )?;
 
     let mut published_count = 0;
@@ -856,6 +857,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             headers.push(stellar_xdr::curr::LedgerHeaderHistoryEntry {
                 header,
                 hash: stellar_xdr::curr::Hash(hash.0),
+                ext: stellar_xdr::curr::LedgerHeaderHistoryEntryExt::V0,
             });
 
             let tx_entry = db

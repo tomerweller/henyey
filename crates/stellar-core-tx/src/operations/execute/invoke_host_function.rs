@@ -84,6 +84,18 @@ fn execute_contract_invocation(
     // Convert auth entries to a slice
     let auth_entries: Vec<_> = op.auth.iter().cloned().collect();
 
+    if footprint_has_unrestored_archived_entries(
+        state,
+        &soroban_data.resources.footprint,
+        &soroban_data.ext,
+        context.sequence,
+    ) {
+        return Ok(OperationExecutionResult::new(make_result(
+            InvokeHostFunctionResultCode::EntryArchived,
+            Hash([0u8; 32]),
+        )));
+    }
+
     // Execute via soroban-env-host
     match execute_host_function(
         &op.host_function,
@@ -119,7 +131,7 @@ fn execute_contract_invocation(
 
             // Map host error to appropriate result code
             Ok(OperationExecutionResult::new(make_result(
-                InvokeHostFunctionResultCode::Trapped,
+                map_host_error_to_result_code(&host_error),
                 Hash([0u8; 32]),
             )))
         }
@@ -291,6 +303,68 @@ fn apply_soroban_storage_change(
     }
 }
 
+fn footprint_has_unrestored_archived_entries(
+    state: &LedgerStateManager,
+    footprint: &stellar_xdr::curr::LedgerFootprint,
+    ext: &stellar_xdr::curr::SorobanTransactionDataExt,
+    current_ledger: u32,
+) -> bool {
+    let mut archived_rw = std::collections::HashSet::new();
+    if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resources_ext) = ext {
+        for index in resources_ext.archived_soroban_entries.iter() {
+            archived_rw.insert(*index as usize);
+        }
+    }
+
+    if footprint
+        .read_only
+        .iter()
+        .any(|key| is_archived_contract_entry(state, key, current_ledger))
+    {
+        return true;
+    }
+
+    for (index, key) in footprint.read_write.iter().enumerate() {
+        if !is_archived_contract_entry(state, key, current_ledger) {
+            continue;
+        }
+        if !archived_rw.contains(&index) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_archived_contract_entry(
+    state: &LedgerStateManager,
+    key: &LedgerKey,
+    current_ledger: u32,
+) -> bool {
+    match key {
+        LedgerKey::ContractData(cd) => {
+            if state
+                .get_contract_data(&cd.contract, &cd.key, cd.durability.clone())
+                .is_none()
+            {
+                return false;
+            }
+        }
+        LedgerKey::ContractCode(cc) => {
+            if state.get_contract_code(&cc.hash).is_none() {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    let key_hash = compute_key_hash(key);
+    match state.get_ttl(&key_hash) {
+        Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
+        None => true,
+    }
+}
+
 /// Compute the hash of a contract code key for TTL lookup.
 fn compute_contract_code_key_hash(code_hash: &Hash) -> Hash {
     use sha2::{Digest, Sha256};
@@ -322,6 +396,24 @@ fn make_result(code: InvokeHostFunctionResultCode, success_hash: Hash) -> Operat
     };
 
     OperationResult::OpInner(OperationResultTr::InvokeHostFunction(result))
+}
+
+fn map_host_error_to_result_code(host_error: &soroban_env_host::HostError) -> InvokeHostFunctionResultCode {
+    use soroban_env_host::xdr::{ScErrorCode, ScErrorType};
+
+    if host_error.error.is_type(ScErrorType::Budget)
+        && host_error.error.is_code(ScErrorCode::ExceededLimit)
+    {
+        return InvokeHostFunctionResultCode::ResourceLimitExceeded;
+    }
+
+    if host_error.error.is_type(ScErrorType::Storage)
+        && host_error.error.is_code(ScErrorCode::ExceededLimit)
+    {
+        return InvokeHostFunctionResultCode::ResourceLimitExceeded;
+    }
+
+    InvokeHostFunctionResultCode::Trapped
 }
 
 #[cfg(test)]
@@ -401,6 +493,166 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    #[test]
+    fn test_invoke_host_function_entry_archived() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([1u8; 32])));
+        let contract_key = ScVal::U32(42);
+        let durability = ContractDataDurability::Persistent;
+
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::I32(7),
+        };
+        state.create_contract_data(cd_entry);
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+        let key_hash = compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1,
+        });
+
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: contract_id,
+            function_name: ScSymbol(StringM::try_from("noop".to_string()).unwrap()),
+            args: VecM::default(),
+        });
+
+        let op = InvokeHostFunctionOp {
+            host_function,
+            auth: VecM::default(),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: vec![key].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint,
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data))
+            .expect("invoke host function");
+
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
+                assert!(matches!(r, InvokeHostFunctionResult::EntryArchived));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_invoke_host_function_archived_allowed_when_marked() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([2u8; 32])));
+        let contract_key = ScVal::U32(5);
+        let durability = ContractDataDurability::Persistent;
+
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::I32(1),
+        };
+        state.create_contract_data(cd_entry);
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+        let key_hash = compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1,
+        });
+
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: contract_id,
+            function_name: ScSymbol(StringM::try_from("noop".to_string()).unwrap()),
+            args: VecM::default(),
+        });
+
+        let op = InvokeHostFunctionOp {
+            host_function,
+            auth: VecM::default(),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: vec![key].try_into().unwrap(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data))
+            .expect("invoke host function");
+
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
+                assert!(matches!(r, InvokeHostFunctionResult::Trapped));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_map_host_error_to_result_code_resource_limit() {
+        let host_error = soroban_env_host::HostError::from((
+            soroban_env_host::xdr::ScErrorType::Budget,
+            soroban_env_host::xdr::ScErrorCode::ExceededLimit,
+        ));
+        assert_eq!(
+            map_host_error_to_result_code(&host_error),
+            InvokeHostFunctionResultCode::ResourceLimitExceeded
+        );
+    }
+
+    #[test]
+    fn test_map_host_error_to_result_code_trapped() {
+        let host_error = soroban_env_host::HostError::from((
+            soroban_env_host::xdr::ScErrorType::Storage,
+            soroban_env_host::xdr::ScErrorCode::MissingValue,
+        ));
+        assert_eq!(
+            map_host_error_to_result_code(&host_error),
+            InvokeHostFunctionResultCode::Trapped
+        );
     }
 
     #[test]
