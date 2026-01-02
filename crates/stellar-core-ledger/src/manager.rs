@@ -500,6 +500,22 @@ impl LedgerManager {
 
         // Validate previous hash
         if close_data.prev_ledger_hash != state.header_hash {
+            // Debug: Log header details to help diagnose hash mismatch
+            tracing::error!(
+                current_seq = state.header.ledger_seq,
+                close_seq = close_data.ledger_seq,
+                our_hash = %state.header_hash.to_hex(),
+                network_prev_hash = %close_data.prev_ledger_hash.to_hex(),
+                header_version = state.header.ledger_version,
+                header_bucket_list_hash = %Hash256::from(state.header.bucket_list_hash.0).to_hex(),
+                header_tx_result_hash = %Hash256::from(state.header.tx_set_result_hash.0).to_hex(),
+                header_total_coins = state.header.total_coins,
+                header_fee_pool = state.header.fee_pool,
+                header_close_time = state.header.scp_value.close_time.0,
+                header_tx_set_hash = %Hash256::from(state.header.scp_value.tx_set_hash.0).to_hex(),
+                header_upgrades_count = state.header.scp_value.upgrades.len(),
+                "Hash mismatch - our computed header hash differs from network's prev_ledger_hash"
+            );
             return Err(LedgerError::HashMismatch {
                 expected: state.header_hash.to_hex(),
                 actual: close_data.prev_ledger_hash.to_hex(),
@@ -832,8 +848,26 @@ impl<'a> LedgerCloseContext<'a> {
             self.prev_header.inflation_seq,
         );
 
-        // Apply upgrades
+        // Apply upgrades to header fields (e.g., ledger_version, base_fee)
         self.upgrade_ctx.apply_to_header(&mut new_header);
+
+        // Also set the raw upgrades in scp_value.upgrades for correct header hash
+        // The upgrades need to be XDR-encoded as UpgradeType (opaque bytes)
+        let raw_upgrades: Vec<stellar_xdr::curr::UpgradeType> = self
+            .close_data
+            .upgrades
+            .iter()
+            .filter_map(|upgrade| {
+                use stellar_xdr::curr::WriteXdr;
+                upgrade
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .ok()
+                    .and_then(|bytes| stellar_xdr::curr::UpgradeType::try_from(bytes).ok())
+            })
+            .collect();
+        if let Ok(upgrades_vec) = raw_upgrades.try_into() {
+            new_header.scp_value.upgrades = upgrades_vec;
+        }
 
         new_header.id_pool = self.id_pool;
 
@@ -868,6 +902,14 @@ impl<'a> LedgerCloseContext<'a> {
             ledger_seq = new_header.ledger_seq,
             tx_count = self.stats.tx_count,
             close_time_ms = self.stats.close_time_ms,
+            computed_hash = %header_hash.to_hex(),
+            bucket_list_hash = %bucket_list_hash.to_hex(),
+            tx_result_hash = %tx_result_hash.to_hex(),
+            total_coins = new_header.total_coins,
+            fee_pool = new_header.fee_pool,
+            close_time = new_header.scp_value.close_time.0,
+            tx_set_hash = %Hash256::from(new_header.scp_value.tx_set_hash.0).to_hex(),
+            upgrades_count = new_header.scp_value.upgrades.len(),
             "Ledger closed"
         );
 
