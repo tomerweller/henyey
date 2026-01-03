@@ -1051,14 +1051,18 @@ impl TransactionExecutor {
         let final_fee = if frame.is_soroban() && all_success {
             if let Some(ref data) = soroban_data {
                 // Compute actual events size
+                let op_events_count: usize = op_events.iter().map(|v| v.len()).sum();
                 let actual_events_size: u32 = op_events.iter()
                     .flat_map(|events| events.iter())
                     .map(|event| {
-                        event.to_xdr(Limits::none())
+                        let size = event.to_xdr(Limits::none())
                             .map(|bytes| bytes.len() as u32)
-                            .unwrap_or(0)
+                            .unwrap_or(0);
+                        debug!(event_type = ?event.type_, event_xdr_size = size, "Event XDR size");
+                        size
                     })
                     .sum();
+                debug!(op_events_len = op_events.len(), op_events_count, actual_events_size, "Events debug info");
 
                 // Get declared resources
                 let resources = &data.resources;

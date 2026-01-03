@@ -241,19 +241,17 @@ fn compute_success_preimage_hash(return_value: &ScVal, events: &[ContractEvent])
 fn build_soroban_operation_meta(
     result: &crate::soroban::SorobanExecutionResult,
 ) -> SorobanOperationMeta {
-    let mut events = Vec::new();
-    let mut diagnostic_events = Vec::new();
+    // Use contract_events which contains the decoded Contract and System events
+    // (result.events is currently Events::default() as per the TODO in host.rs)
+    let events = result.contract_events.clone();
 
-    for host_event in result.events.0.iter() {
-        let event = host_event.event.clone();
-        if matches!(event.type_, ContractEventType::Contract | ContractEventType::System) {
-            events.push(event.clone());
-        }
-        diagnostic_events.push(DiagnosticEvent {
-            in_successful_contract_call: !host_event.failed_call,
-            event,
-        });
-    }
+    // Build diagnostic events from the contract events
+    let diagnostic_events: Vec<DiagnosticEvent> = events.iter()
+        .map(|event| DiagnosticEvent {
+            in_successful_contract_call: true,
+            event: event.clone(),
+        })
+        .collect();
 
     SorobanOperationMeta {
         events,

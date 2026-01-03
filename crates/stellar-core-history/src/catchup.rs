@@ -40,9 +40,10 @@ use sha2::Digest;
 use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::{
-    LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
-    TransactionHistoryResultEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntryExt,
-    TransactionMeta, TransactionResultPair, TransactionResultSet, TransactionSet, WriteXdr,
+    GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry,
+    TransactionHistoryEntry, TransactionHistoryResultEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntryExt, TransactionMeta, TransactionResultPair, TransactionResultSet,
+    TransactionSet, TransactionSetV1, WriteXdr,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -929,10 +930,34 @@ impl CatchupManager {
                     }
                 })
                 .unwrap_or_else(|| {
-                    TransactionSetVariant::Classic(TransactionSet {
-                        previous_ledger_hash: header.previous_ledger_hash.clone(),
-                        txs: Default::default(),
-                    })
+                    // For protocol 20+, use GeneralizedTransactionSet format
+                    // For earlier protocols, use Classic TransactionSet
+                    if header.ledger_version >= 20 {
+                        // Create empty GeneralizedTransactionSet with proper phases
+                        // Phase 0: empty classic phase (V0 with no components)
+                        // Phase 1: empty soroban phase (V1 with no stages)
+                        use stellar_xdr::curr::{TransactionPhase, ParallelTxsComponent, VecM};
+
+                        // Empty classic phase (no components)
+                        let classic_phase = TransactionPhase::V0(VecM::default());
+                        // Empty soroban phase (no execution stages)
+                        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
+                            base_fee: None,
+                            execution_stages: VecM::default(),
+                        });
+
+                        TransactionSetVariant::Generalized(
+                            GeneralizedTransactionSet::V1(TransactionSetV1 {
+                                previous_ledger_hash: header.previous_ledger_hash.clone(),
+                                phases: vec![classic_phase, soroban_phase].try_into().unwrap_or_default(),
+                            })
+                        )
+                    } else {
+                        TransactionSetVariant::Classic(TransactionSet {
+                            previous_ledger_hash: header.previous_ledger_hash.clone(),
+                            txs: Default::default(),
+                        })
+                    }
                 });
 
             let tx_result_entry = cache
