@@ -10,7 +10,8 @@ Invariant framework for validating ledger transitions.
   account flags/signers/home domain/ext checks, trustline asset/limits/flags/
   extensions, offer fields/assets, claimable balance sponsorship/assets/predicates,
   data names, liquidity pool parameters/sponsorship, contract code hash),
-  sponsorship count, account subentry count, and constant product checks.
+  sponsorship count, account subentry count, constant product checks, order book
+  crossed checks, and liabilities vs offer deltas.
 - Hooked into ledger close when enabled.
 
 ## Status

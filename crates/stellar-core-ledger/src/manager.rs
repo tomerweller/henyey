@@ -25,7 +25,7 @@ use stellar_core_invariant::{
     AccountSubEntriesCountIsValid, BucketListHashMatchesHeader, CloseTimeNondecreasing,
     ConservationOfLumens, ConstantProductInvariant, Invariant, InvariantContext, InvariantManager,
     LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerEntryChange, LedgerSeqIncrement,
-    SponsorshipCountIsValid,
+    LiabilitiesMatchOffers, OrderBookIsNotCrossed, SponsorshipCountIsValid,
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
@@ -143,6 +143,8 @@ impl LedgerManager {
         invariants.add(LedgerEntryIsValid);
         invariants.add(SponsorshipCountIsValid);
         invariants.add(AccountSubEntriesCountIsValid);
+        invariants.add(LiabilitiesMatchOffers);
+        invariants.add(OrderBookIsNotCrossed);
         invariants.add(ConstantProductInvariant);
         invariants.add(LastModifiedLedgerSeqMatchesHeader);
 
@@ -891,6 +893,10 @@ impl<'a> LedgerCloseContext<'a> {
         let header_hash = compute_header_hash(&new_header)?;
 
         if self.manager.config.validate_invariants {
+            let full_entries = {
+                let bucket_list = self.manager.bucket_list.read();
+                bucket_list.live_entries()?
+            };
             let changes = self
                 .delta
                 .changes()
@@ -914,6 +920,7 @@ impl<'a> LedgerCloseContext<'a> {
                 fee_pool_delta: self.delta.fee_pool_delta(),
                 total_coins_delta: self.delta.total_coins_delta(),
                 changes: &changes,
+                full_entries: Some(&full_entries),
             };
             self.manager.invariants.read().check_all(&ctx)?;
         }

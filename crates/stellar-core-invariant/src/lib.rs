@@ -1,9 +1,10 @@
 //! Invariant framework for rs-stellar-core.
 
 use stellar_core_common::Hash256;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use stellar_xdr::curr::{AccountId, LedgerEntry, LedgerEntryData, LedgerHeader};
 use thiserror::Error;
+use tracing::error;
 
 #[derive(Debug, Error)]
 pub enum InvariantError {
@@ -44,11 +45,15 @@ pub struct InvariantContext<'a> {
     pub fee_pool_delta: i64,
     pub total_coins_delta: i64,
     pub changes: &'a [LedgerEntryChange],
+    pub full_entries: Option<&'a [LedgerEntry]>,
 }
 
 pub trait Invariant: Send + Sync {
     fn name(&self) -> &str;
     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError>;
+    fn is_strict(&self) -> bool {
+        true
+    }
 }
 
 pub struct InvariantManager {
@@ -66,7 +71,19 @@ impl InvariantManager {
 
     pub fn check_all(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
         for inv in &self.invariants {
-            inv.check(ctx)?;
+            match inv.check(ctx) {
+                Ok(()) => {}
+                Err(err) => {
+                    if inv.is_strict() {
+                        return Err(err);
+                    }
+                    error!(
+                        invariant = inv.name(),
+                        error = %err,
+                        "Non-strict invariant violated"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -123,6 +140,10 @@ impl Invariant for ConservationOfLumens {
         "ConservationOfLumens"
     }
 
+    fn is_strict(&self) -> bool {
+        false
+    }
+
     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
         let expected_total = ctx
             .prev_header
@@ -170,6 +191,10 @@ pub struct LedgerEntryIsValid;
 impl Invariant for LedgerEntryIsValid {
     fn name(&self) -> &str {
         "LedgerEntryIsValid"
+    }
+
+    fn is_strict(&self) -> bool {
+        false
     }
 
     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
@@ -643,6 +668,10 @@ impl Invariant for SponsorshipCountIsValid {
         "SponsorshipCountIsValid"
     }
 
+    fn is_strict(&self) -> bool {
+        false
+    }
+
     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
         let protocol = ctx.curr_header.ledger_version;
         if protocol < 14 {
@@ -743,6 +772,10 @@ impl Invariant for AccountSubEntriesCountIsValid {
         "AccountSubEntriesCountIsValid"
     }
 
+    fn is_strict(&self) -> bool {
+        false
+    }
+
     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
         let mut subentry_changes: HashMap<AccountId, SubEntriesChange> = HashMap::new();
 
@@ -787,6 +820,212 @@ impl Invariant for AccountSubEntriesCountIsValid {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+}
+
+/// Invariant: liabilities remain consistent with offer changes and entry balances.
+pub struct LiabilitiesMatchOffers;
+
+impl Invariant for LiabilitiesMatchOffers {
+    fn name(&self) -> &str {
+        "LiabilitiesMatchOffers"
+    }
+
+    fn is_strict(&self) -> bool {
+        false
+    }
+
+    fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
+        let protocol = ctx.curr_header.ledger_version;
+        if protocol < 10 {
+            return Ok(());
+        }
+
+        let mut delta_liabilities: HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>> =
+            HashMap::new();
+
+        for change in ctx.changes {
+            check_trustline_authorization(change)?;
+            accumulate_liabilities_delta(&mut delta_liabilities, change)?;
+        }
+
+        for (account, assets) in &delta_liabilities {
+            for (asset, liabilities) in assets {
+                if liabilities.buying != 0 {
+                    return Err(InvariantError::Violated {
+                        name: self.name().to_string(),
+                        details: format!(
+                            "change in buying liabilities differed from offer liabilities by {} for {:?} in {:?}",
+                            liabilities.buying, account, asset
+                        ),
+                    });
+                }
+                if liabilities.selling != 0 {
+                    return Err(InvariantError::Violated {
+                        name: self.name().to_string(),
+                        details: format!(
+                            "change in selling liabilities differed from offer liabilities by {} for {:?} in {:?}",
+                            liabilities.selling, account, asset
+                        ),
+                    });
+                }
+            }
+        }
+
+        for change in ctx.changes {
+            check_balance_and_limit(ctx.curr_header, change, protocol)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OfferView {
+    price: stellar_xdr::curr::Price,
+    flags: u32,
+    offer_id: i64,
+}
+
+impl OfferView {
+    fn from_offer(offer: &stellar_xdr::curr::OfferEntry) -> Self {
+        Self {
+            price: offer.price.clone(),
+            flags: offer.flags,
+            offer_id: offer.offer_id,
+        }
+    }
+
+    fn is_passive(&self) -> bool {
+        let passive = stellar_xdr::curr::OfferEntryFlags::PassiveFlag as u32;
+        (self.flags & passive) != 0
+    }
+}
+
+impl Ord for OfferView {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let price_cmp = compare_price(&self.price, &other.price);
+        if price_cmp != std::cmp::Ordering::Equal {
+            return price_cmp;
+        }
+        if self.is_passive() != other.is_passive() {
+            return if self.is_passive() {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+        self.offer_id.cmp(&other.offer_id)
+    }
+}
+
+impl PartialOrd for OfferView {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compare_price(a: &stellar_xdr::curr::Price, b: &stellar_xdr::curr::Price) -> std::cmp::Ordering {
+    let lhs = (a.n as i128) * (b.d as i128);
+    let rhs = (b.n as i128) * (a.d as i128);
+    lhs.cmp(&rhs)
+}
+
+fn price_as_f64(price: &stellar_xdr::curr::Price) -> f64 {
+    price.n as f64 / price.d as f64
+}
+
+fn offer_asset_pair(
+    offer: &stellar_xdr::curr::OfferEntry,
+) -> (stellar_xdr::curr::Asset, stellar_xdr::curr::Asset) {
+    if offer.selling <= offer.buying {
+        (offer.selling.clone(), offer.buying.clone())
+    } else {
+        (offer.buying.clone(), offer.selling.clone())
+    }
+}
+
+fn check_order_book_crossed(
+    order_book: &HashMap<(stellar_xdr::curr::Asset, stellar_xdr::curr::Asset), BTreeSet<OfferView>>,
+    asset_a: &stellar_xdr::curr::Asset,
+    asset_b: &stellar_xdr::curr::Asset,
+) -> Result<(), InvariantError> {
+    let asks = match order_book.get(&(asset_a.clone(), asset_b.clone())) {
+        Some(asks) if !asks.is_empty() => asks,
+        _ => return Ok(()),
+    };
+    let bids = match order_book.get(&(asset_b.clone(), asset_a.clone())) {
+        Some(bids) if !bids.is_empty() => bids,
+        _ => return Ok(()),
+    };
+
+    let lowest_ask = asks.iter().next().unwrap();
+    let highest_bid_inverse = bids.iter().next().unwrap();
+    let highest_bid_price = stellar_xdr::curr::Price {
+        n: highest_bid_inverse.price.d,
+        d: highest_bid_inverse.price.n,
+    };
+
+    let lowest_ask_price = price_as_f64(&lowest_ask.price);
+    let highest_bid = price_as_f64(&highest_bid_price);
+
+    if lowest_ask_price <= highest_bid {
+        if lowest_ask_price == highest_bid {
+            if lowest_ask.is_passive() || highest_bid_inverse.is_passive() {
+                return Ok(());
+            }
+        }
+        return Err(InvariantError::Violated {
+            name: "OrderBookIsNotCrossed".to_string(),
+            details: "order book is crossed".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Invariant: order book should not be crossed.
+pub struct OrderBookIsNotCrossed;
+
+impl Invariant for OrderBookIsNotCrossed {
+    fn name(&self) -> &str {
+        "OrderBookIsNotCrossed"
+    }
+
+    fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
+        let Some(entries) = ctx.full_entries else {
+            return Ok(());
+        };
+
+        let mut order_book: HashMap<(stellar_xdr::curr::Asset, stellar_xdr::curr::Asset), BTreeSet<OfferView>> =
+            HashMap::new();
+        for entry in entries {
+            if let LedgerEntryData::Offer(offer) = &entry.data {
+                order_book
+                    .entry((offer.selling.clone(), offer.buying.clone()))
+                    .or_default()
+                    .insert(OfferView::from_offer(offer));
+            }
+        }
+
+        let mut asset_pairs: HashSet<(stellar_xdr::curr::Asset, stellar_xdr::curr::Asset)> =
+            HashSet::new();
+        for change in ctx.changes {
+            for entry in [change.current_entry(), change.previous_entry()] {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                if let LedgerEntryData::Offer(offer) = &entry.data {
+                    asset_pairs.insert(offer_asset_pair(offer));
+                }
+            }
+        }
+
+        for (asset_a, asset_b) in asset_pairs {
+            check_order_book_crossed(&order_book, &asset_a, &asset_b)?;
         }
 
         Ok(())
@@ -1207,6 +1446,502 @@ fn trustline_flags_valid(flags: u32, protocol: u32) -> bool {
     true
 }
 
+fn liabilities_error(details: impl Into<String>) -> InvariantError {
+    InvariantError::Violated {
+        name: "LiabilitiesMatchOffers".to_string(),
+        details: details.into(),
+    }
+}
+
+fn is_trustline_authorized(entry: &stellar_xdr::curr::TrustLineEntry) -> bool {
+    let flag = stellar_xdr::curr::TrustLineFlags::AuthorizedFlag as u32;
+    (entry.flags & flag) != 0
+}
+
+fn is_trustline_authorized_to_maintain_liabilities(
+    entry: &stellar_xdr::curr::TrustLineEntry,
+) -> bool {
+    let flag = stellar_xdr::curr::TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
+    (entry.flags & flag) != 0
+}
+
+fn account_liabilities(
+    entry: &stellar_xdr::curr::AccountEntry,
+) -> stellar_xdr::curr::Liabilities {
+    match &entry.ext {
+        stellar_xdr::curr::AccountEntryExt::V1(ext) => ext.liabilities.clone(),
+        _ => stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+    }
+}
+
+fn trustline_liabilities(
+    entry: &stellar_xdr::curr::TrustLineEntry,
+) -> stellar_xdr::curr::Liabilities {
+    match &entry.ext {
+        stellar_xdr::curr::TrustLineEntryExt::V1(ext) => ext.liabilities.clone(),
+        _ => stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+    }
+}
+
+fn account_sponsorship_counts(
+    entry: &stellar_xdr::curr::AccountEntry,
+) -> (i64, i64) {
+    match &entry.ext {
+        stellar_xdr::curr::AccountEntryExt::V1(ext) => match &ext.ext {
+            stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => {
+                (i64::from(v2.num_sponsoring), i64::from(v2.num_sponsored))
+            }
+            _ => (0, 0),
+        },
+        _ => (0, 0),
+    }
+}
+
+fn asset_to_trustline_asset(
+    asset: &stellar_xdr::curr::Asset,
+) -> stellar_xdr::curr::TrustLineAsset {
+    match asset {
+        stellar_xdr::curr::Asset::Native => stellar_xdr::curr::TrustLineAsset::Native,
+        stellar_xdr::curr::Asset::CreditAlphanum4(a) => {
+            stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(a.clone())
+        }
+        stellar_xdr::curr::Asset::CreditAlphanum12(a) => {
+            stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone())
+        }
+    }
+}
+
+fn is_issuer(account: &AccountId, asset: &stellar_xdr::curr::Asset) -> bool {
+    match asset {
+        stellar_xdr::curr::Asset::Native => false,
+        stellar_xdr::curr::Asset::CreditAlphanum4(a) => &a.issuer == account,
+        stellar_xdr::curr::Asset::CreditAlphanum12(a) => &a.issuer == account,
+    }
+}
+
+fn check_trustline_authorization(change: &LedgerEntryChange) -> Result<(), InvariantError> {
+    let Some(current) = change.current_entry() else {
+        return Ok(());
+    };
+    let LedgerEntryData::Trustline(trust) = &current.data else {
+        return Ok(());
+    };
+
+    if is_trustline_authorized(trust) {
+        return Ok(());
+    }
+
+    let current_liabilities = trustline_liabilities(trust);
+    let previous_liabilities = change
+        .previous_entry()
+        .and_then(|entry| match &entry.data {
+            LedgerEntryData::Trustline(previous) => Some(trustline_liabilities(previous)),
+            _ => None,
+        })
+        .unwrap_or_else(|| stellar_xdr::curr::Liabilities { buying: 0, selling: 0 });
+
+    if is_trustline_authorized_to_maintain_liabilities(trust) {
+        if current_liabilities.buying > previous_liabilities.buying
+            || current_liabilities.selling > previous_liabilities.selling
+        {
+            return Err(liabilities_error(
+                "liabilities increased on unauthorized trustline",
+            ));
+        }
+    } else if current_liabilities.buying > 0 || current_liabilities.selling > 0 {
+        return Err(liabilities_error(
+            "unauthorized trustline has liabilities",
+        ));
+    }
+
+    Ok(())
+}
+
+fn accumulate_liabilities_delta(
+    delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
+    change: &LedgerEntryChange,
+) -> Result<(), InvariantError> {
+    add_or_subtract_liabilities(delta, change.current_entry(), true)?;
+    add_or_subtract_liabilities(delta, change.previous_entry(), false)?;
+    Ok(())
+}
+
+fn add_or_subtract_liabilities(
+    delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
+    entry: Option<&LedgerEntry>,
+    is_add: bool,
+) -> Result<(), InvariantError> {
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+
+    let sign = if is_add { 1i64 } else { -1i64 };
+    match &entry.data {
+        LedgerEntryData::Account(account) => {
+            let liabilities = account_liabilities(account);
+            let asset = stellar_xdr::curr::TrustLineAsset::Native;
+            update_liability_delta(
+                delta,
+                &account.account_id,
+                asset,
+                -sign * liabilities.buying,
+                -sign * liabilities.selling,
+            )?;
+        }
+        LedgerEntryData::Trustline(trust) => {
+            let liabilities = trustline_liabilities(trust);
+            update_liability_delta(
+                delta,
+                &trust.account_id,
+                trust.asset.clone(),
+                -sign * liabilities.buying,
+                -sign * liabilities.selling,
+            )?;
+        }
+        LedgerEntryData::Offer(offer) => {
+            if !is_issuer(&offer.seller_id, &offer.selling) {
+                let selling = offer_selling_liabilities(offer)?;
+                update_liability_delta(
+                    delta,
+                    &offer.seller_id,
+                    asset_to_trustline_asset(&offer.selling),
+                    0,
+                    sign * selling,
+                )?;
+            }
+            if !is_issuer(&offer.seller_id, &offer.buying) {
+                let buying = offer_buying_liabilities(offer)?;
+                update_liability_delta(
+                    delta,
+                    &offer.seller_id,
+                    asset_to_trustline_asset(&offer.buying),
+                    sign * buying,
+                    0,
+                )?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn update_liability_delta(
+    delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
+    account: &AccountId,
+    asset: stellar_xdr::curr::TrustLineAsset,
+    buying_delta: i64,
+    selling_delta: i64,
+) -> Result<(), InvariantError> {
+    let entry = delta
+        .entry(account.clone())
+        .or_default()
+        .entry(asset)
+        .or_insert(stellar_xdr::curr::Liabilities { buying: 0, selling: 0 });
+
+    entry.buying = entry
+        .buying
+        .checked_add(buying_delta)
+        .ok_or_else(|| liabilities_error("liability buying overflow"))?;
+    entry.selling = entry
+        .selling
+        .checked_add(selling_delta)
+        .ok_or_else(|| liabilities_error("liability selling overflow"))?;
+    Ok(())
+}
+
+fn check_balance_and_limit(
+    header: &LedgerHeader,
+    change: &LedgerEntryChange,
+    protocol: u32,
+) -> Result<(), InvariantError> {
+    let Some(current) = change.current_entry() else {
+        return Ok(());
+    };
+
+    match &current.data {
+        LedgerEntryData::Account(account) => {
+            let previous = change.previous_entry().and_then(|entry| match &entry.data {
+                LedgerEntryData::Account(prev) => Some(prev),
+                _ => None,
+            });
+            if should_check_account(account, previous, protocol) {
+                let liabilities = account_liabilities(account);
+                let min_balance = minimum_balance(header, account, protocol)?;
+                let required = min_balance
+                    .checked_add(liabilities.selling)
+                    .ok_or_else(|| liabilities_error("min balance overflow"))?;
+                if account.balance < required {
+                    return Err(liabilities_error(
+                        "account balance not compatible with liabilities",
+                    ));
+                }
+                if i64::MAX - account.balance < liabilities.buying {
+                    return Err(liabilities_error(
+                        "account balance overflowed by buying liabilities",
+                    ));
+                }
+            }
+        }
+        LedgerEntryData::Trustline(trust) => {
+            let liabilities = trustline_liabilities(trust);
+            if trust.balance < liabilities.selling {
+                return Err(liabilities_error(
+                    "trustline balance below selling liabilities",
+                ));
+            }
+            let available = trust
+                .limit
+                .checked_sub(trust.balance)
+                .ok_or_else(|| liabilities_error("trustline limit below balance"))?;
+            if available < liabilities.buying {
+                return Err(liabilities_error(
+                    "trustline limit below buying liabilities",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn should_check_account(
+    current: &stellar_xdr::curr::AccountEntry,
+    previous: Option<&stellar_xdr::curr::AccountEntry>,
+    protocol: u32,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+
+    let did_balance_decrease = current.balance < previous.balance;
+    if protocol >= 10 {
+        let current_liabilities = account_liabilities(current);
+        let previous_liabilities = account_liabilities(previous);
+        let did_liabilities_increase = current_liabilities.selling > previous_liabilities.selling
+            || current_liabilities.buying > previous_liabilities.buying;
+        did_balance_decrease || did_liabilities_increase
+    } else {
+        did_balance_decrease
+    }
+}
+
+fn minimum_balance(
+    header: &LedgerHeader,
+    account: &stellar_xdr::curr::AccountEntry,
+    protocol: u32,
+) -> Result<i64, InvariantError> {
+    let num_sub_entries = i64::from(account.num_sub_entries);
+    let (num_sponsoring, num_sponsored) = account_sponsorship_counts(account);
+    minimum_balance_with_counts(
+        protocol,
+        num_sub_entries,
+        num_sponsoring,
+        num_sponsored,
+        header.base_reserve,
+    )
+}
+
+fn minimum_balance_with_counts(
+    protocol: u32,
+    num_sub_entries: i64,
+    num_sponsoring: i64,
+    num_sponsored: i64,
+    base_reserve: u32,
+) -> Result<i64, InvariantError> {
+    if protocol < 14 && (num_sponsoring != 0 || num_sponsored != 0) {
+        return Err(liabilities_error(
+            "unexpected sponsorship counts before protocol 14",
+        ));
+    }
+
+    let effective_entries = if protocol < 9 {
+        2 + num_sub_entries
+    } else {
+        2 + num_sub_entries + num_sponsoring - num_sponsored
+    };
+
+    if effective_entries < 0 {
+        return Err(liabilities_error(
+            "negative effective entry count in minimum balance",
+        ));
+    }
+
+    let base_reserve = i64::from(base_reserve);
+    effective_entries
+        .checked_mul(base_reserve)
+        .ok_or_else(|| liabilities_error("minimum balance overflow"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiabilitiesRounding {
+    Normal,
+}
+
+#[derive(Clone, Copy)]
+enum LiabilitiesRound {
+    Down,
+    Up,
+}
+
+fn liabilities_big_multiply(lhs: i64, rhs: i64) -> i128 {
+    let lhs = lhs as i128;
+    let rhs = rhs as i128;
+    lhs.saturating_mul(rhs)
+}
+
+fn liabilities_big_divide(
+    n: i128,
+    d: i128,
+    round: LiabilitiesRound,
+) -> Result<i64, InvariantError> {
+    if d <= 0 {
+        return Err(liabilities_error("invalid price"));
+    }
+    let value = match round {
+        LiabilitiesRound::Down => n / d,
+        LiabilitiesRound::Up => {
+            if n == 0 {
+                0
+            } else {
+                (n + d - 1) / d
+            }
+        }
+    };
+    if value > i64::MAX as i128 {
+        return Err(liabilities_error("liabilities overflow"));
+    }
+    Ok(value as i64)
+}
+
+fn liabilities_calculate_offer_value(
+    price_n: i32,
+    price_d: i32,
+    max_send: i64,
+    max_receive: i64,
+) -> i128 {
+    let send_value = liabilities_big_multiply(max_send, price_n as i64);
+    let receive_value = liabilities_big_multiply(max_receive, price_d as i64);
+    send_value.min(receive_value)
+}
+
+fn exchange_v10_without_price_error_thresholds(
+    price: stellar_xdr::curr::Price,
+    max_wheat_send: i64,
+    max_wheat_receive: i64,
+    max_sheep_send: i64,
+    max_sheep_receive: i64,
+    round: LiabilitiesRounding,
+) -> Result<(i64, i64), InvariantError> {
+    if price.n <= 0 || price.d <= 0 {
+        return Err(liabilities_error("invalid price"));
+    }
+    let wheat_value = liabilities_calculate_offer_value(
+        price.n,
+        price.d,
+        max_wheat_send,
+        max_sheep_receive,
+    );
+    let sheep_value = liabilities_calculate_offer_value(
+        price.d,
+        price.n,
+        max_sheep_send,
+        max_wheat_receive,
+    );
+    let wheat_stays = wheat_value > sheep_value;
+
+    let (wheat_receive, sheep_send) = if wheat_stays {
+        if round == LiabilitiesRounding::Normal {
+            if price.n > price.d {
+                let wheat_receive = liabilities_big_divide(
+                    sheep_value,
+                    price.n as i128,
+                    LiabilitiesRound::Down,
+                )?;
+                let sheep_send = liabilities_big_divide(
+                    (wheat_receive as i128) * (price.n as i128),
+                    price.d as i128,
+                    LiabilitiesRound::Up,
+                )?;
+                (wheat_receive, sheep_send)
+            } else {
+                let sheep_send = liabilities_big_divide(
+                    sheep_value,
+                    price.d as i128,
+                    LiabilitiesRound::Down,
+                )?;
+                let wheat_receive = liabilities_big_divide(
+                    (sheep_send as i128) * (price.d as i128),
+                    price.n as i128,
+                    LiabilitiesRound::Down,
+                )?;
+                (wheat_receive, sheep_send)
+            }
+        } else {
+            let wheat_receive = liabilities_big_divide(
+                wheat_value.min(sheep_value),
+                price.n as i128,
+                LiabilitiesRound::Down,
+            )?;
+            (wheat_receive, max_sheep_send.min(max_sheep_receive))
+        }
+    } else if price.n > price.d {
+        let wheat_receive = liabilities_big_divide(
+            wheat_value,
+            price.n as i128,
+            LiabilitiesRound::Down,
+        )?;
+        let sheep_send = liabilities_big_divide(
+            (wheat_receive as i128) * (price.n as i128),
+            price.d as i128,
+            LiabilitiesRound::Down,
+        )?;
+        (wheat_receive, sheep_send)
+    } else {
+        let sheep_send = liabilities_big_divide(
+            wheat_value,
+            price.d as i128,
+            LiabilitiesRound::Down,
+        )?;
+        let wheat_receive = liabilities_big_divide(
+            (sheep_send as i128) * (price.d as i128),
+            price.n as i128,
+            LiabilitiesRound::Down,
+        )?;
+        (wheat_receive, sheep_send)
+    };
+
+    Ok((wheat_receive, sheep_send))
+}
+
+fn offer_buying_liabilities(
+    offer: &stellar_xdr::curr::OfferEntry,
+) -> Result<i64, InvariantError> {
+    let (_wheat_receive, sheep_send) = exchange_v10_without_price_error_thresholds(
+        offer.price.clone(),
+        offer.amount,
+        i64::MAX,
+        i64::MAX,
+        i64::MAX,
+        LiabilitiesRounding::Normal,
+    )?;
+    Ok(sheep_send)
+}
+
+fn offer_selling_liabilities(
+    offer: &stellar_xdr::curr::OfferEntry,
+) -> Result<i64, InvariantError> {
+    let (wheat_receive, _sheep_send) = exchange_v10_without_price_error_thresholds(
+        offer.price.clone(),
+        offer.amount,
+        i64::MAX,
+        i64::MAX,
+        i64::MAX,
+        LiabilitiesRounding::Normal,
+    )?;
+    Ok(wheat_receive)
+}
+
 fn trustline_clawback_enabled(trust: &stellar_xdr::curr::TrustLineEntry) -> bool {
     let flag = stellar_xdr::curr::TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
     (trust.flags & flag) != 0
@@ -1309,6 +2044,10 @@ impl Invariant for LastModifiedLedgerSeqMatchesHeader {
         "LastModifiedLedgerSeqMatchesHeader"
     }
 
+    fn is_strict(&self) -> bool {
+        false
+    }
+
     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
         let expected = ctx.curr_header.ledger_seq;
         for change in ctx.changes {
@@ -1340,11 +2079,11 @@ mod tests {
         ContractCodeEntry, ContractCodeEntryExt, DataEntry, DataEntryExt, Hash, LedgerEntryExt,
         LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext, LedgerHeaderExt,
         LiquidityPoolConstantProductParameters, LiquidityPoolEntry, LiquidityPoolEntryBody,
-        LiquidityPoolEntryConstantProduct, PoolId, Price, PublicKey, SequenceNumber, Signer,
-        SignerKey, SponsorshipDescriptor, StellarValue, StellarValueExt, Thresholds, TimePoint,
-        TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2,
-        TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TtlEntry, Uint256,
-        VecM,
+        LiquidityPoolEntryConstantProduct, OfferEntryFlags, PoolId, Price, PublicKey,
+        SequenceNumber, Signer, SignerKey, SponsorshipDescriptor, StellarValue, StellarValueExt,
+        Thresholds, TimePoint, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
+        TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
+        TrustLineEntryV1Ext, TtlEntry, Uint256, VecM,
     };
 
     fn make_account_id(byte: u8) -> stellar_xdr::curr::AccountId {
@@ -1533,13 +2272,31 @@ mod tests {
         price: Price,
         flags: u32,
     ) -> LedgerEntry {
+        make_offer_entry_with_assets(
+            offer_id,
+            amount,
+            price,
+            flags,
+            Asset::Native,
+            Asset::Native,
+        )
+    }
+
+    fn make_offer_entry_with_assets(
+        offer_id: i64,
+        amount: i64,
+        price: Price,
+        flags: u32,
+        selling: Asset,
+        buying: Asset,
+    ) -> LedgerEntry {
         LedgerEntry {
             last_modified_ledger_seq: 2,
             data: LedgerEntryData::Offer(stellar_xdr::curr::OfferEntry {
                 seller_id: make_account_id(4),
                 offer_id,
-                selling: Asset::Native,
-                buying: Asset::Native,
+                selling,
+                buying,
                 amount,
                 price,
                 flags,
@@ -1691,6 +2448,7 @@ mod tests {
             fee_pool_delta: 0,
             total_coins_delta: 0,
             changes,
+            full_entries: None,
         };
         ctx
     }
@@ -1710,6 +2468,68 @@ mod tests {
         manager.add(LedgerEntryIsValid);
 
         assert!(manager.check_all(&ctx).is_ok());
+    }
+
+    struct FailingStrict;
+
+    impl Invariant for FailingStrict {
+        fn name(&self) -> &str {
+            "FailingStrict"
+        }
+
+        fn check(&self, _ctx: &InvariantContext) -> Result<(), InvariantError> {
+            Err(InvariantError::Violated {
+                name: self.name().to_string(),
+                details: "boom".to_string(),
+            })
+        }
+    }
+
+    struct FailingNonStrict;
+
+    impl Invariant for FailingNonStrict {
+        fn name(&self) -> &str {
+            "FailingNonStrict"
+        }
+
+        fn is_strict(&self) -> bool {
+            false
+        }
+
+        fn check(&self, _ctx: &InvariantContext) -> Result<(), InvariantError> {
+            Err(InvariantError::Violated {
+                name: self.name().to_string(),
+                details: "boom".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_invariant_manager_allows_non_strict_failures() {
+        let prev = make_header(1, Hash256::ZERO);
+        let curr = make_header(2, Hash256::ZERO);
+        let entries: Vec<LedgerEntry> = Vec::new();
+        let changes = make_changes(entries);
+        let ctx = make_ctx(&prev, &curr, &changes);
+
+        let mut manager = InvariantManager::new();
+        manager.add(FailingNonStrict);
+
+        assert!(manager.check_all(&ctx).is_ok());
+    }
+
+    #[test]
+    fn test_invariant_manager_rejects_strict_failures() {
+        let prev = make_header(1, Hash256::ZERO);
+        let curr = make_header(2, Hash256::ZERO);
+        let entries: Vec<LedgerEntry> = Vec::new();
+        let changes = make_changes(entries);
+        let ctx = make_ctx(&prev, &curr, &changes);
+
+        let mut manager = InvariantManager::new();
+        manager.add(FailingStrict);
+
+        assert!(manager.check_all(&ctx).is_err());
     }
 
     #[test]
@@ -1740,6 +2560,144 @@ mod tests {
 
         let inv = LedgerEntryIsValid;
         assert!(inv.check(&ctx).is_err());
+    }
+
+    #[test]
+    fn test_liabilities_match_offers_rejects_unmatched_offer() {
+        let prev = make_header(1, Hash256::ZERO);
+        let mut curr = make_header(2, Hash256::ZERO);
+        curr.ledger_version = 25;
+        let entries = vec![make_offer_entry(1, 100, Price { n: 1, d: 1 })];
+        let changes = make_changes(entries);
+        let ctx = make_ctx(&prev, &curr, &changes);
+
+        let inv = LiabilitiesMatchOffers;
+        assert!(inv.check(&ctx).is_err());
+    }
+
+    #[test]
+    fn test_liabilities_match_offers_rejects_account_balance_with_liabilities() {
+        let prev = make_header(1, Hash256::ZERO);
+        let mut curr = make_header(2, Hash256::ZERO);
+        curr.ledger_version = 25;
+
+        let mut entry = make_account_entry(1, Vec::new());
+        if let LedgerEntryData::Account(account) = &mut entry.data {
+            account.balance = 1;
+            account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+                ext: AccountEntryExtensionV1Ext::V0,
+            });
+        }
+        let changes = make_changes(vec![entry]);
+        let ctx = make_ctx(&prev, &curr, &changes);
+
+        let inv = LiabilitiesMatchOffers;
+        assert!(inv.check(&ctx).is_err());
+    }
+
+    #[test]
+    fn test_liabilities_match_offers_rejects_trustline_limit() {
+        let prev = make_header(1, Hash256::ZERO);
+        let mut curr = make_header(2, Hash256::ZERO);
+        curr.ledger_version = 25;
+
+        let mut entry = make_trustline_entry(10, 0);
+        if let LedgerEntryData::Trustline(trustline) = &mut entry.data {
+            trustline.balance = 10;
+            trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: stellar_xdr::curr::Liabilities { buying: 1, selling: 0 },
+                ext: TrustLineEntryV1Ext::V0,
+            });
+        }
+        let changes = make_changes(vec![entry]);
+        let ctx = make_ctx(&prev, &curr, &changes);
+
+        let inv = LiabilitiesMatchOffers;
+        assert!(inv.check(&ctx).is_err());
+    }
+
+    #[test]
+    fn test_order_book_is_not_crossed_rejects_crossed_book() {
+        let prev = make_header(1, Hash256::ZERO);
+        let mut curr = make_header(2, Hash256::ZERO);
+        curr.ledger_version = 25;
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"ABCD"),
+            issuer: make_account_id(7),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"WXYZ"),
+            issuer: make_account_id(8),
+        });
+
+        let ask = make_offer_entry_with_assets(
+            1,
+            100,
+            Price { n: 1, d: 1 },
+            0,
+            asset_a.clone(),
+            asset_b.clone(),
+        );
+        let bid = make_offer_entry_with_assets(
+            2,
+            100,
+            Price { n: 1, d: 1 },
+            0,
+            asset_b.clone(),
+            asset_a.clone(),
+        );
+        let changes = make_changes(vec![ask.clone(), bid.clone()]);
+        let full_entries = vec![ask, bid];
+
+        let mut ctx = make_ctx(&prev, &curr, &changes);
+        ctx.full_entries = Some(&full_entries);
+
+        let inv = OrderBookIsNotCrossed;
+        assert!(inv.check(&ctx).is_err());
+    }
+
+    #[test]
+    fn test_order_book_is_not_crossed_allows_passive_equal_price() {
+        let prev = make_header(1, Hash256::ZERO);
+        let mut curr = make_header(2, Hash256::ZERO);
+        curr.ledger_version = 25;
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"ABCD"),
+            issuer: make_account_id(7),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"WXYZ"),
+            issuer: make_account_id(8),
+        });
+
+        let passive = OfferEntryFlags::PassiveFlag as u32;
+        let ask = make_offer_entry_with_assets(
+            1,
+            100,
+            Price { n: 1, d: 1 },
+            passive,
+            asset_a.clone(),
+            asset_b.clone(),
+        );
+        let bid = make_offer_entry_with_assets(
+            2,
+            100,
+            Price { n: 1, d: 1 },
+            0,
+            asset_b.clone(),
+            asset_a.clone(),
+        );
+        let changes = make_changes(vec![ask.clone(), bid.clone()]);
+        let full_entries = vec![ask, bid];
+
+        let mut ctx = make_ctx(&prev, &curr, &changes);
+        ctx.full_entries = Some(&full_entries);
+
+        let inv = OrderBookIsNotCrossed;
+        assert!(inv.check(&ctx).is_ok());
     }
 
     #[test]

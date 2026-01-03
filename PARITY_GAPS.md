@@ -92,8 +92,7 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 ## Invariants
 
 ### Functional Gaps
-- Partial parity: added ledger seq bounds, account sequence/signers/flags/home_domain/ext/num_sub_entries checks; trustline asset/limit/flags/extensions; offer assets/validity/flags; claimable balance sponsorship/asset/predicate/flag checks; data name validation; liquidity pool parameter/sponsorship checks; contract code hash validation; sponsorship count checks; account subentries count checks; and a ledger-close constant product check with pool-share decrease exemption. Full invariant set parity still missing (bucket/ledger/db, order book, liabilities, events, op-level constant product semantics, etc.).
-- Replay invariant failure handling parity (strict vs non-strict, reporting behavior).
+- Partial parity: added ledger seq bounds, account sequence/signers/flags/home_domain/ext/num_sub_entries checks; trustline asset/limit/flags/extensions; offer assets/validity/flags; claimable balance sponsorship/asset/predicate/flag checks; data name validation; liquidity pool parameter/sponsorship checks; contract code hash validation; sponsorship count checks; account subentries count checks; liabilities vs offer deltas; order book crossed checks at ledger-close; and a ledger-close constant product check with pool-share decrease exemption. Full invariant set parity still missing (bucket/ledger/db, op-level liabilities/constant product semantics, events, etc.).
 
 ### Testing Gaps
 - Full invariant coverage tests and replay failure regression tests.

@@ -34,6 +34,7 @@ use stellar_core_db::Database;
 use stellar_core_invariant::{
     BucketListHashMatchesHeader, CloseTimeNondecreasing, ConservationOfLumens, InvariantContext,
     InvariantManager, LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerSeqIncrement,
+    LiabilitiesMatchOffers, OrderBookIsNotCrossed,
 };
 use sha2::Digest;
 use stellar_core_ledger::TransactionSetVariant;
@@ -1308,6 +1309,8 @@ impl CatchupManager {
             }
             manager.add(ConservationOfLumens);
             manager.add(LedgerEntryIsValid);
+            manager.add(LiabilitiesMatchOffers);
+            manager.add(OrderBookIsNotCrossed);
             manager.add(LastModifiedLedgerSeqMatchesHeader);
             Some(manager)
         } else {
@@ -1327,6 +1330,7 @@ impl CatchupManager {
                 Some(&data.tx_results),
             )?;
             if let (Some(prev_header), Some(manager)) = (last_header.as_ref(), invariants.as_ref()) {
+                let full_entries = bucket_list.live_entries()?;
                 let bucket_list_hash = if let Some(hot_archive) = hot_archive_bucket_list {
                     let mut hasher = sha2::Sha256::new();
                     hasher.update(bucket_list.hash().as_bytes());
@@ -1345,6 +1349,7 @@ impl CatchupManager {
                     fee_pool_delta: result.fee_pool_delta,
                     total_coins_delta: result.total_coins_delta,
                     changes: &result.changes,
+                    full_entries: Some(&full_entries),
                 };
                 manager
                     .check_all(&ctx)

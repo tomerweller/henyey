@@ -10,7 +10,10 @@
 //! incremental updates while maintaining full history integrity.
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey};
+use std::collections::HashSet;
+use stellar_xdr::curr::{
+    BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits, WriteXdr,
+};
 
 use stellar_core_common::Hash256;
 
@@ -225,6 +228,47 @@ impl BucketList {
         }
 
         Ok(None)
+    }
+
+    /// Return all live entries as of the current bucket list state.
+    pub fn live_entries(&self) -> Result<Vec<LedgerEntry>> {
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut entries = Vec::new();
+
+        for level in &self.levels {
+            for bucket in [&level.curr, &level.snap] {
+                for entry in bucket.iter() {
+                    match entry {
+                        BucketEntry::Live(live) | BucketEntry::Init(live) => {
+                            let Some(key) = crate::entry::ledger_entry_to_key(&live) else {
+                                continue;
+                            };
+                            let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                                BucketError::Serialization(format!(
+                                    "failed to serialize ledger key: {}",
+                                    e
+                                ))
+                            })?;
+                            if seen.insert(key_bytes) {
+                                entries.push(live);
+                            }
+                        }
+                        BucketEntry::Dead(dead) => {
+                            let key_bytes = dead.to_xdr(Limits::none()).map_err(|e| {
+                                BucketError::Serialization(format!(
+                                    "failed to serialize ledger key: {}",
+                                    e
+                                ))
+                            })?;
+                            seen.insert(key_bytes);
+                        }
+                        BucketEntry::Metadata(_) => {}
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Check if an entry exists (is live) for the given key.
@@ -529,6 +573,22 @@ mod tests {
         } else {
             panic!("Expected Account entry");
         }
+    }
+
+    #[test]
+    fn test_live_entries_respects_deletes() {
+        let mut bl = BucketList::new();
+
+        let entry = make_account_entry([1u8; 32], 100);
+        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
+            .unwrap();
+
+        let dead = make_account_key([1u8; 32]);
+        bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![dead])
+            .unwrap();
+
+        let entries = bl.live_entries().unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]
