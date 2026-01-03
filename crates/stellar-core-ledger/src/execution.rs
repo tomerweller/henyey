@@ -25,18 +25,21 @@ use stellar_core_tx::{
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum4, AlphaNum12, Asset,
-    AssetCode, ClaimableBalanceEntry, ConfigSettingEntry, ConfigSettingId, ContractCostParams,
-    ContractEvent, CreateClaimableBalanceResult,
+    AssetCode, ClaimableBalanceEntry, ClaimableBalanceId, ConfigSettingEntry, ConfigSettingId,
+    ContractCostParams, ContractEvent, CreateClaimableBalanceResult,
     DataEntry, DiagnosticEvent, ExtensionPoint, Hash, InflationResult, LedgerEntry,
     LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey,
-    LedgerKeyConfigSetting, LiquidityPoolEntry, LiquidityPoolEntryBody, ManageBuyOfferResult,
-    ManageSellOfferResult, MuxedAccount, OfferEntry, Operation, OperationBody, OperationMetaV2,
+    LedgerKeyClaimableBalance, LedgerKeyConfigSetting, LedgerKeyLiquidityPool, LiquidityPoolEntry,
+    LiquidityPoolEntryBody,
+    ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation, OperationBody,
+    OperationMetaV2,
     OperationResult, OperationResultTr, PathPaymentStrictReceiveResult,
     PathPaymentStrictSendResult, Preconditions, ScAddress, SignerKey, SorobanTransactionMetaExt,
     SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
     TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultCode,
     TransactionResultExt, TransactionResultMetaV1, TransactionResultPair, TransactionResultResult,
-    TrustLineEntry, TrustLineFlags, VecM, WriteXdr, Limits, InnerTransactionResult,
+    TrustLineAsset, TrustLineEntry, TrustLineFlags, VecM, WriteXdr, Limits,
+    InnerTransactionResult, PoolId,
     InnerTransactionResultExt, InnerTransactionResultPair, InnerTransactionResultResult,
 };
 use tracing::{debug, info, warn};
@@ -483,6 +486,81 @@ impl TransactionExecutor {
         }
 
         Ok(false)
+    }
+
+    /// Load a claimable balance from the snapshot into the state manager.
+    pub fn load_claimable_balance(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        balance_id: &ClaimableBalanceId,
+    ) -> Result<bool> {
+        let key = stellar_xdr::curr::LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load a liquidity pool from the snapshot into the state manager.
+    pub fn load_liquidity_pool(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        pool_id: &PoolId,
+    ) -> Result<Option<LiquidityPoolEntry>> {
+        let key = stellar_xdr::curr::LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: pool_id.clone(),
+        });
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            let pool = match &entry.data {
+                LedgerEntryData::LiquidityPool(pool) => pool.clone(),
+                _ => return Ok(None),
+            };
+            self.state.load_entry(entry);
+            return Ok(Some(pool));
+        }
+        Ok(None)
+    }
+
+    fn load_liquidity_pool_dependencies(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        op_source: &AccountId,
+        pool_id: &PoolId,
+    ) -> Result<()> {
+        if let Some(pool) = self.load_liquidity_pool(snapshot, pool_id)? {
+            let pool_share_asset = TrustLineAsset::PoolShare(pool_id.clone());
+            self.load_trustline(snapshot, op_source, &pool_share_asset)?;
+
+            let load_asset_dependencies = |executor: &mut TransactionExecutor,
+                                           asset: &Asset,
+                                           source: &AccountId|
+             -> Result<()> {
+                if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                    executor.load_trustline(snapshot, source, &tl_asset)?;
+                }
+                match asset {
+                    Asset::CreditAlphanum4(a) => {
+                        executor.load_account(snapshot, &a.issuer)?;
+                    }
+                    Asset::CreditAlphanum12(a) => {
+                        executor.load_account(snapshot, &a.issuer)?;
+                    }
+                    Asset::Native => {}
+                }
+                Ok(())
+            };
+
+            match &pool.body {
+                LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                    load_asset_dependencies(self, &cp.params.asset_a, op_source)?;
+                    load_asset_dependencies(self, &cp.params.asset_b, op_source)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load a ledger entry from the snapshot into the state manager.
@@ -1353,6 +1431,12 @@ impl TransactionExecutor {
             OperationBody::BeginSponsoringFutureReserves(op_data) => {
                 self.load_account(snapshot, &op_data.sponsored_id)?;
             }
+            OperationBody::AllowTrust(op_data) => {
+                let asset = allow_trust_asset(op_data, &op_source);
+                if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
+                    self.load_trustline(snapshot, &op_data.trustor, &tl_asset)?;
+                }
+            }
             OperationBody::Payment(op_data) => {
                 let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
                 self.load_account(snapshot, &dest)?;
@@ -1365,10 +1449,41 @@ impl TransactionExecutor {
                 let dest = stellar_core_tx::muxed_to_account_id(dest);
                 self.load_account(snapshot, &dest)?;
             }
+            OperationBody::ClaimClaimableBalance(op_data) => {
+                self.load_claimable_balance(snapshot, &op_data.balance_id)?;
+            }
+            OperationBody::ClawbackClaimableBalance(op_data) => {
+                self.load_claimable_balance(snapshot, &op_data.balance_id)?;
+            }
             OperationBody::CreateClaimableBalance(op_data) => {
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
                     self.load_trustline(snapshot, &op_source, &tl_asset)?;
                 }
+            }
+            OperationBody::SetTrustLineFlags(op_data) => {
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
+                    self.load_trustline(snapshot, &op_data.trustor, &tl_asset)?;
+                }
+            }
+            OperationBody::Clawback(op_data) => {
+                let from_account = stellar_core_tx::muxed_to_account_id(&op_data.from);
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
+                    self.load_trustline(snapshot, &from_account, &tl_asset)?;
+                }
+            }
+            OperationBody::LiquidityPoolDeposit(op_data) => {
+                self.load_liquidity_pool_dependencies(
+                    snapshot,
+                    &op_source,
+                    &op_data.liquidity_pool_id,
+                )?;
+            }
+            OperationBody::LiquidityPoolWithdraw(op_data) => {
+                self.load_liquidity_pool_dependencies(
+                    snapshot,
+                    &op_source,
+                    &op_data.liquidity_pool_id,
+                )?;
             }
             _ => {
                 // Other operations typically work on source account

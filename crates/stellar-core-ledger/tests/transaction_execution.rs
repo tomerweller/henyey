@@ -6,17 +6,26 @@ use stellar_core_ledger::{LedgerSnapshot, SnapshotBuilder, SnapshotHandle};
 use stellar_core_tx::{soroban::SorobanConfig, ClassicEventConfig};
 use std::sync::Arc;
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, CreateAccountOp, CreateAccountResult,
+    AccountEntry, AccountEntryExt, AccountId, AllowTrustOp, AlphaNum4, Asset, AssetCode, AssetCode4,
+    ClawbackClaimableBalanceOp, ClawbackOp, ClaimClaimableBalanceOp, ClaimableBalanceEntry,
+    ClaimableBalanceEntryExt, ClaimableBalanceId, Claimant, ClaimantV0, ClaimPredicate,
+    CreateAccountOp, CreateAccountResult, SetTrustLineFlagsOp, CreateClaimableBalanceOp,
+    CreateClaimableBalanceResult, LiquidityPoolConstantProductParameters, LiquidityPoolDepositOp,
+    LiquidityPoolEntry, LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
+    LiquidityPoolWithdrawOp,
     BytesM, ContractCodeEntry, ContractCodeEntryExt, ContractEventBody, ContractId, ContractIdPreimage,
     DecoratedSignature, Duration, ExtendFootprintTtlOp, FeeBumpTransaction, FeeBumpTransactionEnvelope,
     FeeBumpTransactionInnerTx, Hash, HashIdPreimage, HashIdPreimageContractId, InnerTransactionResultPair,
-    Int128Parts, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerFootprint, LedgerKey, MuxedAccountMed25519,
-    LedgerKeyContractCode, LedgerKeyTtl, Memo, MuxedAccount, Operation, OperationBody, OperationResult,
-    OperationResultTr, Preconditions, PreconditionsV2, PublicKey, ScAddress, ScString, ScSymbol, ScVal,
-    SequenceNumber, Signature as XdrSignature, SignatureHint, SignerKey, SorobanResources,
+    Int128Parts, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerFootprint, LedgerKey,
+    LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyLiquidityPool, LedgerKeyTrustLine,
+    LedgerKeyTtl,
+    MuxedAccountMed25519, Memo, MuxedAccount, Operation, OperationBody, OperationResult,
+    OperationResultTr, Preconditions, PreconditionsV2, PublicKey, ScAddress, ScString, ScSymbol,
+    ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint, SignerKey, SorobanResources,
     SorobanTransactionData, SorobanTransactionDataExt, String32, StringM, Thresholds, TimeBounds,
-    TimePoint, Transaction, TransactionEnvelope, TransactionEventStage, TransactionExt, TransactionMeta,
-    TransactionResultResult, TransactionV1Envelope, TtlEntry, Uint256, VecM,
+    TimePoint, Transaction, TransactionEnvelope, TransactionEventStage, TransactionExt,
+    TransactionMeta, TransactionResultResult, TransactionV1Envelope, TrustLineAsset, TrustLineEntry,
+    TrustLineEntryExt, TrustLineFlags, TtlEntry, Uint256, VecM, PoolId, Price,
 };
 
 fn create_account_entry_with_last_modified(
@@ -53,6 +62,101 @@ fn create_account_entry(account_id: AccountId, seq_num: i64, balance: i64) -> (L
     create_account_entry_with_last_modified(account_id, seq_num, balance, 1)
 }
 
+fn create_account_entry_with_flags(
+    account_id: AccountId,
+    seq_num: i64,
+    balance: i64,
+    flags: u32,
+) -> (LedgerKey, LedgerEntry) {
+    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(seq_num),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    (key, entry)
+}
+
+fn create_trustline_entry(
+    account_id: AccountId,
+    asset: TrustLineAsset,
+    balance: i64,
+    limit: i64,
+    flags: u32,
+) -> (LedgerKey, LedgerEntry) {
+    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: account_id.clone(),
+        asset: asset.clone(),
+    });
+
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Trustline(TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    (key, entry)
+}
+
+fn create_liquidity_pool_entry(
+    pool_id: PoolId,
+    asset_a: Asset,
+    asset_b: Asset,
+    reserve_a: i64,
+    reserve_b: i64,
+    total_shares: i64,
+    share_trustline_count: i64,
+) -> (LedgerKey, LedgerEntry) {
+    let key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+        liquidity_pool_id: pool_id.clone(),
+    });
+
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::LiquidityPool(LiquidityPoolEntry {
+            liquidity_pool_id: pool_id,
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: LiquidityPoolConstantProductParameters {
+                        asset_a,
+                        asset_b,
+                        fee: 30,
+                    },
+                    reserve_a,
+                    reserve_b,
+                    total_pool_shares: total_shares,
+                    pool_shares_trust_line_count: share_trustline_count,
+                },
+            ),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    (key, entry)
+}
+
 fn sign_envelope(envelope: &TransactionEnvelope, secret: &SecretKey, network_id: &NetworkId) -> DecoratedSignature {
     let frame = stellar_core_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
     let hash = frame.hash(network_id).expect("tx hash");
@@ -77,6 +181,34 @@ fn i128_parts(value: i128) -> Int128Parts {
 
 fn scval_symbol(sym: &str) -> ScVal {
     ScVal::Symbol(ScSymbol(StringM::try_from(sym).unwrap()))
+}
+
+fn account_id_to_strkey(account_id: &AccountId) -> String {
+    match &account_id.0 {
+        PublicKey::PublicKeyTypeEd25519(key) => stellar_core_crypto::encode_account_id(&key.0),
+    }
+}
+
+fn asset_code_to_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn asset_string_scval(asset: &Asset) -> ScVal {
+    let asset_str = match asset {
+        Asset::Native => "native".to_string(),
+        Asset::CreditAlphanum4(a) => format!(
+            "{}:{}",
+            asset_code_to_string(&a.asset_code.0),
+            account_id_to_strkey(&a.issuer)
+        ),
+        Asset::CreditAlphanum12(a) => format!(
+            "{}:{}",
+            asset_code_to_string(&a.asset_code.0),
+            account_id_to_strkey(&a.issuer)
+        ),
+    };
+    ScVal::String(ScString(StringM::try_from(asset_str).unwrap()))
 }
 
 fn native_asset_contract_id(network_id: &NetworkId) -> ContractId {
@@ -1065,6 +1197,1147 @@ fn test_classic_events_payment_memo_precedence() {
         .find(|entry| entry.key == scval_symbol("to_muxed_id"))
         .expect("muxed entry");
     assert_eq!(muxed_entry.val, ScVal::U64(77));
+}
+
+#[test]
+fn test_classic_events_emitted_for_account_merge() {
+    let secret = SecretKey::from_seed(&[71u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([10u8; 32])));
+
+    let source_balance = 20_000_000;
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, source_balance);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 1_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(dest_key, dest_entry)
+        .expect("add dest")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([10u8; 32]))),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 4);
+    assert_eq!(op_topics[0], scval_symbol("transfer"));
+    assert_eq!(op_topics[1], ScVal::Address(ScAddress::Account(source_id.clone())));
+    assert_eq!(op_topics[2], ScVal::Address(ScAddress::Account(dest_id.clone())));
+    assert_eq!(
+        op_topics[3],
+        ScVal::String(ScString(StringM::try_from("native").unwrap()))
+    );
+    assert_eq!(
+        op_body.data,
+        ScVal::I128(i128_parts(i128::from(source_balance - 100)))
+    );
+}
+
+#[test]
+fn test_classic_events_emitted_for_create_account() {
+    let secret = SecretKey::from_seed(&[81u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([11u8; 32])));
+
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 200_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 20_000_000,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 4);
+    assert_eq!(op_topics[0], scval_symbol("transfer"));
+    assert_eq!(op_topics[1], ScVal::Address(ScAddress::Account(source_id.clone())));
+    assert_eq!(op_topics[2], ScVal::Address(ScAddress::Account(dest_id.clone())));
+    assert_eq!(
+        op_topics[3],
+        ScVal::String(ScString(StringM::try_from("native").unwrap()))
+    );
+    assert_eq!(
+        op_body.data,
+        ScVal::I128(i128_parts(20_000_000))
+    );
+}
+
+#[test]
+fn test_classic_events_emitted_for_create_claimable_balance() {
+    let secret = SecretKey::from_seed(&[91u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let claimant_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([12u8; 32])));
+
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 200_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+        destination: claimant_id,
+        predicate: ClaimPredicate::Unconditional,
+    });
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateClaimableBalance(CreateClaimableBalanceOp {
+            asset: Asset::Native,
+            amount: 20_000_000,
+            claimants: vec![claimant].try_into().unwrap(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let balance_id = match result
+        .operation_results
+        .get(0)
+        .expect("operation result")
+    {
+        OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(
+            CreateClaimableBalanceResult::Success(balance_id),
+        )) => balance_id.clone(),
+        other => panic!("unexpected result: {:?}", other),
+    };
+
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 4);
+    assert_eq!(op_topics[0], scval_symbol("transfer"));
+    assert_eq!(op_topics[1], ScVal::Address(ScAddress::Account(source_id.clone())));
+    assert_eq!(
+        op_topics[2],
+        ScVal::Address(ScAddress::ClaimableBalance(balance_id.clone()))
+    );
+    assert_eq!(
+        op_topics[3],
+        ScVal::String(ScString(StringM::try_from("native").unwrap()))
+    );
+    assert_eq!(
+        op_body.data,
+        ScVal::I128(i128_parts(20_000_000))
+    );
+}
+
+#[test]
+fn test_classic_events_emitted_for_claim_claimable_balance() {
+    let secret = SecretKey::from_seed(&[92u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([13u8; 32]));
+
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 20_000_000);
+    let claimants: VecM<Claimant, 10> = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+        destination: source_id.clone(),
+        predicate: ClaimPredicate::Unconditional,
+    })]
+    .try_into()
+    .unwrap();
+    let claimable_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ClaimableBalance(ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants,
+            asset: Asset::Native,
+            amount: 20_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let claimable_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: balance_id.clone(),
+    });
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(claimable_key, claimable_entry)
+        .expect("add claimable balance")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 4);
+    assert_eq!(op_topics[0], scval_symbol("transfer"));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::ClaimableBalance(balance_id.clone()))
+    );
+    assert_eq!(op_topics[2], ScVal::Address(ScAddress::Account(source_id.clone())));
+    assert_eq!(
+        op_topics[3],
+        ScVal::String(ScString(StringM::try_from("native").unwrap()))
+    );
+    assert_eq!(
+        op_body.data,
+        ScVal::I128(i128_parts(20_000_000))
+    );
+}
+
+#[test]
+fn test_classic_events_emitted_for_allow_trust() {
+    let issuer_secret = SecretKey::from_seed(&[93u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+    let trustor_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([14u8; 32])));
+
+    let asset_code = AssetCode4([b'U', b'S', b'D', 0]);
+    let asset = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+    let trustline_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+
+    let (issuer_key, issuer_entry) =
+        create_account_entry_with_flags(issuer_id.clone(), 1, 50_000_000, 0x1);
+    let (trustor_key, trustor_entry) = create_account_entry(trustor_id.clone(), 1, 20_000_000);
+    let (trustline_key, trustline_entry) =
+        create_trustline_entry(trustor_id.clone(), trustline_asset, 0, 100_000_000, 0);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(trustor_key, trustor_entry)
+        .expect("add trustor")
+        .add_entry(trustline_key, trustline_entry)
+        .expect("add trustline")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::AllowTrust(AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(asset_code.clone()),
+            authorize: 1,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*issuer_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &issuer_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 3);
+    assert_eq!(op_topics[0], scval_symbol("set_authorized"));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::Account(trustor_id.clone()))
+    );
+    assert_eq!(op_topics[2], asset_string_scval(&asset));
+    assert_eq!(op_body.data, ScVal::Bool(true));
+}
+
+#[test]
+fn test_classic_events_emitted_for_set_trustline_flags() {
+    let issuer_secret = SecretKey::from_seed(&[94u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+    let trustor_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([15u8; 32])));
+
+    let asset_code = AssetCode4([b'U', b'S', b'D', 0]);
+    let asset = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+    let trustline_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 50_000_000);
+    let (trustor_key, trustor_entry) = create_account_entry(trustor_id.clone(), 1, 20_000_000);
+    let (trustline_key, trustline_entry) =
+        create_trustline_entry(trustor_id.clone(), trustline_asset, 0, 100_000_000, 0);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(trustor_key, trustor_entry)
+        .expect("add trustor")
+        .add_entry(trustline_key, trustline_entry)
+        .expect("add trustline")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::SetTrustLineFlags(SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset.clone(),
+            clear_flags: 0,
+            set_flags: TrustLineFlags::AuthorizedFlag as u32,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*issuer_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &issuer_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 3);
+    assert_eq!(op_topics[0], scval_symbol("set_authorized"));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::Account(trustor_id.clone()))
+    );
+    assert_eq!(op_topics[2], asset_string_scval(&asset));
+    assert_eq!(op_body.data, ScVal::Bool(true));
+}
+
+#[test]
+fn test_classic_events_emitted_for_clawback() {
+    let issuer_secret = SecretKey::from_seed(&[95u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+    let trustor_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([16u8; 32])));
+
+    let asset_code = AssetCode4([b'U', b'S', b'D', 0]);
+    let asset = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+    let trustline_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+
+    let (issuer_key, issuer_entry) =
+        create_account_entry_with_flags(issuer_id.clone(), 1, 50_000_000, 0x8);
+    let (trustor_key, trustor_entry) = create_account_entry(trustor_id.clone(), 1, 20_000_000);
+    let (trustline_key, trustline_entry) =
+        create_trustline_entry(trustor_id.clone(), trustline_asset, 50_000_000, 100_000_000, 0);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(trustor_key, trustor_entry)
+        .expect("add trustor")
+        .add_entry(trustline_key, trustline_entry)
+        .expect("add trustline")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Clawback(ClawbackOp {
+            asset: asset.clone(),
+            from: MuxedAccount::Ed25519(Uint256([16u8; 32])),
+            amount: 20_000_000,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*issuer_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &issuer_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 3);
+    assert_eq!(op_topics[0], scval_symbol("clawback"));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::Account(trustor_id.clone()))
+    );
+    assert_eq!(op_topics[2], asset_string_scval(&asset));
+    assert_eq!(
+        op_body.data,
+        ScVal::I128(i128_parts(20_000_000))
+    );
+}
+
+#[test]
+fn test_classic_events_emitted_for_clawback_claimable_balance() {
+    let issuer_secret = SecretKey::from_seed(&[96u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+    let claimant_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([17u8; 32])));
+    let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([18u8; 32]));
+
+    let asset_code = AssetCode4([b'U', b'S', b'D', 0]);
+    let asset = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+
+    let (issuer_key, issuer_entry) =
+        create_account_entry_with_flags(issuer_id.clone(), 1, 50_000_000, 0x8);
+
+    let claimants: VecM<Claimant, 10> = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+        destination: claimant_id,
+        predicate: ClaimPredicate::Unconditional,
+    })]
+    .try_into()
+    .unwrap();
+    let claimable_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ClaimableBalance(ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants,
+            asset: asset.clone(),
+            amount: 20_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let claimable_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: balance_id.clone(),
+    });
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(claimable_key, claimable_entry)
+        .expect("add claimable balance")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::ClawbackClaimableBalance(ClawbackClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*issuer_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &issuer_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 1);
+    let op_event = &op_event_list[0];
+    let ContractEventBody::V0(op_body) = &op_event.body;
+    let op_topics: &[ScVal] = op_body.topics.as_ref();
+    assert_eq!(op_topics.len(), 3);
+    assert_eq!(op_topics[0], scval_symbol("clawback"));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::ClaimableBalance(balance_id.clone()))
+    );
+    assert_eq!(op_topics[2], asset_string_scval(&asset));
+    assert_eq!(
+        op_body.data,
+        ScVal::I128(i128_parts(20_000_000))
+    );
+}
+
+#[test]
+fn test_classic_events_emitted_for_liquidity_pool_deposit() {
+    let source_secret = SecretKey::from_seed(&[97u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+    let issuer_secret = SecretKey::from_seed(&[18u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+
+    let asset_a = Asset::Native;
+    let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+        issuer: issuer_id.clone(),
+    });
+
+    let pool_id = PoolId(Hash([19u8; 32]));
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 500_000_000);
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
+    let (pool_key, pool_entry) = create_liquidity_pool_entry(
+        pool_id.clone(),
+        asset_a.clone(),
+        asset_b.clone(),
+        0,
+        0,
+        0,
+        1,
+    );
+    let (asset_b_key, asset_b_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_b {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        50_000_000,
+        100_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+    let (pool_share_key, pool_share_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::PoolShare(pool_id.clone()),
+        0,
+        100_000_000,
+        0,
+    );
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(pool_key, pool_entry)
+        .expect("add pool")
+        .add_entry(asset_b_key, asset_b_entry)
+        .expect("add trustline")
+        .add_entry(pool_share_key, pool_share_entry)
+        .expect("add pool share")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::LiquidityPoolDeposit(LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id.clone(),
+            max_amount_a: 10_000_000,
+            max_amount_b: 20_000_000,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 1, d: 2 },
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 2);
+
+    let pool_address = ScAddress::LiquidityPool(pool_id.clone());
+
+    let first_event = &op_event_list[0];
+    let ContractEventBody::V0(first_body) = &first_event.body;
+    let first_topics: &[ScVal] = first_body.topics.as_ref();
+    assert_eq!(first_topics.len(), 4);
+    assert_eq!(first_topics[0], scval_symbol("transfer"));
+    assert_eq!(
+        first_topics[1],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
+    assert_eq!(first_topics[2], ScVal::Address(pool_address.clone()));
+    assert_eq!(first_topics[3], asset_string_scval(&asset_a));
+    assert_eq!(
+        first_body.data,
+        ScVal::I128(i128_parts(10_000_000))
+    );
+
+    let second_event = &op_event_list[1];
+    let ContractEventBody::V0(second_body) = &second_event.body;
+    let second_topics: &[ScVal] = second_body.topics.as_ref();
+    assert_eq!(second_topics.len(), 4);
+    assert_eq!(second_topics[0], scval_symbol("transfer"));
+    assert_eq!(
+        second_topics[1],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
+    assert_eq!(second_topics[2], ScVal::Address(pool_address));
+    assert_eq!(second_topics[3], asset_string_scval(&asset_b));
+    assert_eq!(
+        second_body.data,
+        ScVal::I128(i128_parts(20_000_000))
+    );
+}
+
+#[test]
+fn test_classic_events_emitted_for_liquidity_pool_withdraw() {
+    let source_secret = SecretKey::from_seed(&[98u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+    let issuer_secret = SecretKey::from_seed(&[19u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+
+    let asset_a = Asset::Native;
+    let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'E', b'U', b'R', 0]),
+        issuer: issuer_id.clone(),
+    });
+
+    let pool_id = PoolId(Hash([20u8; 32]));
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 500_000_000);
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
+    let (pool_key, pool_entry) = create_liquidity_pool_entry(
+        pool_id.clone(),
+        asset_a.clone(),
+        asset_b.clone(),
+        50_000_000,
+        100_000_000,
+        100_000_000,
+        1,
+    );
+    let (asset_b_key, asset_b_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_b {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        0,
+        200_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+    let (pool_share_key, pool_share_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::PoolShare(pool_id.clone()),
+        20_000_000,
+        100_000_000,
+        0,
+    );
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(pool_key, pool_entry)
+        .expect("add pool")
+        .add_entry(asset_b_key, asset_b_entry)
+        .expect("add trustline")
+        .add_entry(pool_share_key, pool_share_entry)
+        .expect("add pool share")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::LiquidityPoolWithdraw(LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id.clone(),
+            amount: 10_000_000,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert!(result.success);
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("unexpected tx meta");
+    };
+
+    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    assert_eq!(op_events.len(), 1);
+    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    assert_eq!(op_event_list.len(), 2);
+
+    let pool_address = ScAddress::LiquidityPool(pool_id.clone());
+
+    let first_event = &op_event_list[0];
+    let ContractEventBody::V0(first_body) = &first_event.body;
+    let first_topics: &[ScVal] = first_body.topics.as_ref();
+    assert_eq!(first_topics.len(), 4);
+    assert_eq!(first_topics[0], scval_symbol("transfer"));
+    assert_eq!(first_topics[1], ScVal::Address(pool_address.clone()));
+    assert_eq!(
+        first_topics[2],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
+    assert_eq!(first_topics[3], asset_string_scval(&asset_a));
+    assert_eq!(first_body.data, ScVal::I128(i128_parts(5_000_000)));
+
+    let second_event = &op_event_list[1];
+    let ContractEventBody::V0(second_body) = &second_event.body;
+    let second_topics: &[ScVal] = second_body.topics.as_ref();
+    assert_eq!(second_topics.len(), 4);
+    assert_eq!(second_topics[0], scval_symbol("transfer"));
+    assert_eq!(second_topics[1], ScVal::Address(pool_address));
+    assert_eq!(
+        second_topics[2],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
+    assert_eq!(second_topics[3], asset_string_scval(&asset_b));
+    assert_eq!(second_body.data, ScVal::I128(i128_parts(10_000_000)));
 }
 
 #[test]
