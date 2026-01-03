@@ -4,14 +4,14 @@ use std::collections::HashMap;
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
-    AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountId, Asset, ClaimableBalanceEntry,
-    ClaimableBalanceId,
-    ContractCodeEntry, ContractDataDurability, ContractDataEntry, DataEntry, Hash, LedgerEntry,
-    LedgerEntryData, LedgerEntryExt, LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext, LedgerKey,
-    LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyContractData,
-    LedgerKeyData, LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl,
-    Liabilities, LiquidityPoolEntry, OfferEntry, PoolId, Price, PublicKey, ScAddress, ScVal,
-    SponsorshipDescriptor, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
+    AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, AccountId, Asset,
+    ClaimableBalanceEntry, ClaimableBalanceId, ContractCodeEntry, ContractDataDurability,
+    ContractDataEntry, DataEntry, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext, LedgerKey, LedgerKeyAccount,
+    LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyData,
+    LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl, Liabilities,
+    LiquidityPoolEntry, OfferEntry, PoolId, Price, PublicKey, ScAddress, ScVal, SponsorshipDescriptor,
+    TimePoint, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
 };
 
 use crate::apply::LedgerDelta;
@@ -228,6 +228,7 @@ impl LedgerStateManager {
         }
         Ok((self.ledger_seq as i64) << 32)
     }
+
 
     /// Calculate the minimum balance required for an account.
     pub fn minimum_balance_for_account(
@@ -1914,6 +1915,120 @@ impl LedgerStateManager {
         self.modified_liquidity_pools.clear();
     }
 
+    /// Record updates for mutated entries into the delta and clear modification tracking.
+    ///
+    /// This is needed for operations that mutate entries through `get_*_mut`,
+    /// which do not call `record_update` directly.
+    pub fn flush_modified_entries(&mut self) {
+        let modified_accounts = std::mem::take(&mut self.modified_accounts);
+        for key in modified_accounts {
+            if let Some(snapshot) = self.account_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.accounts.get(&key) {
+                        let ledger_entry = self.account_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_trustlines = std::mem::take(&mut self.modified_trustlines);
+        for key in modified_trustlines {
+            if let Some(snapshot) = self.trustline_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.trustlines.get(&key) {
+                        let ledger_entry = self.trustline_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_offers = std::mem::take(&mut self.modified_offers);
+        for key in modified_offers {
+            if let Some(snapshot) = self.offer_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.offers.get(&key) {
+                        let ledger_entry = self.offer_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_data = std::mem::take(&mut self.modified_data);
+        for key in modified_data {
+            if let Some(snapshot) = self.data_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.data_entries.get(&key) {
+                        let ledger_entry = self.data_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_contract_data = std::mem::take(&mut self.modified_contract_data);
+        for key in modified_contract_data {
+            if let Some(snapshot) = self.contract_data_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.contract_data.get(&key) {
+                        let ledger_entry = self.contract_data_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_contract_code = std::mem::take(&mut self.modified_contract_code);
+        for key in modified_contract_code {
+            if let Some(snapshot) = self.contract_code_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.contract_code.get(&key) {
+                        let ledger_entry = self.contract_code_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_ttl = std::mem::take(&mut self.modified_ttl);
+        for key in modified_ttl {
+            if let Some(snapshot) = self.ttl_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.ttl_entries.get(&key) {
+                        let ledger_entry = self.ttl_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_claimable_balances = std::mem::take(&mut self.modified_claimable_balances);
+        for key in modified_claimable_balances {
+            if let Some(snapshot) = self.claimable_balance_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.claimable_balances.get(&key) {
+                        let ledger_entry = self.claimable_balance_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+
+        let modified_liquidity_pools = std::mem::take(&mut self.modified_liquidity_pools);
+        for key in modified_liquidity_pools {
+            if let Some(snapshot) = self.liquidity_pool_snapshots.get(&key) {
+                if snapshot.is_some() {
+                    if let Some(entry) = self.liquidity_pools.get(&key) {
+                        let ledger_entry = self.liquidity_pool_to_ledger_entry(entry);
+                        self.delta.record_update(ledger_entry);
+                    }
+                }
+            }
+        }
+    }
+
     // ==================== Helper Methods ====================
 
     /// Convert an AccountEntry to a LedgerEntry.
@@ -2135,6 +2250,25 @@ pub(crate) fn ensure_account_ext_v2(account: &mut AccountEntry) -> &mut AccountE
     }
 
     unreachable!("account ext v2 should exist after ensure_account_ext_v2")
+}
+
+/// Update sequence metadata when an account's sequence number changes.
+pub fn update_account_seq_info(account: &mut AccountEntry, ledger_seq: u32, close_time: u64) {
+    let ext_v2 = ensure_account_ext_v2(account);
+    let seq_time = TimePoint(close_time);
+    match &mut ext_v2.ext {
+        AccountEntryExtensionV2Ext::V0 => {
+            ext_v2.ext = AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
+                ext: ExtensionPoint::V0,
+                seq_ledger: ledger_seq,
+                seq_time,
+            });
+        }
+        AccountEntryExtensionV2Ext::V3(v3) => {
+            v3.seq_ledger = ledger_seq;
+            v3.seq_time = seq_time;
+        }
+    }
 }
 
 fn build_signer_sponsoring_ids(count: usize) -> VecM<SponsorshipDescriptor, 20> {

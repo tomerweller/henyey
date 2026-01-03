@@ -14,7 +14,7 @@ pub fn execute_bump_sequence(
     op: &BumpSequenceOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     if op.bump_to.0 < 0 {
         return Ok(make_result(BumpSequenceResultCode::BadSeq));
@@ -28,6 +28,7 @@ pub fn execute_bump_sequence(
     // Only bump if new sequence is higher
     if op.bump_to.0 > source_account.seq_num.0 {
         source_account.seq_num.0 = op.bump_to.0;
+        crate::state::update_account_seq_info(source_account, context.sequence, context.close_time);
     }
 
     Ok(make_result(BumpSequenceResultCode::Success))

@@ -95,6 +95,7 @@ pub fn execute_create_account(
     };
 
     let mut new_account = new_account;
+    crate::state::update_account_seq_info(&mut new_account, context.sequence, context.close_time);
     if let Some(sponsor) = sponsor {
         let ledger_key = LedgerKey::Account(LedgerKeyAccount {
             account_id: op.destination.clone(),

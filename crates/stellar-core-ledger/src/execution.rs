@@ -235,10 +235,8 @@ impl TransactionExecutor {
         });
 
         if let Some(entry) = snapshot.get_entry(&key)? {
-            if let LedgerEntryData::Account(account) = entry.data {
-                self.state.create_account(account);
-                return Ok(true);
-            }
+            self.state.load_entry(entry);
+            return Ok(true);
         }
 
         Ok(false)
@@ -265,10 +263,8 @@ impl TransactionExecutor {
         });
 
         if let Some(entry) = snapshot.get_entry(&key)? {
-            if let LedgerEntryData::Trustline(trustline) = entry.data {
-                self.state.create_trustline(trustline);
-                return Ok(true);
-            }
+            self.state.load_entry(entry);
+            return Ok(true);
         }
 
         Ok(false)
@@ -672,8 +668,10 @@ impl TransactionExecutor {
         }
         if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
             acc.seq_num.0 += 1;
+            stellar_core_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
         }
 
+        self.state.flush_modified_entries();
         let delta_after_fee = delta_snapshot(&self.state);
         let (fee_created, fee_updated, fee_deleted) =
             delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
@@ -732,6 +730,7 @@ impl TransactionExecutor {
 
             match result {
                 Ok(op_exec) => {
+                    self.state.flush_modified_entries();
                     let op_result = op_exec.result;
                     // Check if operation succeeded
                     if !is_operation_success(&op_result) {
@@ -770,10 +769,6 @@ impl TransactionExecutor {
                 }
             }
 
-            // If operation failed and this is a required operation, stop
-            if !all_success {
-                break;
-            }
         }
 
         if all_success
@@ -785,10 +780,17 @@ impl TransactionExecutor {
         }
 
         if !all_success {
-            let remaining = frame.operations().len().saturating_sub(operation_results.len());
-            if remaining > 0 {
-                operation_results.extend(std::iter::repeat(OperationResult::OpNotSupported).take(remaining));
-            }
+            let tx_hash = frame
+                .hash(&self.network_id)
+                .map(|hash| hash.to_hex())
+                .unwrap_or_else(|_| "unknown".to_string());
+            warn!(
+                tx_hash = %tx_hash,
+                fee_source = ?fee_source_id,
+                inner_source = ?inner_source_id,
+                results = ?operation_results,
+                "Transaction failed; rolling back changes"
+            );
             self.state.rollback();
             restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
             op_changes = vec![empty_entry_changes(); frame.operations().len()];
