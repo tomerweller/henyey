@@ -15,10 +15,17 @@
 //! 2. Load the contract WASM and invoke functions via soroban-env-host
 //! 3. Capture state changes and events
 //! 4. Apply changes back to our ledger state
+//!
+//! ## Protocol Versioning
+//!
+//! The `protocol` submodule provides protocol-versioned host implementations.
+//! Each protocol version uses the exact same soroban-env-host version as
+//! C++ stellar-core to ensure deterministic replay.
 
 mod budget;
 mod events;
 mod host;
+pub mod protocol;
 mod storage;
 
 pub use budget::{SorobanBudget, SorobanConfig, ResourceLimits};

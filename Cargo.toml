@@ -29,12 +29,19 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Stellar official crates
-# NOTE: Testnet is on protocol 24, so we use stellar-xdr 24 and soroban-env-host 24 for compatibility.
-# When testnet upgrades to protocol 25, update these to version 25.
+# We support multiple protocol versions by including multiple soroban-env-host versions.
+# Each host version is labeled with the MAXIMUM protocol it supports.
 stellar-xdr = { version = "24.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
 stellar-strkey = "0.0.11"
-soroban-env-host = "24"
-soroban-env-common = "24"
+
+# Soroban host for Protocol 24 (supports protocols 20-24)
+# Using exact git revision from stellar-core for deterministic replay
+soroban-env-host-p24 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
+soroban-env-common-p24 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
+
+# Keep the simple name for backward compatibility (currently points to p24)
+soroban-env-host = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
+soroban-env-common = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
 
 # Workspace crates
 stellar-core-common = { path = "crates/stellar-core-common" }
