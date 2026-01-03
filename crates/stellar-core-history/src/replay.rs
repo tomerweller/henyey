@@ -212,6 +212,10 @@ pub fn replay_ledger_with_execution(
     } else {
         None
     };
+    let classic_events = stellar_core_tx::ClassicEventConfig {
+        emit_classic_events: config.emit_classic_events,
+        backfill_stellar_asset_events: config.backfill_stellar_asset_events,
+    };
     let (results, tx_results, _tx_result_metas, _total_fees) = execute_transaction_set(
         &snapshot,
         &transactions,
@@ -224,6 +228,7 @@ pub fn replay_ledger_with_execution(
         &mut delta,
         soroban_config,
         soroban_base_prng_seed.0,
+        classic_events,
         op_invariants,
     )
     .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
@@ -766,6 +771,8 @@ mod tests {
             verify_results: false, // Skip verification for test
             verify_bucket_list: false,
             verify_invariants: false,
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
         };
 
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config).unwrap();
@@ -887,6 +894,8 @@ mod tests {
             verify_results: false,
             verify_bucket_list: true,
             verify_invariants: false,
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
         };
 
         let result = replay_ledger_with_execution(
@@ -913,6 +922,8 @@ mod tests {
             verify_results: true,
             verify_bucket_list: false,
             verify_invariants: false,
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
         };
 
         let result = replay_ledger_with_execution(
@@ -942,6 +953,8 @@ mod tests {
             verify_results: true,
             verify_bucket_list: false,
             verify_invariants: false,
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
         };
 
         let result = replay_ledger_with_execution(

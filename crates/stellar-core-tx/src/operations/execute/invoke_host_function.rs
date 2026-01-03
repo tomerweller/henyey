@@ -255,7 +255,7 @@ fn build_soroban_operation_meta(
     let events = result.contract_events.clone();
 
     // Build diagnostic events from the contract events
-    let diagnostic_events: Vec<DiagnosticEvent> = events.iter()
+    let mut diagnostic_events: Vec<DiagnosticEvent> = events.iter()
         .map(|event| DiagnosticEvent {
             in_successful_contract_call: true,
             event: event.clone(),

@@ -2,7 +2,7 @@
 //!
 //! Tracks CPU instructions and memory usage for contract execution.
 
-use soroban_env_host::fees::{FeeConfiguration, RentFeeConfiguration};
+pub use soroban_env_host::fees::{FeeConfiguration, RentFeeConfiguration};
 use stellar_xdr::curr::ContractCostParams;
 
 /// Soroban network configuration for contract execution.

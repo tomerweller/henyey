@@ -35,6 +35,8 @@ pub struct SorobanExecutionResult {
     pub return_value: ScVal,
     /// Storage changes made during execution.
     pub storage_changes: Vec<StorageChange>,
+    /// Contract and system events emitted during execution.
+    pub contract_events: Vec<stellar_xdr::curr::ContractEvent>,
     /// Events emitted during execution.
     pub events: Events,
     /// Diagnostic events emitted during execution.
@@ -478,7 +480,7 @@ pub fn execute_host_function(
         }
     }
 
-    let host_events = contract_events
+    let host_events: Vec<soroban_env_host::events::HostEvent> = contract_events
         .into_iter()
         .map(|event| soroban_env_host::events::HostEvent {
             event,
@@ -524,6 +526,10 @@ pub fn execute_host_function(
     Ok(SorobanExecutionResult {
         return_value,
         storage_changes,
+        contract_events: host_events
+            .iter()
+            .map(|event| event.event.clone())
+            .collect(),
         events: Events(host_events),
         diagnostic_events,
         cpu_insns,

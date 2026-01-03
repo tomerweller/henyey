@@ -1546,6 +1546,8 @@ impl CatchupManagerBuilder {
             verify_results: self.options.verify_headers,
             verify_bucket_list: self.options.verify_buckets,
             verify_invariants: true,
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
         };
 
         Ok(manager)
