@@ -129,6 +129,17 @@ fn execute_contract_invocation(
             ))
         }
         Err(host_error) => {
+            // Print detailed error info to help debug
+            eprintln!(
+                "=== SOROBAN EXECUTION FAILED ===\n\
+                 Error: {:?}\n\
+                 Host function: {:?}\n\
+                 Ledger: {}\n\
+                 =================================",
+                host_error,
+                &op.host_function,
+                context.sequence
+            );
             tracing::warn!(
                 error = %host_error,
                 "Soroban contract execution failed"

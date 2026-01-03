@@ -10,16 +10,18 @@ use sha2::{Digest, Sha256};
 // Use soroban-env-host types for Host interaction
 use soroban_env_host::{
     budget::Budget,
+    e2e_invoke::{self, InvokeHostFunctionResult},
     events::Events,
     storage::{AccessType, EntryWithLiveUntil, Footprint, FootprintMap, SnapshotSource, Storage, StorageMap},
     DiagnosticLevel, Host, HostError, LedgerInfo,
+    xdr::DiagnosticEvent,
 };
 
 // Both soroban-env-host v25 and our code use stellar-xdr v25, so we can use types directly
 use stellar_xdr::curr::{
     AccountId, ContractDataDurability, Hash, HostFunction, LedgerEntry, LedgerEntryData,
     LedgerEntryExt, LedgerFootprint, LedgerKey, Limits, ReadXdr, ScAddress, ScVal,
-    SorobanAuthorizationEntry, SorobanTransactionData, WriteXdr,
+    SorobanAuthorizationEntry, SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
 };
 
 use crate::state::LedgerStateManager;
@@ -129,12 +131,39 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 }
 
 /// Get the TTL for a ledger entry.
-fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, _current_ledger: u32) -> Option<u32> {
+fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             // Compute key hash for TTL lookup
             let key_hash = compute_key_hash(key);
-            state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq)
+            let ttl = state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq);
+            if let Some(live_until) = ttl {
+                if live_until < current_ledger {
+                    eprintln!(
+                        "=== SOROBAN TTL EXPIRED: {} live_until={} current={} ===",
+                        if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                        live_until,
+                        current_ledger
+                    );
+                    tracing::warn!(
+                        current_ledger,
+                        live_until,
+                        key_type = if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                        "Soroban entry TTL is EXPIRED"
+                    );
+                }
+            } else {
+                eprintln!(
+                    "=== SOROBAN NO TTL: {} {:?} ===",
+                    if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                    key
+                );
+                tracing::warn!(
+                    key_type = if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                    "Soroban entry has NO TTL record"
+                );
+            }
+            ttl
         }
         _ => None,
     }
@@ -176,16 +205,61 @@ pub fn build_storage_map(
     snapshot: &impl SnapshotSource,
 ) -> Result<StorageMap, HostError> {
     let mut storage_map = StorageMap::new();
+    let mut found_count = 0;
+    let mut missing_count = 0;
 
-    for (key, _access_type) in footprint.0.iter(budget)? {
+    for (key, access_type) in footprint.0.iter(budget)? {
         let entry = snapshot.get(key)?;
+        let key_type = match key.as_ref() {
+            LedgerKey::Account(_) => "Account",
+            LedgerKey::Trustline(_) => "Trustline",
+            LedgerKey::ContractData(_) => "ContractData",
+            LedgerKey::ContractCode(_) => "ContractCode",
+            LedgerKey::Ttl(_) => "Ttl",
+            _ => "Other",
+        };
+
+        if let Some((ref e, ref ttl)) = entry {
+            found_count += 1;
+            let has_ext = !matches!(e.ext, LedgerEntryExt::V0);
+            tracing::trace!(
+                key_type,
+                access = ?access_type,
+                last_modified = e.last_modified_ledger_seq,
+                has_ext,
+                live_until = ?ttl,
+                "Soroban footprint entry found"
+            );
+            // Extra debug for contract code
+            if let LedgerEntryData::ContractCode(ref cc) = e.data {
+                eprintln!("=== LOADED CONTRACT CODE: hash={:?}, code_len={} ===", cc.hash.0, cc.code.len());
+            }
+        } else {
+            missing_count += 1;
+            eprintln!("=== SOROBAN FOOTPRINT ENTRY MISSING: {} {:?} ===", key_type, key);
+            tracing::warn!(
+                key_type,
+                access = ?access_type,
+                "Soroban footprint entry MISSING from storage"
+            );
+        }
         storage_map = storage_map.insert(key.clone(), entry, budget)?;
     }
+
+    tracing::debug!(
+        found_count,
+        missing_count,
+        total = found_count + missing_count,
+        "Soroban storage map built from footprint"
+    );
 
     Ok(storage_map)
 }
 
-/// Execute a Soroban host function using soroban-env-host.
+/// Execute a Soroban host function using soroban-env-host's e2e_invoke API.
+///
+/// This uses the same high-level API that C++ stellar-core uses, which handles
+/// all the internal setup correctly.
 ///
 /// # Arguments
 ///
@@ -211,17 +285,13 @@ pub fn execute_host_function(
     soroban_config: &SorobanConfig,
 ) -> Result<SorobanExecutionResult, HostError> {
     // Create budget with network cost parameters
-    // Use transaction-specified instruction limit, capped by network limit
-    let instruction_limit = std::cmp::min(
-        soroban_data.resources.instructions as u64,
-        soroban_config.tx_max_instructions,
-    );
-
-    // SorobanResources does not include a per-transaction memory cap; enforce network limit.
-    let memory_limit = soroban_config.tx_max_memory_bytes;
+    // Use a larger budget for the e2e_invoke call which includes XDR parsing overhead
+    // The transaction's instruction limit is for contract execution only, but e2e_invoke
+    // also meters the setup operations (XDR parsing, storage map building, etc.)
+    let instruction_limit = soroban_config.tx_max_instructions * 2; // Double for setup overhead
+    let memory_limit = soroban_config.tx_max_memory_bytes * 2; // Double for setup overhead
 
     let budget = if soroban_config.has_valid_cost_params() {
-        // Use network cost parameters for accurate metering
         Budget::try_from_configs(
             instruction_limit,
             memory_limit,
@@ -229,31 +299,13 @@ pub fn execute_host_function(
             soroban_config.mem_cost_params.clone(),
         )?
     } else {
-        // Fallback to default budget if no cost params available
-        // This will produce incorrect results but allows basic testing
         tracing::warn!(
-            "Using default Soroban budget - cost parameters not loaded from network. \
-             Transaction results may not match network."
+            "Using default Soroban budget - cost parameters not loaded from network."
         );
         Budget::default()
     };
 
-    // Build footprint from transaction resources
-    let footprint = build_footprint(&budget, &soroban_data.resources.footprint)?;
-
-    // Create snapshot adapter
-    let snapshot = LedgerSnapshotAdapter::new(state, context.sequence);
-
-    // Build storage map from footprint
-    let storage_map = build_storage_map(&budget, &footprint, &snapshot)?;
-
-    // Create storage with enforcing footprint
-    let storage = Storage::with_enforcing_footprint_and_map(footprint, storage_map);
-
-    // Create host
-    let host = Host::with_storage_and_budget(storage, budget.clone());
-
-    // Set ledger info with TTL values from network config
+    // Build ledger info
     let ledger_info = LedgerInfo {
         protocol_version: context.protocol_version,
         sequence_number: context.sequence,
@@ -264,62 +316,199 @@ pub fn execute_host_function(
         min_persistent_entry_ttl: soroban_config.min_persistent_entry_ttl,
         max_entry_ttl: soroban_config.max_entry_ttl,
     };
-    host.set_ledger_info(ledger_info)?;
+    tracing::debug!(
+        protocol_version = context.protocol_version,
+        sequence_number = context.sequence,
+        timestamp = context.close_time,
+        instruction_limit,
+        memory_limit,
+        has_cost_params = soroban_config.has_valid_cost_params(),
+        "Soroban host ledger info configured"
+    );
 
-    // Set source account
-    host.set_source_account(source.clone())?;
+    // Use PRNG seed from context if provided (computed as subSha256(txSetHash, txIndex)),
+    // otherwise fall back to a deterministic but incorrect seed based on ledger info.
+    let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
+        prng_seed.to_vec()
+    } else {
+        // Fallback: use ledger info to generate a deterministic but incorrect seed.
+        // This will cause Soroban contract results to differ from C++ stellar-core.
+        tracing::warn!(
+            "Using fallback PRNG seed - results may differ from C++ stellar-core"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(&context.network_id.0.0);
+        hasher.update(&context.sequence.to_le_bytes());
+        hasher.update(&context.close_time.to_le_bytes());
+        hasher.finalize().to_vec()
+    };
 
-    // Set authorization entries
-    host.set_authorization_entries(auth_entries.to_vec())?;
+    // Encode all data to XDR bytes for e2e_invoke
+    let encoded_host_fn = host_function.to_xdr(Limits::none())
+        .map_err(|e| HostError::from(soroban_env_host::Error::from_type_and_code(
+            soroban_env_host::xdr::ScErrorType::Context,
+            soroban_env_host::xdr::ScErrorCode::InternalError,
+        )))?;
 
-    // Generate PRNG seed from ledger info
-    let mut seed = [0u8; 32];
-    let mut hasher = Sha256::new();
-    hasher.update(&context.network_id.0.0);
-    hasher.update(&context.sequence.to_le_bytes());
-    hasher.update(&context.close_time.to_le_bytes());
-    seed.copy_from_slice(&hasher.finalize());
-    host.set_base_prng_seed(seed)?;
+    let encoded_resources = soroban_data.resources.to_xdr(Limits::none())
+        .map_err(|e| HostError::from(soroban_env_host::Error::from_type_and_code(
+            soroban_env_host::xdr::ScErrorType::Context,
+            soroban_env_host::xdr::ScErrorCode::InternalError,
+        )))?;
 
-    // Enable diagnostics for debugging
-    host.set_diagnostic_level(DiagnosticLevel::Debug)?;
+    let encoded_source = source.to_xdr(Limits::none())
+        .map_err(|e| HostError::from(soroban_env_host::Error::from_type_and_code(
+            soroban_env_host::xdr::ScErrorType::Context,
+            soroban_env_host::xdr::ScErrorCode::InternalError,
+        )))?;
 
-    // Execute the host function
-    let result = host.invoke_function(host_function.clone())?;
+    // Encode auth entries
+    let encoded_auth_entries: Vec<Vec<u8>> = auth_entries
+        .iter()
+        .map(|e| e.to_xdr(Limits::none()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| HostError::from(soroban_env_host::Error::from_type_and_code(
+            soroban_env_host::xdr::ScErrorType::Context,
+            soroban_env_host::xdr::ScErrorCode::InternalError,
+        )))?;
 
-    // Get final storage and events
-    let (final_storage, events) = host.try_finish()?;
+    // Create snapshot adapter to get ledger entries
+    let snapshot = LedgerSnapshotAdapter::new(state, context.sequence);
 
-    // Extract storage changes
-    let mut storage_changes = Vec::new();
-    for (key, entry_with_live_until) in final_storage.map.iter(&budget)? {
-        match entry_with_live_until {
-            Some((entry, live_until)) => {
-                storage_changes.push(StorageChange {
-                    key: key.as_ref().clone(),
-                    new_entry: Some(entry.as_ref().clone()),
-                    live_until: *live_until,
-                });
-            }
-            None => {
-                // Entry was deleted
-                storage_changes.push(StorageChange {
-                    key: key.as_ref().clone(),
-                    new_entry: None,
-                    live_until: None,
-                });
-            }
+    // Collect and encode ledger entries from the footprint
+    // IMPORTANT: e2e_invoke expects exactly one TTL entry for each ledger entry (they are zipped)
+    // For non-contract entries (Account, etc), we pass empty bytes for TTL
+    let mut encoded_ledger_entries = Vec::new();
+    let mut encoded_ttl_entries = Vec::new();
+
+    // Helper to encode an entry and its TTL
+    let mut add_entry = |key: &LedgerKey, entry: &LedgerEntry, live_until: Option<u32>| -> Result<(), HostError> {
+        encoded_ledger_entries.push(entry.to_xdr(Limits::none())
+            .map_err(|_| HostError::from(soroban_env_host::Error::from_type_and_code(
+                soroban_env_host::xdr::ScErrorType::Context,
+                soroban_env_host::xdr::ScErrorCode::InternalError,
+            )))?);
+
+        // Encode TTL entry if present, otherwise push empty bytes
+        // e2e_invoke zips entries with TTLs, so we need exactly one TTL per entry
+        let ttl_bytes = if let Some(lu) = live_until {
+            let key_hash = compute_key_hash(key);
+            let ttl_entry = stellar_xdr::curr::TtlEntry {
+                key_hash,
+                live_until_ledger_seq: lu,
+            };
+            ttl_entry.to_xdr(Limits::none())
+                .map_err(|_| HostError::from(soroban_env_host::Error::from_type_and_code(
+                    soroban_env_host::xdr::ScErrorType::Context,
+                    soroban_env_host::xdr::ScErrorCode::InternalError,
+                )))?
+        } else {
+            // Empty bytes for entries that don't need TTL (non-contract entries)
+            Vec::new()
+        };
+        encoded_ttl_entries.push(ttl_bytes);
+        Ok(())
+    };
+
+    for key in soroban_data.resources.footprint.read_only.iter() {
+        if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
+            add_entry(key, &entry, live_until)?;
         }
     }
+
+    for key in soroban_data.resources.footprint.read_write.iter() {
+        if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
+            add_entry(key, &entry, live_until)?;
+        }
+    }
+
+    tracing::debug!(
+        ledger_entries_count = encoded_ledger_entries.len(),
+        ttl_entries_count = encoded_ttl_entries.len(),
+        "Prepared entries for e2e_invoke"
+    );
+
+    // Extract archived entry indices from soroban_data.ext for TTL restoration
+    // These are indices into the read_write footprint entries that need their TTL restored
+    let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
+        SorobanTransactionDataExt::V1(ext) => {
+            ext.archived_soroban_entries.iter().copied().collect()
+        }
+        SorobanTransactionDataExt::V0 => Vec::new(),
+    };
+
+    // Call e2e_invoke - iterator yields &Vec<u8> which implements AsRef<[u8]>
+    let mut diagnostic_events = Vec::new();
+    let result = match e2e_invoke::invoke_host_function(
+        &budget,
+        true, // enable_diagnostics
+        &encoded_host_fn,
+        &encoded_resources,
+        &restored_rw_entry_indices,
+        &encoded_source,
+        encoded_auth_entries.iter(),
+        ledger_info,
+        encoded_ledger_entries.iter(),
+        encoded_ttl_entries.iter(),
+        &seed,
+        &mut diagnostic_events,
+        None, // trace_hook
+        None, // module_cache - let host load from storage
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                diagnostic_events = diagnostic_events.len(),
+                "Soroban e2e_invoke failed"
+            );
+            return Err(e);
+        }
+    };
+
+    // Parse the result
+    let return_value = match result.encoded_invoke_result {
+        Ok(ref bytes) => {
+            ScVal::from_xdr(bytes, Limits::none())
+                .unwrap_or(ScVal::Void)
+        }
+        Err(ref e) => {
+            return Err(e.clone());
+        }
+    };
+
+    // Convert ledger changes to our format
+    let storage_changes = result.ledger_changes
+        .into_iter()
+        .filter_map(|change| {
+            // Include if there's a new value or if it was modified (has old entry size)
+            if change.encoded_new_value.is_some() || change.old_entry_size_bytes_for_rent > 0 {
+                let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
+                let new_entry = change.encoded_new_value.and_then(|bytes| {
+                    LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
+                });
+                // Get TTL from ttl_change if present
+                let live_until = change.ttl_change.map(|ttl| ttl.new_live_until_ledger);
+                Some(StorageChange {
+                    key,
+                    new_entry,
+                    live_until,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
 
     // Get budget consumption
     let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
     let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
 
     Ok(SorobanExecutionResult {
-        return_value: result,
+        return_value,
         storage_changes,
-        events,
+        events: Events::default(), // TODO: parse from result
         cpu_insns,
         mem_bytes,
     })

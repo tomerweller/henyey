@@ -270,12 +270,121 @@ impl TransactionExecutor {
         Ok(false)
     }
 
+    /// Load a ledger entry from the snapshot into the state manager.
+    ///
+    /// This handles all entry types including contract data, contract code, and TTL entries.
+    /// Returns true if the entry was found and loaded.
+    pub fn load_entry(&mut self, snapshot: &SnapshotHandle, key: &LedgerKey) -> Result<bool> {
+        if let Some(entry) = snapshot.get_entry(key)? {
+            match &entry.data {
+                LedgerEntryData::Account(account) => {
+                    if self.state.get_account(&account.account_id).is_none() {
+                        self.state.create_account(account.clone());
+                    }
+                }
+                LedgerEntryData::Trustline(trustline) => {
+                    if self.state.get_trustline_by_trustline_asset(
+                        &trustline.account_id,
+                        &trustline.asset,
+                    ).is_none() {
+                        self.state.create_trustline(trustline.clone());
+                    }
+                }
+                LedgerEntryData::ContractData(cd) => {
+                    if self.state.get_contract_data(&cd.contract, &cd.key, cd.durability.clone()).is_none() {
+                        self.state.create_contract_data(cd.clone());
+                    }
+                }
+                LedgerEntryData::ContractCode(cc) => {
+                    if self.state.get_contract_code(&cc.hash).is_none() {
+                        self.state.create_contract_code(cc.clone());
+                    }
+                }
+                LedgerEntryData::Ttl(ttl) => {
+                    if self.state.get_ttl(&ttl.key_hash).is_none() {
+                        self.state.create_ttl(ttl.clone());
+                    }
+                }
+                LedgerEntryData::Data(data) => {
+                    let name_str = std::str::from_utf8(data.data_name.as_slice()).unwrap_or("");
+                    if self.state.get_data(&data.account_id, name_str).is_none() {
+                        self.state.create_data(data.clone());
+                    }
+                }
+                LedgerEntryData::Offer(offer) => {
+                    if self.state.get_offer(&offer.seller_id, offer.offer_id).is_none() {
+                        self.state.create_offer(offer.clone());
+                    }
+                }
+                LedgerEntryData::ClaimableBalance(_cb) => {
+                    // ClaimableBalance loading handled separately
+                }
+                LedgerEntryData::ConfigSetting(_) | LedgerEntryData::LiquidityPool(_) => {
+                    // ConfigSetting and LiquidityPool handled by specialized loaders
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load all entries from a Soroban footprint into the state manager.
+    ///
+    /// This is essential for Soroban transaction execution - the footprint specifies
+    /// which ledger entries the transaction will read or write, and they must be
+    /// loaded before the Soroban host can access them.
+    pub fn load_soroban_footprint(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        footprint: &stellar_xdr::curr::LedgerFootprint,
+    ) -> Result<()> {
+        // Load read-only entries
+        for key in footprint.read_only.iter() {
+            self.load_entry(snapshot, key)?;
+            // Also load TTL for contract entries
+            self.load_ttl_for_key(snapshot, key)?;
+        }
+
+        // Load read-write entries
+        for key in footprint.read_write.iter() {
+            self.load_entry(snapshot, key)?;
+            // Also load TTL for contract entries
+            self.load_ttl_for_key(snapshot, key)?;
+        }
+
+        Ok(())
+    }
+
+    /// Load the TTL entry for a contract data or code key.
+    fn load_ttl_for_key(&mut self, snapshot: &SnapshotHandle, key: &LedgerKey) -> Result<()> {
+        match key {
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
+                use sha2::{Digest, Sha256};
+                // Compute the key hash for TTL lookup
+                let key_bytes = key.to_xdr(Limits::none())
+                    .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+
+                let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
+                self.load_entry(snapshot, &ttl_key)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Execute a transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `soroban_prng_seed` - Optional PRNG seed for Soroban execution.
+    ///   Computed as subSha256(txSetHash, txIndex) at the transaction set level.
     pub fn execute_transaction(
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
     ) -> Result<TransactionExecutionResult> {
         let mut frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
         let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
@@ -681,16 +790,36 @@ impl TransactionExecutor {
         self.state.commit();
 
         // Create ledger context for operation execution
-        let ledger_context = LedgerContext::new(
-            self.ledger_seq,
-            self.close_time,
-            base_fee,
-            self.base_reserve,
-            self.protocol_version,
-            self.network_id.clone(),
-        );
+        let ledger_context = if let Some(prng_seed) = soroban_prng_seed {
+            LedgerContext::with_prng_seed(
+                self.ledger_seq,
+                self.close_time,
+                base_fee,
+                self.base_reserve,
+                self.protocol_version,
+                self.network_id.clone(),
+                prng_seed,
+            )
+        } else {
+            LedgerContext::new(
+                self.ledger_seq,
+                self.close_time,
+                base_fee,
+                self.base_reserve,
+                self.protocol_version,
+                self.network_id.clone(),
+            )
+        };
 
         let soroban_data = frame.soroban_data();
+
+        // For Soroban transactions, load all footprint entries from the snapshot
+        // before executing operations. This ensures contract data, code, and TTLs
+        // are available to the Soroban host.
+        if let Some(ref data) = soroban_data {
+            self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
+        }
+
         self.state.clear_sponsorship_stack();
 
         // Execute operations
@@ -1505,7 +1634,24 @@ fn has_signed_payload_signature(
         .any(|sig| validation::verify_signature_with_key(&payload_hash, sig, &pk))
 }
 
+/// Compute subSha256(baseSeed, index) as used by C++ stellar-core for PRNG seeds.
+///
+/// This computes SHA256(baseSeed || index) where index is encoded as 4 big-endian bytes
+/// (matching C++ network byte order used in XDR).
+fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(base_seed);
+    hasher.update(&index.to_be_bytes()); // 4 bytes big-endian (XDR byte order)
+    hasher.finalize().into()
+}
+
 /// Execute a full transaction set.
+///
+/// # Arguments
+///
+/// * `soroban_base_prng_seed` - The transaction set hash used as base seed for Soroban PRNG.
+///   Each transaction gets its own seed computed as subSha256(baseSeed, txIndex).
 pub fn execute_transaction_set(
     snapshot: &SnapshotHandle,
     transactions: &[(TransactionEnvelope, Option<u32>)],
@@ -1517,6 +1663,7 @@ pub fn execute_transaction_set(
     network_id: NetworkId,
     delta: &mut LedgerDelta,
     soroban_config: SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
 ) -> Result<(
     Vec<TransactionExecutionResult>,
     Vec<TransactionResultPair>,
@@ -1539,9 +1686,11 @@ pub fn execute_transaction_set(
     let mut tx_results = Vec::with_capacity(transactions.len());
     let mut tx_result_metas = Vec::with_capacity(transactions.len());
 
-    for (tx, tx_base_fee) in transactions {
+    for (tx_index, (tx, tx_base_fee)) in transactions.iter().enumerate() {
         let tx_fee = tx_base_fee.unwrap_or(base_fee);
-        let result = executor.execute_transaction(snapshot, tx, tx_fee)?;
+        // Compute per-transaction PRNG seed: subSha256(basePrngSeed, txIndex)
+        let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
+        let result = executor.execute_transaction(snapshot, tx, tx_fee, Some(tx_prng_seed))?;
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
         let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result)?;
         let tx_meta = result

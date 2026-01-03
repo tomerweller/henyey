@@ -29,10 +29,12 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Stellar official crates
-stellar-xdr = { version = "25.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
+# NOTE: Testnet is on protocol 24, so we use stellar-xdr 24 and soroban-env-host 24 for compatibility.
+# When testnet upgrades to protocol 25, update these to version 25.
+stellar-xdr = { version = "24.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
 stellar-strkey = "0.0.11"
-soroban-env-host = "25"
-soroban-env-common = "25"
+soroban-env-host = "24"
+soroban-env-common = "24"
 
 # Workspace crates
 stellar-core-common = { path = "crates/stellar-core-common" }

@@ -791,6 +791,8 @@ impl<'a> LedgerCloseContext<'a> {
 
         // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
         let soroban_config = crate::execution::load_soroban_config(&self.snapshot);
+        // Use transaction set hash as base PRNG seed for Soroban execution
+        let soroban_base_prng_seed = self.close_data.tx_set_hash();
         let (results, tx_results, tx_result_metas, id_pool) = execute_transaction_set(
             &self.snapshot,
             &transactions,
@@ -802,6 +804,7 @@ impl<'a> LedgerCloseContext<'a> {
             self.manager.network_id.clone(),
             &mut self.delta,
             soroban_config,
+            soroban_base_prng_seed.0,
         )?;
         self.id_pool = id_pool;
         self.tx_results = tx_results;

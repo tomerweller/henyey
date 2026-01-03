@@ -186,6 +186,8 @@ pub fn replay_ledger_with_execution(
     let transactions = tx_set.transactions_with_base_fee();
     // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
     let soroban_config = load_soroban_config(&snapshot);
+    // Use transaction set hash as base PRNG seed for Soroban execution
+    let soroban_base_prng_seed = tx_set.hash();
     let (results, tx_results, _tx_result_metas, _total_fees) = execute_transaction_set(
         &snapshot,
         &transactions,
@@ -197,6 +199,7 @@ pub fn replay_ledger_with_execution(
         *network_id,
         &mut delta,
         soroban_config,
+        soroban_base_prng_seed.0,
     )
     .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 

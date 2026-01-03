@@ -27,6 +27,10 @@ pub struct LedgerContext {
     pub protocol_version: u32,
     /// Network ID.
     pub network_id: NetworkId,
+    /// PRNG seed for Soroban contract execution.
+    /// This is computed as subSha256(txSetHash, txIndex) per the C++ stellar-core spec.
+    /// None means use a default (incorrect) seed for compatibility.
+    pub soroban_prng_seed: Option<[u8; 32]>,
 }
 
 impl LedgerContext {
@@ -46,6 +50,28 @@ impl LedgerContext {
             base_reserve,
             protocol_version,
             network_id,
+            soroban_prng_seed: None,
+        }
+    }
+
+    /// Create a new ledger context with a Soroban PRNG seed.
+    pub fn with_prng_seed(
+        sequence: u32,
+        close_time: u64,
+        base_fee: u32,
+        base_reserve: u32,
+        protocol_version: u32,
+        network_id: NetworkId,
+        soroban_prng_seed: [u8; 32],
+    ) -> Self {
+        Self {
+            sequence,
+            close_time,
+            base_fee,
+            base_reserve,
+            protocol_version,
+            network_id,
+            soroban_prng_seed: Some(soroban_prng_seed),
         }
     }
 
@@ -58,6 +84,7 @@ impl LedgerContext {
             base_reserve: 5_000_000,
             protocol_version: 21,
             network_id: NetworkId::testnet(),
+            soroban_prng_seed: None,
         }
     }
 
@@ -70,6 +97,7 @@ impl LedgerContext {
             base_reserve: 5_000_000,
             protocol_version: 21,
             network_id: NetworkId::mainnet(),
+            soroban_prng_seed: None,
         }
     }
 }
