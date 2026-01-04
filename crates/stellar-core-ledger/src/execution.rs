@@ -1386,8 +1386,13 @@ impl TransactionExecutor {
                 results = ?operation_results,
                 "Transaction failed; rolling back changes"
             );
+            // Save accumulated fees before rollback - rollback creates a new delta
+            // which would lose fee_charged for this and all previous transactions
+            let accumulated_fees = self.state.delta().fee_charged();
             self.state.rollback();
             restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
+            // Restore accumulated fees (including this transaction's fee which was already charged)
+            self.state.delta_mut().add_fee(accumulated_fees);
             if let (Some(runner), Some(snapshot)) =
                 (self.op_invariants.as_mut(), op_invariant_snapshot)
             {
