@@ -28,6 +28,10 @@ Thumbs.db
 
 # Logs
 /logs/
+*.log
+
+# Lock files
+stellar.lock
 
 # Local runtime data
 /data/
