@@ -142,6 +142,42 @@ rs-stellar-core offline encode-xdr --type Hash <64-char-hex>
 rs-stellar-core offline bucket-info /path/to/buckets
 ```
 
+##### replay-test
+
+Test ledger hash parity by replaying ledgers from history archives offline.
+This is useful for debugging hash mismatches without connecting to the live network.
+
+```bash
+# Test recent ledgers (default: ~1000 ledgers back)
+rs-stellar-core --testnet offline replay-test
+
+# Test a specific ledger range
+rs-stellar-core --testnet offline replay-test --from 310000 --to 311000
+
+# Stop on first mismatch (for debugging)
+rs-stellar-core --testnet offline replay-test --from 310000 --stop-on-error
+
+# Compare transaction results for detailed mismatch info
+rs-stellar-core --testnet offline replay-test --from 310000 --compare-results
+
+# Skip invariant checking (faster)
+rs-stellar-core --testnet offline replay-test --from 310000 --skip-invariants
+```
+
+Options:
+- `--from <LEDGER>`: Start ledger sequence (defaults to ~16 checkpoints back)
+- `--to <LEDGER>`: End ledger sequence (defaults to latest available)
+- `--stop-on-error`: Stop on first hash mismatch
+- `--compare-results`: Compare transaction results against history
+- `--skip-invariants`: Skip invariant checking for faster testing
+
+The command downloads bucket list state at the start checkpoint, then replays
+each ledger by re-executing transactions and comparing the resulting bucket
+list hash against the expected hash from history. This helps identify:
+- Transaction execution differences
+- Bucket list update differences
+- Fee pool or total coins calculation differences
+
 ## HTTP API
 
 When running, the node exposes an HTTP API:
