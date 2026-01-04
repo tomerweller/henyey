@@ -4,8 +4,8 @@
 //! which allows accounts to attach arbitrary key-value data.
 
 use stellar_xdr::curr::{
-    AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData, ManageDataOp, ManageDataResult,
-    ManageDataResultCode, OperationResult, OperationResultTr,
+    AccountEntry, AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData, Liabilities,
+    ManageDataOp, ManageDataResult, ManageDataResultCode, OperationResult, OperationResultTr,
 };
 
 use crate::state::LedgerStateManager;
@@ -102,7 +102,12 @@ pub fn execute_manage_data(
                         1,
                         0,
                     )?;
-                    if sponsor_account.balance < new_min_balance {
+                    let mut available = sponsor_account.balance;
+                    if context.protocol_version >= 10 {
+                        available =
+                            available.saturating_sub(account_liabilities(sponsor_account).selling);
+                    }
+                    if available < new_min_balance {
                         return Ok(make_result(ManageDataResultCode::LowReserve));
                     }
                 } else {
@@ -114,7 +119,11 @@ pub fn execute_manage_data(
                         context.protocol_version,
                         1,
                     )?;
-                    if source_account.balance < new_min_balance {
+                    let mut available = source_account.balance;
+                    if context.protocol_version >= 10 {
+                        available = available.saturating_sub(account_liabilities(source_account).selling);
+                    }
+                    if available < new_min_balance {
                         return Ok(make_result(ManageDataResultCode::LowReserve));
                     }
                 }
@@ -150,6 +159,13 @@ pub fn execute_manage_data(
     }
 
     Ok(make_result(ManageDataResultCode::Success))
+}
+
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
 }
 
 /// Create an OperationResult from a ManageDataResultCode.
@@ -197,6 +213,17 @@ mod tests {
 
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
+    }
+
+    fn with_selling_liabilities(mut account: AccountEntry, selling: i64) -> AccountEntry {
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        account
     }
 
     fn make_string64(s: &str) -> String64 {
@@ -249,6 +276,36 @@ mod tests {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
                 assert!(matches!(r, ManageDataResult::NotSupportedYet));
             }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_data_low_reserve_with_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 25;
+
+        let source_id = create_test_account_id(0);
+        let mut account = create_test_account(source_id.clone(), 0);
+        let new_min_balance = state
+            .minimum_balance_for_account(&account, context.protocol_version, 1)
+            .expect("min balance");
+        let selling_liabilities = 1_000_000;
+        account.balance = new_min_balance + selling_liabilities - 1;
+        account = with_selling_liabilities(account, selling_liabilities);
+        state.create_account(account);
+
+        let op = ManageDataOp {
+            data_name: make_string64("test_key"),
+            data_value: Some(vec![1, 2, 3, 4].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context)
+            .expect("manage data result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageData(ManageDataResult::LowReserve)) => {}
             other => panic!("unexpected result: {:?}", other),
         }
     }
