@@ -36,7 +36,7 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 - Edge-case SCP semantics still pending (slot/ballot corner cases not yet fully validated against upstream).
 
 ### Testing Gaps
-- Additional upstream-aligned golden vectors for nomination/ballot edge cases.
+- Additional upstream-aligned golden vectors for nomination/ballot edge cases (basic quorum/v-blocking, quorum sanity/normalization, and nomination weight unit tests are in place; broader ballot/nomination scenarios still missing).
 
 ## Herder
 
@@ -62,7 +62,7 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 - None known at v25 parity baseline.
 
 ### Testing Gaps
-- Upstream tx meta hash vector coverage (synthetic vectors exist; upstream fixtures pending).
+- Upstream tx meta hash vector coverage (synthetic vectors exist; upstream baseline loader/format checks in place; initial create-account baseline test is scaffolded but ignored pending ledger/header alignment; full per-test hash parity still pending).
 - Classic event emission golden vectors (ledger-close-meta fixtures with EMIT_CLASSIC_EVENTS enabled).
 - Expanded per-operation regression suite for classic + Soroban edge cases (classic events now covered for payments, account merge/create, claimable balance create/claim/clawback, trustline flags, liquidity pool deposit/withdraw; remaining ops + Soroban edge cases pending).
 

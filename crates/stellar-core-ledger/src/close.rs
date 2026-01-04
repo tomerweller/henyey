@@ -7,8 +7,9 @@
 use stellar_core_common::Hash256;
 use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade, TransactionEnvelope,
-    TransactionResultPair, TransactionResultSet, TransactionSet, Limits, WriteXdr,
+    GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade, ScpHistoryEntry,
+    TransactionEnvelope, TransactionResultPair, TransactionResultSet, TransactionSet, Limits,
+    WriteXdr,
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -31,6 +32,9 @@ pub struct LedgerCloseData {
     /// Protocol upgrades to apply (if any).
     pub upgrades: Vec<LedgerUpgrade>,
 
+    /// SCP history entries for this ledger close, if available.
+    pub scp_history: Vec<ScpHistoryEntry>,
+
     /// Hash of the previous ledger.
     pub prev_ledger_hash: Hash256,
 }
@@ -48,6 +52,7 @@ impl LedgerCloseData {
             tx_set,
             close_time,
             upgrades: Vec::new(),
+            scp_history: Vec::new(),
             prev_ledger_hash,
         }
     }
@@ -61,6 +66,12 @@ impl LedgerCloseData {
     /// Add multiple protocol upgrades.
     pub fn with_upgrades(mut self, upgrades: Vec<LedgerUpgrade>) -> Self {
         self.upgrades = upgrades;
+        self
+    }
+
+    /// Attach SCP history entries for this ledger close.
+    pub fn with_scp_history(mut self, scp_history: Vec<ScpHistoryEntry>) -> Self {
+        self.scp_history = scp_history;
         self
     }
 

@@ -49,14 +49,15 @@ use stellar_core_scp::hash_quorum_set;
 use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 use stellar_xdr::curr::{
     Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand,
-    Hash, LedgerCloseMeta, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope,
-    SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue, SurveyMessageCommandType,
-    SurveyRequestMessage, SurveyResponseBody, SurveyResponseMessage, TimeSlicedSurveyRequestMessage,
-    TimeSlicedSurveyResponseMessage, TimeSlicedSurveyStartCollectingMessage,
-    TimeSlicedSurveyStopCollectingMessage, TimeSlicedPeerDataList, TopologyResponseBodyV2,
-    TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
-    TransactionHistoryResultEntryExt, TransactionMeta, TransactionResultPair, TransactionResultSet,
-    TransactionSet, TxAdvertVector, TxDemandVector, UpgradeType, VecM, WriteXdr,
+    Hash, LedgerCloseMeta, LedgerScpMessages, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope,
+    ScpHistoryEntry, ScpHistoryEntryV0, SignedTimeSlicedSurveyResponseMessage, StellarMessage,
+    StellarValue, SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody,
+    SurveyResponseMessage, TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
+    TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
+    TimeSlicedPeerDataList, TopologyResponseBodyV2, TransactionHistoryEntry,
+    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+    TransactionMeta, TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector,
+    TxDemandVector, UpgradeType, VecM, WriteXdr,
 };
 use stellar_core_tx::TransactionFrame;
 
@@ -3886,6 +3887,57 @@ impl App {
         Hash256::hash_xdr(tx_env).ok()
     }
 
+    fn build_scp_history_entry(&self, ledger_seq: u32) -> Option<ScpHistoryEntry> {
+        let envelopes = self.herder.get_scp_envelopes(ledger_seq as u64);
+        if envelopes.is_empty() {
+            return None;
+        }
+
+        let mut qset_hashes = HashSet::new();
+        for envelope in &envelopes {
+            if let Some(hash) = Self::scp_quorum_set_hash(&envelope.statement) {
+                qset_hashes.insert(Hash256::from_bytes(hash.0));
+            }
+        }
+
+        let mut hashes = qset_hashes.into_iter().collect::<Vec<_>>();
+        hashes.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+
+        let mut qsets = Vec::new();
+        for hash in hashes {
+            match self.herder.get_quorum_set_by_hash(hash.as_bytes()) {
+                Some(qset) => qsets.push(qset),
+                None => {
+                    tracing::warn!(hash = %hash.to_hex(), "Missing quorum set for SCP history entry");
+                    return None;
+                }
+            }
+        }
+
+        let quorum_sets = match qsets.try_into() {
+            Ok(qsets) => qsets,
+            Err(_) => {
+                tracing::warn!(ledger_seq, "Too many quorum sets for SCP history entry");
+                return None;
+            }
+        };
+        let messages = match envelopes.try_into() {
+            Ok(messages) => messages,
+            Err(_) => {
+                tracing::warn!(ledger_seq, "Too many SCP envelopes for SCP history entry");
+                return None;
+            }
+        };
+
+        Some(ScpHistoryEntry::V0(ScpHistoryEntryV0 {
+            quorum_sets,
+            ledger_messages: LedgerScpMessages {
+                ledger_seq,
+                messages,
+            },
+        }))
+    }
+
     async fn enqueue_tx_advert(&self, tx_env: &stellar_xdr::curr::TransactionEnvelope) {
         let Some(hash) = self.tx_hash(tx_env) else {
             tracing::debug!("Failed to hash transaction for advert");
@@ -5822,6 +5874,9 @@ impl HerderCallback for App {
         let decoded_upgrades = decode_upgrades(upgrades);
         if !decoded_upgrades.is_empty() {
             close_data = close_data.with_upgrades(decoded_upgrades);
+        }
+        if let Some(entry) = self.build_scp_history_entry(ledger_seq) {
+            close_data = close_data.with_scp_history(vec![entry]);
         }
 
         // Begin the ledger close

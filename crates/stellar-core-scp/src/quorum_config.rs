@@ -9,7 +9,7 @@ use stellar_core_common::config::QuorumSetConfig;
 use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
 use tracing::warn;
 
-use crate::{is_valid_quorum_set, get_all_nodes};
+use crate::{get_all_nodes, is_quorum_set_sane, is_valid_quorum_set};
 
 /// Errors that can occur when parsing quorum set configuration.
 #[derive(Debug, Clone)]
@@ -148,6 +148,10 @@ pub fn validate_quorum_config(config: &QuorumSetConfig) -> Result<(), QuorumConf
 
     // Convert to XDR to validate structure
     let qs = config_to_quorum_set(config)?;
+
+    if let Err(err) = is_quorum_set_sane(&qs, false) {
+        return Err(QuorumConfigError::InvalidStructure(err));
+    }
 
     // Check we have validators
     let all_nodes = get_all_nodes(&qs);

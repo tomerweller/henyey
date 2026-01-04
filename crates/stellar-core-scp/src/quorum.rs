@@ -163,6 +163,137 @@ pub fn is_v_blocking(
     is_blocking_set(quorum_set, nodes)
 }
 
+const MAXIMUM_QUORUM_NESTING_LEVEL: u32 = 4;
+const MAXIMUM_QUORUM_NODES: usize = 1000;
+
+/// Check if a quorum set is sane.
+///
+/// This validates structural constraints, duplicate nodes, and optionally
+/// enforces a safety threshold (> 50%).
+pub fn is_quorum_set_sane(
+    quorum_set: &ScpQuorumSet,
+    extra_checks: bool,
+) -> Result<(), String> {
+    let mut checker = QuorumSetSanityChecker {
+        extra_checks,
+        known_nodes: HashSet::new(),
+        count: 0,
+    };
+    checker.check_sanity(quorum_set, 0)?;
+
+    if checker.count < 1 || checker.count > MAXIMUM_QUORUM_NODES {
+        return Err("Total number of nodes in a quorum must be within 1 and 1000".to_string());
+    }
+
+    Ok(())
+}
+
+struct QuorumSetSanityChecker {
+    extra_checks: bool,
+    known_nodes: HashSet<NodeId>,
+    count: usize,
+}
+
+impl QuorumSetSanityChecker {
+    fn check_sanity(&mut self, quorum_set: &ScpQuorumSet, depth: u32) -> Result<(), String> {
+        if depth > MAXIMUM_QUORUM_NESTING_LEVEL {
+            return Err("Maximum quorum nesting level exceeded".to_string());
+        }
+
+        if quorum_set.threshold < 1 {
+            return Err("Threshold must be greater than 0".to_string());
+        }
+
+        let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
+        if quorum_set.threshold as usize > total {
+            return Err("Threshold exceeds total number of entries".to_string());
+        }
+
+        let v_blocking_size = total.saturating_sub(quorum_set.threshold as usize) + 1;
+        if self.extra_checks && (quorum_set.threshold as usize) < v_blocking_size {
+            return Err("Threshold is lower than the v-blocking size (< 51%).".to_string());
+        }
+
+        self.count = self.count.saturating_add(quorum_set.validators.len());
+        for node in quorum_set.validators.iter() {
+            if !self.known_nodes.insert(node.clone()) {
+                return Err("Duplicate node found in quorum configuration".to_string());
+            }
+        }
+
+        for inner in quorum_set.inner_sets.iter() {
+            self.check_sanity(inner, depth + 1)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Find the closest v-blocking set for a quorum set.
+///
+/// Returns a minimal set of nodes from `nodes` that would v-block the quorum
+/// set, excluding `excluded` if provided. An empty result means the set is
+/// already v-blocking.
+pub fn find_closest_v_blocking(
+    quorum_set: &ScpQuorumSet,
+    nodes: &HashSet<NodeId>,
+    excluded: Option<&NodeId>,
+) -> Vec<NodeId> {
+    let mut left_till_block = 1i64
+        + quorum_set.validators.len() as i64
+        + quorum_set.inner_sets.len() as i64
+        - quorum_set.threshold as i64;
+
+    if left_till_block <= 0 {
+        return Vec::new();
+    }
+
+    let mut res = Vec::new();
+
+    for validator in quorum_set.validators.iter() {
+        if excluded.map_or(false, |node| node == validator) {
+            continue;
+        }
+
+        if nodes.contains(validator) {
+            res.push(validator.clone());
+        } else {
+            left_till_block -= 1;
+            if left_till_block == 0 {
+                return Vec::new();
+            }
+        }
+    }
+
+    let mut res_internals: Vec<(usize, usize, Vec<NodeId>)> = Vec::new();
+    for (index, inner) in quorum_set.inner_sets.iter().enumerate() {
+        let v = find_closest_v_blocking(inner, nodes, excluded);
+        if v.is_empty() {
+            left_till_block -= 1;
+            if left_till_block == 0 {
+                return Vec::new();
+            }
+        } else {
+            res_internals.push((v.len(), index, v));
+        }
+    }
+
+    if res.len() > left_till_block as usize {
+        res.truncate(left_till_block as usize);
+    }
+    left_till_block -= res.len() as i64;
+
+    res_internals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut idx = 0;
+    while left_till_block != 0 && idx < res_internals.len() {
+        res.extend(res_internals[idx].2.iter().cloned());
+        left_till_block -= 1;
+        idx += 1;
+    }
+
+    res
+}
+
 /// Compute the hash of a quorum set.
 ///
 /// This hash is used to reference quorum sets by their content
@@ -176,32 +307,94 @@ pub fn hash_quorum_set(quorum_set: &ScpQuorumSet) -> Hash256 {
 /// This ensures consistent hashing regardless of the order in which
 /// validators were added to the quorum set.
 pub fn normalize_quorum_set(quorum_set: &mut ScpQuorumSet) {
-    // Sort validators by their public key bytes
+    normalize_quorum_set_simplify(quorum_set);
+
     let mut validators: Vec<_> = quorum_set.validators.iter().cloned().collect();
-    validators.sort_by(|a, b| {
-        let a_bytes = match &a.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(bytes),
-            ) => bytes,
-        };
-        let b_bytes = match &b.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(bytes),
-            ) => bytes,
-        };
-        a_bytes.cmp(b_bytes)
-    });
+    validators.sort_by(|a, b| node_id_cmp(a, b));
     quorum_set.validators = validators.try_into().unwrap_or_default();
 
-    // Recursively normalize inner sets
     let mut inner_sets: Vec<_> = quorum_set.inner_sets.iter().cloned().collect();
     for inner_set in &mut inner_sets {
         normalize_quorum_set(inner_set);
     }
 
-    // Sort inner sets by their hash
-    inner_sets.sort_by_cached_key(|qs| hash_quorum_set(qs).0);
+    inner_sets.sort_by(|a, b| quorum_set_cmp(a, b));
     quorum_set.inner_sets = inner_sets.try_into().unwrap_or_default();
+}
+
+fn normalize_quorum_set_simplify(quorum_set: &mut ScpQuorumSet) {
+    let mut inner_sets: Vec<ScpQuorumSet> = quorum_set.inner_sets.iter().cloned().collect();
+    let mut merged_validators: Vec<NodeId> = quorum_set.validators.iter().cloned().collect();
+
+    let mut idx = 0;
+    while idx < inner_sets.len() {
+        normalize_quorum_set_simplify(&mut inner_sets[idx]);
+
+        let is_singleton = inner_sets[idx].threshold == 1
+            && inner_sets[idx].validators.len() == 1
+            && inner_sets[idx].inner_sets.is_empty();
+        if is_singleton {
+            merged_validators.push(inner_sets[idx].validators[0].clone());
+            inner_sets.remove(idx);
+        } else {
+            idx += 1;
+        }
+    }
+
+    quorum_set.validators = merged_validators.try_into().unwrap_or_default();
+    quorum_set.inner_sets = inner_sets.try_into().unwrap_or_default();
+
+    if quorum_set.threshold == 1
+        && quorum_set.validators.is_empty()
+        && quorum_set.inner_sets.len() == 1
+    {
+        let inner = quorum_set.inner_sets[0].clone();
+        *quorum_set = inner;
+    }
+}
+
+fn node_id_bytes(node_id: &NodeId) -> [u8; 32] {
+    match &node_id.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
+            *bytes
+        }
+    }
+}
+
+fn node_id_cmp(a: &NodeId, b: &NodeId) -> std::cmp::Ordering {
+    node_id_bytes(a).cmp(&node_id_bytes(b))
+}
+
+fn quorum_set_cmp(a: &ScpQuorumSet, b: &ScpQuorumSet) -> std::cmp::Ordering {
+    let mut index = 0;
+    let a_vals: Vec<NodeId> = a.validators.iter().cloned().collect();
+    let b_vals: Vec<NodeId> = b.validators.iter().cloned().collect();
+    while index < a_vals.len() && index < b_vals.len() {
+        let ord = node_id_cmp(&a_vals[index], &b_vals[index]);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+        index += 1;
+    }
+    if a_vals.len() != b_vals.len() {
+        return a_vals.len().cmp(&b_vals.len());
+    }
+
+    let mut inner_index = 0;
+    let a_inners: Vec<ScpQuorumSet> = a.inner_sets.iter().cloned().collect();
+    let b_inners: Vec<ScpQuorumSet> = b.inner_sets.iter().cloned().collect();
+    while inner_index < a_inners.len() && inner_index < b_inners.len() {
+        let ord = quorum_set_cmp(&a_inners[inner_index], &b_inners[inner_index]);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+        inner_index += 1;
+    }
+    if a_inners.len() != b_inners.len() {
+        return a_inners.len().cmp(&b_inners.len());
+    }
+
+    a.threshold.cmp(&b.threshold)
 }
 
 /// Check if a quorum set is valid.
@@ -266,6 +459,13 @@ mod tests {
 
     fn make_simple_quorum_set(threshold: u32, node_ids: &[NodeId]) -> ScpQuorumSet {
         simple_quorum_set(threshold, node_ids.to_vec())
+    }
+
+    fn make_node_id_with_index(index: u16) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = (index & 0xff) as u8;
+        bytes[1] = (index >> 8) as u8;
+        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
     }
 
     #[test]
@@ -344,5 +544,354 @@ mod tests {
         // Invalid: 3-of-2
         let qs = make_simple_quorum_set(3, &[node1, node2]);
         assert!(!is_valid_quorum_set(&qs));
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_basic() {
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        let qs = make_simple_quorum_set(1, &[node1.clone(), node2.clone()]);
+        assert!(is_quorum_set_sane(&qs, false).is_ok());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_threshold_zero() {
+        let mut qs = make_simple_quorum_set(1, &[]);
+        qs.threshold = 0;
+        assert!(is_quorum_set_sane(&qs, false).is_err());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_threshold_too_high() {
+        let node1 = make_node_id(1);
+        let mut qs = make_simple_quorum_set(1, &[node1]);
+        qs.threshold = 2;
+        assert!(is_quorum_set_sane(&qs, false).is_err());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_duplicate_nodes() {
+        let node1 = make_node_id(1);
+        let mut qs = make_simple_quorum_set(1, &[node1.clone()]);
+        qs.validators = vec![node1.clone(), node1].try_into().unwrap_or_default();
+        assert!(is_quorum_set_sane(&qs, false).is_err());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_max_depth() {
+        let node1 = make_node_id(1);
+        let mut qs = make_simple_quorum_set(1, &[node1.clone()]);
+        for _ in 0..=MAXIMUM_QUORUM_NESTING_LEVEL {
+            let inner = qs.clone();
+            qs = ScpQuorumSet {
+                threshold: 1,
+                validators: Vec::new().try_into().unwrap_or_default(),
+                inner_sets: vec![inner].try_into().unwrap_or_default(),
+            };
+        }
+        assert!(is_quorum_set_sane(&qs, false).is_err());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_node_count_limit() {
+        let mut validators = Vec::new();
+        for idx in 0..=MAXIMUM_QUORUM_NODES {
+            validators.push(make_node_id_with_index(idx as u16));
+        }
+        let qs = simple_quorum_set(1, validators);
+        assert!(is_quorum_set_sane(&qs, false).is_err());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_node_count_limit_with_inner_sets() {
+        let mut nodes = Vec::new();
+        for idx in 0..=MAXIMUM_QUORUM_NODES {
+            nodes.push(make_node_id_with_index(idx as u16));
+        }
+
+        let mut qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![nodes[0].clone()].try_into().unwrap_or_default(),
+            inner_sets: Vec::new().try_into().unwrap_or_default(),
+        };
+
+        let mut inners = Vec::new();
+        for set_index in 0..10 {
+            let start = 1 + set_index * 100;
+            let end = start + 100;
+            let slice: Vec<NodeId> = nodes[start..end].iter().cloned().collect();
+            inners.push(simple_quorum_set(1, slice));
+        }
+        qs.inner_sets = inners.try_into().unwrap_or_default();
+
+        assert!(is_quorum_set_sane(&qs, false).is_err());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_extra_checks() {
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        let qs = make_simple_quorum_set(1, &[node1, node2]);
+        assert!(is_quorum_set_sane(&qs, true).is_err());
+    }
+
+    #[test]
+    fn test_is_quorum_set_sane_extra_checks_threshold_ok() {
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        let qs = make_simple_quorum_set(2, &[node1, node2, node3]);
+        assert!(is_quorum_set_sane(&qs, true).is_ok());
+    }
+
+    #[test]
+    fn test_normalize_quorum_set_merges_singletons() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+
+        let mut qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node0.clone()].try_into().unwrap_or_default(),
+            inner_sets: vec![make_simple_quorum_set(1, &[node1.clone()])]
+                .try_into()
+                .unwrap_or_default(),
+        };
+
+        normalize_quorum_set(&mut qs);
+
+        assert_eq!(qs.threshold, 1);
+        let validators: Vec<NodeId> = qs.validators.iter().cloned().collect();
+        assert_eq!(validators, vec![node0, node1]);
+        assert!(qs.inner_sets.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_quorum_set_flattens_nested_singletons() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        let mut qs = ScpQuorumSet {
+            threshold: 1,
+            validators: Vec::new().try_into().unwrap_or_default(),
+            inner_sets: vec![ScpQuorumSet {
+                threshold: 1,
+                validators: vec![node0.clone()].try_into().unwrap_or_default(),
+                inner_sets: vec![
+                    make_simple_quorum_set(1, &[node1.clone()]),
+                    make_simple_quorum_set(1, &[node2.clone(), node3.clone()]),
+                ]
+                .try_into()
+                .unwrap_or_default(),
+            }]
+            .try_into()
+            .unwrap_or_default(),
+        };
+
+        normalize_quorum_set(&mut qs);
+
+        assert_eq!(qs.threshold, 1);
+        let validators: Vec<NodeId> = qs.validators.iter().cloned().collect();
+        assert_eq!(validators, vec![node0, node1]);
+        assert_eq!(qs.inner_sets.len(), 1);
+        let inner = &qs.inner_sets[0];
+        assert_eq!(inner.threshold, 1);
+        let inner_validators: Vec<NodeId> = inner.validators.iter().cloned().collect();
+        assert_eq!(inner_validators, vec![node2, node3]);
+    }
+
+    #[test]
+    fn test_normalize_quorum_set_promotes_single_inner() {
+        let node0 = make_node_id(0);
+        let mut qs = ScpQuorumSet {
+            threshold: 1,
+            validators: Vec::new().try_into().unwrap_or_default(),
+            inner_sets: vec![make_simple_quorum_set(1, &[node0.clone()])]
+                .try_into()
+                .unwrap_or_default(),
+        };
+
+        normalize_quorum_set(&mut qs);
+
+        assert_eq!(qs.threshold, 1);
+        let validators: Vec<NodeId> = qs.validators.iter().cloned().collect();
+        assert_eq!(validators, vec![node0]);
+        assert!(qs.inner_sets.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_quorum_set_sorts_validators() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        let mut qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node2.clone(), node0.clone(), node1.clone()]
+                .try_into()
+                .unwrap_or_default(),
+            inner_sets: Vec::new().try_into().unwrap_or_default(),
+        };
+
+        normalize_quorum_set(&mut qs);
+
+        let validators: Vec<NodeId> = qs.validators.iter().cloned().collect();
+        assert_eq!(validators, vec![node0, node1, node2]);
+    }
+
+    #[test]
+    fn test_normalize_quorum_set_sorts_inner_sets() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        let inner_a = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node2.clone(), node3.clone()]
+                .try_into()
+                .unwrap_or_default(),
+            inner_sets: Vec::new().try_into().unwrap_or_default(),
+        };
+        let inner_b = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node0.clone(), node1.clone()]
+                .try_into()
+                .unwrap_or_default(),
+            inner_sets: Vec::new().try_into().unwrap_or_default(),
+        };
+
+        let mut qs = ScpQuorumSet {
+            threshold: 2,
+            validators: Vec::new().try_into().unwrap_or_default(),
+            inner_sets: vec![inner_a, inner_b].try_into().unwrap_or_default(),
+        };
+
+        normalize_quorum_set(&mut qs);
+
+        assert_eq!(qs.inner_sets.len(), 2);
+        let first_validators: Vec<NodeId> = qs.inner_sets[0].validators.iter().cloned().collect();
+        let second_validators: Vec<NodeId> = qs.inner_sets[1].validators.iter().cloned().collect();
+        assert_eq!(first_validators, vec![node0, node1]);
+        assert_eq!(second_validators, vec![node2, node3]);
+    }
+
+    #[test]
+    fn test_vblocking_and_quorum() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        let qs = make_simple_quorum_set(3, &[node0.clone(), node1.clone(), node2.clone(), node3.clone()]);
+
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        assert!(!is_quorum_slice(&qs, &nodes, &|_: &NodeId| None));
+        assert!(!is_v_blocking(&qs, &nodes));
+
+        nodes.insert(node2.clone());
+        assert!(!is_quorum_slice(&qs, &nodes, &|_: &NodeId| None));
+        assert!(is_v_blocking(&qs, &nodes));
+
+        nodes.insert(node3.clone());
+        assert!(is_quorum_slice(&qs, &nodes, &|_: &NodeId| None));
+        assert!(is_v_blocking(&qs, &nodes));
+
+        nodes.insert(node1.clone());
+        assert!(is_quorum_slice(&qs, &nodes, &|_: &NodeId| None));
+        assert!(is_v_blocking(&qs, &nodes));
+    }
+
+    #[test]
+    fn test_find_closest_vblocking_distance() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+        let node5 = make_node_id(5);
+        let node6 = make_node_id(6);
+        let node7 = make_node_id(7);
+
+        let mut qs = make_simple_quorum_set(2, &[node0.clone(), node1.clone(), node2.clone()]);
+
+        let mut good = HashSet::new();
+        good.insert(node0.clone());
+
+        let check = |q: &ScpQuorumSet, s: &HashSet<NodeId>, expected: usize| {
+            let result = find_closest_v_blocking(q, s, None);
+            assert_eq!(result.len(), expected);
+        };
+
+        check(&qs, &good, 0);
+
+        good.insert(node1.clone());
+        check(&qs, &good, 1);
+
+        good.insert(node2.clone());
+        check(&qs, &good, 2);
+
+        let qsub1 = make_simple_quorum_set(1, &[node3.clone(), node4.clone(), node5.clone()]);
+        let mut inner_sets = Vec::new();
+        inner_sets.push(qsub1);
+        qs.inner_sets = inner_sets.try_into().unwrap_or_default();
+
+        good.insert(node3.clone());
+        check(&qs, &good, 3);
+
+        good.insert(node4.clone());
+        check(&qs, &good, 3);
+
+        qs.threshold = 1;
+        check(&qs, &good, 5);
+
+        good.insert(node5.clone());
+        check(&qs, &good, 6);
+
+        let qsub2 = make_simple_quorum_set(2, &[node6.clone(), node7.clone()]);
+        let mut inner_sets: Vec<ScpQuorumSet> = qs.inner_sets.iter().cloned().collect();
+        inner_sets.push(qsub2);
+        qs.inner_sets = inner_sets.try_into().unwrap_or_default();
+
+        check(&qs, &good, 6);
+
+        good.insert(node6.clone());
+        check(&qs, &good, 6);
+
+        good.insert(node7.clone());
+        check(&qs, &good, 7);
+
+        qs.threshold = 4;
+        check(&qs, &good, 2);
+
+        qs.threshold = 3;
+        check(&qs, &good, 3);
+
+        qs.threshold = 2;
+        check(&qs, &good, 4);
+    }
+
+    #[test]
+    fn test_find_closest_vblocking_with_excluded() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        let qs = make_simple_quorum_set(2, &[node0.clone(), node1.clone(), node2.clone()]);
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+
+        let without_excluded = find_closest_v_blocking(&qs, &nodes, None);
+        let with_excluded = find_closest_v_blocking(&qs, &nodes, Some(&node1));
+
+        assert_eq!(without_excluded.len(), 1);
+        assert_eq!(with_excluded.len(), 1);
+        assert!(!with_excluded.contains(&node1));
     }
 }

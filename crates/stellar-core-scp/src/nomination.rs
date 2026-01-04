@@ -712,6 +712,39 @@ mod tests {
     use std::time::Duration;
     use stellar_xdr::curr::{PublicKey, ScpBallot, Uint256};
 
+    fn is_near_weight(weight: u64, target: f64) -> bool {
+        let ratio = weight as f64 / u64::MAX as f64;
+        (ratio - target).abs() < 0.01
+    }
+
+    #[test]
+    fn test_nomination_weight() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+        let node5 = make_node_id(5);
+
+        let mut qset = make_quorum_set(
+            vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()],
+            3,
+        );
+        let protocol = NominationProtocol::new();
+
+        let weight = protocol.get_node_weight(&qset, &node0, &node2);
+        assert!(is_near_weight(weight, 0.75));
+
+        let weight = protocol.get_node_weight(&qset, &node0, &node4);
+        assert_eq!(weight, 0);
+
+        let inner = make_quorum_set(vec![node4.clone(), node5.clone()], 1);
+        qset.inner_sets = vec![inner].try_into().unwrap_or_default();
+
+        let weight = protocol.get_node_weight(&qset, &node0, &node4);
+        assert!(is_near_weight(weight, 0.6 * 0.5));
+    }
+
     #[test]
     fn test_nomination_new() {
         let nom = NominationProtocol::new();

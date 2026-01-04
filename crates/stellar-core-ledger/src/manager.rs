@@ -30,7 +30,7 @@ use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
     ConfigSettingScpTiming, GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt,
     LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, Limits, ScpHistoryEntry,
+    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, Limits,
     TransactionPhase, TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
     TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM, WriteXdr,
 };
@@ -1046,7 +1046,11 @@ fn build_ledger_close_meta(
         tx_set,
         tx_processing: tx_result_metas.to_vec().try_into().unwrap_or_default(),
         upgrades_processing: VecM::<UpgradeEntryMeta>::default(),
-        scp_info: VecM::<ScpHistoryEntry>::default(),
+        scp_info: close_data
+            .scp_history
+            .clone()
+            .try_into()
+            .unwrap_or_default(),
         total_byte_size_of_live_soroban_state: 0,
         evicted_keys: VecM::default(),
     })
@@ -1090,6 +1094,9 @@ fn extract_scp_timing(entry: &LedgerEntry) -> Option<ConfigSettingScpTiming> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_xdr::curr::{
+        LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0, TransactionSet,
+    };
 
     // Note: These tests require proper mocking of BucketManager and Database
     // For now they are placeholder tests
@@ -1108,5 +1115,35 @@ mod tests {
         assert!(config.validate_bucket_hash);
         assert!(config.validate_invariants);
         assert!(config.persist_to_db);
+    }
+
+    #[test]
+    fn test_ledger_close_meta_includes_scp_history() {
+        let scp_entry = ScpHistoryEntry::V0(ScpHistoryEntryV0 {
+            quorum_sets: VecM::default(),
+            ledger_messages: LedgerScpMessages {
+                ledger_seq: 1,
+                messages: VecM::default(),
+            },
+        });
+        let close_data = LedgerCloseData::new(
+            1,
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash::from(Hash256::ZERO),
+                txs: VecM::default(),
+            }),
+            0,
+            Hash256::ZERO,
+        )
+        .with_scp_history(vec![scp_entry.clone()]);
+
+        let header = create_genesis_header();
+        let meta = build_ledger_close_meta(&close_data, &header, Hash256::ZERO, &[]);
+        let scp_info_len = match meta {
+            LedgerCloseMeta::V0(_) => 0,
+            LedgerCloseMeta::V1(v1) => v1.scp_info.len(),
+            LedgerCloseMeta::V2(v2) => v2.scp_info.len(),
+        };
+        assert_eq!(scp_info_len, 1);
     }
 }

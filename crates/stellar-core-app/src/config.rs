@@ -139,11 +139,13 @@ impl QuorumSetConfig {
         let total = validators.len() + inner_sets.len();
         let threshold = ((total as u32 * self.threshold_percent) / 100).max(1);
 
-        Some(ScpQuorumSet {
+        let mut quorum_set = ScpQuorumSet {
             threshold,
             validators: validators.try_into().ok()?,
             inner_sets: inner_sets.try_into().ok()?,
-        })
+        };
+        stellar_core_scp::normalize_quorum_set(&mut quorum_set);
+        Some(quorum_set)
     }
 }
 
@@ -832,6 +834,14 @@ impl AppConfig {
             {
                 anyhow::bail!("Validators must have a quorum set configured");
             }
+            let quorum_set = self
+                .node
+                .quorum_set
+                .to_xdr()
+                .ok_or_else(|| anyhow::anyhow!("Invalid quorum set configuration"))?;
+            if let Err(err) = stellar_core_scp::is_quorum_set_sane(&quorum_set, true) {
+                anyhow::bail!("Invalid quorum set: {}", err);
+            }
         }
 
         Ok(())
@@ -986,6 +996,23 @@ mod tests {
     }
 
     #[test]
+    fn test_validation_validator_with_unsafe_quorum() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed = Some(
+            "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string(),
+        );
+        config.node.quorum_set.validators = vec![
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string(),
+            "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQB4".to_string(),
+        ];
+        config.node.quorum_set.threshold_percent = 50;
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_network_id() {
         let config = AppConfig::testnet();
         let network_id = config.network_id();
@@ -999,5 +1026,28 @@ mod tests {
         assert!(!sample.is_empty());
         assert!(sample.contains("[node]"));
         assert!(sample.contains("[network]"));
+    }
+
+    #[test]
+    fn test_quorum_set_normalizes_validators() {
+        let mut config = AppConfig::default();
+        let first_key = stellar_core_scp::quorum_config::known_validators::TESTNET_VALIDATORS[0];
+        let second_key = stellar_core_scp::quorum_config::known_validators::TESTNET_VALIDATORS[1];
+        config.node.quorum_set.validators = vec![second_key.to_string(), first_key.to_string()];
+        config.node.quorum_set.threshold_percent = 67;
+
+        let quorum_set = config.node.quorum_set.to_xdr().expect("quorum set");
+        let validators: Vec<_> = quorum_set.validators.iter().cloned().collect();
+
+        assert_eq!(validators.len(), 2);
+        let bytes: Vec<[u8; 32]> = validators
+            .iter()
+            .map(|node_id| match &node_id.0 {
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::curr::Uint256(bytes),
+                ) => *bytes,
+            })
+            .collect();
+        assert!(bytes[0] <= bytes[1]);
     }
 }
