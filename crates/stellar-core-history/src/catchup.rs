@@ -862,6 +862,18 @@ impl CatchupManager {
                 }
             }
 
+            // Log the HAS hashes before restoration
+            for level_idx in 0..5 {
+                if let Some((curr, snap)) = has.hot_archive_bucket_hashes_at_level(level_idx) {
+                    info!(
+                        "Hot archive HAS level {} hashes: curr={}, snap={}",
+                        level_idx,
+                        curr.map_or("None".to_string(), |h| h.to_hex()),
+                        snap.map_or("None".to_string(), |h| h.to_hex())
+                    );
+                }
+            }
+
             let hot_bucket_list = BucketList::restore_from_hashes(&hot_hashes, load_bucket)
                 .map_err(|e| HistoryError::CatchupFailed(format!("Failed to restore hot archive bucket list: {}", e)))?;
 
@@ -869,6 +881,16 @@ impl CatchupManager {
                 "Hot archive bucket list restored: {} total entries",
                 hot_bucket_list.stats().total_entries
             );
+
+            // Log the restored bucket list state
+            for (level_idx, level) in hot_bucket_list.levels().iter().enumerate().take(5) {
+                info!(
+                    "Hot archive restored level {}: curr={}, snap={}",
+                    level_idx,
+                    level.curr.hash().to_hex(),
+                    level.snap.hash().to_hex()
+                );
+            }
 
             Some(hot_bucket_list)
         } else {

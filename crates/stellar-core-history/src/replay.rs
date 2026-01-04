@@ -327,13 +327,23 @@ pub fn replay_ledger_with_execution(
         )
         .map_err(HistoryError::Bucket)?;
 
-    // NOTE: We do NOT update the hot archive bucket list during replay.
-    // The hot archive only receives entries when temporary entries are evicted,
-    // which we don't simulate during catchup. The hot archive hash from the HAS
-    // checkpoint is used as-is for the combined bucket list hash computation.
+    // NOTE: We do NOT update the hot archive bucket list during catchup/replay.
+    // During catchup, we're replaying transactions that have already been applied.
+    // The hot archive only changes when there are actual evictions, which we don't
+    // simulate during replay. The hot archive hash from the checkpoint HAS is used
+    // directly for the combined bucket list hash computation.
+    //
+    // TODO: Investigate why C++ stellar-core's hash differs - maybe the hot archive
+    // spill schedule runs differently or the combined hash formula is different.
 
     if config.verify_bucket_list {
         let expected = Hash256::from(header.bucket_list_hash.0);
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            protocol_version = header.ledger_version,
+            expected_hash = %expected.to_hex(),
+            "Verifying bucket list hash"
+        );
         let actual = combined_bucket_list_hash(
             bucket_list,
             hot_archive_bucket_list.as_deref(),
@@ -341,8 +351,9 @@ pub fn replay_ledger_with_execution(
         );
         if actual != expected {
             return Err(HistoryError::VerificationFailed(format!(
-                "bucket list hash mismatch at ledger {} (expected {}, got {})",
+                "bucket list hash mismatch at ledger {} protocol {} (expected {}, got {})",
                 header.ledger_seq,
+                header.ledger_version,
                 expected.to_hex(),
                 actual.to_hex()
             )));
