@@ -601,8 +601,20 @@ impl Default for AppConfig {
 impl AppConfig {
     /// Create a default testnet configuration.
     pub fn testnet() -> Self {
+        use stellar_core_scp::quorum_config::known_validators;
+
         Self {
-            node: NodeConfig::default(),
+            node: NodeConfig {
+                quorum_set: QuorumSetConfig {
+                    threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT,
+                    validators: known_validators::TESTNET_VALIDATORS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    inner_sets: Vec::new(),
+                },
+                ..Default::default()
+            },
             network: NetworkConfig::testnet(),
             upgrades: UpgradeConfig::default(),
             database: DatabaseConfig::default(),
@@ -655,8 +667,20 @@ impl AppConfig {
 
     /// Create a default mainnet configuration.
     pub fn mainnet() -> Self {
+        use stellar_core_scp::quorum_config::known_validators;
+
         Self {
-            node: NodeConfig::default(),
+            node: NodeConfig {
+                quorum_set: QuorumSetConfig {
+                    threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT,
+                    validators: known_validators::MAINNET_SDF_VALIDATORS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    inner_sets: Vec::new(),
+                },
+                ..Default::default()
+            },
             network: NetworkConfig::mainnet(),
             upgrades: UpgradeConfig::default(),
             database: DatabaseConfig::default(),

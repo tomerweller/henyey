@@ -2736,178 +2736,153 @@ impl App {
             "Evaluating buffered catchup"
         );
 
-        if first_buffered == current_ledger + 1 {
-            // Sequential ledger case - check if we can close it or need recovery
-            let has_tx_set = {
-                let buffer = self.syncing_ledgers.read().await;
-                buffer.get(&first_buffered).map_or(false, |info| info.tx_set.is_some())
+        // Check if sequential ledger has tx set available
+        let sequential_with_tx_set = if first_buffered == current_ledger + 1 {
+            let buffer = self.syncing_ledgers.read().await;
+            buffer.get(&first_buffered).map_or(false, |info| info.tx_set.is_some())
+        } else {
+            false
+        };
+
+        if sequential_with_tx_set {
+            // Tx set is available, clear stuck state and let normal flow handle it
+            *self.consensus_stuck_state.write().await = None;
+            tracing::info!(
+                current_ledger,
+                first_buffered,
+                "Sequential ledger available; skipping buffered catchup"
+            );
+            return;
+        }
+
+        // Calculate gap and determine catchup strategy
+        let gap = first_buffered.saturating_sub(current_ledger);
+        let large_gap = gap >= CHECKPOINT_FREQUENCY && first_buffered > current_ledger + 1;
+
+        // Check if we can trigger immediate catchup (upstream behavior)
+        let can_trigger_immediate = if large_gap {
+            // Large gap - trigger immediately to first_buffered - 1
+            true
+        } else if Self::is_first_ledger_in_checkpoint(first_buffered) && first_buffered < last_buffered {
+            // First buffered is checkpoint boundary AND we have multiple buffered ledgers
+            // This matches upstream: catchup to first_buffered - 1
+            true
+        } else {
+            false
+        };
+
+        // If we can't trigger immediate catchup, check if we should wait for trigger
+        // or if we're stuck and need timeout-based catchup
+        if !can_trigger_immediate {
+            let (required_first, trigger) = if Self::is_first_ledger_in_checkpoint(first_buffered) {
+                (first_buffered, first_buffered.saturating_add(1))
+            } else {
+                let required_first =
+                    Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY);
+                (required_first, required_first.saturating_add(1))
             };
 
-            if has_tx_set {
-                // Tx set is available, clear stuck state and let normal flow handle it
-                *self.consensus_stuck_state.write().await = None;
-                tracing::info!(
-                    current_ledger,
-                    first_buffered,
-                    "Sequential ledger available; skipping buffered catchup"
-                );
-                return;
-            }
+            // Check if we have the trigger ledger
+            if last_buffered >= trigger {
+                // We have enough buffered ledgers - proceed to catchup below
+            } else {
+                // We're waiting for trigger - apply consensus stuck timeout
+                // This handles the case where we have a gap but can't reach the trigger
+                let now = Instant::now();
+                let action = {
+                    let mut stuck_state = self.consensus_stuck_state.write().await;
+                    match stuck_state.as_mut() {
+                        Some(state) if state.current_ledger == current_ledger
+                                    && state.first_buffered == first_buffered => {
+                            let elapsed = state.stuck_start.elapsed().as_secs();
+                            let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
 
-            // Tx set is missing - implement C++ out-of-sync recovery behavior
-            let now = Instant::now();
-            let action = {
-                let mut stuck_state = self.consensus_stuck_state.write().await;
-                match stuck_state.as_mut() {
-                    Some(state) if state.current_ledger == current_ledger
-                                && state.first_buffered == first_buffered => {
-                        // Already tracking this stuck condition
-                        let elapsed = state.stuck_start.elapsed().as_secs();
-                        let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
-
-                        if elapsed >= CONSENSUS_STUCK_TIMEOUT_SECS {
-                            // Timeout expired - trigger catchup
-                            tracing::warn!(
-                                current_ledger,
-                                first_buffered,
-                                elapsed_secs = elapsed,
-                                recovery_attempts = state.recovery_attempts,
-                                "Consensus stuck timeout; triggering catchup"
-                            );
-                            *stuck_state = None;
-                            ConsensusStuckAction::TriggerCatchup
-                        } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
-                            // Time for another recovery attempt
-                            state.last_recovery_attempt = now;
-                            state.recovery_attempts += 1;
+                            if elapsed >= CONSENSUS_STUCK_TIMEOUT_SECS {
+                                tracing::warn!(
+                                    current_ledger,
+                                    first_buffered,
+                                    last_buffered,
+                                    required_first,
+                                    trigger,
+                                    elapsed_secs = elapsed,
+                                    recovery_attempts = state.recovery_attempts,
+                                    "Buffered catchup stuck timeout; triggering catchup"
+                                );
+                                *stuck_state = None;
+                                ConsensusStuckAction::TriggerCatchup
+                            } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
+                                state.last_recovery_attempt = now;
+                                state.recovery_attempts += 1;
+                                tracing::info!(
+                                    current_ledger,
+                                    first_buffered,
+                                    elapsed_secs = elapsed,
+                                    recovery_attempts = state.recovery_attempts,
+                                    timeout_secs = CONSENSUS_STUCK_TIMEOUT_SECS,
+                                    "Attempting out-of-sync recovery (buffered gap)"
+                                );
+                                ConsensusStuckAction::AttemptRecovery
+                            } else {
+                                tracing::debug!(
+                                    current_ledger,
+                                    first_buffered,
+                                    last_buffered,
+                                    required_first,
+                                    trigger,
+                                    elapsed_secs = elapsed,
+                                    "Waiting for buffered catchup trigger ledger"
+                                );
+                                ConsensusStuckAction::Wait
+                            }
+                        }
+                        _ => {
                             tracing::info!(
                                 current_ledger,
                                 first_buffered,
-                                elapsed_secs = elapsed,
-                                recovery_attempts = state.recovery_attempts,
-                                timeout_secs = CONSENSUS_STUCK_TIMEOUT_SECS,
-                                "Attempting out-of-sync recovery"
+                                last_buffered,
+                                required_first,
+                                trigger,
+                                "Buffered gap detected; starting recovery timer"
                             );
-                            ConsensusStuckAction::AttemptRecovery
-                        } else {
-                            // Still waiting
-                            tracing::debug!(
+                            *stuck_state = Some(ConsensusStuckState {
                                 current_ledger,
                                 first_buffered,
-                                elapsed_secs = elapsed,
-                                next_recovery_in = OUT_OF_SYNC_RECOVERY_TIMER_SECS.saturating_sub(since_recovery),
-                                "Waiting for sequential ledger tx set"
-                            );
-                            ConsensusStuckAction::Wait
+                                stuck_start: now,
+                                last_recovery_attempt: now,
+                                recovery_attempts: 0,
+                            });
+                            ConsensusStuckAction::AttemptRecovery
                         }
                     }
-                    _ => {
-                        // Start tracking this stuck condition
-                        tracing::info!(
-                            current_ledger,
-                            first_buffered,
-                            "Consensus stuck detected; starting recovery timer"
-                        );
-                        *stuck_state = Some(ConsensusStuckState {
-                            current_ledger,
-                            first_buffered,
-                            stuck_start: now,
-                            last_recovery_attempt: now,
-                            recovery_attempts: 0,
-                        });
-                        // Immediately attempt first recovery
-                        ConsensusStuckAction::AttemptRecovery
+                };
+
+                match action {
+                    ConsensusStuckAction::Wait => return,
+                    ConsensusStuckAction::AttemptRecovery => {
+                        self.out_of_sync_recovery(current_ledger).await;
+                        return;
                     }
-                }
-            };
-
-            match action {
-                ConsensusStuckAction::Wait => return,
-                ConsensusStuckAction::AttemptRecovery => {
-                    // C++ out-of-sync recovery: broadcast recent SCP messages and request state
-                    self.out_of_sync_recovery(current_ledger).await;
-                    return;
-                }
-                ConsensusStuckAction::TriggerCatchup => {
-                    // Recovery attempts exhausted - trigger catchup
-                    let timeout_target = Self::compute_catchup_target_for_timeout(last_buffered);
-                    if let Some(target) = timeout_target {
-                        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
-                            tracing::info!("Timeout catchup already in progress");
-                            return;
-                        }
-
-                        tracing::info!(
-                            current_ledger,
-                            target,
-                            last_buffered,
-                            "Starting catchup after consensus stuck timeout"
-                        );
-
-                        let catchup_result = self.catchup(CatchupTarget::Ledger(target)).await;
-                        self.catchup_in_progress.store(false, Ordering::SeqCst);
-
-                        match catchup_result {
-                            Ok(result) => {
-                                *self.current_ledger.write().await = result.ledger_seq;
-                                *self.last_processed_slot.write().await = result.ledger_seq as u64;
-                                self.clear_tx_advert_history(result.ledger_seq).await;
-                                self.herder.bootstrap(result.ledger_seq);
-                                let cleaned = self
-                                    .herder
-                                    .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
-                                if cleaned > 0 {
-                                    tracing::info!(cleaned, "Dropped stale pending tx set requests after recovery catchup");
-                                }
-                                self.prune_tx_set_tracking().await;
-                                if self.is_validator {
-                                    self.set_state(AppState::Validating).await;
-                                } else {
-                                    self.set_state(AppState::Synced).await;
-                                }
-                                tracing::info!(
-                                    ledger_seq = result.ledger_seq,
-                                    "Recovery catchup complete"
-                                );
-                                self.try_apply_buffered_ledgers().await;
-                            }
-                            Err(err) => {
-                                tracing::error!(error = %err, "Recovery catchup failed");
-                            }
-                        }
+                    ConsensusStuckAction::TriggerCatchup => {
+                        // Fall through to catchup below
                     }
-                    return;
                 }
             }
         }
 
-        let gap = first_buffered.saturating_sub(current_ledger);
-        let large_gap = gap >= CHECKPOINT_FREQUENCY && first_buffered > current_ledger + 1;
-        let (required_first, trigger) = if large_gap {
-            (0, 0)
-        } else if Self::is_first_ledger_in_checkpoint(first_buffered) {
-            let required_first = first_buffered;
-            (required_first, required_first.saturating_add(1))
-        } else {
-            let required_first =
-                Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY);
-            (required_first, required_first.saturating_add(1))
-        };
+        // Determine catchup target
         let target = Self::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
-        if target.is_none() {
-            if !large_gap {
-                tracing::info!(
-                    current_ledger,
-                    first_buffered,
-                    last_buffered,
-                    required_first,
-                    trigger,
-                    "Waiting for buffered catchup trigger ledger"
-                );
+        let target = match target {
+            Some(t) => t,
+            None => {
+                // Fallback: use timeout-based target if buffered_catchup_target returns None
+                // but we've decided to catchup due to timeout
+                match Self::compute_catchup_target_for_timeout(last_buffered) {
+                    Some(t) => t,
+                    None => return,
+                }
             }
-            return;
-        }
-        let target = target.unwrap();
+        };
+
         if large_gap {
             tracing::info!(
                 current_ledger,
