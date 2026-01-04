@@ -225,6 +225,29 @@ enum OfflineCommands {
         /// Path to bucket directory
         path: PathBuf,
     },
+
+    /// Replay ledgers from history and test for hash mismatches
+    ReplayTest {
+        /// Start ledger sequence (defaults to a recent checkpoint)
+        #[arg(long)]
+        from: Option<u32>,
+
+        /// End ledger sequence (defaults to latest available)
+        #[arg(long)]
+        to: Option<u32>,
+
+        /// Stop on first mismatch
+        #[arg(long)]
+        stop_on_error: bool,
+
+        /// Compare local results against history (slower but more detailed)
+        #[arg(long)]
+        compare_results: bool,
+
+        /// Skip invariant checking (faster)
+        #[arg(long)]
+        skip_invariants: bool,
+    },
 }
 
 #[tokio::main]
@@ -268,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::SampleConfig => cmd_sample_config(),
 
-        Commands::Offline(cmd) => cmd_offline(cmd),
+        Commands::Offline(cmd) => cmd_offline(cmd, config),
     }
 }
 
@@ -1231,6 +1254,240 @@ fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Replay test command handler - replays ledgers from history and checks for hash mismatches.
+async fn cmd_replay_test(
+    config: AppConfig,
+    from: Option<u32>,
+    to: Option<u32>,
+    stop_on_error: bool,
+    compare_results: bool,
+    skip_invariants: bool,
+) -> anyhow::Result<()> {
+    use stellar_core_bucket::{BucketList, BucketManager};
+    use stellar_core_common::{Hash256, NetworkId};
+    use stellar_core_history::{HistoryArchive, checkpoint, replay::{replay_ledger_with_execution, ReplayConfig}};
+    use stellar_core_ledger::TransactionSetVariant;
+    use stellar_xdr::curr::TransactionHistoryEntryExt;
+
+    println!("Replay Test - Testing ledger close hash parity");
+    println!();
+
+    // Create archive clients from config
+    let archives: Vec<HistoryArchive> = config.history.archives
+        .iter()
+        .filter(|a| a.get_enabled)
+        .filter_map(|a| {
+            match HistoryArchive::new(&a.url) {
+                Ok(archive) => Some(archive),
+                Err(e) => {
+                    println!("Warning: Failed to create archive {}: {}", a.url, e);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if archives.is_empty() {
+        anyhow::bail!("No history archives available");
+    }
+
+    let archive = &archives[0];
+    println!("Using archive: {}", config.history.archives[0].url);
+
+    // Get current ledger from archive
+    let root_has = archive.get_root_has().await?;
+    let current_ledger = root_has.current_ledger;
+    println!("Archive current ledger: {}", current_ledger);
+
+    // Calculate range - default to last ~1000 ledgers (about 1.4 hours)
+    let end_checkpoint = to.map(|l| checkpoint::checkpoint_containing(l))
+        .unwrap_or_else(|| checkpoint::latest_checkpoint_before_or_at(current_ledger).unwrap_or(current_ledger));
+
+    let start_checkpoint = from.map(|l| checkpoint::checkpoint_containing(l))
+        .unwrap_or_else(|| {
+            // Default to ~16 checkpoints back (~1000 ledgers)
+            let checkpoints_back = 16u32;
+            let freq = stellar_core_history::CHECKPOINT_FREQUENCY;
+            end_checkpoint.saturating_sub(checkpoints_back * freq)
+                .max(freq - 1) // Minimum is first checkpoint (63)
+        });
+
+    println!("Testing checkpoints {} to {}", start_checkpoint, end_checkpoint);
+    println!();
+
+    // Setup bucket manager
+    let bucket_dir = tempfile::tempdir()?;
+    let bucket_manager = BucketManager::new(bucket_dir.path().to_path_buf())?;
+
+    // Get the initial checkpoint state
+    println!("Downloading initial state at checkpoint {}...", start_checkpoint);
+    let start_has = archive.get_checkpoint_has(start_checkpoint).await?;
+
+    // Download and restore bucket list
+    let bucket_hashes: Vec<Hash256> = start_has.current_buckets
+        .iter()
+        .flat_map(|level| {
+            vec![
+                Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+                Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+            ]
+        })
+        .collect();
+
+    println!("Downloading {} buckets...", bucket_hashes.iter().filter(|h| !h.is_zero()).count());
+    for hash in &bucket_hashes {
+        if !hash.is_zero() {
+            if bucket_manager.load_bucket(hash).is_err() {
+                let bucket_data = archive.get_bucket(hash).await?;
+                bucket_manager.import_bucket(&bucket_data)?;
+            }
+        }
+    }
+
+    // Restore bucket list
+    let mut bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
+        bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+    })?;
+
+    let network_id = NetworkId::from_passphrase(&config.network.passphrase);
+
+    // Replay configuration
+    let replay_config = ReplayConfig {
+        verify_results: compare_results,
+        verify_bucket_list: true,
+        verify_invariants: !skip_invariants,
+        emit_classic_events: false,
+        backfill_stellar_asset_events: false,
+    };
+
+    // Track results
+    let mut ledgers_tested = 0u32;
+    let mut mismatches = 0u32;
+    let mut first_mismatch: Option<u32> = None;
+
+    // Iterate through checkpoints
+    let mut current_cp = start_checkpoint;
+    while current_cp <= end_checkpoint {
+        let next_cp = checkpoint::next_checkpoint(current_cp);
+        let cp_end = next_cp.min(end_checkpoint);
+
+        println!("Processing checkpoint {} (ledgers {} to {})...", current_cp, current_cp + 1, cp_end);
+
+        // Download ledger data for this checkpoint
+        let headers = archive.get_ledger_headers(current_cp).await?;
+        let tx_entries = archive.get_transactions(current_cp).await?;
+        let results = archive.get_results(current_cp).await?;
+
+        // Build maps for quick lookup
+        let tx_map: std::collections::HashMap<u32, _> = tx_entries
+            .iter()
+            .map(|e| (e.ledger_seq, e))
+            .collect();
+        let result_map: std::collections::HashMap<u32, _> = results
+            .iter()
+            .map(|e| (e.ledger_seq, e))
+            .collect();
+
+        // Replay each ledger in the checkpoint
+        for header_entry in &headers {
+            let header = &header_entry.header;
+            let seq = header.ledger_seq;
+
+            // Skip ledgers before our start or after our end
+            if seq <= start_checkpoint || seq > cp_end {
+                continue;
+            }
+
+            let Some(tx_entry) = tx_map.get(&seq) else {
+                println!("  Ledger {}: SKIP (no tx entry)", seq);
+                continue;
+            };
+            let Some(result_entry) = result_map.get(&seq) else {
+                println!("  Ledger {}: SKIP (no result entry)", seq);
+                continue;
+            };
+
+            // Convert tx set
+            let tx_set = match &tx_entry.ext {
+                TransactionHistoryEntryExt::V1(generalized) => {
+                    TransactionSetVariant::Generalized(generalized.clone())
+                }
+                TransactionHistoryEntryExt::V0 => {
+                    TransactionSetVariant::Classic(tx_entry.tx_set.clone())
+                }
+            };
+
+            // Get expected results for comparison
+            let expected_results: Vec<_> = result_entry.tx_result_set.results.to_vec();
+
+            // Replay the ledger
+            match replay_ledger_with_execution(
+                header,
+                &tx_set,
+                &mut bucket_list,
+                None, // hot_archive_bucket_list
+                &network_id,
+                &replay_config,
+                if compare_results { Some(&expected_results) } else { None },
+            ) {
+                Ok(result) => {
+                    let expected_hash = Hash256::from(header_entry.hash.0);
+                    if result.ledger_hash == expected_hash {
+                        println!("  Ledger {}: OK (txs={}, ops={})", seq, result.tx_count, result.op_count);
+                    } else {
+                        println!("  Ledger {}: HASH MISMATCH", seq);
+                        println!("    Expected: {}", expected_hash.to_hex());
+                        println!("    Got:      {}", result.ledger_hash.to_hex());
+                        mismatches += 1;
+                        if first_mismatch.is_none() {
+                            first_mismatch = Some(seq);
+                        }
+                        if stop_on_error {
+                            println!();
+                            println!("Stopping on first error (--stop-on-error)");
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  Ledger {}: ERROR - {}", seq, e);
+                    mismatches += 1;
+                    if first_mismatch.is_none() {
+                        first_mismatch = Some(seq);
+                    }
+                    if stop_on_error {
+                        println!();
+                        println!("Stopping on first error (--stop-on-error)");
+                        break;
+                    }
+                }
+            }
+
+            ledgers_tested += 1;
+        }
+
+        if stop_on_error && mismatches > 0 {
+            break;
+        }
+
+        current_cp = next_cp;
+    }
+
+    println!();
+    println!("Replay Test Complete");
+    println!("  Ledgers tested: {}", ledgers_tested);
+    println!("  Mismatches: {}", mismatches);
+    if let Some(first) = first_mismatch {
+        println!("  First mismatch at ledger: {}", first);
+    }
+
+    if mismatches > 0 {
+        anyhow::bail!("Replay test failed with {} mismatches", mismatches);
+    }
+
+    Ok(())
+}
+
 /// Sample config command handler.
 fn cmd_sample_config() -> anyhow::Result<()> {
     let sample = AppConfig::sample_config();
@@ -1239,7 +1496,7 @@ fn cmd_sample_config() -> anyhow::Result<()> {
 }
 
 /// Offline commands handler.
-fn cmd_offline(cmd: OfflineCommands) -> anyhow::Result<()> {
+fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<()> {
     match cmd {
         OfflineCommands::ConvertKey { key } => {
             convert_key(&key)
@@ -1252,6 +1509,16 @@ fn cmd_offline(cmd: OfflineCommands) -> anyhow::Result<()> {
         }
         OfflineCommands::BucketInfo { path } => {
             bucket_info(&path)
+        }
+        OfflineCommands::ReplayTest {
+            from,
+            to,
+            stop_on_error,
+            compare_results,
+            skip_invariants,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cmd_replay_test(config, from, to, stop_on_error, compare_results, skip_invariants))
         }
     }
 }
