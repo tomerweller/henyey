@@ -126,7 +126,26 @@ impl Bucket {
 
     /// Create a bucket from uncompressed XDR bytes.
     pub fn from_xdr_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::from_xdr_bytes_internal(bytes, true)
+        let bucket = Self::from_xdr_bytes_internal(bytes, true)?;
+
+        // Debug: verify that re-serializing entries produces the same hash
+        if let BucketStorage::InMemory { entries, .. } = &bucket.storage {
+            if !entries.is_empty() {
+                let reserialized = Self::serialize_entries(entries)?;
+                let reserialized_hash = Hash256::hash(&reserialized);
+                if reserialized_hash != bucket.hash {
+                    tracing::warn!(
+                        original_hash = %bucket.hash,
+                        reserialized_hash = %reserialized_hash,
+                        original_len = bytes.len(),
+                        reserialized_len = reserialized.len(),
+                        "Bucket roundtrip hash mismatch detected"
+                    );
+                }
+            }
+        }
+
+        Ok(bucket)
     }
 
     /// Create a bucket from uncompressed XDR bytes without building the key index.

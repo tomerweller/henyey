@@ -226,7 +226,7 @@ impl CatchupManager {
 
         // Step 4: Apply buckets to build initial state
         self.update_progress(CatchupStatus::ApplyingBuckets, 3, "Applying buckets to build initial state");
-        let (mut bucket_list, hot_archive_bucket_list) = self.apply_buckets(&has, &buckets).await?;
+        let (mut bucket_list, mut hot_archive_bucket_list) = self.apply_buckets(&has, &buckets).await?;
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         // Step 5: Download ledger data from checkpoint to target
@@ -255,7 +255,7 @@ impl CatchupManager {
         } else {
             // Replay ledgers to reach target
             let final_state = self
-                .replay_ledgers(&mut bucket_list, hot_archive_bucket_list.as_ref(), &ledger_data, network_id)
+                .replay_ledgers(&mut bucket_list, hot_archive_bucket_list.as_mut(), &ledger_data, network_id)
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
             // Get the final header from replay
@@ -363,7 +363,7 @@ impl CatchupManager {
             3,
             "Applying buckets to build initial state",
         );
-        let (mut bucket_list, hot_archive_bucket_list) =
+        let (mut bucket_list, mut hot_archive_bucket_list) =
             self.apply_buckets(&data.has, &buckets).await?;
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
@@ -420,7 +420,7 @@ impl CatchupManager {
             (checkpoint_header, header_hash, 0)
         } else {
             let final_state = self
-                .replay_ledgers(&mut bucket_list, hot_archive_bucket_list.as_ref(), &ledger_data, network_id)
+                .replay_ledgers(&mut bucket_list, hot_archive_bucket_list.as_mut(), &ledger_data, network_id)
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
             let final_header = data
@@ -1325,7 +1325,7 @@ impl CatchupManager {
     async fn replay_ledgers(
         &mut self,
         bucket_list: &mut BucketList,
-        hot_archive_bucket_list: Option<&BucketList>,
+        mut hot_archive_bucket_list: Option<&mut BucketList>,
         ledger_data: &[LedgerData],
         network_id: NetworkId,
     ) -> Result<ReplayedLedgerState> {
@@ -1362,14 +1362,14 @@ impl CatchupManager {
                 &data.header,
                 &data.tx_set,
                 bucket_list,
-                hot_archive_bucket_list,
+                hot_archive_bucket_list.as_deref_mut(),
                 &network_id,
                 &self.replay_config,
                 Some(&data.tx_results),
             )?;
             if let (Some(prev_header), Some(manager)) = (last_header.as_ref(), invariants.as_ref()) {
                 let full_entries = bucket_list.live_entries()?;
-                let bucket_list_hash = if let Some(hot_archive) = hot_archive_bucket_list {
+                let bucket_list_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
                     let mut hasher = sha2::Sha256::new();
                     hasher.update(bucket_list.hash().as_bytes());
                     hasher.update(hot_archive.hash().as_bytes());

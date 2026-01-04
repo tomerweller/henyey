@@ -19,7 +19,7 @@ use stellar_core_common::Hash256;
 
 use crate::bucket::Bucket;
 use crate::entry::BucketEntry;
-use crate::merge::merge_buckets;
+use crate::merge::merge_buckets_with_options;
 use crate::{BucketError, Result};
 
 /// Number of levels in the BucketList.
@@ -92,32 +92,48 @@ impl BucketLevel {
         }
     }
 
-    /// Snap the current bucket and clear curr.
+    /// Snap the current bucket: move curr→snap, return the old curr.
+    ///
+    /// This matches C++ stellar-core's BucketLevel::snap() which:
+    /// 1. Moves curr to snap (replacing old snap)
+    /// 2. Sets curr to empty
+    /// 3. Returns the new snap (which is the old curr)
+    ///
+    /// The returned bucket is what flows to the next level during a spill.
     fn snap(&mut self) -> Bucket {
-        let curr = std::mem::replace(&mut self.curr, Bucket::empty());
-        self.snap = curr.clone();
-        curr
+        let old_curr = std::mem::replace(&mut self.curr, Bucket::empty());
+        self.snap = old_curr.clone();
+        old_curr
     }
 
-    /// Prepare the next bucket for this level.
+    /// Prepare the next bucket for this level with explicit INIT normalization control.
     ///
-    /// This merges the current bucket (self.curr) with the incoming snap bucket.
-    /// The curr may be empty if this level was already snapped from a higher level's
-    /// processing - this is handled naturally by processing levels from high to low.
-    fn prepare(
+    /// This merges the current bucket (self.curr) with the incoming bucket.
+    /// The curr may be empty if this level was already snapped from processing
+    /// higher levels first.
+    ///
+    /// - `normalize_init`: If true, INIT entries are converted to LIVE (for level crossings)
+    fn prepare_with_normalization(
         &mut self,
         _ledger_seq: u32,
         protocol_version: u32,
-        snap: Bucket,
+        incoming: Bucket,
         keep_dead_entries: bool,
+        normalize_init: bool,
     ) -> Result<()> {
         if self.next.is_some() {
             return Err(BucketError::Merge("bucket merge already in progress".to_string()));
         }
 
-        // Merge curr with the incoming snap
+        // Merge curr with the incoming bucket
         // curr may be empty if this level was already snapped
-        let merged = merge_buckets(&self.curr, &snap, keep_dead_entries, protocol_version)?;
+        let merged = merge_buckets_with_options(
+            &self.curr,
+            &incoming,
+            keep_dead_entries,
+            protocol_version,
+            normalize_init,
+        )?;
         self.next = Some(merged);
         Ok(())
     }
@@ -343,80 +359,86 @@ impl BucketList {
             "add_batch_internal: starting spill processing"
         );
 
-        // Step 1: First, apply new entries to level 0
-        // Level 0's curr is merged with the new bucket
-        tracing::debug!(
-            curr_hash = %self.levels[0].curr.hash(),
-            snap_hash = %self.levels[0].snap.hash(),
-            new_bucket_hash = %new_bucket.hash(),
-            "Level 0 before"
-        );
-
-        self.levels[0].commit();
-        let keep_dead_0 = Self::keep_tombstone_entries(0);
-        self.levels[0].prepare(ledger_seq, protocol_version, new_bucket, keep_dead_0)?;
-        self.levels[0].commit();
-
-        tracing::debug!(
-            curr_hash = %self.levels[0].curr.hash(),
-            snap_hash = %self.levels[0].snap.hash(),
-            "Level 0 after merge"
-        );
-
-        // Step 2: Process spills from level 0 upward
-        // Each level that spills sends its ORIGINAL curr to the next level.
-        // The receiving level merges with its ORIGINAL curr (not a cascaded result).
+        // Step 1: Process spills from highest level down to level 1
+        // This matches C++ stellar-core's BucketListBase::addBatchInternal
         //
-        // Algorithm:
-        //   1. Collect all ORIGINAL curr values for both spilling and receiving levels
-        //   2. Snap each spilling level (curr -> snap, curr = empty)
-        //   3. For each receiving level, merge its ORIGINAL curr with incoming spill
+        // The key insight is that snap() moves curr→snap and returns the OLD curr.
+        // This OLD curr (not old snap!) is what flows to the next level.
+        //
+        // By processing from highest to lowest, we ensure each level's curr is
+        // available to be snapped before any modifications occur.
 
-        // Collect original curr values
-        let original_currs: Vec<Bucket> = self.levels.iter()
-            .map(|level| level.curr.clone())
-            .collect();
+        for i in (1..BUCKET_LIST_LEVELS).rev() {
+            if Self::level_should_spill(ledger_seq, i - 1) {
+                // Snap level i-1: moves curr→snap, returns OLD curr (new snap)
+                // This is what flows to level i
+                let spilling_curr = self.levels[i - 1].snap();
 
-        // Snap each level that needs to spill
-        for i in 0..(BUCKET_LIST_LEVELS - 1) {
-            if Self::level_should_spill(ledger_seq, i) {
-                // snap: curr -> snap, curr = empty
-                self.levels[i].snap();
+                tracing::debug!(
+                    level = i - 1,
+                    spilling_curr_hash = %spilling_curr.hash(),
+                    new_snap_hash = %self.levels[i - 1].snap.hash(),
+                    "Level snapped"
+                );
+
+                // Commit any pending merge at level i (promotes next→curr)
+                self.levels[i].commit();
+
+                // Prepare level i: merge curr with the spilling_curr from level i-1
+                // In C++ stellar-core, INIT normalization is tied to !keepDeadEntries:
+                // - Levels 0-9: keep_dead=true, so normalize_init=false (INIT stays INIT)
+                // - Level 10: keep_dead=false, so normalize_init=true (INIT becomes LIVE)
+                let keep_dead = Self::keep_tombstone_entries(i);
+                let normalize_init = !keep_dead;
+                self.levels[i].prepare_with_normalization(
+                    ledger_seq,
+                    protocol_version,
+                    spilling_curr,
+                    keep_dead,
+                    normalize_init,
+                )?;
+
                 tracing::debug!(
                     level = i,
-                    new_snap_hash = %self.levels[i].snap.hash(),
-                    "After snap"
+                    "Level prepared with spill from level {}",
+                    i - 1
                 );
             }
         }
 
-        // Merge into next levels using ORIGINAL curr values
-        for i in 0..(BUCKET_LIST_LEVELS - 1) {
-            if Self::level_should_spill(ledger_seq, i) {
-                let spilling = &original_currs[i];
-                let next_level = i + 1;
-                let next_original_curr = &original_currs[next_level];
+        // Step 2: Apply new entries to level 0
+        tracing::info!(
+            curr_hash = %self.levels[0].curr.hash(),
+            snap_hash = %self.levels[0].snap.hash(),
+            new_bucket_hash = %new_bucket.hash(),
+            new_bucket_entries = new_bucket.len(),
+            "Level 0 before merge"
+        );
 
-                tracing::debug!(
-                    level = next_level,
-                    spilling_hash = %spilling.hash(),
-                    original_curr_hash = %next_original_curr.hash(),
-                    "Before merge"
-                );
+        // Prepare level 0: merge curr with new entries
+        // Don't normalize INIT entries at level 0 - they stay as INIT
+        let keep_dead_0 = Self::keep_tombstone_entries(0);
+        self.levels[0].prepare_with_normalization(
+            ledger_seq,
+            protocol_version,
+            new_bucket,
+            keep_dead_0,
+            false, // don't normalize at level 0
+        )?;
+        self.levels[0].commit();
 
-                // Merge original curr with incoming spill
-                let keep_dead = Self::keep_tombstone_entries(next_level);
-                let merged = merge_buckets(next_original_curr, spilling, keep_dead, protocol_version)?;
+        tracing::info!(
+            curr_hash = %self.levels[0].curr.hash(),
+            curr_entries = self.levels[0].curr.len(),
+            snap_hash = %self.levels[0].snap.hash(),
+            "Level 0 after merge"
+        );
 
-                // Set the merged result as the new curr
-                self.levels[next_level].curr = merged;
-
-                tracing::debug!(
-                    level = next_level,
-                    new_curr_hash = %self.levels[next_level].curr.hash(),
-                    "After merge"
-                );
-            }
+        // Step 3: Resolve any ready futures (commit all pending merges)
+        // In C++ stellar-core, this is done by resolveAnyReadyFutures()
+        // Since we're doing synchronous merges, all prepares are already complete
+        for level in &mut self.levels {
+            level.commit();
         }
 
         // Log final state of all levels
@@ -441,14 +463,16 @@ impl BucketList {
         value & !(modulus - 1)
     }
 
-    /// Idealized size of a level for spill boundaries.
-    fn level_size(level: usize) -> u32 {
-        1u32 << (2 * (level + 1))
+    /// Half the idealized size of a level (matches C++ stellar-core's levelHalf).
+    /// Level 0: 2, Level 1: 8, Level 2: 32, Level 3: 128, etc.
+    fn level_half(level: usize) -> u32 {
+        1u32 << (2 * level + 1)
     }
 
-    /// Half the idealized size of a level.
-    fn level_half(level: usize) -> u32 {
-        Self::level_size(level) >> 1
+    /// Idealized size of a level for spill boundaries (matches C++ stellar-core's levelSize).
+    /// Level 0: 4, Level 1: 16, Level 2: 64, Level 3: 256, etc.
+    fn level_size(level: usize) -> u32 {
+        1u32 << (2 * (level + 1))
     }
 
     /// Returns true if a level should spill at a given ledger.

@@ -1365,7 +1365,7 @@ async fn cmd_replay_test(
     })?;
 
     // Restore hot archive bucket list if present
-    let hot_archive_bucket_list: Option<BucketList> = if let Some(ref hashes) = hot_archive_hashes {
+    let mut hot_archive_bucket_list: Option<BucketList> = if let Some(ref hashes) = hot_archive_hashes {
         Some(BucketList::restore_from_hashes(hashes, |hash| {
             bucket_manager.load_bucket(hash).map(|b| (*b).clone())
         })?)
@@ -1373,8 +1373,25 @@ async fn cmd_replay_test(
         None
     };
 
-    if hot_archive_bucket_list.is_some() {
-        println!("Hot archive bucket list restored (Protocol 23+)");
+    // Print restored bucket list hashes for verification
+    println!("Restored bucket list at checkpoint {}:", start_checkpoint);
+    println!("  Live bucket list hash: {}", bucket_list.hash().to_hex());
+    // Debug: Print individual level hashes
+    for (i, level_hash) in bucket_list.all_bucket_hashes().chunks(2).enumerate() {
+        println!("    Level {}: curr={} snap={}",
+            i,
+            level_hash[0].to_hex(),
+            level_hash[1].to_hex()
+        );
+    }
+    if let Some(ref hot_archive) = hot_archive_bucket_list {
+        println!("  Hot archive hash: {}", hot_archive.hash().to_hex());
+        // Compute combined hash
+        let combined = stellar_core_crypto::sha256_multi(&[
+            bucket_list.hash().as_bytes(),
+            hot_archive.hash().as_bytes(),
+        ]);
+        println!("  Combined hash: {}", combined.to_hex());
     }
 
     let network_id = NetworkId::from_passphrase(&config.network.passphrase);
@@ -1403,6 +1420,12 @@ async fn cmd_replay_test(
 
         // Download ledger data for this checkpoint
         let headers = archive.get_ledger_headers(current_cp).await?;
+
+        // Print the checkpoint ledger's bucket_list_hash for verification
+        if let Some(checkpoint_header) = headers.iter().find(|h| h.header.ledger_seq == current_cp) {
+            println!("  Checkpoint {} header.bucket_list_hash = {}",
+                current_cp, Hash256::from(checkpoint_header.header.bucket_list_hash.0).to_hex());
+        }
         let tx_entries = archive.get_transactions(current_cp).await?;
         let results = archive.get_results(current_cp).await?;
 
@@ -1448,12 +1471,20 @@ async fn cmd_replay_test(
             // Get expected results for comparison
             let expected_results: Vec<_> = result_entry.tx_result_set.results.to_vec();
 
+            // Print expected bucket list hash from header
+            println!("  Ledger {}: header.bucket_list_hash = {}",
+                seq, Hash256::from(header.bucket_list_hash.0).to_hex());
+            println!("  Ledger {}: pre-replay live hash = {}",
+                seq, bucket_list.hash().to_hex());
+            println!("  Ledger {}: tx_count in set = {}",
+                seq, tx_set.num_transactions());
+
             // Replay the ledger
             match replay_ledger_with_execution(
                 header,
                 &tx_set,
                 &mut bucket_list,
-                hot_archive_bucket_list.as_ref(),
+                hot_archive_bucket_list.as_mut(),
                 &network_id,
                 &replay_config,
                 if compare_results { Some(&expected_results) } else { None },

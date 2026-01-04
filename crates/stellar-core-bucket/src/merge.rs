@@ -31,21 +31,56 @@ const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 /// - When keys match, the newer entry wins
 /// - Dead entries shadow live entries (the entry is deleted)
 /// - If `keep_dead_entries` is false and a dead entry shadows nothing, it's removed
-/// - Init entries are converted to Live entries when merged with older buckets
+/// - Init entries are converted to Live entries when crossing level boundaries
+///
+/// Note: This wrapper always normalizes INIT→LIVE for backward compatibility with
+/// tests. For bucket list operations, use `merge_buckets_with_options`.
 pub fn merge_buckets(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
     keep_dead_entries: bool,
     max_protocol_version: u32,
 ) -> Result<Bucket> {
+    merge_buckets_with_options(old_bucket, new_bucket, keep_dead_entries, max_protocol_version, true)
+}
+
+/// Merge two buckets into a new bucket with explicit normalization control.
+///
+/// # Arguments
+/// * `old_bucket` - The older bucket (entries may be shadowed)
+/// * `new_bucket` - The newer bucket (entries take precedence)
+/// * `keep_dead_entries` - Whether to keep dead entries in the output
+/// * `max_protocol_version` - Maximum protocol version allowed for the merge
+/// * `normalize_init_entries` - Whether to convert INIT entries to LIVE entries.
+///   Set to true when merging spills (crossing level boundaries), false for
+///   same-level merges (e.g., at level 0).
+///
+/// # Merge Semantics
+/// - When keys match, the newer entry wins
+/// - Dead entries shadow live entries (the entry is deleted)
+/// - If `keep_dead_entries` is false and a dead entry shadows nothing, it's removed
+/// - Init entries are converted to Live entries only if `normalize_init_entries` is true
+pub fn merge_buckets_with_options(
+    old_bucket: &Bucket,
+    new_bucket: &Bucket,
+    keep_dead_entries: bool,
+    max_protocol_version: u32,
+    normalize_init_entries: bool,
+) -> Result<Bucket> {
     // Fast path: if new is empty, return old unchanged.
     if new_bucket.is_empty() {
         return Ok(old_bucket.clone());
     }
 
-    // Note: We cannot use a fast path when old is empty because we need to
-    // convert any Init entries in new to Live entries (they're crossing a
-    // merge boundary). The merge logic below handles this via normalize_entry().
+    // Fast path: if old is empty and we don't need to normalize init entries,
+    // return new unchanged. This preserves the original bucket hash.
+    if old_bucket.is_empty() && !normalize_init_entries {
+        return Ok(new_bucket.clone());
+    }
+
+    // Note: We cannot use a fast path when old is empty AND normalization is needed
+    // because we need to convert any Init entries in new to Live entries (they're
+    // crossing a merge boundary). The merge logic below handles this via normalize_entry().
 
     // Get entries from both buckets (already sorted)
     // Note: use iter() instead of entries() to support disk-backed buckets
@@ -106,7 +141,7 @@ pub fn merge_buckets(
                     Ordering::Greater => {
                         // New entry comes first
                         if should_keep_entry(new_entry, keep_dead_entries) {
-                            merged.push(normalize_entry(new_entry.clone()));
+                            merged.push(maybe_normalize_entry(new_entry.clone(), normalize_init_entries));
                         }
                         new_idx += 1;
                     }
@@ -114,7 +149,7 @@ pub fn merge_buckets(
                         // Keys match - new entry shadows old entry
                         // Apply merge semantics (per CAP-0020)
                         if let Some(merged_entry) =
-                            merge_entries(old_entry, new_entry, keep_dead_entries)
+                            merge_entries(old_entry, new_entry, keep_dead_entries, normalize_init_entries)
                         {
                             merged.push(merged_entry);
                         }
@@ -145,7 +180,7 @@ pub fn merge_buckets(
     while new_idx < new_entries.len() {
         let entry = &new_entries[new_idx];
         if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
-            merged.push(normalize_entry(entry.clone()));
+            merged.push(maybe_normalize_entry(entry.clone(), normalize_init_entries));
         }
         new_idx += 1;
     }
@@ -179,6 +214,17 @@ fn normalize_entry(entry: BucketEntry) -> BucketEntry {
     }
 }
 
+/// Conditionally normalize an entry.
+///
+/// If `normalize` is true, converts INIT to LIVE. Otherwise returns entry unchanged.
+fn maybe_normalize_entry(entry: BucketEntry, normalize: bool) -> BucketEntry {
+    if normalize {
+        normalize_entry(entry)
+    } else {
+        entry
+    }
+}
+
 /// Merge two entries with the same key.
 ///
 /// Returns the merged entry, or None if the entry should be removed.
@@ -193,6 +239,7 @@ fn merge_entries(
     old: &BucketEntry,
     new: &BucketEntry,
     keep_dead_entries: bool,
+    normalize_init_entries: bool,
 ) -> Option<BucketEntry> {
     match (old, new) {
         // CAP-0020: INITENTRY + DEADENTRY → Both annihilated
@@ -222,8 +269,14 @@ fn merge_entries(
             Some(BucketEntry::Live(entry.clone()))
         }
 
-        // Any old + new Init (not covered above) → convert to Live
-        (_, BucketEntry::Init(entry)) => Some(BucketEntry::Live(entry.clone())),
+        // Any old + new Init (not covered above) → convert to Live only if crossing levels
+        (_, BucketEntry::Init(entry)) => {
+            if normalize_init_entries {
+                Some(BucketEntry::Live(entry.clone()))
+            } else {
+                Some(BucketEntry::Init(entry.clone()))
+            }
+        }
 
         // LIVEENTRY + DEADENTRY → Dead entry (tombstone) if keeping, else nothing
         (BucketEntry::Live(_), BucketEntry::Dead(key)) => {
@@ -360,8 +413,9 @@ impl Iterator for MergeIterator {
                         Ordering::Equal => {
                             self.old_idx += 1;
                             self.new_idx += 1;
+                            // Always normalize in MergeIterator for backward compatibility
                             if let Some(merged) =
-                                merge_entries(old_entry, new_entry, self.keep_dead_entries)
+                                merge_entries(old_entry, new_entry, self.keep_dead_entries, true)
                             {
                                 return Some(merged);
                             }

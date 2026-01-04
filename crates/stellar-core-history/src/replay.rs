@@ -177,7 +177,7 @@ pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
     bucket_list: &mut stellar_core_bucket::BucketList,
-    hot_archive_bucket_list: Option<&stellar_core_bucket::BucketList>,
+    mut hot_archive_bucket_list: Option<&mut stellar_core_bucket::BucketList>,
     network_id: &NetworkId,
     config: &ReplayConfig,
     expected_tx_results: Option<&[TransactionResultPair]>,
@@ -284,13 +284,38 @@ pub fn replay_ledger_with_execution(
     let init_entries = delta.init_entries();
     let live_entries = delta.live_entries();
     let dead_entries = delta.dead_entries();
-    tracing::debug!(
+    tracing::info!(
         ledger_seq = header.ledger_seq,
         init_count = init_entries.len(),
         live_count = live_entries.len(),
         dead_count = dead_entries.len(),
         "add_batch entries"
     );
+    // Log detailed entry info for debugging
+    for (i, entry) in init_entries.iter().enumerate() {
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            entry_idx = i,
+            entry_type = ?entry.data.discriminant(),
+            "INIT entry"
+        );
+    }
+    for (i, entry) in live_entries.iter().enumerate() {
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            entry_idx = i,
+            entry_type = ?entry.data.discriminant(),
+            "LIVE entry"
+        );
+    }
+    for (i, key) in dead_entries.iter().enumerate() {
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            entry_idx = i,
+            key_type = ?key.discriminant(),
+            "DEAD entry"
+        );
+    }
     bucket_list
         .add_batch(
             header.ledger_seq,
@@ -301,11 +326,17 @@ pub fn replay_ledger_with_execution(
             dead_entries.clone(),
         )
         .map_err(HistoryError::Bucket)?;
+
+    // NOTE: We do NOT update the hot archive bucket list during replay.
+    // The hot archive only receives entries when temporary entries are evicted,
+    // which we don't simulate during catchup. The hot archive hash from the HAS
+    // checkpoint is used as-is for the combined bucket list hash computation.
+
     if config.verify_bucket_list {
         let expected = Hash256::from(header.bucket_list_hash.0);
         let actual = combined_bucket_list_hash(
             bucket_list,
-            hot_archive_bucket_list,
+            hot_archive_bucket_list.as_deref(),
             header.ledger_version,
         );
         if actual != expected {

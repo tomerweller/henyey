@@ -68,7 +68,7 @@ pub use disk_bucket::{DiskBucket, DiskBucketIter};
 pub use entry::{compare_entries, compare_keys, ledger_entry_to_key, BucketEntry};
 pub use error::BucketError;
 pub use manager::{BucketManager, BucketManagerStats};
-pub use merge::{merge_buckets, merge_multiple, MergeIterator};
+pub use merge::{merge_buckets, merge_buckets_with_options, merge_multiple, MergeIterator};
 
 /// Result type for bucket operations.
 pub type Result<T> = std::result::Result<T, BucketError>;
