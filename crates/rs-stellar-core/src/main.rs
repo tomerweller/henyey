@@ -291,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::SampleConfig => cmd_sample_config(),
 
-        Commands::Offline(cmd) => cmd_offline(cmd, config),
+        Commands::Offline(cmd) => cmd_offline(cmd, config).await,
     }
 }
 
@@ -1496,7 +1496,7 @@ fn cmd_sample_config() -> anyhow::Result<()> {
 }
 
 /// Offline commands handler.
-fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<()> {
+async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<()> {
     match cmd {
         OfflineCommands::ConvertKey { key } => {
             convert_key(&key)
@@ -1517,8 +1517,7 @@ fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<()> {
             compare_results,
             skip_invariants,
         } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_replay_test(config, from, to, stop_on_error, compare_results, skip_invariants))
+            cmd_replay_test(config, from, to, stop_on_error, compare_results, skip_invariants).await
         }
     }
 }
