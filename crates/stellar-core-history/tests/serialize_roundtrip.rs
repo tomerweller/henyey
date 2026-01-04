@@ -55,27 +55,31 @@ fn test_history_archive_state_roundtrip() {
     let fixtures = [
         (
             "stellar-history.testnet.6714239.json",
-            include_str!(
-                "../../../upstream/stellar-core/src/history/serialize-tests/stellar-history.testnet.6714239.json"
-            ),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/serialize-tests/stellar-history.testnet.6714239.json"
+            )),
         ),
         (
             "stellar-history.livenet.15686975.json",
-            include_str!(
-                "../../../upstream/stellar-core/src/history/serialize-tests/stellar-history.livenet.15686975.json"
-            ),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/serialize-tests/stellar-history.livenet.15686975.json"
+            )),
         ),
         (
             "stellar-history.testnet.6714239.networkPassphrase.json",
-            include_str!(
-                "../../../upstream/stellar-core/src/history/serialize-tests/stellar-history.testnet.6714239.networkPassphrase.json"
-            ),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/serialize-tests/stellar-history.testnet.6714239.networkPassphrase.json"
+            )),
         ),
         (
             "stellar-history.testnet.6714239.networkPassphrase.v2.json",
-            include_str!(
-                "../../../upstream/stellar-core/src/history/serialize-tests/stellar-history.testnet.6714239.networkPassphrase.v2.json"
-            ),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/serialize-tests/stellar-history.testnet.6714239.networkPassphrase.v2.json"
+            )),
         ),
     ];
 

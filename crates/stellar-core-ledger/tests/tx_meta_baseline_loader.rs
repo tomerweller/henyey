@@ -7,7 +7,7 @@ use serde_json::Value;
 
 fn baseline_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.upstream-v25/test-tx-meta-baseline-current")
+        .join("../../testdata/tx-meta-baseline-current")
 }
 
 fn load_json(path: &PathBuf) -> Value {

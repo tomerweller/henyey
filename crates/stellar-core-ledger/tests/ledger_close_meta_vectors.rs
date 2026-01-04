@@ -17,10 +17,8 @@ fn testdata_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("..");
     path.push("..");
-    path.push("upstream");
-    path.push("stellar-core");
-    path.push("src");
     path.push("testdata");
+    path.push("ledger-close-meta");
     path.push(name);
     path
 }

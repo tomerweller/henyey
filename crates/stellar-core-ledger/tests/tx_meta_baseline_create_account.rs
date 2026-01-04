@@ -23,7 +23,7 @@ const GENESIS_BUCKET_LIST_HASH: [u8; 32] = hex_literal::hex!(
 
 fn baseline_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.upstream-v25/test-tx-meta-baseline-current/CreateAccountTests.json")
+        .join("../../testdata/tx-meta-baseline-current/CreateAccountTests.json")
 }
 
 fn load_baseline_hashes(test_name: &str) -> Vec<u64> {

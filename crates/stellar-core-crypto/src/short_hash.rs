@@ -82,7 +82,13 @@ pub fn xdr_compute_hash<T: WriteXdr>(value: &T) -> Result<u64, CryptoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use stellar_xdr::curr::LedgerEntry;
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(())).lock().expect("test guard poisoned")
+    }
 
     fn reset_state() {
         let mut state = key_state().lock().expect("short hash lock poisoned");
@@ -97,6 +103,7 @@ mod tests {
 
     #[test]
     fn test_siphash_vector() {
+        let _guard = test_guard();
         reset_state();
         let key: [u8; KEY_BYTES] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
@@ -110,6 +117,7 @@ mod tests {
 
     #[test]
     fn test_xdr_hash_matches_bytes() {
+        let _guard = test_guard();
         reset_state();
         initialize();
         let entry = LedgerEntry::default();
@@ -121,6 +129,7 @@ mod tests {
 
     #[test]
     fn test_seed_matches_upstream_key_derivation() {
+        let _guard = test_guard();
         reset_state();
         let seed_value = 0x12345678;
         seed(seed_value).expect("seed");
@@ -132,6 +141,7 @@ mod tests {
 
     #[test]
     fn test_seed_conflict_after_hash() {
+        let _guard = test_guard();
         reset_state();
         initialize();
         let _ = compute_hash(b"warmup");
@@ -147,6 +157,7 @@ mod tests {
 
     #[test]
     fn test_seed_repeat_is_allowed() {
+        let _guard = test_guard();
         reset_state();
         seed(99).expect("seed");
         let _ = compute_hash(b"first");

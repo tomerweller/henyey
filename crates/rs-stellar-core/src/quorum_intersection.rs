@@ -126,8 +126,6 @@ mod tests {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("..");
         path.push("..");
-        path.push(".upstream-v25");
-        path.push("src");
         path.push("testdata");
         path.push("check-quorum-intersection-json");
         path.push(name);
