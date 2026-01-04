@@ -62,7 +62,7 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 - None known at v25 parity baseline.
 
 ### Testing Gaps
-- Upstream tx meta hash vector coverage (synthetic vectors exist; upstream baseline loader/format checks in place; initial create-account baseline test is scaffolded but ignored pending ledger/header alignment; full per-test hash parity still pending).
+- Upstream tx meta hash vector coverage (synthetic vectors exist; upstream baseline loader/format checks in place; create-account low-reserve + success + already-exists + not-enough-funds + native-liabilities baselines now match; remaining per-operation baseline hash parity tests still pending).
 - Classic event emission golden vectors (ledger-close-meta fixtures with EMIT_CLASSIC_EVENTS enabled).
 - Expanded per-operation regression suite for classic + Soroban edge cases (classic events now covered for payments, account merge/create, claimable balance create/claim/clawback, trustline flags, liquidity pool deposit/withdraw; remaining ops + Soroban edge cases pending).
 

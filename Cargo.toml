@@ -87,6 +87,7 @@ toml = "0.8"
 hex = "0.4"
 base32 = "0.5"
 base64 = "0.22"
+hex-literal = "0.4"
 
 # Compression - pure Rust backend
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }

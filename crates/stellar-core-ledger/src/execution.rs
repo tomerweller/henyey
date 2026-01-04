@@ -1155,13 +1155,19 @@ impl TransactionExecutor {
 
         let delta_before_fee = delta_snapshot(&self.state);
 
-        // Deduct fee and increment sequence
+        // Deduct fee (sequence update is handled separately for protocol >= 10).
         if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
             acc.balance -= fee;
         }
-        if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-            acc.seq_num.0 += 1;
-            stellar_core_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
+        if self.protocol_version < 10 {
+            if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+                acc.seq_num.0 += 1;
+                stellar_core_tx::state::update_account_seq_info(
+                    acc,
+                    self.ledger_seq,
+                    self.close_time,
+                );
+            }
         }
         self.state.delta_mut().add_fee(fee);
 
@@ -1169,9 +1175,50 @@ impl TransactionExecutor {
         let delta_after_fee = delta_snapshot(&self.state);
         let (fee_created, fee_updated, fee_deleted) =
             delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
-        let fee_changes = build_entry_changes(&fee_created, &fee_updated, &fee_deleted);
+        let fee_changes =
+            build_entry_changes_with_state(&self.state, &fee_created, &fee_updated, &fee_deleted);
 
-        // Commit fee changes so rollback doesn't revert them.
+        let mut tx_changes_before = empty_entry_changes();
+        let mut seq_created = Vec::new();
+        let mut seq_updated = Vec::new();
+        let mut seq_deleted = Vec::new();
+
+        if self.protocol_version >= 10 {
+            let mut seq_state_overrides = HashMap::new();
+            if let Some(pre_seq_entry) = self.state.get_account(&inner_source_id).cloned() {
+                let ledger_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: inner_source_id.clone(),
+                });
+                let state_entry = self.state.ledger_entry_for_account(&pre_seq_entry);
+                seq_state_overrides.insert(ledger_key, state_entry);
+            }
+
+            let delta_before_seq = delta_snapshot(&self.state);
+            if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+                acc.seq_num.0 += 1;
+                stellar_core_tx::state::update_account_seq_info(
+                    acc,
+                    self.ledger_seq,
+                    self.close_time,
+                );
+            }
+            self.state.flush_modified_entries();
+            let delta_after_seq = delta_snapshot(&self.state);
+            let (created, updated, deleted) =
+                delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
+            tx_changes_before = build_entry_changes_with_state_overrides(
+                &self.state,
+                &created,
+                &updated,
+                &deleted,
+                &seq_state_overrides,
+            );
+            seq_created = created;
+            seq_updated = updated;
+            seq_deleted = deleted;
+        }
+
+        // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
 
         // Create ledger context for operation execution
@@ -1229,6 +1276,7 @@ impl TransactionExecutor {
                 .clone()
                 .unwrap_or_else(|| frame.inner_source_account());
             let op_delta_before = delta_snapshot(&self.state);
+            self.state.begin_op_snapshot();
 
             if !orderbook_loaded && op_requires_orderbook(&op.body) {
                 self.load_orderbook_offers(snapshot)?;
@@ -1315,7 +1363,14 @@ impl TransactionExecutor {
                     let op_delta_after = delta_snapshot(&self.state);
                     let (created, updated, deleted) =
                         delta_changes_between(self.state.delta(), op_delta_before, op_delta_after);
-                    let op_changes_local = build_entry_changes(&created, &updated, &deleted);
+                    let op_snapshots = self.state.end_op_snapshot();
+                    let op_changes_local = build_entry_changes_with_state_overrides(
+                        &self.state,
+                        &created,
+                        &updated,
+                        &deleted,
+                        &op_snapshots,
+                    );
 
                     let mut op_events_final = Vec::new();
                     if all_success && is_operation_success(&op_result) {
@@ -1355,6 +1410,7 @@ impl TransactionExecutor {
                     }
                 }
                 Err(e) => {
+                    self.state.end_op_snapshot();
                     all_success = false;
                     warn!(error = %e, "Operation execution failed");
                     operation_results.push(OperationResult::OpNotSupported);
@@ -1386,20 +1442,18 @@ impl TransactionExecutor {
                 results = ?operation_results,
                 "Transaction failed; rolling back changes"
             );
-            // Save accumulated fees before rollback - rollback creates a new delta
-            // which would lose fee_charged for this and all previous transactions
-            let accumulated_fees = self.state.delta().fee_charged();
             self.state.rollback();
             restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
-            // Restore accumulated fees (including this transaction's fee which was already charged)
-            self.state.delta_mut().add_fee(accumulated_fees);
+            if self.protocol_version >= 10 {
+                restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
+            }
             if let (Some(runner), Some(snapshot)) =
                 (self.op_invariants.as_mut(), op_invariant_snapshot)
             {
                 runner.restore(snapshot);
             }
-            op_changes = vec![empty_entry_changes(); frame.operations().len()];
-            op_events = vec![Vec::new(); frame.operations().len()];
+            op_changes.clear();
+            op_events.clear();
             diagnostic_events.clear();
             soroban_return_value = None;
         } else {
@@ -1420,7 +1474,8 @@ impl TransactionExecutor {
                 let delta_after_refund = delta_snapshot(&self.state);
                 let (created, updated, deleted) =
                     delta_changes_between(self.state.delta(), delta_before_refund, delta_after_refund);
-                post_fee_changes = build_entry_changes(&created, &updated, &deleted);
+                post_fee_changes =
+                    build_entry_changes_with_state(&self.state, &created, &updated, &deleted);
             }
             let stage = if self.protocol_version >= 23 {
                 TransactionEventStage::AfterAllTxs
@@ -1433,7 +1488,7 @@ impl TransactionExecutor {
 
         let tx_events = tx_event_manager.finalize();
         let tx_meta = build_transaction_meta(
-            fee_changes.clone(),
+            tx_changes_before.clone(),
             op_changes,
             op_events,
             tx_events,
@@ -1482,8 +1537,8 @@ impl TransactionExecutor {
 
         // Load destination accounts based on operation type
         match &op.body {
-            OperationBody::CreateAccount(_op_data) => {
-                // Don't load destination - it shouldn't exist
+            OperationBody::CreateAccount(op_data) => {
+                self.load_account(snapshot, &op_data.destination)?;
             }
             OperationBody::BeginSponsoringFutureReserves(op_data) => {
                 self.load_account(snapshot, &op_data.sponsored_id)?;
@@ -2100,33 +2155,81 @@ impl OperationInvariantRunner {
     }
 }
 
-fn build_entry_changes(
+fn build_entry_changes_with_state(
+    state: &LedgerStateManager,
     created: &[LedgerEntry],
     updated: &[LedgerEntry],
     deleted: &[LedgerKey],
 ) -> LedgerEntryChanges {
+    build_entry_changes_with_state_overrides(
+        state,
+        created,
+        updated,
+        deleted,
+        &HashMap::new(),
+    )
+}
+
+fn build_entry_changes_with_state_overrides(
+    state: &LedgerStateManager,
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    deleted: &[LedgerKey],
+    state_overrides: &HashMap<LedgerKey, LedgerEntry>,
+) -> LedgerEntryChanges {
+    fn change_type_order(change: &LedgerEntryChange) -> u8 {
+        match change {
+            LedgerEntryChange::State(_) => 0,
+            LedgerEntryChange::Created(_) => 1,
+            LedgerEntryChange::Updated(_) => 2,
+            LedgerEntryChange::Removed(_) => 3,
+            LedgerEntryChange::Restored(_) => 4,
+        }
+    }
+
+    fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
+        crate::delta::entry_to_key(entry)
+            .ok()
+            .and_then(|key| key.to_xdr(Limits::none()).ok())
+            .unwrap_or_default()
+    }
+
     let mut changes: Vec<(Vec<u8>, LedgerEntryChange)> = Vec::new();
 
     for entry in created {
-        let key_bytes = crate::delta::entry_to_key(entry)
-            .map(|key| key.to_xdr(Limits::none()).unwrap_or_default())
-            .unwrap_or_else(|_| entry.to_xdr(Limits::none()).unwrap_or_default());
-        changes.push((key_bytes, LedgerEntryChange::Created(entry.clone())));
+        changes.push((entry_key_bytes(entry), LedgerEntryChange::Created(entry.clone())));
     }
 
     for entry in updated {
-        let key_bytes = crate::delta::entry_to_key(entry)
-            .map(|key| key.to_xdr(Limits::none()).unwrap_or_default())
-            .unwrap_or_else(|_| entry.to_xdr(Limits::none()).unwrap_or_default());
-        changes.push((key_bytes, LedgerEntryChange::Updated(entry.clone())));
+        if let Ok(key) = crate::delta::entry_to_key(entry) {
+            if let Some(state_entry) = state_overrides
+                .get(&key)
+                .cloned()
+                .or_else(|| state.snapshot_entry(&key))
+            {
+                changes.push((entry_key_bytes(&state_entry), LedgerEntryChange::State(state_entry)));
+            }
+        }
+        changes.push((entry_key_bytes(entry), LedgerEntryChange::Updated(entry.clone())));
     }
 
     for key in deleted {
+        if let Some(state_entry) = state_overrides
+            .get(key)
+            .cloned()
+            .or_else(|| state.snapshot_entry(key))
+        {
+            changes.push((entry_key_bytes(&state_entry), LedgerEntryChange::State(state_entry)));
+        }
         let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
         changes.push((key_bytes, LedgerEntryChange::Removed(key.clone())));
     }
 
-    changes.sort_by(|a, b| a.0.cmp(&b.0));
+    changes.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| change_type_order(&a.1).cmp(&change_type_order(&b.1)))
+    });
+
     let ordered = changes.into_iter().map(|(_, change)| change);
     LedgerEntryChanges(ordered.collect::<Vec<_>>().try_into().unwrap_or_default())
 }

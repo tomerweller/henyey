@@ -2,8 +2,8 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountId, CreateAccountOp, CreateAccountResult,
-    CreateAccountResultCode, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr,
-    SequenceNumber, String32, Thresholds,
+    CreateAccountResultCode, LedgerKey, LedgerKeyAccount, Liabilities, OperationResult,
+    OperationResultTr, SequenceNumber, String32, Thresholds,
 };
 
 use crate::state::LedgerStateManager;
@@ -49,7 +49,10 @@ pub fn execute_create_account(
     // Check source has sufficient available balance
     let source_min_balance =
         state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
-    let available = source_account.balance - source_min_balance;
+    let mut available = source_account.balance - source_min_balance;
+    if context.protocol_version >= 10 {
+        available = available.saturating_sub(account_liabilities(source_account).selling);
+    }
     if available < op.starting_balance {
         return Ok(make_result(CreateAccountResultCode::Underfunded));
     }
@@ -95,7 +98,6 @@ pub fn execute_create_account(
     };
 
     let mut new_account = new_account;
-    crate::state::update_account_seq_info(&mut new_account, context.sequence, context.close_time);
     if let Some(sponsor) = sponsor {
         let ledger_key = LedgerKey::Account(LedgerKeyAccount {
             account_id: op.destination.clone(),
@@ -118,6 +120,16 @@ fn make_result(code: CreateAccountResultCode) -> OperationResult {
         CreateAccountResultCode::AlreadyExist => CreateAccountResult::AlreadyExist,
     };
     OperationResult::OpInner(OperationResultTr::CreateAccount(result))
+}
+
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
 }
 
 #[cfg(test)]
