@@ -100,6 +100,9 @@ pub struct LedgerManager {
     /// Bucket list for ledger state (wrapped in Arc for sharing with snapshots).
     bucket_list: Arc<RwLock<BucketList>>,
 
+    /// Hot archive bucket list for Protocol 23+ (stores archived/evicted entries).
+    hot_archive_bucket_list: Arc<RwLock<Option<BucketList>>>,
+
     /// Network passphrase for transaction signing.
     network_passphrase: String,
 
@@ -160,6 +163,7 @@ impl LedgerManager {
             db,
             bucket_manager,
             bucket_list: Arc::new(RwLock::new(BucketList::default())),
+            hot_archive_bucket_list: Arc::new(RwLock::new(None)),
             network_passphrase,
             network_id,
             state: RwLock::new(LedgerState {
@@ -361,6 +365,7 @@ impl LedgerManager {
 
         // Update state
         *self.bucket_list.write() = bucket_list;
+        *self.hot_archive_bucket_list.write() = hot_archive_bucket_list;
         state.header = header;
         state.header_hash = header_hash;
         state.initialized = true;
@@ -430,6 +435,7 @@ impl LedgerManager {
 
     fn reset_for_catchup(&self) {
         *self.bucket_list.write() = BucketList::default();
+        *self.hot_archive_bucket_list.write() = None;
         self.entry_cache.write().clear();
         self.snapshots.clear();
 
@@ -620,7 +626,28 @@ impl LedgerManager {
         // Just validate the hash if configured
         if self.config.validate_bucket_hash {
             let bucket_list = self.bucket_list.read();
-            let computed = bucket_list.hash();
+            let live_hash = bucket_list.hash();
+
+            // For Protocol 23+, compute combined hash
+            let computed = if new_header.ledger_version >= 23 {
+                let hot_archive_guard = self.hot_archive_bucket_list.read();
+                if let Some(ref hot_archive) = *hot_archive_guard {
+                    use sha2::{Digest, Sha256};
+                    let hot_hash = hot_archive.hash();
+                    let mut hasher = Sha256::new();
+                    hasher.update(live_hash.as_bytes());
+                    hasher.update(hot_hash.as_bytes());
+                    let result = hasher.finalize();
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&result);
+                    Hash256::from_bytes(bytes)
+                } else {
+                    live_hash
+                }
+            } else {
+                live_hash
+            };
+
             let expected = Hash256::from(new_header.bucket_list_hash.0);
             if computed != expected {
                 return Err(LedgerError::HashMismatch {
@@ -886,7 +913,29 @@ impl<'a> LedgerCloseContext<'a> {
                 dead_entries,
             )?;
 
-            bucket_list.hash()
+            let live_hash = bucket_list.hash();
+
+            // For Protocol 23+, combine live and hot archive bucket list hashes
+            if protocol_version >= 23 {
+                let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
+                if let Some(ref hot_archive) = *hot_archive_guard {
+                    use sha2::{Digest, Sha256};
+                    let hot_hash = hot_archive.hash();
+                    let mut hasher = Sha256::new();
+                    hasher.update(live_hash.as_bytes());
+                    hasher.update(hot_hash.as_bytes());
+                    let result = hasher.finalize();
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&result);
+                    Hash256::from_bytes(bytes)
+                } else {
+                    // No hot archive bucket list available, use live hash only
+                    // This shouldn't happen for Protocol 23+ but fall back gracefully
+                    live_hash
+                }
+            } else {
+                live_hash
+            }
         };
 
         // Create the new header
