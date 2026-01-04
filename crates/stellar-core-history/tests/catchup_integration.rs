@@ -30,6 +30,17 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish")
 }
 
+/// Wrap XDR data in record marking format (RFC 5531).
+/// Each record is prefixed with a 4-byte mark: high bit set + 31-bit size (big-endian).
+fn wrap_in_record_marks(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(4 + data.len());
+    let size = data.len() as u32;
+    let record_mark = size | 0x80000000; // Set high bit (last fragment)
+    result.extend_from_slice(&record_mark.to_be_bytes());
+    result.extend_from_slice(data);
+    result
+}
+
 fn make_test_header(ledger_seq: u32, bucket_list_hash: Hash256) -> LedgerHeader {
     LedgerHeader {
         ledger_version: 25,
@@ -101,27 +112,44 @@ async fn test_catchup_against_local_archive_checkpoint() {
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("header xdr");
 
+    // Create all 11 bucket levels (required by BucketList)
+    let zero_hash = "0".repeat(64);
+    let mut current_buckets = Vec::with_capacity(11);
+    for level in 0..11 {
+        if level == 0 {
+            current_buckets.push(HASBucketLevel {
+                curr: bucket_hash.to_hex(),
+                snap: zero_hash.clone(),
+                next: Default::default(),
+            });
+        } else {
+            current_buckets.push(HASBucketLevel {
+                curr: zero_hash.clone(),
+                snap: zero_hash.clone(),
+                next: Default::default(),
+            });
+        }
+    }
+
     let has = HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core test".to_string()),
         current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
-        current_buckets: vec![HASBucketLevel {
-            curr: bucket_hash.to_hex(),
-            snap: "0".repeat(64),
-            next: Default::default(),
-        }],
+        current_buckets,
         hot_archive_buckets: None,
     };
     let has_json = has.to_json().expect("has json");
 
     let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
-    fixtures.insert(checkpoint_path("history", checkpoint, "json"), has_json.into_bytes());
-    fixtures.insert(
-        checkpoint_path("ledger", checkpoint, "xdr.gz"),
-        gzip_bytes(&header_xdr),
-    );
-    fixtures.insert(bucket_path(&bucket_hash), gzip_bytes(&bucket_data));
+    let has_path = checkpoint_path("history", checkpoint, "json");
+    let ledger_path = checkpoint_path("ledger", checkpoint, "xdr.gz");
+    let bucket_path_str = bucket_path(&bucket_hash);
+
+    fixtures.insert(has_path, has_json.into_bytes());
+    // Ledger headers need record marking format
+    fixtures.insert(ledger_path, gzip_bytes(&wrap_in_record_marks(&header_xdr)));
+    fixtures.insert(bucket_path_str, gzip_bytes(&bucket_data));
 
     let fixtures = Arc::new(fixtures);
     let app = Router::new()

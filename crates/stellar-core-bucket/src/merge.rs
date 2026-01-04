@@ -8,7 +8,7 @@
 
 use std::cmp::Ordering;
 
-use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey};
+use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
 
 use crate::bucket::Bucket;
 use crate::entry::{compare_keys, BucketEntry};
@@ -31,21 +31,38 @@ const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 /// - When keys match, the newer entry wins
 /// - Dead entries shadow live entries (the entry is deleted)
 /// - If `keep_dead_entries` is false and a dead entry shadows nothing, it's removed
-/// - Init entries are converted to Live entries when merged
+/// - Init entries are converted to Live entries when merged with older buckets
 pub fn merge_buckets(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
     keep_dead_entries: bool,
     max_protocol_version: u32,
 ) -> Result<Bucket> {
+    // Fast path: if new is empty, return old unchanged.
+    if new_bucket.is_empty() {
+        return Ok(old_bucket.clone());
+    }
+
+    // Note: We cannot use a fast path when old is empty because we need to
+    // convert any Init entries in new to Live entries (they're crossing a
+    // merge boundary). The merge logic below handles this via normalize_entry().
+
     // Get entries from both buckets (already sorted)
     // Note: use iter() instead of entries() to support disk-backed buckets
     let old_entries: Vec<BucketEntry> = old_bucket.iter().collect();
     let new_entries: Vec<BucketEntry> = new_bucket.iter().collect();
 
+    tracing::trace!(
+        old_hash = %old_bucket.hash(),
+        new_hash = %new_bucket.hash(),
+        old_entries = old_entries.len(),
+        new_entries = new_entries.len(),
+        "merge_buckets starting"
+    );
+
     let old_meta = extract_metadata(&old_entries);
     let new_meta = extract_metadata(&new_entries);
-    let (protocol_version, output_meta) =
+    let (_, output_meta) =
         build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
 
     let mut merged = Vec::with_capacity(
@@ -81,6 +98,8 @@ pub fn merge_buckets(
                 match compare_keys(ok, nk) {
                     Ordering::Less => {
                         // Old entry comes first, no shadow
+                        // DON'T normalize old entries - they should stay as-is
+                        // Init entries in old bucket are from before this merge boundary
                         merged.push(old_entry.clone());
                         old_idx += 1;
                     }
@@ -93,7 +112,7 @@ pub fn merge_buckets(
                     }
                     Ordering::Equal => {
                         // Keys match - new entry shadows old entry
-                        // Apply merge semantics
+                        // Apply merge semantics (per CAP-0020)
                         if let Some(merged_entry) =
                             merge_entries(old_entry, new_entry, keep_dead_entries)
                         {
@@ -135,7 +154,13 @@ pub fn merge_buckets(
         return Ok(Bucket::empty());
     }
 
-    Bucket::from_entries(merged)
+    let result = Bucket::from_entries(merged)?;
+    tracing::trace!(
+        result_hash = %result.hash(),
+        result_entries = result.len(),
+        "merge_buckets complete"
+    );
+    Ok(result)
 }
 
 /// Check if an entry should be kept in the merged output.

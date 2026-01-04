@@ -100,39 +100,24 @@ impl BucketLevel {
     }
 
     /// Prepare the next bucket for this level.
+    ///
+    /// This merges the current bucket (self.curr) with the incoming snap bucket.
+    /// The curr may be empty if this level was already snapped from a higher level's
+    /// processing - this is handled naturally by processing levels from high to low.
     fn prepare(
         &mut self,
-        ledger_seq: u32,
+        _ledger_seq: u32,
         protocol_version: u32,
         snap: Bucket,
         keep_dead_entries: bool,
-    ) -> Result<()> {
-        self.prepare_with_saved_curr(ledger_seq, protocol_version, snap, keep_dead_entries, None)
-    }
-
-    /// Prepare the next bucket for this level, optionally using a saved curr value.
-    /// This is needed during synchronous batch updates where snap() may have already
-    /// cleared the curr before prepare() is called.
-    fn prepare_with_saved_curr(
-        &mut self,
-        ledger_seq: u32,
-        protocol_version: u32,
-        snap: Bucket,
-        keep_dead_entries: bool,
-        saved_curr: Option<Bucket>,
     ) -> Result<()> {
         if self.next.is_some() {
             return Err(BucketError::Merge("bucket merge already in progress".to_string()));
         }
 
-        let curr = if BucketList::should_merge_with_empty_curr(ledger_seq, self.level) {
-            Bucket::empty()
-        } else {
-            // Use saved curr if provided, otherwise use self.curr
-            saved_curr.unwrap_or_else(|| self.curr.clone())
-        };
-
-        let merged = merge_buckets(&curr, &snap, keep_dead_entries, protocol_version)?;
+        // Merge curr with the incoming snap
+        // curr may be empty if this level was already snapped
+        let merged = merge_buckets(&self.curr, &snap, keep_dead_entries, protocol_version)?;
         self.next = Some(merged);
         Ok(())
     }
@@ -305,29 +290,38 @@ impl BucketList {
         dead_entries: Vec<LedgerKey>,
     ) -> Result<()> {
         let use_init = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
-        let mut entries: Vec<BucketEntry> = Vec::new();
 
-        if use_init {
-            let mut meta = BucketMetadata {
-                ledger_version: protocol_version,
-                ext: BucketMetadataExt::V0,
-            };
-            if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
-                meta.ext = BucketMetadataExt::V1(bucket_list_type);
-            }
-            entries.push(BucketEntry::Metadata(meta));
-        }
+        // If there are no entries to add, use an empty bucket
+        // Metadata is only included when there are actual entries
+        let has_entries = !init_entries.is_empty() || !live_entries.is_empty() || !dead_entries.is_empty();
 
-        if use_init {
-            entries.extend(init_entries.into_iter().map(BucketEntry::Init));
+        let new_bucket = if !has_entries {
+            Bucket::empty()
         } else {
-            entries.extend(init_entries.into_iter().map(BucketEntry::Live));
-        }
+            let mut entries: Vec<BucketEntry> = Vec::new();
 
-        entries.extend(live_entries.into_iter().map(BucketEntry::Live));
-        entries.extend(dead_entries.into_iter().map(BucketEntry::Dead));
+            if use_init {
+                let mut meta = BucketMetadata {
+                    ledger_version: protocol_version,
+                    ext: BucketMetadataExt::V0,
+                };
+                if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                    meta.ext = BucketMetadataExt::V1(bucket_list_type);
+                }
+                entries.push(BucketEntry::Metadata(meta));
+            }
 
-        let new_bucket = Bucket::from_entries(entries)?;
+            if use_init {
+                entries.extend(init_entries.into_iter().map(BucketEntry::Init));
+            } else {
+                entries.extend(init_entries.into_iter().map(BucketEntry::Live));
+            }
+
+            entries.extend(live_entries.into_iter().map(BucketEntry::Live));
+            entries.extend(dead_entries.into_iter().map(BucketEntry::Dead));
+
+            Bucket::from_entries(entries)?
+        };
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;
@@ -344,49 +338,98 @@ impl BucketList {
             return Err(BucketError::Merge("ledger sequence must be > 0".to_string()));
         }
 
-        // In synchronous mode, we need to handle the bucket list update carefully.
-        // The key insight is that snap() clears level.curr, but prepare() needs the
-        // ORIGINAL curr value before any snap() calls modified it.
-        //
-        // First, save the original curr values for all levels that will have prepare() called
-        let mut saved_currs: [Option<Bucket>; BUCKET_LIST_LEVELS] = Default::default();
-        for i in 1..BUCKET_LIST_LEVELS {
-            if Self::level_should_spill(ledger_seq, i - 1) {
-                // Save the curr before any snap() calls modify it
-                saved_currs[i] = Some(self.levels[i].curr.clone());
-            }
-        }
+        tracing::debug!(
+            ledger_seq = ledger_seq,
+            "add_batch_internal: starting spill processing"
+        );
 
-        // First pass: call snap() on source levels to get the incoming data
-        let mut incoming_snaps: [Option<Bucket>; BUCKET_LIST_LEVELS] = Default::default();
-        for i in (1..BUCKET_LIST_LEVELS).rev() {
-            if Self::level_should_spill(ledger_seq, i - 1) {
-                // snap() returns the old curr and sets snap = curr, then clears curr
-                incoming_snaps[i] = Some(self.levels[i - 1].snap());
-            }
-        }
+        // Step 1: First, apply new entries to level 0
+        // Level 0's curr is merged with the new bucket
+        tracing::debug!(
+            curr_hash = %self.levels[0].curr.hash(),
+            snap_hash = %self.levels[0].snap.hash(),
+            new_bucket_hash = %new_bucket.hash(),
+            "Level 0 before"
+        );
 
-        // Second pass: do the merges and commits using saved curr values
-        // Process from low levels to high to maintain proper dependency order
-        for i in 1..BUCKET_LIST_LEVELS {
-            if let Some(incoming_snap) = incoming_snaps[i].take() {
-                let keep_dead = Self::keep_tombstone_entries(i);
-                // Use saved curr value instead of self.curr (which may have been cleared by snap())
-                let saved_curr = saved_currs[i].take();
-                self.levels[i].prepare_with_saved_curr(
-                    ledger_seq,
-                    protocol_version,
-                    incoming_snap,
-                    keep_dead,
-                    saved_curr,
-                )?;
-                self.levels[i].commit();
-            }
-        }
-
-        let keep_dead = Self::keep_tombstone_entries(0);
-        self.levels[0].prepare(ledger_seq, protocol_version, new_bucket, keep_dead)?;
         self.levels[0].commit();
+        let keep_dead_0 = Self::keep_tombstone_entries(0);
+        self.levels[0].prepare(ledger_seq, protocol_version, new_bucket, keep_dead_0)?;
+        self.levels[0].commit();
+
+        tracing::debug!(
+            curr_hash = %self.levels[0].curr.hash(),
+            snap_hash = %self.levels[0].snap.hash(),
+            "Level 0 after merge"
+        );
+
+        // Step 2: Process spills from level 0 upward
+        // Each level that spills sends its ORIGINAL curr to the next level.
+        // The receiving level merges with its ORIGINAL curr (not a cascaded result).
+        //
+        // Algorithm:
+        //   1. Collect all ORIGINAL curr values for both spilling and receiving levels
+        //   2. Snap each spilling level (curr -> snap, curr = empty)
+        //   3. For each receiving level, merge its ORIGINAL curr with incoming spill
+
+        // Collect original curr values
+        let mut original_currs: Vec<Bucket> = self.levels.iter()
+            .map(|level| level.curr.clone())
+            .collect();
+
+        // Snap each level that needs to spill
+        for i in 0..(BUCKET_LIST_LEVELS - 1) {
+            if Self::level_should_spill(ledger_seq, i) {
+                // snap: curr -> snap, curr = empty
+                self.levels[i].snap();
+                tracing::debug!(
+                    level = i,
+                    new_snap_hash = %self.levels[i].snap.hash(),
+                    "After snap"
+                );
+            }
+        }
+
+        // Merge into next levels using ORIGINAL curr values
+        for i in 0..(BUCKET_LIST_LEVELS - 1) {
+            if Self::level_should_spill(ledger_seq, i) {
+                let spilling = &original_currs[i];
+                let next_level = i + 1;
+                let next_original_curr = &original_currs[next_level];
+
+                tracing::debug!(
+                    level = next_level,
+                    spilling_hash = %spilling.hash(),
+                    original_curr_hash = %next_original_curr.hash(),
+                    "Before merge"
+                );
+
+                // Merge original curr with incoming spill
+                let keep_dead = Self::keep_tombstone_entries(next_level);
+                let merged = merge_buckets(next_original_curr, spilling, keep_dead, protocol_version)?;
+
+                // Set the merged result as the new curr
+                self.levels[next_level].curr = merged;
+
+                tracing::debug!(
+                    level = next_level,
+                    new_curr_hash = %self.levels[next_level].curr.hash(),
+                    "After merge"
+                );
+            }
+        }
+
+        // Log final state of all levels
+        tracing::info!(ledger_seq = ledger_seq, "Final bucket list state after add_batch");
+        for i in 0..BUCKET_LIST_LEVELS {
+            tracing::info!(
+                level = i,
+                curr_hash = %self.levels[i].curr.hash(),
+                snap_hash = %self.levels[i].snap.hash(),
+                "Level state"
+            );
+        }
+
         Ok(())
     }
 
@@ -418,16 +461,6 @@ impl BucketList {
         let size = Self::level_size(level);
         ledger_seq == Self::round_down(ledger_seq, half)
             || ledger_seq == Self::round_down(ledger_seq, size)
-    }
-
-    fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
-        if level == 0 {
-            return false;
-        }
-
-        let merge_start = Self::round_down(ledger_seq, Self::level_half(level - 1));
-        let next_change = merge_start + Self::level_half(level - 1);
-        Self::level_should_spill(next_change, level)
     }
 
     fn keep_tombstone_entries(level: usize) -> bool {

@@ -88,9 +88,16 @@ fn combined_bucket_list_hash(
 ) -> Hash256 {
     if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
         if let Some(hot_archive) = hot_archive_bucket_list {
+            let live_hash = live_bucket_list.hash();
+            let hot_hash = hot_archive.hash();
+            tracing::info!(
+                live_hash = %live_hash,
+                hot_archive_hash = %hot_hash,
+                "Computing combined bucket list hash"
+            );
             let mut hasher = Sha256::new();
-            hasher.update(live_bucket_list.hash().as_bytes());
-            hasher.update(hot_archive.hash().as_bytes());
+            hasher.update(live_hash.as_bytes());
+            hasher.update(hot_hash.as_bytes());
             let result = hasher.finalize();
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(&result);
@@ -277,6 +284,13 @@ pub fn replay_ledger_with_execution(
     let init_entries = delta.init_entries();
     let live_entries = delta.live_entries();
     let dead_entries = delta.dead_entries();
+    tracing::debug!(
+        ledger_seq = header.ledger_seq,
+        init_count = init_entries.len(),
+        live_count = live_entries.len(),
+        dead_count = dead_entries.len(),
+        "add_batch entries"
+    );
     bucket_list
         .add_batch(
             header.ledger_seq,

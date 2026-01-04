@@ -816,8 +816,16 @@ impl CatchupManager {
 
         for level_idx in 0..11 {
             if let Some((curr, snap)) = has.bucket_hashes_at_level(level_idx) {
-                live_hashes.push(curr.unwrap_or(Hash256::ZERO));
-                live_hashes.push(snap.unwrap_or(Hash256::ZERO));
+                let curr_hash = curr.unwrap_or(Hash256::ZERO);
+                let snap_hash = snap.unwrap_or(Hash256::ZERO);
+                info!(
+                    "HAS level {} hashes: curr={}, snap={}",
+                    level_idx,
+                    curr_hash,
+                    snap_hash
+                );
+                live_hashes.push(curr_hash);
+                live_hashes.push(snap_hash);
             } else {
                 // Level doesn't exist in HAS, use zero hashes
                 live_hashes.push(Hash256::ZERO);
@@ -829,6 +837,11 @@ impl CatchupManager {
         let bucket_list = BucketList::restore_from_hashes(&live_hashes, load_bucket)
             .map_err(|e| HistoryError::CatchupFailed(format!("Failed to restore live bucket list: {}", e)))?;
 
+        // Log the restored bucket list hash
+        info!(
+            "Live bucket list restored hash: {}",
+            bucket_list.hash()
+        );
         info!(
             "Live bucket list restored: {} total entries",
             bucket_list.stats().total_entries

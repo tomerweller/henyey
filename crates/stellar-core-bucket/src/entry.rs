@@ -491,4 +491,36 @@ mod tests {
         assert_eq!(dead.entry_type(), BucketEntryType::Deadentry);
         assert_eq!(init.entry_type(), BucketEntryType::Initentry);
     }
+
+    #[test]
+    fn test_ledger_entry_type_discriminants() {
+        // These values MUST match stellar-core's XDR definition for correct sorting
+        // See Stellar-ledger-entries.x in stellar/stellar-xdr
+        assert_eq!(LedgerEntryType::Account as i32, 0);
+        assert_eq!(LedgerEntryType::Trustline as i32, 1);
+        assert_eq!(LedgerEntryType::Offer as i32, 2);
+        assert_eq!(LedgerEntryType::Data as i32, 3);
+        assert_eq!(LedgerEntryType::ClaimableBalance as i32, 4);
+        assert_eq!(LedgerEntryType::LiquidityPool as i32, 5);
+        assert_eq!(LedgerEntryType::ContractData as i32, 6);
+        assert_eq!(LedgerEntryType::ContractCode as i32, 7);
+        assert_eq!(LedgerEntryType::ConfigSetting as i32, 8);
+        assert_eq!(LedgerEntryType::Ttl as i32, 9);
+    }
+
+    #[test]
+    fn test_compare_keys_different_types() {
+        // Ensure keys of different types are compared by type discriminant first
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: make_account_id([255u8; 32]), // Highest possible account
+        });
+        let trustline_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: make_account_id([0u8; 32]), // Lowest possible account
+            asset: TrustLineAsset::Native,
+        });
+
+        // Account (type 0) should sort before Trustline (type 1), regardless of account bytes
+        assert_eq!(compare_keys(&account_key, &trustline_key), Ordering::Less);
+        assert_eq!(compare_keys(&trustline_key, &account_key), Ordering::Greater);
+    }
 }
