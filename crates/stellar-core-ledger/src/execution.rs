@@ -504,6 +504,23 @@ impl TransactionExecutor {
         Ok(false)
     }
 
+    fn load_asset_issuer(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        asset: &Asset,
+    ) -> Result<()> {
+        match asset {
+            Asset::CreditAlphanum4(a) => {
+                self.load_account(snapshot, &a.issuer)?;
+            }
+            Asset::CreditAlphanum12(a) => {
+                self.load_account(snapshot, &a.issuer)?;
+            }
+            Asset::Native => {}
+        }
+        Ok(())
+    }
+
     /// Load a liquidity pool from the snapshot into the state manager.
     pub fn load_liquidity_pool(
         &mut self,
@@ -559,6 +576,34 @@ impl TransactionExecutor {
                     load_asset_dependencies(self, &cp.params.asset_b, op_source)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn load_offer_dependencies(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        offer: &OfferEntry,
+    ) -> Result<()> {
+        self.load_account(snapshot, &offer.seller_id)?;
+        if let Some(tl_asset) = asset_to_trustline_asset(&offer.selling) {
+            self.load_trustline(snapshot, &offer.seller_id, &tl_asset)?;
+        }
+        if let Some(tl_asset) = asset_to_trustline_asset(&offer.buying) {
+            self.load_trustline(snapshot, &offer.seller_id, &tl_asset)?;
+        }
+        Ok(())
+    }
+
+    fn load_orderbook_offers(&mut self, snapshot: &SnapshotHandle) -> Result<()> {
+        let entries = snapshot.all_entries()?;
+        for entry in entries {
+            let LedgerEntryData::Offer(offer) = &entry.data else {
+                continue;
+            };
+            let offer = offer.clone();
+            self.state.load_entry(entry);
+            self.load_offer_dependencies(snapshot, &offer)?;
         }
         Ok(())
     }
@@ -1169,6 +1214,7 @@ impl TransactionExecutor {
         let mut soroban_return_value = None;
         let mut all_success = true;
         let mut failure = None;
+        let mut orderbook_loaded = false;
         let op_invariant_snapshot = self
             .op_invariants
             .as_ref()
@@ -1182,6 +1228,11 @@ impl TransactionExecutor {
                 .clone()
                 .unwrap_or_else(|| frame.inner_source_account());
             let op_delta_before = delta_snapshot(&self.state);
+
+            if !orderbook_loaded && op_requires_orderbook(&op.body) {
+                self.load_orderbook_offers(snapshot)?;
+                orderbook_loaded = true;
+            }
 
             // Load any accounts needed for this operation
             self.load_operation_accounts(snapshot, op, &inner_source_id)?;
@@ -1471,6 +1522,54 @@ impl TransactionExecutor {
                     self.load_trustline(snapshot, &from_account, &tl_asset)?;
                 }
             }
+            OperationBody::ManageSellOffer(op_data) => {
+                for asset in [&op_data.selling, &op_data.buying] {
+                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                    }
+                    self.load_asset_issuer(snapshot, asset)?;
+                }
+            }
+            OperationBody::CreatePassiveSellOffer(op_data) => {
+                for asset in [&op_data.selling, &op_data.buying] {
+                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                    }
+                    self.load_asset_issuer(snapshot, asset)?;
+                }
+            }
+            OperationBody::ManageBuyOffer(op_data) => {
+                for asset in [&op_data.selling, &op_data.buying] {
+                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                    }
+                    self.load_asset_issuer(snapshot, asset)?;
+                }
+            }
+            OperationBody::PathPaymentStrictSend(op_data) => {
+                let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
+                self.load_account(snapshot, &dest)?;
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
+                    self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                }
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
+                    self.load_trustline(snapshot, &dest, &tl_asset)?;
+                }
+                self.load_asset_issuer(snapshot, &op_data.send_asset)?;
+                self.load_asset_issuer(snapshot, &op_data.dest_asset)?;
+            }
+            OperationBody::PathPaymentStrictReceive(op_data) => {
+                let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
+                self.load_account(snapshot, &dest)?;
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
+                    self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                }
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
+                    self.load_trustline(snapshot, &dest, &tl_asset)?;
+                }
+                self.load_asset_issuer(snapshot, &op_data.send_asset)?;
+                self.load_asset_issuer(snapshot, &op_data.dest_asset)?;
+            }
             OperationBody::LiquidityPoolDeposit(op_data) => {
                 self.load_liquidity_pool_dependencies(
                     snapshot,
@@ -1584,6 +1683,17 @@ fn asset_to_trustline_asset(asset: &stellar_xdr::curr::Asset) -> Option<stellar_
             Some(stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone()))
         }
     }
+}
+
+fn op_requires_orderbook(op: &OperationBody) -> bool {
+    matches!(
+        op,
+        OperationBody::ManageSellOffer(_)
+            | OperationBody::ManageBuyOffer(_)
+            | OperationBody::CreatePassiveSellOffer(_)
+            | OperationBody::PathPaymentStrictSend(_)
+            | OperationBody::PathPaymentStrictReceive(_)
+    )
 }
 
 #[derive(Clone, Copy)]

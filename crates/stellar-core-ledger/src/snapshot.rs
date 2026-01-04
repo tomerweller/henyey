@@ -175,6 +175,7 @@ impl Clone for LedgerSnapshot {
 /// A callback for looking up entries not in the snapshot cache.
 pub type EntryLookupFn = Arc<dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync>;
 pub type LedgerHeaderLookupFn = Arc<dyn Fn(u32) -> Result<Option<LedgerHeader>> + Send + Sync>;
+pub type EntriesLookupFn = Arc<dyn Fn() -> Result<Vec<LedgerEntry>> + Send + Sync>;
 
 /// A thread-safe handle to a ledger snapshot.
 ///
@@ -187,6 +188,8 @@ pub struct SnapshotHandle {
     lookup_fn: Option<EntryLookupFn>,
     /// Optional lookup function for historical ledger headers.
     header_lookup_fn: Option<LedgerHeaderLookupFn>,
+    /// Optional lookup function for all live entries (e.g., bucket list scan).
+    entries_fn: Option<EntriesLookupFn>,
 }
 
 impl SnapshotHandle {
@@ -196,6 +199,7 @@ impl SnapshotHandle {
             inner: Arc::new(snapshot),
             lookup_fn: None,
             header_lookup_fn: None,
+            entries_fn: None,
         }
     }
 
@@ -205,6 +209,7 @@ impl SnapshotHandle {
             inner: Arc::new(snapshot),
             lookup_fn: Some(lookup_fn),
             header_lookup_fn: None,
+            entries_fn: None,
         }
     }
 
@@ -218,6 +223,22 @@ impl SnapshotHandle {
             inner: Arc::new(snapshot),
             lookup_fn: Some(lookup_fn),
             header_lookup_fn: Some(header_lookup_fn),
+            entries_fn: None,
+        }
+    }
+
+    /// Create a new handle with lookup functions for entries, headers, and full scans.
+    pub fn with_lookups_and_entries(
+        snapshot: LedgerSnapshot,
+        lookup_fn: EntryLookupFn,
+        header_lookup_fn: LedgerHeaderLookupFn,
+        entries_fn: EntriesLookupFn,
+    ) -> Self {
+        Self {
+            inner: Arc::new(snapshot),
+            lookup_fn: Some(lookup_fn),
+            header_lookup_fn: Some(header_lookup_fn),
+            entries_fn: Some(entries_fn),
         }
     }
 
@@ -231,9 +252,22 @@ impl SnapshotHandle {
         self.header_lookup_fn = Some(lookup_fn);
     }
 
+    /// Set the full-entry lookup function.
+    pub fn set_entries_lookup(&mut self, entries_fn: EntriesLookupFn) {
+        self.entries_fn = Some(entries_fn);
+    }
+
     /// Get the underlying snapshot.
     pub fn snapshot(&self) -> &LedgerSnapshot {
         &self.inner
+    }
+
+    /// Return all live entries when available, falling back to cached entries.
+    pub fn all_entries(&self) -> Result<Vec<LedgerEntry>> {
+        if let Some(entries_fn) = &self.entries_fn {
+            return entries_fn();
+        }
+        Ok(self.inner.entries.values().cloned().collect())
     }
 
     /// Get the ledger sequence.

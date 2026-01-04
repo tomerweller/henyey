@@ -644,7 +644,7 @@ fn convert_with_offers(
     let mut max_recv = max_recv;
     let mut need_more = max_send > 0 && max_recv > 0;
     while need_more {
-        let offer = state.best_offer(recv_asset, send_asset);
+        let offer = state.best_offer(send_asset, recv_asset);
         let Some(offer) = offer else {
             break;
         };

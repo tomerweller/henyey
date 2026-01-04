@@ -575,9 +575,9 @@ impl LedgerManager {
         );
 
         // Create a lookup function that queries the bucket list
-        let bucket_list = self.bucket_list.clone();
+        let bucket_list_lookup = self.bucket_list.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
-            bucket_list.read().get(key).map_err(LedgerError::Bucket)
+            bucket_list_lookup.read().get(key).map_err(LedgerError::Bucket)
         });
 
         // Create a lookup function that queries the ledger header table
@@ -586,10 +586,19 @@ impl LedgerManager {
             db.get_ledger_header(seq).map_err(LedgerError::from)
         });
 
-        Ok(SnapshotHandle::with_lookups(
+        let bucket_list_entries = self.bucket_list.clone();
+        let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
+            bucket_list_entries
+                .read()
+                .live_entries()
+                .map_err(LedgerError::Bucket)
+        });
+
+        Ok(SnapshotHandle::with_lookups_and_entries(
             snapshot,
             lookup_fn,
             header_lookup_fn,
+            entries_fn,
         ))
     }
 
