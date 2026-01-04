@@ -2876,7 +2876,7 @@ impl App {
             None => {
                 // Fallback: use timeout-based target if buffered_catchup_target returns None
                 // but we've decided to catchup due to timeout
-                match Self::compute_catchup_target_for_timeout(last_buffered) {
+                match Self::compute_catchup_target_for_timeout(last_buffered, first_buffered, current_ledger) {
                     Some(t) => t,
                     None => return,
                 }
@@ -3039,23 +3039,39 @@ impl App {
         }
     }
 
-    /// Compute a catchup target when sequential ledger tx set is unavailable.
-    /// This finds the most recent checkpoint before the last buffered ledger.
-    fn compute_catchup_target_for_timeout(last_buffered: u32) -> Option<u32> {
-        // Find the last ledger of the checkpoint containing last_buffered
-        // This is the ledger right before the next checkpoint starts
-        let checkpoint_start = Self::first_ledger_in_checkpoint(last_buffered);
+    /// Compute a catchup target when we're stuck waiting for buffered ledgers.
+    /// This targets the checkpoint boundary that will allow us to apply buffered ledgers.
+    fn compute_catchup_target_for_timeout(last_buffered: u32, first_buffered: u32, current_ledger: u32) -> Option<u32> {
+        // We need to catch up to a point that lets us make progress.
+        // The best target is just before first_buffered, so we can then apply the buffered ledgers.
 
-        // Target is the last ledger of the previous checkpoint
-        // which is checkpoint_start - 1
-        let target = checkpoint_start.saturating_sub(1);
+        // Find the checkpoint that contains first_buffered
+        let first_buffered_checkpoint_start = Self::first_ledger_in_checkpoint(first_buffered);
 
-        // If we're too early (within first checkpoint), use last_buffered - 1
-        if target == 0 {
-            let alt_target = last_buffered.saturating_sub(1);
-            if alt_target > 0 {
+        // Target should be the last ledger of the checkpoint BEFORE the one containing first_buffered
+        // This is checkpoint_start - 1
+        let target = if first_buffered_checkpoint_start > 0 {
+            first_buffered_checkpoint_start.saturating_sub(1)
+        } else {
+            // first_buffered is in the first checkpoint, target first_buffered - 1
+            first_buffered.saturating_sub(1)
+        };
+
+        // If target is not better than current_ledger, try targeting last_buffered's checkpoint
+        if target <= current_ledger {
+            let last_checkpoint_start = Self::first_ledger_in_checkpoint(last_buffered);
+            let alt_target = last_checkpoint_start.saturating_sub(1);
+
+            if alt_target > current_ledger {
                 return Some(alt_target);
             }
+
+            // Last resort: target just before first_buffered to bridge the gap
+            let bridge_target = first_buffered.saturating_sub(1);
+            if bridge_target > current_ledger {
+                return Some(bridge_target);
+            }
+
             return None;
         }
 
@@ -6015,39 +6031,50 @@ mod tests {
 
     #[test]
     fn test_compute_catchup_target_for_timeout() {
-        // Test with last_buffered in the middle of a checkpoint
-        // Checkpoint at 64, 128, 192, etc. (ledgers 63, 127, 191 are checkpoint ends)
-        let last_buffered = 150;
-        let target = App::compute_catchup_target_for_timeout(last_buffered);
-        // last_buffered 150 is in checkpoint starting at 128
-        // Target should be end of previous checkpoint (127)
+        // Test case 1: first_buffered in middle of checkpoint, current_ledger far behind
+        // first_buffered=100 is in checkpoint starting at 64
+        // Target should be 63 (end of previous checkpoint)
+        let target = App::compute_catchup_target_for_timeout(150, 100, 50);
+        assert_eq!(target, Some(63));
+
+        // Test case 2: first_buffered at start of checkpoint
+        // first_buffered=128 is in checkpoint starting at 128
+        // Target should be 127 (end of previous checkpoint)
+        let target = App::compute_catchup_target_for_timeout(150, 128, 50);
         assert_eq!(target, Some(127));
 
-        // Test with last_buffered at start of checkpoint
-        let last_buffered = 128;
-        let target = App::compute_catchup_target_for_timeout(last_buffered);
-        // 128 is first ledger of checkpoint, target should be 127
+        // Test case 3: current_ledger already past first_buffered's checkpoint target
+        // first_buffered=100 -> checkpoint start 64 -> target 63, but current is 70
+        // Should fall through to last_buffered's checkpoint (128) -> target 127
+        let target = App::compute_catchup_target_for_timeout(150, 100, 70);
         assert_eq!(target, Some(127));
 
-        // Test with last_buffered at end of checkpoint
-        let last_buffered = 191;
-        let target = App::compute_catchup_target_for_timeout(last_buffered);
-        // 191 is last ledger of checkpoint starting at 128
-        // Target should be end of previous checkpoint (127)
-        assert_eq!(target, Some(127));
+        // Test case 4: current_ledger past all checkpoint targets, use bridge target
+        // first_buffered=100, last_buffered=110, current=95
+        // first_buffered checkpoint start=64, target=63 (but 63 < 95)
+        // last_buffered checkpoint start=64, alt_target=63 (but 63 < 95)
+        // bridge_target = 100 - 1 = 99 > 95, so return 99
+        let target = App::compute_catchup_target_for_timeout(110, 100, 95);
+        assert_eq!(target, Some(99));
 
-        // Test with very early ledger (first checkpoint)
-        let last_buffered = 50;
-        let target = App::compute_catchup_target_for_timeout(last_buffered);
-        // First checkpoint is 0-63, so target would be 0-1 = underflow protection
-        // The function uses saturating_sub, so target should be 49 (last_buffered - 1)
+        // Test case 5: current_ledger already at or past first_buffered, return None
+        // This happens when we've caught up but buffered ledgers haven't been processed
+        let target = App::compute_catchup_target_for_timeout(110, 100, 100);
+        assert!(target.is_none());
+
+        // Test case 6: very early ledger (first checkpoint)
+        // first_buffered=50 is in checkpoint starting at 0
+        // Target would be 0 - 1 with saturating_sub = 0, which is <= current_ledger=10
+        // Fall through to bridge_target = 50 - 1 = 49 > 10
+        let target = App::compute_catchup_target_for_timeout(60, 50, 10);
         assert_eq!(target, Some(49));
 
-        // Test edge case: ledger 1
-        let last_buffered = 1;
-        let target = App::compute_catchup_target_for_timeout(last_buffered);
-        // Should return Some(0) or handle gracefully
-        assert!(target.is_none() || target == Some(0));
+        // Test case 7: edge case with very small ledgers
+        let target = App::compute_catchup_target_for_timeout(5, 3, 0);
+        // first_buffered=3, checkpoint start=0, target=0 (saturating_sub)
+        // 0 <= 0, so try last_buffered=5, checkpoint start=0, alt_target=0
+        // 0 <= 0, so try bridge_target = 3 - 1 = 2 > 0, return 2
+        assert_eq!(target, Some(2));
     }
 
     #[test]
