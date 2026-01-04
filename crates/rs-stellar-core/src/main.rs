@@ -1323,7 +1323,7 @@ async fn cmd_replay_test(
     println!("Downloading initial state at checkpoint {}...", start_checkpoint);
     let start_has = archive.get_checkpoint_has(start_checkpoint).await?;
 
-    // Download and restore bucket list
+    // Download and restore live bucket list
     let bucket_hashes: Vec<Hash256> = start_has.current_buckets
         .iter()
         .flat_map(|level| {
@@ -1334,20 +1334,48 @@ async fn cmd_replay_test(
         })
         .collect();
 
-    println!("Downloading {} buckets...", bucket_hashes.iter().filter(|h| !h.is_zero()).count());
-    for hash in &bucket_hashes {
-        if !hash.is_zero() {
-            if bucket_manager.load_bucket(hash).is_err() {
-                let bucket_data = archive.get_bucket(hash).await?;
-                bucket_manager.import_bucket(&bucket_data)?;
-            }
+    // Download and restore hot archive bucket list (Protocol 23+)
+    let hot_archive_hashes: Option<Vec<Hash256>> = start_has.hot_archive_buckets.as_ref().map(|levels| {
+        levels.iter()
+            .flat_map(|level| {
+                vec![
+                    Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+                    Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+                ]
+            })
+            .collect()
+    });
+
+    let all_hashes: Vec<&Hash256> = bucket_hashes.iter()
+        .chain(hot_archive_hashes.as_ref().map(|v| v.iter()).unwrap_or_default())
+        .filter(|h| !h.is_zero())
+        .collect();
+
+    println!("Downloading {} buckets (live + hot archive)...", all_hashes.len());
+    for hash in all_hashes {
+        if bucket_manager.load_bucket(hash).is_err() {
+            let bucket_data = archive.get_bucket(hash).await?;
+            bucket_manager.import_bucket(&bucket_data)?;
         }
     }
 
-    // Restore bucket list
+    // Restore live bucket list
     let mut bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
         bucket_manager.load_bucket(hash).map(|b| (*b).clone())
     })?;
+
+    // Restore hot archive bucket list if present
+    let hot_archive_bucket_list: Option<BucketList> = if let Some(ref hashes) = hot_archive_hashes {
+        Some(BucketList::restore_from_hashes(hashes, |hash| {
+            bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+        })?)
+    } else {
+        None
+    };
+
+    if hot_archive_bucket_list.is_some() {
+        println!("Hot archive bucket list restored (Protocol 23+)");
+    }
 
     let network_id = NetworkId::from_passphrase(&config.network.passphrase);
 
@@ -1425,7 +1453,7 @@ async fn cmd_replay_test(
                 header,
                 &tx_set,
                 &mut bucket_list,
-                None, // hot_archive_bucket_list
+                hot_archive_bucket_list.as_ref(),
                 &network_id,
                 &replay_config,
                 if compare_results { Some(&expected_results) } else { None },
