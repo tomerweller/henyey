@@ -985,7 +985,33 @@ impl TransactionExecutor {
         }
 
         // Validate sequence number
-        let expected_seq = source_account.seq_num.0 + 1;
+        if self.ledger_seq <= i32::MAX as u32 {
+            let starting_seq = (self.ledger_seq as i64) << 32;
+            if frame.sequence_number() == starting_seq {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    operation_results: vec![],
+                    error: Some("Bad sequence: equals starting sequence".into()),
+                    failure: Some(ExecutionFailure::BadSequence),
+                    tx_meta: None,
+                    fee_changes: None,
+                    post_fee_changes: None,
+                });
+            }
+        }
+        let Some(expected_seq) = source_account.seq_num.0.checked_add(1) else {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                operation_results: vec![],
+                error: Some("Bad sequence: sequence overflow".into()),
+                failure: Some(ExecutionFailure::BadSequence),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+            });
+        };
         if frame.sequence_number() != expected_seq {
             return Ok(TransactionExecutionResult {
                 success: false,
@@ -2773,10 +2799,15 @@ pub fn execute_transaction_set(
         let result = executor.execute_transaction(snapshot, tx, tx_fee, Some(tx_prng_seed))?;
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
         let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result)?;
+        let op_count = if result.operation_results.is_empty() {
+            0
+        } else {
+            frame.operations().len()
+        };
         let tx_meta = result
             .tx_meta
             .clone()
-            .unwrap_or_else(|| empty_transaction_meta(frame.operations().len()));
+            .unwrap_or_else(|| empty_transaction_meta(op_count));
         let fee_changes = result
             .fee_changes
             .clone()
