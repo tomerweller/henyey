@@ -1266,6 +1266,7 @@ async fn cmd_replay_test(
     use stellar_core_bucket::{BucketList, BucketManager};
     use stellar_core_common::{Hash256, NetworkId};
     use stellar_core_history::{HistoryArchive, checkpoint, replay::{replay_ledger_with_execution, ReplayConfig}};
+    use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
     use stellar_core_ledger::TransactionSetVariant;
     use stellar_xdr::curr::TransactionHistoryEntryExt;
 
@@ -1403,7 +1404,12 @@ async fn cmd_replay_test(
         verify_invariants: !skip_invariants,
         emit_classic_events: false,
         backfill_stellar_asset_events: false,
+        run_eviction: hot_archive_bucket_list.is_some(),
+        eviction_settings: StateArchivalSettings::default(),
     };
+
+    // Initialize eviction iterator for incremental eviction scanning
+    let mut eviction_iterator = EvictionIterator::default();
 
     // Track results
     let mut ledgers_tested = 0u32;
@@ -1488,8 +1494,13 @@ async fn cmd_replay_test(
                 &network_id,
                 &replay_config,
                 if compare_results { Some(&expected_results) } else { None },
+                Some(eviction_iterator),
             ) {
                 Ok(result) => {
+                    // Update eviction iterator for next ledger
+                    if let Some(new_iter) = result.eviction_iterator {
+                        eviction_iterator = new_iter;
+                    }
                     let expected_hash = Hash256::from(header_entry.hash.0);
                     if result.ledger_hash == expected_hash {
                         println!("  Ledger {}: OK (txs={}, ops={})", seq, result.tx_count, result.op_count);

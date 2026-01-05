@@ -1351,6 +1351,8 @@ impl CatchupManager {
         ledger_data: &[LedgerData],
         network_id: NetworkId,
     ) -> Result<ReplayedLedgerState> {
+        use stellar_core_bucket::EvictionIterator;
+
         if ledger_data.is_empty() {
             return Err(HistoryError::CatchupFailed(
                 "no ledger data to replay".to_string(),
@@ -1360,6 +1362,17 @@ impl CatchupManager {
         let total = ledger_data.len();
         let mut last_result: Option<LedgerReplayResult> = None;
         let mut last_header: Option<LedgerHeader> = None;
+
+        // Initialize eviction iterator for incremental eviction scan
+        // Start at the configured starting level (default: level 6)
+        let mut eviction_iterator: Option<EvictionIterator> = if self.replay_config.run_eviction {
+            Some(EvictionIterator::new(
+                self.replay_config.eviction_settings.starting_eviction_scan_level,
+            ))
+        } else {
+            None
+        };
+
         let invariants = if self.replay_config.verify_invariants {
             let mut manager = InvariantManager::new();
             manager.add(LedgerSeqIncrement);
@@ -1388,7 +1401,11 @@ impl CatchupManager {
                 &network_id,
                 &self.replay_config,
                 Some(&data.tx_results),
+                eviction_iterator,
             )?;
+
+            // Update eviction iterator for next ledger
+            eviction_iterator = result.eviction_iterator;
             if let (Some(prev_header), Some(manager)) = (last_header.as_ref(), invariants.as_ref()) {
                 let full_entries = bucket_list.live_entries()?;
                 let bucket_list_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
@@ -1583,6 +1600,8 @@ impl CatchupManagerBuilder {
             verify_invariants: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
+            run_eviction: true,
+            eviction_settings: stellar_core_bucket::StateArchivalSettings::default(),
         };
 
         Ok(manager)

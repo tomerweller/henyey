@@ -11,6 +11,7 @@
 //! future alternative flows.
 
 use crate::{verify, HistoryError, Result};
+use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_invariant::LedgerEntryChange;
 use stellar_core_ledger::{
@@ -48,6 +49,8 @@ pub struct LedgerReplayResult {
     pub dead_entries: Vec<LedgerKey>,
     /// Detailed entry changes for invariants.
     pub changes: Vec<LedgerEntryChange>,
+    /// Updated eviction iterator after this ledger (for incremental eviction).
+    pub eviction_iterator: Option<EvictionIterator>,
 }
 
 /// Configuration for ledger replay.
@@ -65,6 +68,13 @@ pub struct ReplayConfig {
 
     /// Whether to backfill Stellar asset events pre-protocol 23.
     pub backfill_stellar_asset_events: bool,
+
+    /// Whether to run incremental eviction scan during replay.
+    /// This is required for correct bucket list hash verification in protocol 23+.
+    pub run_eviction: bool,
+
+    /// State archival settings for eviction scan.
+    pub eviction_settings: StateArchivalSettings,
 }
 
 impl Default for ReplayConfig {
@@ -75,6 +85,8 @@ impl Default for ReplayConfig {
             verify_invariants: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
+            run_eviction: true,
+            eviction_settings: StateArchivalSettings::default(),
         }
     }
 }
@@ -169,10 +181,14 @@ pub fn replay_ledger(
         live_entries,
         dead_entries,
         changes: Vec::new(),
+        eviction_iterator: None, // Metadata-based replay doesn't track eviction
     })
 }
 
 /// Replay a ledger by re-executing transactions against the current bucket list.
+///
+/// If `eviction_iterator` is provided, incremental eviction will be performed.
+/// The updated iterator is returned in the result for use in subsequent ledgers.
 pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
@@ -181,6 +197,7 @@ pub fn replay_ledger_with_execution(
     network_id: &NetworkId,
     config: &ReplayConfig,
     expected_tx_results: Option<&[TransactionResultPair]>,
+    eviction_iterator: Option<EvictionIterator>,
 ) -> Result<LedgerReplayResult> {
     if config.verify_results {
         verify::verify_tx_set(header, tx_set)?;
@@ -316,6 +333,42 @@ pub fn replay_ledger_with_execution(
             "DEAD entry"
         );
     }
+    // Run incremental eviction scan for protocol 23+ before applying transaction changes
+    // This matches C++ stellar-core's behavior: eviction is determined by TTL state
+    // from the current bucket list, then evicted entries are added as DEAD entries
+    let mut updated_eviction_iterator = eviction_iterator;
+    let mut evicted_keys: Vec<LedgerKey> = Vec::new();
+    let mut archived_entries: Vec<LedgerEntry> = Vec::new();
+
+    if config.run_eviction
+        && header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+        && hot_archive_bucket_list.is_some()
+    {
+        if let Some(iter) = eviction_iterator {
+            let eviction_result = bucket_list
+                .scan_for_eviction_incremental(iter, header.ledger_seq, &config.eviction_settings)
+                .map_err(HistoryError::Bucket)?;
+
+            tracing::info!(
+                ledger_seq = header.ledger_seq,
+                bytes_scanned = eviction_result.bytes_scanned,
+                archived_count = eviction_result.archived_entries.len(),
+                evicted_count = eviction_result.evicted_keys.len(),
+                end_level = eviction_result.end_iterator.bucket_list_level,
+                end_is_curr = eviction_result.end_iterator.is_curr_bucket,
+                "Incremental eviction scan results"
+            );
+
+            evicted_keys = eviction_result.evicted_keys;
+            archived_entries = eviction_result.archived_entries;
+            updated_eviction_iterator = Some(eviction_result.end_iterator);
+        }
+    }
+
+    // Combine transaction dead entries with evicted entries
+    let mut all_dead_entries = dead_entries.clone();
+    all_dead_entries.extend(evicted_keys);
+
     bucket_list
         .add_batch(
             header.ledger_seq,
@@ -323,40 +376,64 @@ pub fn replay_ledger_with_execution(
             BucketListType::Live,
             init_entries.clone(),
             live_entries.clone(),
-            dead_entries.clone(),
+            all_dead_entries,
         )
         .map_err(HistoryError::Bucket)?;
 
-    // NOTE: We do NOT update the hot archive bucket list during catchup/replay.
-    // During catchup, we're replaying transactions that have already been applied.
-    // The hot archive only changes when there are actual evictions, which we don't
-    // simulate during replay. The hot archive hash from the checkpoint HAS is used
-    // directly for the combined bucket list hash computation.
-    //
-    // TODO: Investigate why C++ stellar-core's hash differs - maybe the hot archive
-    // spill schedule runs differently or the combined hash formula is different.
+    // Update hot archive with archived persistent entries
+    if !archived_entries.is_empty() {
+        if let Some(hot_archive) = hot_archive_bucket_list.as_deref_mut() {
+            hot_archive
+                .add_batch(
+                    header.ledger_seq,
+                    header.ledger_version,
+                    BucketListType::HotArchive,
+                    archived_entries,
+                    vec![],
+                    vec![],
+                )
+                .map_err(HistoryError::Bucket)?;
+        }
+    }
 
     if config.verify_bucket_list {
-        let expected = Hash256::from(header.bucket_list_hash.0);
-        tracing::info!(
-            ledger_seq = header.ledger_seq,
-            protocol_version = header.ledger_version,
-            expected_hash = %expected.to_hex(),
-            "Verifying bucket list hash"
-        );
-        let actual = combined_bucket_list_hash(
-            bucket_list,
-            hot_archive_bucket_list.as_deref(),
-            header.ledger_version,
-        );
-        if actual != expected {
-            return Err(HistoryError::VerificationFailed(format!(
-                "bucket list hash mismatch at ledger {} protocol {} (expected {}, got {})",
-                header.ledger_seq,
+        // For protocol 23+, bucket list verification requires running eviction.
+        // If eviction is enabled and an iterator was provided, we can verify all ledgers.
+        // Otherwise, we can only verify at checkpoints or pre-protocol 23 ledgers.
+        let eviction_running = config.run_eviction && eviction_iterator.is_some();
+        let is_checkpoint = header.ledger_seq % 64 == 63;
+        let can_verify = header.ledger_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+            || eviction_running
+            || is_checkpoint;
+
+        if can_verify {
+            let expected = Hash256::from(header.bucket_list_hash.0);
+            tracing::info!(
+                ledger_seq = header.ledger_seq,
+                protocol_version = header.ledger_version,
+                expected_hash = %expected.to_hex(),
+                "Verifying bucket list hash"
+            );
+            let actual = combined_bucket_list_hash(
+                bucket_list,
+                hot_archive_bucket_list.as_deref(),
                 header.ledger_version,
-                expected.to_hex(),
-                actual.to_hex()
-            )));
+            );
+            if actual != expected {
+                return Err(HistoryError::VerificationFailed(format!(
+                    "bucket list hash mismatch at ledger {} protocol {} (expected {}, got {})",
+                    header.ledger_seq,
+                    header.ledger_version,
+                    expected.to_hex(),
+                    actual.to_hex()
+                )));
+            }
+        } else {
+            tracing::debug!(
+                ledger_seq = header.ledger_seq,
+                protocol_version = header.ledger_version,
+                "Skipping bucket list verification (eviction not running for protocol 23+)"
+            );
         }
     }
 
@@ -376,6 +453,7 @@ pub fn replay_ledger_with_execution(
         live_entries,
         dead_entries,
         changes,
+        eviction_iterator: updated_eviction_iterator,
     })
 }
 

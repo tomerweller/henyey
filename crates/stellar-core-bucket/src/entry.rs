@@ -6,9 +6,10 @@
 use std::cmp::Ordering;
 
 use stellar_xdr::curr::{
-    BucketEntry as XdrBucketEntry, BucketEntryType, BucketMetadata, LedgerEntry,
-    LedgerKey, ReadXdr, WriteXdr, Limits,
+    BucketEntry as XdrBucketEntry, BucketEntryType, BucketMetadata, ContractDataDurability,
+    Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl, ReadXdr, WriteXdr, Limits,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{BucketError, Result};
 
@@ -400,6 +401,97 @@ pub fn compare_entries(a: &BucketEntry, b: &BucketEntry) -> Ordering {
         (None, Some(_)) => Ordering::Less,  // Metadata comes first
         (Some(_), None) => Ordering::Greater,
         (None, None) => Ordering::Equal,    // Both metadata
+    }
+}
+
+// ============================================================================
+// Eviction helper functions
+// ============================================================================
+
+/// Check if a ledger entry is a Soroban entry (ContractData or ContractCode).
+///
+/// These are the entry types that can be evicted and have associated TTL entries.
+pub fn is_soroban_entry(entry: &LedgerEntry) -> bool {
+    matches!(
+        entry.data,
+        LedgerEntryData::ContractData(_) | LedgerEntryData::ContractCode(_)
+    )
+}
+
+/// Check if a ledger key is for a Soroban entry.
+pub fn is_soroban_key(key: &LedgerKey) -> bool {
+    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
+}
+
+/// Check if a ledger entry is a temporary entry (temporary ContractData).
+///
+/// Temporary entries are deleted on eviction, not archived.
+pub fn is_temporary_entry(entry: &LedgerEntry) -> bool {
+    if let LedgerEntryData::ContractData(data) = &entry.data {
+        data.durability == ContractDataDurability::Temporary
+    } else {
+        false
+    }
+}
+
+/// Check if a ledger entry is a persistent entry (ContractCode or persistent ContractData).
+///
+/// Persistent entries are archived to the hot archive on eviction.
+pub fn is_persistent_entry(entry: &LedgerEntry) -> bool {
+    match &entry.data {
+        LedgerEntryData::ContractCode(_) => true,
+        LedgerEntryData::ContractData(data) => {
+            data.durability == ContractDataDurability::Persistent
+        }
+        _ => false,
+    }
+}
+
+/// Get the TTL key for a Soroban entry.
+///
+/// The TTL key contains a hash of the entry's key, used to look up the TTL entry
+/// that tracks when this entry expires.
+///
+/// Returns None if the key is not a Soroban key (ContractData or ContractCode).
+pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
+    if !is_soroban_key(key) {
+        return None;
+    }
+
+    // Serialize the key to XDR and hash it
+    let key_bytes = key.to_xdr(Limits::none()).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&key_bytes);
+    let hash_result = hasher.finalize();
+
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&hash_result);
+
+    Some(LedgerKey::Ttl(LedgerKeyTtl {
+        key_hash: Hash(hash_bytes),
+    }))
+}
+
+/// Check if a TTL entry is expired at the given ledger sequence.
+///
+/// An entry is expired when its `live_until_ledger_seq` is less than the current ledger.
+/// Returns None if the entry is not a TTL entry.
+pub fn is_ttl_expired(ttl_entry: &LedgerEntry, current_ledger: u32) -> Option<bool> {
+    if let LedgerEntryData::Ttl(ttl) = &ttl_entry.data {
+        Some(ttl.live_until_ledger_seq < current_ledger)
+    } else {
+        None
+    }
+}
+
+/// Get the live_until_ledger_seq from a TTL entry.
+///
+/// Returns None if the entry is not a TTL entry.
+pub fn get_ttl_live_until(ttl_entry: &LedgerEntry) -> Option<u32> {
+    if let LedgerEntryData::Ttl(ttl) = &ttl_entry.data {
+        Some(ttl.live_until_ledger_seq)
+    } else {
+        None
     }
 }
 

@@ -18,7 +18,13 @@ use stellar_xdr::curr::{
 use stellar_core_common::Hash256;
 
 use crate::bucket::Bucket;
-use crate::entry::BucketEntry;
+use crate::entry::{
+    get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
+    ledger_entry_to_key, BucketEntry,
+};
+use crate::eviction::{
+    update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
+};
 use crate::merge::merge_buckets_with_options;
 use crate::{BucketError, Result};
 
@@ -562,6 +568,341 @@ impl BucketList {
             total_entries,
             total_buckets,
         }
+    }
+
+    /// Scan for expired Soroban entries in the bucket list.
+    ///
+    /// This scans all Soroban entries (ContractData, ContractCode) and checks their
+    /// TTL entries to determine which have expired.
+    ///
+    /// Returns:
+    /// - `archived_entries`: Persistent entries (ContractCode or persistent ContractData)
+    ///   that should be archived to the hot archive bucket list
+    /// - `deleted_keys`: Temporary entries that should be deleted
+    ///
+    /// An entry is considered expired when its TTL's `live_until_ledger_seq < current_ledger`.
+    pub fn scan_for_eviction(
+        &self,
+        current_ledger: u32,
+    ) -> Result<(Vec<LedgerEntry>, Vec<LedgerKey>)> {
+        let mut archived_entries: Vec<LedgerEntry> = Vec::new();
+        let mut deleted_keys: Vec<LedgerKey> = Vec::new();
+
+        // Track which keys we've already processed (to avoid duplicates from different levels)
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        // Iterate through all levels from newest to oldest
+        for level in &self.levels {
+            for bucket in [&level.curr, &level.snap] {
+                for entry in bucket.iter() {
+                    // Only process LIVE and INIT entries (not DEAD or Metadata)
+                    let live_entry = match entry {
+                        BucketEntry::Live(e) | BucketEntry::Init(e) => e,
+                        BucketEntry::Dead(key) => {
+                            // Mark dead keys as seen so we don't process older versions
+                            let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                                BucketError::Serialization(format!(
+                                    "failed to serialize ledger key: {}",
+                                    e
+                                ))
+                            })?;
+                            seen_keys.insert(key_bytes);
+                            continue;
+                        }
+                        BucketEntry::Metadata(_) => continue,
+                    };
+
+                    // Only check Soroban entries (ContractData, ContractCode)
+                    if !is_soroban_entry(&live_entry) {
+                        continue;
+                    }
+
+                    // Get the key for this entry
+                    let Some(key) = ledger_entry_to_key(&live_entry) else {
+                        continue;
+                    };
+
+                    // Check if we've already processed this key
+                    let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                        BucketError::Serialization(format!(
+                            "failed to serialize ledger key: {}",
+                            e
+                        ))
+                    })?;
+                    if !seen_keys.insert(key_bytes) {
+                        // Already processed this key from a newer level
+                        continue;
+                    }
+
+                    // Get the TTL key for this Soroban entry
+                    let Some(ttl_key) = get_ttl_key(&key) else {
+                        continue;
+                    };
+
+                    // Look up the TTL entry in the bucket list
+                    let Some(ttl_entry) = self.get(&ttl_key)? else {
+                        // No TTL entry found - this shouldn't happen for valid Soroban entries
+                        // but we skip rather than error
+                        tracing::warn!(
+                            ?key,
+                            "Soroban entry has no TTL entry during eviction scan"
+                        );
+                        continue;
+                    };
+
+                    // Check if the entry is expired
+                    let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
+                        // Not a TTL entry (shouldn't happen)
+                        continue;
+                    };
+
+                    if !is_expired {
+                        // Entry is still live, skip it
+                        continue;
+                    }
+
+                    // Entry is expired - categorize it
+                    if is_temporary_entry(&live_entry) {
+                        // Temporary entries are deleted
+                        deleted_keys.push(key);
+                    } else if is_persistent_entry(&live_entry) {
+                        // Persistent entries are archived to hot archive
+                        archived_entries.push(live_entry);
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            current_ledger,
+            archived_count = archived_entries.len(),
+            deleted_count = deleted_keys.len(),
+            "Eviction scan completed"
+        );
+
+        Ok((archived_entries, deleted_keys))
+    }
+
+    /// Perform an incremental eviction scan starting from the given iterator position.
+    ///
+    /// This matches C++ stellar-core's `scanForEviction` behavior:
+    /// - Scans entries starting from the iterator's current position
+    /// - Stops when `settings.eviction_scan_size` bytes have been scanned
+    /// - Updates the iterator to the new position
+    /// - Returns evicted entries (archived persistent + deleted temporary)
+    ///
+    /// The scan automatically advances through buckets when reaching the end of one.
+    pub fn scan_for_eviction_incremental(
+        &self,
+        mut iter: EvictionIterator,
+        current_ledger: u32,
+        settings: &StateArchivalSettings,
+    ) -> Result<EvictionResult> {
+        let mut result = EvictionResult {
+            archived_entries: Vec::new(),
+            evicted_keys: Vec::new(),
+            end_iterator: iter,
+            bytes_scanned: 0,
+            scan_complete: false,
+        };
+
+        // Update iterator based on spills (reset offset if bucket received new data)
+        update_starting_eviction_iterator(
+            &mut iter,
+            settings.starting_eviction_scan_level,
+            current_ledger,
+        );
+
+        let start_iter = iter;
+        let mut bytes_remaining = settings.eviction_scan_size;
+
+        // Track keys we've seen to avoid duplicates (from shadowed entries)
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        loop {
+            // Get the current bucket
+            let level = iter.bucket_list_level as usize;
+            if level >= BUCKET_LIST_LEVELS {
+                // Wrapped around, done
+                result.scan_complete = true;
+                break;
+            }
+
+            let bucket = if iter.is_curr_bucket {
+                &self.levels[level].curr
+            } else {
+                &self.levels[level].snap
+            };
+
+            // Scan entries in this bucket starting from the offset
+            let (_entries_scanned, bytes_used, finished_bucket) = self.scan_bucket_region(
+                bucket,
+                &mut iter,
+                bytes_remaining,
+                current_ledger,
+                &mut result.archived_entries,
+                &mut result.evicted_keys,
+                &mut seen_keys,
+            )?;
+
+            result.bytes_scanned += bytes_used;
+
+            if bytes_remaining > bytes_used {
+                bytes_remaining -= bytes_used;
+            } else {
+                bytes_remaining = 0;
+            }
+
+            // If we've scanned enough bytes, we're done
+            if bytes_remaining == 0 {
+                result.scan_complete = true;
+                break;
+            }
+
+            // If we finished this bucket, move to the next one
+            if finished_bucket {
+                let wrapped = iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
+
+                // Check if we've completed a full cycle
+                if wrapped
+                    || (iter.bucket_list_level == start_iter.bucket_list_level
+                        && iter.is_curr_bucket == start_iter.is_curr_bucket)
+                {
+                    result.scan_complete = true;
+                    break;
+                }
+            }
+        }
+
+        result.end_iterator = iter;
+
+        tracing::debug!(
+            current_ledger,
+            bytes_scanned = result.bytes_scanned,
+            archived_count = result.archived_entries.len(),
+            evicted_count = result.evicted_keys.len(),
+            end_level = result.end_iterator.bucket_list_level,
+            end_is_curr = result.end_iterator.is_curr_bucket,
+            end_offset = result.end_iterator.bucket_file_offset,
+            "Incremental eviction scan completed"
+        );
+
+        Ok(result)
+    }
+
+    /// Scan a region of a bucket for evictable entries.
+    ///
+    /// Returns (entries_scanned, bytes_used, finished_bucket).
+    fn scan_bucket_region(
+        &self,
+        bucket: &Bucket,
+        iter: &mut EvictionIterator,
+        max_bytes: u64,
+        current_ledger: u32,
+        archived_entries: &mut Vec<LedgerEntry>,
+        evicted_keys: &mut Vec<LedgerKey>,
+        seen_keys: &mut HashSet<Vec<u8>>,
+    ) -> Result<(usize, u64, bool)> {
+        let mut entries_scanned = 0;
+        let mut bytes_used = 0u64;
+
+        // Skip to the current offset (entry index)
+        // Note: bucket_file_offset is used as entry index for in-memory buckets
+        let start_index = iter.bucket_file_offset as usize;
+
+        let entries: Vec<_> = bucket.iter().collect();
+        let total_entries = entries.len();
+
+        for (i, entry) in entries.iter().enumerate().skip(start_index) {
+            // Estimate entry size (XDR serialized size)
+            let entry_size = match entry {
+                BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                    e.to_xdr(Limits::none()).map(|v| v.len()).unwrap_or(100) as u64
+                }
+                BucketEntry::Dead(k) => {
+                    k.to_xdr(Limits::none()).map(|v| v.len()).unwrap_or(50) as u64
+                }
+                BucketEntry::Metadata(m) => {
+                    m.to_xdr(Limits::none()).map(|v| v.len()).unwrap_or(20) as u64
+                }
+            };
+
+            // Check if we've scanned enough bytes
+            if bytes_used + entry_size > max_bytes && entries_scanned > 0 {
+                // Update iterator to current position and return
+                iter.bucket_file_offset = i as u32;
+                return Ok((entries_scanned, bytes_used, false));
+            }
+
+            bytes_used += entry_size;
+            entries_scanned += 1;
+
+            // Process the entry for eviction
+            let live_entry = match entry {
+                BucketEntry::Live(e) | BucketEntry::Init(e) => e,
+                BucketEntry::Dead(key) => {
+                    // Mark dead keys as seen
+                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                        seen_keys.insert(key_bytes);
+                    }
+                    continue;
+                }
+                BucketEntry::Metadata(_) => continue,
+            };
+
+            // Only check Soroban entries
+            if !is_soroban_entry(live_entry) {
+                continue;
+            }
+
+            // Get the key for this entry
+            let Some(key) = ledger_entry_to_key(live_entry) else {
+                continue;
+            };
+
+            // Check if we've already seen this key (from a newer bucket)
+            let key_bytes = match key.to_xdr(Limits::none()) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+
+            if !seen_keys.insert(key_bytes) {
+                // Already processed from a newer level
+                continue;
+            }
+
+            // Get the TTL key
+            let Some(ttl_key) = get_ttl_key(&key) else {
+                continue;
+            };
+
+            // Look up the TTL entry
+            let Some(ttl_entry) = self.get(&ttl_key)? else {
+                continue;
+            };
+
+            // Check if expired
+            let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
+                continue;
+            };
+
+            if !is_expired {
+                continue;
+            }
+
+            // Entry is expired - categorize it
+            if is_temporary_entry(live_entry) {
+                evicted_keys.push(key);
+            } else if is_persistent_entry(live_entry) {
+                // Persistent entries go to hot archive AND are evicted from live
+                archived_entries.push(live_entry.clone());
+                evicted_keys.push(key);
+            }
+        }
+
+        // Finished the bucket
+        iter.bucket_file_offset = total_entries as u32;
+        Ok((entries_scanned, bytes_used, true))
     }
 }
 

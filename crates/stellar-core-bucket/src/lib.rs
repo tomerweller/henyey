@@ -58,6 +58,7 @@ mod bucket_list;
 mod disk_bucket;
 mod entry;
 mod error;
+mod eviction;
 mod manager;
 mod merge;
 
@@ -67,6 +68,11 @@ pub use bucket_list::{BucketLevel, BucketList, BucketListStats, BUCKET_LIST_LEVE
 pub use disk_bucket::{DiskBucket, DiskBucketIter};
 pub use entry::{compare_entries, compare_keys, ledger_entry_to_key, BucketEntry};
 pub use error::BucketError;
+pub use eviction::{
+    bucket_update_period, level_half, level_should_spill, level_size,
+    update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
+    DEFAULT_EVICTION_SCAN_SIZE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
+};
 pub use manager::{BucketManager, BucketManagerStats};
 pub use merge::{merge_buckets, merge_buckets_with_options, merge_multiple, MergeIterator};
 
