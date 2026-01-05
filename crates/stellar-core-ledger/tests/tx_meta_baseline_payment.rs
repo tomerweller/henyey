@@ -334,13 +334,16 @@ fn advance_header(header: &LedgerHeader, total_coins: i64) -> LedgerHeader {
     )
 }
 
-#[test]
-fn payment_send_xlm_to_existing_account_tx_meta_matches_baseline() {
-    seed(12345).expect("seed short hash");
-    let expected =
-        load_baseline_hashes("payment|protocol version 25|send XLM to an existing account");
-    assert_eq!(expected.len(), 1);
+struct PaymentWorld {
+    entries: std::collections::HashMap<Vec<u8>, LedgerEntry>,
+    header: LedgerHeader,
+    network_id: NetworkId,
+    root_secret: SecretKey,
+    root_account_id: AccountId,
+    a1_id: AccountId,
+}
 
+fn setup_payment_world() -> PaymentWorld {
     let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
     let root_secret = SecretKey::from_seed(network_id.as_bytes());
     let root_account_id: AccountId = (&root_secret.public_key()).into();
@@ -416,19 +419,117 @@ fn payment_send_xlm_to_existing_account_tx_meta_matches_baseline() {
     execute_and_apply(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx_gate2);
     header = advance_header(&header, total_coins);
 
-    let root_seq = account_seq(&entries, &root_account_id);
+    PaymentWorld {
+        entries,
+        header,
+        network_id,
+        root_secret,
+        root_account_id,
+        a1_id,
+    }
+}
+
+#[test]
+fn payment_send_xlm_to_existing_account_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected =
+        load_baseline_hashes("payment|protocol version 25|send XLM to an existing account");
+    assert_eq!(expected.len(), 1);
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+
+    let payment_amount = ((2 + 2) as i64 * base_reserve as i64 + 10 * base_fee as i64) / 2;
+
+    let mut world = setup_payment_world();
+    let root_seq = account_seq(&world.entries, &world.root_account_id);
     let payment_tx = payment_envelope(
-        &root_secret,
-        &a1_id,
-        more_payment,
+        &world.root_secret,
+        &world.a1_id,
+        payment_amount,
         base_fee,
         root_seq + 1,
-        &network_id,
+        &world.network_id,
     );
     let meta = execute_and_apply(
-        &mut entries,
-        &header,
-        network_id,
+        &mut world.entries,
+        &world.header,
+        world.network_id,
+        base_fee,
+        base_reserve,
+        25,
+        payment_tx,
+    )
+    .0;
+
+    let got = tx_meta_hash(&meta);
+    assert_eq!(got, expected[0]);
+}
+
+#[test]
+fn payment_send_xlm_to_new_account_no_destination_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected =
+        load_baseline_hashes("payment|protocol version 25|send XLM to a new account (no destination)");
+    assert_eq!(expected.len(), 1);
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+
+    let mut world = setup_payment_world();
+
+    let dest_secret = secret_from_name("B");
+    let dest_id: AccountId = (&dest_secret.public_key()).into();
+
+    let root_seq = account_seq(&world.entries, &world.root_account_id);
+    let payment_tx = payment_envelope(
+        &world.root_secret,
+        &dest_id,
+        min_balance0,
+        base_fee,
+        root_seq + 1,
+        &world.network_id,
+    );
+    let meta = execute_and_apply(
+        &mut world.entries,
+        &world.header,
+        world.network_id,
+        base_fee,
+        base_reserve,
+        25,
+        payment_tx,
+    )
+    .0;
+
+    let got = tx_meta_hash(&meta);
+    assert_eq!(got, expected[0]);
+}
+
+#[test]
+fn payment_dest_amount_too_big_for_native_asset_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected =
+        load_baseline_hashes("payment|protocol version 25|dest amount too big for native asset");
+    assert_eq!(expected.len(), 1);
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+
+    let mut world = setup_payment_world();
+    let root_seq = account_seq(&world.entries, &world.root_account_id);
+    let payment_tx = payment_envelope(
+        &world.root_secret,
+        &world.a1_id,
+        i64::MAX,
+        base_fee,
+        root_seq + 1,
+        &world.network_id,
+    );
+    let meta = execute_and_apply(
+        &mut world.entries,
+        &world.header,
+        world.network_id,
         base_fee,
         base_reserve,
         25,
