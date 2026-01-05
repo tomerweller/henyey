@@ -48,17 +48,22 @@ impl Slot {
         local_quorum_set: ScpQuorumSet,
         is_validator: bool,
     ) -> Self {
+        let mut nomination = NominationProtocol::new();
+        nomination.set_fully_validated(is_validator);
+        let mut ballot = BallotProtocol::new();
+        ballot.set_fully_validated(is_validator);
+
         Self {
             slot_index,
             local_node_id,
             local_quorum_set,
             is_validator,
-            nomination: NominationProtocol::new(),
-            ballot: BallotProtocol::new(),
+            nomination,
+            ballot,
             envelopes: HashMap::new(),
             externalized_value: None,
             nomination_started: false,
-            fully_validated: false,
+            fully_validated: is_validator,
         }
     }
 
@@ -92,6 +97,11 @@ impl Slot {
         self.fully_validated
     }
 
+    /// Check if we've heard from quorum for the current ballot.
+    pub fn heard_from_quorum(&self) -> bool {
+        self.ballot.heard_from_quorum()
+    }
+
     /// Process an incoming SCP envelope.
     ///
     /// # Returns
@@ -102,12 +112,6 @@ impl Slot {
         driver: &Arc<D>,
     ) -> EnvelopeState {
         let node_id = envelope.statement.node_id.clone();
-
-        // Store envelope
-        self.envelopes
-            .entry(node_id.clone())
-            .or_default()
-            .push(envelope.clone());
 
         // Process based on statement type
         let result = match &envelope.statement.pledges {
@@ -121,6 +125,13 @@ impl Slot {
             }
         };
 
+        if result.is_valid() {
+            self.envelopes
+                .entry(node_id.clone())
+                .or_default()
+                .push(envelope.clone());
+        }
+
         // Check if we need to transition from nomination to ballot
         self.check_nomination_to_ballot(driver);
 
@@ -129,6 +140,8 @@ impl Slot {
             if let Some(value) = self.ballot.get_externalized_value() {
                 self.externalized_value = Some(value.clone());
                 self.fully_validated = true;
+                self.nomination.set_fully_validated(true);
+                self.ballot.set_fully_validated(true);
             }
         }
 
@@ -201,6 +214,24 @@ impl Slot {
         self.ballot.current_ballot_counter()
     }
 
+    /// Process the latest envelopes for this slot.
+    pub fn process_current_state<F>(&self, mut f: F, force_self: bool) -> bool
+    where
+        F: FnMut(&ScpEnvelope) -> bool,
+    {
+        self.nomination.process_current_state(
+            |env| f(env),
+            &self.local_node_id,
+            self.fully_validated,
+            force_self,
+        ) && self.ballot.process_current_state(
+            |env| f(env),
+            &self.local_node_id,
+            self.fully_validated,
+            force_self,
+        )
+    }
+
     /// Process a nomination envelope.
     fn process_nomination_envelope<D: SCPDriver>(
         &mut self,
@@ -222,6 +253,29 @@ impl Slot {
         envelope: &ScpEnvelope,
         driver: &Arc<D>,
     ) -> EnvelopeState {
+        if !self.ballot.is_statement_sane(
+            &envelope.statement,
+            &self.local_node_id,
+            &self.local_quorum_set,
+            driver,
+        ) {
+            return EnvelopeState::Invalid;
+        }
+
+        let validation = self
+            .ballot
+            .validate_statement_values(&envelope.statement, driver, self.slot_index);
+
+        if validation == crate::ValidationLevel::Invalid {
+            return EnvelopeState::Invalid;
+        }
+
+        if validation == crate::ValidationLevel::MaybeValid {
+            self.fully_validated = false;
+            self.nomination.set_fully_validated(false);
+            self.ballot.set_fully_validated(false);
+        }
+
         self.ballot.process_envelope(
             envelope,
             &self.local_node_id,
@@ -264,6 +318,8 @@ impl Slot {
         self.externalized_value = Some(value);
         self.fully_validated = true;
         self.nomination.stop();
+        self.nomination.set_fully_validated(true);
+        self.ballot.set_fully_validated(true);
     }
 
     /// Get the current ballot phase.

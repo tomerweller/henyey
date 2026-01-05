@@ -18,7 +18,7 @@ use tracing::{debug, info, warn, error};
 use stellar_core_common::Hash256;
 use stellar_core_crypto::{PublicKey, SecretKey};
 use stellar_core_ledger::LedgerManager;
-use stellar_core_scp::{SCP, SlotIndex};
+use stellar_core_scp::{BallotPhase, SCP, SlotIndex};
 use stellar_xdr::curr::{
     NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, StellarValue, TimePoint, TransactionEnvelope,
     UpgradeType, Value, WriteXdr, Limits,
@@ -872,7 +872,9 @@ impl Herder {
     pub fn get_nomination_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
         if let Some(ref scp) = self.scp {
             if let Some(state) = scp.get_slot_state(slot) {
-                return Some(scp.get_nomination_timeout(state.nomination_round));
+                if state.is_nominating {
+                    return Some(scp.get_nomination_timeout(state.nomination_round));
+                }
             }
         }
         None
@@ -883,7 +885,9 @@ impl Herder {
         if let Some(ref scp) = self.scp {
             if let Some(state) = scp.get_slot_state(slot) {
                 if let Some(round) = state.ballot_round {
-                    return Some(scp.get_ballot_timeout(round));
+                    if state.heard_from_quorum && !matches!(state.ballot_phase, BallotPhase::Externalize) {
+                        return Some(scp.get_ballot_timeout(round));
+                    }
                 }
             }
         }
@@ -1149,14 +1153,106 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         ScpStatement, ScpStatementPledges, ScpNomination, ScpBallot,
-        ScpStatementExternalize, NodeId as XdrNodeId, Value,
+        ScpStatementExternalize, NodeId as XdrNodeId, Value, StellarValue, TimePoint,
         Signature as XdrSignature, WriteXdr, Limits,
     };
     use stellar_core_crypto::SecretKey;
+    use stellar_core_scp::hash_quorum_set;
+    use crate::tx_queue::TransactionSet;
 
     fn make_test_herder() -> Herder {
         let config = HerderConfig::default();
         Herder::new(config)
+    }
+
+    fn make_validator_herder() -> (Herder, SecretKey) {
+        let seed = [7u8; 32];
+        let secret_for_herder = SecretKey::from_seed(&seed);
+        let public = secret_for_herder.public_key();
+        let node_id = node_id_from_public_key(&public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, secret_for_herder);
+        let secret_for_signing = SecretKey::from_seed(&seed);
+
+        (herder, secret_for_signing)
+    }
+
+    fn make_valid_value_with_cached_tx_set(herder: &Herder) -> Value {
+        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        let tx_set_hash = tx_set.hash;
+        herder.scp_driver.cache_tx_set(tx_set);
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1),
+            upgrades: vec![].try_into().unwrap(),
+            ext: stellar_xdr::curr::StellarValueExt::Basic,
+        };
+        let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
+        Value(value_bytes.try_into().unwrap())
+    }
+
+    fn sign_statement(statement: &ScpStatement, herder: &Herder, secret: &SecretKey) -> ScpEnvelope {
+        let statement_bytes = statement.to_xdr(Limits::none()).unwrap();
+        let mut data = herder.scp_driver.network_id().0.to_vec();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP = 1
+        data.extend_from_slice(&statement_bytes);
+
+        let signature = secret.sign(&data);
+        let sig_bytes: Vec<u8> = signature.as_bytes().to_vec();
+
+        ScpEnvelope {
+            statement: statement.clone(),
+            signature: XdrSignature(sig_bytes.try_into().unwrap()),
+        }
+    }
+
+    fn make_signed_nomination_envelope(
+        slot: u64,
+        value: Value,
+        accepted: bool,
+        herder: &Herder,
+        secret: &SecretKey,
+    ) -> ScpEnvelope {
+        let quorum_set = herder
+            .scp_driver
+            .get_local_quorum_set()
+            .expect("local quorum set");
+
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
+        ));
+
+        let accepted_values = if accepted {
+            vec![value.clone()].try_into().unwrap()
+        } else {
+            vec![].try_into().unwrap()
+        };
+
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Nominate(ScpNomination {
+                quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+                votes: vec![value].try_into().unwrap(),
+                accepted: accepted_values,
+            }),
+        };
+
+        sign_statement(&statement, herder, secret)
     }
 
     /// Creates a test envelope with a valid signature for the given herder's network.
@@ -1420,5 +1516,59 @@ mod tests {
         assert_eq!(result, EnvelopeState::Valid);
         // Tracking slot should have advanced (to slot + 1, since EXTERNALIZE completes that slot)
         assert_eq!(herder.tracking_slot(), acceptable_slot + 1);
+    }
+
+    #[test]
+    fn test_nomination_timeout_requires_started() {
+        let (herder, _secret) = make_validator_herder();
+        let scp = herder.scp().expect("validator scp");
+        let slot = 1u64;
+
+        assert!(herder.get_nomination_timeout(slot).is_none());
+
+        let value = make_valid_value_with_cached_tx_set(&herder);
+        let prev_value = value.clone();
+        assert!(scp.nominate(slot, value, &prev_value));
+
+        assert!(herder.get_nomination_timeout(slot).is_some());
+    }
+
+    #[test]
+    fn test_ballot_timeout_requires_heard_from_quorum() {
+        let (herder, secret) = make_validator_herder();
+        let scp = herder.scp().expect("validator scp");
+        let slot = 1u64;
+
+        assert!(herder.get_ballot_timeout(slot).is_none());
+
+        let value = make_valid_value_with_cached_tx_set(&herder);
+        let prev_value = value.clone();
+        assert!(scp.nominate(slot, value.clone(), &prev_value));
+
+        let env = make_signed_nomination_envelope(slot, value, true, &herder, &secret);
+        scp.receive_envelope(env);
+
+        assert!(herder.get_ballot_timeout(slot).is_some());
+    }
+
+    #[test]
+    fn test_timeouts_none_for_non_validator() {
+        let herder = make_test_herder();
+        let slot = 1u64;
+
+        assert!(herder.get_nomination_timeout(slot).is_none());
+        assert!(herder.get_ballot_timeout(slot).is_none());
+    }
+
+    #[test]
+    fn test_ballot_timeout_none_when_externalized() {
+        let (herder, _secret) = make_validator_herder();
+        let scp = herder.scp().expect("validator scp");
+        let slot = 1u64;
+
+        let value = make_valid_value_with_cached_tx_set(&herder);
+        scp.force_externalize(slot, value);
+
+        assert!(herder.get_ballot_timeout(slot).is_none());
     }
 }

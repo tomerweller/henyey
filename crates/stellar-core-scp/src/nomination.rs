@@ -42,6 +42,12 @@ pub struct NominationProtocol {
     latest_nominations: HashMap<NodeId, ScpEnvelope>,
     /// Round leaders (nodes we're nominating values from).
     round_leaders: HashSet<NodeId>,
+    /// Last local envelope we built.
+    last_envelope: Option<ScpEnvelope>,
+    /// Last local envelope we emitted.
+    last_envelope_emit: Option<ScpEnvelope>,
+    /// Whether the slot is fully validated.
+    fully_validated: bool,
 }
 
 impl NominationProtocol {
@@ -59,6 +65,9 @@ impl NominationProtocol {
             timer_exp_count: 0,
             latest_nominations: HashMap::new(),
             round_leaders: HashSet::new(),
+            last_envelope: None,
+            last_envelope_emit: None,
+            fully_validated: true,
         }
     }
 
@@ -77,6 +86,11 @@ impl NominationProtocol {
         self.stopped
     }
 
+    /// Update fully-validated state for local emission gating.
+    pub fn set_fully_validated(&mut self, fully_validated: bool) {
+        self.fully_validated = fully_validated;
+    }
+
     /// Get the voted values.
     pub fn votes(&self) -> &[Value] {
         &self.votes
@@ -90,6 +104,35 @@ impl NominationProtocol {
     /// Get the latest composite value.
     pub fn latest_composite(&self) -> Option<&Value> {
         self.latest_composite.as_ref()
+    }
+
+    /// Process the latest nomination envelopes with a callback.
+    pub fn process_current_state<F>(
+        &self,
+        mut f: F,
+        local_node_id: &NodeId,
+        fully_validated: bool,
+        force_self: bool,
+    ) -> bool
+    where
+        F: FnMut(&ScpEnvelope) -> bool,
+    {
+        let mut nodes: Vec<_> = self.latest_nominations.keys().collect();
+        nodes.sort();
+
+        for node_id in nodes {
+            if !force_self && node_id == local_node_id && !fully_validated {
+                continue;
+            }
+
+            if let Some(envelope) = self.latest_nominations.get(node_id) {
+                if !f(envelope) {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     /// Nominate a value for this slot.
@@ -362,8 +405,27 @@ impl NominationProtocol {
         };
 
         driver.sign_envelope(&mut envelope);
-        self.record_local_nomination(local_node_id, &statement, envelope.clone());
-        driver.emit_envelope(&envelope);
+        if self.record_local_nomination(local_node_id, &statement, envelope.clone()) {
+            self.last_envelope = Some(envelope.clone());
+            self.send_latest_envelope(driver);
+        }
+    }
+
+    fn send_latest_envelope<D: SCPDriver>(&mut self, driver: &Arc<D>) {
+        if !self.fully_validated {
+            return;
+        }
+
+        let Some(envelope) = self.last_envelope.as_ref() else {
+            return;
+        };
+
+        if self.last_envelope_emit.as_ref() == Some(envelope) {
+            return;
+        }
+
+        self.last_envelope_emit = Some(envelope.clone());
+        driver.emit_envelope(envelope);
     }
 
     fn record_local_nomination(
@@ -371,18 +433,19 @@ impl NominationProtocol {
         local_node_id: &NodeId,
         statement: &ScpStatement,
         envelope: ScpEnvelope,
-    ) {
+    ) -> bool {
         let nomination = match &statement.pledges {
             ScpStatementPledges::Nominate(nom) => nom,
-            _ => return,
+            _ => return false,
         };
         if !self.is_newer_statement(local_node_id, nomination) {
-            return;
+            return false;
         }
         // Safe to insert: we only store nominations here.
         // This keeps local state in the same envelope stream as remote peers.
         self.latest_nominations
             .insert(local_node_id.clone(), envelope);
+        true
     }
 
     fn is_newer_statement(&self, node_id: &NodeId, nomination: &ScpNomination) -> bool {
@@ -980,5 +1043,204 @@ mod tests {
 
         nom.nominate(&node, &quorum_set, &driver, 10, value, &prev, true);
         assert!(nom.round() > round_before);
+    }
+
+    #[test]
+    fn test_nomination_process_current_state_skips_self_when_not_validated() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let value_local = make_value(&[1]);
+        let value_remote = make_value(&[2]);
+        let env_local = make_nomination_envelope(
+            local.clone(),
+            11,
+            &quorum_set,
+            vec![value_local],
+            vec![],
+        );
+        let env_remote = make_nomination_envelope(
+            remote.clone(),
+            11,
+            &quorum_set,
+            vec![value_remote],
+            vec![],
+        );
+
+        nom.process_envelope(&env_local, &local, &quorum_set, &driver, 11);
+        nom.process_envelope(&env_remote, &local, &quorum_set, &driver, 11);
+
+        let mut seen = Vec::new();
+        nom.process_current_state(
+            |env| {
+                seen.push(env.statement.node_id.clone());
+                true
+            },
+            &local,
+            false,
+            false,
+        );
+
+        assert!(seen.contains(&remote));
+        assert!(!seen.contains(&local));
+    }
+
+    #[test]
+    fn test_nomination_process_current_state_includes_self_when_forced() {
+        let local = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![local.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let value_local = make_value(&[3]);
+        let env_local = make_nomination_envelope(
+            local.clone(),
+            12,
+            &quorum_set,
+            vec![value_local],
+            vec![],
+        );
+
+        nom.process_envelope(&env_local, &local, &quorum_set, &driver, 12);
+
+        let mut seen = Vec::new();
+        nom.process_current_state(
+            |env| {
+                seen.push(env.statement.node_id.clone());
+                true
+            },
+            &local,
+            false,
+            true,
+        );
+
+        assert!(seen.contains(&local));
+    }
+
+    #[test]
+    fn test_nomination_process_current_state_orders_by_node_id() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(3);
+        let node_c = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let env_local = make_nomination_envelope(
+            local.clone(),
+            13,
+            &quorum_set,
+            vec![make_value(&[1])],
+            vec![],
+        );
+        let env_b = make_nomination_envelope(
+            node_b.clone(),
+            13,
+            &quorum_set,
+            vec![make_value(&[2])],
+            vec![],
+        );
+        let env_c = make_nomination_envelope(
+            node_c.clone(),
+            13,
+            &quorum_set,
+            vec![make_value(&[3])],
+            vec![],
+        );
+
+        nom.process_envelope(&env_b, &local, &quorum_set, &driver, 13);
+        nom.process_envelope(&env_c, &local, &quorum_set, &driver, 13);
+        nom.process_envelope(&env_local, &local, &quorum_set, &driver, 13);
+
+        let mut seen = Vec::new();
+        nom.process_current_state(
+            |env| {
+                seen.push(env.statement.node_id.clone());
+                true
+            },
+            &local,
+            true,
+            false,
+        );
+
+        assert_eq!(seen, vec![local, node_c, node_b]);
+    }
+
+    #[test]
+    fn test_nomination_newer_statement_accepts_accepted_growth() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let value = make_value(&[9]);
+        let env_old = make_nomination_envelope(
+            remote.clone(),
+            14,
+            &quorum_set,
+            vec![value.clone()],
+            vec![],
+        );
+        let env_new = make_nomination_envelope(
+            remote.clone(),
+            14,
+            &quorum_set,
+            vec![value.clone()],
+            vec![value],
+        );
+
+        nom.process_envelope(&env_old, &local, &quorum_set, &driver, 14);
+        nom.process_envelope(&env_new, &local, &quorum_set, &driver, 14);
+
+        let mut accepted_counts = Vec::new();
+        nom.process_current_state(
+            |env| {
+                if let ScpStatementPledges::Nominate(nom) = &env.statement.pledges {
+                    accepted_counts.push(nom.accepted.len());
+                }
+                true
+            },
+            &local,
+            true,
+            false,
+        );
+
+        assert_eq!(accepted_counts, vec![1]);
+    }
+
+    #[test]
+    fn test_nomination_rejects_shrinking_votes() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let value_a = make_value(&[1]);
+        let value_b = make_value(&[2]);
+        let env_old = make_nomination_envelope(
+            remote.clone(),
+            15,
+            &quorum_set,
+            vec![value_a.clone(), value_b.clone()],
+            vec![],
+        );
+        let env_new = make_nomination_envelope(
+            remote.clone(),
+            15,
+            &quorum_set,
+            vec![value_a],
+            vec![],
+        );
+
+        let first = nom.process_envelope(&env_old, &local, &quorum_set, &driver, 15);
+        let second = nom.process_envelope(&env_new, &local, &quorum_set, &driver, 15);
+
+        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert_eq!(second, EnvelopeState::Invalid);
     }
 }

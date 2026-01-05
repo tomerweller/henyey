@@ -270,6 +270,86 @@ mod tests {
         }
     }
 
+    fn make_quorum_set_with_inners(
+        validators: Vec<NodeId>,
+        inner_sets: Vec<ScpQuorumSet>,
+        threshold: u32,
+    ) -> ScpQuorumSet {
+        ScpQuorumSet {
+            threshold,
+            validators: validators.try_into().unwrap_or_default(),
+            inner_sets: inner_sets.try_into().unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn test_slot_quorum_tracker_quorum_and_vblocking() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let qset = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 2);
+
+        let mut tracker = SlotQuorumTracker::new(Some(qset), 4);
+        tracker.record_envelope(7, local.clone());
+        tracker.record_envelope(7, node_b.clone());
+
+        assert!(tracker.has_quorum(7, |node| {
+            if node == &local || node == &node_b || node == &node_c {
+                Some(make_quorum_set(
+                    vec![local.clone(), node_b.clone(), node_c.clone()],
+                    2,
+                ))
+            } else {
+                None
+            }
+        }));
+        assert!(tracker.is_v_blocking(7));
+
+        tracker.record_envelope(7, node_c.clone());
+        assert!(tracker.has_quorum(7, |node| {
+            if node == &local || node == &node_b || node == &node_c {
+                Some(make_quorum_set(
+                    vec![local.clone(), node_b.clone(), node_c.clone()],
+                    2,
+                ))
+            } else {
+                None
+            }
+        }));
+        assert!(tracker.is_v_blocking(7));
+    }
+
+    #[test]
+    fn test_slot_quorum_tracker_prunes_old_slots() {
+        let local = make_node_id(1);
+        let qset = make_quorum_set(vec![local.clone()], 1);
+
+        let mut tracker = SlotQuorumTracker::new(Some(qset), 2);
+        tracker.record_envelope(1, local.clone());
+        tracker.record_envelope(2, local.clone());
+        tracker.record_envelope(3, local);
+
+        assert!(!tracker.has_quorum(1, |_| Some(make_quorum_set(vec![make_node_id(1)], 1))));
+        assert!(tracker.has_quorum(2, |_| Some(make_quorum_set(vec![make_node_id(1)], 1))));
+        assert!(tracker.has_quorum(3, |_| Some(make_quorum_set(vec![make_node_id(1)], 1))));
+    }
+
+    #[test]
+    fn test_slot_quorum_tracker_clear_and_set_local_qset() {
+        let local = make_node_id(1);
+        let qset = make_quorum_set(vec![local.clone()], 1);
+
+        let mut tracker = SlotQuorumTracker::new(None, 2);
+        tracker.record_envelope(5, local.clone());
+        assert!(!tracker.has_quorum(5, |_| Some(qset.clone())));
+
+        tracker.set_local_quorum_set(Some(qset.clone()));
+        assert!(tracker.has_quorum(5, |_| Some(qset.clone())));
+
+        tracker.clear_slot(5);
+        assert!(!tracker.has_quorum(5, |_| Some(qset.clone())));
+    }
+
     #[test]
     fn test_expand_tracks_closest_validators() {
         let local = make_node_id(1);
@@ -348,5 +428,84 @@ mod tests {
         assert!(tracker.expand(&local, qset_local));
         assert!(tracker.expand(&node_b, qset_b.clone()));
         assert!(tracker.expand(&node_b, qset_b));
+    }
+
+    #[test]
+    fn test_rebuild_merges_closest_validators_for_shared_nodes() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let node_d = make_node_id(4);
+
+        let qset_a = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 2);
+        let qset_b = make_quorum_set(vec![node_b.clone(), node_d.clone()], 2);
+        let qset_c = make_quorum_set(vec![node_c.clone(), node_d.clone()], 2);
+
+        let mut tracker = QuorumTracker::new(local.clone());
+        tracker
+            .rebuild(|node| {
+                if node == &local {
+                    Some(qset_a.clone())
+                } else if node == &node_b {
+                    Some(qset_b.clone())
+                } else if node == &node_c {
+                    Some(qset_c.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("rebuild");
+
+        let closest_d = tracker.find_closest_validators(&node_d).unwrap();
+        assert!(closest_d.contains(&node_b));
+        assert!(closest_d.contains(&node_c));
+    }
+
+    #[test]
+    fn test_expand_tracks_inner_set_nodes() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+
+        let inner = make_quorum_set(vec![node_b.clone(), node_c.clone()], 1);
+        let qset_local = make_quorum_set_with_inners(vec![local.clone()], vec![inner], 1);
+
+        let mut tracker = QuorumTracker::new(local.clone());
+        assert!(tracker.expand(&local, qset_local));
+
+        assert!(tracker.is_node_definitely_in_quorum(&node_b));
+        assert!(tracker.is_node_definitely_in_quorum(&node_c));
+
+        let closest_b = tracker.find_closest_validators(&node_b).unwrap();
+        assert!(closest_b.contains(&node_b));
+    }
+
+    #[test]
+    fn test_rebuild_closest_validators_via_inner_sets() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let node_d = make_node_id(4);
+
+        let inner = make_quorum_set(vec![node_b.clone(), node_c.clone()], 1);
+        let qset_local = make_quorum_set_with_inners(vec![local.clone()], vec![inner], 1);
+        let qset_b = make_quorum_set(vec![node_b.clone(), node_d.clone()], 2);
+
+        let mut tracker = QuorumTracker::new(local.clone());
+        tracker
+            .rebuild(|node| {
+                if node == &local {
+                    Some(qset_local.clone())
+                } else if node == &node_b {
+                    Some(qset_b.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("rebuild");
+
+        let closest_d = tracker.find_closest_validators(&node_d).unwrap();
+        assert!(closest_d.contains(&node_b));
+        assert!(!closest_d.contains(&node_c));
     }
 }

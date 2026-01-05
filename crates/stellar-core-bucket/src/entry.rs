@@ -477,11 +477,7 @@ pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
 /// An entry is expired when its `live_until_ledger_seq` is less than the current ledger.
 /// Returns None if the entry is not a TTL entry.
 pub fn is_ttl_expired(ttl_entry: &LedgerEntry, current_ledger: u32) -> Option<bool> {
-    if let LedgerEntryData::Ttl(ttl) = &ttl_entry.data {
-        Some(ttl.live_until_ledger_seq < current_ledger)
-    } else {
-        None
-    }
+    get_ttl_live_until(ttl_entry).map(|live_until| live_until < current_ledger)
 }
 
 /// Get the live_until_ledger_seq from a TTL entry.

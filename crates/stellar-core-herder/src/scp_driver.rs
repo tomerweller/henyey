@@ -708,6 +708,125 @@ impl ScpDriver {
     }
 }
 
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::tx_queue::TransactionSet;
+    use std::thread;
+    use std::time::Duration;
+    use stellar_core_scp::hash_quorum_set;
+
+    fn make_config(max_cache: usize) -> ScpDriverConfig {
+        ScpDriverConfig {
+            max_tx_set_cache: max_cache,
+            ..ScpDriverConfig::default()
+        }
+    }
+
+    fn make_tx_set(seed: u8) -> TransactionSet {
+        let prev_hash = Hash256::from_bytes([seed; 32]);
+        TransactionSet::new(prev_hash, Vec::new())
+    }
+
+    #[test]
+    fn test_cache_tx_set_evicts_oldest() {
+        let driver = ScpDriver::new(make_config(1), Hash256::hash(b"network"));
+        let first = make_tx_set(1);
+        let second = make_tx_set(2);
+
+        driver.cache_tx_set(first.clone());
+        thread::sleep(Duration::from_millis(1));
+        driver.cache_tx_set(second.clone());
+
+        assert!(!driver.has_tx_set(&first.hash));
+        assert!(driver.has_tx_set(&second.hash));
+    }
+
+    #[test]
+    fn test_request_and_receive_tx_set() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let tx_set = make_tx_set(3);
+        let slot = 12u64;
+
+        assert!(driver.request_tx_set(tx_set.hash, slot));
+        assert!(!driver.request_tx_set(tx_set.hash, slot));
+        assert!(driver.needs_tx_set(&tx_set.hash));
+        assert_eq!(driver.get_pending_tx_set_hashes(), vec![tx_set.hash]);
+
+        let received = driver.receive_tx_set(tx_set.clone());
+        assert_eq!(received, Some(slot));
+        assert!(!driver.needs_tx_set(&tx_set.hash));
+        assert!(driver.get_tx_set(&tx_set.hash).is_some());
+    }
+
+    #[test]
+    fn test_receive_tx_set_rejects_mismatched_hash() {
+        let driver = ScpDriver::new(make_config(2), Hash256::hash(b"network"));
+        let tx_set = make_tx_set(4);
+        let bad_hash = Hash256::from_bytes([9; 32]);
+        let bad_set = TransactionSet::with_hash(tx_set.previous_ledger_hash, bad_hash, Vec::new());
+
+        let received = driver.receive_tx_set(bad_set);
+        assert_eq!(received, None);
+        assert!(!driver.has_tx_set(&bad_hash));
+    }
+
+    #[test]
+    fn test_cleanup_old_pending_slots() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let tx_set_a = make_tx_set(5);
+        let tx_set_b = make_tx_set(6);
+
+        driver.request_tx_set(tx_set_a.hash, 10);
+        driver.request_tx_set(tx_set_b.hash, 12);
+
+        let removed = driver.cleanup_old_pending_slots(12);
+        assert_eq!(removed, 1);
+
+        let pending = driver.get_pending_tx_sets();
+        assert_eq!(pending, vec![(tx_set_b.hash, 12)]);
+    }
+
+    #[test]
+    fn test_cleanup_pending_tx_sets_by_age() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let tx_set = make_tx_set(7);
+        driver.request_tx_set(tx_set.hash, 20);
+
+        driver.cleanup_pending_tx_sets(0);
+        assert!(driver.get_pending_tx_set_hashes().is_empty());
+    }
+
+    #[test]
+    fn test_request_quorum_set_tracks_unknown_only() {
+        let node_id = PublicKey::from_bytes(&[9u8; 32]).expect("node id");
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![
+                stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::curr::Uint256([1u8; 32]),
+                )),
+            ]
+            .try_into()
+            .unwrap(),
+            inner_sets: Vec::new().try_into().unwrap(),
+        };
+        let config = ScpDriverConfig {
+            node_id,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..make_config(4)
+        };
+        let driver = ScpDriver::new(config, Hash256::hash(b"network"));
+
+        let known_hash = hash_quorum_set(&quorum_set);
+        assert!(!driver.request_quorum_set(known_hash));
+
+        let unknown_hash = Hash256::from_bytes([42u8; 32]);
+        assert!(driver.request_quorum_set(unknown_hash));
+        assert!(!driver.request_quorum_set(unknown_hash));
+    }
+}
+
 /// SCP callback implementation wrapper.
 ///
 /// This wraps the ScpDriver to implement the SCPDriver trait.
@@ -795,6 +914,10 @@ impl SCPDriver for HerderScpCallback {
 
     fn get_quorum_set(&self, node_id: &stellar_xdr::curr::NodeId) -> Option<ScpQuorumSet> {
         self.driver.get_quorum_set(node_id)
+    }
+
+    fn get_quorum_set_by_hash(&self, hash: &stellar_core_common::Hash256) -> Option<ScpQuorumSet> {
+        self.driver.get_quorum_set_by_hash(hash.as_bytes())
     }
 
     fn nominating_value(&self, _slot_index: u64, _value: &Value) {

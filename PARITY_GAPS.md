@@ -33,10 +33,10 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 ## SCP
 
 ### Functional Gaps
-- Edge-case SCP semantics still pending (slot/ballot corner cases not yet fully validated against upstream).
+- None known at v25 parity baseline.
 
 ### Testing Gaps
-- Additional upstream-aligned golden vectors for nomination/ballot edge cases (basic quorum/v-blocking, quorum sanity/normalization, and nomination weight unit tests are in place; broader ballot/nomination scenarios still missing).
+- Additional upstream-aligned golden vectors for nomination/ballot edge cases (basic quorum/v-blocking, quorum sanity/normalization, nomination weight, statement sanity/value-validation, quorum-set-hash rejection, expanded statement ordering, SCP state emission gating including nomination/ballot current-state filtering, deterministic SCP state ordering by node/slot, ballot commit-range externalization, and externalized bump rejection tests are in place; broader ballot/nomination scenarios still missing).
 
 ## Herder
 
@@ -44,8 +44,10 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 - None known at v25 parity baseline.
 
 ### Testing Gaps
-- Broader quorum tracker regression coverage (basic expansion/rebuild edge cases covered; broader graph scenarios still missing).
+- Broader quorum tracker regression coverage (basic expansion/rebuild edge cases covered, including shared-node and inner-set closest-validator coverage plus SlotQuorumTracker quorum/v-blocking + prune tests; broader graph scenarios still missing).
+- SCP driver tx set cache/pending request tests cover eviction, request/receive, mismatch rejection, cleanup, and quorum-set request tracking; broader driver coverage still missing.
 - Tx set builder parity tests against upstream fixtures.
+- Herder timeout scheduling regression coverage beyond nomination/ballot gating tests.
 
 ## Ledger / Close
 

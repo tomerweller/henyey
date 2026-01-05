@@ -16,8 +16,8 @@ use stellar_xdr::curr::{
     Value, WriteXdr,
 };
 
-use crate::driver::SCPDriver;
-use crate::quorum::{hash_quorum_set, is_blocking_set, is_quorum};
+use crate::driver::{SCPDriver, ValidationLevel};
+use crate::quorum::{hash_quorum_set, is_blocking_set, is_quorum, is_quorum_set_sane, simple_quorum_set};
 use crate::EnvelopeState;
 
 /// Phase of the ballot protocol.
@@ -50,8 +50,18 @@ pub struct BallotProtocol {
     latest_envelopes: HashMap<NodeId, ScpEnvelope>,
     /// Value being confirmed/externalized.
     value: Option<Value>,
+    /// Value override set when confirming prepared/commit.
+    value_override: Option<Value>,
     /// Whether we've heard from quorum in current round.
     heard_from_quorum: bool,
+    /// Recursion level for advance_slot.
+    current_message_level: u32,
+    /// Last local envelope we built.
+    last_envelope: Option<ScpEnvelope>,
+    /// Last local envelope we emitted.
+    last_envelope_emit: Option<ScpEnvelope>,
+    /// Whether the slot is fully validated.
+    fully_validated: bool,
 }
 
 impl BallotProtocol {
@@ -66,7 +76,12 @@ impl BallotProtocol {
             phase: BallotPhase::Prepare,
             latest_envelopes: HashMap::new(),
             value: None,
+            value_override: None,
             heard_from_quorum: false,
+            current_message_level: 0,
+            last_envelope: None,
+            last_envelope_emit: None,
+            fully_validated: true,
         }
     }
 
@@ -100,6 +115,45 @@ impl BallotProtocol {
         self.phase == BallotPhase::Externalize
     }
 
+    /// Process the latest ballot envelopes with a callback.
+    pub fn process_current_state<F>(
+        &self,
+        mut f: F,
+        local_node_id: &NodeId,
+        fully_validated: bool,
+        force_self: bool,
+    ) -> bool
+    where
+        F: FnMut(&ScpEnvelope) -> bool,
+    {
+        let mut nodes: Vec<_> = self.latest_envelopes.keys().collect();
+        nodes.sort();
+
+        for node_id in nodes {
+            if !force_self && node_id == local_node_id && !fully_validated {
+                continue;
+            }
+
+            if let Some(envelope) = self.latest_envelopes.get(node_id) {
+                if !f(envelope) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Update fully-validated state for local emission gating.
+    pub fn set_fully_validated(&mut self, fully_validated: bool) {
+        self.fully_validated = fully_validated;
+    }
+
+    /// Check whether we've heard from quorum for the current ballot.
+    pub fn heard_from_quorum(&self) -> bool {
+        self.heard_from_quorum
+    }
+
     /// Get the externalized value if we've reached consensus.
     pub fn get_externalized_value(&self) -> Option<&Value> {
         if self.phase == BallotPhase::Externalize {
@@ -123,19 +177,16 @@ impl BallotProtocol {
             return false;
         }
 
+        if !force && self.current_ballot.is_some() {
+            return false;
+        }
+
         // Calculate new ballot counter
-        let counter = if let Some(ref current) = self.current_ballot {
-            if force {
-                current.counter + 1
-            } else if current.value == value {
-                // Same value, no need to bump
-                return false;
-            } else {
-                current.counter + 1
-            }
-        } else {
-            1
-        };
+        let counter = self
+            .current_ballot
+            .as_ref()
+            .map(|current| current.counter + 1)
+            .unwrap_or(1);
 
         let ballot = ScpBallot {
             counter,
@@ -148,6 +199,7 @@ impl BallotProtocol {
 
         // Emit prepare statement
         self.emit_prepare(local_node_id, local_quorum_set, driver, slot_index);
+        self.check_heard_from_quorum(local_node_id, local_quorum_set, driver, slot_index);
 
         true
     }
@@ -168,6 +220,7 @@ impl BallotProtocol {
             ballot.counter += 1;
             self.heard_from_quorum = false;
             self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
+            self.check_heard_from_quorum(local_node_id, local_quorum_set, driver, slot_index);
             true
         } else {
             false
@@ -196,30 +249,26 @@ impl BallotProtocol {
             return EnvelopeState::Invalid;
         }
 
+        if self.phase == BallotPhase::Externalize {
+            if self.statement_value_matches_commit(&envelope.statement) {
+                self.latest_envelopes
+                    .insert(node_id.clone(), envelope.clone());
+                return EnvelopeState::Valid;
+            }
+            return EnvelopeState::Invalid;
+        }
+
         // Store the envelope
         self.latest_envelopes
             .insert(node_id.clone(), envelope.clone());
 
-        // Process based on statement type
-        match &envelope.statement.pledges {
-            ScpStatementPledges::Prepare(_) => {
-                self.advance_slot(local_node_id, local_quorum_set, driver, slot_index)
-            }
-            ScpStatementPledges::Confirm(_) => {
-                self.advance_slot(local_node_id, local_quorum_set, driver, slot_index)
-            }
-            ScpStatementPledges::Externalize(ext) => {
-                // If we receive externalize from enough nodes, we should externalize too
-                self.try_accept_externalize(
-                    ext,
-                    local_node_id,
-                    local_quorum_set,
-                    driver,
-                    slot_index,
-                )
-            }
-            _ => EnvelopeState::Invalid,
-        }
+        self.advance_slot(
+            &envelope.statement,
+            local_node_id,
+            local_quorum_set,
+            driver,
+            slot_index,
+        )
     }
 
     fn is_newer_statement(&self, node_id: &NodeId, statement: &ScpStatement) -> bool {
@@ -288,6 +337,197 @@ impl BallotProtocol {
         }
     }
 
+    pub(crate) fn is_statement_sane<D: SCPDriver>(
+        &self,
+        statement: &ScpStatement,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+    ) -> bool {
+        let quorum_set = match self.statement_quorum_set(statement, local_node_id, local_quorum_set, driver) {
+            Some(qset) => qset,
+            None => return false,
+        };
+
+        if is_quorum_set_sane(&quorum_set, false).is_err() {
+            return false;
+        }
+
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(prep) => {
+                let is_self = statement.node_id == *local_node_id;
+                if !is_self && prep.ballot.counter == 0 {
+                    return false;
+                }
+
+                if let (Some(prepared_prime), Some(prepared)) = (&prep.prepared_prime, &prep.prepared) {
+                    if !(ballot_compare(prepared_prime, prepared) == std::cmp::Ordering::Less
+                        && !ballot_compatible(prepared_prime, prepared))
+                    {
+                        return false;
+                    }
+                }
+
+                if prep.n_h != 0 {
+                    if let Some(prepared) = &prep.prepared {
+                        if prep.n_h > prepared.counter {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+
+                if prep.n_c != 0 {
+                    if prep.n_h == 0 {
+                        return false;
+                    }
+                    if prep.ballot.counter < prep.n_h || prep.n_h < prep.n_c {
+                        return false;
+                    }
+                }
+            }
+            ScpStatementPledges::Confirm(conf) => {
+                if conf.ballot.counter == 0 {
+                    return false;
+                }
+                if conf.n_h > conf.ballot.counter {
+                    return false;
+                }
+                if conf.n_commit > conf.n_h {
+                    return false;
+                }
+            }
+            ScpStatementPledges::Externalize(ext) => {
+                if ext.commit.counter == 0 {
+                    return false;
+                }
+                if ext.n_h < ext.commit.counter {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+
+        true
+    }
+
+    pub(crate) fn validate_statement_values<D: SCPDriver>(
+        &self,
+        statement: &ScpStatement,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> ValidationLevel {
+        let values = self.statement_values(statement);
+        if values.is_empty() {
+            return ValidationLevel::Invalid;
+        }
+
+        let mut level = ValidationLevel::FullyValidated;
+        for value in values {
+            let next = driver.validate_value(slot_index, &value, false);
+            level = min_validation_level(level, next);
+            if level == ValidationLevel::Invalid {
+                break;
+            }
+        }
+        level
+    }
+
+    fn statement_quorum_set<D: SCPDriver>(
+        &self,
+        statement: &ScpStatement,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+    ) -> Option<ScpQuorumSet> {
+        match &statement.pledges {
+            ScpStatementPledges::Externalize(_) => {
+                Some(simple_quorum_set(1, vec![statement.node_id.clone()]))
+            }
+            ScpStatementPledges::Prepare(prep) => {
+                let provided = stellar_core_common::Hash256::from(prep.quorum_set_hash.clone());
+                if &statement.node_id == local_node_id {
+                    let expected = hash_quorum_set(local_quorum_set);
+                    if expected == provided {
+                        return Some(local_quorum_set.clone());
+                    }
+                }
+                if let Some(qset) = driver.get_quorum_set_by_hash(&provided) {
+                    return Some(qset);
+                }
+                driver.get_quorum_set(&statement.node_id).and_then(|qset| {
+                    let expected = hash_quorum_set(&qset);
+                    if expected == provided {
+                        Some(qset)
+                    } else {
+                        None
+                    }
+                })
+            }
+            ScpStatementPledges::Confirm(conf) => {
+                let provided = stellar_core_common::Hash256::from(conf.quorum_set_hash.clone());
+                if &statement.node_id == local_node_id {
+                    let expected = hash_quorum_set(local_quorum_set);
+                    if expected == provided {
+                        return Some(local_quorum_set.clone());
+                    }
+                }
+                if let Some(qset) = driver.get_quorum_set_by_hash(&provided) {
+                    return Some(qset);
+                }
+                driver.get_quorum_set(&statement.node_id).and_then(|qset| {
+                    let expected = hash_quorum_set(&qset);
+                    if expected == provided {
+                        Some(qset)
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn statement_values(&self, statement: &ScpStatement) -> Vec<Value> {
+        let mut values = Vec::new();
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(prep) => {
+                if prep.ballot.counter != 0 {
+                    values.push(prep.ballot.value.clone());
+                }
+                if let Some(prepared) = &prep.prepared {
+                    values.push(prepared.value.clone());
+                }
+                if let Some(prepared_prime) = &prep.prepared_prime {
+                    values.push(prepared_prime.value.clone());
+                }
+            }
+            ScpStatementPledges::Confirm(conf) => {
+                values.push(conf.ballot.value.clone());
+            }
+            ScpStatementPledges::Externalize(ext) => {
+                values.push(ext.commit.value.clone());
+            }
+            _ => {}
+        }
+        values
+    }
+
+    fn statement_value_matches_commit(&self, statement: &ScpStatement) -> bool {
+        let commit = match self.commit.as_ref() {
+            Some(commit) => commit,
+            None => return false,
+        };
+
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(prep) => commit.value == prep.ballot.value,
+            ScpStatementPledges::Confirm(conf) => commit.value == conf.ballot.value,
+            ScpStatementPledges::Externalize(ext) => commit.value == ext.commit.value,
+            _ => false,
+        }
+    }
+
     fn compare_optional_ballots(&self, left: &Option<ScpBallot>, right: &Option<ScpBallot>) -> i32 {
         match (left, right) {
             (Some(a), Some(b)) => self.compare_ballots(a, b),
@@ -324,154 +564,914 @@ impl BallotProtocol {
     /// Try to advance the slot state based on received messages.
     fn advance_slot<D: SCPDriver>(
         &mut self,
+        hint: &ScpStatement,
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
     ) -> EnvelopeState {
-        match self.phase {
-            BallotPhase::Prepare => {
-                self.try_advance_prepare(
-                    local_node_id,
-                    local_quorum_set,
-                    driver,
-                    slot_index,
-                )
-            }
-            BallotPhase::Confirm => {
-                self.try_advance_confirm(
-                    local_node_id,
-                    local_quorum_set,
-                    driver,
-                    slot_index,
-                )
-            }
-            BallotPhase::Externalize => EnvelopeState::Valid,
+        self.current_message_level = self.current_message_level.saturating_add(1);
+        if self.current_message_level > 50 {
+            self.current_message_level = 0;
+            return EnvelopeState::Invalid;
         }
-    }
+        let mut did_work = false;
 
-    /// Try to advance from prepare phase.
-    fn try_advance_prepare<D: SCPDriver>(
-        &mut self,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
-        slot_index: u64,
-    ) -> EnvelopeState {
-        // Check if we can accept "prepare(b)" for any ballot b
-        if let Some(ref current) = self.current_ballot.clone() {
-            // Get nodes that have voted or accepted prepare for this ballot
-            let preparers = self.get_nodes_that_prepared_or_better(current);
+        did_work = self.attempt_accept_prepared(hint, local_node_id, local_quorum_set, driver, slot_index)
+            || did_work;
+        did_work =
+            self.attempt_confirm_prepared(hint, local_node_id, local_quorum_set, driver, slot_index)
+                || did_work;
+        did_work =
+            self.attempt_accept_commit(hint, local_node_id, local_quorum_set, driver, slot_index)
+                || did_work;
+        did_work = self.attempt_confirm_commit(
+            hint,
+            local_node_id,
+            local_quorum_set,
+            driver,
+            slot_index,
+        ) || did_work;
 
-            let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> {
-                driver.get_quorum_set(node_id)
-            };
-
-            // Check if quorum has prepared
-            if is_quorum(local_quorum_set, &preparers, get_qs) {
-                if !self.heard_from_quorum {
-                    self.heard_from_quorum = true;
-                    driver.ballot_did_hear_from_quorum(slot_index, current);
+        if self.current_message_level == 1 {
+            loop {
+                let bumped =
+                    self.attempt_bump(local_node_id, local_quorum_set, driver, slot_index);
+                did_work = bumped || did_work;
+                if !bumped {
+                    break;
                 }
-                // Accept prepare
-                self.set_prepared(current.clone(), driver, slot_index);
+            }
+            self.check_heard_from_quorum(local_node_id, local_quorum_set, driver, slot_index);
+        }
 
-                // Check if we can move to confirm
-                let confirmers = self.get_nodes_that_confirmed_or_better(current);
-                let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> {
-                    driver.get_quorum_set(node_id)
-                };
-                if is_quorum(local_quorum_set, &confirmers, get_qs) {
-                    self.phase = BallotPhase::Confirm;
-                    self.emit_confirm(local_node_id, local_quorum_set, driver, slot_index);
-                    driver.confirmed_ballot_prepared(slot_index, current);
-                    driver.ballot_did_confirm(slot_index, current);
-                } else {
-                    self.emit_prepare(local_node_id, local_quorum_set, driver, slot_index);
+        self.current_message_level = self.current_message_level.saturating_sub(1);
+        if did_work {
+            self.send_latest_envelope(driver);
+            EnvelopeState::ValidNew
+        } else {
+            EnvelopeState::Valid
+        }
+    }
+
+    fn attempt_accept_prepared<D: SCPDriver>(
+        &mut self,
+        hint: &ScpStatement,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        if !matches!(self.phase, BallotPhase::Prepare | BallotPhase::Confirm) {
+            return false;
+        }
+
+        let candidates = self.get_prepare_candidates(hint);
+
+        for ballot in candidates.iter().rev() {
+            if self.phase == BallotPhase::Confirm {
+                if let Some(prepared) = &self.prepared {
+                    if !are_ballots_less_and_compatible(prepared, ballot) {
+                        continue;
+                    }
                 }
-            } else if is_blocking_set(local_quorum_set, &preparers) {
-                // Blocking set has prepared - we should too
-                self.set_prepared(current.clone(), driver, slot_index);
-                self.emit_prepare(local_node_id, local_quorum_set, driver, slot_index);
+                if let Some(commit) = &self.commit {
+                    if !ballot_compatible(commit, ballot) {
+                        continue;
+                    }
+                }
             }
-        }
 
-        EnvelopeState::ValidNew
-    }
-
-    /// Try to advance from confirm phase.
-    fn try_advance_confirm<D: SCPDriver>(
-        &mut self,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
-        slot_index: u64,
-    ) -> EnvelopeState {
-        if let Some(ref current) = self.current_ballot.clone() {
-            // Get nodes that have externalized
-            let externalizers = self.get_nodes_that_externalized(&current.value);
-
-            let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> {
-                driver.get_quorum_set(node_id)
-            };
-
-            // Check if quorum has externalized
-            if is_quorum(local_quorum_set, &externalizers, get_qs) {
-                // We can externalize
-                self.do_externalize(
-                    &current.value.clone(),
-                    local_node_id,
-                    local_quorum_set,
-                    driver,
-                    slot_index,
-                );
-            } else if is_blocking_set(local_quorum_set, &externalizers) {
-                // Blocking set has externalized - we should too
-                self.do_externalize(
-                    &current.value.clone(),
-                    local_node_id,
-                    local_quorum_set,
-                    driver,
-                    slot_index,
-                );
+            if let Some(prepared_prime) = &self.prepared_prime {
+                if ballot_compare(ballot, prepared_prime) != std::cmp::Ordering::Greater {
+                    continue;
+                }
             }
-        }
 
-        EnvelopeState::ValidNew
-    }
+            if let Some(prepared) = &self.prepared {
+                if are_ballots_less_and_compatible(ballot, prepared) {
+                    continue;
+                }
+            }
 
-    /// Try to accept externalize from received envelope.
-    fn try_accept_externalize<D: SCPDriver>(
-        &mut self,
-        ext: &ScpStatementExternalize,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
-        slot_index: u64,
-    ) -> EnvelopeState {
-        let value = &ext.commit.value;
-
-        // Get nodes that have externalized this value
-        let externalizers = self.get_nodes_that_externalized(value);
-
-        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> {
-            driver.get_quorum_set(node_id)
-        };
-
-        // If quorum or blocking set has externalized, we should too
-        if is_quorum(local_quorum_set, &externalizers, get_qs)
-            || is_blocking_set(local_quorum_set, &externalizers)
-        {
-            self.do_externalize(
-                value,
+            let accepted = self.federated_accept(
+                |st| self.statement_votes_for_ballot(ballot, st),
+                |st| self.has_prepared_ballot(ballot, st),
                 local_node_id,
                 local_quorum_set,
                 driver,
-                slot_index,
             );
+
+            if accepted && self.set_accept_prepared(ballot.clone(), local_node_id, local_quorum_set, driver, slot_index) {
+                return true;
+            }
         }
 
-        EnvelopeState::ValidNew
+        false
+    }
+
+    fn set_accept_prepared<D: SCPDriver>(
+        &mut self,
+        ballot: ScpBallot,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        let mut did_work = self.set_prepared(ballot.clone(), driver, slot_index);
+
+        if self.commit.is_some() && self.high_ballot.is_some() {
+            let high = self.high_ballot.as_ref().unwrap();
+            let incompatible = self
+                .prepared
+                .as_ref()
+                .map(|p| are_ballots_less_and_incompatible(high, p))
+                .unwrap_or(false)
+                || self
+                    .prepared_prime
+                    .as_ref()
+                    .map(|p| are_ballots_less_and_incompatible(high, p))
+                    .unwrap_or(false);
+            if incompatible {
+                self.commit = None;
+                did_work = true;
+            }
+        }
+
+        if did_work {
+            self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
+        }
+
+        did_work
+    }
+
+    fn attempt_confirm_prepared<D: SCPDriver>(
+        &mut self,
+        hint: &ScpStatement,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        if self.phase != BallotPhase::Prepare {
+            return false;
+        }
+        if self.prepared.is_none() {
+            return false;
+        }
+
+        let candidates = self.get_prepare_candidates(hint);
+        let mut new_h: Option<ScpBallot> = None;
+        let mut new_h_index: Option<usize> = None;
+
+        for (idx, ballot) in candidates.iter().enumerate().rev() {
+            if let Some(high) = &self.high_ballot {
+                if ballot_compare(high, ballot) != std::cmp::Ordering::Less {
+                    break;
+                }
+            }
+
+            if self.federated_ratify(
+                |st| self.has_prepared_ballot(ballot, st),
+                local_node_id,
+                local_quorum_set,
+                driver,
+            ) {
+                new_h = Some(ballot.clone());
+                new_h_index = Some(idx);
+                break;
+            }
+        }
+
+        let Some(new_h_ballot) = new_h else {
+            return false;
+        };
+
+        let mut new_c = ScpBallot {
+            counter: 0,
+            value: new_h_ballot.value.clone(),
+        };
+
+        let current = self.current_ballot.clone().unwrap_or(ScpBallot {
+            counter: 0,
+            value: new_h_ballot.value.clone(),
+        });
+
+        if self.commit.is_none()
+            && self
+                .prepared
+                .as_ref()
+                .map(|p| !are_ballots_less_and_incompatible(&new_h_ballot, p))
+                .unwrap_or(true)
+            && self
+                .prepared_prime
+                .as_ref()
+                .map(|p| !are_ballots_less_and_incompatible(&new_h_ballot, p))
+                .unwrap_or(true)
+        {
+            if let Some(start_idx) = new_h_index {
+                for ballot in candidates[..=start_idx].iter().rev() {
+                    if ballot_compare(ballot, &current) == std::cmp::Ordering::Less {
+                        break;
+                    }
+                    if !are_ballots_less_and_compatible(ballot, &new_h_ballot) {
+                        continue;
+                    }
+                    if self.federated_ratify(
+                        |st| self.has_prepared_ballot(ballot, st),
+                        local_node_id,
+                        local_quorum_set,
+                        driver,
+                    ) {
+                        new_c = ballot.clone();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.set_confirm_prepared(
+            new_c,
+            new_h_ballot,
+            local_node_id,
+            local_quorum_set,
+            driver,
+            slot_index,
+        )
+    }
+
+    fn set_confirm_prepared<D: SCPDriver>(
+        &mut self,
+        new_c: ScpBallot,
+        new_h: ScpBallot,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        let mut did_work = false;
+        self.value_override = Some(new_h.value.clone());
+
+        if self
+            .current_ballot
+            .as_ref()
+            .map(|b| ballot_compatible(b, &new_h))
+            .unwrap_or(true)
+        {
+            if self
+                .high_ballot
+                .as_ref()
+                .map(|b| ballot_compare(&new_h, b) == std::cmp::Ordering::Greater)
+                .unwrap_or(true)
+            {
+                self.high_ballot = Some(new_h.clone());
+                did_work = true;
+            }
+
+            if new_c.counter != 0 && self.commit.is_none() {
+                self.commit = Some(new_c);
+                did_work = true;
+            }
+
+            if did_work {
+                driver.confirmed_ballot_prepared(slot_index, &new_h);
+            }
+        }
+
+        did_work = self.update_current_if_needed(&new_h) || did_work;
+        if did_work {
+            self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
+        }
+
+        did_work
+    }
+
+    fn attempt_accept_commit<D: SCPDriver>(
+        &mut self,
+        hint: &ScpStatement,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        if !matches!(self.phase, BallotPhase::Prepare | BallotPhase::Confirm) {
+            return false;
+        }
+
+        let Some(ballot) = self.hint_ballot_for_commit(hint) else {
+            return false;
+        };
+        if self.phase == BallotPhase::Confirm {
+            if let Some(high) = &self.high_ballot {
+                if !ballot_compatible(&ballot, high) {
+                    return false;
+                }
+            }
+        }
+
+        let boundaries = self.get_commit_boundaries_from_statements(&ballot);
+        if boundaries.is_empty() {
+            return false;
+        }
+
+        let mut candidate = (0u32, 0u32);
+        self.find_extended_interval(&mut candidate, &boundaries, |interval| {
+            self.federated_accept(
+                |st| self.statement_votes_commit(&ballot, interval, st),
+                |st| self.commit_predicate(&ballot, interval, st),
+                local_node_id,
+                local_quorum_set,
+                driver,
+            )
+        });
+
+        if candidate.0 == 0 {
+            return false;
+        }
+
+        if self.phase != BallotPhase::Confirm
+            || candidate.1 > self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0)
+        {
+            let c = ScpBallot {
+                counter: candidate.0,
+                value: ballot.value.clone(),
+            };
+            let h = ScpBallot {
+                counter: candidate.1,
+                value: ballot.value.clone(),
+            };
+            return self.set_accept_commit(c, h, local_node_id, local_quorum_set, driver, slot_index);
+        }
+
+        false
+    }
+
+    fn set_accept_commit<D: SCPDriver>(
+        &mut self,
+        c: ScpBallot,
+        h: ScpBallot,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        let mut did_work = false;
+        self.value_override = Some(h.value.clone());
+
+        if self
+            .high_ballot
+            .as_ref()
+            .map(|b| ballot_compare(b, &h) != std::cmp::Ordering::Equal)
+            .unwrap_or(true)
+            || self
+                .commit
+                .as_ref()
+                .map(|b| ballot_compare(b, &c) != std::cmp::Ordering::Equal)
+                .unwrap_or(true)
+        {
+            self.commit = Some(c.clone());
+            self.high_ballot = Some(h.clone());
+            did_work = true;
+        }
+
+        if self.phase == BallotPhase::Prepare {
+            self.phase = BallotPhase::Confirm;
+            if let Some(current) = &self.current_ballot {
+                if !are_ballots_less_and_compatible(&h, current) {
+                    self.bump_to_ballot(&h, false);
+                }
+            }
+            self.prepared_prime = None;
+            did_work = true;
+        }
+
+        if did_work {
+            self.update_current_if_needed(&h);
+            driver.accepted_commit(slot_index, &h);
+            self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
+        }
+
+        did_work
+    }
+
+    fn attempt_confirm_commit<D: SCPDriver>(
+        &mut self,
+        hint: &ScpStatement,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        if self.phase != BallotPhase::Confirm {
+            return false;
+        }
+        if self.high_ballot.is_none() || self.commit.is_none() {
+            return false;
+        }
+
+        let Some(ballot) = self.hint_ballot_for_commit(hint) else {
+            return false;
+        };
+        if !ballot_compatible(&ballot, self.commit.as_ref().unwrap()) {
+            return false;
+        }
+
+        let boundaries = self.get_commit_boundaries_from_statements(&ballot);
+        let mut candidate = (0u32, 0u32);
+        self.find_extended_interval(&mut candidate, &boundaries, |interval| {
+            self.federated_ratify(
+                |st| self.commit_predicate(&ballot, interval, st),
+                local_node_id,
+                local_quorum_set,
+                driver,
+            )
+        });
+
+        if candidate.0 == 0 {
+            return false;
+        }
+
+        let c = ScpBallot {
+            counter: candidate.0,
+            value: ballot.value.clone(),
+        };
+        let h = ScpBallot {
+            counter: candidate.1,
+            value: ballot.value.clone(),
+        };
+        self.set_confirm_commit(c, h, local_node_id, local_quorum_set, driver, slot_index)
+    }
+
+    fn set_confirm_commit<D: SCPDriver>(
+        &mut self,
+        c: ScpBallot,
+        h: ScpBallot,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        self.commit = Some(c.clone());
+        self.high_ballot = Some(h.clone());
+        self.update_current_if_needed(&h);
+        self.phase = BallotPhase::Externalize;
+
+        self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
+        driver.value_externalized(slot_index, &h.value);
+        true
+    }
+
+    fn attempt_bump<D: SCPDriver>(
+        &mut self,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        _slot_index: u64,
+    ) -> bool {
+        if !matches!(self.phase, BallotPhase::Prepare | BallotPhase::Confirm) {
+            return false;
+        }
+
+        let local_counter = self.current_ballot.as_ref().map(|b| b.counter).unwrap_or(0);
+        if !self.has_vblocking_subset_strictly_ahead_of(local_counter, local_node_id, local_quorum_set, driver) {
+            return false;
+        }
+
+        let mut counters = std::collections::BTreeSet::new();
+        for envelope in self.latest_envelopes.values() {
+            let counter = self.statement_ballot_counter(&envelope.statement);
+            if counter > local_counter {
+                counters.insert(counter);
+            }
+        }
+
+        for counter in counters {
+            if !self.has_vblocking_subset_strictly_ahead_of(counter, local_node_id, local_quorum_set, driver) {
+                return self.abandon_ballot(counter);
+            }
+        }
+
+        false
+    }
+
+    fn abandon_ballot(&mut self, counter: u32) -> bool {
+        if let Some(value) = self
+            .value_override
+            .clone()
+            .or_else(|| self.current_ballot.as_ref().map(|b| b.value.clone()))
+        {
+            return self.bump_to_ballot(
+                &ScpBallot {
+                    counter: if counter == 0 {
+                        self.current_ballot
+                            .as_ref()
+                            .map(|b| b.counter + 1)
+                            .unwrap_or(1)
+                    } else {
+                        counter
+                    },
+                    value,
+                },
+                true,
+            );
+        }
+        false
+    }
+
+    fn update_current_if_needed(&mut self, ballot: &ScpBallot) -> bool {
+        if self
+            .current_ballot
+            .as_ref()
+            .map(|b| ballot_compare(b, ballot) == std::cmp::Ordering::Less)
+            .unwrap_or(true)
+        {
+            return self.bump_to_ballot(ballot, true);
+        }
+        false
+    }
+
+    fn bump_to_ballot(&mut self, ballot: &ScpBallot, check: bool) -> bool {
+        if check {
+            if let Some(current) = &self.current_ballot {
+                if ballot_compare(ballot, current) != std::cmp::Ordering::Greater {
+                    return false;
+                }
+            }
+        }
+
+        self.current_ballot = Some(ballot.clone());
+        self.value = Some(ballot.value.clone());
+        self.heard_from_quorum = false;
+        true
+    }
+
+    fn get_prepare_candidates(&self, hint: &ScpStatement) -> Vec<ScpBallot> {
+        let mut hint_ballots: Vec<ScpBallot> = Vec::new();
+        match &hint.pledges {
+            ScpStatementPledges::Prepare(prep) => {
+                hint_ballots.push(prep.ballot.clone());
+                if let Some(prepared) = &prep.prepared {
+                    hint_ballots.push(prepared.clone());
+                }
+                if let Some(prepared_prime) = &prep.prepared_prime {
+                    hint_ballots.push(prepared_prime.clone());
+                }
+            }
+            ScpStatementPledges::Confirm(conf) => {
+                hint_ballots.push(ScpBallot {
+                    counter: conf.n_prepared,
+                    value: conf.ballot.value.clone(),
+                });
+                hint_ballots.push(ScpBallot {
+                    counter: u32::MAX,
+                    value: conf.ballot.value.clone(),
+                });
+            }
+            ScpStatementPledges::Externalize(ext) => {
+                hint_ballots.push(ScpBallot {
+                    counter: u32::MAX,
+                    value: ext.commit.value.clone(),
+                });
+            }
+            _ => {}
+        }
+
+        let mut candidates: Vec<ScpBallot> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        hint_ballots.sort_by(|a, b| ballot_compare(a, b));
+
+        for top_vote in hint_ballots.iter().rev() {
+            for envelope in self.latest_envelopes.values() {
+                match &envelope.statement.pledges {
+                    ScpStatementPledges::Prepare(prep) => {
+                        if are_ballots_less_and_compatible(&prep.ballot, top_vote) {
+                            self.push_candidate(&mut candidates, &mut seen, prep.ballot.clone());
+                        }
+                        if let Some(prepared) = &prep.prepared {
+                            if are_ballots_less_and_compatible(prepared, top_vote) {
+                                self.push_candidate(
+                                    &mut candidates,
+                                    &mut seen,
+                                    prepared.clone(),
+                                );
+                            }
+                        }
+                        if let Some(prepared_prime) = &prep.prepared_prime {
+                            if are_ballots_less_and_compatible(prepared_prime, top_vote) {
+                                self.push_candidate(
+                                    &mut candidates,
+                                    &mut seen,
+                                    prepared_prime.clone(),
+                                );
+                            }
+                        }
+                    }
+                    ScpStatementPledges::Confirm(conf) => {
+                        if ballot_compatible(top_vote, &conf.ballot) {
+                            self.push_candidate(&mut candidates, &mut seen, top_vote.clone());
+                            if conf.n_prepared < top_vote.counter {
+                                self.push_candidate(
+                                    &mut candidates,
+                                    &mut seen,
+                                    ScpBallot {
+                                        counter: conf.n_prepared,
+                                        value: top_vote.value.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ScpStatementPledges::Externalize(ext) => {
+                        if ballot_compatible(top_vote, &ext.commit) {
+                            self.push_candidate(&mut candidates, &mut seen, top_vote.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| ballot_compare(a, b));
+        candidates
+    }
+
+    fn push_candidate(
+        &self,
+        candidates: &mut Vec<ScpBallot>,
+        seen: &mut std::collections::HashSet<(u32, Vec<u8>)>,
+        ballot: ScpBallot,
+    ) {
+        let key = (ballot.counter, ballot.value.to_xdr(Limits::none()).unwrap_or_default());
+        if seen.insert(key) {
+            candidates.push(ballot);
+        }
+    }
+
+    fn commit_predicate(
+        &self,
+        ballot: &ScpBallot,
+        interval: (u32, u32),
+        statement: &ScpStatement,
+    ) -> bool {
+        match &statement.pledges {
+            ScpStatementPledges::Confirm(conf) => {
+                if ballot_compatible(ballot, &conf.ballot) {
+                    conf.n_commit <= interval.0 && interval.1 <= conf.n_h
+                } else {
+                    false
+                }
+            }
+            ScpStatementPledges::Externalize(ext) => {
+                if ballot_compatible(ballot, &ext.commit) {
+                    ext.commit.counter <= interval.0
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn get_commit_boundaries_from_statements(&self, ballot: &ScpBallot) -> std::collections::BTreeSet<u32> {
+        let mut res = std::collections::BTreeSet::new();
+        for envelope in self.latest_envelopes.values() {
+            match &envelope.statement.pledges {
+                ScpStatementPledges::Prepare(prep) => {
+                    if ballot_compatible(ballot, &prep.ballot) && prep.n_c != 0 {
+                        res.insert(prep.n_c);
+                        res.insert(prep.n_h);
+                    }
+                }
+                ScpStatementPledges::Confirm(conf) => {
+                    if ballot_compatible(ballot, &conf.ballot) {
+                        res.insert(conf.n_commit);
+                        res.insert(conf.n_h);
+                    }
+                }
+                ScpStatementPledges::Externalize(ext) => {
+                    if ballot_compatible(ballot, &ext.commit) {
+                        res.insert(ext.commit.counter);
+                        res.insert(ext.n_h);
+                        res.insert(u32::MAX);
+                    }
+                }
+                _ => {}
+            }
+        }
+        res
+    }
+
+    fn find_extended_interval<F>(&self, candidate: &mut (u32, u32), boundaries: &std::collections::BTreeSet<u32>, pred: F)
+    where
+        F: Fn((u32, u32)) -> bool,
+    {
+        for boundary in boundaries.iter().rev() {
+            let current = if candidate.0 == 0 {
+                (*boundary, *boundary)
+            } else if *boundary > candidate.1 {
+                continue;
+            } else {
+                (*boundary, candidate.1)
+            };
+
+            if pred(current) {
+                *candidate = current;
+            } else if candidate.0 != 0 {
+                break;
+            }
+        }
+    }
+
+    fn hint_ballot_for_commit(&self, hint: &ScpStatement) -> Option<ScpBallot> {
+        match &hint.pledges {
+            ScpStatementPledges::Prepare(prep) => {
+                if prep.n_c != 0 {
+                    Some(ScpBallot {
+                        counter: prep.n_h,
+                        value: prep.ballot.value.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            ScpStatementPledges::Confirm(conf) => Some(ScpBallot {
+                counter: conf.n_h,
+                value: conf.ballot.value.clone(),
+            }),
+            ScpStatementPledges::Externalize(ext) => Some(ScpBallot {
+                counter: ext.n_h,
+                value: ext.commit.value.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn statement_ballot_counter(&self, statement: &ScpStatement) -> u32 {
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(prep) => prep.ballot.counter,
+            ScpStatementPledges::Confirm(conf) => conf.ballot.counter,
+            ScpStatementPledges::Externalize(_) => u32::MAX,
+            _ => 0,
+        }
+    }
+
+    fn has_vblocking_subset_strictly_ahead_of<D: SCPDriver>(
+        &self,
+        counter: u32,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+    ) -> bool {
+        let mut nodes = HashSet::new();
+        for (node_id, envelope) in &self.latest_envelopes {
+            if self.statement_ballot_counter(&envelope.statement) > counter {
+                nodes.insert(node_id.clone());
+            }
+        }
+        is_blocking_set(local_quorum_set, &nodes)
+            && self.statement_quorum_set_map(local_node_id, local_quorum_set, driver).len() > 0
+    }
+
+    fn statement_quorum_set_map<D: SCPDriver>(
+        &self,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+    ) -> HashMap<NodeId, ScpQuorumSet> {
+        let mut map = HashMap::new();
+        for (node_id, envelope) in &self.latest_envelopes {
+            if let Some(qset) = self.statement_quorum_set(
+                &envelope.statement,
+                local_node_id,
+                local_quorum_set,
+                driver,
+            ) {
+                map.insert(node_id.clone(), qset);
+            }
+        }
+        if !map.contains_key(local_node_id) {
+            map.insert(local_node_id.clone(), local_quorum_set.clone());
+        }
+        map
+    }
+
+    fn federated_accept<D: SCPDriver, V, A>(
+        &self,
+        voted: V,
+        accepted: A,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+    ) -> bool
+    where
+        V: Fn(&ScpStatement) -> bool,
+        A: Fn(&ScpStatement) -> bool,
+    {
+        let mut accepted_nodes = HashSet::new();
+        let mut supporters = HashSet::new();
+        for (node_id, envelope) in &self.latest_envelopes {
+            let statement = &envelope.statement;
+            if accepted(statement) {
+                accepted_nodes.insert(node_id.clone());
+                supporters.insert(node_id.clone());
+            } else if voted(statement) {
+                supporters.insert(node_id.clone());
+            }
+        }
+
+        if is_blocking_set(local_quorum_set, &accepted_nodes) {
+            return true;
+        }
+
+        let qsets = self.statement_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
+        is_quorum(local_quorum_set, &supporters, get_qs)
+    }
+
+    fn federated_ratify<D: SCPDriver, V>(
+        &self,
+        voted: V,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+    ) -> bool
+    where
+        V: Fn(&ScpStatement) -> bool,
+    {
+        let mut supporters = HashSet::new();
+        for (node_id, envelope) in &self.latest_envelopes {
+            if voted(&envelope.statement) {
+                supporters.insert(node_id.clone());
+            }
+        }
+
+        let qsets = self.statement_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
+        is_quorum(local_quorum_set, &supporters, get_qs)
+    }
+
+    fn statement_votes_for_ballot(&self, ballot: &ScpBallot, statement: &ScpStatement) -> bool {
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(prep) => {
+                are_ballots_less_and_compatible(ballot, &prep.ballot)
+            }
+            ScpStatementPledges::Confirm(conf) => {
+                ballot_compatible(ballot, &conf.ballot)
+            }
+            ScpStatementPledges::Externalize(ext) => ballot_compatible(ballot, &ext.commit),
+            _ => false,
+        }
+    }
+
+    fn statement_votes_commit(
+        &self,
+        ballot: &ScpBallot,
+        interval: (u32, u32),
+        statement: &ScpStatement,
+    ) -> bool {
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(prep) => {
+                if ballot_compatible(ballot, &prep.ballot) && prep.n_c != 0 {
+                    prep.n_c <= interval.0 && interval.1 <= prep.n_h
+                } else {
+                    false
+                }
+            }
+            ScpStatementPledges::Confirm(conf) => {
+                ballot_compatible(ballot, &conf.ballot) && conf.n_commit <= interval.0
+            }
+            ScpStatementPledges::Externalize(ext) => {
+                ballot_compatible(ballot, &ext.commit) && ext.commit.counter <= interval.0
+            }
+            _ => false,
+        }
+    }
+
+    fn has_prepared_ballot(&self, ballot: &ScpBallot, statement: &ScpStatement) -> bool {
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(prep) => {
+                prep.prepared
+                    .as_ref()
+                    .map(|p| are_ballots_less_and_compatible(ballot, p))
+                    .unwrap_or(false)
+                    || prep
+                        .prepared_prime
+                        .as_ref()
+                        .map(|p| are_ballots_less_and_compatible(ballot, p))
+                        .unwrap_or(false)
+            }
+            ScpStatementPledges::Confirm(conf) => {
+                let prepared = ScpBallot {
+                    counter: conf.n_prepared,
+                    value: conf.ballot.value.clone(),
+                };
+                are_ballots_less_and_compatible(ballot, &prepared)
+            }
+            ScpStatementPledges::Externalize(ext) => ballot_compatible(ballot, &ext.commit),
+            _ => false,
+        }
     }
 
     /// Set prepared ballot.
@@ -480,126 +1480,116 @@ impl BallotProtocol {
         ballot: ScpBallot,
         driver: &Arc<D>,
         slot_index: u64,
-    ) {
-        // Update prepared and prepared_prime
+    ) -> bool {
+        let mut did_work = false;
         if let Some(ref current_prepared) = self.prepared {
-            if ballot_compare(&ballot, current_prepared) == std::cmp::Ordering::Greater {
-                self.prepared_prime = self.prepared.take();
-                self.prepared = Some(ballot.clone());
-                driver.accepted_ballot_prepared(slot_index, &ballot);
-                driver.ballot_did_prepare(slot_index, &ballot);
+            match ballot_compare(current_prepared, &ballot) {
+                std::cmp::Ordering::Less => {
+                    if !ballot_compatible(current_prepared, &ballot) {
+                        self.prepared_prime = Some(current_prepared.clone());
+                    }
+                    self.prepared = Some(ballot.clone());
+                    did_work = true;
+                }
+                std::cmp::Ordering::Greater => {
+                    let should_update_prime = match &self.prepared_prime {
+                        None => true,
+                        Some(prepared_prime) => {
+                            ballot_compare(prepared_prime, &ballot)
+                                == std::cmp::Ordering::Less
+                                && !ballot_compatible(current_prepared, &ballot)
+                        }
+                    };
+                    if should_update_prime {
+                        self.prepared_prime = Some(ballot.clone());
+                        did_work = true;
+                    }
+                }
+                std::cmp::Ordering::Equal => {}
             }
         } else {
             self.prepared = Some(ballot.clone());
+            did_work = true;
+        }
+
+        if did_work {
             driver.accepted_ballot_prepared(slot_index, &ballot);
             driver.ballot_did_prepare(slot_index, &ballot);
         }
+
+        did_work
     }
 
-    /// Finalize externalization.
-    fn do_externalize<D: SCPDriver>(
+    fn check_heard_from_quorum<D: SCPDriver>(
         &mut self,
-        value: &Value,
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
     ) {
-        if self.phase == BallotPhase::Externalize {
+        let current = match self.current_ballot.as_ref() {
+            Some(ballot) => ballot.clone(),
+            None => return,
+        };
+
+        let mut nodes = HashSet::new();
+        let mut quorum_sets = HashMap::new();
+
+        for (node_id, envelope) in &self.latest_envelopes {
+            let include = match &envelope.statement.pledges {
+                ScpStatementPledges::Prepare(prep) => current.counter <= prep.ballot.counter,
+                ScpStatementPledges::Confirm(_) | ScpStatementPledges::Externalize(_) => true,
+                _ => false,
+            };
+            if !include {
+                continue;
+            }
+
+            nodes.insert(node_id.clone());
+            if let Some(qs) = self.statement_quorum_set(
+                &envelope.statement,
+                local_node_id,
+                local_quorum_set,
+                driver,
+            ) {
+                quorum_sets.insert(node_id.clone(), qs);
+            }
+        }
+
+        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> {
+            quorum_sets.get(node_id).cloned()
+        };
+
+        if is_quorum(local_quorum_set, &nodes, get_qs) {
+            let old = self.heard_from_quorum;
+            self.heard_from_quorum = true;
+            if !old {
+                driver.ballot_did_hear_from_quorum(slot_index, &current);
+            }
+        } else {
+            self.heard_from_quorum = false;
+        }
+    }
+
+    fn send_latest_envelope<D: SCPDriver>(&mut self, driver: &Arc<D>) {
+        if self.current_message_level != 0 {
             return;
         }
 
-        self.phase = BallotPhase::Externalize;
-        self.value = Some(value.clone());
-
-        // Set commit ballot
-        if self.commit.is_none() {
-            if let Some(ref current) = self.current_ballot {
-                self.commit = Some(current.clone());
-            } else {
-                // Create a commit ballot with counter 1
-                self.commit = Some(ScpBallot {
-                    counter: 1,
-                    value: value.clone(),
-                });
-            }
-            if let Some(ref commit) = self.commit {
-                driver.accepted_commit(slot_index, commit);
-            }
+        if !self.fully_validated {
+            return;
         }
 
-        // Emit externalize statement
-        self.emit_externalize(local_node_id, local_quorum_set, driver, slot_index);
+        let Some(envelope) = self.last_envelope.as_ref() else {
+            return;
+        };
 
-        // Notify driver
-        driver.value_externalized(slot_index, value);
-    }
-
-    /// Get nodes that have prepared or confirmed/externalized a ballot.
-    fn get_nodes_that_prepared_or_better(&self, ballot: &ScpBallot) -> HashSet<NodeId> {
-        let mut nodes = HashSet::new();
-
-        for (node_id, envelope) in &self.latest_envelopes {
-            match &envelope.statement.pledges {
-                ScpStatementPledges::Prepare(prep) => {
-                    // Check if prepared ballot is >= our ballot
-                    if ballot_compatible(&prep.ballot, ballot) {
-                        nodes.insert(node_id.clone());
-                    }
-                }
-                ScpStatementPledges::Confirm(conf) => {
-                    if ballot_compatible(&conf.ballot, ballot) {
-                        nodes.insert(node_id.clone());
-                    }
-                }
-                ScpStatementPledges::Externalize(ext) => {
-                    if ext.commit.value == ballot.value {
-                        nodes.insert(node_id.clone());
-                    }
-                }
-                _ => {}
-            }
+        if self.last_envelope_emit.as_ref() == Some(envelope) {
+            return;
         }
 
-        nodes
-    }
-
-    /// Get nodes that have confirmed or externalized a ballot.
-    fn get_nodes_that_confirmed_or_better(&self, ballot: &ScpBallot) -> HashSet<NodeId> {
-        let mut nodes = HashSet::new();
-
-        for (node_id, envelope) in &self.latest_envelopes {
-            match &envelope.statement.pledges {
-                ScpStatementPledges::Confirm(conf) => {
-                    if ballot_compatible(&conf.ballot, ballot) {
-                        nodes.insert(node_id.clone());
-                    }
-                }
-                ScpStatementPledges::Externalize(ext) => {
-                    if ext.commit.value == ballot.value {
-                        nodes.insert(node_id.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        nodes
-    }
-
-    /// Get nodes that have externalized a specific value.
-    fn get_nodes_that_externalized(&self, value: &Value) -> HashSet<NodeId> {
-        let mut nodes = HashSet::new();
-
-        for (node_id, envelope) in &self.latest_envelopes {
-            if let ScpStatementPledges::Externalize(ext) = &envelope.statement.pledges {
-                if &ext.commit.value == value {
-                    nodes.insert(node_id.clone());
-                }
-            }
-        }
-
-        nodes
+        self.last_envelope_emit = Some(envelope.clone());
+        driver.emit_envelope(envelope);
     }
 
     /// Emit prepare statement.
@@ -634,8 +1624,10 @@ impl BallotProtocol {
             };
 
             driver.sign_envelope(&mut envelope);
-            self.record_local_envelope(local_node_id, envelope.clone());
-            driver.emit_envelope(&envelope);
+            if self.record_local_envelope(local_node_id, envelope.clone()) {
+                self.last_envelope = Some(envelope.clone());
+                self.send_latest_envelope(driver);
+            }
         }
     }
 
@@ -670,8 +1662,10 @@ impl BallotProtocol {
             };
 
             driver.sign_envelope(&mut envelope);
-            self.record_local_envelope(local_node_id, envelope.clone());
-            driver.emit_envelope(&envelope);
+            if self.record_local_envelope(local_node_id, envelope.clone()) {
+                self.last_envelope = Some(envelope.clone());
+                self.send_latest_envelope(driver);
+            }
         }
     }
 
@@ -704,8 +1698,10 @@ impl BallotProtocol {
             };
 
             driver.sign_envelope(&mut envelope);
-            self.record_local_envelope(local_node_id, envelope.clone());
-            driver.emit_envelope(&envelope);
+            if self.record_local_envelope(local_node_id, envelope.clone()) {
+                self.last_envelope = Some(envelope.clone());
+                self.send_latest_envelope(driver);
+            }
         }
     }
 
@@ -730,12 +1726,23 @@ impl BallotProtocol {
         }
     }
 
-    fn record_local_envelope(&mut self, local_node_id: &NodeId, envelope: ScpEnvelope) {
+    fn record_local_envelope(&mut self, local_node_id: &NodeId, envelope: ScpEnvelope) -> bool {
         if !self.is_newer_statement(local_node_id, &envelope.statement) {
-            return;
+            return false;
         }
         self.latest_envelopes
             .insert(local_node_id.clone(), envelope);
+        true
+    }
+}
+
+fn min_validation_level(left: ValidationLevel, right: ValidationLevel) -> ValidationLevel {
+    match (left, right) {
+        (ValidationLevel::Invalid, _) | (_, ValidationLevel::Invalid) => ValidationLevel::Invalid,
+        (ValidationLevel::MaybeValid, _) | (_, ValidationLevel::MaybeValid) => {
+            ValidationLevel::MaybeValid
+        }
+        _ => ValidationLevel::FullyValidated,
     }
 }
 
@@ -757,6 +1764,14 @@ fn ballot_compare(a: &ScpBallot, b: &ScpBallot) -> std::cmp::Ordering {
 /// Check if two ballots are compatible (same value).
 fn ballot_compatible(a: &ScpBallot, b: &ScpBallot) -> bool {
     a.value == b.value
+}
+
+fn are_ballots_less_and_compatible(a: &ScpBallot, b: &ScpBallot) -> bool {
+    ballot_compare(a, b) != std::cmp::Ordering::Greater && ballot_compatible(a, b)
+}
+
+fn are_ballots_less_and_incompatible(a: &ScpBallot, b: &ScpBallot) -> bool {
+    ballot_compare(a, b) != std::cmp::Ordering::Greater && !ballot_compatible(a, b)
 }
 
 #[cfg(test)]
@@ -1020,6 +2035,35 @@ mod tests {
         }
     }
 
+    fn make_prepare_envelope_with_counters(
+        node_id: NodeId,
+        slot_index: u64,
+        quorum_set: &ScpQuorumSet,
+        ballot: ScpBallot,
+        prepared: Option<ScpBallot>,
+        prepared_prime: Option<ScpBallot>,
+        n_c: u32,
+        n_h: u32,
+    ) -> ScpEnvelope {
+        let prep = ScpStatementPrepare {
+            quorum_set_hash: hash_quorum_set(quorum_set).into(),
+            ballot,
+            prepared,
+            prepared_prime,
+            n_c,
+            n_h,
+        };
+        let statement = ScpStatement {
+            node_id,
+            slot_index,
+            pledges: ScpStatementPledges::Prepare(prep),
+        };
+        ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        }
+    }
+
     fn make_confirm_envelope(
         node_id: NodeId,
         slot_index: u64,
@@ -1031,6 +2075,33 @@ mod tests {
             n_prepared: 0,
             n_commit: 0,
             n_h: 0,
+            quorum_set_hash: hash_quorum_set(quorum_set).into(),
+        };
+        let statement = ScpStatement {
+            node_id,
+            slot_index,
+            pledges: ScpStatementPledges::Confirm(conf),
+        };
+        ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        }
+    }
+
+    fn make_confirm_envelope_with_counters(
+        node_id: NodeId,
+        slot_index: u64,
+        quorum_set: &ScpQuorumSet,
+        ballot: ScpBallot,
+        n_prepared: u32,
+        n_commit: u32,
+        n_h: u32,
+    ) -> ScpEnvelope {
+        let conf = ScpStatementConfirm {
+            ballot,
+            n_prepared,
+            n_commit,
+            n_h,
             quorum_set_hash: hash_quorum_set(quorum_set).into(),
         };
         let statement = ScpStatement {
@@ -1058,6 +2129,55 @@ mod tests {
             node_id,
             slot_index,
             pledges: ScpStatementPledges::Nominate(nomination),
+        };
+        ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        }
+    }
+
+    fn make_externalize_envelope(
+        node_id: NodeId,
+        slot_index: u64,
+        quorum_set: &ScpQuorumSet,
+        commit: ScpBallot,
+        n_h: u32,
+    ) -> ScpEnvelope {
+        let ext = ScpStatementExternalize {
+            commit,
+            n_h,
+            commit_quorum_set_hash: hash_quorum_set(quorum_set).into(),
+        };
+        let statement = ScpStatement {
+            node_id,
+            slot_index,
+            pledges: ScpStatementPledges::Externalize(ext),
+        };
+        ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        }
+    }
+
+    fn make_quorum_set_hashless_confirm_envelope(
+        node_id: NodeId,
+        slot_index: u64,
+        ballot: ScpBallot,
+        n_prepared: u32,
+        n_commit: u32,
+        n_h: u32,
+    ) -> ScpEnvelope {
+        let conf = ScpStatementConfirm {
+            ballot,
+            n_prepared,
+            n_commit,
+            n_h,
+            quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+        };
+        let statement = ScpStatement {
+            node_id,
+            slot_index,
+            pledges: ScpStatementPledges::Confirm(conf),
         };
         ScpEnvelope {
             statement,
@@ -1131,6 +2251,229 @@ mod tests {
     }
 
     #[test]
+    fn test_ballot_statement_ordering_confirm_counters() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+        let ballot_value = ScpBallot {
+            counter: 2,
+            value: make_value(&[9]),
+        };
+
+        let older = make_confirm_envelope_with_counters(
+            make_node_id(2),
+            4,
+            &quorum_set,
+            ballot_value.clone(),
+            1,
+            0,
+            1,
+        );
+        let newer = make_confirm_envelope_with_counters(
+            make_node_id(2),
+            4,
+            &quorum_set,
+            ballot_value.clone(),
+            2,
+            0,
+            1,
+        );
+
+        let first = ballot.process_envelope(&older, &node, &quorum_set, &driver, 4);
+        let second = ballot.process_envelope(&newer, &node, &quorum_set, &driver, 4);
+        let third = ballot.process_envelope(&older, &node, &quorum_set, &driver, 4);
+
+        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert!(matches!(second, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert_eq!(third, EnvelopeState::Invalid);
+    }
+
+    #[test]
+    fn test_ballot_statement_ordering_prepare_n_h() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+        let ballot_value = ScpBallot {
+            counter: 3,
+            value: make_value(&[7]),
+        };
+        let prepared = Some(ScpBallot {
+            counter: 2,
+            value: make_value(&[6]),
+        });
+
+        let older = make_prepare_envelope_with_counters(
+            make_node_id(2),
+            5,
+            &quorum_set,
+            ballot_value.clone(),
+            prepared.clone(),
+            None,
+            0,
+            1,
+        );
+        let newer = make_prepare_envelope_with_counters(
+            make_node_id(2),
+            5,
+            &quorum_set,
+            ballot_value.clone(),
+            prepared,
+            None,
+            0,
+            2,
+        );
+
+        let first = ballot.process_envelope(&older, &node, &quorum_set, &driver, 5);
+        let second = ballot.process_envelope(&newer, &node, &quorum_set, &driver, 5);
+        let third = ballot.process_envelope(&older, &node, &quorum_set, &driver, 5);
+
+        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert!(matches!(second, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert_eq!(third, EnvelopeState::Invalid);
+    }
+
+    #[test]
+    fn test_ballot_statement_ordering_prepare_prepared() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+        let ballot_value = ScpBallot {
+            counter: 3,
+            value: make_value(&[4]),
+        };
+
+        let older = make_prepare_envelope_with_counters(
+            make_node_id(2),
+            6,
+            &quorum_set,
+            ballot_value.clone(),
+            Some(ScpBallot {
+                counter: 1,
+                value: make_value(&[1]),
+            }),
+            None,
+            0,
+            1,
+        );
+        let newer = make_prepare_envelope_with_counters(
+            make_node_id(2),
+            6,
+            &quorum_set,
+            ballot_value.clone(),
+            Some(ScpBallot {
+                counter: 2,
+                value: make_value(&[1]),
+            }),
+            None,
+            0,
+            1,
+        );
+
+        let first = ballot.process_envelope(&older, &node, &quorum_set, &driver, 6);
+        let second = ballot.process_envelope(&newer, &node, &quorum_set, &driver, 6);
+        let third = ballot.process_envelope(&older, &node, &quorum_set, &driver, 6);
+
+        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert!(matches!(second, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert_eq!(third, EnvelopeState::Invalid);
+    }
+
+    #[test]
+    fn test_ballot_statement_ordering_prepare_prepared_prime() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+        let ballot_value = ScpBallot {
+            counter: 3,
+            value: make_value(&[5]),
+        };
+
+        let older = make_prepare_envelope_with_counters(
+            make_node_id(2),
+            7,
+            &quorum_set,
+            ballot_value.clone(),
+            Some(ScpBallot {
+                counter: 2,
+                value: make_value(&[2]),
+            }),
+            Some(ScpBallot {
+                counter: 1,
+                value: make_value(&[9]),
+            }),
+            0,
+            1,
+        );
+        let newer = make_prepare_envelope_with_counters(
+            make_node_id(2),
+            7,
+            &quorum_set,
+            ballot_value.clone(),
+            Some(ScpBallot {
+                counter: 2,
+                value: make_value(&[2]),
+            }),
+            Some(ScpBallot {
+                counter: 2,
+                value: make_value(&[9]),
+            }),
+            0,
+            1,
+        );
+
+        let first = ballot.process_envelope(&older, &node, &quorum_set, &driver, 7);
+        let second = ballot.process_envelope(&newer, &node, &quorum_set, &driver, 7);
+        let third = ballot.process_envelope(&older, &node, &quorum_set, &driver, 7);
+
+        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert!(matches!(second, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert_eq!(third, EnvelopeState::Invalid);
+    }
+
+    #[test]
+    fn test_ballot_statement_ordering_confirm_n_h() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+        let ballot_value = ScpBallot {
+            counter: 4,
+            value: make_value(&[8]),
+        };
+
+        let older = make_confirm_envelope_with_counters(
+            make_node_id(2),
+            8,
+            &quorum_set,
+            ballot_value.clone(),
+            1,
+            0,
+            1,
+        );
+        let newer = make_confirm_envelope_with_counters(
+            make_node_id(2),
+            8,
+            &quorum_set,
+            ballot_value.clone(),
+            1,
+            0,
+            2,
+        );
+
+        let first = ballot.process_envelope(&older, &node, &quorum_set, &driver, 8);
+        let second = ballot.process_envelope(&newer, &node, &quorum_set, &driver, 8);
+        let third = ballot.process_envelope(&older, &node, &quorum_set, &driver, 8);
+
+        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert!(matches!(second, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert_eq!(third, EnvelopeState::Invalid);
+    }
+
+    #[test]
     fn test_ballot_timeout_bumps_counter() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
@@ -1143,5 +2486,606 @@ mod tests {
 
         assert!(ballot.bump_timeout(&node, &quorum_set, &driver, 3));
         assert_eq!(ballot.current_ballot_counter(), Some(2));
+    }
+
+    #[test]
+    fn test_ballot_process_current_state_skips_self_when_not_validated() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+
+        let ballot_local = ScpBallot {
+            counter: 1,
+            value: make_value(&[1]),
+        };
+        let ballot_remote = ScpBallot {
+            counter: 1,
+            value: make_value(&[2]),
+        };
+        let env_local = make_prepare_envelope(local.clone(), 13, &quorum_set, ballot_local);
+        let env_remote = make_prepare_envelope(remote.clone(), 13, &quorum_set, ballot_remote);
+
+        ballot.process_envelope(&env_local, &local, &quorum_set, &driver, 13);
+        ballot.process_envelope(&env_remote, &local, &quorum_set, &driver, 13);
+
+        let mut seen = Vec::new();
+        ballot.process_current_state(
+            |env| {
+                seen.push(env.statement.node_id.clone());
+                true
+            },
+            &local,
+            false,
+            false,
+        );
+
+        assert!(seen.contains(&remote));
+        assert!(!seen.contains(&local));
+    }
+
+    #[test]
+    fn test_ballot_process_current_state_includes_self_when_forced() {
+        let local = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![local.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+
+        let ballot_local = ScpBallot {
+            counter: 1,
+            value: make_value(&[3]),
+        };
+        let env_local = make_prepare_envelope(local.clone(), 14, &quorum_set, ballot_local);
+        ballot.process_envelope(&env_local, &local, &quorum_set, &driver, 14);
+
+        let mut seen = Vec::new();
+        ballot.process_current_state(
+            |env| {
+                seen.push(env.statement.node_id.clone());
+                true
+            },
+            &local,
+            false,
+            true,
+        );
+
+        assert!(seen.contains(&local));
+    }
+
+    #[test]
+    fn test_ballot_rejects_bumps_after_externalize() {
+        let node = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+        let node5 = make_node_id(5);
+        let quorum_set = make_quorum_set(
+            vec![
+                node.clone(),
+                node2.clone(),
+                node3.clone(),
+                node4.clone(),
+                node5.clone(),
+            ],
+            4,
+        );
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+
+        let value = make_value(&[1]);
+        assert!(ballot.bump(&node, &quorum_set, &driver, 15, value.clone(), false));
+
+        let current = ballot.current_ballot().expect("current ballot").clone();
+        let env2 = make_confirm_envelope_with_counters(
+            node2.clone(),
+            15,
+            &quorum_set,
+            current.clone(),
+            current.counter,
+            current.counter,
+            current.counter,
+        );
+        let env3 = make_confirm_envelope_with_counters(
+            node3.clone(),
+            15,
+            &quorum_set,
+            current.clone(),
+            current.counter,
+            current.counter,
+            current.counter,
+        );
+        let env4 = make_confirm_envelope_with_counters(
+            node4.clone(),
+            15,
+            &quorum_set,
+            current.clone(),
+            current.counter,
+            current.counter,
+            current.counter,
+        );
+
+        ballot.process_envelope(&env2, &node, &quorum_set, &driver, 15);
+        ballot.process_envelope(&env3, &node, &quorum_set, &driver, 15);
+        ballot.process_envelope(&env4, &node, &quorum_set, &driver, 15);
+
+        assert!(ballot.is_externalized());
+        let externalized_value = ballot.get_externalized_value().expect("value").clone();
+
+        let bump_ballot = ScpBallot {
+            counter: 2,
+            value: make_value(&[2]),
+        };
+        let bump_env2 = make_quorum_set_hashless_confirm_envelope(
+            node2,
+            15,
+            bump_ballot.clone(),
+            bump_ballot.counter,
+            bump_ballot.counter,
+            bump_ballot.counter,
+        );
+        let bump_env3 = make_quorum_set_hashless_confirm_envelope(
+            node3,
+            15,
+            bump_ballot.clone(),
+            bump_ballot.counter,
+            bump_ballot.counter,
+            bump_ballot.counter,
+        );
+        let bump_env4 = make_quorum_set_hashless_confirm_envelope(
+            node4,
+            15,
+            bump_ballot.clone(),
+            bump_ballot.counter,
+            bump_ballot.counter,
+            bump_ballot.counter,
+        );
+
+        assert_eq!(
+            ballot.process_envelope(&bump_env2, &node, &quorum_set, &driver, 15),
+            EnvelopeState::Invalid
+        );
+        assert_eq!(
+            ballot.process_envelope(&bump_env3, &node, &quorum_set, &driver, 15),
+            EnvelopeState::Invalid
+        );
+        assert_eq!(
+            ballot.process_envelope(&bump_env4, &node, &quorum_set, &driver, 15),
+            EnvelopeState::Invalid
+        );
+
+        assert_eq!(
+            ballot.get_externalized_value().cloned(),
+            Some(externalized_value)
+        );
+    }
+
+    #[test]
+    fn test_ballot_commit_range_externalizes() {
+        let node = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+        let node5 = make_node_id(5);
+        let quorum_set = make_quorum_set(
+            vec![
+                node.clone(),
+                node2.clone(),
+                node3.clone(),
+                node4.clone(),
+                node5.clone(),
+            ],
+            4,
+        );
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+
+        let value = make_value(&[9]);
+        assert!(ballot.bump(&node, &quorum_set, &driver, 16, value.clone(), false));
+
+        let current = ballot.current_ballot().expect("current ballot").clone();
+        let prep2 = make_prepare_envelope(node2.clone(), 16, &quorum_set, current.clone());
+        let prep3 = make_prepare_envelope(node3.clone(), 16, &quorum_set, current.clone());
+        let prep4 = make_prepare_envelope(node4.clone(), 16, &quorum_set, current.clone());
+        let prep5 = make_prepare_envelope(node5.clone(), 16, &quorum_set, current.clone());
+
+        ballot.process_envelope(&prep2, &node, &quorum_set, &driver, 16);
+        ballot.process_envelope(&prep3, &node, &quorum_set, &driver, 16);
+        ballot.process_envelope(&prep4, &node, &quorum_set, &driver, 16);
+        ballot.process_envelope(&prep5, &node, &quorum_set, &driver, 16);
+
+        let prepared2 = make_prepare_envelope_with_counters(
+            node2.clone(),
+            16,
+            &quorum_set,
+            current.clone(),
+            Some(current.clone()),
+            None,
+            current.counter,
+            current.counter,
+        );
+        let prepared3 = make_prepare_envelope_with_counters(
+            node3.clone(),
+            16,
+            &quorum_set,
+            current.clone(),
+            Some(current.clone()),
+            None,
+            current.counter,
+            current.counter,
+        );
+        let prepared4 = make_prepare_envelope_with_counters(
+            node4.clone(),
+            16,
+            &quorum_set,
+            current.clone(),
+            Some(current.clone()),
+            None,
+            current.counter,
+            current.counter,
+        );
+        let prepared5 = make_prepare_envelope_with_counters(
+            node5.clone(),
+            16,
+            &quorum_set,
+            current.clone(),
+            Some(current.clone()),
+            None,
+            current.counter,
+            current.counter,
+        );
+
+        ballot.process_envelope(&prepared2, &node, &quorum_set, &driver, 16);
+        ballot.process_envelope(&prepared3, &node, &quorum_set, &driver, 16);
+        ballot.process_envelope(&prepared4, &node, &quorum_set, &driver, 16);
+        ballot.process_envelope(&prepared5, &node, &quorum_set, &driver, 16);
+
+        assert!(matches!(ballot.phase(), BallotPhase::Confirm));
+        assert_eq!(ballot.commit().map(|b| b.counter), Some(1));
+
+        let confirm1 = make_confirm_envelope_with_counters(
+            node2.clone(),
+            16,
+            &quorum_set,
+            ScpBallot {
+                counter: 4,
+                value: value.clone(),
+            },
+            2,
+            2,
+            4,
+        );
+        let confirm2 = make_confirm_envelope_with_counters(
+            node3.clone(),
+            16,
+            &quorum_set,
+            ScpBallot {
+                counter: 6,
+                value: value.clone(),
+            },
+            2,
+            2,
+            6,
+        );
+        let confirm4 = make_confirm_envelope_with_counters(
+            node5,
+            16,
+            &quorum_set,
+            ScpBallot {
+                counter: 6,
+                value: value.clone(),
+            },
+            3,
+            3,
+            6,
+        );
+
+        ballot.process_envelope(&confirm1, &node, &quorum_set, &driver, 16);
+        ballot.process_envelope(&confirm2, &node, &quorum_set, &driver, 16);
+
+        assert!(!ballot.is_externalized());
+
+        ballot.process_envelope(&confirm4, &node, &quorum_set, &driver, 16);
+
+        assert!(ballot.is_externalized());
+        assert_eq!(ballot.get_externalized_value(), Some(&value));
+        assert_eq!(ballot.commit().map(|b| b.counter), Some(3));
+    }
+
+    #[test]
+    fn test_ballot_statement_sanity_prepare_constraints() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let ballot = BallotProtocol::new();
+
+        let prepared = ScpBallot {
+            counter: 2,
+            value: make_value(&[1]),
+        };
+        let prepared_prime = ScpBallot {
+            counter: 1,
+            value: make_value(&[1]),
+        };
+        let prep = ScpStatementPrepare {
+            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+            ballot: ScpBallot {
+                counter: 3,
+                value: make_value(&[2]),
+            },
+            prepared: Some(prepared),
+            prepared_prime: Some(prepared_prime),
+            n_c: 0,
+            n_h: 0,
+        };
+        let statement = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 7,
+            pledges: ScpStatementPledges::Prepare(prep),
+        };
+
+        assert!(!ballot.is_statement_sane(
+            &statement,
+            &node,
+            &quorum_set,
+            &driver
+        ));
+
+        let prep_bad_h = ScpStatementPrepare {
+            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+            ballot: ScpBallot {
+                counter: 3,
+                value: make_value(&[3]),
+            },
+            prepared: Some(ScpBallot {
+                counter: 2,
+                value: make_value(&[4]),
+            }),
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 5,
+        };
+        let statement_bad_h = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 8,
+            pledges: ScpStatementPledges::Prepare(prep_bad_h),
+        };
+        assert!(!ballot.is_statement_sane(
+            &statement_bad_h,
+            &node,
+            &quorum_set,
+            &driver
+        ));
+
+        let prep_bad_c = ScpStatementPrepare {
+            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+            ballot: ScpBallot {
+                counter: 3,
+                value: make_value(&[5]),
+            },
+            prepared: Some(ScpBallot {
+                counter: 3,
+                value: make_value(&[6]),
+            }),
+            prepared_prime: None,
+            n_c: 1,
+            n_h: 0,
+        };
+        let statement_bad_c = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 9,
+            pledges: ScpStatementPledges::Prepare(prep_bad_c),
+        };
+        assert!(!ballot.is_statement_sane(
+            &statement_bad_c,
+            &node,
+            &quorum_set,
+            &driver
+        ));
+    }
+
+    #[test]
+    fn test_ballot_statement_sanity_confirm_constraints() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let ballot = BallotProtocol::new();
+
+        let conf = ScpStatementConfirm {
+            ballot: ScpBallot {
+                counter: 0,
+                value: make_value(&[1]),
+            },
+            n_prepared: 0,
+            n_commit: 0,
+            n_h: 0,
+            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+        };
+        let statement = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 10,
+            pledges: ScpStatementPledges::Confirm(conf),
+        };
+
+        assert!(!ballot.is_statement_sane(
+            &statement,
+            &node,
+            &quorum_set,
+            &driver
+        ));
+    }
+
+    #[test]
+    fn test_ballot_statement_sanity_externalize_constraints() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let ballot = BallotProtocol::new();
+
+        let env = make_externalize_envelope(
+            node.clone(),
+            11,
+            &quorum_set,
+            ScpBallot {
+                counter: 2,
+                value: make_value(&[1]),
+            },
+            1,
+        );
+
+        assert!(!ballot.is_statement_sane(
+            &env.statement,
+            &node,
+            &quorum_set,
+            &driver
+        ));
+    }
+
+    struct ValidationDriver {
+        quorum_set: ScpQuorumSet,
+        invalid_value: Value,
+    }
+
+    impl ValidationDriver {
+        fn new(quorum_set: ScpQuorumSet, invalid_value: Value) -> Self {
+            Self {
+                quorum_set,
+                invalid_value,
+            }
+        }
+    }
+
+    impl SCPDriver for ValidationDriver {
+        fn validate_value(
+            &self,
+            _slot_index: u64,
+            value: &Value,
+            _nomination: bool,
+        ) -> ValidationLevel {
+            if value == &self.invalid_value {
+                ValidationLevel::Invalid
+            } else {
+                ValidationLevel::FullyValidated
+            }
+        }
+
+        fn combine_candidates(
+            &self,
+            _slot_index: u64,
+            _candidates: &[Value],
+        ) -> Option<Value> {
+            None
+        }
+
+        fn extract_valid_value(
+            &self,
+            _slot_index: u64,
+            _value: &Value,
+        ) -> Option<Value> {
+            None
+        }
+
+        fn emit_envelope(&self, _envelope: &ScpEnvelope) {}
+
+        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+            Some(self.quorum_set.clone())
+        }
+
+        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
+
+        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
+
+        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn compute_hash_node(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _is_priority: bool,
+            _round: u32,
+            _node_id: &NodeId,
+        ) -> u64 {
+            0
+        }
+
+        fn compute_value_hash(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _round: u32,
+            _value: &Value,
+        ) -> u64 {
+            0
+        }
+
+        fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
+            Duration::from_millis(1)
+        }
+
+        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
+
+        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_ballot_value_validation_rejects_invalid() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let invalid_value = make_value(&[0]);
+        let driver = Arc::new(ValidationDriver::new(
+            quorum_set.clone(),
+            invalid_value.clone(),
+        ));
+        let ballot = BallotProtocol::new();
+
+        let env = make_prepare_envelope(
+            make_node_id(2),
+            12,
+            &quorum_set,
+            ScpBallot {
+                counter: 1,
+                value: invalid_value,
+            },
+        );
+
+        let result = ballot.validate_statement_values(&env.statement, &driver, 12);
+        assert_eq!(result, ValidationLevel::Invalid);
+    }
+
+    #[test]
+    fn test_ballot_rejects_unknown_quorum_set_hash() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let ballot = BallotProtocol::new();
+
+        let other_qset = make_quorum_set(vec![make_node_id(2)], 1);
+        let prep = ScpStatementPrepare {
+            quorum_set_hash: hash_quorum_set(&other_qset).into(),
+            ballot: ScpBallot {
+                counter: 1,
+                value: make_value(&[9]),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        };
+        let statement = ScpStatement {
+            node_id: make_node_id(3),
+            slot_index: 13,
+            pledges: ScpStatementPledges::Prepare(prep),
+        };
+
+        assert!(!ballot.is_statement_sane(
+            &statement,
+            &node,
+            &quorum_set,
+            &driver
+        ));
     }
 }

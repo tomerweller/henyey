@@ -92,6 +92,17 @@ pub trait SCPDriver: Send + Sync {
     /// The quorum set, or None if unknown.
     fn get_quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet>;
 
+    /// Get a quorum set by its hash.
+    ///
+    /// # Arguments
+    /// * `hash` - The quorum set hash
+    ///
+    /// # Returns
+    /// The quorum set, or None if unknown.
+    fn get_quorum_set_by_hash(&self, _hash: &Hash256) -> Option<ScpQuorumSet> {
+        None
+    }
+
     /// Called when we start nominating a value for a slot.
     fn nominating_value(&self, slot_index: u64, value: &Value);
 
