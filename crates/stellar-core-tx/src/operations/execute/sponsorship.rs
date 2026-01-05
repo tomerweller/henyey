@@ -637,6 +637,25 @@ mod tests {
     }
 
     #[test]
+    fn test_end_sponsoring_not_sponsored() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let account_id = create_test_account_id(0);
+        state.create_account(create_test_account(account_id.clone(), 100_000_000));
+
+        let result = execute_end_sponsoring_future_reserves(&account_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::EndSponsoringFutureReserves(r)) => {
+                assert!(matches!(r, EndSponsoringFutureReservesResult::NotSponsored));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
     fn test_revoke_sponsorship_not_exists() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();

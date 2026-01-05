@@ -1243,4 +1243,45 @@ mod tests {
         assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
         assert_eq!(second, EnvelopeState::Invalid);
     }
+
+    #[test]
+    fn test_nomination_process_current_state_short_circuits() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let env_local = make_nomination_envelope(
+            local.clone(),
+            16,
+            &quorum_set,
+            vec![make_value(&[1])],
+            vec![],
+        );
+        let env_remote = make_nomination_envelope(
+            remote.clone(),
+            16,
+            &quorum_set,
+            vec![make_value(&[2])],
+            vec![],
+        );
+
+        nom.process_envelope(&env_remote, &local, &quorum_set, &driver, 16);
+        nom.process_envelope(&env_local, &local, &quorum_set, &driver, 16);
+
+        let mut seen = Vec::new();
+        let ok = nom.process_current_state(
+            |env| {
+                seen.push(env.statement.node_id.clone());
+                false
+            },
+            &local,
+            true,
+            false,
+        );
+
+        assert!(!ok);
+        assert_eq!(seen.len(), 1);
+    }
 }
