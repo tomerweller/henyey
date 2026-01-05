@@ -13,7 +13,8 @@ use stellar_xdr::curr::{
     LedgerHeader, LedgerKey, LedgerKeyAccount, MuxedAccount, Operation, OperationBody,
     Preconditions, SequenceNumber, Signature as XdrSignature, SignatureHint, String32,
     Thresholds, TimePoint, Transaction, TransactionEnvelope, TransactionExt, TransactionMeta,
-    TransactionResultMetaV1, TransactionV1Envelope, Uint256, VecM, WriteXdr, Limits,
+    TransactionResultMetaV1, TransactionV1Envelope, Uint256, VecM, WriteXdr, Limits, Asset,
+    PaymentOp, PublicKey,
 };
 
 const GENESIS_BUCKET_LIST_HASH: [u8; 32] = hex_literal::hex!(
@@ -60,6 +61,12 @@ fn tx_meta_hash(meta: &TransactionMeta) -> u64 {
 fn key_bytes(key: &LedgerKey) -> Vec<u8> {
     key.to_xdr(Limits::none())
         .unwrap_or_default()
+}
+
+fn muxed_from_account_id(account_id: &AccountId) -> MuxedAccount {
+    match &account_id.0 {
+        PublicKey::PublicKeyTypeEd25519(pk) => MuxedAccount::Ed25519(pk.clone()),
+    }
 }
 
 fn secret_from_name(name: &str) -> SecretKey {
@@ -202,6 +209,56 @@ fn create_account_envelope(
     let decorated = sign_envelope(&envelope, source, network_id);
     if let TransactionEnvelope::Tx(ref mut env) = envelope {
         env.signatures = vec![decorated].try_into().unwrap();
+    }
+    envelope
+}
+
+fn create_account_with_payment_after_envelope(
+    root: &SecretKey,
+    secondary: &SecretKey,
+    destination: AccountId,
+    payment_destination: AccountId,
+    starting_balance: i64,
+    payment_amount: i64,
+    base_fee: u32,
+    sequence: i64,
+    network_id: &NetworkId,
+) -> TransactionEnvelope {
+    let create_op = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(stellar_xdr::curr::CreateAccountOp {
+            destination,
+            starting_balance,
+        }),
+    };
+    let payment_source = MuxedAccount::Ed25519(Uint256(*secondary.public_key().as_bytes()));
+    let payment_op = Operation {
+        source_account: Some(payment_source),
+        body: OperationBody::Payment(PaymentOp {
+            destination: muxed_from_account_id(&payment_destination),
+            asset: Asset::Native,
+            amount: payment_amount,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*root.public_key().as_bytes())),
+        fee: base_fee * 2,
+        seq_num: SequenceNumber(sequence),
+        cond: Preconditions::None,
+        memo: stellar_xdr::curr::Memo::None,
+        operations: vec![create_op, payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let root_sig = sign_envelope(&envelope, root, network_id);
+    let secondary_sig = sign_envelope(&envelope, secondary, network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![root_sig, secondary_sig].try_into().unwrap();
     }
     envelope
 }
@@ -369,6 +426,93 @@ fn txresults_create_account_normal_tx_meta_matches_baseline() {
         25,
         tx_f,
     );
+
+    let got = tx_meta_hash(&meta);
+    assert_eq!(got, expected[0]);
+}
+
+#[test]
+fn txresults_create_account_with_payment_after_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes("txresults|protocol version 25|create account|with payment after");
+    assert_eq!(expected.len(), 1);
+
+    let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
+    let root_secret = SecretKey::from_seed(network_id.as_bytes());
+    let root_account_id: AccountId = (&root_secret.public_key()).into();
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+    let total_coins = 1_000_000_000_000_000_000i64;
+    let start_amount = base_reserve as i64 * 100;
+    let min_balance0 = 2i64 * base_reserve as i64;
+
+    let genesis = genesis_header(25, base_fee, base_reserve, total_coins);
+    let mut header = test_header(
+        2,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        compute_header_hash(&genesis).expect("genesis hash"),
+    );
+
+    let (root_key, root_entry) = account_entry(
+        root_account_id.clone(),
+        0,
+        total_coins,
+        header.ledger_seq - 1,
+    );
+    let mut entries = std::collections::HashMap::new();
+    entries.insert(key_bytes(&root_key), root_entry);
+
+    for name in ["a", "b", "c", "d", "e"] {
+        header = advance_header(&header, total_coins);
+        let dest = secret_from_name(name);
+        let dest_id: AccountId = (&dest.public_key()).into();
+        let root_seq = account_seq(&entries, &root_account_id);
+        let tx = create_account_envelope(
+            &root_secret,
+            dest_id,
+            start_amount,
+            base_fee,
+            root_seq + 1,
+            &network_id,
+        );
+        execute_and_apply(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    }
+
+    header = advance_header(&header, total_coins);
+    let g_secret = secret_from_name("g");
+    let g_id: AccountId = (&g_secret.public_key()).into();
+    let root_seq = account_seq(&entries, &root_account_id);
+    let tx_g = create_account_envelope(
+        &root_secret,
+        g_id,
+        min_balance0,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    execute_and_apply(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx_g);
+
+    header = advance_header(&header, total_coins);
+    let f_secret = secret_from_name("f");
+    let f_id: AccountId = (&f_secret.public_key()).into();
+    let a_secret = secret_from_name("a");
+    let root_seq = account_seq(&entries, &root_account_id);
+    let tx = create_account_with_payment_after_envelope(
+        &root_secret,
+        &a_secret,
+        f_id,
+        root_account_id,
+        start_amount,
+        start_amount / 2,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let meta = execute_and_apply(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
 
     let got = tx_meta_hash(&meta);
     assert_eq!(got, expected[0]);
