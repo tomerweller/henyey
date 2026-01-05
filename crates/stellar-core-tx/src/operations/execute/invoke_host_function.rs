@@ -248,8 +248,7 @@ fn compute_success_preimage_hash(return_value: &ScVal, events: &[ContractEvent])
 fn build_soroban_operation_meta(
     result: &crate::soroban::SorobanExecutionResult,
 ) -> SorobanOperationMeta {
-    // Use contract_events which contains the decoded Contract and System events
-    // (result.events is currently Events::default() as per the TODO in host.rs)
+    // Use contract_events which contains the decoded Contract and System events.
     let events = result.contract_events.clone();
 
     // Build diagnostic events from the contract events
@@ -439,8 +438,10 @@ fn make_result(code: InvokeHostFunctionResultCode, success_hash: Hash) -> Operat
     OperationResult::OpInner(OperationResultTr::InvokeHostFunction(result))
 }
 
-fn map_host_error_to_result_code(host_error: &soroban_env_host::HostError) -> InvokeHostFunctionResultCode {
-    use soroban_env_host::xdr::{ScErrorCode, ScErrorType};
+fn map_host_error_to_result_code(
+    host_error: &soroban_env_host_p25::HostError,
+) -> InvokeHostFunctionResultCode {
+    use soroban_env_host_p25::xdr::{ScErrorCode, ScErrorType};
 
     if host_error.error.is_type(ScErrorType::Budget)
         && host_error.error.is_code(ScErrorCode::ExceededLimit)
@@ -682,9 +683,9 @@ mod tests {
 
     #[test]
     fn test_map_host_error_to_result_code_resource_limit() {
-        let host_error = soroban_env_host::HostError::from((
-            soroban_env_host::xdr::ScErrorType::Budget,
-            soroban_env_host::xdr::ScErrorCode::ExceededLimit,
+        let host_error = soroban_env_host_p25::HostError::from((
+            soroban_env_host_p25::xdr::ScErrorType::Budget,
+            soroban_env_host_p25::xdr::ScErrorCode::ExceededLimit,
         ));
         assert_eq!(
             map_host_error_to_result_code(&host_error),
@@ -694,9 +695,9 @@ mod tests {
 
     #[test]
     fn test_map_host_error_to_result_code_trapped() {
-        let host_error = soroban_env_host::HostError::from((
-            soroban_env_host::xdr::ScErrorType::Storage,
-            soroban_env_host::xdr::ScErrorCode::MissingValue,
+        let host_error = soroban_env_host_p25::HostError::from((
+            soroban_env_host_p25::xdr::ScErrorType::Storage,
+            soroban_env_host_p25::xdr::ScErrorCode::MissingValue,
         ));
         assert_eq!(
             map_host_error_to_result_code(&host_error),

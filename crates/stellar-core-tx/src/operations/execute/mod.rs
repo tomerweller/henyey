@@ -7,9 +7,10 @@ use stellar_xdr::curr::{
     AccountId, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, Operation, OperationBody,
     OperationResult, OperationResultTr, RestoreFootprintResult, SorobanTransactionData, WriteXdr,
 };
-use soroban_env_host::budget::Budget;
-use soroban_env_host::e2e_invoke::entry_size_for_rent;
-use soroban_env_host::fees::{compute_rent_fee, LedgerEntryRentChange};
+use soroban_env_host_p24 as soroban_env_host24;
+use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
+use soroban_env_host_p25 as soroban_env_host25;
+use stellar_core_common::{protocol_version_is_before, ProtocolVersion};
 
 use crate::frame::muxed_to_account_id;
 use crate::soroban::SorobanConfig;
@@ -119,6 +120,15 @@ struct RentSnapshot {
     old_live_until: u32,
 }
 
+struct RentChange {
+    is_persistent: bool,
+    is_code_entry: bool,
+    old_size_bytes: u32,
+    new_size_bytes: u32,
+    old_live_until_ledger: u32,
+    new_live_until_ledger: u32,
+}
+
 fn ledger_key_hash(key: &stellar_xdr::curr::LedgerKey) -> stellar_xdr::curr::Hash {
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::WriteXdr;
@@ -130,19 +140,58 @@ fn ledger_key_hash(key: &stellar_xdr::curr::LedgerKey) -> stellar_xdr::curr::Has
     stellar_xdr::curr::Hash(hasher.finalize().into())
 }
 
+fn entry_size_for_rent_by_protocol(
+    protocol_version: u32,
+    entry: &stellar_xdr::curr::LedgerEntry,
+    entry_xdr_size: u32,
+) -> u32 {
+    if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
+        let budget = soroban_env_host24::budget::Budget::default();
+        let entry = convert_ledger_entry_to_p24(entry);
+        entry
+            .and_then(|entry| {
+                soroban_env_host24::e2e_invoke::entry_size_for_rent(
+                    &budget,
+                    &entry,
+                    entry_xdr_size,
+                )
+                .ok()
+            })
+            .unwrap_or(entry_xdr_size)
+    } else {
+        let budget = soroban_env_host25::budget::Budget::default();
+        soroban_env_host25::e2e_invoke::entry_size_for_rent(&budget, entry, entry_xdr_size)
+            .unwrap_or(entry_xdr_size)
+    }
+}
+
+fn convert_ledger_entry_to_p24(
+    entry: &stellar_xdr::curr::LedgerEntry,
+) -> Option<soroban_env_host24::xdr::LedgerEntry> {
+    let bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
+    soroban_env_host24::xdr::LedgerEntry::from_xdr(
+        &bytes,
+        soroban_env_host24::xdr::Limits::none(),
+    )
+    .ok()
+}
+
 fn rent_snapshot_for_keys(
     keys: &[stellar_xdr::curr::LedgerKey],
     state: &LedgerStateManager,
+    protocol_version: u32,
 ) -> Vec<RentSnapshot> {
-    let budget = Budget::default();
     let mut snapshots = Vec::new();
     for key in keys {
         let Some(entry) = state.get_entry(key) else {
             continue;
         };
         let entry_xdr = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-        let entry_size = entry_size_for_rent(&budget, &entry, entry_xdr.len() as u32)
-            .unwrap_or(entry_xdr.len() as u32);
+        let entry_size = entry_size_for_rent_by_protocol(
+            protocol_version,
+            &entry,
+            entry_xdr.len() as u32,
+        );
         let key_hash = ledger_key_hash(key);
         let old_live_until = state
             .get_ttl(&key_hash)
@@ -169,16 +218,19 @@ fn rent_snapshot_for_keys(
 fn rent_changes_from_snapshots(
     snapshots: &[RentSnapshot],
     state: &LedgerStateManager,
-) -> Vec<LedgerEntryRentChange> {
-    let budget = Budget::default();
+    protocol_version: u32,
+) -> Vec<RentChange> {
     let mut changes = Vec::new();
     for snapshot in snapshots {
         let Some(entry) = state.get_entry(&snapshot.key) else {
             continue;
         };
         let entry_xdr = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-        let new_size_bytes = entry_size_for_rent(&budget, &entry, entry_xdr.len() as u32)
-            .unwrap_or(entry_xdr.len() as u32);
+        let new_size_bytes = entry_size_for_rent_by_protocol(
+            protocol_version,
+            &entry,
+            entry_xdr.len() as u32,
+        );
         let key_hash = ledger_key_hash(&snapshot.key);
         let new_live_until = state
             .get_ttl(&key_hash)
@@ -189,7 +241,7 @@ fn rent_changes_from_snapshots(
         {
             continue;
         }
-        changes.push(LedgerEntryRentChange {
+        changes.push(RentChange {
             is_persistent: snapshot.is_persistent,
             is_code_entry: snapshot.is_code_entry,
             old_size_bytes: snapshot.old_size_bytes,
@@ -199,6 +251,54 @@ fn rent_changes_from_snapshots(
         });
     }
     changes
+}
+
+fn rent_fee_config_p25_to_p24(
+    config: &soroban_env_host25::fees::RentFeeConfiguration,
+) -> soroban_env_host24::fees::RentFeeConfiguration {
+    soroban_env_host24::fees::RentFeeConfiguration {
+        fee_per_write_1kb: config.fee_per_write_1kb,
+        fee_per_rent_1kb: config.fee_per_rent_1kb,
+        fee_per_write_entry: config.fee_per_write_entry,
+        persistent_rent_rate_denominator: config.persistent_rent_rate_denominator,
+        temporary_rent_rate_denominator: config.temporary_rent_rate_denominator,
+    }
+}
+
+fn compute_rent_fee_by_protocol(
+    protocol_version: u32,
+    rent_changes: &[RentChange],
+    config: &soroban_env_host25::fees::RentFeeConfiguration,
+    ledger_seq: u32,
+) -> i64 {
+    if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
+        let changes: Vec<soroban_env_host24::fees::LedgerEntryRentChange> = rent_changes
+            .iter()
+            .map(|change| soroban_env_host24::fees::LedgerEntryRentChange {
+                is_persistent: change.is_persistent,
+                is_code_entry: change.is_code_entry,
+                old_size_bytes: change.old_size_bytes,
+                new_size_bytes: change.new_size_bytes,
+                old_live_until_ledger: change.old_live_until_ledger,
+                new_live_until_ledger: change.new_live_until_ledger,
+            })
+            .collect();
+        let config = rent_fee_config_p25_to_p24(config);
+        soroban_env_host24::fees::compute_rent_fee(&changes, &config, ledger_seq)
+    } else {
+        let changes: Vec<soroban_env_host25::fees::LedgerEntryRentChange> = rent_changes
+            .iter()
+            .map(|change| soroban_env_host25::fees::LedgerEntryRentChange {
+                is_persistent: change.is_persistent,
+                is_code_entry: change.is_code_entry,
+                old_size_bytes: change.old_size_bytes,
+                new_size_bytes: change.new_size_bytes,
+                old_live_until_ledger: change.old_live_until_ledger,
+                new_live_until_ledger: change.new_live_until_ledger,
+            })
+            .collect();
+        soroban_env_host25::fees::compute_rent_fee(&changes, config, ledger_seq)
+    }
 }
 
 pub fn execute_operation(
@@ -307,7 +407,7 @@ pub fn execute_operation_with_soroban(
                     let mut keys = Vec::new();
                     keys.extend(data.resources.footprint.read_only.iter().cloned());
                     keys.extend(data.resources.footprint.read_write.iter().cloned());
-                    rent_snapshot_for_keys(&keys, state)
+                    rent_snapshot_for_keys(&keys, state, context.protocol_version)
                 })
                 .unwrap_or_default();
             let result = extend_footprint_ttl::execute_extend_footprint_ttl(
@@ -324,8 +424,13 @@ pub fn execute_operation_with_soroban(
                     ExtendFootprintTtlResult::Success
                 ))
             ) {
-                let rent_changes = rent_changes_from_snapshots(&snapshots, state);
-                let rent_fee = compute_rent_fee(
+                let rent_changes = rent_changes_from_snapshots(
+                    &snapshots,
+                    state,
+                    context.protocol_version,
+                );
+                let rent_fee = compute_rent_fee_by_protocol(
+                    context.protocol_version,
                     &rent_changes,
                     &config.rent_fee_config,
                     context.sequence,
@@ -348,7 +453,7 @@ pub fn execute_operation_with_soroban(
                     let mut keys = Vec::new();
                     keys.extend(data.resources.footprint.read_only.iter().cloned());
                     keys.extend(data.resources.footprint.read_write.iter().cloned());
-                    rent_snapshot_for_keys(&keys, state)
+                    rent_snapshot_for_keys(&keys, state, context.protocol_version)
                 })
                 .unwrap_or_default();
             let result = restore_footprint::execute_restore_footprint(
@@ -365,8 +470,13 @@ pub fn execute_operation_with_soroban(
                     RestoreFootprintResult::Success
                 ))
             ) {
-                let rent_changes = rent_changes_from_snapshots(&snapshots, state);
-                let rent_fee = compute_rent_fee(
+                let rent_changes = rent_changes_from_snapshots(
+                    &snapshots,
+                    state,
+                    context.protocol_version,
+                );
+                let rent_fee = compute_rent_fee_by_protocol(
+                    context.protocol_version,
                     &rent_changes,
                     &config.rent_fee_config,
                     context.sequence,

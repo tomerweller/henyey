@@ -31,7 +31,7 @@ rust-version = "1.75"
 # Stellar official crates
 # We support multiple protocol versions by including multiple soroban-env-host versions.
 # Each host version is labeled with the MAXIMUM protocol it supports.
-stellar-xdr = { version = "24.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
+stellar-xdr = { git = "https://github.com/stellar/rs-stellar-xdr", rev = "89cc1cbadf1b9a16843826954dede7fec514d8e7", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
 stellar-strkey = "0.0.11"
 
 # Soroban host for Protocol 24 (supports protocols 20-24)
@@ -39,9 +39,10 @@ stellar-strkey = "0.0.11"
 soroban-env-host-p24 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
 soroban-env-common-p24 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
 
-# Keep the simple name for backward compatibility (currently points to p24)
-soroban-env-host = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
-soroban-env-common = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
+# Soroban host for Protocol 25 (supports protocol 25+)
+# Using exact git revision from stellar-core v25 for deterministic replay
+soroban-env-host-p25 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "0a0c2df704edeb3cdafabfcc759eddccd6775337" }
+soroban-env-common-p25 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "0a0c2df704edeb3cdafabfcc759eddccd6775337" }
 
 # Workspace crates
 stellar-core-common = { path = "crates/stellar-core-common" }
@@ -150,3 +151,6 @@ debug = true
 
 [profile.test]
 opt-level = 1
+
+[patch.crates-io]
+stellar-xdr = { git = "https://github.com/stellar/rs-stellar-xdr", rev = "89cc1cbadf1b9a16843826954dede7fec514d8e7" }

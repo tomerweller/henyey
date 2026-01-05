@@ -2,7 +2,7 @@
 
 use stellar_core_common::{Hash256, NetworkId, Resource};
 use stellar_core_crypto::sha256;
-use soroban_env_host::fees::TransactionResources;
+use soroban_env_host_p25::fees::TransactionResources;
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, EnvelopeType, FeeBumpTransactionInnerTx, Hash,
     InvokeHostFunctionOp, LedgerKey, Memo,

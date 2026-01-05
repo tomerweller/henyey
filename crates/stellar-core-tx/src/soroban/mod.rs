@@ -24,6 +24,7 @@
 
 mod budget;
 mod events;
+mod error;
 mod host;
 pub mod protocol;
 mod storage;

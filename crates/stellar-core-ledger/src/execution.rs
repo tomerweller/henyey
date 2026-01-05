@@ -11,7 +11,7 @@ use stellar_core_invariant::{
     LedgerEntryChange as InvariantLedgerEntryChange, LiabilitiesMatchOffers,
     OrderBookIsNotCrossed,
 };
-use soroban_env_host::fees::{
+use soroban_env_host_p25::fees::{
     compute_rent_write_fee_per_1kb, compute_transaction_resource_fee, FeeConfiguration,
     RentFeeConfiguration, RentWriteFeeConfiguration,
 };

@@ -13,8 +13,8 @@ stellar-core-crypto.workspace = true
 stellar-core-db.workspace = true
 
 # Soroban integration
-soroban-env-host.workspace = true
-soroban-env-common.workspace = true
+soroban-env-host-p24.workspace = true
+soroban-env-host-p25.workspace = true
 
 # Async runtime
 tokio.workspace = true

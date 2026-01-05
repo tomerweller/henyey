@@ -8,6 +8,7 @@
 //! The dispatch is done at runtime based on the ledger's protocol version.
 
 pub mod p24;
+pub mod p25;
 mod types;
 
 pub use types::*;
@@ -17,7 +18,7 @@ use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use stellar_xdr::curr::{AccountId, HostFunction, SorobanAuthorizationEntry, SorobanTransactionData};
-use soroban_env_host::HostError;
+use soroban_env_host_p25::HostError as HostErrorP25;
 
 /// Execute a host function using the appropriate protocol-versioned host.
 ///
@@ -31,11 +32,10 @@ pub fn execute_host_function(
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
-) -> Result<InvokeHostFunctionOutput, HostError> {
+) -> Result<InvokeHostFunctionOutput, HostErrorP25> {
     let protocol_version = context.protocol_version;
 
     // Dispatch to the appropriate protocol-versioned host
-    // Currently we only have p24, which handles protocols 20-24
     if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
         p24::invoke_host_function(
             host_function,
@@ -47,11 +47,14 @@ pub fn execute_host_function(
             soroban_config,
         )
     } else {
-        // Protocol 25+: not yet implemented
-        // TODO: Add p25 implementation when needed
-        Err(HostError::from(soroban_env_host::Error::from_type_and_code(
-            soroban_env_host::xdr::ScErrorType::Context,
-            soroban_env_host::xdr::ScErrorCode::InternalError,
-        )))
+        p25::invoke_host_function(
+            host_function,
+            auth_entries,
+            source,
+            state,
+            context,
+            soroban_data,
+            soroban_config,
+        )
     }
 }
