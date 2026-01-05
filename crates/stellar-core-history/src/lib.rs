@@ -51,6 +51,7 @@
 pub mod archive;
 pub mod archive_state;
 pub mod catchup;
+pub mod cdp;
 pub mod checkpoint;
 pub mod download;
 pub mod error;
@@ -74,6 +75,7 @@ pub use error::HistoryError;
 pub use paths::{bucket_path, checkpoint_ledger, checkpoint_path};
 pub use replay::{LedgerReplayResult, ReplayConfig, ReplayedLedgerState};
 pub use verify::{compute_header_hash, verify_bucket_hash, verify_header_chain};
+pub use cdp::{CdpDataLake, extract_transaction_metas, extract_ledger_header};
 
 /// Result type for history operations.
 pub type Result<T> = std::result::Result<T, HistoryError>;

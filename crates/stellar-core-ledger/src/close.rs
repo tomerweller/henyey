@@ -165,6 +165,16 @@ impl TransactionSetVariant {
         }
     }
 
+    /// Create an empty generalized transaction set for a given ledger header.
+    pub fn empty_generalized(header: &LedgerHeader) -> Self {
+        TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(
+            stellar_xdr::curr::TransactionSetV1 {
+                previous_ledger_hash: header.previous_ledger_hash.clone(),
+                phases: stellar_xdr::curr::VecM::default(),
+            }
+        ))
+    }
+
     /// Iterate over transactions (borrowed).
     pub fn transactions(&self) -> Vec<&TransactionEnvelope> {
         match self {

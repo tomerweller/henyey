@@ -19,8 +19,9 @@ use stellar_core_ledger::{
     LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle, TransactionSetVariant,
 };
 use stellar_xdr::curr::{
-    BucketListType, LedgerEntry, LedgerHeader, LedgerKey, TransactionEnvelope, TransactionMeta,
-    TransactionResultPair, TransactionResultSet, WriteXdr,
+    BucketListType, ConfigSettingEntry, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    LedgerHeader, LedgerKey, TransactionEnvelope, TransactionMeta, TransactionResultPair,
+    TransactionResultSet, WriteXdr, EvictionIterator as XdrEvictionIterator,
 };
 use sha2::{Digest, Sha256};
 
@@ -313,6 +314,7 @@ pub fn replay_ledger_with_execution(
     let mut updated_eviction_iterator = eviction_iterator;
     let mut evicted_keys: Vec<LedgerKey> = Vec::new();
     let mut archived_entries: Vec<LedgerEntry> = Vec::new();
+    let mut eviction_actually_ran = false;
 
     if config.run_eviction
         && header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
@@ -336,6 +338,7 @@ pub fn replay_ledger_with_execution(
             evicted_keys = eviction_result.evicted_keys;
             archived_entries = eviction_result.archived_entries;
             updated_eviction_iterator = Some(eviction_result.end_iterator);
+            eviction_actually_ran = true;
         }
     }
 
@@ -343,13 +346,41 @@ pub fn replay_ledger_with_execution(
     let mut all_dead_entries = dead_entries.clone();
     all_dead_entries.extend(evicted_keys);
 
+    // Build live entries including eviction iterator update.
+    // C++ stellar-core updates the EvictionIterator ConfigSettingEntry EVERY ledger
+    // during eviction scan. We do the same for consistency.
+    let mut all_live_entries = live_entries.clone();
+    if eviction_actually_ran {
+        if let Some(iter) = updated_eviction_iterator {
+            let eviction_iter_entry = LedgerEntry {
+                last_modified_ledger_seq: header.ledger_seq,
+                data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
+                    XdrEvictionIterator {
+                        bucket_file_offset: iter.bucket_file_offset as u64,
+                        bucket_list_level: iter.bucket_list_level,
+                        is_curr_bucket: iter.is_curr_bucket,
+                    },
+                )),
+                ext: LedgerEntryExt::V0,
+            };
+            all_live_entries.push(eviction_iter_entry);
+            tracing::debug!(
+                ledger_seq = header.ledger_seq,
+                level = iter.bucket_list_level,
+                is_curr = iter.is_curr_bucket,
+                offset = iter.bucket_file_offset,
+                "Added EvictionIterator entry to live entries"
+            );
+        }
+    }
+
     bucket_list
         .add_batch(
             header.ledger_seq,
             header.ledger_version,
             BucketListType::Live,
             init_entries.clone(),
-            live_entries.clone(),
+            all_live_entries,
             all_dead_entries,
         )
         .map_err(HistoryError::Bucket)?;
@@ -359,6 +390,13 @@ pub fn replay_ledger_with_execution(
     // because the hot archive bucket list needs to run spill logic at the same
     // ledger boundaries as the live bucket list.
     if let Some(hot_archive) = hot_archive_bucket_list.as_deref_mut() {
+        let pre_hash = hot_archive.hash();
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            pre_hash = %pre_hash,
+            archived_count = archived_entries.len(),
+            "Hot archive add_batch - BEFORE"
+        );
         hot_archive
             .add_batch(
                 header.ledger_seq,
@@ -369,6 +407,18 @@ pub fn replay_ledger_with_execution(
                 vec![],
             )
             .map_err(HistoryError::Bucket)?;
+        let post_hash = hot_archive.hash();
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            post_hash = %post_hash,
+            hash_changed = (pre_hash != post_hash),
+            "Hot archive add_batch - AFTER"
+        );
+    } else {
+        tracing::warn!(
+            ledger_seq = header.ledger_seq,
+            "Hot archive bucket list is None - skipping add_batch"
+        );
     }
 
     if config.verify_bucket_list {
@@ -546,7 +596,7 @@ fn summarize_operations(tx: &TransactionEnvelope) -> Vec<String> {
 /// - init_entries: Entries that were created
 /// - live_entries: Entries that were updated or restored
 /// - dead_entries: Keys of entries that were deleted
-fn extract_ledger_changes(
+pub fn extract_ledger_changes(
     tx_metas: &[TransactionMeta],
 ) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
     let mut init_entries = Vec::new();

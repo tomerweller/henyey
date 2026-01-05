@@ -22,6 +22,7 @@ url.workspace = true
 
 # Compression
 flate2.workspace = true
+zstd.workspace = true
 
 # Async runtime
 tokio.workspace = true

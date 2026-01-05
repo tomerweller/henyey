@@ -92,6 +92,7 @@ hex-literal = "0.4"
 
 # Compression - pure Rust backend
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+zstd = "0.13"
 
 # HTTP client - pure Rust TLS
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json"] }
