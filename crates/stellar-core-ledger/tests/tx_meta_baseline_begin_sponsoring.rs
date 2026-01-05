@@ -6,12 +6,14 @@ use base64::Engine;
 use stellar_core_common::{normalize_transaction_meta, Hash256, NetworkId};
 use stellar_core_crypto::{seed, xdr_compute_hash, SecretKey};
 use stellar_core_ledger::execution::execute_transaction_set;
-use stellar_core_ledger::{compute_header_hash, SnapshotBuilder, SnapshotHandle};
+use stellar_core_ledger::{compute_header_hash, entry_to_key, LedgerDelta, SnapshotBuilder, SnapshotHandle};
 use stellar_core_tx::{ClassicEventConfig, soroban::SorobanConfig};
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    AccountEntry, AccountEntryExt, AccountId, AlphaNum4, AssetCode4, BeginSponsoringFutureReservesOp,
+    BumpSequenceOp, ChangeTrustAsset, ChangeTrustOp, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     LedgerHeader, LedgerKey, LedgerKeyAccount, MuxedAccount, Operation, OperationBody,
-    Preconditions, SequenceNumber, Signature as XdrSignature, SignatureHint, String32,
+    Preconditions, SequenceNumber,
+    Signature as XdrSignature, SignatureHint, String32,
     Thresholds, TimePoint, Transaction, TransactionEnvelope, TransactionExt, TransactionMeta,
     TransactionResultMetaV1, TransactionV1Envelope, Uint256, VecM, WriteXdr, Limits,
 };
@@ -156,6 +158,49 @@ fn sign_envelope(
     }
 }
 
+fn muxed_from_account_id(account_id: &AccountId) -> MuxedAccount {
+    match &account_id.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => MuxedAccount::Ed25519(pk.clone()),
+    }
+}
+
+fn begin_sponsoring_op(sponsored: AccountId) -> Operation {
+    Operation {
+        source_account: None,
+        body: OperationBody::BeginSponsoringFutureReserves(BeginSponsoringFutureReservesOp {
+            sponsored_id: sponsored,
+        }),
+    }
+}
+
+fn end_sponsoring_op() -> Operation {
+    Operation {
+        source_account: None,
+        body: OperationBody::EndSponsoringFutureReserves,
+    }
+}
+
+fn change_trust_op(asset: ChangeTrustAsset, limit: i64) -> Operation {
+    Operation {
+        source_account: None,
+        body: OperationBody::ChangeTrust(ChangeTrustOp { line: asset, limit }),
+    }
+}
+
+fn sign_multi(
+    envelope: &mut TransactionEnvelope,
+    secrets: &[&SecretKey],
+    network_id: &NetworkId,
+) {
+    let mut signatures = Vec::new();
+    for secret in secrets {
+        signatures.push(sign_envelope(envelope, secret, network_id));
+    }
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = signatures.try_into().unwrap();
+    }
+}
+
 fn create_account_envelope(
     source: &SecretKey,
     destination: AccountId,
@@ -237,12 +282,146 @@ fn execute_create_account(
     meta.tx_apply_processing.clone()
 }
 
+fn apply_delta(entries: &mut std::collections::HashMap<Vec<u8>, LedgerEntry>, delta: &LedgerDelta) {
+    for change in delta.changes() {
+        match change {
+            stellar_core_ledger::EntryChange::Created(entry)
+            | stellar_core_ledger::EntryChange::Updated { current: entry, .. } => {
+                let key = entry_to_key(entry).expect("entry key");
+                entries.insert(key_bytes(&key), entry.clone());
+            }
+            stellar_core_ledger::EntryChange::Deleted { previous } => {
+                let key = entry_to_key(previous).expect("entry key");
+                entries.remove(&key_bytes(&key));
+            }
+        }
+    }
+}
+
+fn execute_and_apply(
+    entries: &mut std::collections::HashMap<Vec<u8>, LedgerEntry>,
+    header: &LedgerHeader,
+    network_id: NetworkId,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    envelope: TransactionEnvelope,
+) -> TransactionMeta {
+    let snapshot = SnapshotBuilder::new(header.ledger_seq)
+        .with_header(header.clone(), Hash256::ZERO)
+        .add_entries(
+            entries
+                .values()
+                .cloned()
+                .map(|entry| (entry_to_key(&entry).expect("entry key"), entry)),
+        )
+        .expect("snapshot entries")
+        .build()
+        .expect("build snapshot");
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let mut delta = LedgerDelta::new(header.ledger_seq);
+    let (_results, _tx_results, tx_result_metas, _id_pool) = execute_transaction_set(
+        &snapshot,
+        &[(envelope, None)],
+        header.ledger_seq,
+        0,
+        base_fee,
+        base_reserve,
+        protocol_version,
+        network_id,
+        &mut delta,
+        SorobanConfig::default(),
+        [0u8; 32],
+        ClassicEventConfig::default(),
+        None,
+    )
+    .expect("execute transaction set");
+
+    apply_delta(entries, &delta);
+
+    let meta: &TransactionResultMetaV1 = tx_result_metas.first().expect("tx meta");
+    meta.tx_apply_processing.clone()
+}
+
+fn bump_sequence_envelope(
+    source: &SecretKey,
+    bump_to: i64,
+    base_fee: u32,
+    sequence: i64,
+    network_id: &NetworkId,
+) -> TransactionEnvelope {
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::BumpSequence(BumpSequenceOp {
+            bump_to: SequenceNumber(bump_to),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(sequence),
+        cond: Preconditions::None,
+        memo: stellar_xdr::curr::Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, source, network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+    envelope
+}
+
+fn sponsoring_change_trust_envelope(
+    root_secret: &SecretKey,
+    root_account: &AccountId,
+    sponsored_secret: &SecretKey,
+    sponsored_account: &AccountId,
+    asset: ChangeTrustAsset,
+    base_fee: u32,
+    sequence: i64,
+    network_id: &NetworkId,
+) -> TransactionEnvelope {
+    let mut op_begin = begin_sponsoring_op(sponsored_account.clone());
+    op_begin.source_account = Some(muxed_from_account_id(root_account));
+
+    let mut op_change = change_trust_op(asset, 1000);
+    op_change.source_account = Some(muxed_from_account_id(sponsored_account));
+
+    let mut op_end = end_sponsoring_op();
+    op_end.source_account = Some(muxed_from_account_id(sponsored_account));
+
+    let tx = Transaction {
+        source_account: muxed_from_account_id(root_account),
+        fee: base_fee * 3,
+        seq_num: SequenceNumber(sequence),
+        cond: Preconditions::None,
+        memo: stellar_xdr::curr::Memo::None,
+        operations: vec![op_begin, op_change, op_end].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    sign_multi(&mut envelope, &[root_secret, sponsored_secret], network_id);
+    envelope
+}
+
 #[test]
 fn begin_sponsoring_success_baseline_matches() {
     seed(12345).expect("seed short hash");
     let expected =
         load_baseline_hashes("sponsor future reserves|protocol version 25|success");
-    assert_eq!(expected.len(), 1);
+    assert_eq!(expected.len(), 2);
 
     let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
     let root_secret = SecretKey::from_seed(network_id.as_bytes());
@@ -277,7 +456,7 @@ fn begin_sponsoring_success_baseline_matches() {
 
     let tx = create_account_envelope(
         &root_secret,
-        a1_id,
+        a1_id.clone(),
         min_balance0,
         base_fee,
         1,
@@ -295,4 +474,140 @@ fn begin_sponsoring_success_baseline_matches() {
 
     let got = tx_meta_hash(&meta);
     assert_eq!(got, expected[0]);
+}
+
+#[test]
+fn begin_sponsoring_precondition_v3_baseline_matches() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "sponsor future reserves|protocol version 25|sponsorships with precondition that uses v3 extension",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
+    let root_secret = SecretKey::from_seed(network_id.as_bytes());
+    let root_account_id: AccountId = (&root_secret.public_key()).into();
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+    let total_coins = 1_000_000_000_000_000_000i64;
+    let min_balance0 = 2i64 * base_reserve as i64;
+
+    let genesis = genesis_header(25, base_fee, base_reserve, total_coins);
+    let header = test_header(
+        2,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        compute_header_hash(&genesis).expect("genesis hash"),
+    );
+
+    let (root_key, root_entry) = account_entry(
+        root_account_id.clone(),
+        0,
+        total_coins,
+        header.ledger_seq - 1,
+    );
+    let mut entries = std::collections::HashMap::new();
+    entries.insert(key_bytes(&root_key), root_entry);
+
+    let a1_secret = secret_from_name("a1");
+    let a1_id: AccountId = (&a1_secret.public_key()).into();
+
+    let tx = create_account_envelope(
+        &root_secret,
+        a1_id.clone(),
+        min_balance0 + 301,
+        base_fee,
+        1,
+        &network_id,
+    );
+    let meta_create = execute_and_apply(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        tx,
+    );
+
+    let header_after_create = test_header(
+        3,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        compute_header_hash(&header).expect("header hash"),
+    );
+
+    let root_entry = entries
+        .get(&key_bytes(&LedgerKey::Account(LedgerKeyAccount { account_id: root_account_id.clone() })))
+        .expect("root entry");
+    let root_seq = match &root_entry.data {
+        LedgerEntryData::Account(account) => account.seq_num.0,
+        _ => panic!("root entry not account"),
+    };
+
+    let cur1 = ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4(*b"CUR1"),
+        issuer: root_account_id.clone(),
+    });
+    let sponsor_tx = sponsoring_change_trust_envelope(
+        &root_secret,
+        &root_account_id,
+        &a1_secret,
+        &a1_id,
+        cur1,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let _meta_sponsor = execute_and_apply(
+        &mut entries,
+        &header_after_create,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        sponsor_tx,
+    );
+
+    let header_after_sponsor = test_header(
+        4,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        compute_header_hash(&header_after_create).expect("header hash"),
+    );
+
+    let a1_entry = entries
+        .get(&key_bytes(&LedgerKey::Account(LedgerKeyAccount { account_id: a1_id.clone() })))
+        .expect("a1 entry");
+    let a1_seq = match &a1_entry.data {
+        LedgerEntryData::Account(account) => account.seq_num.0,
+        _ => panic!("a1 entry not account"),
+    };
+
+    let bump_tx = bump_sequence_envelope(
+        &a1_secret,
+        0,
+        base_fee,
+        a1_seq + 1,
+        &network_id,
+    );
+    let meta_bump = execute_and_apply(
+        &mut entries,
+        &header_after_sponsor,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        bump_tx,
+    );
+
+    let got = vec![tx_meta_hash(&meta_create), tx_meta_hash(&meta_bump)];
+    assert_eq!(got, expected);
 }
