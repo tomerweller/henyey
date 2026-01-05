@@ -1204,21 +1204,16 @@ impl TransactionExecutor {
         let fee_changes =
             build_entry_changes_with_state(&self.state, &fee_created, &fee_updated, &fee_deleted);
 
+        // Fee processing happens before sequence updates in upstream. Commit here so
+        // txChangesBefore reflects the post-fee account state.
+        self.state.commit();
+
         let mut tx_changes_before = empty_entry_changes();
         let mut seq_created = Vec::new();
         let mut seq_updated = Vec::new();
         let mut seq_deleted = Vec::new();
 
         if self.protocol_version >= 10 {
-            let mut seq_state_overrides = HashMap::new();
-            if let Some(pre_seq_entry) = self.state.get_account(&inner_source_id).cloned() {
-                let ledger_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                    account_id: inner_source_id.clone(),
-                });
-                let state_entry = self.state.ledger_entry_for_account(&pre_seq_entry);
-                seq_state_overrides.insert(ledger_key, state_entry);
-            }
-
             let delta_before_seq = delta_snapshot(&self.state);
             if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
                 acc.seq_num.0 += 1;
@@ -1232,13 +1227,8 @@ impl TransactionExecutor {
             let delta_after_seq = delta_snapshot(&self.state);
             let (created, updated, deleted) =
                 delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
-            tx_changes_before = build_entry_changes_with_state_overrides(
-                &self.state,
-                &created,
-                &updated,
-                &deleted,
-                &seq_state_overrides,
-            );
+            tx_changes_before =
+                build_entry_changes_with_state(&self.state, &created, &updated, &deleted);
             seq_created = created;
             seq_updated = updated;
             seq_deleted = deleted;
