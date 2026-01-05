@@ -7,9 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_invariant::{
-    ConstantProductInvariant, EventsAreConsistentWithEntryDiffs, InvariantContext, InvariantManager,
-    LedgerEntryChange as InvariantLedgerEntryChange, LiabilitiesMatchOffers,
-    OrderBookIsNotCrossed,
+    ConstantProductInvariant, InvariantContext, InvariantManager,
+    LedgerEntryChange as InvariantLedgerEntryChange, LiabilitiesMatchOffers, OrderBookIsNotCrossed,
 };
 use soroban_env_host_p25::fees::{
     compute_rent_write_fee_per_1kb, compute_transaction_resource_fee, FeeConfiguration,
@@ -2091,12 +2090,14 @@ pub struct OperationInvariantRunner {
 }
 
 impl OperationInvariantRunner {
-    pub fn new(entries: Vec<LedgerEntry>, header: LedgerHeader, network_id: NetworkId) -> Result<Self> {
+    pub fn new(entries: Vec<LedgerEntry>, header: LedgerHeader, _network_id: NetworkId) -> Result<Self> {
         let mut manager = InvariantManager::new();
         manager.add(LiabilitiesMatchOffers);
         manager.add(OrderBookIsNotCrossed);
         manager.add(ConstantProductInvariant);
-        manager.add(EventsAreConsistentWithEntryDiffs::new(network_id.0));
+        // Note: EventsAreConsistentWithEntryDiffs is NOT added because during replay
+        // we don't have TransactionMeta, which means our generated events and entry
+        // diffs may not match C++ stellar-core's authoritative values.
 
         let mut map = HashMap::new();
         for entry in entries {

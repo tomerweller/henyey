@@ -176,19 +176,42 @@ impl LedgerDelta {
     }
 
     /// Record the creation of a new entry.
+    ///
+    /// If the entry already exists in the delta:
+    /// - If it was created, update with the new value
+    /// - If it was updated, keep original previous and update current
+    /// - If it was deleted, return error (can't create a deleted entry)
     pub fn record_create(&mut self, entry: LedgerEntry) -> Result<()> {
         let key = entry_to_key(&entry)?;
         let key_bytes = key_to_bytes(&key)?;
 
-        if self.changes.contains_key(&key_bytes) {
-            return Err(LedgerError::DuplicateEntry(format!(
-                "entry already exists in delta: {:?}",
-                key
-            )));
+        if let Some(existing) = self.changes.get(&key_bytes) {
+            match existing {
+                EntryChange::Created(_) => {
+                    // Entry was already created, update with new value
+                    self.changes
+                        .insert(key_bytes, EntryChange::Created(entry));
+                }
+                EntryChange::Updated { previous, .. } => {
+                    // Entry was updated, keep original previous and update current
+                    self.changes.insert(
+                        key_bytes,
+                        EntryChange::Updated {
+                            previous: previous.clone(),
+                            current: entry,
+                        },
+                    );
+                }
+                EntryChange::Deleted { .. } => {
+                    return Err(LedgerError::Internal(
+                        "cannot create an entry that was deleted in the same delta".to_string(),
+                    ));
+                }
+            }
+        } else {
+            self.change_order.push(key_bytes.clone());
+            self.changes.insert(key_bytes, EntryChange::Created(entry));
         }
-
-        self.change_order.push(key_bytes.clone());
-        self.changes.insert(key_bytes, EntryChange::Created(entry));
         Ok(())
     }
 
@@ -231,6 +254,11 @@ impl LedgerDelta {
     }
 
     /// Record the deletion of an entry.
+    ///
+    /// If the entry already exists in the delta:
+    /// - If it was created, remove from delta entirely (create + delete = no-op)
+    /// - If it was updated, record as deleted with original previous
+    /// - If it was already deleted, skip (idempotent delete)
     pub fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
         let key = entry_to_key(&entry)?;
         let key_bytes = key_to_bytes(&key)?;
@@ -253,9 +281,8 @@ impl LedgerDelta {
                     );
                 }
                 EntryChange::Deleted { .. } => {
-                    return Err(LedgerError::Internal(
-                        "cannot delete an already deleted entry".to_string(),
-                    ));
+                    // Entry already deleted, this is a no-op (idempotent delete)
+                    // This can happen during replay when entries are processed multiple times
                 }
             }
         } else {

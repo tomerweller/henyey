@@ -47,14 +47,6 @@ path = "testnet.db"
 pool_size = 10
 
 [history]
-# History archives for catchup
-# These are the official SDF testnet archives
-archives = [
-    "https://history.stellar.org/prd/core-testnet/core_testnet_001",
-    "https://history.stellar.org/prd/core-testnet/core_testnet_002",
-    "https://history.stellar.org/prd/core-testnet/core_testnet_003"
-]
-
 # Archive selection strategy: "random", "sequential", "fastest"
 selection_strategy = "random"
 
@@ -63,6 +55,19 @@ max_retries = 3
 
 # Download parallelism (concurrent bucket downloads)
 parallelism = 8
+
+# History archives for catchup - these are the official SDF testnet archives
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[[history.archives]]
+name = "sdf2"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_002"
+
+[[history.archives]]
+name = "sdf3"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_003"
 
 [peers]
 # Known peer addresses for bootstrap

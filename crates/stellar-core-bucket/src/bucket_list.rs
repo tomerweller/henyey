@@ -373,6 +373,10 @@ impl BucketList {
         //
         // By processing from highest to lowest, we ensure each level's curr is
         // available to be snapped before any modifications occur.
+        //
+        // When multiple levels spill at once (e.g., at checkpoint boundaries),
+        // the snapped levels have empty currs, so the merge result is just
+        // the incoming spill. This is correct C++ behavior.
 
         for i in (1..BUCKET_LIST_LEVELS).rev() {
             if Self::level_should_spill(ledger_seq, i - 1) {
@@ -413,14 +417,6 @@ impl BucketList {
         }
 
         // Step 2: Apply new entries to level 0
-        tracing::info!(
-            curr_hash = %self.levels[0].curr.hash(),
-            snap_hash = %self.levels[0].snap.hash(),
-            new_bucket_hash = %new_bucket.hash(),
-            new_bucket_entries = new_bucket.len(),
-            "Level 0 before merge"
-        );
-
         // Prepare level 0: merge curr with new entries
         // Don't normalize INIT entries at level 0 - they stay as INIT
         let keep_dead_0 = Self::keep_tombstone_entries(0);
@@ -433,29 +429,11 @@ impl BucketList {
         )?;
         self.levels[0].commit();
 
-        tracing::info!(
-            curr_hash = %self.levels[0].curr.hash(),
-            curr_entries = self.levels[0].curr.len(),
-            snap_hash = %self.levels[0].snap.hash(),
-            "Level 0 after merge"
-        );
-
         // Step 3: Resolve any ready futures (commit all pending merges)
         // In C++ stellar-core, this is done by resolveAnyReadyFutures()
         // Since we're doing synchronous merges, all prepares are already complete
         for level in &mut self.levels {
             level.commit();
-        }
-
-        // Log final state of all levels
-        tracing::info!(ledger_seq = ledger_seq, "Final bucket list state after add_batch");
-        for i in 0..BUCKET_LIST_LEVELS {
-            tracing::info!(
-                level = i,
-                curr_hash = %self.levels[i].curr.hash(),
-                snap_hash = %self.levels[i].snap.hash(),
-                "Level state"
-            );
         }
 
         Ok(())
