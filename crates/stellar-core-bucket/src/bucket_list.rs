@@ -914,6 +914,8 @@ pub struct BucketListStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::BucketEntry as BucketListEntry;
+    use crate::merge::merge_buckets_with_options;
     use stellar_xdr::curr::*;
 
     const TEST_PROTOCOL: u32 = 25;
@@ -1048,6 +1050,74 @@ mod tests {
         assert_eq!(BucketList::level_half(1), 8);
         assert_eq!(BucketList::level_half(2), 32);
         assert_eq!(BucketList::level_half(3), 128);
+    }
+
+    #[test]
+    fn test_level_should_spill_boundaries() {
+        assert!(BucketList::level_should_spill(2, 0));
+        assert!(BucketList::level_should_spill(4, 0));
+        assert!(!BucketList::level_should_spill(3, 0));
+
+        assert!(BucketList::level_should_spill(8, 1));
+        assert!(BucketList::level_should_spill(16, 1));
+        assert!(!BucketList::level_should_spill(12, 1));
+
+        assert!(!BucketList::level_should_spill(64, BUCKET_LIST_LEVELS - 1));
+    }
+
+    #[test]
+    fn test_prepare_with_normalization_converts_init() {
+        let mut level = BucketLevel::new(BUCKET_LIST_LEVELS - 1);
+        let entry = make_account_entry([1u8; 32], 100);
+        let meta = BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V1(BucketListType::Live),
+        };
+        let incoming = Bucket::from_entries(vec![
+            BucketListEntry::Metadata(meta),
+            BucketListEntry::Init(entry.clone()),
+        ])
+        .unwrap();
+
+        level
+            .prepare_with_normalization(5, TEST_PROTOCOL, incoming, false, true)
+            .unwrap();
+        level.commit();
+
+        let mut saw_live = false;
+        for entry in level.curr.iter() {
+            match entry {
+                BucketListEntry::Live(live) => {
+                    saw_live = true;
+                    assert!(matches!(live.data, LedgerEntryData::Account(_)));
+                }
+                BucketListEntry::Init(_) => panic!("init entry should be normalized"),
+                _ => {}
+            }
+        }
+        assert!(saw_live);
+    }
+
+    #[test]
+    fn test_merge_drops_dead_when_keep_dead_false() {
+        let key = make_account_key([1u8; 32]);
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Dead(key)]).unwrap();
+        let merged = merge_buckets_with_options(
+            &Bucket::empty(),
+            &bucket,
+            false,
+            TEST_PROTOCOL,
+            true,
+        )
+        .unwrap();
+        let mut has_non_meta = false;
+        for entry in merged.iter() {
+            if !entry.is_metadata() {
+                has_non_meta = true;
+                break;
+            }
+        }
+        assert!(!has_non_meta);
     }
 
     #[test]
