@@ -614,52 +614,8 @@ impl TransactionExecutor {
     /// Returns true if the entry was found and loaded.
     pub fn load_entry(&mut self, snapshot: &SnapshotHandle, key: &LedgerKey) -> Result<bool> {
         if let Some(entry) = snapshot.get_entry(key)? {
-            match &entry.data {
-                LedgerEntryData::Account(account) => {
-                    if self.state.get_account(&account.account_id).is_none() {
-                        self.state.create_account(account.clone());
-                    }
-                }
-                LedgerEntryData::Trustline(trustline) => {
-                    if self.state.get_trustline_by_trustline_asset(
-                        &trustline.account_id,
-                        &trustline.asset,
-                    ).is_none() {
-                        self.state.create_trustline(trustline.clone());
-                    }
-                }
-                LedgerEntryData::ContractData(cd) => {
-                    if self.state.get_contract_data(&cd.contract, &cd.key, cd.durability.clone()).is_none() {
-                        self.state.create_contract_data(cd.clone());
-                    }
-                }
-                LedgerEntryData::ContractCode(cc) => {
-                    if self.state.get_contract_code(&cc.hash).is_none() {
-                        self.state.create_contract_code(cc.clone());
-                    }
-                }
-                LedgerEntryData::Ttl(ttl) => {
-                    if self.state.get_ttl(&ttl.key_hash).is_none() {
-                        self.state.create_ttl(ttl.clone());
-                    }
-                }
-                LedgerEntryData::Data(data) => {
-                    let name_str = std::str::from_utf8(data.data_name.as_slice()).unwrap_or("");
-                    if self.state.get_data(&data.account_id, name_str).is_none() {
-                        self.state.create_data(data.clone());
-                    }
-                }
-                LedgerEntryData::Offer(offer) => {
-                    if self.state.get_offer(&offer.seller_id, offer.offer_id).is_none() {
-                        self.state.create_offer(offer.clone());
-                    }
-                }
-                LedgerEntryData::ClaimableBalance(_cb) => {
-                    // ClaimableBalance loading handled separately
-                }
-                LedgerEntryData::ConfigSetting(_) | LedgerEntryData::LiquidityPool(_) => {
-                    // ConfigSetting and LiquidityPool handled by specialized loaders
-                }
+            if self.state.get_entry(key).is_none() {
+                self.state.load_entry(entry);
             }
             return Ok(true);
         }
@@ -1232,6 +1188,10 @@ impl TransactionExecutor {
             seq_updated = updated;
             seq_deleted = deleted;
         }
+        // Persist sequence updates so failed transactions still consume sequence numbers.
+        if self.protocol_version >= 10 {
+            self.state.commit();
+        }
 
         // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
@@ -1597,6 +1557,15 @@ impl TransactionExecutor {
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
                     self.load_trustline(snapshot, &from_account, &tl_asset)?;
                 }
+            }
+            OperationBody::ManageData(op_data) => {
+                let key = stellar_xdr::curr::LedgerKey::Data(
+                    stellar_xdr::curr::LedgerKeyData {
+                        account_id: op_source.clone(),
+                        data_name: op_data.data_name.clone(),
+                    },
+                );
+                self.load_entry(snapshot, &key)?;
             }
             OperationBody::ManageSellOffer(op_data) => {
                 for asset in [&op_data.selling, &op_data.buying] {
