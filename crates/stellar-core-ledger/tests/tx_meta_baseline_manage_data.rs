@@ -14,7 +14,7 @@ use stellar_xdr::curr::{
     Operation, OperationBody, Preconditions, SequenceNumber, Signature as XdrSignature,
     SignatureHint, String32, String64, Thresholds, TimePoint, Transaction, TransactionEnvelope,
     TransactionExt, TransactionMeta, TransactionResultMetaV1, TransactionV1Envelope, Uint256,
-    VecM, WriteXdr, Limits,
+    VecM, WriteXdr, Limits, Asset, PaymentOp, Price, PublicKey,
 };
 
 const GENESIS_BUCKET_LIST_HASH: [u8; 32] = hex_literal::hex!(
@@ -59,6 +59,12 @@ fn tx_meta_hash(meta: &TransactionMeta) -> u64 {
 
 fn key_bytes(key: &LedgerKey) -> Vec<u8> {
     key.to_xdr(Limits::none()).unwrap_or_default()
+}
+
+fn muxed_from_account_id(account_id: &AccountId) -> MuxedAccount {
+    match &account_id.0 {
+        PublicKey::PublicKeyTypeEd25519(pk) => MuxedAccount::Ed25519(pk.clone()),
+    }
 }
 
 fn secret_from_name(name: &str) -> SecretKey {
@@ -205,6 +211,93 @@ fn create_account_envelope(
     envelope
 }
 
+fn payment_envelope(
+    source: &SecretKey,
+    destination: AccountId,
+    amount: i64,
+    base_fee: u32,
+    sequence: i64,
+    network_id: &NetworkId,
+) -> TransactionEnvelope {
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Payment(PaymentOp {
+            destination: muxed_from_account_id(&destination),
+            asset: Asset::Native,
+            amount,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(sequence),
+        cond: Preconditions::None,
+        memo: stellar_xdr::curr::Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, source, network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+    envelope
+}
+
+fn manage_sell_offer_envelope(
+    source: &SecretKey,
+    selling: Asset,
+    buying: Asset,
+    amount: i64,
+    price: Price,
+    base_fee: u32,
+    sequence: i64,
+    network_id: &NetworkId,
+) -> TransactionEnvelope {
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::ManageSellOffer(stellar_xdr::curr::ManageSellOfferOp {
+            selling,
+            buying,
+            amount,
+            price,
+            offer_id: 0,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(sequence),
+        cond: Preconditions::None,
+        memo: stellar_xdr::curr::Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, source, network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+    envelope
+}
+
+fn credit_asset(code: &[u8; 4], issuer: &AccountId) -> Asset {
+    Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+        asset_code: stellar_xdr::curr::AssetCode4(*code),
+        issuer: issuer.clone(),
+    })
+}
+
 fn manage_data_envelope(
     source: &SecretKey,
     data_name: &str,
@@ -336,7 +429,18 @@ fn data_entry_exists(
     entries.contains_key(&key_bytes(&key))
 }
 
-fn run_manage_data_base() -> Vec<u64> {
+fn run_manage_data_base_with_state(
+) -> (
+    Vec<u64>,
+    std::collections::HashMap<Vec<u8>, LedgerEntry>,
+    LedgerHeader,
+    NetworkId,
+    SecretKey,
+    AccountId,
+    u32,
+    u32,
+    i64,
+) {
     let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
     let root_secret = SecretKey::from_seed(network_id.as_bytes());
     let root_account_id: AccountId = (&root_secret.public_key()).into();
@@ -438,22 +542,204 @@ fn run_manage_data_base() -> Vec<u64> {
         hashes.push(tx_meta_hash(&meta));
     }
 
-    hashes
+    (
+        hashes,
+        entries,
+        header,
+        network_id,
+        root_secret,
+        root_account_id,
+        base_fee,
+        base_reserve,
+        total_coins,
+    )
 }
 
 #[test]
 fn manage_data_base_tx_meta_matches_baseline() {
     seed(12345).expect("seed short hash");
     let expected = load_baseline_hashes("manage data|protocol version 25");
-    let single_run = run_manage_data_base();
+    let (single_run, _entries, _header, _network_id, _root_secret, _root_account_id, _base_fee, _base_reserve, _total_coins) =
+        run_manage_data_base_with_state();
     assert!(!single_run.is_empty());
     assert_eq!(expected.len() % single_run.len(), 0);
 
     let repeats = expected.len() / single_run.len();
     let mut got = Vec::with_capacity(expected.len());
     for _ in 0..repeats {
-        got.extend(run_manage_data_base());
+        let (run, _entries, _header, _network_id, _root_secret, _root_account_id, _base_fee, _base_reserve, _total_coins) =
+            run_manage_data_base_with_state();
+        got.extend(run);
     }
 
     assert_eq!(got, expected);
+}
+
+#[test]
+fn manage_data_native_selling_liabilities_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected =
+        load_baseline_hashes("manage data|protocol version 25|create data with native selling liabilities");
+    assert_eq!(expected.len(), 5);
+    let (_base_hashes, mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins) =
+        run_manage_data_base_with_state();
+    let min_balance2 = (2 + 2) as i64 * base_reserve as i64;
+    let acc_balance = min_balance2 + (base_fee as i64 * 2) + 500 - 1;
+
+    let acc_secret = secret_from_name("acc1");
+    let acc_id: AccountId = (&acc_secret.public_key()).into();
+    header = advance_header(&header, total_coins);
+    let root_seq = account_seq(&entries, &root_account_id);
+    let tx = create_account_envelope(
+        &root_secret,
+        acc_id.clone(),
+        acc_balance,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let mut hashes = Vec::new();
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    header = advance_header(&header, total_coins);
+    let acc_seq = account_seq(&entries, &acc_id);
+    let cur1 = credit_asset(b"CUR1", &acc_id);
+    let tx = manage_sell_offer_envelope(
+        &acc_secret,
+        Asset::Native,
+        cur1,
+        500,
+        Price { n: 1, d: 1 },
+        base_fee,
+        acc_seq + 1,
+        &network_id,
+    );
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    header = advance_header(&header, total_coins);
+    let acc_seq = account_seq(&entries, &acc_id);
+    let mut value = vec![0u8; 64];
+    for idx in 0..64 {
+        value[idx] = idx as u8;
+    }
+    let tx = manage_data_envelope(
+        &acc_secret,
+        "test",
+        Some(value.as_slice()),
+        base_fee,
+        acc_seq + 1,
+        &network_id,
+    );
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(!result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    header = advance_header(&header, total_coins);
+    let root_seq = account_seq(&entries, &root_account_id);
+    let tx = payment_envelope(
+        &root_secret,
+        acc_id.clone(),
+        base_fee as i64 + 1,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    header = advance_header(&header, total_coins);
+    let acc_seq = account_seq(&entries, &acc_id);
+    let tx = manage_data_envelope(
+        &acc_secret,
+        "test",
+        Some(value.as_slice()),
+        base_fee,
+        acc_seq + 1,
+        &network_id,
+    );
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    assert_eq!(hashes, expected);
+}
+
+#[test]
+fn manage_data_native_buying_liabilities_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected =
+        load_baseline_hashes("manage data|protocol version 25|create data with native buying liabilities");
+    assert_eq!(expected.len(), 3);
+
+    let (_base_hashes, mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins) =
+        run_manage_data_base_with_state();
+    let min_balance2 = (2 + 2) as i64 * base_reserve as i64;
+    let acc_balance = min_balance2 + (base_fee as i64 * 2) + 500 - 1;
+
+    let acc_secret = secret_from_name("acc1");
+    let acc_id: AccountId = (&acc_secret.public_key()).into();
+    header = advance_header(&header, total_coins);
+    let root_seq = account_seq(&entries, &root_account_id);
+    let tx = create_account_envelope(
+        &root_secret,
+        acc_id.clone(),
+        acc_balance,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let mut hashes = Vec::new();
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    header = advance_header(&header, total_coins);
+    let acc_seq = account_seq(&entries, &acc_id);
+    let cur1 = credit_asset(b"CUR1", &acc_id);
+    let tx = manage_sell_offer_envelope(
+        &acc_secret,
+        cur1,
+        Asset::Native,
+        500,
+        Price { n: 1, d: 1 },
+        base_fee,
+        acc_seq + 1,
+        &network_id,
+    );
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    header = advance_header(&header, total_coins);
+    let acc_seq = account_seq(&entries, &acc_id);
+    let mut value = vec![0u8; 64];
+    for idx in 0..64 {
+        value[idx] = idx as u8;
+    }
+    let tx = manage_data_envelope(
+        &acc_secret,
+        "test",
+        Some(value.as_slice()),
+        base_fee,
+        acc_seq + 1,
+        &network_id,
+    );
+    let (meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
+
+    assert_eq!(hashes, expected);
 }
