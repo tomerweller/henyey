@@ -436,6 +436,31 @@ impl TransactionExecutor {
         }
     }
 
+    /// Advance to a new ledger, preserving the current state.
+    /// This is useful for replaying multiple consecutive ledgers without
+    /// losing state changes between them.
+    pub fn advance_to_ledger(
+        &mut self,
+        ledger_seq: u32,
+        close_time: u64,
+        base_fee: u32,
+        base_reserve: u32,
+        protocol_version: u32,
+        id_pool: u64,
+        soroban_config: SorobanConfig,
+    ) {
+        self.ledger_seq = ledger_seq;
+        self.close_time = close_time;
+        self.base_fee = base_fee;
+        self.base_reserve = base_reserve;
+        self.protocol_version = protocol_version;
+        self.soroban_config = soroban_config;
+        self.state.set_id_pool(id_pool);
+        self.state.set_ledger_seq(ledger_seq);
+        // Note: loaded_accounts cache is preserved - this is intentional because
+        // accounts that were loaded/created in previous ledgers remain valid
+    }
+
     /// Load an account from the snapshot into the state manager.
     pub fn load_account(&mut self, snapshot: &SnapshotHandle, account_id: &AccountId) -> Result<bool> {
         // First check if the account was created/updated by a previous transaction in this ledger
@@ -875,14 +900,34 @@ impl TransactionExecutor {
         }
 
         // Compute fee using the same logic as execute_transaction_with_fee_mode
-        let required_fee =
-            base_fee as i64 * std::cmp::max(1, frame.operation_count() as i64);
+        // For fee bump transactions, the required fee includes an extra base fee for the wrapper
+        let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+        let required_fee = if frame.is_fee_bump() {
+            // Fee bumps pay baseFee * (numOps + 1) - extra charge for the fee bump wrapper
+            base_fee as i64 * (num_ops + 1)
+        } else {
+            base_fee as i64 * num_ops
+        };
         let inclusion_fee = frame.inclusion_fee();
         let fee = if frame.is_soroban() {
             frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
         } else {
             std::cmp::min(inclusion_fee, required_fee)
         };
+
+        if frame.is_fee_bump() {
+            tracing::debug!(
+                is_fee_bump = true,
+                total_fee = frame.total_fee(),
+                inner_fee = frame.inner_fee(),
+                inclusion_fee = inclusion_fee,
+                base_fee = base_fee,
+                operation_count = frame.operation_count(),
+                required_fee = required_fee,
+                fee_charged = fee,
+                "Fee bump transaction fee calculation"
+            );
+        }
 
         if fee == 0 {
             return Ok((empty_entry_changes(), 0));
@@ -1344,8 +1389,14 @@ impl TransactionExecutor {
             }
         }
 
-        let required_fee =
-            base_fee as i64 * std::cmp::max(1, frame.operation_count() as i64);
+        // For fee bump transactions, the required fee includes an extra base fee for the wrapper
+        let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+        let required_fee = if frame.is_fee_bump() {
+            // Fee bumps pay baseFee * (numOps + 1) - extra charge for the fee bump wrapper
+            base_fee as i64 * (num_ops + 1)
+        } else {
+            base_fee as i64 * num_ops
+        };
         let inclusion_fee = frame.inclusion_fee();
         let mut fee = if frame.is_soroban() {
             frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
@@ -1382,7 +1433,7 @@ impl TransactionExecutor {
         let mut fee_created = Vec::new();
         let mut fee_updated = Vec::new();
         let mut fee_deleted = Vec::new();
-        let fee_changes = if !deduct_fee || fee == 0 {
+        let mut fee_changes = if !deduct_fee || fee == 0 {
             empty_entry_changes()
         } else {
             let delta_before_fee = delta_snapshot(&self.state);
@@ -1449,11 +1500,44 @@ impl TransactionExecutor {
             let delta_after_seq = delta_snapshot(&self.state);
             let (created, updated, deleted) =
                 delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
-            tx_changes_before =
+            let seq_changes =
                 build_entry_changes_with_state(&self.state, &created, &updated, &deleted);
             seq_created = created;
             seq_updated = updated;
             seq_deleted = deleted;
+
+            // For fee bump transactions with separate fee source and deduct_fee=false
+            // (two-phase processing), include the fee source's current state in tx_changes_before.
+            // C++ stellar-core's tx_changes_before captures the fee source state at Phase 2 time
+            // (after all fees have been paid in Phase 1), as STATE/UPDATED with the same value.
+            let fee_source_changes = if !deduct_fee && frame.is_fee_bump() && fee_source_id != inner_source_id {
+                let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: fee_source_id.clone(),
+                });
+                if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
+                    vec![
+                        LedgerEntryChange::State(fee_source_entry.clone()),
+                        LedgerEntryChange::Updated(fee_source_entry),
+                    ]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            };
+
+            // Merge fee_changes and seq_changes into tx_changes_before.
+            // In C++ stellar-core, tx_changes_before captures both fee processing
+            // and sequence bump changes together. Fee changes come first.
+            // For fee bump transactions in two-phase mode, fee_source_changes come first.
+            let mut combined = Vec::with_capacity(fee_source_changes.len() + fee_changes.len() + seq_changes.len());
+            combined.extend(fee_source_changes);
+            combined.extend(fee_changes.iter().cloned());
+            combined.extend(seq_changes.iter().cloned());
+            tx_changes_before = combined.try_into().unwrap_or_default();
+
+            // Clear fee_changes since they're now merged into tx_changes_before
+            fee_changes = empty_entry_changes();
         }
         // Persist sequence updates so failed transactions still consume sequence numbers.
         if self.protocol_version >= 10 {

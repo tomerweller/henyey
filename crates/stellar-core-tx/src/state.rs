@@ -426,6 +426,11 @@ impl LedgerStateManager {
         self.ledger_seq
     }
 
+    /// Set the current ledger sequence.
+    pub fn set_ledger_seq(&mut self, ledger_seq: u32) {
+        self.ledger_seq = ledger_seq;
+    }
+
     /// Clear active sponsorship state (start of a new transaction).
     pub fn clear_sponsorship_stack(&mut self) {
         self.sponsorship_stack.clear();

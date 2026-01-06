@@ -1724,10 +1724,16 @@ async fn cmd_verify_execution(
     let mut transactions_verified = 0u32;
     let mut transactions_matched = 0u32;
     let mut transactions_mismatched = 0u32;
+    let mut phase1_fee_mismatches = 0u32;
 
     // Process ledgers from init_checkpoint+1 to end_ledger
     let process_from = init_checkpoint + 1;
     let process_from_cp = checkpoint::checkpoint_containing(process_from);
+
+    // Create the executor once and reuse across ledgers to preserve state
+    // This is critical because accounts modified in earlier ledgers (during catchup)
+    // need to reflect those changes when processing later ledgers
+    let mut executor: Option<TransactionExecutor> = None;
 
     let mut current_cp = process_from_cp;
     while current_cp <= end_checkpoint {
@@ -1833,19 +1839,34 @@ async fn cmd_verify_execution(
             // Load Soroban config from ledger state
             let soroban_config = load_soroban_config(&snapshot_handle);
 
-            // Create transaction executor
-            let mut executor = TransactionExecutor::new(
-                seq,
-                cdp_header.scp_value.close_time.0,
-                cdp_header.base_fee,
-                cdp_header.base_reserve,
-                cdp_header.ledger_version,
-                network_id.clone(),
-                cdp_header.id_pool,
-                soroban_config,
-                ClassicEventConfig::default(),
-                None, // No invariant checking for now
-            );
+            // Create or advance the transaction executor
+            // Keeping the executor across ledgers preserves state changes from earlier ledgers
+            // (e.g., account balance updates), which is critical for correct execution
+            if let Some(ref mut exec) = executor {
+                exec.advance_to_ledger(
+                    seq,
+                    cdp_header.scp_value.close_time.0,
+                    cdp_header.base_fee,
+                    cdp_header.base_reserve,
+                    cdp_header.ledger_version,
+                    cdp_header.id_pool,
+                    soroban_config,
+                );
+            } else {
+                executor = Some(TransactionExecutor::new(
+                    seq,
+                    cdp_header.scp_value.close_time.0,
+                    cdp_header.base_fee,
+                    cdp_header.base_reserve,
+                    cdp_header.ledger_version,
+                    network_id.clone(),
+                    cdp_header.id_pool,
+                    soroban_config,
+                    ClassicEventConfig::default(),
+                    None, // No invariant checking for now
+                ));
+            }
+            let executor = executor.as_mut().unwrap();
 
             // Execute each transaction and compare (using aligned envelope/result/meta)
             let mut ledger_matched = true;
@@ -1854,15 +1875,43 @@ async fn cmd_verify_execution(
             // Phase 1: Process all fees first (modifies state for all fee sources)
             // Phase 2: Apply all transactions (with deduct_fee=false since fees already processed)
 
-            // Phase 1: Process fees for all transactions
-            let mut fee_results: Vec<Result<(stellar_xdr::curr::LedgerEntryChanges, i64), _>> = Vec::new();
-            for tx_info in tx_processing.iter() {
+            // Phase 1: Process fees for all transactions and compare with CDP
+            let mut phase1_mismatches = 0;
+            for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 let fee_result = executor.process_fee_only(
                     &snapshot_handle,
                     &tx_info.envelope,
                     cdp_header.base_fee,
                 );
-                fee_results.push(fee_result);
+
+                // Compare our Phase 1 fee changes with CDP's fee_meta
+                if in_test_range {
+                    let our_fee_changes: Vec<_> = match &fee_result {
+                        Ok((changes, _fee)) => changes.iter().cloned().collect(),
+                        Err(_) => vec![],
+                    };
+                    let cdp_fee_changes: Vec<_> = tx_info.fee_meta.iter().cloned().collect();
+
+                    let (fee_matches, fee_diffs) = compare_entry_changes(&our_fee_changes, &cdp_fee_changes);
+                    if !fee_matches {
+                        phase1_mismatches += 1;
+                        if show_diff {
+                            println!("    TX {} Phase 1 FEE MISMATCH:", tx_idx);
+                            println!("      Our fee changes: {}, CDP fee changes: {}", our_fee_changes.len(), cdp_fee_changes.len());
+                            for diff in fee_diffs.iter().take(5) {
+                                println!("      - {}", diff);
+                            }
+                        }
+                    }
+                }
+
+                // Always sync with CDP's fee_meta to ensure correct state for Phase 2
+                executor.apply_ledger_entry_changes(&tx_info.fee_meta);
+            }
+
+            // Accumulate Phase 1 fee mismatches
+            if in_test_range {
+                phase1_fee_mismatches += phase1_mismatches as u32;
             }
 
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
@@ -1886,10 +1935,17 @@ async fn cmd_verify_execution(
                 );
 
                 // Check if CDP transaction succeeded
-                let cdp_succeeded = matches!(
-                    tx_info.result.result.result,
-                    stellar_xdr::curr::TransactionResultResult::TxSuccess(_)
-                );
+                // For fee bump transactions, success is TxFeeBumpInnerSuccess with inner TxSuccess
+                let cdp_succeeded = match &tx_info.result.result.result {
+                    stellar_xdr::curr::TransactionResultResult::TxSuccess(_) => true,
+                    stellar_xdr::curr::TransactionResultResult::TxFeeBumpInnerSuccess(inner) => {
+                        matches!(
+                            inner.result.result,
+                            stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(_)
+                        )
+                    }
+                    _ => false,
+                };
 
                 // Always sync state with CDP to ensure subsequent transactions see correct state.
                 // This is critical because even when both succeed, our state changes may differ
@@ -1909,12 +1965,16 @@ async fn cmd_verify_execution(
                 if in_test_range {
                     transactions_verified += 1;
 
+                    // Note: Fee bump transactions with separate fee source are now handled
+                    // directly in execution.rs, which includes the fee source's current state
+                    // in tx_changes_before when deduct_fee=false (two-phase mode).
+
                     match exec_result {
                         Ok(result) => {
                             // Deep comparison of transaction meta if both are available
                             let (meta_matches, meta_diffs) = match &result.tx_meta {
                                 Some(our_meta) => {
-                                    compare_transaction_meta(our_meta, &tx_info.meta, show_diff)
+                                    compare_transaction_meta(our_meta, &tx_info.meta, None, show_diff)
                                 }
                                 None => (false, vec!["We produced no meta but CDP has some".to_string()]),
                             };
@@ -1937,8 +1997,7 @@ async fn cmd_verify_execution(
                                     );
                                     // Show all changes for OK transactions too
                                     if let Some(our_meta) = &result.tx_meta {
-                                        let our_changes = extract_changes_from_meta(our_meta);
-                                        for (i, c) in our_changes.iter().enumerate() {
+                                        for (i, c) in extract_changes_from_meta(our_meta).iter().enumerate() {
                                             println!("        {}: {}", i, describe_change_detailed(c));
                                         }
                                     }
@@ -1964,26 +2023,27 @@ async fn cmd_verify_execution(
                                     println!("      - {}", diff);
                                 }
                                 // Print detailed changes for diagnosis
-                                if let Some(our_meta) = &result.tx_meta {
-                                    let our_changes = extract_changes_from_meta(our_meta);
-                                    let cdp_changes = extract_changes_from_meta(&tx_info.meta);
-                                    let max_len = our_changes.len().max(cdp_changes.len());
+                                let our_changes = result.tx_meta
+                                    .as_ref()
+                                    .map(|m| extract_changes_from_meta(m))
+                                    .unwrap_or_default();
+                                let cdp_changes = extract_changes_from_meta(&tx_info.meta);
+                                let max_len = our_changes.len().max(cdp_changes.len());
 
-                                    // Show side-by-side comparison with detailed values for differing entries
-                                    println!("      Changes comparison (ours={}, cdp={}):", our_changes.len(), cdp_changes.len());
-                                    for i in 0..max_len {
-                                        let our_str = our_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
-                                        let cdp_str = cdp_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
-                                        let differs = our_changes.get(i) != cdp_changes.get(i);
-                                        if differs {
-                                            println!("        {} DIFFERS:", i);
-                                            let our_detail = our_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
-                                            let cdp_detail = cdp_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
-                                            println!("          ours: {}", our_detail);
-                                            println!("          cdp:  {}", cdp_detail);
-                                        } else {
-                                            println!("        {} OK: {}", i, our_str);
-                                        }
+                                // Show side-by-side comparison with detailed values for differing entries
+                                println!("      Changes comparison (ours={}, cdp={}):", our_changes.len(), cdp_changes.len());
+                                for i in 0..max_len {
+                                    let our_str = our_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
+                                    let _cdp_str = cdp_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
+                                    let differs = our_changes.get(i) != cdp_changes.get(i);
+                                    if differs {
+                                        println!("        {} DIFFERS:", i);
+                                        let our_detail = our_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
+                                        let cdp_detail = cdp_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
+                                        println!("          ours: {}", our_detail);
+                                        println!("          cdp:  {}", cdp_detail);
+                                    } else {
+                                        println!("        {} OK: {}", i, our_str);
                                     }
                                 }
                             }
@@ -2047,12 +2107,19 @@ async fn cmd_verify_execution(
     println!("Transaction Execution Verification Complete");
     println!("  Ledgers verified: {}", ledgers_verified);
     println!("  Transactions verified: {}", transactions_verified);
-    println!("  Transactions matched: {}", transactions_matched);
-    println!("  Transactions mismatched: {}", transactions_mismatched);
+    println!("  Phase 1 fee calculations matched: {}", transactions_verified - phase1_fee_mismatches);
+    println!("  Phase 1 fee calculations mismatched: {}", phase1_fee_mismatches);
+    println!("  Phase 2 execution matched: {}", transactions_matched);
+    println!("  Phase 2 execution mismatched: {}", transactions_mismatched);
+
+    if phase1_fee_mismatches > 0 {
+        println!();
+        println!("WARNING: {} transactions had Phase 1 fee calculation differences!", phase1_fee_mismatches);
+    }
 
     if transactions_mismatched > 0 {
         println!();
-        println!("WARNING: {} transactions had execution differences!", transactions_mismatched);
+        println!("WARNING: {} transactions had Phase 2 execution differences!", transactions_mismatched);
     }
 
     Ok(())
@@ -2094,10 +2161,61 @@ fn extract_upgrade_changes(
     Ok((init_entries, live_entries, dead_entries))
 }
 
+/// Compare two lists of ledger entry changes.
+/// Returns (matches, differences) where differences contains descriptions of mismatches.
+fn compare_entry_changes(
+    our_changes: &[stellar_xdr::curr::LedgerEntryChange],
+    cdp_changes: &[stellar_xdr::curr::LedgerEntryChange],
+) -> (bool, Vec<String>) {
+    use stellar_xdr::curr::{WriteXdr, Limits};
+
+    let mut diffs = Vec::new();
+
+    // Compare the number of changes
+    if our_changes.len() != cdp_changes.len() {
+        diffs.push(format!(
+            "Change count: ours={}, cdp={}",
+            our_changes.len(),
+            cdp_changes.len()
+        ));
+    }
+
+    // Compare individual changes
+    for (i, (our, cdp)) in our_changes.iter().zip(cdp_changes.iter()).enumerate() {
+        let our_xdr = our.to_xdr(Limits::none()).unwrap_or_default();
+        let cdp_xdr = cdp.to_xdr(Limits::none()).unwrap_or_default();
+
+        if our_xdr != cdp_xdr {
+            diffs.push(format!(
+                "Change {} differs:\n        ours: {}\n        cdp:  {}",
+                i,
+                describe_change_detailed(our),
+                describe_change_detailed(cdp)
+            ));
+        }
+    }
+
+    // Report any extra changes on either side
+    if our_changes.len() > cdp_changes.len() {
+        for (i, change) in our_changes.iter().skip(cdp_changes.len()).enumerate() {
+            diffs.push(format!("Extra our change {}: {}", cdp_changes.len() + i, describe_change(change)));
+        }
+    }
+    if cdp_changes.len() > our_changes.len() {
+        for (i, change) in cdp_changes.iter().skip(our_changes.len()).enumerate() {
+            diffs.push(format!("Extra CDP change {}: {}", our_changes.len() + i, describe_change(change)));
+        }
+    }
+
+    (diffs.is_empty(), diffs)
+}
+
 /// Compare transaction meta to find differences in ledger entry changes.
+/// For fee bump transactions with separate fee source, fee_changes from Phase 1 should be prepended.
 fn compare_transaction_meta(
     our_meta: &stellar_xdr::curr::TransactionMeta,
     cdp_meta: &stellar_xdr::curr::TransactionMeta,
+    fee_changes: Option<&stellar_xdr::curr::LedgerEntryChanges>,
     show_diff: bool,
 ) -> (bool, Vec<String>) {
     use stellar_xdr::curr::{WriteXdr, Limits};
@@ -2105,7 +2223,12 @@ fn compare_transaction_meta(
     let mut diffs = Vec::new();
 
     // Extract changes from both metas
-    let our_changes = extract_changes_from_meta(our_meta);
+    // For fee bump transactions with separate fee source, prepend Phase 1 fee_changes
+    let mut our_changes = Vec::new();
+    if let Some(fc) = fee_changes {
+        our_changes.extend(fc.iter().cloned());
+    }
+    our_changes.extend(extract_changes_from_meta(our_meta));
     let cdp_changes = extract_changes_from_meta(cdp_meta);
 
     // Compare the number of changes
