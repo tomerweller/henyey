@@ -23,7 +23,7 @@ use stellar_core_tx::{
     TxError, TxEventManager,
 };
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum4, AlphaNum12, Asset,
+    AccountEntry, AccountEntryExt, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum4, AlphaNum12, Asset,
     AssetCode, ClaimableBalanceEntry, ClaimableBalanceId, ConfigSettingEntry, ConfigSettingId,
     ContractCostParams, ContractEvent, CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint,
     InflationResult, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
@@ -468,6 +468,22 @@ impl TransactionExecutor {
 
         tracing::debug!(account = ?account_id, "load_account: NOT FOUND in bucket list");
         Ok(false)
+    }
+
+    fn available_balance_for_fee(&self, account: &AccountEntry) -> Result<i64> {
+        let min_balance = self
+            .state
+            .minimum_balance_for_account(account, self.protocol_version, 0)
+            .map_err(|e| LedgerError::Internal(e.to_string()))?;
+        let mut available = account.balance - min_balance;
+        if self.protocol_version >= 10 {
+            let selling = match &account.ext {
+                AccountEntryExt::V1(v1) => v1.liabilities.selling,
+                AccountEntryExt::V0 => 0,
+            };
+            available -= selling;
+        }
+        Ok(available)
     }
 
     /// Load a trustline from the snapshot into the state manager.
@@ -1249,22 +1265,19 @@ impl TransactionExecutor {
         let required_fee =
             base_fee as i64 * std::cmp::max(1, frame.operation_count() as i64);
         let inclusion_fee = frame.inclusion_fee();
-        let fee = if frame.is_soroban() {
+        let mut fee = if frame.is_soroban() {
             frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
         } else {
             std::cmp::min(inclusion_fee, required_fee)
         };
-        if deduct_fee && fee_source_account.balance < fee {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                operation_results: vec![],
-                error: Some("Insufficient balance for fee".into()),
-                failure: Some(ExecutionFailure::InsufficientBalance),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-            });
+
+        let mut preflight_failure = None;
+        if deduct_fee {
+            if let Some(acc) = self.state.get_account(&fee_source_id) {
+                if self.available_balance_for_fee(acc)? < fee {
+                    preflight_failure = Some(ExecutionFailure::InsufficientBalance);
+                }
+            }
         }
 
         let mut tx_event_manager = TxEventManager::new(
@@ -1273,14 +1286,6 @@ impl TransactionExecutor {
             self.network_id.clone(),
             self.classic_events,
         );
-        if deduct_fee && fee != 0 {
-            tx_event_manager.new_fee_event(
-                &fee_source_id,
-                fee,
-                TransactionEventStage::BeforeAllTxs,
-            );
-        }
-
         let mut refundable_fee_tracker = if frame.is_soroban() {
             let (non_refundable_fee, _) =
                 compute_soroban_resource_fee(&frame, self.protocol_version, &self.soroban_config, 0)
@@ -1303,13 +1308,15 @@ impl TransactionExecutor {
             // Deduct fee (sequence update is handled separately for protocol >= 10).
             if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
                 let old_balance = acc.balance;
-                acc.balance -= fee;
+                let charged_fee = std::cmp::min(acc.balance, fee);
+                acc.balance -= charged_fee;
+                fee = charged_fee;
                 let key_bytes = stellar_core_tx::account_id_to_key(&fee_source_id);
                 tracing::debug!(
                     account_prefix = ?&key_bytes[0..4],
                     old_balance = old_balance,
                     new_balance = acc.balance,
-                    fee = fee,
+                    fee = charged_fee,
                     "Fee deducted from account"
                 );
             }
@@ -1422,157 +1429,162 @@ impl TransactionExecutor {
             .map(|runner| runner.snapshot());
 
         let tx_seq = frame.sequence_number();
-        for (op_index, op) in frame.operations().iter().enumerate() {
-            let op_type = OperationType::from_body(&op.body);
-            let op_source_muxed = op
-                .source_account
-                .clone()
-                .unwrap_or_else(|| frame.inner_source_account());
-            let op_delta_before = delta_snapshot(&self.state);
-            self.state.begin_op_snapshot();
+        if let Some(preflight_failure) = preflight_failure {
+            all_success = false;
+            failure = Some(preflight_failure);
+        } else {
+            for (op_index, op) in frame.operations().iter().enumerate() {
+                let op_type = OperationType::from_body(&op.body);
+                let op_source_muxed = op
+                    .source_account
+                    .clone()
+                    .unwrap_or_else(|| frame.inner_source_account());
+                let op_delta_before = delta_snapshot(&self.state);
+                self.state.begin_op_snapshot();
 
-            if !orderbook_loaded && op_requires_orderbook(&op.body) {
-                self.load_orderbook_offers(snapshot)?;
-                orderbook_loaded = true;
-            }
+                if !orderbook_loaded && op_requires_orderbook(&op.body) {
+                    self.load_orderbook_offers(snapshot)?;
+                    orderbook_loaded = true;
+                }
 
-            // Load any accounts needed for this operation
-            self.load_operation_accounts(snapshot, op, &inner_source_id)?;
+                // Load any accounts needed for this operation
+                self.load_operation_accounts(snapshot, op, &inner_source_id)?;
 
-            // Get operation source
-            let op_source = stellar_core_tx::muxed_to_account_id(&op_source_muxed);
+                // Get operation source
+                let op_source = stellar_core_tx::muxed_to_account_id(&op_source_muxed);
 
-            let pre_claimable_balance = match &op.body {
-                OperationBody::ClaimClaimableBalance(op_data) => self
-                    .state
-                    .get_claimable_balance(&op_data.balance_id)
-                    .cloned(),
-                OperationBody::ClawbackClaimableBalance(op_data) => self
-                    .state
-                    .get_claimable_balance(&op_data.balance_id)
-                    .cloned(),
-                _ => None,
-            };
-            let pre_pool = match &op.body {
-                OperationBody::LiquidityPoolDeposit(op_data) => self
-                    .state
-                    .get_liquidity_pool(&op_data.liquidity_pool_id)
-                    .cloned(),
-                OperationBody::LiquidityPoolWithdraw(op_data) => self
-                    .state
-                    .get_liquidity_pool(&op_data.liquidity_pool_id)
-                    .cloned(),
-                _ => None,
-            };
-            let mut op_event_manager = OpEventManager::new(
-                true,
-                op_type.is_soroban(),
-                self.protocol_version,
-                self.network_id.clone(),
-                frame.memo().clone(),
-                self.classic_events,
-            );
+                let pre_claimable_balance = match &op.body {
+                    OperationBody::ClaimClaimableBalance(op_data) => self
+                        .state
+                        .get_claimable_balance(&op_data.balance_id)
+                        .cloned(),
+                    OperationBody::ClawbackClaimableBalance(op_data) => self
+                        .state
+                        .get_claimable_balance(&op_data.balance_id)
+                        .cloned(),
+                    _ => None,
+                };
+                let pre_pool = match &op.body {
+                    OperationBody::LiquidityPoolDeposit(op_data) => self
+                        .state
+                        .get_liquidity_pool(&op_data.liquidity_pool_id)
+                        .cloned(),
+                    OperationBody::LiquidityPoolWithdraw(op_data) => self
+                        .state
+                        .get_liquidity_pool(&op_data.liquidity_pool_id)
+                        .cloned(),
+                    _ => None,
+                };
+                let mut op_event_manager = OpEventManager::new(
+                    true,
+                    op_type.is_soroban(),
+                    self.protocol_version,
+                    self.network_id.clone(),
+                    frame.memo().clone(),
+                    self.classic_events,
+                );
 
-            // Execute the operation
-            let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
-            let result = self.execute_single_operation(
-                op,
-                &op_source,
-                &inner_source_id,
-                tx_seq,
-                op_index,
-                &ledger_context,
-                soroban_data,
-            );
+                // Execute the operation
+                let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
+                let result = self.execute_single_operation(
+                    op,
+                    &op_source,
+                    &inner_source_id,
+                    tx_seq,
+                    op_index,
+                    &ledger_context,
+                    soroban_data,
+                );
 
-            match result {
-                Ok(op_exec) => {
-                    self.state.flush_modified_entries();
-                    let mut op_result = op_exec.result;
-                    if let Some(meta) = &op_exec.soroban_meta {
-                        if let Some(tracker) = refundable_fee_tracker.as_mut() {
-                            if !tracker.consume(
-                                &frame,
-                                self.protocol_version,
-                                &self.soroban_config,
-                                meta.event_size_bytes,
-                                meta.rent_fee,
-                            ) {
-                                op_result = insufficient_refundable_fee_result(op);
-                                all_success = false;
-                                failure = Some(ExecutionFailure::OperationFailed);
+                match result {
+                    Ok(op_exec) => {
+                        self.state.flush_modified_entries();
+                        let mut op_result = op_exec.result;
+                        if let Some(meta) = &op_exec.soroban_meta {
+                            if let Some(tracker) = refundable_fee_tracker.as_mut() {
+                                if !tracker.consume(
+                                    &frame,
+                                    self.protocol_version,
+                                    &self.soroban_config,
+                                    meta.event_size_bytes,
+                                    meta.rent_fee,
+                                ) {
+                                    op_result = insufficient_refundable_fee_result(op);
+                                    all_success = false;
+                                    failure = Some(ExecutionFailure::OperationFailed);
+                                }
                             }
                         }
+                        // Check if operation succeeded
+                        if !is_operation_success(&op_result) {
+                            all_success = false;
+                            if matches!(op_result, OperationResult::OpNotSupported) {
+                                failure = Some(ExecutionFailure::NotSupported);
+                            }
+                        }
+                        operation_results.push(op_result.clone());
+
+                        let op_delta_after = delta_snapshot(&self.state);
+                        let (created, updated, deleted) =
+                            delta_changes_between(self.state.delta(), op_delta_before, op_delta_after);
+                        let op_snapshots = self.state.end_op_snapshot();
+                        let op_changes_local = build_entry_changes_with_state_overrides(
+                            &self.state,
+                            &created,
+                            &updated,
+                            &deleted,
+                            &op_snapshots,
+                        );
+
+                        let mut op_events_final = Vec::new();
+                        if all_success && is_operation_success(&op_result) {
+                            if let Some(meta) = &op_exec.soroban_meta {
+                                op_event_manager.set_events(meta.events.clone());
+                                diagnostic_events.extend(meta.diagnostic_events.iter().cloned());
+                                soroban_return_value = meta.return_value.clone().or(soroban_return_value);
+                            }
+
+                            if !op_type.is_soroban() {
+                                emit_classic_events_for_operation(
+                                    &mut op_event_manager,
+                                    op,
+                                    &op_result,
+                                    &op_source_muxed,
+                                    &self.state,
+                                    pre_claimable_balance.as_ref(),
+                                    pre_pool.as_ref(),
+                                );
+                            }
+
+                            if op_event_manager.is_enabled() {
+                                op_events_final = op_event_manager.finalize();
+                            }
+                        }
+
+                        if let Some(runner) = self.op_invariants.as_mut() {
+                            runner.apply_and_check(&op_changes_local, &op_events_final)?;
+                        }
+
+                        if all_success {
+                            op_changes.push(op_changes_local);
+                            op_events.push(op_events_final);
+                        } else {
+                            op_changes.push(empty_entry_changes());
+                            op_events.push(Vec::new());
+                        }
                     }
-                    // Check if operation succeeded
-                    if !is_operation_success(&op_result) {
+                    Err(e) => {
+                        self.state.end_op_snapshot();
                         all_success = false;
-                        if matches!(op_result, OperationResult::OpNotSupported) {
-                            failure = Some(ExecutionFailure::NotSupported);
-                        }
-                    }
-                    operation_results.push(op_result.clone());
-
-                    let op_delta_after = delta_snapshot(&self.state);
-                    let (created, updated, deleted) =
-                        delta_changes_between(self.state.delta(), op_delta_before, op_delta_after);
-                    let op_snapshots = self.state.end_op_snapshot();
-                    let op_changes_local = build_entry_changes_with_state_overrides(
-                        &self.state,
-                        &created,
-                        &updated,
-                        &deleted,
-                        &op_snapshots,
-                    );
-
-                    let mut op_events_final = Vec::new();
-                    if all_success && is_operation_success(&op_result) {
-                        if let Some(meta) = &op_exec.soroban_meta {
-                            op_event_manager.set_events(meta.events.clone());
-                            diagnostic_events.extend(meta.diagnostic_events.iter().cloned());
-                            soroban_return_value = meta.return_value.clone().or(soroban_return_value);
-                        }
-
-                        if !op_type.is_soroban() {
-                            emit_classic_events_for_operation(
-                                &mut op_event_manager,
-                                op,
-                                &op_result,
-                                &op_source_muxed,
-                                &self.state,
-                                pre_claimable_balance.as_ref(),
-                                pre_pool.as_ref(),
-                            );
-                        }
-
-                        if op_event_manager.is_enabled() {
-                            op_events_final = op_event_manager.finalize();
-                        }
-                    }
-
-                    if let Some(runner) = self.op_invariants.as_mut() {
-                        runner.apply_and_check(&op_changes_local, &op_events_final)?;
-                    }
-
-                    if all_success {
-                        op_changes.push(op_changes_local);
-                        op_events.push(op_events_final);
-                    } else {
+                        warn!(error = %e, "Operation execution failed");
+                        operation_results.push(OperationResult::OpNotSupported);
                         op_changes.push(empty_entry_changes());
                         op_events.push(Vec::new());
+                        failure = Some(ExecutionFailure::NotSupported);
                     }
                 }
-                Err(e) => {
-                    self.state.end_op_snapshot();
-                    all_success = false;
-                    warn!(error = %e, "Operation execution failed");
-                    operation_results.push(OperationResult::OpNotSupported);
-                    op_changes.push(empty_entry_changes());
-                    op_events.push(Vec::new());
-                    failure = Some(ExecutionFailure::NotSupported);
-                }
-            }
 
+            }
         }
 
         if all_success
@@ -1737,15 +1749,6 @@ impl TransactionExecutor {
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
                     self.load_trustline(snapshot, &from_account, &tl_asset)?;
                 }
-            }
-            OperationBody::ManageData(op_data) => {
-                let key = stellar_xdr::curr::LedgerKey::Data(
-                    stellar_xdr::curr::LedgerKeyData {
-                        account_id: op_source.clone(),
-                        data_name: op_data.data_name.clone(),
-                    },
-                );
-                self.load_entry(snapshot, &key)?;
             }
             OperationBody::ManageSellOffer(op_data) => {
                 for asset in [&op_data.selling, &op_data.buying] {
@@ -2511,17 +2514,11 @@ fn build_transaction_meta(
     })
 }
 
-fn empty_transaction_meta(op_count: usize) -> TransactionMeta {
-    let mut op_changes = Vec::with_capacity(op_count);
-    let mut op_events = Vec::with_capacity(op_count);
-    for _ in 0..op_count {
-        op_changes.push(empty_entry_changes());
-        op_events.push(Vec::new());
-    }
+fn empty_transaction_meta() -> TransactionMeta {
     build_transaction_meta(
         empty_entry_changes(),
-        op_changes,
-        op_events,
+        Vec::new(),
+        Vec::new(),
         Vec::new(),
         None,
         Vec::new(),
@@ -3053,15 +3050,10 @@ pub fn execute_transaction_set_with_fee_mode(
         )?;
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
         let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result)?;
-        let op_count = if result.operation_results.is_empty() {
-            0
-        } else {
-            frame.operations().len()
-        };
         let tx_meta = result
             .tx_meta
             .clone()
-            .unwrap_or_else(|| empty_transaction_meta(op_count));
+            .unwrap_or_else(|| empty_transaction_meta());
         let fee_changes = result
             .fee_changes
             .clone()

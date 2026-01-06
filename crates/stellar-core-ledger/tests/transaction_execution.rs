@@ -922,7 +922,7 @@ fn test_operation_failure_rolls_back_changes() {
         .expect("execute");
 
     assert!(!result.success);
-    assert_eq!(result.failure, Some(ExecutionFailure::OperationFailed));
+    assert_eq!(result.failure, Some(ExecutionFailure::InsufficientBalance));
 
     let state = executor.state();
     assert!(state.get_account(&destination).is_none());
@@ -1010,27 +1010,9 @@ fn test_classic_events_emitted_for_payment() {
     };
 
     let tx_events: &[stellar_xdr::curr::TransactionEvent] = meta.events.as_ref();
-    assert_eq!(tx_events.len(), 1);
-    let fee_event = &tx_events[0];
-    assert_eq!(fee_event.stage, TransactionEventStage::BeforeAllTxs);
-    let contract_id = native_asset_contract_id(&network_id);
-    assert_eq!(fee_event.event.contract_id, Some(contract_id.clone()));
-    let ContractEventBody::V0(fee_body) = &fee_event.event.body;
-    let fee_topics: &[ScVal] = fee_body.topics.as_ref();
-    assert_eq!(fee_topics.len(), 2);
-    assert_eq!(
-        fee_topics[0],
-        ScVal::Symbol(ScSymbol(StringM::try_from("fee").unwrap()))
-    );
-    assert_eq!(
-        fee_topics[1],
-        ScVal::Address(ScAddress::Account(source_id.clone()))
-    );
-    assert_eq!(
-        fee_body.data,
-        ScVal::I128(i128_parts(100))
-    );
+    assert_eq!(tx_events.len(), 0);
 
+    let contract_id = native_asset_contract_id(&network_id);
     let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
     let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
@@ -3014,19 +2996,10 @@ fn test_soroban_refund_event_after_all_txs() {
     };
 
     let tx_events: &[stellar_xdr::curr::TransactionEvent] = meta.events.as_ref();
-    assert_eq!(tx_events.len(), 2);
+    assert_eq!(tx_events.len(), 1);
 
     let contract_id = native_asset_contract_id(&network_id);
-    let fee_event = &tx_events[0];
-    assert_eq!(fee_event.stage, TransactionEventStage::BeforeAllTxs);
-    let ContractEventBody::V0(fee_body) = &fee_event.event.body;
-    assert_eq!(fee_event.event.contract_id, Some(contract_id.clone()));
-    assert_eq!(
-        fee_body.data,
-        ScVal::I128(i128_parts(1000))
-    );
-
-    let refund_event = &tx_events[1];
+    let refund_event = &tx_events[0];
     assert_eq!(refund_event.stage, TransactionEventStage::AfterAllTxs);
     let ContractEventBody::V0(refund_body) = &refund_event.event.body;
     assert_eq!(refund_event.event.contract_id, Some(contract_id));

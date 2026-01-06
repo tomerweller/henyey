@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use stellar_core_bucket::{BucketList, BucketManager};
 use stellar_core_common::{Hash256, NetworkId};
+use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_core_db::Database;
 use stellar_core_invariant::{
     AccountSubEntriesCountIsValid, BucketListHashMatchesHeader, CloseTimeNondecreasing,
@@ -31,10 +32,44 @@ use stellar_xdr::curr::{
     ConfigSettingScpTiming, GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt,
     LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
     LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, Limits,
-    TransactionPhase, TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
+    TransactionMeta, TransactionEventStage, TransactionPhase, TransactionResultMetaV1,
+    TransactionSetV1, TxSetComponent,
     TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM, WriteXdr,
 };
 use tracing::{debug, info};
+
+fn prepend_fee_event(
+    meta: &mut TransactionMeta,
+    fee_source: &AccountId,
+    fee_charged: i64,
+    protocol_version: u32,
+    network_id: &NetworkId,
+    classic_events: ClassicEventConfig,
+) {
+    if fee_charged == 0 || !classic_events.events_enabled(protocol_version) {
+        return;
+    }
+
+    let mut manager = TxEventManager::new(true, protocol_version, network_id.clone(), classic_events);
+    manager.new_fee_event(
+        fee_source,
+        fee_charged,
+        TransactionEventStage::BeforeAllTxs,
+    );
+    let fee_events = manager.finalize();
+    if fee_events.is_empty() {
+        return;
+    }
+
+    if let TransactionMeta::V4(ref mut v4) = meta {
+        let existing_events: Vec<stellar_xdr::curr::TransactionEvent> =
+            v4.events.iter().cloned().collect();
+        let mut combined = Vec::with_capacity(fee_events.len() + existing_events.len());
+        combined.extend(fee_events);
+        combined.extend(existing_events);
+        v4.events = combined.try_into().unwrap_or_default();
+    }
+}
 
 /// Configuration for the LedgerManager.
 #[derive(Debug, Clone)]
@@ -848,7 +883,11 @@ impl<'a> LedgerCloseContext<'a> {
         let soroban_config = crate::execution::load_soroban_config(&self.snapshot);
         // Use transaction set hash as base PRNG seed for Soroban execution
         let soroban_base_prng_seed = self.close_data.tx_set_hash();
-        let (results, tx_results, tx_result_metas, id_pool) = execute_transaction_set(
+        let classic_events = ClassicEventConfig {
+            emit_classic_events: self.manager.config.emit_classic_events,
+            backfill_stellar_asset_events: self.manager.config.backfill_stellar_asset_events,
+        };
+        let (results, tx_results, mut tx_result_metas, id_pool) = execute_transaction_set(
             &self.snapshot,
             &transactions,
             self.close_data.ledger_seq,
@@ -860,12 +899,30 @@ impl<'a> LedgerCloseContext<'a> {
             &mut self.delta,
             soroban_config,
             soroban_base_prng_seed.0,
-            stellar_core_tx::ClassicEventConfig {
-                emit_classic_events: self.manager.config.emit_classic_events,
-                backfill_stellar_asset_events: self.manager.config.backfill_stellar_asset_events,
-            },
+            classic_events,
             op_invariants,
         )?;
+        if classic_events.events_enabled(self.prev_header.ledger_version) {
+            for (idx, ((envelope, _), meta)) in
+                transactions.iter().zip(tx_result_metas.iter_mut()).enumerate()
+            {
+                let fee_charged = tx_results[idx].result.fee_charged;
+                let frame = TransactionFrame::with_network(
+                    envelope.clone(),
+                    self.manager.network_id.clone(),
+                );
+                let fee_source =
+                    stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+                prepend_fee_event(
+                    &mut meta.tx_apply_processing,
+                    &fee_source,
+                    fee_charged,
+                    self.prev_header.ledger_version,
+                    &self.manager.network_id,
+                    classic_events,
+                );
+            }
+        }
         self.id_pool = id_pool;
         self.tx_results = tx_results;
         self.tx_result_metas = tx_result_metas;

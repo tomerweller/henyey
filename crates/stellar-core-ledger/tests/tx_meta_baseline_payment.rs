@@ -343,6 +343,16 @@ struct PaymentWorld {
     a1_id: AccountId,
 }
 
+struct PaymentFeeWorld {
+    entries: std::collections::HashMap<Vec<u8>, LedgerEntry>,
+    header: LedgerHeader,
+    network_id: NetworkId,
+    root_account_id: AccountId,
+    pay_from_secret: SecretKey,
+    pay_from_id: AccountId,
+    create_meta: TransactionMeta,
+}
+
 fn setup_payment_world() -> PaymentWorld {
     let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
     let root_secret = SecretKey::from_seed(network_id.as_bytes());
@@ -427,6 +437,96 @@ fn setup_payment_world() -> PaymentWorld {
         root_account_id,
         a1_id,
     }
+}
+
+fn setup_payment_fee_world(
+    base_fee: u32,
+    base_reserve: u32,
+    total_coins: i64,
+    pay_from_balance: i64,
+) -> PaymentFeeWorld {
+    let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
+    let root_secret = SecretKey::from_seed(network_id.as_bytes());
+    let root_account_id: AccountId = (&root_secret.public_key()).into();
+
+    let genesis = genesis_header(25, base_fee, base_reserve, total_coins);
+    let mut header = test_header(
+        2,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        compute_header_hash(&genesis).expect("genesis hash"),
+    );
+
+    let (root_key, root_entry) = account_entry(
+        root_account_id.clone(),
+        0,
+        total_coins,
+        header.ledger_seq - 1,
+    );
+    let mut entries = std::collections::HashMap::new();
+    entries.insert(key_bytes(&root_key), root_entry);
+
+    let pay_from_secret = secret_from_name("pay-from");
+    let pay_from_id: AccountId = (&pay_from_secret.public_key()).into();
+    let root_seq = account_seq(&entries, &root_account_id);
+    let create_tx = create_account_envelope(
+        &root_secret,
+        pay_from_id.clone(),
+        pay_from_balance,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let create_meta = execute_and_apply(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        create_tx,
+    )
+    .0;
+    header = advance_header(&header, total_coins);
+
+    PaymentFeeWorld {
+        entries,
+        header,
+        network_id,
+        root_account_id,
+        pay_from_secret,
+        pay_from_id,
+        create_meta,
+    }
+}
+
+fn run_payment_fee_case(base_fee: u32, base_reserve: u32, pay_from_balance: i64) -> Vec<u64> {
+    let total_coins = 1_000_000_000_000_000_000i64;
+    let amount = 1i64;
+
+    let mut world = setup_payment_fee_world(base_fee, base_reserve, total_coins, pay_from_balance);
+    let pay_from_seq = account_seq(&world.entries, &world.pay_from_id);
+    let payment_tx = payment_envelope(
+        &world.pay_from_secret,
+        &world.root_account_id,
+        amount,
+        base_fee,
+        pay_from_seq + 1,
+        &world.network_id,
+    );
+    let meta_payment = execute_and_apply(
+        &mut world.entries,
+        &world.header,
+        world.network_id,
+        base_fee,
+        base_reserve,
+        25,
+        payment_tx,
+    )
+    .0;
+    vec![tx_meta_hash(&world.create_meta), tx_meta_hash(&meta_payment)]
 }
 
 #[test]
@@ -539,4 +639,260 @@ fn payment_dest_amount_too_big_for_native_asset_tx_meta_matches_baseline() {
 
     let got = tx_meta_hash(&meta);
     assert_eq!(got, expected[0]);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_min_balance_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_than_base_reserve_min_balance_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_one_fee_minus_one_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount + one operation fee - one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + base_fee as i64 - 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_one_fee_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount + one operation fee",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + base_fee as i64;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_base_reserve_one_fee_minus_one_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount + one operation fee - one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + base_fee as i64 - 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_base_reserve_one_fee_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount + one operation fee",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + base_fee as i64;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_one_stroop_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount + one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_one_fee_plus_one_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount + one operation fee + one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + base_fee as i64 + 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_two_fees_minus_two_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount + two operation fees - two stroops",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 2 * base_fee as i64 - 2;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_two_fees_minus_one_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount + two operation fees - one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 2 * base_fee as i64 - 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_equal_base_reserve_two_fees_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee equal to base reserve|account has only base reserve + amount + two operation fees",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = base_reserve;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 2 * base_fee as i64;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_base_reserve_one_stroop_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount + one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_base_reserve_one_fee_plus_one_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount + one operation fee + one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + base_fee as i64 + 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_base_reserve_two_fees_minus_two_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount + two operation fees - two stroops",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 2 * base_fee as i64 - 2;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_base_reserve_two_fees_minus_one_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount + two operation fees - one stroop",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 2 * base_fee as i64 - 1;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn payment_fees_bigger_base_reserve_two_fees_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "payment fees|protocol version 25|fee bigger than base reserve|account has only base reserve + amount + two operation fees",
+    );
+    assert_eq!(expected.len(), 2);
+
+    let base_reserve = 100_000_000u32;
+    let base_fee = 200_000_000u32;
+    let min_balance0 = 2i64 * base_reserve as i64;
+    let pay_from_balance = min_balance0 + 1 + 2 * base_fee as i64;
+    let got = run_payment_fee_case(base_fee, base_reserve, pay_from_balance);
+    assert_eq!(got, expected);
 }
