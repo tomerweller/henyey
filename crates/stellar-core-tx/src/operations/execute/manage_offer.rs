@@ -1051,13 +1051,16 @@ fn offer_filter(
     passive: bool,
     max_wheat_price: &Price,
 ) -> OfferFilterResult {
-    if offer.seller_id == *source {
-        return OfferFilterResult::StopCrossSelf;
-    }
-
+    // Check price first - if offer price is worse than our limit, stop looking
+    // (offers are sorted by price, so all subsequent offers will be worse)
     let price_cmp = compare_price(&offer.price, max_wheat_price);
     if (passive && price_cmp != Ordering::Less) || (!passive && price_cmp == Ordering::Greater) {
         return OfferFilterResult::StopBadPrice;
+    }
+
+    // Only after confirming prices would cross, check if it's our own offer
+    if offer.seller_id == *source {
+        return OfferFilterResult::StopCrossSelf;
     }
 
     OfferFilterResult::Keep
