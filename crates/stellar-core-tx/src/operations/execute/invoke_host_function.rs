@@ -307,6 +307,21 @@ fn apply_soroban_storage_change(
                     state.create_ttl(ttl.clone());
                 }
             }
+            // SAC (Stellar Asset Contract) can modify Account and Trustline entries
+            stellar_xdr::curr::LedgerEntryData::Account(acc) => {
+                if state.get_account(&acc.account_id).is_some() {
+                    state.update_account(acc.clone());
+                } else {
+                    state.create_account(acc.clone());
+                }
+            }
+            stellar_xdr::curr::LedgerEntryData::Trustline(tl) => {
+                if state.get_trustline_by_trustline_asset(&tl.account_id, &tl.asset).is_some() {
+                    state.update_trustline(tl.clone());
+                } else {
+                    state.create_trustline(tl.clone());
+                }
+            }
             _ => {}
         }
 
@@ -346,6 +361,19 @@ fn apply_soroban_storage_change(
             }
             LedgerKey::Ttl(key) => {
                 state.delete_ttl(&key.key_hash);
+            }
+            // SAC can also delete Account and Trustline entries (rare but possible)
+            LedgerKey::Account(key) => {
+                state.delete_account(&key.account_id);
+            }
+            LedgerKey::Trustline(key) => {
+                if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(asset4) = &key.asset {
+                    let asset = stellar_xdr::curr::Asset::CreditAlphanum4(asset4.clone());
+                    state.delete_trustline(&key.account_id, &asset);
+                } else if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(asset12) = &key.asset {
+                    let asset = stellar_xdr::curr::Asset::CreditAlphanum12(asset12.clone());
+                    state.delete_trustline(&key.account_id, &asset);
+                }
             }
             _ => {}
         }

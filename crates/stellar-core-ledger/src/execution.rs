@@ -2733,14 +2733,24 @@ fn build_entry_changes_with_hot_archive(
         final_values.insert(key_bytes, entry.clone());
     }
 
-    // Determine ordering: for Soroban, sort by key bytes in reverse order to match C++ behavior
-    let key_order: Vec<Vec<u8>> = if footprint.is_some() {
-        // For Soroban operations, sort by serialized key bytes in reverse order
-        // C++ stellar-core uses reverse sorted iteration (descending order)
-        let mut keys: Vec<Vec<u8>> = final_values.keys().cloned().collect();
-        keys.sort();
-        keys.reverse();
-        keys
+    // Determine ordering: for Soroban, use footprint order; for classic, use first-occurrence
+    let key_order: Vec<Vec<u8>> = if let Some(fp) = footprint {
+        // For Soroban operations, use the footprint read_write order
+        // This matches how C++ stellar-core iterates over entries
+        let mut order = Vec::new();
+        for key in fp.read_write.iter() {
+            let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+            if final_values.contains_key(&key_bytes) && !order.contains(&key_bytes) {
+                order.push(key_bytes);
+            }
+        }
+        // Add any entries not in footprint (shouldn't happen, but be safe)
+        for key_bytes in final_values.keys() {
+            if !order.contains(key_bytes) {
+                order.push(key_bytes.clone());
+            }
+        }
+        order
     } else {
         // For classic operations, use first-occurrence order from delta
         let mut order = Vec::new();
@@ -2753,11 +2763,21 @@ fn build_entry_changes_with_hot_archive(
         order
     };
 
-    // Deleted entries come FIRST - also sorted in reverse order for Soroban
-    let deleted_ordered: Vec<_> = if footprint.is_some() {
-        let mut keys: Vec<_> = deleted.iter().cloned().collect();
-        keys.sort_by(|a, b| key_to_bytes(b).cmp(&key_to_bytes(a))); // Reverse order
-        keys
+    // Deleted entries come FIRST - use footprint order for Soroban
+    let deleted_ordered: Vec<_> = if let Some(fp) = footprint {
+        let mut order = Vec::new();
+        for key in fp.read_write.iter() {
+            if deleted.contains(key) && !order.contains(key) {
+                order.push(key.clone());
+            }
+        }
+        // Add any deleted entries not in footprint
+        for key in deleted {
+            if !order.contains(key) {
+                order.push(key.clone());
+            }
+        }
+        order
     } else {
         deleted.to_vec()
     };
@@ -2813,63 +2833,10 @@ fn build_entry_changes_with_hot_archive(
     }
 
     // Created entries come last
-    // For Soroban, we need to group (ContractData/Code, Ttl) pairs and sort them
-    if footprint.is_some() && !created.is_empty() {
-        // Group entries by their associated key (ContractData/Code entries with their TTLs)
-        // Then sort groups in reverse order by the main entry's key
-        let mut contract_entries: Vec<&LedgerEntry> = Vec::new();
-        let mut ttl_entries: Vec<&LedgerEntry> = Vec::new();
-
-        for entry in created {
-            match &entry.data {
-                stellar_xdr::curr::LedgerEntryData::ContractData(_)
-                | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
-                    contract_entries.push(entry);
-                }
-                stellar_xdr::curr::LedgerEntryData::Ttl(_) => {
-                    ttl_entries.push(entry);
-                }
-                _ => {
-                    // Non-Soroban entries go first
-                    changes.push(LedgerEntryChange::Created(entry.clone()));
-                }
-            }
-        }
-
-        // Sort contract entries in reverse order by key
-        contract_entries.sort_by(|a, b| {
-            let key_a = entry_key_bytes(a);
-            let key_b = entry_key_bytes(b);
-            key_b.cmp(&key_a) // Reverse order
-        });
-
-        // Build a map of key_hash -> Ttl entry for quick lookup
-        let mut ttl_map: HashMap<Vec<u8>, &LedgerEntry> = HashMap::new();
-        for ttl_entry in &ttl_entries {
-            if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &ttl_entry.data {
-                ttl_map.insert(ttl.key_hash.0.to_vec(), ttl_entry);
-            }
-        }
-
-        // Emit (ContractData/Code, Ttl) pairs in sorted order
-        for entry in contract_entries {
-            changes.push(LedgerEntryChange::Created(entry.clone()));
-            // Find and emit the corresponding TTL
-            let key_hash = compute_entry_key_hash(entry);
-            if let Some(ttl_entry) = ttl_map.remove(&key_hash) {
-                changes.push(LedgerEntryChange::Created((*ttl_entry).clone()));
-            }
-        }
-
-        // Emit any remaining TTL entries (shouldn't happen normally)
-        for (_, ttl_entry) in ttl_map {
-            changes.push(LedgerEntryChange::Created((*ttl_entry).clone()));
-        }
-    } else {
-        // Non-Soroban: preserve original order
-        for entry in created {
-            changes.push(LedgerEntryChange::Created(entry.clone()));
-        }
+    // For Soroban, preserve the original order from the host execution
+    // The host should return entries in the correct order (ContractData followed by its TTL)
+    for entry in created {
+        changes.push(LedgerEntryChange::Created(entry.clone()));
     }
 
     // Note: Order is deleted -> updated -> created to match C++ hash table iteration order.
