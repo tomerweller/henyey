@@ -240,6 +240,128 @@ pub fn extract_transaction_metas(
     }
 }
 
+/// Transaction processing info - combines envelope, result, and meta in apply order.
+#[derive(Debug, Clone)]
+pub struct TransactionProcessingInfo {
+    /// The transaction envelope
+    pub envelope: stellar_xdr::curr::TransactionEnvelope,
+    /// The transaction result
+    pub result: stellar_xdr::curr::TransactionResultPair,
+    /// The transaction metadata (ledger entry changes)
+    pub meta: stellar_xdr::curr::TransactionMeta,
+    /// Fee changes meta
+    pub fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+}
+
+/// Extract all transaction processing info in apply order from LedgerCloseMeta.
+/// This ensures envelope, result, and meta are all aligned.
+/// The network_id is needed to compute the correct transaction hash for matching.
+pub fn extract_transaction_processing(
+    meta: &LedgerCloseMeta,
+    network_id: &[u8; 32],
+) -> Vec<TransactionProcessingInfo> {
+    match meta {
+        LedgerCloseMeta::V0(v0) => {
+            // V0 has a simpler structure - tx_set.txs and tx_processing should align
+            let txs = &v0.tx_set.txs;
+            v0.tx_processing
+                .iter()
+                .enumerate()
+                .filter_map(|(i, tp)| {
+                    txs.get(i).map(|env| TransactionProcessingInfo {
+                        envelope: env.clone(),
+                        result: tp.result.clone(),
+                        meta: tp.tx_apply_processing.clone(),
+                        fee_meta: tp.fee_processing.clone(),
+                    })
+                })
+                .collect()
+        }
+        LedgerCloseMeta::V1(v1) => {
+            // V1/V2: tx_processing contains the transactions in apply order
+            // We need to get the envelopes from tx_set but match them to processing
+            // The transaction_hash uses network-aware hashing
+            let txs = extract_txs_from_generalized_set(&v1.tx_set);
+            let tx_map = build_tx_hash_map_with_network(&txs, network_id);
+
+            v1.tx_processing
+                .iter()
+                .filter_map(|tp| {
+                    let tx_hash = tp.result.transaction_hash.0;
+                    tx_map.get(&tx_hash).map(|env| TransactionProcessingInfo {
+                        envelope: env.clone(),
+                        result: tp.result.clone(),
+                        meta: tp.tx_apply_processing.clone(),
+                        fee_meta: tp.fee_processing.clone(),
+                    })
+                })
+                .collect()
+        }
+        LedgerCloseMeta::V2(v2) => {
+            let txs = extract_txs_from_generalized_set(&v2.tx_set);
+            let tx_map = build_tx_hash_map_with_network(&txs, network_id);
+
+            v2.tx_processing
+                .iter()
+                .filter_map(|tp| {
+                    let tx_hash = tp.result.transaction_hash.0;
+                    tx_map.get(&tx_hash).map(|env| TransactionProcessingInfo {
+                        envelope: env.clone(),
+                        result: tp.result.clone(),
+                        meta: tp.tx_apply_processing.clone(),
+                        fee_meta: tp.fee_processing.clone(),
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+/// Build a map from transaction hash to envelope for matching.
+/// This version uses the network-aware hash (network_id || ENVELOPE_TYPE || tx).
+pub fn build_tx_hash_map_with_network(
+    txs: &[stellar_xdr::curr::TransactionEnvelope],
+    network_id: &[u8; 32],
+) -> std::collections::HashMap<[u8; 32], stellar_xdr::curr::TransactionEnvelope> {
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{EnvelopeType, Limits, WriteXdr};
+
+    txs.iter()
+        .filter_map(|env| {
+            // Hash format: SHA256(network_id || envelope_type || transaction)
+            let mut hasher = Sha256::new();
+            hasher.update(network_id);
+
+            // Add envelope type discriminant
+            let envelope_type = match env {
+                stellar_xdr::curr::TransactionEnvelope::TxV0(_) => EnvelopeType::TxV0,
+                stellar_xdr::curr::TransactionEnvelope::Tx(_) => EnvelopeType::Tx,
+                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(_) => EnvelopeType::TxFeeBump,
+            };
+            hasher.update(&(envelope_type as i32).to_be_bytes());
+
+            // Add the transaction body (not the full envelope)
+            match env {
+                stellar_xdr::curr::TransactionEnvelope::TxV0(tx_v0) => {
+                    let tx_xdr = tx_v0.tx.to_xdr(Limits::none()).ok()?;
+                    hasher.update(&tx_xdr);
+                }
+                stellar_xdr::curr::TransactionEnvelope::Tx(tx_v1) => {
+                    let tx_xdr = tx_v1.tx.to_xdr(Limits::none()).ok()?;
+                    hasher.update(&tx_xdr);
+                }
+                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(fee_bump) => {
+                    let tx_xdr = fee_bump.tx.to_xdr(Limits::none()).ok()?;
+                    hasher.update(&tx_xdr);
+                }
+            }
+
+            let hash: [u8; 32] = hasher.finalize().into();
+            Some((hash, env.clone()))
+        })
+        .collect()
+}
+
 /// Extract ledger header from LedgerCloseMeta.
 pub fn extract_ledger_header(meta: &LedgerCloseMeta) -> stellar_xdr::curr::LedgerHeader {
     match meta {

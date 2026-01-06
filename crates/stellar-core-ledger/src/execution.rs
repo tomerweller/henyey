@@ -437,14 +437,22 @@ impl TransactionExecutor {
 
     /// Load an account from the snapshot into the state manager.
     pub fn load_account(&mut self, snapshot: &SnapshotHandle, account_id: &AccountId) -> Result<bool> {
-        let key_bytes = account_id_to_key(account_id);
-
-        // Check if already loaded
-        if self.loaded_accounts.contains_key(&key_bytes) {
-            return Ok(self.state.get_account(account_id).is_some());
+        // First check if the account was created/updated by a previous transaction in this ledger
+        // This is important for intra-ledger dependencies (e.g., TX0 creates account, TX1 uses it)
+        if self.state.get_account(account_id).is_some() {
+            tracing::trace!(account = ?account_id, "load_account: found in state");
+            return Ok(true);
         }
 
-        // Mark as loaded (even if not found)
+        let key_bytes = account_id_to_key(account_id);
+
+        // Check if we've already tried to load from snapshot
+        if self.loaded_accounts.contains_key(&key_bytes) {
+            tracing::trace!(account = ?account_id, "load_account: already tried, not found");
+            return Ok(false); // Already tried and not found
+        }
+
+        // Mark as attempted
         self.loaded_accounts.insert(key_bytes, true);
 
         // Try to load from snapshot
@@ -453,10 +461,12 @@ impl TransactionExecutor {
         });
 
         if let Some(entry) = snapshot.get_entry(&key)? {
+            tracing::trace!(account = ?account_id, "load_account: found in bucket list");
             self.state.load_entry(entry);
             return Ok(true);
         }
 
+        tracing::debug!(account = ?account_id, "load_account: NOT FOUND in bucket list");
         Ok(false)
     }
 
@@ -494,8 +504,60 @@ impl TransactionExecutor {
         snapshot: &SnapshotHandle,
         balance_id: &ClaimableBalanceId,
     ) -> Result<bool> {
+        // Check if already in state from previous transaction in this ledger
+        if self.state.get_claimable_balance(balance_id).is_some() {
+            return Ok(true);
+        }
+
         let key = stellar_xdr::curr::LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: balance_id.clone(),
+        });
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load a data entry from the snapshot into the state manager.
+    pub fn load_data(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        data_name: &str,
+    ) -> Result<bool> {
+        // Check if already in state from previous transaction in this ledger
+        if self.state.get_data(account_id, data_name).is_some() {
+            return Ok(true);
+        }
+
+        let name_bytes = stellar_xdr::curr::String64::try_from(data_name.as_bytes().to_vec())
+            .map_err(|e| LedgerError::Internal(format!("Invalid data name: {}", e)))?;
+        let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+            account_id: account_id.clone(),
+            data_name: name_bytes,
+        });
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load an offer from the snapshot into the state manager.
+    pub fn load_offer(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        seller_id: &AccountId,
+        offer_id: i64,
+    ) -> Result<bool> {
+        if self.state.get_offer(seller_id, offer_id).is_some() {
+            return Ok(true);
+        }
+
+        let key = stellar_xdr::curr::LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id,
         });
         if let Some(entry) = snapshot.get_entry(&key)? {
             self.state.load_entry(entry);
@@ -1565,6 +1627,8 @@ impl TransactionExecutor {
                     self.load_trustline(snapshot, &op_source, &tl_asset)?;
                     self.load_trustline(snapshot, &dest, &tl_asset)?;
                 }
+                // Load issuer account for non-native assets
+                self.load_asset_issuer(snapshot, &op_data.asset)?;
             }
             OperationBody::AccountMerge(dest) => {
                 let dest = stellar_core_tx::muxed_to_account_id(dest);
@@ -1608,6 +1672,10 @@ impl TransactionExecutor {
                     }
                     self.load_asset_issuer(snapshot, asset)?;
                 }
+                // Load existing offer if modifying/deleting (offer_id != 0)
+                if op_data.offer_id != 0 {
+                    self.load_offer(snapshot, &op_source, op_data.offer_id)?;
+                }
             }
             OperationBody::CreatePassiveSellOffer(op_data) => {
                 for asset in [&op_data.selling, &op_data.buying] {
@@ -1616,6 +1684,7 @@ impl TransactionExecutor {
                     }
                     self.load_asset_issuer(snapshot, asset)?;
                 }
+                // Passive sell offers always create new offers, no existing offer to load
             }
             OperationBody::ManageBuyOffer(op_data) => {
                 for asset in [&op_data.selling, &op_data.buying] {
@@ -1623,6 +1692,10 @@ impl TransactionExecutor {
                         self.load_trustline(snapshot, &op_source, &tl_asset)?;
                     }
                     self.load_asset_issuer(snapshot, asset)?;
+                }
+                // Load existing offer if modifying/deleting (offer_id != 0)
+                if op_data.offer_id != 0 {
+                    self.load_offer(snapshot, &op_source, op_data.offer_id)?;
                 }
             }
             OperationBody::PathPaymentStrictSend(op_data) => {
@@ -1662,6 +1735,64 @@ impl TransactionExecutor {
                     &op_source,
                     &op_data.liquidity_pool_id,
                 )?;
+            }
+            OperationBody::ChangeTrust(op_data) => {
+                // Load existing trustline if any
+                let tl_asset = match &op_data.line {
+                    stellar_xdr::curr::ChangeTrustAsset::Native => None,
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
+                        Some(TrustLineAsset::CreditAlphanum4(a.clone()))
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
+                        Some(TrustLineAsset::CreditAlphanum12(a.clone()))
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
+                        // Compute pool ID from params
+                        use sha2::{Digest, Sha256};
+                        let xdr = params.to_xdr(Limits::none())
+                            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
+                        Some(TrustLineAsset::PoolShare(pool_id))
+                    }
+                };
+                if let Some(ref tl_asset) = tl_asset {
+                    self.load_trustline(snapshot, &op_source, tl_asset)?;
+                }
+                // Load issuer account for non-pool-share assets
+                match &op_data.line {
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
+                        let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
+                        tracing::debug!(
+                            asset_code = %asset_code,
+                            issuer = ?a.issuer,
+                            "ChangeTrust: loading issuer for CreditAlphanum4"
+                        );
+                        self.load_account(snapshot, &a.issuer)?;
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
+                        let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
+                        tracing::debug!(
+                            asset_code = %asset_code,
+                            issuer = ?a.issuer,
+                            "ChangeTrust: loading issuer for CreditAlphanum12"
+                        );
+                        self.load_account(snapshot, &a.issuer)?;
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
+                        // Compute pool ID and load the liquidity pool
+                        use sha2::{Digest, Sha256};
+                        let xdr = params.to_xdr(Limits::none())
+                            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
+                        self.load_liquidity_pool(snapshot, &pool_id)?;
+                    }
+                    _ => {}
+                }
+            }
+            OperationBody::ManageData(op_data) => {
+                // Load existing data entry if any (needed for delete/update)
+                let data_name = String::from_utf8_lossy(op_data.data_name.as_vec()).to_string();
+                self.load_data(snapshot, &op_source, &data_name)?;
             }
             _ => {
                 // Other operations typically work on source account

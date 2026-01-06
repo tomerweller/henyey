@@ -1601,7 +1601,7 @@ async fn cmd_verify_execution(
     use stellar_core_bucket::{BucketList, BucketManager};
     use stellar_core_common::{Hash256, NetworkId};
     use stellar_core_history::{HistoryArchive, checkpoint};
-    use stellar_core_history::cdp::{CdpDataLake, extract_transaction_metas, extract_transaction_envelopes, extract_ledger_header, extract_upgrade_metas};
+    use stellar_core_history::cdp::{CdpDataLake, extract_ledger_header, extract_upgrade_metas};
     use stellar_core_history::replay::extract_ledger_changes;
     use stellar_core_ledger::{LedgerSnapshot, SnapshotHandle, LedgerError};
     use stellar_core_ledger::execution::{TransactionExecutor, load_soroban_config};
@@ -1692,6 +1692,7 @@ async fn cmd_verify_execution(
     ));
 
     println!("Initial bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
+
     println!();
 
     // Track results
@@ -1734,9 +1735,47 @@ async fn cmd_verify_execution(
             };
 
             // Extract transactions and expected results from CDP
-            let tx_envelopes = extract_transaction_envelopes(&lcm);
-            let tx_metas = extract_transaction_metas(&lcm);
             let cdp_header = extract_ledger_header(&lcm);
+
+            // Use the new function that ensures envelope/result/meta are properly aligned
+            let tx_processing = stellar_core_history::cdp::extract_transaction_processing(
+                &lcm,
+                network_id.as_bytes(),
+            );
+
+            // Validate that CDP data matches the history archive data
+            // If ledger hashes don't match, we're likely comparing data from different network epochs
+            // (e.g., testnet was reset between when CDP was captured and current archive state)
+            let _archive_header_hash = Hash256::from(header_entry.hash.0);
+            let archive_close_time = header.scp_value.close_time.0;
+            let cdp_close_time = cdp_header.scp_value.close_time.0;
+
+            tracing::debug!(
+                ledger_seq = seq,
+                archive_close_time = archive_close_time,
+                cdp_close_time = cdp_close_time,
+                archive_prev_hash = hex::encode(header.previous_ledger_hash.0),
+                cdp_prev_hash = hex::encode(cdp_header.previous_ledger_hash.0),
+                "Comparing archive vs CDP headers"
+            );
+
+            // Check both close time AND previous ledger hash - either can indicate epoch mismatch
+            let prev_hash_matches = header.previous_ledger_hash.0 == cdp_header.previous_ledger_hash.0;
+            if archive_close_time != cdp_close_time || !prev_hash_matches {
+                if in_test_range {
+                    println!("  Ledger {}: EPOCH MISMATCH - archive close_time={} vs CDP close_time={}",
+                        seq, archive_close_time, cdp_close_time);
+                    println!("    This indicates CDP data is from a different network epoch (e.g., testnet was reset)");
+                    println!("    Archive previous_ledger_hash: {}", hex::encode(header.previous_ledger_hash.0));
+                    println!("    CDP previous_ledger_hash: {}", hex::encode(cdp_header.previous_ledger_hash.0));
+                }
+                if stop_on_error {
+                    anyhow::bail!("CDP data is from a different network epoch than the history archive. \
+                        The network (likely testnet) was reset after the CDP date {}. \
+                        Use a more recent CDP date partition or switch to mainnet.", cdp_date);
+                }
+                continue;
+            }
 
             // Create snapshot handle with bucket list lookup
             let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
@@ -1771,9 +1810,9 @@ async fn cmd_verify_execution(
                 None, // No invariant checking for now
             );
 
-            // Execute each transaction and compare
+            // Execute each transaction and compare (using aligned envelope/result/meta)
             let mut ledger_matched = true;
-            for (tx_idx, tx_envelope) in tx_envelopes.iter().enumerate() {
+            for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
                 let prng_seed = {
                     let mut data = Vec::with_capacity(36);
@@ -1786,7 +1825,7 @@ async fn cmd_verify_execution(
                 // Execute the transaction
                 let exec_result = executor.execute_transaction(
                     &snapshot_handle,
-                    tx_envelope,
+                    &tx_info.envelope,
                     cdp_header.base_fee,
                     prng_seed,
                 );
@@ -1796,23 +1835,24 @@ async fn cmd_verify_execution(
 
                     match exec_result {
                         Ok(result) => {
-                            // Get expected meta from CDP
-                            let expected_meta = tx_metas.get(tx_idx);
+                            // Check if CDP shows transaction as succeeded
+                            let cdp_succeeded = matches!(
+                                tx_info.result.result.result,
+                                stellar_xdr::curr::TransactionResultResult::TxSuccess(_)
+                            );
 
                             // Deep comparison of transaction meta if both are available
-                            let (meta_matches, meta_diffs) = match (&result.tx_meta, expected_meta) {
-                                (Some(our_meta), Some(cdp_meta)) => {
-                                    compare_transaction_meta(our_meta, cdp_meta, show_diff)
+                            let (meta_matches, meta_diffs) = match &result.tx_meta {
+                                Some(our_meta) => {
+                                    compare_transaction_meta(our_meta, &tx_info.meta, show_diff)
                                 }
-                                (None, None) => (true, vec![]),
-                                (Some(_), None) => (false, vec!["We produced meta but CDP has none".to_string()]),
-                                (None, Some(_)) => (false, vec!["CDP has meta but we produced none".to_string()]),
+                                None => (false, vec!["We produced no meta but CDP has some".to_string()]),
                             };
 
-                            // Check basic success status
-                            let success_matches = result.success == expected_meta.is_some();
+                            // Check that success status matches
+                            let success_matches = result.success == cdp_succeeded;
 
-                            if meta_matches && success_matches {
+                            if success_matches && (result.success == false || meta_matches) {
                                 transactions_matched += 1;
                                 if show_diff {
                                     let change_count = result.tx_meta
@@ -1829,10 +1869,12 @@ async fn cmd_verify_execution(
                             } else {
                                 transactions_mismatched += 1;
                                 ledger_matched = false;
-                                println!("    TX {}: MISMATCH - our: {}, expected meta present: {}",
+                                let cdp_result_code = format!("{:?}", tx_info.result.result.result);
+                                println!("    TX {}: MISMATCH - our: {} vs CDP: {} (cdp_succeeded: {})",
                                     tx_idx,
                                     if result.success { "success" } else { "failed" },
-                                    expected_meta.is_some()
+                                    cdp_result_code,
+                                    cdp_succeeded
                                 );
                                 for diff in &meta_diffs {
                                     println!("      - {}", diff);
@@ -1851,6 +1893,8 @@ async fn cmd_verify_execution(
             // Apply changes to bucket list for next ledger using CDP metadata
             // This ensures subsequent ledgers have correct state for lookups
             {
+                // Extract metas from tx_processing
+                let tx_metas: Vec<_> = tx_processing.iter().map(|tp| tp.meta.clone()).collect();
                 let (init_entries, live_entries, dead_entries) = extract_ledger_changes(&tx_metas)?;
 
                 // Also process upgrade changes
@@ -1874,13 +1918,13 @@ async fn cmd_verify_execution(
             }
 
             if in_test_range {
-                if ledger_matched || tx_envelopes.is_empty() {
+                if ledger_matched || tx_processing.is_empty() {
                     println!("  Ledger {}: {} transactions - {}",
-                        seq, tx_envelopes.len(),
-                        if tx_envelopes.is_empty() { "no txs" } else { "all matched" }
+                        seq, tx_processing.len(),
+                        if tx_processing.is_empty() { "no txs" } else { "all matched" }
                     );
                 } else {
-                    println!("  Ledger {}: {} transactions - SOME MISMATCHES", seq, tx_envelopes.len());
+                    println!("  Ledger {}: {} transactions - SOME MISMATCHES", seq, tx_processing.len());
                     if stop_on_error {
                         anyhow::bail!("Stopping on first error");
                     }
