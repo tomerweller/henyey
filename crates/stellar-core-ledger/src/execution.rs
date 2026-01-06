@@ -1695,11 +1695,14 @@ impl TransactionExecutor {
                             delta_changes_between(self.state.delta(), op_delta_before, op_delta_after);
                         let op_snapshots = self.state.end_op_snapshot();
 
-                        // For Soroban operations, extract hot archive restored keys
-                        let hot_archive_keys = if op_type.is_soroban() {
-                            extract_hot_archive_restored_keys(soroban_data, op_type)
+                        // For Soroban operations, extract hot archive restored keys and footprint
+                        let (hot_archive_keys, footprint) = if op_type.is_soroban() {
+                            (
+                                extract_hot_archive_restored_keys(soroban_data, op_type),
+                                soroban_data.map(|d| &d.resources.footprint),
+                            )
                         } else {
-                            HashSet::new()
+                            (HashSet::new(), None)
                         };
 
                         let op_changes_local = build_entry_changes_with_hot_archive(
@@ -1709,6 +1712,7 @@ impl TransactionExecutor {
                             &deleted,
                             &op_snapshots,
                             &hot_archive_keys,
+                            footprint,
                         );
 
                         let mut op_events_final = Vec::new();
@@ -2295,6 +2299,19 @@ fn get_ttl_key_for_entry(key: &LedgerKey) -> Option<LedgerKey> {
     }
 }
 
+/// Compute the key hash for a Soroban entry (for matching with TTL entries).
+fn compute_entry_key_hash(entry: &LedgerEntry) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    if let Ok(key) = crate::delta::entry_to_key(entry) {
+        if let Ok(bytes) = key.to_xdr(Limits::none()) {
+            let hash = Sha256::digest(&bytes);
+            return hash.to_vec();
+        }
+    }
+    Vec::new()
+}
+
 fn emit_classic_events_for_operation(
     op_event_manager: &mut OpEventManager,
     op: &Operation,
@@ -2664,7 +2681,7 @@ fn build_entry_changes_with_state_overrides(
     deleted: &[LedgerKey],
     state_overrides: &HashMap<LedgerKey, LedgerEntry>,
 ) -> LedgerEntryChanges {
-    // Call with empty hot archive set for non-Soroban operations
+    // Call with empty hot archive set and no footprint for non-Soroban operations
     build_entry_changes_with_hot_archive(
         state,
         created,
@@ -2672,6 +2689,7 @@ fn build_entry_changes_with_state_overrides(
         deleted,
         state_overrides,
         &HashSet::new(),
+        None,
     )
 }
 
@@ -2680,6 +2698,9 @@ fn build_entry_changes_with_state_overrides(
 /// For entries in `hot_archive_restored_keys`:
 /// - Emit RESTORED instead of STATE/UPDATED (entry was restored from hot archive per CAP-0066)
 /// - For deleted entries that were restored, emit RESTORED then REMOVED
+///
+/// When `footprint` is provided (for Soroban operations), entries are ordered according to
+/// the footprint's read_write order to match C++ stellar-core behavior.
 fn build_entry_changes_with_hot_archive(
     state: &LedgerStateManager,
     created: &[LedgerEntry],
@@ -2687,6 +2708,7 @@ fn build_entry_changes_with_hot_archive(
     deleted: &[LedgerKey],
     state_overrides: &HashMap<LedgerKey, LedgerEntry>,
     hot_archive_restored_keys: &HashSet<LedgerKey>,
+    footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
 ) -> LedgerEntryChanges {
     fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
         crate::delta::entry_to_key(entry)
@@ -2695,34 +2717,58 @@ fn build_entry_changes_with_hot_archive(
             .unwrap_or_default()
     }
 
+    fn key_to_bytes(key: &LedgerKey) -> Vec<u8> {
+        key.to_xdr(Limits::none()).unwrap_or_default()
+    }
+
     let mut changes: Vec<LedgerEntryChange> = Vec::new();
 
-    // Deduplicate updated entries while preserving order of first occurrence.
+    // Deduplicate updated entries while preserving order.
     // For each unique key, emit STATE (original state) then UPDATED (final state).
-    // Track order of first occurrence and final values separately.
-    let mut key_order: Vec<Vec<u8>> = Vec::new();
     let mut final_values: HashMap<Vec<u8>, LedgerEntry> = HashMap::new();
 
     for entry in updated {
         let key_bytes = entry_key_bytes(entry);
-        if !final_values.contains_key(&key_bytes) {
-            // First occurrence - record the order
-            key_order.push(key_bytes.clone());
-        }
         // Always update to get the final value
         final_values.insert(key_bytes, entry.clone());
     }
 
-    // Deleted entries come FIRST to match C++ stellar-core hash table iteration order
-    // (for AccountMerge, the deleted source account typically comes before updated destination)
-    for key in deleted {
-        if hot_archive_restored_keys.contains(key) {
+    // Determine ordering: for Soroban, sort by key bytes in reverse order to match C++ behavior
+    let key_order: Vec<Vec<u8>> = if footprint.is_some() {
+        // For Soroban operations, sort by serialized key bytes in reverse order
+        // C++ stellar-core uses reverse sorted iteration (descending order)
+        let mut keys: Vec<Vec<u8>> = final_values.keys().cloned().collect();
+        keys.sort();
+        keys.reverse();
+        keys
+    } else {
+        // For classic operations, use first-occurrence order from delta
+        let mut order = Vec::new();
+        for entry in updated {
+            let key_bytes = entry_key_bytes(entry);
+            if !order.contains(&key_bytes) {
+                order.push(key_bytes);
+            }
+        }
+        order
+    };
+
+    // Deleted entries come FIRST - also sorted in reverse order for Soroban
+    let deleted_ordered: Vec<_> = if footprint.is_some() {
+        let mut keys: Vec<_> = deleted.iter().cloned().collect();
+        keys.sort_by(|a, b| key_to_bytes(b).cmp(&key_to_bytes(a))); // Reverse order
+        keys
+    } else {
+        deleted.to_vec()
+    };
+    for key in deleted_ordered {
+        if hot_archive_restored_keys.contains(&key) {
             // Hot archive restored entry that was then deleted:
             // Per CAP-0066: emit RESTORED (entry came from hot archive) then REMOVED
             if let Some(state_entry) = state_overrides
-                .get(key)
+                .get(&key)
                 .cloned()
-                .or_else(|| state.snapshot_entry(key))
+                .or_else(|| state.snapshot_entry(&key))
             {
                 changes.push(LedgerEntryChange::Restored(state_entry));
             }
@@ -2730,9 +2776,9 @@ fn build_entry_changes_with_hot_archive(
         } else {
             // Normal deletion: STATE then REMOVED
             if let Some(state_entry) = state_overrides
-                .get(key)
+                .get(&key)
                 .cloned()
-                .or_else(|| state.snapshot_entry(key))
+                .or_else(|| state.snapshot_entry(&key))
             {
                 changes.push(LedgerEntryChange::State(state_entry));
             }
@@ -2767,8 +2813,63 @@ fn build_entry_changes_with_hot_archive(
     }
 
     // Created entries come last
-    for entry in created {
-        changes.push(LedgerEntryChange::Created(entry.clone()));
+    // For Soroban, we need to group (ContractData/Code, Ttl) pairs and sort them
+    if footprint.is_some() && !created.is_empty() {
+        // Group entries by their associated key (ContractData/Code entries with their TTLs)
+        // Then sort groups in reverse order by the main entry's key
+        let mut contract_entries: Vec<&LedgerEntry> = Vec::new();
+        let mut ttl_entries: Vec<&LedgerEntry> = Vec::new();
+
+        for entry in created {
+            match &entry.data {
+                stellar_xdr::curr::LedgerEntryData::ContractData(_)
+                | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
+                    contract_entries.push(entry);
+                }
+                stellar_xdr::curr::LedgerEntryData::Ttl(_) => {
+                    ttl_entries.push(entry);
+                }
+                _ => {
+                    // Non-Soroban entries go first
+                    changes.push(LedgerEntryChange::Created(entry.clone()));
+                }
+            }
+        }
+
+        // Sort contract entries in reverse order by key
+        contract_entries.sort_by(|a, b| {
+            let key_a = entry_key_bytes(a);
+            let key_b = entry_key_bytes(b);
+            key_b.cmp(&key_a) // Reverse order
+        });
+
+        // Build a map of key_hash -> Ttl entry for quick lookup
+        let mut ttl_map: HashMap<Vec<u8>, &LedgerEntry> = HashMap::new();
+        for ttl_entry in &ttl_entries {
+            if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &ttl_entry.data {
+                ttl_map.insert(ttl.key_hash.0.to_vec(), ttl_entry);
+            }
+        }
+
+        // Emit (ContractData/Code, Ttl) pairs in sorted order
+        for entry in contract_entries {
+            changes.push(LedgerEntryChange::Created(entry.clone()));
+            // Find and emit the corresponding TTL
+            let key_hash = compute_entry_key_hash(entry);
+            if let Some(ttl_entry) = ttl_map.remove(&key_hash) {
+                changes.push(LedgerEntryChange::Created((*ttl_entry).clone()));
+            }
+        }
+
+        // Emit any remaining TTL entries (shouldn't happen normally)
+        for (_, ttl_entry) in ttl_map {
+            changes.push(LedgerEntryChange::Created((*ttl_entry).clone()));
+        }
+    } else {
+        // Non-Soroban: preserve original order
+        for entry in created {
+            changes.push(LedgerEntryChange::Created(entry.clone()));
+        }
     }
 
     // Note: Order is deleted -> updated -> created to match C++ hash table iteration order.
