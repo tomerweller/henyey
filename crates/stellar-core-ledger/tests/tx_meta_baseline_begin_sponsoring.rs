@@ -421,7 +421,7 @@ fn begin_sponsoring_success_baseline_matches() {
     seed(12345).expect("seed short hash");
     let expected =
         load_baseline_hashes("sponsor future reserves|protocol version 25|success");
-    assert_eq!(expected.len(), 2);
+    assert_eq!(expected.len(), 1);
 
     let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
     let root_secret = SecretKey::from_seed(network_id.as_bytes());

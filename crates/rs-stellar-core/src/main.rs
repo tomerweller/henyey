@@ -1432,7 +1432,7 @@ async fn cmd_replay_bucket_list(
     }
     println!();
 
-    let replay_config = ReplayConfig {
+    let _replay_config = ReplayConfig {
         verify_results: false,
         verify_bucket_list: true,
         verify_invariants: false,

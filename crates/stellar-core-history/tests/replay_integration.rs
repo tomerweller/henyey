@@ -21,7 +21,9 @@ use stellar_core_history::{
 use stellar_core_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
-    StellarValue, StellarValueExt, TimePoint, TransactionResultSet, TransactionSet, VecM, WriteXdr,
+    StellarValue, StellarValueExt, TimePoint, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
+    TransactionSet, VecM, WriteXdr,
 };
 use tokio::net::TcpListener;
 
@@ -30,6 +32,17 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
     encoder.write_all(data).expect("gzip write");
     encoder.finish().expect("gzip finish")
+}
+
+fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let len = u32::try_from(entry.len()).expect("entry too large");
+        let record_mark = len | 0x8000_0000;
+        out.extend_from_slice(&record_mark.to_be_bytes());
+        out.extend_from_slice(entry);
+    }
+    out
 }
 
 fn make_header(
@@ -83,6 +96,7 @@ fn empty_bucket_list() -> BucketList {
 async fn test_catchup_replay_bucket_hash_verification() {
     let checkpoint = 63u32;
     let target = 64u32;
+    let data_checkpoint = stellar_core_history::checkpoint::checkpoint_containing(target);
 
     let bucket_list = empty_bucket_list();
     let checkpoint_bucket_hash = bucket_list.hash();
@@ -140,19 +154,44 @@ async fn test_catchup_replay_bucket_hash_verification() {
         };
         let entry64 = LedgerHeaderHistoryEntry {
             hash: Hash([0u8; 32]),
+            header: header64.clone(),
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+        let entry63_xdr = entry63
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("header63 xdr");
+        let entry64_xdr = entry64
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("header64 xdr");
+        record_marked(&[entry63_xdr, entry64_xdr])
+    };
+    let headers_xdr_for_data_checkpoint = {
+        let entry64 = LedgerHeaderHistoryEntry {
+            hash: Hash([0u8; 32]),
             header: header64,
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
-        let mut bytes = entry63
+        let entry64_xdr = entry64
             .to_xdr(stellar_xdr::curr::Limits::none())
-            .expect("header63 xdr");
-        bytes.extend_from_slice(
-            &entry64
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .expect("header64 xdr"),
-        );
-        bytes
+            .expect("header64 xdr");
+        record_marked(&[entry64_xdr])
     };
+    let tx_history_entry = TransactionHistoryEntry {
+        ledger_seq: target,
+        tx_set: tx_set.clone(),
+        ext: TransactionHistoryEntryExt::V0,
+    };
+    let tx_history_xdr = record_marked(&[tx_history_entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx history xdr")]);
+    let tx_result_entry = TransactionHistoryResultEntry {
+        ledger_seq: target,
+        tx_result_set: result_set,
+        ext: TransactionHistoryResultEntryExt::default(),
+    };
+    let tx_result_xdr = record_marked(&[tx_result_entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx result history xdr")]);
 
     let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
     for _ in 0..BUCKET_LIST_LEVELS {
@@ -188,6 +227,18 @@ async fn test_catchup_replay_bucket_hash_verification() {
     fixtures.insert(
         checkpoint_path("results", checkpoint, "xdr.gz"),
         gzip_bytes(&[]),
+    );
+    fixtures.insert(
+        checkpoint_path("ledger", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&headers_xdr_for_data_checkpoint),
+    );
+    fixtures.insert(
+        checkpoint_path("transactions", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&tx_history_xdr),
+    );
+    fixtures.insert(
+        checkpoint_path("results", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&tx_result_xdr),
     );
 
     let fixtures = Arc::new(fixtures);

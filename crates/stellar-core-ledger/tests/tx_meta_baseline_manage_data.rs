@@ -526,10 +526,9 @@ fn run_manage_data_base_with_state(
     u32,
     i64,
 ) {
-    let (mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins, _gateway_secret, gateway_id) =
+    let (mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins, gateway_secret, gateway_id) =
         run_manage_data_setup_with_gateway();
     let mut hashes = Vec::new();
-    header = advance_header(&header, total_coins);
     let root_seq = account_seq(&entries, &root_account_id);
     let (meta, result) = execute_and_apply_with_result(
         &mut entries,
@@ -870,28 +869,8 @@ fn run_manage_data_too_many_subentries_case(
     num_sponsoring: u32,
     num_sponsored: u32,
 ) -> Vec<TransactionMeta> {
-    let (mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins, gateway_secret, gateway_id) =
-        run_manage_data_setup_with_gateway();
-    header = advance_header(&header, total_coins);
-    let root_seq = account_seq(&entries, &root_account_id);
-    let (_gateway_meta, result) = execute_and_apply_with_result(
-        &mut entries,
-        &header,
-        network_id,
-        base_fee,
-        base_reserve,
-        25,
-        create_account_envelope(
-            &root_secret,
-            gateway_id.clone(),
-            (2 + 3) as i64 * base_reserve as i64 - 100,
-            base_fee,
-            root_seq + 1,
-            &network_id,
-        ),
-    );
-    assert!(result.success);
-
+    let (_base_hashes, mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins) =
+        run_manage_data_base_with_state();
     header = advance_header(&header, total_coins);
     let min_balance0 = (2 + 0) as i64 * base_reserve as i64;
     let acc_secret = secret_from_name("acc1");
@@ -906,7 +885,7 @@ fn run_manage_data_too_many_subentries_case(
         root_seq + 1,
         &network_id,
     );
-    let (_create_meta, result) =
+    let (create_meta, result) =
         execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
     assert!(result.success);
 
@@ -921,7 +900,7 @@ fn run_manage_data_too_many_subentries_case(
         root_seq + 1,
         &network_id,
     );
-    let (_payment_meta, result) =
+    let (payment_meta, result) =
         execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
     assert!(result.success);
 
@@ -956,7 +935,7 @@ fn run_manage_data_too_many_subentries_case(
         acc_seq + 2,
         &network_id,
     );
-    let (meta1, result1) = execute_and_apply_with_result(
+    let (_meta1, result1) = execute_and_apply_with_result(
         &mut entries,
         &header,
         network_id,
@@ -967,7 +946,7 @@ fn run_manage_data_too_many_subentries_case(
     );
     assert!(result1.success);
 
-    let (meta2, result2) = execute_and_apply_with_result(
+    let (_meta2, result2) = execute_and_apply_with_result(
         &mut entries,
         &header,
         network_id,
@@ -983,7 +962,7 @@ fn run_manage_data_too_many_subentries_case(
         stellar_xdr::curr::OperationResult::OpTooManySubentries
     ));
 
-    vec![meta1, meta2]
+    vec![create_meta, payment_meta]
 }
 
 #[test]

@@ -33,6 +33,17 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish")
 }
 
+fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let len = u32::try_from(entry.len()).expect("entry too large");
+        let record_mark = len | 0x8000_0000;
+        out.extend_from_slice(&record_mark.to_be_bytes());
+        out.extend_from_slice(entry);
+    }
+    out
+}
+
 fn gunzip_bytes(data: &[u8]) -> Vec<u8> {
     use std::io::Read;
     let mut decoder = GzDecoder::new(data);
@@ -104,7 +115,10 @@ async fn test_history_work_chain() {
         header,
         ext: LedgerHeaderHistoryEntryExt::default(),
     };
-    let header_xdr = header_entry.to_xdr(stellar_xdr::curr::Limits::none()).expect("xdr");
+    let header_xdr_raw = header_entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("xdr");
+    let header_xdr = record_marked(&[header_xdr_raw.clone()]);
 
     let has = HistoryArchiveState {
         version: 2,
@@ -135,9 +149,10 @@ async fn test_history_work_chain() {
         tx_set,
         ext: TransactionHistoryEntryExt::default(),
     };
-    let tx_entry_xdr = tx_entry
+    let tx_entry_xdr_raw = tx_entry
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("tx entry xdr");
+    let tx_entry_xdr = record_marked(&[tx_entry_xdr_raw.clone()]);
     fixtures.insert(
         checkpoint_path("transactions", checkpoint, "xdr.gz"),
         gzip_bytes(&tx_entry_xdr),
@@ -148,9 +163,10 @@ async fn test_history_work_chain() {
         tx_result_set,
         ext: TransactionHistoryResultEntryExt::default(),
     };
-    let tx_result_entry_xdr = tx_result_entry
+    let tx_result_entry_xdr_raw = tx_result_entry
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("tx result entry xdr");
+    let tx_result_entry_xdr = record_marked(&[tx_result_entry_xdr_raw.clone()]);
     fixtures.insert(
         checkpoint_path("results", checkpoint, "xdr.gz"),
         gzip_bytes(&tx_result_entry_xdr),
@@ -163,9 +179,10 @@ async fn test_history_work_chain() {
             messages: VecM::default(),
         },
     });
-    let scp_entry_xdr = scp_entry
+    let scp_entry_xdr_raw = scp_entry
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("scp entry xdr");
+    let scp_entry_xdr = record_marked(&[scp_entry_xdr_raw.clone()]);
     fixtures.insert(
         checkpoint_path("scp", checkpoint, "xdr.gz"),
         gzip_bytes(&scp_entry_xdr),
@@ -252,14 +269,14 @@ async fn test_history_work_chain() {
     assert_eq!(gunzip_bytes(&bucket_payload), bucket_data);
 
     let headers_payload = std::fs::read(&headers_file).expect("read ledger headers");
-    assert_eq!(gunzip_bytes(&headers_payload), header_xdr);
+    assert_eq!(gunzip_bytes(&headers_payload), header_xdr_raw);
 
     let transactions_payload = std::fs::read(&transactions_file).expect("read transactions");
-    assert_eq!(gunzip_bytes(&transactions_payload), tx_entry_xdr);
+    assert_eq!(gunzip_bytes(&transactions_payload), tx_entry_xdr_raw);
 
     let results_payload = std::fs::read(&results_file).expect("read results");
-    assert_eq!(gunzip_bytes(&results_payload), tx_result_entry_xdr);
+    assert_eq!(gunzip_bytes(&results_payload), tx_result_entry_xdr_raw);
 
     let scp_payload = std::fs::read(&scp_file).expect("read scp");
-    assert_eq!(gunzip_bytes(&scp_payload), scp_entry_xdr);
+    assert_eq!(gunzip_bytes(&scp_payload), scp_entry_xdr_raw);
 }
