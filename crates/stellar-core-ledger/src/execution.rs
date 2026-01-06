@@ -33,7 +33,8 @@ use stellar_xdr::curr::{
     ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation, OperationBody,
     OperationMetaV2,
     OperationResult, OperationResultTr, PathPaymentStrictReceiveResult,
-    PathPaymentStrictSendResult, Preconditions, ScAddress, SignerKey, SorobanTransactionMetaExt,
+    PathPaymentStrictSendResult, Preconditions, ScAddress, SignerKey, SorobanTransactionData,
+    SorobanTransactionDataExt, SorobanTransactionMetaExt,
     SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
     TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultExt,
     TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset,
@@ -743,6 +744,87 @@ impl TransactionExecutor {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Clear archived entries from state before Soroban execution.
+    ///
+    /// In C++ stellar-core, archived entries (with expired TTLs) are moved to the hot archive
+    /// bucket list and are not present in the live bucket list. When a Soroban transaction
+    /// restores them, they appear as CREATED in the ledger entry changes.
+    ///
+    /// Our implementation loads all entries from checkpoint including archived ones. To match
+    /// the C++ behavior, we delete archived entries from state before executing the operation.
+    /// This way, when the Soroban host re-adds these entries, they will be recorded as CREATED
+    /// rather than UPDATED in the transaction meta.
+    fn clear_archived_entries_from_state(&mut self, soroban_data: &SorobanTransactionData) {
+        // Get archived entry indices from SorobanTransactionDataExt::V1
+        let archived_indices: HashSet<usize> =
+            if let SorobanTransactionDataExt::V1(resources_ext) = &soroban_data.ext {
+                resources_ext
+                    .archived_soroban_entries
+                    .iter()
+                    .map(|idx| *idx as usize)
+                    .collect()
+            } else {
+                return; // No archived entries to clear
+            };
+
+        if archived_indices.is_empty() {
+            return;
+        }
+
+        // For each archived entry index, get the key from the read_write footprint
+        // and delete it from state (along with its TTL)
+        for (index, key) in soroban_data.resources.footprint.read_write.iter().enumerate() {
+            if !archived_indices.contains(&index) {
+                continue;
+            }
+
+            // Delete the entry from state
+            match key {
+                LedgerKey::ContractData(cd) => {
+                    self.state.delete_contract_data(&cd.contract, &cd.key, cd.durability.clone());
+                }
+                LedgerKey::ContractCode(cc) => {
+                    self.state.delete_contract_code(&cc.hash);
+                }
+                _ => continue,
+            }
+
+            // Also delete the associated TTL entry
+            use sha2::{Digest, Sha256};
+            if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                self.state.delete_ttl(&key_hash);
+            }
+        }
+    }
+
+    /// Apply ledger entry changes to the executor's state WITHOUT delta tracking.
+    ///
+    /// This is used during verification to sync state with CDP after each transaction,
+    /// ensuring subsequent transactions see the correct state even if our validation
+    /// failed for an earlier transaction.
+    ///
+    /// Uses no-tracking methods to avoid polluting the delta for subsequent transactions.
+    pub fn apply_ledger_entry_changes(&mut self, changes: &stellar_xdr::curr::LedgerEntryChanges) {
+        use stellar_xdr::curr::LedgerEntryChange;
+
+        for change in changes.iter() {
+            match change {
+                LedgerEntryChange::Created(entry) | LedgerEntryChange::Updated(entry) | LedgerEntryChange::Restored(entry) => {
+                    // Use no-tracking method to avoid delta pollution
+                    self.state.apply_entry_no_tracking(entry);
+                }
+                LedgerEntryChange::Removed(key) => {
+                    // Use no-tracking method to avoid delta pollution
+                    self.state.delete_entry_no_tracking(key);
+                }
+                LedgerEntryChange::State(_) => {
+                    // State changes are informational only, no action needed
+                }
+            }
+        }
     }
 
     /// Execute a transaction.
@@ -1528,12 +1610,21 @@ impl TransactionExecutor {
                         let (created, updated, deleted) =
                             delta_changes_between(self.state.delta(), op_delta_before, op_delta_after);
                         let op_snapshots = self.state.end_op_snapshot();
-                        let op_changes_local = build_entry_changes_with_state_overrides(
+
+                        // For Soroban operations, extract hot archive restored keys
+                        let hot_archive_keys = if op_type.is_soroban() {
+                            extract_hot_archive_restored_keys(soroban_data, op_type)
+                        } else {
+                            HashSet::new()
+                        };
+
+                        let op_changes_local = build_entry_changes_with_hot_archive(
                             &self.state,
                             &created,
                             &updated,
                             &deleted,
                             &op_snapshots,
+                            &hot_archive_keys,
                         );
 
                         let mut op_events_final = Vec::new();
@@ -2039,6 +2130,87 @@ fn pool_reserves(pool: &LiquidityPoolEntry) -> Option<(Asset, Asset, i64, i64)> 
     }
 }
 
+/// Extract keys of entries being restored from the hot archive.
+///
+/// For InvokeHostFunction: `archived_soroban_entries` contains indices into the
+/// read_write footprint that point to entries being auto-restored from hot archive.
+///
+/// For RestoreFootprint: ALL read_write footprint entries are being restored.
+///
+/// Per CAP-0066, these entries should be emitted as RESTORED (not CREATED or STATE/UPDATED)
+/// in the transaction meta. Both the data/code entry AND its associated TTL entry are restored.
+fn extract_hot_archive_restored_keys(
+    soroban_data: Option<&SorobanTransactionData>,
+    op_type: OperationType,
+) -> HashSet<LedgerKey> {
+    let mut keys = HashSet::new();
+
+    let Some(data) = soroban_data else {
+        return keys;
+    };
+
+    // For RestoreFootprint, ALL read_write entries are being restored
+    if op_type == OperationType::RestoreFootprint {
+        for key in data.resources.footprint.read_write.iter() {
+            keys.insert(key.clone());
+            // Also add the associated TTL key
+            if let Some(ttl_key) = get_ttl_key_for_entry(key) {
+                keys.insert(ttl_key);
+            }
+        }
+        return keys;
+    }
+
+    // For InvokeHostFunction: extract archived entry indices from the extension
+    let archived_indices: Vec<u32> = match &data.ext {
+        SorobanTransactionDataExt::V1(ext) => {
+            ext.archived_soroban_entries.iter().copied().collect()
+        }
+        SorobanTransactionDataExt::V0 => Vec::new(),
+    };
+
+    if archived_indices.is_empty() {
+        return keys;
+    }
+
+    // Get the corresponding keys from the read_write footprint
+    let read_write = &data.resources.footprint.read_write;
+    for index in archived_indices {
+        if let Some(key) = read_write.get(index as usize) {
+            keys.insert(key.clone());
+            // Also add the associated TTL key if it's a persistent entry
+            if let Some(ttl_key) = get_ttl_key_for_entry(key) {
+                keys.insert(ttl_key);
+            }
+        }
+    }
+
+    keys
+}
+
+/// Get the TTL key for a persistent Soroban entry.
+fn get_ttl_key_for_entry(key: &LedgerKey) -> Option<LedgerKey> {
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{LedgerKeyTtl, Limits, WriteXdr};
+
+    match key {
+        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
+            // Compute the key hash for TTL lookup
+            if let Ok(bytes) = key.to_xdr(Limits::none()) {
+                let hash = Sha256::digest(&bytes);
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(&hash);
+                Some(LedgerKey::Ttl(LedgerKeyTtl {
+                    key_hash: stellar_xdr::curr::Hash(hash_bytes),
+                }))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn emit_classic_events_for_operation(
     op_event_manager: &mut OpEventManager,
     op: &Operation,
@@ -2408,6 +2580,30 @@ fn build_entry_changes_with_state_overrides(
     deleted: &[LedgerKey],
     state_overrides: &HashMap<LedgerKey, LedgerEntry>,
 ) -> LedgerEntryChanges {
+    // Call with empty hot archive set for non-Soroban operations
+    build_entry_changes_with_hot_archive(
+        state,
+        created,
+        updated,
+        deleted,
+        state_overrides,
+        &HashSet::new(),
+    )
+}
+
+/// Build entry changes with support for hot archive restoration tracking.
+///
+/// For entries in `hot_archive_restored_keys`:
+/// - Emit RESTORED instead of STATE/UPDATED (entry was restored from hot archive per CAP-0066)
+/// - For deleted entries that were restored, emit RESTORED then REMOVED
+fn build_entry_changes_with_hot_archive(
+    state: &LedgerStateManager,
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    deleted: &[LedgerKey],
+    state_overrides: &HashMap<LedgerKey, LedgerEntry>,
+    hot_archive_restored_keys: &HashSet<LedgerKey>,
+) -> LedgerEntryChanges {
     fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
         crate::delta::entry_to_key(entry)
             .ok()
@@ -2436,29 +2632,53 @@ fn build_entry_changes_with_state_overrides(
     // Deleted entries come FIRST to match C++ stellar-core hash table iteration order
     // (for AccountMerge, the deleted source account typically comes before updated destination)
     for key in deleted {
-        if let Some(state_entry) = state_overrides
-            .get(key)
-            .cloned()
-            .or_else(|| state.snapshot_entry(key))
-        {
-            changes.push(LedgerEntryChange::State(state_entry));
+        if hot_archive_restored_keys.contains(key) {
+            // Hot archive restored entry that was then deleted:
+            // Per CAP-0066: emit RESTORED (entry came from hot archive) then REMOVED
+            if let Some(state_entry) = state_overrides
+                .get(key)
+                .cloned()
+                .or_else(|| state.snapshot_entry(key))
+            {
+                changes.push(LedgerEntryChange::Restored(state_entry));
+            }
+            changes.push(LedgerEntryChange::Removed(key.clone()));
+        } else {
+            // Normal deletion: STATE then REMOVED
+            if let Some(state_entry) = state_overrides
+                .get(key)
+                .cloned()
+                .or_else(|| state.snapshot_entry(key))
+            {
+                changes.push(LedgerEntryChange::State(state_entry));
+            }
+            changes.push(LedgerEntryChange::Removed(key.clone()));
         }
-        changes.push(LedgerEntryChange::Removed(key.clone()));
     }
 
     // Emit updated changes in order of first occurrence
     for key_bytes in key_order {
         if let Some(final_entry) = final_values.get(&key_bytes) {
             if let Ok(key) = crate::delta::entry_to_key(final_entry) {
-                if let Some(state_entry) = state_overrides
-                    .get(&key)
-                    .cloned()
-                    .or_else(|| state.snapshot_entry(&key))
-                {
-                    changes.push(LedgerEntryChange::State(state_entry));
+                if hot_archive_restored_keys.contains(&key) {
+                    // Hot archive restored entry: per CAP-0066 emit RESTORED instead of STATE/UPDATED
+                    // The RESTORED change type indicates the entry was restored from hot archive
+                    changes.push(LedgerEntryChange::Restored(final_entry.clone()));
+                } else {
+                    // Normal update: STATE then UPDATED
+                    if let Some(state_entry) = state_overrides
+                        .get(&key)
+                        .cloned()
+                        .or_else(|| state.snapshot_entry(&key))
+                    {
+                        changes.push(LedgerEntryChange::State(state_entry));
+                    }
+                    changes.push(LedgerEntryChange::Updated(final_entry.clone()));
                 }
+            } else {
+                // Couldn't extract key - fall back to normal update
+                changes.push(LedgerEntryChange::Updated(final_entry.clone()));
             }
-            changes.push(LedgerEntryChange::Updated(final_entry.clone()));
         }
     }
 

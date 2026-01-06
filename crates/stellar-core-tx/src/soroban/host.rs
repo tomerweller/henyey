@@ -89,6 +89,11 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
             ))
         })?;
 
+        // For ContractData and ContractCode, check TTL first.
+        // If TTL has expired, the entry is considered to be in the hot archive
+        // and not accessible. This mimics C++ stellar-core behavior.
+        let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
+
         let entry = match &current_key {
             LedgerKey::Account(account_key) => {
                 self.state.get_account(&account_key.account_id).map(|acc| {
@@ -109,6 +114,12 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     })
             }
             LedgerKey::ContractData(cd_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        return Ok(None);
+                    }
+                }
                 self.state
                     .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
                     .map(|cd| LedgerEntry {
@@ -118,6 +129,12 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     })
             }
             LedgerKey::ContractCode(cc_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        return Ok(None);
+                    }
+                }
                 self.state.get_contract_code(&cc_key.hash).map(|code| {
                     LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
@@ -146,7 +163,6 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                         soroban_env_host24::xdr::ScErrorCode::InternalError,
                     ))
                 })?;
-                let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
                 Ok(Some((Rc::new(entry), live_until)))
             }
             None => Ok(None),
@@ -174,6 +190,11 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
         &self,
         key: &Rc<LedgerKey>,
     ) -> Result<Option<soroban_env_host25::storage::EntryWithLiveUntil>, HostErrorP25> {
+        // For ContractData and ContractCode, check TTL first.
+        // If TTL has expired, the entry is considered to be in the hot archive
+        // and not accessible. This mimics C++ stellar-core behavior.
+        let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
+
         let entry = match key.as_ref() {
             LedgerKey::Account(account_key) => {
                 self.state.get_account(&account_key.account_id).map(|acc| {
@@ -194,6 +215,12 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
                     })
             }
             LedgerKey::ContractData(cd_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        return Ok(None);
+                    }
+                }
                 self.state
                     .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
                     .map(|cd| LedgerEntry {
@@ -203,6 +230,12 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
                     })
             }
             LedgerKey::ContractCode(cc_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        return Ok(None);
+                    }
+                }
                 self.state.get_contract_code(&cc_key.hash).map(|code| {
                     LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
@@ -225,7 +258,6 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
 
         match entry {
             Some(e) => {
-                let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
                 Ok(Some((Rc::new(e), live_until)))
             }
             None => Ok(None),
@@ -721,8 +753,14 @@ fn execute_host_function_p24(
     let storage_changes = result.ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // Include if there's a new value or if it was modified (has old entry size)
-            if change.encoded_new_value.is_some() || change.old_entry_size_bytes_for_rent > 0 {
+            // Include entries that:
+            // 1. Have a new value (were created or modified), OR
+            // 2. Are NOT read-only and have no new value (were deleted)
+            // Skip read-only entries that weren't modified (just reads, not deletions).
+            let is_deletion = !change.read_only && change.encoded_new_value.is_none();
+            let is_modification = change.encoded_new_value.is_some();
+
+            if is_modification || is_deletion {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change.encoded_new_value.and_then(|bytes| {
                     LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
@@ -964,7 +1002,14 @@ fn execute_host_function_p25(
     let storage_changes = result.ledger_changes
         .into_iter()
         .filter_map(|change| {
-            if change.encoded_new_value.is_some() || change.old_entry_size_bytes_for_rent > 0 {
+            // Include entries that:
+            // 1. Have a new value (were created or modified), OR
+            // 2. Are NOT read-only and have no new value (were deleted)
+            // Skip read-only entries that weren't modified (just reads, not deletions).
+            let is_deletion = !change.read_only && change.encoded_new_value.is_none();
+            let is_modification = change.encoded_new_value.is_some();
+
+            if is_modification || is_deletion {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change.encoded_new_value.and_then(|bytes| {
                     LedgerEntry::from_xdr(&bytes, Limits::none()).ok()

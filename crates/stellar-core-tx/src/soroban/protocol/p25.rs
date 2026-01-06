@@ -47,6 +47,13 @@ impl<'a> LedgerSnapshotAdapter<'a> {
 
 impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
     fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        // For ContractData and ContractCode, check TTL first.
+        // If TTL has expired, the entry is considered to be in the hot archive
+        // and not accessible (unless being explicitly restored).
+        // This mimics C++ stellar-core behavior where archived entries are not
+        // in the live bucket list.
+        let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
+
         let entry = match key.as_ref() {
             LedgerKey::Account(account_key) => {
                 self.state.get_account(&account_key.account_id).map(|acc| {
@@ -67,6 +74,10 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     })
             }
             LedgerKey::ContractData(cd_key) => {
+                // NOTE: In production, entries with expired TTL would be evicted to
+                // hot archive. But in verification mode we don't run eviction, so
+                // we pass all entries to Soroban and let it handle TTL checking.
+                // The live_until value is still included for Soroban to use.
                 self.state
                     .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
                     .map(|cd| LedgerEntry {
@@ -76,6 +87,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     })
             }
             LedgerKey::ContractCode(cc_key) => {
+                // NOTE: Same as ContractData - let Soroban handle TTL checking.
                 self.state.get_contract_code(&cc_key.hash).map(|code| {
                     LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
@@ -98,7 +110,6 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 
         match entry {
             Some(e) => {
-                let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
                 Ok(Some((Rc::new(e), live_until)))
             }
             None => Ok(None),
@@ -140,6 +151,54 @@ fn compute_key_hash(key: &LedgerKey) -> Hash {
         hasher.update(&bytes);
     }
     Hash(hasher.finalize().into())
+}
+
+/// Get an entry for restoration from the hot archive, without TTL filtering.
+///
+/// This is used when an entry is being explicitly restored - we need to fetch
+/// the entry even though its TTL has expired.
+fn get_entry_for_restoration(
+    state: &LedgerStateManager,
+    key: &LedgerKey,
+    current_ledger: u32,
+) -> Result<Option<EntryWithLiveUntil>, HostError> {
+    // Get TTL (may be expired, that's expected for restoration)
+    let live_until = match key {
+        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
+            let key_hash = compute_key_hash(key);
+            state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq)
+        }
+        _ => None,
+    };
+
+    // Fetch entry from state WITHOUT filtering by TTL
+    let entry = match key {
+        LedgerKey::ContractData(cd_key) => {
+            state
+                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+                .map(|cd| LedgerEntry {
+                    last_modified_ledger_seq: current_ledger,
+                    data: LedgerEntryData::ContractData(cd.clone()),
+                    ext: LedgerEntryExt::V0,
+                })
+        }
+        LedgerKey::ContractCode(cc_key) => {
+            state.get_contract_code(&cc_key.hash).map(|code| LedgerEntry {
+                last_modified_ledger_seq: current_ledger,
+                data: LedgerEntryData::ContractCode(code.clone()),
+                ext: LedgerEntryExt::V0,
+            })
+        }
+        _ => {
+            // Restoration only applies to ContractData and ContractCode
+            return Ok(None);
+        }
+    };
+
+    match entry {
+        Some(e) => Ok(Some((Rc::new(e), live_until))),
+        None => Ok(None),
+    }
 }
 
 /// Invoke a host function using the protocol 25 soroban-env-host.
@@ -238,6 +297,25 @@ pub fn invoke_host_function(
     // Create snapshot adapter
     let snapshot = LedgerSnapshotAdapter::new(state, context.sequence);
 
+    // Extract archived entry indices for TTL restoration BEFORE collecting entries
+    // These indices point into the read_write footprint and indicate entries being restored
+    let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
+        SorobanTransactionDataExt::V1(ext) => {
+            let indices: Vec<u32> = ext.archived_soroban_entries.iter().copied().collect();
+            if !indices.is_empty() {
+                tracing::info!(
+                    indices = ?indices,
+                    rw_footprint_len = soroban_data.resources.footprint.read_write.len(),
+                    "P25: Found archived entry indices for restoration"
+                );
+            }
+            indices
+        }
+        SorobanTransactionDataExt::V0 => Vec::new(),
+    };
+    let restored_indices_set: std::collections::HashSet<u32> =
+        restored_rw_entry_indices.iter().copied().collect();
+
     // Collect and encode ledger entries from the footprint
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
@@ -273,25 +351,35 @@ pub fn invoke_host_function(
         }
     }
 
-    for key in soroban_data.resources.footprint.read_write.iter() {
-        if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
-            add_entry(key, &entry, live_until)?;
+    // For read_write entries, check if they're being restored from archive
+    for (idx, key) in soroban_data.resources.footprint.read_write.iter().enumerate() {
+        let is_being_restored = restored_indices_set.contains(&(idx as u32));
+
+        if is_being_restored {
+            // Entry is being restored from hot archive - fetch without TTL filtering
+            if let Some((entry, live_until)) = get_entry_for_restoration(state, key, context.sequence)? {
+                tracing::debug!(
+                    idx,
+                    live_until,
+                    current_ledger = context.sequence,
+                    "Fetching archived entry for restoration"
+                );
+                add_entry(key, &entry, live_until)?;
+            }
+        } else {
+            // Normal entry - use standard TTL-filtered lookup
+            if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
+                add_entry(key, &entry, live_until)?;
+            }
         }
     }
 
     tracing::debug!(
         ledger_entries_count = encoded_ledger_entries.len(),
         ttl_entries_count = encoded_ttl_entries.len(),
+        restored_count = restored_rw_entry_indices.len(),
         "P25: Prepared entries for e2e_invoke"
     );
-
-    // Extract archived entry indices for TTL restoration
-    let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
-        SorobanTransactionDataExt::V1(ext) => {
-            ext.archived_soroban_entries.iter().copied().collect()
-        }
-        SorobanTransactionDataExt::V0 => Vec::new(),
-    };
 
     // Call e2e_invoke
     let mut diagnostic_events: Vec<DiagnosticEvent> = Vec::new();

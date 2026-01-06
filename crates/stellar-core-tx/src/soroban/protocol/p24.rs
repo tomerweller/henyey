@@ -60,6 +60,13 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
             ))
         })?;
 
+        // For ContractData and ContractCode, check TTL first.
+        // If TTL has expired, the entry is considered to be in the hot archive
+        // and not accessible (unless being explicitly restored).
+        // This mimics C++ stellar-core behavior where archived entries are not
+        // in the live bucket list.
+        let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
+
         let entry = match &current_key {
             LedgerKey::Account(account_key) => {
                 self.state.get_account(&account_key.account_id).map(|acc| {
@@ -80,6 +87,13 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     })
             }
             LedgerKey::ContractData(cd_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        // Entry is archived, not in live bucket list
+                        return Ok(None);
+                    }
+                }
                 self.state
                     .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
                     .map(|cd| LedgerEntry {
@@ -89,6 +103,13 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     })
             }
             LedgerKey::ContractCode(cc_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        // Entry is archived, not in live bucket list
+                        return Ok(None);
+                    }
+                }
                 self.state.get_contract_code(&cc_key.hash).map(|code| {
                     LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
@@ -117,7 +138,6 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                         soroban_env_host_p24::xdr::ScErrorCode::InternalError,
                     ))
                 })?;
-                let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
                 Ok(Some((Rc::new(entry), live_until)))
             }
             None => Ok(None),

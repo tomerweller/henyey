@@ -894,6 +894,126 @@ impl LedgerStateManager {
         }
     }
 
+    /// Set an account entry directly without delta tracking.
+    ///
+    /// This is used during verification to sync state with CDP without
+    /// affecting the delta computation for subsequent transactions.
+    pub fn set_account_no_tracking(&mut self, entry: AccountEntry) {
+        let key = account_id_to_bytes(&entry.account_id);
+        self.accounts.insert(key, entry);
+    }
+
+    /// Apply a ledger entry directly without delta tracking.
+    ///
+    /// This is used during verification to sync state with CDP without
+    /// affecting the delta computation for subsequent transactions.
+    pub fn apply_entry_no_tracking(&mut self, entry: &stellar_xdr::curr::LedgerEntry) {
+        use stellar_xdr::curr::LedgerEntryData;
+        match &entry.data {
+            LedgerEntryData::Account(acc) => {
+                let key = account_id_to_bytes(&acc.account_id);
+                self.accounts.insert(key, acc.clone());
+            }
+            LedgerEntryData::Trustline(tl) => {
+                let account_key = account_id_to_bytes(&tl.account_id);
+                let asset_key = AssetKey::from_trustline_asset(&tl.asset);
+                let key = (account_key, asset_key);
+                self.trustlines.insert(key, tl.clone());
+            }
+            LedgerEntryData::Offer(offer) => {
+                let key = (account_id_to_bytes(&offer.seller_id), offer.offer_id);
+                self.offers.insert(key, offer.clone());
+            }
+            LedgerEntryData::Data(data) => {
+                let name = data_name_to_string(&data.data_name);
+                let key = (account_id_to_bytes(&data.account_id), name);
+                self.data_entries.insert(key, data.clone());
+            }
+            LedgerEntryData::ClaimableBalance(cb) => {
+                let key = claimable_balance_id_to_bytes(&cb.balance_id);
+                self.claimable_balances.insert(key, cb.clone());
+            }
+            LedgerEntryData::LiquidityPool(lp) => {
+                let key = pool_id_to_bytes(&lp.liquidity_pool_id);
+                self.liquidity_pools.insert(key, lp.clone());
+            }
+            LedgerEntryData::ContractData(cd) => {
+                let key = ContractDataKey::new(
+                    cd.contract.clone(),
+                    cd.key.clone(),
+                    cd.durability.clone(),
+                );
+                self.contract_data.insert(key, cd.clone());
+            }
+            LedgerEntryData::ContractCode(cc) => {
+                let key = cc.hash.0;
+                self.contract_code.insert(key, cc.clone());
+            }
+            LedgerEntryData::Ttl(ttl) => {
+                let key = ttl.key_hash.0;
+                self.ttl_entries.insert(key, ttl.clone());
+            }
+            LedgerEntryData::ConfigSetting(_) => {
+                // Config settings not tracked
+            }
+        }
+    }
+
+    /// Delete a ledger entry directly without delta tracking.
+    ///
+    /// This is used during verification to sync state with CDP without
+    /// affecting the delta computation for subsequent transactions.
+    pub fn delete_entry_no_tracking(&mut self, key: &stellar_xdr::curr::LedgerKey) {
+        use stellar_xdr::curr::LedgerKey;
+        match key {
+            LedgerKey::Account(k) => {
+                let account_key = account_id_to_bytes(&k.account_id);
+                self.accounts.remove(&account_key);
+            }
+            LedgerKey::Trustline(k) => {
+                let account_key = account_id_to_bytes(&k.account_id);
+                let asset_key = AssetKey::from_trustline_asset(&k.asset);
+                self.trustlines.remove(&(account_key, asset_key));
+            }
+            LedgerKey::Offer(k) => {
+                let offer_key = (account_id_to_bytes(&k.seller_id), k.offer_id);
+                self.offers.remove(&offer_key);
+            }
+            LedgerKey::Data(k) => {
+                let name = data_name_to_string(&k.data_name);
+                let data_key = (account_id_to_bytes(&k.account_id), name);
+                self.data_entries.remove(&data_key);
+            }
+            LedgerKey::ClaimableBalance(k) => {
+                let cb_key = claimable_balance_id_to_bytes(&k.balance_id);
+                self.claimable_balances.remove(&cb_key);
+            }
+            LedgerKey::LiquidityPool(k) => {
+                let pool_key = pool_id_to_bytes(&k.liquidity_pool_id);
+                self.liquidity_pools.remove(&pool_key);
+            }
+            LedgerKey::ContractData(k) => {
+                let cd_key = ContractDataKey::new(
+                    k.contract.clone(),
+                    k.key.clone(),
+                    k.durability.clone(),
+                );
+                self.contract_data.remove(&cd_key);
+            }
+            LedgerKey::ContractCode(k) => {
+                let code_key = k.hash.0;
+                self.contract_code.remove(&code_key);
+            }
+            LedgerKey::Ttl(k) => {
+                let ttl_key = k.key_hash.0;
+                self.ttl_entries.remove(&ttl_key);
+            }
+            LedgerKey::ConfigSetting(_) => {
+                // Config settings not tracked
+            }
+        }
+    }
+
     /// Delete an account entry.
     pub fn delete_account(&mut self, account_id: &AccountId) {
         let key = account_id_to_bytes(account_id);

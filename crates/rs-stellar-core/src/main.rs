@@ -1665,7 +1665,7 @@ async fn cmd_verify_execution(
     println!("Downloading initial state at checkpoint {}...", init_checkpoint);
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
-    // Download buckets for state lookups
+    // Download buckets for state lookups (both live and hot archive)
     let bucket_hashes: Vec<Hash256> = init_has.current_buckets
         .iter()
         .flat_map(|level| vec![
@@ -1674,7 +1674,21 @@ async fn cmd_verify_execution(
         ])
         .collect();
 
-    let all_hashes: Vec<&Hash256> = bucket_hashes.iter().filter(|h| !h.is_zero()).collect();
+    // Hot archive bucket hashes (protocol 23+)
+    let hot_archive_hashes: Option<Vec<Hash256>> = init_has.hot_archive_buckets.as_ref().map(|levels| {
+        levels.iter()
+            .flat_map(|level| vec![
+                Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+                Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+            ])
+            .collect()
+    });
+
+    // Collect all hashes to download
+    let all_hashes: Vec<&Hash256> = bucket_hashes.iter()
+        .chain(hot_archive_hashes.as_ref().map(|v| v.iter()).unwrap_or_default())
+        .filter(|h| !h.is_zero())
+        .collect();
 
     println!("Downloading {} buckets...", all_hashes.len());
     for hash in all_hashes {
@@ -1684,14 +1698,24 @@ async fn cmd_verify_execution(
         }
     }
 
-    // Restore bucket list for state lookups
+    // Restore live bucket list for state lookups
     let bucket_list = Arc::new(RwLock::new(
         BucketList::restore_from_hashes(&bucket_hashes, |hash| {
             bucket_manager.load_bucket(hash).map(|b| (*b).clone())
         })?
     ));
 
-    println!("Initial bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
+    // Restore hot archive bucket list if present (protocol 23+)
+    let hot_archive_bucket_list: Option<Arc<RwLock<BucketList>>> = hot_archive_hashes.as_ref().map(|hashes| {
+        BucketList::restore_from_hashes(hashes, |hash| {
+            bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+        })
+    }).transpose()?.map(|bl| Arc::new(RwLock::new(bl)));
+
+    println!("Initial live bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
+    if let Some(ref hot) = hot_archive_bucket_list {
+        println!("Initial hot archive hash: {}", hot.read().unwrap().hash().to_hex());
+    }
 
     println!();
 
@@ -1777,13 +1801,26 @@ async fn cmd_verify_execution(
                 continue;
             }
 
-            // Create snapshot handle with bucket list lookup
+            // Create snapshot handle with bucket list lookup (checks both live and hot archive)
             let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
+            let hot_archive_clone: Option<Arc<RwLock<BucketList>>> = hot_archive_bucket_list.clone();
             let lookup_fn: Arc<dyn Fn(&LedgerKey) -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> + Send + Sync> =
                 Arc::new(move |key: &LedgerKey| {
-                    bucket_list_clone.read().unwrap().get(key).map_err(|e| {
-                        LedgerError::Internal(format!("Bucket lookup failed: {}", e))
-                    })
+                    // First try the live bucket list
+                    if let Some(entry) = bucket_list_clone.read().unwrap().get(key).map_err(|e| {
+                        LedgerError::Internal(format!("Live bucket lookup failed: {}", e))
+                    })? {
+                        return Ok(Some(entry));
+                    }
+                    // Then try the hot archive bucket list (for archived/evicted entries)
+                    if let Some(ref hot_archive) = hot_archive_clone {
+                        if let Some(entry) = hot_archive.read().unwrap().get(key).map_err(|e| {
+                            LedgerError::Internal(format!("Hot archive bucket lookup failed: {}", e))
+                        })? {
+                            return Ok(Some(entry));
+                        }
+                    }
+                    Ok(None)
                 });
 
             let snapshot = LedgerSnapshot::new(
@@ -1848,17 +1885,32 @@ async fn cmd_verify_execution(
                     false, // deduct_fee = false - fees already processed
                 );
 
+                // Check if CDP transaction succeeded
+                let cdp_succeeded = matches!(
+                    tx_info.result.result.result,
+                    stellar_xdr::curr::TransactionResultResult::TxSuccess(_)
+                );
+
+                // Always sync state with CDP to ensure subsequent transactions see correct state.
+                // This is critical because even when both succeed, our state changes may differ
+                // from CDP's (e.g., fee calculations, refunds, or execution differences).
+                // Without syncing, these differences accumulate and cause subsequent failures.
+                let cdp_changes = extract_changes_from_meta(&tx_info.meta);
+                let cdp_changes_vec: stellar_xdr::curr::LedgerEntryChanges = cdp_changes
+                    .try_into()
+                    .unwrap_or_default();
+                executor.apply_ledger_entry_changes(&cdp_changes_vec);
+
+                let our_succeeded = match &exec_result {
+                    Ok(result) => result.success,
+                    Err(_) => false,
+                };
+
                 if in_test_range {
                     transactions_verified += 1;
 
                     match exec_result {
                         Ok(result) => {
-                            // Check if CDP shows transaction as succeeded
-                            let cdp_succeeded = matches!(
-                                tx_info.result.result.result,
-                                stellar_xdr::curr::TransactionResultResult::TxSuccess(_)
-                            );
-
                             // Deep comparison of transaction meta if both are available
                             let (meta_matches, meta_diffs) = match &result.tx_meta {
                                 Some(our_meta) => {
@@ -1901,6 +1953,13 @@ async fn cmd_verify_execution(
                                     cdp_result_code,
                                     cdp_succeeded
                                 );
+                                // Print our error message if present
+                                if let Some(err) = &result.error {
+                                    println!("      - Our error: {}", err);
+                                }
+                                if let Some(failure) = &result.failure {
+                                    println!("      - Our failure type: {:?}", failure);
+                                }
                                 for diff in &meta_diffs {
                                     println!("      - {}", diff);
                                 }
