@@ -1812,6 +1812,23 @@ async fn cmd_verify_execution(
 
             // Execute each transaction and compare (using aligned envelope/result/meta)
             let mut ledger_matched = true;
+
+            // Two-phase transaction processing matching C++ stellar-core:
+            // Phase 1: Process all fees first (modifies state for all fee sources)
+            // Phase 2: Apply all transactions (with deduct_fee=false since fees already processed)
+
+            // Phase 1: Process fees for all transactions
+            let mut fee_results: Vec<Result<(stellar_xdr::curr::LedgerEntryChanges, i64), _>> = Vec::new();
+            for tx_info in tx_processing.iter() {
+                let fee_result = executor.process_fee_only(
+                    &snapshot_handle,
+                    &tx_info.envelope,
+                    cdp_header.base_fee,
+                );
+                fee_results.push(fee_result);
+            }
+
+            // Phase 2: Apply all transactions (fees already deducted in phase 1)
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
                 let prng_seed = {
@@ -1822,12 +1839,13 @@ async fn cmd_verify_execution(
                     Some(*hash.as_bytes())
                 };
 
-                // Execute the transaction
-                let exec_result = executor.execute_transaction(
+                // Execute the transaction without fee deduction (fees processed in phase 1)
+                let exec_result = executor.execute_transaction_with_fee_mode(
                     &snapshot_handle,
                     &tx_info.envelope,
                     cdp_header.base_fee,
                     prng_seed,
+                    false, // deduct_fee = false - fees already processed
                 );
 
                 if in_test_range {
@@ -1865,6 +1883,13 @@ async fn cmd_verify_execution(
                                         result.operation_results.len(),
                                         change_count
                                     );
+                                    // Show all changes for OK transactions too
+                                    if let Some(our_meta) = &result.tx_meta {
+                                        let our_changes = extract_changes_from_meta(our_meta);
+                                        for (i, c) in our_changes.iter().enumerate() {
+                                            println!("        {}: {}", i, describe_change_detailed(c));
+                                        }
+                                    }
                                 }
                             } else {
                                 transactions_mismatched += 1;

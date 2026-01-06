@@ -751,6 +751,79 @@ impl TransactionExecutor {
         )
     }
 
+    /// Process fee for a transaction without executing it.
+    ///
+    /// This method is used for batched fee processing where all fees are
+    /// processed before any transaction is applied. This matches the behavior
+    /// of C++ stellar-core.
+    ///
+    /// Returns the fee changes and the fee amount charged.
+    pub fn process_fee_only(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+    ) -> Result<(LedgerEntryChanges, i64)> {
+        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
+        let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+        let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
+
+        // Load source accounts
+        if !self.load_account(snapshot, &fee_source_id)? {
+            return Err(LedgerError::Internal("Fee source account not found".into()));
+        }
+        if !self.load_account(snapshot, &inner_source_id)? {
+            return Err(LedgerError::Internal("Inner source account not found".into()));
+        }
+
+        // Compute fee using the same logic as execute_transaction_with_fee_mode
+        let required_fee =
+            base_fee as i64 * std::cmp::max(1, frame.operation_count() as i64);
+        let inclusion_fee = frame.inclusion_fee();
+        let fee = if frame.is_soroban() {
+            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
+        } else {
+            std::cmp::min(inclusion_fee, required_fee)
+        };
+
+        if fee == 0 {
+            return Ok((empty_entry_changes(), 0));
+        }
+
+        let delta_before_fee = delta_snapshot(&self.state);
+
+        // Deduct fee
+        if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+            acc.balance -= fee;
+        }
+
+        // For protocol < 10, sequence bump happens during fee processing
+        if self.protocol_version < 10 {
+            if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+                acc.seq_num.0 += 1;
+                stellar_core_tx::state::update_account_seq_info(
+                    acc,
+                    self.ledger_seq,
+                    self.close_time,
+                );
+            }
+        }
+
+        self.state.delta_mut().add_fee(fee);
+        self.state.flush_modified_entries();
+
+        let delta_after_fee = delta_snapshot(&self.state);
+        let (created, updated, deleted) =
+            delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
+        let fee_changes =
+            build_entry_changes_with_state(&self.state, &created, &updated, &deleted);
+
+        // Commit fee changes so they persist to subsequent transactions
+        self.state.commit();
+
+        Ok((fee_changes, fee))
+    }
+
     /// Execute a transaction with configurable fee deduction.
     ///
     /// When `deduct_fee` is false, fee validation still occurs but no fee
@@ -1229,7 +1302,16 @@ impl TransactionExecutor {
 
             // Deduct fee (sequence update is handled separately for protocol >= 10).
             if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+                let old_balance = acc.balance;
                 acc.balance -= fee;
+                let key_bytes = stellar_core_tx::account_id_to_key(&fee_source_id);
+                tracing::debug!(
+                    account_prefix = ?&key_bytes[0..4],
+                    old_balance = old_balance,
+                    new_balance = acc.balance,
+                    fee = fee,
+                    "Fee deducted from account"
+                );
             }
             if self.protocol_version < 10 {
                 if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
@@ -2348,7 +2430,20 @@ fn build_entry_changes_with_state_overrides(
         final_values.insert(key_bytes, entry.clone());
     }
 
-    // Emit changes in order of first occurrence
+    // Deleted entries come FIRST to match C++ stellar-core hash table iteration order
+    // (for AccountMerge, the deleted source account typically comes before updated destination)
+    for key in deleted {
+        if let Some(state_entry) = state_overrides
+            .get(key)
+            .cloned()
+            .or_else(|| state.snapshot_entry(key))
+        {
+            changes.push(LedgerEntryChange::State(state_entry));
+        }
+        changes.push(LedgerEntryChange::Removed(key.clone()));
+    }
+
+    // Emit updated changes in order of first occurrence
     for key_bytes in key_order {
         if let Some(final_entry) = final_values.get(&key_bytes) {
             if let Ok(key) = crate::delta::entry_to_key(final_entry) {
@@ -2364,26 +2459,12 @@ fn build_entry_changes_with_state_overrides(
         }
     }
 
-    // Created entries come AFTER updated entries to match C++ stellar-core execution order
-    // (e.g., for CreateAccount: source debit, root credit for base reserve, then new account)
+    // Created entries come last
     for entry in created {
         changes.push(LedgerEntryChange::Created(entry.clone()));
     }
 
-    for key in deleted {
-        if let Some(state_entry) = state_overrides
-            .get(key)
-            .cloned()
-            .or_else(|| state.snapshot_entry(key))
-        {
-            changes.push(LedgerEntryChange::State(state_entry));
-        }
-        changes.push(LedgerEntryChange::Removed(key.clone()));
-    }
-
-    // Note: We preserve the order changes were recorded (update order, then creation order,
-    // then delete order). This matches C++ stellar-core's behavior of emitting changes
-    // in operation execution order.
+    // Note: Order is deleted -> updated -> created to match C++ hash table iteration order.
     LedgerEntryChanges(changes.try_into().unwrap_or_default())
 }
 

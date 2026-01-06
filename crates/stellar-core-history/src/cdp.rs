@@ -264,7 +264,8 @@ pub fn extract_transaction_processing(
         LedgerCloseMeta::V0(v0) => {
             // V0 has a simpler structure - tx_set.txs and tx_processing should align
             let txs = &v0.tx_set.txs;
-            v0.tx_processing
+            let processing_count = v0.tx_processing.len();
+            let result: Vec<_> = v0.tx_processing
                 .iter()
                 .enumerate()
                 .filter_map(|(i, tp)| {
@@ -275,7 +276,15 @@ pub fn extract_transaction_processing(
                         fee_meta: tp.fee_processing.clone(),
                     })
                 })
-                .collect()
+                .collect();
+            if result.len() != processing_count {
+                tracing::warn!(
+                    processing_count = processing_count,
+                    result_count = result.len(),
+                    "Some transactions were not matched in V0 LedgerCloseMeta"
+                );
+            }
+            result
         }
         LedgerCloseMeta::V1(v1) => {
             // V1/V2: tx_processing contains the transactions in apply order
@@ -283,8 +292,9 @@ pub fn extract_transaction_processing(
             // The transaction_hash uses network-aware hashing
             let txs = extract_txs_from_generalized_set(&v1.tx_set);
             let tx_map = build_tx_hash_map_with_network(&txs, network_id);
+            let processing_count = v1.tx_processing.len();
 
-            v1.tx_processing
+            let result: Vec<_> = v1.tx_processing
                 .iter()
                 .filter_map(|tp| {
                     let tx_hash = tp.result.transaction_hash.0;
@@ -295,13 +305,23 @@ pub fn extract_transaction_processing(
                         fee_meta: tp.fee_processing.clone(),
                     })
                 })
-                .collect()
+                .collect();
+            if result.len() != processing_count {
+                tracing::warn!(
+                    processing_count = processing_count,
+                    result_count = result.len(),
+                    txs_in_set = txs.len(),
+                    "Some transactions were not matched in V1 LedgerCloseMeta"
+                );
+            }
+            result
         }
         LedgerCloseMeta::V2(v2) => {
             let txs = extract_txs_from_generalized_set(&v2.tx_set);
             let tx_map = build_tx_hash_map_with_network(&txs, network_id);
+            let processing_count = v2.tx_processing.len();
 
-            v2.tx_processing
+            let result: Vec<_> = v2.tx_processing
                 .iter()
                 .filter_map(|tp| {
                     let tx_hash = tp.result.transaction_hash.0;
@@ -312,7 +332,16 @@ pub fn extract_transaction_processing(
                         fee_meta: tp.fee_processing.clone(),
                     })
                 })
-                .collect()
+                .collect();
+            if result.len() != processing_count {
+                tracing::warn!(
+                    processing_count = processing_count,
+                    result_count = result.len(),
+                    txs_in_set = txs.len(),
+                    "Some transactions were not matched in V2 LedgerCloseMeta"
+                );
+            }
+            result
         }
     }
 }
@@ -401,7 +430,16 @@ fn extract_txs_from_generalized_set(
                             })
                             .collect::<Vec<_>>()
                     }
-                    _ => vec![],
+                    stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        // V1 phase contains parallel/Soroban transactions in execution_stages
+                        let mut txs = Vec::new();
+                        for stage in parallel.execution_stages.iter() {
+                            for cluster in stage.iter() {
+                                txs.extend(cluster.0.iter().cloned());
+                            }
+                        }
+                        txs
+                    }
                 })
                 .collect()
         }
