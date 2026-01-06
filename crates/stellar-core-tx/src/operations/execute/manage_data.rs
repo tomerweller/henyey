@@ -17,6 +17,8 @@ const MAX_DATA_NAME_LENGTH: usize = 64;
 
 /// Maximum length for data values.
 const MAX_DATA_VALUE_LENGTH: usize = 64;
+/// Maximum number of subentries per account.
+const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
 /// Execute a ManageData operation.
 ///
@@ -90,6 +92,27 @@ pub fn execute_manage_data(
                     entry.data_value = value.clone();
                 }
             } else {
+                let source_account = state
+                    .get_account(source)
+                    .ok_or(TxError::SourceAccountNotFound)?;
+
+                // Enforce subentry limits before adding the new entry.
+                let (num_sponsoring, _num_sponsored) = state
+                    .sponsorship_counts_for_account(source)
+                    .unwrap_or((0, 0));
+                if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT
+                    || source_account.num_sub_entries.saturating_add(1) > ACCOUNT_SUBENTRY_LIMIT
+                {
+                    return Ok(OperationResult::OpTooManySubentries);
+                }
+                if context.protocol_version >= 18 {
+                    let total =
+                        source_account.num_sub_entries as u64 + num_sponsoring as u64 + 1;
+                    if total > u32::MAX as u64 {
+                        return Ok(OperationResult::OpTooManySubentries);
+                    }
+                }
+
                 // Check source can afford new sub-entry
                 if let Some(sponsor) = &sponsor {
                     let sponsor_account = state
@@ -111,9 +134,6 @@ pub fn execute_manage_data(
                         return Ok(make_result(ManageDataResultCode::LowReserve));
                     }
                 } else {
-                    let source_account = state
-                        .get_account(source)
-                        .ok_or(TxError::SourceAccountNotFound)?;
                     let new_min_balance = state.minimum_balance_for_account(
                         source_account,
                         context.protocol_version,

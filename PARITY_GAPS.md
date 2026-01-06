@@ -65,6 +65,7 @@ Scope: Protocol 23+ only, SQLite only, no production hardening. Metrics parity i
 
 ### Testing Gaps
 - Upstream tx meta hash vector coverage (synthetic vectors exist; upstream baseline loader/format checks in place; create-account low-reserve + success + already-exists + not-enough-funds + native-liabilities plus txresults create-account normal + with-payment-after, manage-data base + native buying/selling liabilities, and bump-sequence baselines now match; begin-sponsoring success + precondition-v3 baselines now match; end-sponsoring not-sponsored and payment existing-account + no-destination + dest-amount-too-big baselines now match; remaining per-operation baseline hash parity tests still pending).
+- Manage-data "too many subentries" tx meta baseline hash mismatch persists after aligning gateway setup and ledger progression with upstream test setup; hashes for the successful + failed manage-data txs still diverge from upstream (needs deeper tx-meta diff vs upstream for account/op changes).
 - Classic event emission golden vectors (ledger-close-meta fixtures with EMIT_CLASSIC_EVENTS enabled).
 - Expanded per-operation regression suite for classic + Soroban edge cases (classic events now covered for payments, account merge/create, claimable balance create/claim/clawback, trustline flags, liquidity pool deposit/withdraw; remaining ops + Soroban edge cases pending).
 

@@ -680,6 +680,27 @@ impl TransactionExecutor {
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
     ) -> Result<TransactionExecutionResult> {
+        self.execute_transaction_with_fee_mode(
+            snapshot,
+            tx_envelope,
+            base_fee,
+            soroban_prng_seed,
+            true,
+        )
+    }
+
+    /// Execute a transaction with configurable fee deduction.
+    ///
+    /// When `deduct_fee` is false, fee validation still occurs but no fee
+    /// processing changes are applied to the state or delta.
+    pub fn execute_transaction_with_fee_mode(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+    ) -> Result<TransactionExecutionResult> {
         let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
         let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
@@ -1098,7 +1119,7 @@ impl TransactionExecutor {
         } else {
             std::cmp::min(inclusion_fee, required_fee)
         };
-        if fee_source_account.balance < fee {
+        if deduct_fee && fee_source_account.balance < fee {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
@@ -1117,11 +1138,13 @@ impl TransactionExecutor {
             self.network_id.clone(),
             self.classic_events,
         );
-        tx_event_manager.new_fee_event(
-            &fee_source_id,
-            fee,
-            TransactionEventStage::BeforeAllTxs,
-        );
+        if deduct_fee && fee != 0 {
+            tx_event_manager.new_fee_event(
+                &fee_source_id,
+                fee,
+                TransactionEventStage::BeforeAllTxs,
+            );
+        }
 
         let mut refundable_fee_tracker = if frame.is_soroban() {
             let (non_refundable_fee, _) =
@@ -1134,34 +1157,45 @@ impl TransactionExecutor {
             None
         };
 
-        let delta_before_fee = delta_snapshot(&self.state);
+        let mut fee_created = Vec::new();
+        let mut fee_updated = Vec::new();
+        let mut fee_deleted = Vec::new();
+        let fee_changes = if !deduct_fee || fee == 0 {
+            empty_entry_changes()
+        } else {
+            let delta_before_fee = delta_snapshot(&self.state);
 
-        // Deduct fee (sequence update is handled separately for protocol >= 10).
-        if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
-            acc.balance -= fee;
-        }
-        if self.protocol_version < 10 {
-            if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-                acc.seq_num.0 += 1;
-                stellar_core_tx::state::update_account_seq_info(
-                    acc,
-                    self.ledger_seq,
-                    self.close_time,
-                );
+            // Deduct fee (sequence update is handled separately for protocol >= 10).
+            if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+                acc.balance -= fee;
             }
-        }
-        self.state.delta_mut().add_fee(fee);
+            if self.protocol_version < 10 {
+                if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+                    acc.seq_num.0 += 1;
+                    stellar_core_tx::state::update_account_seq_info(
+                        acc,
+                        self.ledger_seq,
+                        self.close_time,
+                    );
+                }
+            }
+            self.state.delta_mut().add_fee(fee);
 
-        self.state.flush_modified_entries();
-        let delta_after_fee = delta_snapshot(&self.state);
-        let (fee_created, fee_updated, fee_deleted) =
-            delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
-        let fee_changes =
-            build_entry_changes_with_state(&self.state, &fee_created, &fee_updated, &fee_deleted);
+            self.state.flush_modified_entries();
+            let delta_after_fee = delta_snapshot(&self.state);
+            let (created, updated, deleted) =
+                delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
+            fee_created = created;
+            fee_updated = updated;
+            fee_deleted = deleted;
+            let fee_changes =
+                build_entry_changes_with_state(&self.state, &fee_created, &fee_updated, &fee_deleted);
 
-        // Fee processing happens before sequence updates in upstream. Commit here so
-        // txChangesBefore reflects the post-fee account state.
-        self.state.commit();
+            // Fee processing happens before sequence updates in upstream. Commit here so
+            // txChangesBefore reflects the post-fee account state.
+            self.state.commit();
+            fee_changes
+        };
 
         let mut tx_changes_before = empty_entry_changes();
         let mut seq_created = Vec::new();
@@ -2734,6 +2768,46 @@ pub fn execute_transaction_set(
     Vec<TransactionResultMetaV1>,
     u64,
 )> {
+    execute_transaction_set_with_fee_mode(
+        snapshot,
+        transactions,
+        ledger_seq,
+        close_time,
+        base_fee,
+        base_reserve,
+        protocol_version,
+        network_id,
+        delta,
+        soroban_config,
+        soroban_base_prng_seed,
+        classic_events,
+        op_invariants,
+        true,
+    )
+}
+
+/// Execute a full transaction set with configurable fee deduction.
+pub fn execute_transaction_set_with_fee_mode(
+    snapshot: &SnapshotHandle,
+    transactions: &[(TransactionEnvelope, Option<u32>)],
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    delta: &mut LedgerDelta,
+    soroban_config: SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    op_invariants: Option<OperationInvariantRunner>,
+    deduct_fee: bool,
+) -> Result<(
+    Vec<TransactionExecutionResult>,
+    Vec<TransactionResultPair>,
+    Vec<TransactionResultMetaV1>,
+    u64,
+)> {
     let id_pool = snapshot.header().id_pool;
     let mut executor = TransactionExecutor::new(
         ledger_seq,
@@ -2756,7 +2830,13 @@ pub fn execute_transaction_set(
         let tx_fee = tx_base_fee.unwrap_or(base_fee);
         // Compute per-transaction PRNG seed: subSha256(basePrngSeed, txIndex)
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
-        let result = executor.execute_transaction(snapshot, tx, tx_fee, Some(tx_prng_seed))?;
+        let result = executor.execute_transaction_with_fee_mode(
+            snapshot,
+            tx,
+            tx_fee,
+            Some(tx_prng_seed),
+            deduct_fee,
+        )?;
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
         let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result)?;
         let op_count = if result.operation_results.is_empty() {
@@ -2800,8 +2880,10 @@ pub fn execute_transaction_set(
     executor.apply_to_delta(snapshot, delta)?;
 
     // Add fees to fee pool
-    let total_fees = executor.total_fees();
-    delta.record_fee_pool_delta(total_fees);
+    if deduct_fee {
+        let total_fees = executor.total_fees();
+        delta.record_fee_pool_delta(total_fees);
+    }
 
     Ok((results, tx_results, tx_result_metas, executor.id_pool()))
 }

@@ -6,15 +6,17 @@ use base64::Engine;
 use stellar_core_common::{normalize_transaction_meta, Hash256, NetworkId};
 use stellar_core_crypto::{seed, xdr_compute_hash, SecretKey};
 use stellar_core_ledger::execution::execute_transaction_set;
-use stellar_core_ledger::{compute_header_hash, entry_to_key, LedgerDelta, SnapshotBuilder, SnapshotHandle};
+use stellar_core_ledger::{compute_header_hash, entry_to_key, LedgerDelta, SnapshotBuilder, SnapshotHandle, reserves};
 use stellar_core_tx::{ClassicEventConfig, soroban::SorobanConfig};
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountId, DataValue, LedgerEntry, LedgerEntryData,
-    LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyAccount, ManageDataOp, MuxedAccount,
-    Operation, OperationBody, Preconditions, SequenceNumber, Signature as XdrSignature,
+    LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyAccount, ManageDataOp,
+    MuxedAccount, Operation, OperationBody, Preconditions, SequenceNumber, Signature as XdrSignature,
     SignatureHint, String32, String64, Thresholds, TimePoint, Transaction, TransactionEnvelope,
     TransactionExt, TransactionMeta, TransactionResultMetaV1, TransactionV1Envelope, Uint256,
-    VecM, WriteXdr, Limits, Asset, PaymentOp, Price, PublicKey,
+    VecM, WriteXdr, Limits, Asset, PaymentOp, Price, PublicKey, AccountEntryExtensionV1,
+    AccountEntryExtensionV1Ext, AccountEntryExtensionV2, AccountEntryExtensionV2Ext,
+    Liabilities, SponsorshipDescriptor,
 };
 
 const GENESIS_BUCKET_LIST_HASH: [u8; 32] = hex_literal::hex!(
@@ -56,6 +58,8 @@ fn tx_meta_hash(meta: &TransactionMeta) -> u64 {
     normalize_transaction_meta(&mut meta).expect("normalize tx meta");
     xdr_compute_hash(&meta).expect("hash tx meta")
 }
+
+
 
 fn key_bytes(key: &LedgerKey) -> Vec<u8> {
     key.to_xdr(Limits::none()).unwrap_or_default()
@@ -298,6 +302,67 @@ fn credit_asset(code: &[u8; 4], issuer: &AccountId) -> Asset {
     })
 }
 
+fn update_account_subentries_and_sponsoring(
+    entries: &mut std::collections::HashMap<Vec<u8>, LedgerEntry>,
+    account_id: &AccountId,
+    num_sub_entries: u32,
+    num_sponsoring: u32,
+    num_sponsored: u32,
+    current_ledger_seq: u32,
+) {
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+    let entry = entries
+        .get_mut(&key_bytes(&key))
+        .expect("account entry");
+    entry.last_modified_ledger_seq = current_ledger_seq;
+    let LedgerEntryData::Account(account) = &mut entry.data else {
+        panic!("entry is not account");
+    };
+
+    account.num_sub_entries = num_sub_entries;
+
+    if num_sponsoring == 0 && num_sponsored == 0 {
+        return;
+    }
+
+    let (liabilities, signer_sponsoring, ext_v2_ext) = match &account.ext {
+        AccountEntryExt::V1(v1) => {
+            let signer_sponsoring = match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => v2.signer_sponsoring_i_ds.clone(),
+                AccountEntryExtensionV1Ext::V0 => {
+                    vec![SponsorshipDescriptor(None); account.signers.len()]
+                        .try_into()
+                        .unwrap_or_default()
+                }
+            };
+            let ext_v2_ext = match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => v2.ext.clone(),
+                AccountEntryExtensionV1Ext::V0 => AccountEntryExtensionV2Ext::V0,
+            };
+            (v1.liabilities.clone(), signer_sponsoring, ext_v2_ext)
+        }
+        AccountEntryExt::V0 => (
+            Liabilities { buying: 0, selling: 0 },
+            vec![SponsorshipDescriptor(None); account.signers.len()]
+                .try_into()
+                .unwrap_or_default(),
+            AccountEntryExtensionV2Ext::V0,
+        ),
+    };
+
+    account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+        liabilities,
+        ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+            num_sponsored,
+            num_sponsoring,
+            signer_sponsoring_i_ds: signer_sponsoring,
+            ext: ext_v2_ext,
+        }),
+    });
+}
+
 fn manage_data_envelope(
     source: &SecretKey,
     data_name: &str,
@@ -416,6 +481,26 @@ fn account_seq(
     }
 }
 
+fn account_available_balance(
+    entries: &std::collections::HashMap<Vec<u8>, LedgerEntry>,
+    account_id: &AccountId,
+    base_reserve: u32,
+) -> i64 {
+    let entry = entries
+        .get(&key_bytes(&LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        })))
+        .expect("account entry");
+    let LedgerEntryData::Account(account) = &entry.data else {
+        panic!("entry is not account");
+    };
+    let selling_liabilities = match &account.ext {
+        AccountEntryExt::V0 => 0,
+        AccountEntryExt::V1(v1) => v1.liabilities.selling,
+    };
+    account.balance - reserves::minimum_balance(account, base_reserve) - selling_liabilities
+}
+
 fn data_entry_exists(
     entries: &std::collections::HashMap<Vec<u8>, LedgerEntry>,
     account_id: &AccountId,
@@ -441,48 +526,27 @@ fn run_manage_data_base_with_state(
     u32,
     i64,
 ) {
-    let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
-    let root_secret = SecretKey::from_seed(network_id.as_bytes());
-    let root_account_id: AccountId = (&root_secret.public_key()).into();
-
-    let base_fee = 100u32;
-    let base_reserve = 100_000_000u32;
-    let total_coins = 1_000_000_000_000_000_000i64;
-    let min_balance = (2 + 3) as i64 * base_reserve as i64 - 100;
-
-    let genesis = genesis_header(25, base_fee, base_reserve, total_coins);
-    let mut header = test_header(
-        2,
-        25,
+    let (mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins, _gateway_secret, gateway_id) =
+        run_manage_data_setup_with_gateway();
+    let mut hashes = Vec::new();
+    header = advance_header(&header, total_coins);
+    let root_seq = account_seq(&entries, &root_account_id);
+    let (meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
         base_fee,
         base_reserve,
-        total_coins,
-        compute_header_hash(&genesis).expect("genesis hash"),
+        25,
+        create_account_envelope(
+            &root_secret,
+            gateway_id.clone(),
+            (2 + 3) as i64 * base_reserve as i64 - 100,
+            base_fee,
+            root_seq + 1,
+            &network_id,
+        ),
     );
-
-    let (root_key, root_entry) = account_entry(
-        root_account_id.clone(),
-        0,
-        total_coins,
-        header.ledger_seq - 1,
-    );
-    let mut entries = std::collections::HashMap::new();
-    entries.insert(key_bytes(&root_key), root_entry);
-
-    let gateway_secret = secret_from_name("gw");
-    let gateway_id: AccountId = (&gateway_secret.public_key()).into();
-    let root_seq = account_seq(&entries, &root_account_id);
-    let tx = create_account_envelope(
-        &root_secret,
-        gateway_id.clone(),
-        min_balance,
-        base_fee,
-        root_seq + 1,
-        &network_id,
-    );
-    let mut hashes = Vec::new();
-    let (meta, result) =
-        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
     assert!(result.success);
     hashes.push(tx_meta_hash(&meta));
 
@@ -552,6 +616,63 @@ fn run_manage_data_base_with_state(
         base_fee,
         base_reserve,
         total_coins,
+    )
+}
+
+fn run_manage_data_setup_with_gateway(
+) -> (
+    std::collections::HashMap<Vec<u8>, LedgerEntry>,
+    LedgerHeader,
+    NetworkId,
+    SecretKey,
+    AccountId,
+    u32,
+    u32,
+    i64,
+    SecretKey,
+    AccountId,
+) {
+    let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
+    let root_secret = SecretKey::from_seed(network_id.as_bytes());
+    let root_account_id: AccountId = (&root_secret.public_key()).into();
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+    let total_coins = 1_000_000_000_000_000_000i64;
+
+    let genesis = genesis_header(25, base_fee, base_reserve, total_coins);
+    let header = test_header(
+        2,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        compute_header_hash(&genesis).expect("genesis hash"),
+    );
+
+    let (root_key, root_entry) = account_entry(
+        root_account_id.clone(),
+        0,
+        total_coins,
+        header.ledger_seq - 1,
+    );
+    let mut entries = std::collections::HashMap::new();
+    entries.insert(key_bytes(&root_key), root_entry);
+
+    let gateway_secret = secret_from_name("gw");
+    let gateway_id: AccountId = (&gateway_secret.public_key()).into();
+
+    (
+        entries,
+        header,
+        network_id,
+        root_secret,
+        root_account_id,
+        base_fee,
+        base_reserve,
+        total_coins,
+        gateway_secret,
+        gateway_id,
     )
 }
 
@@ -740,6 +861,142 @@ fn manage_data_native_buying_liabilities_tx_meta_matches_baseline() {
         execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
     assert!(result.success);
     hashes.push(tx_meta_hash(&meta));
+
+    assert_eq!(hashes, expected);
+}
+
+fn run_manage_data_too_many_subentries_case(
+    num_sub_entries: u32,
+    num_sponsoring: u32,
+    num_sponsored: u32,
+) -> Vec<TransactionMeta> {
+    let (mut entries, mut header, network_id, root_secret, root_account_id, base_fee, base_reserve, total_coins, gateway_secret, gateway_id) =
+        run_manage_data_setup_with_gateway();
+    header = advance_header(&header, total_coins);
+    let root_seq = account_seq(&entries, &root_account_id);
+    let (_gateway_meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        create_account_envelope(
+            &root_secret,
+            gateway_id.clone(),
+            (2 + 3) as i64 * base_reserve as i64 - 100,
+            base_fee,
+            root_seq + 1,
+            &network_id,
+        ),
+    );
+    assert!(result.success);
+
+    header = advance_header(&header, total_coins);
+    let min_balance0 = (2 + 0) as i64 * base_reserve as i64;
+    let acc_secret = secret_from_name("acc1");
+    let acc_id: AccountId = (&acc_secret.public_key()).into();
+
+    let root_seq = account_seq(&entries, &root_account_id);
+    let tx = create_account_envelope(
+        &root_secret,
+        acc_id.clone(),
+        min_balance0,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let (_create_meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+
+    header = advance_header(&header, total_coins);
+    let root_seq = account_seq(&entries, &root_account_id);
+    let root_available = account_available_balance(&entries, &root_account_id, base_reserve);
+    let tx = payment_envelope(
+        &root_secret,
+        acc_id.clone(),
+        root_available - 100,
+        base_fee,
+        root_seq + 1,
+        &network_id,
+    );
+    let (_payment_meta, result) =
+        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, tx);
+    assert!(result.success);
+
+    update_account_subentries_and_sponsoring(
+        &mut entries,
+        &acc_id,
+        num_sub_entries,
+        num_sponsoring,
+        num_sponsored,
+        header.ledger_seq,
+    );
+
+    let mut value = vec![0u8; 64];
+    for idx in 0..64 {
+        value[idx] = idx as u8;
+    }
+
+    let acc_seq = account_seq(&entries, &acc_id);
+    let tx1 = manage_data_envelope(
+        &acc_secret,
+        "test",
+        Some(value.as_slice()),
+        base_fee,
+        acc_seq + 1,
+        &network_id,
+    );
+    let tx2 = manage_data_envelope(
+        &acc_secret,
+        "test2",
+        Some(value.as_slice()),
+        base_fee,
+        acc_seq + 2,
+        &network_id,
+    );
+    let (meta1, result1) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        tx1,
+    );
+    assert!(result1.success);
+
+    let (meta2, result2) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        tx2,
+    );
+    assert!(!result2.success);
+    assert_eq!(result2.operation_results.len(), 1);
+    assert!(matches!(
+        result2.operation_results[0],
+        stellar_xdr::curr::OperationResult::OpTooManySubentries
+    ));
+
+    vec![meta1, meta2]
+}
+
+#[test]
+fn manage_data_too_many_subentries_tx_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes("manage data|protocol version 25|too many subentries");
+    assert_eq!(expected.len(), 4);
+
+    let mut hashes = Vec::new();
+    let case1 = run_manage_data_too_many_subentries_case(999, 0, 0);
+    let case2 = run_manage_data_too_many_subentries_case(50, u32::MAX - 1 - 50, 0);
+    hashes.extend(case1.iter().map(tx_meta_hash));
+    hashes.extend(case2.iter().map(tx_meta_hash));
 
     assert_eq!(hashes, expected);
 }
