@@ -1883,13 +1883,23 @@ async fn cmd_verify_execution(
                                 if let Some(our_meta) = &result.tx_meta {
                                     let our_changes = extract_changes_from_meta(our_meta);
                                     let cdp_changes = extract_changes_from_meta(&tx_info.meta);
-                                    println!("      Our changes ({}):", our_changes.len());
-                                    for (i, change) in our_changes.iter().enumerate() {
-                                        println!("        {}: {}", i, describe_change(change));
-                                    }
-                                    println!("      CDP changes ({}):", cdp_changes.len());
-                                    for (i, change) in cdp_changes.iter().enumerate() {
-                                        println!("        {}: {}", i, describe_change(change));
+                                    let max_len = our_changes.len().max(cdp_changes.len());
+
+                                    // Show side-by-side comparison with detailed values for differing entries
+                                    println!("      Changes comparison (ours={}, cdp={}):", our_changes.len(), cdp_changes.len());
+                                    for i in 0..max_len {
+                                        let our_str = our_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
+                                        let cdp_str = cdp_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
+                                        let differs = our_changes.get(i) != cdp_changes.get(i);
+                                        if differs {
+                                            println!("        {} DIFFERS:", i);
+                                            let our_detail = our_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
+                                            let cdp_detail = cdp_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
+                                            println!("          ours: {}", our_detail);
+                                            println!("          cdp:  {}", cdp_detail);
+                                        } else {
+                                            println!("        {} OK: {}", i, our_str);
+                                        }
                                     }
                                 }
                             }
@@ -2072,6 +2082,43 @@ fn describe_change(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
         LedgerEntryChange::Removed(key) => format!("REMOVED {:?}", key),
         LedgerEntryChange::State(entry) => format!("STATE {}", describe_entry(&entry.data)),
         LedgerEntryChange::Restored(entry) => format!("RESTORED {}", describe_entry(&entry.data)),
+    }
+}
+
+/// Describe a LedgerEntryChange with detailed values for debugging.
+fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
+    use stellar_xdr::curr::{LedgerEntry, LedgerEntryChange, LedgerEntryData};
+
+    fn describe_entry_detailed(entry: &LedgerEntry) -> String {
+        match &entry.data {
+            LedgerEntryData::Account(a) => {
+                let id = &a.account_id.0;
+                let id_hex = match id {
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                        hex::encode(&pk.0[0..4])
+                    }
+                };
+                format!(
+                    "Account({}...) bal={} seq={} lm={}",
+                    id_hex, a.balance, a.seq_num.0, entry.last_modified_ledger_seq
+                )
+            }
+            LedgerEntryData::Trustline(t) => {
+                format!(
+                    "Trustline bal={} lm={}",
+                    t.balance, entry.last_modified_ledger_seq
+                )
+            }
+            _ => format!("lm={}", entry.last_modified_ledger_seq),
+        }
+    }
+
+    match change {
+        LedgerEntryChange::Created(entry) => format!("CREATED {}", describe_entry_detailed(entry)),
+        LedgerEntryChange::Updated(entry) => format!("UPDATED {}", describe_entry_detailed(entry)),
+        LedgerEntryChange::Removed(_) => describe_change(change),
+        LedgerEntryChange::State(entry) => format!("STATE {}", describe_entry_detailed(entry)),
+        LedgerEntryChange::Restored(entry) => format!("RESTORED {}", describe_entry_detailed(entry)),
     }
 }
 
