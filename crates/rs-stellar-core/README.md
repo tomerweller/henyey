@@ -9,6 +9,19 @@ This crate provides:
 - Command-line interface (CLI) for all node operations
 - Thin wrapper around `stellar-core-app` for runtime orchestration
 
+## Architecture
+
+- CLI parsing builds a `Config` and dispatches to `stellar-core-app` commands.
+- Run modes (watcher/validator) initialize overlay, herder, ledger, and history subsystems.
+- Catchup and offline tooling reuse historywork/history pipelines for deterministic replay.
+- HTTP endpoints expose app state and control hooks (status, peers, surveys).
+
+## Key Concepts
+
+- **Run modes**: watcher vs validator, derived from config and CLI flags.
+- **Catchup modes**: minimal vs complete, controlled by checkpoint selection.
+- **Offline tools**: deterministic replay and XDR utilities for parity debugging.
+
 ## CLI Usage
 
 ```bash

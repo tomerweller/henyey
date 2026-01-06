@@ -6,6 +6,19 @@ History archive access, catchup, replay, and publish support.
 
 This crate reads and writes history archives (HAS, buckets, ledger headers, transaction sets/results, and SCP history). It powers catchup and replay verification for validators.
 
+## Architecture
+
+- `archive` and `paths` map archive URLs and on-disk layout.
+- `catchup` orchestrates checkpoint selection and replay sequencing.
+- `replay` re-executes transactions and verifies hashes.
+- `publish` writes new archive checkpoints when enabled.
+
+## Key Concepts
+
+- **Checkpoint**: 64-ledger boundary for archive snapshots.
+- **HAS**: history archive state file with bucket list and ledger chain.
+- **Record-marked XDR**: stream format used by history files.
+
 ## Upstream Mapping
 
 - `src/history/*`
@@ -36,4 +49,3 @@ From `src/history/test/`:
 - HAS parsing and integrity checks.
 - Replay verification of tx set/result hashes.
 - Publish validation for archive layout.
-

@@ -11,12 +11,20 @@ The BucketList is the canonical on-disk state for Stellar. It stores ordered led
 - `src/bucket/*` (Bucket, BucketList, BucketManager, BucketIndex, BucketMerger)
 - `LiveBucket` and hot archive buckets
 
+## Architecture
+
+- `BucketManager` owns on-disk buckets and performs merges per level spill rules.
+- `BucketList` maintains `curr/snap/next` for each level and computes hashes.
+- `BucketIndex` accelerates lookups during replay and validation.
+- `LiveBucket`/hot archive handling keeps Soroban archival state separate.
+
 ## Key Concepts
 
 - **BucketList**: 11 levels (0-10), each with `curr`, `snap`, and optional `next`.
 - **BucketEntry**: `LiveEntry`, `DeadEntry`, `InitEntry`, `Metadata`.
 - **Spill schedule**: Level N spills every 2^(2N) ledgers.
 - **Hot archive**: Separate bucket list for archived Soroban entries.
+- **Merge determinism**: merges are ordered and hashed via record-marked XDR.
 
 ## Layout
 
@@ -53,4 +61,3 @@ From `src/bucket/test/`:
 - Prefer memory-mapped reads for large buckets.
 - Cache bucket indexes for hot buckets.
 - Parallelize merges when safe.
-

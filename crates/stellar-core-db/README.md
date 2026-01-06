@@ -6,6 +6,18 @@ SQLite persistence layer for rs-stellar-core.
 
 This crate provides schema management and query helpers for ledger headers, transactions, SCP history, peers, and operational metadata. SQLite is the only supported backend.
 
+## Architecture
+
+- `schema` defines the SQLite layout and versioning.
+- `migrate` handles schema upgrades at startup.
+- `queries/*` is the typed access layer used by app, overlay, and ledger.
+
+## Key Concepts
+
+- **Schema versioning**: tracked in the DB and validated on startup.
+- **History persistence**: headers, tx sets/results, and SCP envelopes stored for catchup.
+- **Peer cache**: outbound/inbound peer records for overlay stability.
+
 ## Upstream Mapping
 
 - `src/database/*`
@@ -40,4 +52,3 @@ From `src/database/test/`:
 
 - Use prepared statements for hot paths.
 - Batch writes during ledger close and history publish.
-

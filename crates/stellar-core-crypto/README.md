@@ -12,6 +12,20 @@ This crate provides hashing, signatures, key encoding, and sealed-box support us
 - StrKey and key utilities
 - Short-hash utilities
 
+## Architecture
+
+- Deterministic primitives built on pure Rust crates.
+- XDR hashing utilities shared by ledger, overlay, and history.
+- Key material handled via explicit types (SecretKey/PublicKey/StrKey).
+- No libsodium dependency; behavior must match upstream with pure Rust.
+
+## Key Concepts
+
+- **StrKey**: base32 encoding for Stellar public/secret keys.
+- **ShortHash**: SipHash-2-4 for deterministic ordering.
+- **XDR hashing**: hash over canonical XDR bytes for parity.
+- **Deterministic inputs**: avoid non-deterministic salts or RNGs in hashes.
+
 ## Key Capabilities
 
 - Ed25519 key generation, signing, verification
@@ -49,4 +63,3 @@ crates/stellar-core-crypto/
 
 - Keys are zeroized on drop where possible.
 - Avoid non-deterministic ordering by always hashing XDR bytes directly.
-

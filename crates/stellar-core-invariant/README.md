@@ -18,6 +18,18 @@ Invariant framework for validating ledger transitions.
 - Operation-level event consistency checks for Soroban contract events are run
   alongside other op-level invariants.
 
+## Architecture
+
+- `InvariantManager` holds a registry of invariants with strict/relaxed modes.
+- Ledger-close invariants see full header/entry deltas for a ledger.
+- Operation-level invariants run during transaction execution.
+
+## Key Concepts
+
+- **Invariant**: pure validation over ledger deltas and context.
+- **Strict vs relaxed**: determines whether violations halt ledger close.
+- **InvariantContext**: carries pre/post headers and entry diffs.
+
 ## Status
 
 Partial parity with upstream `src/invariant/*`. Additional core invariants,

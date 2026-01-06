@@ -9,6 +9,20 @@ History work items that drive catchup and publish workflows.
 - Publish scaffolding for HAS, buckets, headers, transactions, results, and SCP history.
 - Progress tracking via shared state (`get_progress`).
 
+## Architecture
+
+- Work items are registered with `WorkScheduler` as a DAG of dependencies.
+- Download tasks populate shared state for HAS, buckets, and checkpoint files.
+- Verification tasks validate header chains and hash integrity before replay.
+- Publish tasks reuse the same graph, writing to `ArchiveWriter` targets.
+
+## Key Concepts
+
+- **CheckpointData**: in-memory snapshot of downloaded artifacts.
+- **ArchiveWriter**: abstraction for publishing checkpoints (local or remote).
+- **Progress state**: shared map for reporting status across work items.
+- **Work graph phases**: HAS -> buckets -> headers/tx/results/scp -> verify.
+
 ## Status
 
 Partial parity with upstream `src/historywork/*`. Metrics export wiring and

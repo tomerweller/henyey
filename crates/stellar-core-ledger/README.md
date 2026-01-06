@@ -6,6 +6,13 @@ Ledger state management and ledger close pipeline for rs-stellar-core.
 
 This crate owns ledger close execution, bucket list updates, and ledger header/close metadata generation. It integrates transaction execution, invariants, and bucket list hashing.
 
+## Architecture
+
+- `LedgerManager` owns the ledger state machine and bucket list updates.
+- `close` builds `LedgerCloseMeta` and applies transactions in order.
+- `execution` bridges to `stellar-core-tx` for per-tx execution.
+- `snapshot` provides read-only views for replay and validation.
+
 ## Upstream Mapping
 
 - `src/ledger/*` (LedgerManager, LedgerTxn, LedgerCloseMeta)
@@ -31,6 +38,7 @@ crates/stellar-core-ledger/
 - **LedgerCloseData**: externalized tx set + close time + upgrades.
 - **LedgerManager**: coordinates close, applies txs, updates bucket list.
 - **LedgerCloseMeta**: persisted per-ledger metadata for history.
+- **LedgerDelta**: change-set for ledger entries during close.
 
 ## Tests To Port
 
@@ -38,4 +46,3 @@ From `src/ledger/test/`:
 - Ledger close meta vectors
 - LedgerTxn consistency checks
 - Bucket hash consistency
-

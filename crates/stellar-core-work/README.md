@@ -8,6 +8,20 @@ Work scheduler and orchestration primitives for rs-stellar-core.
 - Dependency-aware scheduler (`WorkScheduler`) with queue de-duplication.
 - Work sequences (`WorkSequence`) and callback wrappers (`WorkWithCallback`).
 
+## Architecture
+
+- `Work` is a stateful task with retryable outcomes.
+- `WorkScheduler` manages dependencies and scheduling order.
+- `WorkSequence` composes serial workflows (used by catchup/publish).
+- Scheduler loop handles backoff and stops on terminal failures.
+
+## Key Concepts
+
+- **Outcome**: success/failure/needs-retry state for work items.
+- **Dependency graph**: ensures prerequisite tasks finish first.
+- **Callbacks**: integrate work completion with higher-level flows.
+- **Deduping**: work IDs prevent duplicate enqueues.
+
 ## Status
 
 Core parity with upstream work scheduling: cancellation, metrics, and

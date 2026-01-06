@@ -62,6 +62,25 @@ backfill_stellar_asset_events = false
 - `configs/` — example configs
 - `PARITY_GAPS.md` — master parity gap list
 
+## Crate Manifest
+
+- `crates/rs-stellar-core/` — CLI and entrypoint binary (`crates/rs-stellar-core/README.md`)
+- `crates/stellar-core-app/` — app wiring, config, and run/catchup orchestration (`crates/stellar-core-app/README.md`)
+- `crates/stellar-core-overlay/` — P2P overlay protocol, peers, and flood control (`crates/stellar-core-overlay/README.md`)
+- `crates/stellar-core-scp/` — SCP nomination/ballot protocols and slot state (`crates/stellar-core-scp/README.md`)
+- `crates/stellar-core-herder/` — consensus tracking, tx set management, and ledger close triggers (`crates/stellar-core-herder/README.md`)
+- `crates/stellar-core-ledger/` — ledger close pipeline and ledger state updates (`crates/stellar-core-ledger/README.md`)
+- `crates/stellar-core-tx/` — transaction validation/execution (classic + Soroban) (`crates/stellar-core-tx/README.md`)
+- `crates/stellar-core-bucket/` — BucketList, merges, and on-disk state (`crates/stellar-core-bucket/README.md`)
+- `crates/stellar-core-history/` — history archive I/O, replay, and catchup (`crates/stellar-core-history/README.md`)
+- `crates/stellar-core-historywork/` — history work scheduling and publish/catchup tasks (`crates/stellar-core-historywork/README.md`)
+- `crates/stellar-core-db/` — SQLite schema and query layer (`crates/stellar-core-db/README.md`)
+- `crates/stellar-core-crypto/` — signing, hashing, strkey, and short-hash utilities (`crates/stellar-core-crypto/README.md`)
+- `crates/stellar-core-common/` — shared types, config helpers, and utilities (`crates/stellar-core-common/README.md`)
+- `crates/stellar-core-invariant/` — invariant checks for ledger transitions (`crates/stellar-core-invariant/README.md`)
+- `crates/stellar-core-work/` — generic work scheduler primitives (`crates/stellar-core-work/README.md`)
+- `crates/stellar-core-simulation/` — test/sim harness for overlay/SCP (`crates/stellar-core-simulation/README.md`)
+
 ## Contributing
 
 - Keep behavior deterministic and aligned with stellar-core v25.x.

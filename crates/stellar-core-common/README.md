@@ -12,6 +12,19 @@ This crate provides shared types, traits, and utilities used across all rs-stell
 - **Time utilities** - Stellar time handling
 - **Common types** - Hash256, primitives, and helpers
 
+## Architecture
+
+- Small, dependency-light modules to avoid cycles across core crates.
+- Pure data types and helpers with no IO or side effects.
+- Re-exports XDR types used across the workspace.
+- Centralizes network ID and hash handling for consistent behavior.
+
+## Key Concepts
+
+- **NetworkId**: deterministic hash of the network passphrase.
+- **Hash256**: canonical 32-byte hash wrapper with hex helpers.
+- **TimePoint**: Stellar time conversion helpers for ledgers and close times.
+
 ## Modules
 
 | Module | Description |

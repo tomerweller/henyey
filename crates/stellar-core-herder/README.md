@@ -6,6 +6,19 @@ SCP coordination and ledger-close orchestration for rs-stellar-core.
 
 The herder bridges SCP consensus with ledger close. It tracks externalized slots, requests transaction sets, manages the transaction queue, and produces `LedgerCloseInfo` used by the ledger manager.
 
+## Architecture
+
+- `Herder` owns SCP driver, tx queue, and externalization tracking state.
+- `SCPDriver` validates envelopes and manages tx set/quorum set caches.
+- `TxQueue` builds candidate tx sets with surge pricing and lane limits.
+- Externalization triggers `LedgerCloseInfo` for the ledger manager.
+
+## Key Concepts
+
+- **LedgerCloseInfo**: externalized tx set + close time + upgrades.
+- **TxSet cache**: request/response store keyed by tx set hash.
+- **Quorum tracking**: identifies v-blocking/quorum and security checks.
+
 ## Upstream Mapping
 
 - `src/herder/*` (Herder, HerderSCPDriver, TxQueue)
@@ -62,4 +75,3 @@ From `src/herder/test/`:
 - Tx set builder ordering and surge pricing.
 - Quorum tracking edge cases.
 - Externalization and catchup boundary behavior.
-
