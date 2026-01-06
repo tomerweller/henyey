@@ -311,16 +311,25 @@ fn apply_soroban_storage_change(
         }
 
         // Apply TTL if present for contract entries.
+        // Only emit TTL changes when the TTL is actually being modified.
+        // C++ stellar-core does not emit TTL updates when only the data is modified.
         if let Some(live_until) = change.live_until {
             let key_hash = compute_key_hash(&change.key);
-            let ttl = TtlEntry {
-                key_hash,
-                live_until_ledger_seq: live_until,
-            };
-            if state.get_ttl(&ttl.key_hash).is_some() {
-                state.update_ttl(ttl);
-            } else {
-                state.create_ttl(ttl);
+            let existing_ttl = state.get_ttl(&key_hash);
+            let ttl_changed = existing_ttl
+                .map(|t| t.live_until_ledger_seq != live_until)
+                .unwrap_or(true); // New TTL = always emit
+
+            if ttl_changed {
+                let ttl = TtlEntry {
+                    key_hash,
+                    live_until_ledger_seq: live_until,
+                };
+                if existing_ttl.is_some() {
+                    state.update_ttl(ttl);
+                } else {
+                    state.create_ttl(ttl);
+                }
             }
         }
     } else {

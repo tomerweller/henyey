@@ -23,27 +23,24 @@ use crate::{Result, TxError};
 /// This operation marks the beginning of a sponsorship relationship where
 /// the source account will pay reserves for entries created by the sponsored account.
 ///
-/// Note: In a full implementation, this would require transaction-level state
-/// to track the sponsorship stack. For now, we validate basic conditions.
+/// Note: The sponsored account does NOT need to exist at this point - it may be
+/// created by a later operation in the same transaction (e.g., CreateAccount).
 pub fn execute_begin_sponsoring_future_reserves(
     op: &BeginSponsoringFutureReservesOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
-    // Check source account exists
+    // Check source account exists (the sponsor must exist to pay reserves)
     if state.get_account(source).is_none() {
         return Ok(make_begin_result(
             BeginSponsoringFutureReservesResultCode::Malformed,
         ));
     }
 
-    // Check sponsored account exists
-    if state.get_account(&op.sponsored_id).is_none() {
-        return Ok(make_begin_result(
-            BeginSponsoringFutureReservesResultCode::Malformed,
-        ));
-    }
+    // Note: We do NOT check if sponsored_id exists here because:
+    // 1. The account may be created by a later CreateAccount operation
+    // 2. C++ stellar-core does not require the sponsored account to exist
 
     // Cannot sponsor yourself
     if source == &op.sponsored_id {

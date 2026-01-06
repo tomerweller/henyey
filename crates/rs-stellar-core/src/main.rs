@@ -2193,6 +2193,32 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                     t.balance, entry.last_modified_ledger_seq
                 )
             }
+            LedgerEntryData::ContractData(cd) => {
+                let contract_hex = match &cd.contract {
+                    stellar_xdr::curr::ScAddress::Contract(contract_id) => {
+                        hex::encode(&contract_id.0.0[0..4])
+                    }
+                    _ => "other".to_string(),
+                };
+                format!(
+                    "ContractData({}...) dur={:?} lm={}",
+                    contract_hex, cd.durability, entry.last_modified_ledger_seq
+                )
+            }
+            LedgerEntryData::ContractCode(cc) => {
+                let hash_hex = hex::encode(&cc.hash.0[0..4]);
+                format!(
+                    "ContractCode({}...) lm={}",
+                    hash_hex, entry.last_modified_ledger_seq
+                )
+            }
+            LedgerEntryData::Ttl(ttl) => {
+                let key_hex = hex::encode(&ttl.key_hash.0[0..4]);
+                format!(
+                    "Ttl({}...) live_until={} lm={}",
+                    key_hex, ttl.live_until_ledger_seq, entry.last_modified_ledger_seq
+                )
+            }
             _ => format!("lm={}", entry.last_modified_ledger_seq),
         }
     }
