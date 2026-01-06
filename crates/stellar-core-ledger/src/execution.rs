@@ -1789,11 +1789,6 @@ impl TransactionExecutor {
                     _ => {}
                 }
             }
-            OperationBody::ManageData(op_data) => {
-                // Load existing data entry if any (needed for delete/update)
-                let data_name = String::from_utf8_lossy(op_data.data_name.as_vec()).to_string();
-                self.load_data(snapshot, &op_source, &data_name)?;
-            }
             _ => {
                 // Other operations typically work on source account
             }
@@ -2328,16 +2323,6 @@ fn build_entry_changes_with_state_overrides(
     deleted: &[LedgerKey],
     state_overrides: &HashMap<LedgerKey, LedgerEntry>,
 ) -> LedgerEntryChanges {
-    fn change_type_order(change: &LedgerEntryChange) -> u8 {
-        match change {
-            LedgerEntryChange::State(_) => 0,
-            LedgerEntryChange::Created(_) => 1,
-            LedgerEntryChange::Updated(_) => 2,
-            LedgerEntryChange::Removed(_) => 3,
-            LedgerEntryChange::Restored(_) => 4,
-        }
-    }
-
     fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
         crate::delta::entry_to_key(entry)
             .ok()
@@ -2345,23 +2330,44 @@ fn build_entry_changes_with_state_overrides(
             .unwrap_or_default()
     }
 
-    let mut changes: Vec<(Vec<u8>, LedgerEntryChange)> = Vec::new();
+    let mut changes: Vec<LedgerEntryChange> = Vec::new();
 
-    for entry in created {
-        changes.push((entry_key_bytes(entry), LedgerEntryChange::Created(entry.clone())));
-    }
+    // Deduplicate updated entries while preserving order of first occurrence.
+    // For each unique key, emit STATE (original state) then UPDATED (final state).
+    // Track order of first occurrence and final values separately.
+    let mut key_order: Vec<Vec<u8>> = Vec::new();
+    let mut final_values: HashMap<Vec<u8>, LedgerEntry> = HashMap::new();
 
     for entry in updated {
-        if let Ok(key) = crate::delta::entry_to_key(entry) {
-            if let Some(state_entry) = state_overrides
-                .get(&key)
-                .cloned()
-                .or_else(|| state.snapshot_entry(&key))
-            {
-                changes.push((entry_key_bytes(&state_entry), LedgerEntryChange::State(state_entry)));
-            }
+        let key_bytes = entry_key_bytes(entry);
+        if !final_values.contains_key(&key_bytes) {
+            // First occurrence - record the order
+            key_order.push(key_bytes.clone());
         }
-        changes.push((entry_key_bytes(entry), LedgerEntryChange::Updated(entry.clone())));
+        // Always update to get the final value
+        final_values.insert(key_bytes, entry.clone());
+    }
+
+    // Emit changes in order of first occurrence
+    for key_bytes in key_order {
+        if let Some(final_entry) = final_values.get(&key_bytes) {
+            if let Ok(key) = crate::delta::entry_to_key(final_entry) {
+                if let Some(state_entry) = state_overrides
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| state.snapshot_entry(&key))
+                {
+                    changes.push(LedgerEntryChange::State(state_entry));
+                }
+            }
+            changes.push(LedgerEntryChange::Updated(final_entry.clone()));
+        }
+    }
+
+    // Created entries come AFTER updated entries to match C++ stellar-core execution order
+    // (e.g., for CreateAccount: source debit, root credit for base reserve, then new account)
+    for entry in created {
+        changes.push(LedgerEntryChange::Created(entry.clone()));
     }
 
     for key in deleted {
@@ -2370,19 +2376,15 @@ fn build_entry_changes_with_state_overrides(
             .cloned()
             .or_else(|| state.snapshot_entry(key))
         {
-            changes.push((entry_key_bytes(&state_entry), LedgerEntryChange::State(state_entry)));
+            changes.push(LedgerEntryChange::State(state_entry));
         }
-        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-        changes.push((key_bytes, LedgerEntryChange::Removed(key.clone())));
+        changes.push(LedgerEntryChange::Removed(key.clone()));
     }
 
-    changes.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| change_type_order(&a.1).cmp(&change_type_order(&b.1)))
-    });
-
-    let ordered = changes.into_iter().map(|(_, change)| change);
-    LedgerEntryChanges(ordered.collect::<Vec<_>>().try_into().unwrap_or_default())
+    // Note: We preserve the order changes were recorded (update order, then creation order,
+    // then delete order). This matches C++ stellar-core's behavior of emitting changes
+    // in operation execution order.
+    LedgerEntryChanges(changes.try_into().unwrap_or_default())
 }
 
 fn empty_entry_changes() -> LedgerEntryChanges {

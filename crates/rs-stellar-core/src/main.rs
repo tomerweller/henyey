@@ -1879,6 +1879,19 @@ async fn cmd_verify_execution(
                                 for diff in &meta_diffs {
                                     println!("      - {}", diff);
                                 }
+                                // Print detailed changes for diagnosis
+                                if let Some(our_meta) = &result.tx_meta {
+                                    let our_changes = extract_changes_from_meta(our_meta);
+                                    let cdp_changes = extract_changes_from_meta(&tx_info.meta);
+                                    println!("      Our changes ({}):", our_changes.len());
+                                    for (i, change) in our_changes.iter().enumerate() {
+                                        println!("        {}: {}", i, describe_change(change));
+                                    }
+                                    println!("      CDP changes ({}):", cdp_changes.len());
+                                    for (i, change) in cdp_changes.iter().enumerate() {
+                                        println!("        {}: {}", i, describe_change(change));
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -2023,6 +2036,43 @@ fn compare_transaction_meta(
     }
 
     (diffs.is_empty(), diffs)
+}
+
+/// Describe a LedgerEntryChange for debugging.
+fn describe_change(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData};
+
+    fn describe_entry(entry: &LedgerEntryData) -> String {
+        match entry {
+            LedgerEntryData::Account(a) => {
+                // Just show first/last few bytes of account id
+                let id = &a.account_id.0;
+                let id_hex = match id {
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                        hex::encode(&pk.0[0..4])
+                    }
+                };
+                format!("Account({}...)", id_hex)
+            }
+            LedgerEntryData::Trustline(t) => format!("Trustline({:?})", t.asset),
+            LedgerEntryData::Offer(o) => format!("Offer({})", o.offer_id),
+            LedgerEntryData::Data(d) => format!("Data({})", String::from_utf8_lossy(&d.data_name.0)),
+            LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance".to_string(),
+            LedgerEntryData::LiquidityPool(_) => "LiquidityPool".to_string(),
+            LedgerEntryData::ContractData(_) => "ContractData".to_string(),
+            LedgerEntryData::ContractCode(_) => "ContractCode".to_string(),
+            LedgerEntryData::ConfigSetting(_) => "ConfigSetting".to_string(),
+            LedgerEntryData::Ttl(_) => "Ttl".to_string(),
+        }
+    }
+
+    match change {
+        LedgerEntryChange::Created(entry) => format!("CREATED {}", describe_entry(&entry.data)),
+        LedgerEntryChange::Updated(entry) => format!("UPDATED {}", describe_entry(&entry.data)),
+        LedgerEntryChange::Removed(key) => format!("REMOVED {:?}", key),
+        LedgerEntryChange::State(entry) => format!("STATE {}", describe_entry(&entry.data)),
+        LedgerEntryChange::Restored(entry) => format!("RESTORED {}", describe_entry(&entry.data)),
+    }
 }
 
 /// Extract all ledger entry changes from TransactionMeta.

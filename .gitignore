@@ -44,3 +44,5 @@ stellar.lock
 source
 .upstream-v25/
 upstream/
+rust_out
+testnet.lock
