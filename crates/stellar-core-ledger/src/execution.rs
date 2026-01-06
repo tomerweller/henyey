@@ -586,6 +586,33 @@ impl TransactionExecutor {
         Ok(false)
     }
 
+    /// Load a data entry from the snapshot using the raw String64 key.
+    /// This preserves non-UTF8 bytes in the data name.
+    pub fn load_data_raw(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        data_name: &stellar_xdr::curr::String64,
+    ) -> Result<bool> {
+        // Convert to string for state lookup (matches how data_entries are keyed)
+        let name_str = String::from_utf8_lossy(data_name.as_slice()).to_string();
+
+        // Check if already in state from previous transaction in this ledger
+        if self.state.get_data(account_id, &name_str).is_some() {
+            return Ok(true);
+        }
+
+        let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+            account_id: account_id.clone(),
+            data_name: data_name.clone(),
+        });
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Load an offer from the snapshot into the state manager.
     pub fn load_offer(
         &mut self,
@@ -2073,6 +2100,10 @@ impl TransactionExecutor {
                     }
                     _ => {}
                 }
+            }
+            OperationBody::ManageData(op_data) => {
+                // Load existing data entry if any (needed for updates and deletes)
+                self.load_data_raw(snapshot, &op_source, &op_data.data_name)?;
             }
             _ => {
                 // Other operations typically work on source account
