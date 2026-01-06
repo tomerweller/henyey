@@ -1487,6 +1487,27 @@ impl TransactionExecutor {
         let mut seq_deleted = Vec::new();
 
         if self.protocol_version >= 10 {
+            // For fee bump transactions in two-phase mode, C++ stellar-core's
+            // FeeBumpTransactionFrame::apply() creates a nested LedgerTxn and calls
+            // removeOneTimeSignerKeyFromFeeSource() followed by pushTxChangesBefore().
+            // This creates a STATE/UPDATED pair for the fee source even if nothing changed.
+            // We capture the fee source state BEFORE sequence bump to match this behavior.
+            let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
+                let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: fee_source_id.clone(),
+                });
+                if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
+                    vec![
+                        LedgerEntryChange::State(fee_source_entry.clone()),
+                        LedgerEntryChange::Updated(fee_source_entry),
+                    ]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            };
+
             let delta_before_seq = delta_snapshot(&self.state);
             if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
                 acc.seq_num.0 += 1;
@@ -1506,10 +1527,8 @@ impl TransactionExecutor {
             seq_updated = updated;
             seq_deleted = deleted;
 
-            // For fee bump transactions with separate fee source and deduct_fee=false
-            // (two-phase processing), include the fee source's current state in tx_changes_before.
-            // C++ stellar-core's tx_changes_before captures the fee source state at Phase 2 time
-            // (after all fees have been paid in Phase 1), as STATE/UPDATED with the same value.
+            // For fee bump transactions with DIFFERENT fee source in two-phase mode,
+            // we also need to include the fee source's current state (separate from inner source).
             let fee_source_changes = if !deduct_fee && frame.is_fee_bump() && fee_source_id != inner_source_id {
                 let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                     account_id: fee_source_id.clone(),
@@ -1526,11 +1545,13 @@ impl TransactionExecutor {
                 vec![]
             };
 
-            // Merge fee_changes and seq_changes into tx_changes_before.
-            // In C++ stellar-core, tx_changes_before captures both fee processing
-            // and sequence bump changes together. Fee changes come first.
-            // For fee bump transactions in two-phase mode, fee_source_changes come first.
-            let mut combined = Vec::with_capacity(fee_source_changes.len() + fee_changes.len() + seq_changes.len());
+            // Merge all changes into tx_changes_before.
+            // Order: fee_bump_wrapper_changes (fee source pre-seq-bump), fee_source_changes
+            // (if different), fee_changes, then seq_changes.
+            let mut combined = Vec::with_capacity(
+                fee_bump_wrapper_changes.len() + fee_source_changes.len() + fee_changes.len() + seq_changes.len()
+            );
+            combined.extend(fee_bump_wrapper_changes);
             combined.extend(fee_source_changes);
             combined.extend(fee_changes.iter().cloned());
             combined.extend(seq_changes.iter().cloned());
