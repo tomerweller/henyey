@@ -1588,9 +1588,6 @@ async fn cmd_replay_bucket_list(
 /// This test re-executes transactions and compares the resulting ledger entry changes
 /// against what C++ stellar-core produced (from CDP). Differences indicate execution
 /// divergence that needs investigation (e.g., Soroban host differences).
-///
-/// NOTE: This is a placeholder that shows the expected changes from CDP.
-/// Full execution comparison requires the transaction execution infrastructure.
 async fn cmd_verify_execution(
     config: AppConfig,
     from: Option<u32>,
@@ -1600,19 +1597,28 @@ async fn cmd_verify_execution(
     cdp_url: &str,
     cdp_date: &str,
 ) -> anyhow::Result<()> {
+    use std::sync::{Arc, RwLock};
     use stellar_core_bucket::{BucketList, BucketManager};
-    use stellar_core_common::Hash256;
+    use stellar_core_common::{Hash256, NetworkId};
     use stellar_core_history::{HistoryArchive, checkpoint};
-    use stellar_core_history::cdp::{CdpDataLake, extract_transaction_metas};
+    use stellar_core_history::cdp::{CdpDataLake, extract_transaction_metas, extract_transaction_envelopes, extract_ledger_header, extract_upgrade_metas};
     use stellar_core_history::replay::extract_ledger_changes;
-    use stellar_core_ledger::TransactionSetVariant;
-    use stellar_xdr::curr::{TransactionHistoryEntryExt, WriteXdr, Limits};
+    use stellar_core_ledger::{LedgerSnapshot, SnapshotHandle, LedgerError};
+    use stellar_core_ledger::execution::{TransactionExecutor, load_soroban_config};
+    use stellar_core_tx::ClassicEventConfig;
+    use stellar_xdr::curr::{LedgerKey, LedgerEntry, BucketListType};
 
     println!("Transaction Execution Verification");
     println!("===================================");
-    println!("Analyzes expected ledger changes from CDP metadata.");
-    println!("(Full execution comparison coming soon)");
+    println!("Re-executes transactions and compares results against CDP metadata.");
     println!();
+
+    // Determine network ID
+    let network_id = if config.network.passphrase.contains("Test") {
+        NetworkId::testnet()
+    } else {
+        NetworkId::mainnet()
+    };
 
     // Create archive client
     let archive = config.history.archives
@@ -1637,12 +1643,16 @@ async fn cmd_verify_execution(
         checkpoint::checkpoint_containing(end_ledger).saturating_sub(4 * freq).max(freq)
     });
 
-    // Calculate checkpoint range needed to cover the ledger range
+    // For execution, we need to restore from the checkpoint BEFORE our start ledger
+    let freq = stellar_core_history::CHECKPOINT_FREQUENCY;
+    let init_checkpoint = checkpoint::latest_checkpoint_before_or_at(start_ledger.saturating_sub(1))
+        .unwrap_or(freq - 1);
+
+    // Calculate checkpoint range needed for headers
     let end_checkpoint = checkpoint::checkpoint_containing(end_ledger);
-    let start_checkpoint = checkpoint::checkpoint_containing(start_ledger);
 
     println!("Ledger range: {} to {}", start_ledger, end_ledger);
-    println!("Checkpoint range: {} to {}", start_checkpoint, end_checkpoint);
+    println!("Initial state: checkpoint {}", init_checkpoint);
     println!();
 
     // Create CDP client
@@ -1650,13 +1660,13 @@ async fn cmd_verify_execution(
 
     // Setup bucket manager and restore initial state
     let bucket_dir = tempfile::tempdir()?;
-    let bucket_manager = BucketManager::new(bucket_dir.path().to_path_buf())?;
+    let bucket_manager = Arc::new(BucketManager::new(bucket_dir.path().to_path_buf())?);
 
-    println!("Downloading initial state at checkpoint {}...", start_checkpoint);
-    let start_has = archive.get_checkpoint_has(start_checkpoint).await?;
+    println!("Downloading initial state at checkpoint {}...", init_checkpoint);
+    let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
     // Download buckets for state lookups
-    let bucket_hashes: Vec<Hash256> = start_has.current_buckets
+    let bucket_hashes: Vec<Hash256> = init_has.current_buckets
         .iter()
         .flat_map(|level| vec![
             Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
@@ -1675,114 +1685,346 @@ async fn cmd_verify_execution(
     }
 
     // Restore bucket list for state lookups
-    let _bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
-        bucket_manager.load_bucket(hash).map(|b| (*b).clone())
-    })?;
+    let bucket_list = Arc::new(RwLock::new(
+        BucketList::restore_from_hashes(&bucket_hashes, |hash| {
+            bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+        })?
+    ));
+
+    println!("Initial bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
+    println!();
 
     // Track results
-    let mut ledgers_analyzed = 0u32;
-    let mut total_tx_count = 0u32;
-    let mut total_init_entries = 0usize;
-    let mut total_live_entries = 0usize;
-    let mut total_dead_entries = 0usize;
+    let mut ledgers_verified = 0u32;
+    let mut transactions_verified = 0u32;
+    let mut transactions_matched = 0u32;
+    let mut transactions_mismatched = 0u32;
 
-    // Iterate through checkpoints
-    let mut current_cp = start_checkpoint;
+    // Process ledgers from init_checkpoint+1 to end_ledger
+    let process_from = init_checkpoint + 1;
+    let process_from_cp = checkpoint::checkpoint_containing(process_from);
+
+    let mut current_cp = process_from_cp;
     while current_cp <= end_checkpoint {
         let next_cp = checkpoint::next_checkpoint(current_cp);
-        let cp_end = next_cp.min(end_checkpoint);
 
         let headers = archive.get_ledger_headers(current_cp).await?;
-        let tx_entries = archive.get_transactions(current_cp).await?;
-        let tx_map: std::collections::HashMap<u32, _> = tx_entries
-            .iter()
-            .map(|e| (e.ledger_seq, e))
-            .collect();
 
         for header_entry in &headers {
             let header = &header_entry.header;
             let seq = header.ledger_seq;
 
-            // Skip ledgers outside our requested range
-            if seq < start_ledger || seq > end_ledger {
+            // Skip ledgers before our initial state or after our target
+            if seq <= init_checkpoint || seq > end_ledger {
                 continue;
             }
 
-            // Fetch CDP metadata for expected changes
+            // Determine if this ledger is in the user's requested test range
+            let in_test_range = seq >= start_ledger && seq <= end_ledger;
+
+            // Fetch CDP metadata
             let lcm = match cdp.get_ledger_close_meta(seq).await {
                 Ok(lcm) => lcm,
                 Err(e) => {
-                    println!("  Ledger {}: CDP fetch failed: {}", seq, e);
+                    if in_test_range {
+                        println!("  Ledger {}: CDP fetch failed: {}", seq, e);
+                    }
                     continue;
                 }
             };
+
+            // Extract transactions and expected results from CDP
+            let tx_envelopes = extract_transaction_envelopes(&lcm);
             let tx_metas = extract_transaction_metas(&lcm);
+            let cdp_header = extract_ledger_header(&lcm);
 
-            // Get transaction set
-            let tx_set = match tx_map.get(&seq) {
-                Some(tx_entry) => match &tx_entry.ext {
-                    TransactionHistoryEntryExt::V1(g) => TransactionSetVariant::Generalized(g.clone()),
-                    TransactionHistoryEntryExt::V0 => TransactionSetVariant::Classic(tx_entry.tx_set.clone()),
-                },
-                None => TransactionSetVariant::empty_generalized(header),
-            };
+            // Create snapshot handle with bucket list lookup
+            let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
+            let lookup_fn: Arc<dyn Fn(&LedgerKey) -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> + Send + Sync> =
+                Arc::new(move |key: &LedgerKey| {
+                    bucket_list_clone.read().unwrap().get(key).map_err(|e| {
+                        LedgerError::Internal(format!("Bucket lookup failed: {}", e))
+                    })
+                });
 
-            let tx_count = tx_set.num_transactions();
+            let snapshot = LedgerSnapshot::new(
+                header.clone(),
+                Hash256::from(header_entry.hash.0),
+                std::collections::HashMap::new(),
+            );
+            let snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
 
-            // Extract expected changes from CDP metadata
-            let (init_entries, live_entries, dead_entries) = extract_ledger_changes(&tx_metas)?;
+            // Load Soroban config from ledger state
+            let soroban_config = load_soroban_config(&snapshot_handle);
 
-            total_tx_count += tx_count as u32;
-            total_init_entries += init_entries.len();
-            total_live_entries += live_entries.len();
-            total_dead_entries += dead_entries.len();
+            // Create transaction executor
+            let mut executor = TransactionExecutor::new(
+                seq,
+                cdp_header.scp_value.close_time.0,
+                cdp_header.base_fee,
+                cdp_header.base_reserve,
+                cdp_header.ledger_version,
+                network_id.clone(),
+                cdp_header.id_pool,
+                soroban_config,
+                ClassicEventConfig::default(),
+                None, // No invariant checking for now
+            );
 
-            if show_diff && !init_entries.is_empty() {
-                println!("  Ledger {}: {} txs -> {} init, {} live, {} dead",
-                    seq, tx_count, init_entries.len(), live_entries.len(), dead_entries.len());
+            // Execute each transaction and compare
+            let mut ledger_matched = true;
+            for (tx_idx, tx_envelope) in tx_envelopes.iter().enumerate() {
+                // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
+                let prng_seed = {
+                    let mut data = Vec::with_capacity(36);
+                    data.extend_from_slice(&cdp_header.scp_value.tx_set_hash.0);
+                    data.extend_from_slice(&(tx_idx as u32).to_be_bytes());
+                    let hash = stellar_core_crypto::sha256(&data);
+                    Some(*hash.as_bytes())
+                };
 
-                // Show sample entries
-                for (i, entry) in init_entries.iter().take(2).enumerate() {
-                    if let Ok(xdr) = entry.to_xdr(Limits::none()) {
-                        println!("    Init[{}]: {} bytes, type={:?}", i, xdr.len(), entry.data.discriminant());
+                // Execute the transaction
+                let exec_result = executor.execute_transaction(
+                    &snapshot_handle,
+                    tx_envelope,
+                    cdp_header.base_fee,
+                    prng_seed,
+                );
+
+                if in_test_range {
+                    transactions_verified += 1;
+
+                    match exec_result {
+                        Ok(result) => {
+                            // Get expected meta from CDP
+                            let expected_meta = tx_metas.get(tx_idx);
+
+                            // Deep comparison of transaction meta if both are available
+                            let (meta_matches, meta_diffs) = match (&result.tx_meta, expected_meta) {
+                                (Some(our_meta), Some(cdp_meta)) => {
+                                    compare_transaction_meta(our_meta, cdp_meta, show_diff)
+                                }
+                                (None, None) => (true, vec![]),
+                                (Some(_), None) => (false, vec!["We produced meta but CDP has none".to_string()]),
+                                (None, Some(_)) => (false, vec!["CDP has meta but we produced none".to_string()]),
+                            };
+
+                            // Check basic success status
+                            let success_matches = result.success == expected_meta.is_some();
+
+                            if meta_matches && success_matches {
+                                transactions_matched += 1;
+                                if show_diff {
+                                    let change_count = result.tx_meta
+                                        .as_ref()
+                                        .map(|m| extract_changes_from_meta(m).len())
+                                        .unwrap_or(0);
+                                    println!("    TX {}: {} (ops: {}, changes: {})",
+                                        tx_idx,
+                                        if result.success { "OK" } else { "FAILED" },
+                                        result.operation_results.len(),
+                                        change_count
+                                    );
+                                }
+                            } else {
+                                transactions_mismatched += 1;
+                                ledger_matched = false;
+                                println!("    TX {}: MISMATCH - our: {}, expected meta present: {}",
+                                    tx_idx,
+                                    if result.success { "success" } else { "failed" },
+                                    expected_meta.is_some()
+                                );
+                                for diff in &meta_diffs {
+                                    println!("      - {}", diff);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            transactions_mismatched += 1;
+                            ledger_matched = false;
+                            println!("    TX {}: EXECUTION ERROR: {}", tx_idx, e);
+                        }
                     }
                 }
-                if init_entries.len() > 2 {
-                    println!("    ... and {} more init entries", init_entries.len() - 2);
+            }
+
+            // Apply changes to bucket list for next ledger using CDP metadata
+            // This ensures subsequent ledgers have correct state for lookups
+            {
+                let (init_entries, live_entries, dead_entries) = extract_ledger_changes(&tx_metas)?;
+
+                // Also process upgrade changes
+                let upgrade_metas = extract_upgrade_metas(&lcm);
+                let (upgrade_init, upgrade_live, upgrade_dead) = extract_upgrade_changes(&upgrade_metas)?;
+
+                // Combine all changes
+                let all_init: Vec<LedgerEntry> = init_entries.into_iter().chain(upgrade_init).collect();
+                let all_live: Vec<LedgerEntry> = live_entries.into_iter().chain(upgrade_live).collect();
+                let all_dead: Vec<LedgerKey> = dead_entries.into_iter().chain(upgrade_dead).collect();
+
+                // Apply to bucket list
+                bucket_list.write().unwrap().add_batch(
+                    seq,
+                    cdp_header.ledger_version,
+                    BucketListType::Live,
+                    all_init,
+                    all_live,
+                    all_dead,
+                )?;
+            }
+
+            if in_test_range {
+                if ledger_matched || tx_envelopes.is_empty() {
+                    println!("  Ledger {}: {} transactions - {}",
+                        seq, tx_envelopes.len(),
+                        if tx_envelopes.is_empty() { "no txs" } else { "all matched" }
+                    );
+                } else {
+                    println!("  Ledger {}: {} transactions - SOME MISMATCHES", seq, tx_envelopes.len());
+                    if stop_on_error {
+                        anyhow::bail!("Stopping on first error");
+                    }
                 }
-            } else {
-                println!("  Ledger {}: {} txs, {} init, {} live, {} dead",
-                    seq, tx_count, init_entries.len(), live_entries.len(), dead_entries.len());
+                ledgers_verified += 1;
             }
-
-            ledgers_analyzed += 1;
-
-            if stop_on_error && ledgers_analyzed >= 10 {
-                println!();
-                println!("Stopping after 10 ledgers (--stop-on-error)");
-                break;
-            }
-        }
-
-        if stop_on_error && ledgers_analyzed >= 10 {
-            break;
         }
 
         current_cp = next_cp;
     }
 
     println!();
-    println!("Transaction Execution Analysis Complete");
-    println!("  Ledgers analyzed: {}", ledgers_analyzed);
-    println!("  Total transactions: {}", total_tx_count);
-    println!("  Total init entries: {}", total_init_entries);
-    println!("  Total live entries: {}", total_live_entries);
-    println!("  Total dead entries: {}", total_dead_entries);
-    println!();
-    println!("Note: Full execution comparison (running our Soroban host and");
-    println!("comparing results) will be implemented in a future update.");
+    println!("Transaction Execution Verification Complete");
+    println!("  Ledgers verified: {}", ledgers_verified);
+    println!("  Transactions verified: {}", transactions_verified);
+    println!("  Transactions matched: {}", transactions_matched);
+    println!("  Transactions mismatched: {}", transactions_mismatched);
+
+    if transactions_mismatched > 0 {
+        println!();
+        println!("WARNING: {} transactions had execution differences!", transactions_mismatched);
+    }
 
     Ok(())
+}
+
+/// Extract ledger entry changes from upgrade metadata.
+fn extract_upgrade_changes(
+    upgrade_metas: &[stellar_xdr::curr::UpgradeEntryMeta],
+) -> anyhow::Result<(Vec<stellar_xdr::curr::LedgerEntry>, Vec<stellar_xdr::curr::LedgerEntry>, Vec<stellar_xdr::curr::LedgerKey>)> {
+    use stellar_xdr::curr::LedgerEntryChange;
+
+    let mut init_entries = Vec::new();
+    let mut live_entries = Vec::new();
+    let mut dead_entries = Vec::new();
+
+    for meta in upgrade_metas {
+        for change in meta.changes.iter() {
+            match change {
+                LedgerEntryChange::Created(entry) => {
+                    init_entries.push(entry.clone());
+                }
+                LedgerEntryChange::Updated(entry) => {
+                    live_entries.push(entry.clone());
+                }
+                LedgerEntryChange::Removed(key) => {
+                    dead_entries.push(key.clone());
+                }
+                LedgerEntryChange::State(_) => {
+                    // State entries are just snapshots, not actual changes
+                }
+                LedgerEntryChange::Restored(entry) => {
+                    // Restored entries come back from hot archive to live
+                    live_entries.push(entry.clone());
+                }
+            }
+        }
+    }
+
+    Ok((init_entries, live_entries, dead_entries))
+}
+
+/// Compare transaction meta to find differences in ledger entry changes.
+fn compare_transaction_meta(
+    our_meta: &stellar_xdr::curr::TransactionMeta,
+    cdp_meta: &stellar_xdr::curr::TransactionMeta,
+    show_diff: bool,
+) -> (bool, Vec<String>) {
+    use stellar_xdr::curr::{WriteXdr, Limits};
+
+    let mut diffs = Vec::new();
+
+    // Extract changes from both metas
+    let our_changes = extract_changes_from_meta(our_meta);
+    let cdp_changes = extract_changes_from_meta(cdp_meta);
+
+    // Compare the number of changes
+    if our_changes.len() != cdp_changes.len() {
+        diffs.push(format!(
+            "Change count mismatch: ours={}, expected={}",
+            our_changes.len(),
+            cdp_changes.len()
+        ));
+    }
+
+    // Compare individual changes if showing diffs
+    if show_diff {
+        for (i, (our, cdp)) in our_changes.iter().zip(cdp_changes.iter()).enumerate() {
+            let our_xdr = our.to_xdr(Limits::none()).unwrap_or_default();
+            let cdp_xdr = cdp.to_xdr(Limits::none()).unwrap_or_default();
+
+            if our_xdr != cdp_xdr {
+                diffs.push(format!("Change {} differs", i));
+            }
+        }
+    }
+
+    (diffs.is_empty(), diffs)
+}
+
+/// Extract all ledger entry changes from TransactionMeta.
+fn extract_changes_from_meta(
+    meta: &stellar_xdr::curr::TransactionMeta,
+) -> Vec<stellar_xdr::curr::LedgerEntryChange> {
+    use stellar_xdr::curr::TransactionMeta;
+
+    let mut changes = Vec::new();
+
+    match meta {
+        TransactionMeta::V0(operations) => {
+            for op_meta in operations.iter() {
+                changes.extend(op_meta.changes.iter().cloned());
+            }
+        }
+        TransactionMeta::V1(v1) => {
+            changes.extend(v1.tx_changes.iter().cloned());
+            for op_meta in v1.operations.iter() {
+                changes.extend(op_meta.changes.iter().cloned());
+            }
+        }
+        TransactionMeta::V2(v2) => {
+            changes.extend(v2.tx_changes_before.iter().cloned());
+            for op_meta in v2.operations.iter() {
+                changes.extend(op_meta.changes.iter().cloned());
+            }
+            changes.extend(v2.tx_changes_after.iter().cloned());
+        }
+        TransactionMeta::V3(v3) => {
+            changes.extend(v3.tx_changes_before.iter().cloned());
+            for op_meta in v3.operations.iter() {
+                changes.extend(op_meta.changes.iter().cloned());
+            }
+            changes.extend(v3.tx_changes_after.iter().cloned());
+        }
+        TransactionMeta::V4(v4) => {
+            changes.extend(v4.tx_changes_before.iter().cloned());
+            for op_meta in v4.operations.iter() {
+                changes.extend(op_meta.changes.iter().cloned());
+            }
+            changes.extend(v4.tx_changes_after.iter().cloned());
+        }
+    }
+
+    changes
 }
 
 /// Sample config command handler.

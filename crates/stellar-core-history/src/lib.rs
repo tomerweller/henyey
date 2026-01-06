@@ -75,7 +75,7 @@ pub use error::HistoryError;
 pub use paths::{bucket_path, checkpoint_ledger, checkpoint_path};
 pub use replay::{LedgerReplayResult, ReplayConfig, ReplayedLedgerState};
 pub use verify::{compute_header_hash, verify_bucket_hash, verify_header_chain};
-pub use cdp::{CdpDataLake, extract_transaction_metas, extract_ledger_header};
+pub use cdp::{CdpDataLake, extract_transaction_metas, extract_ledger_header, extract_transaction_envelopes};
 
 /// Result type for history operations.
 pub type Result<T> = std::result::Result<T, HistoryError>;
