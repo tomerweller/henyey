@@ -230,10 +230,38 @@ fn create_fee_bump_envelope(
     sequence: i64,
     network_id: &NetworkId,
 ) -> TransactionEnvelope {
+    create_fee_bump_envelope_with_signatures(
+        fee_source,
+        inner_source,
+        destination,
+        outer_fee,
+        inner_fee,
+        amount,
+        sequence,
+        network_id,
+        true,
+        true,
+        false,
+    )
+}
+
+fn create_fee_bump_envelope_with_signatures(
+    fee_source: &SecretKey,
+    inner_source: &SecretKey,
+    destination: AccountId,
+    outer_fee: u32,
+    inner_fee: u32,
+    amount: i64,
+    sequence: i64,
+    network_id: &NetworkId,
+    sign_outer: bool,
+    sign_inner: bool,
+    sign_outer_before_inner: bool,
+) -> TransactionEnvelope {
     let payment_op = Operation {
         source_account: None,
         body: OperationBody::Payment(PaymentOp {
-            destination,
+            destination: muxed_from_account_id(&destination),
             asset: stellar_xdr::curr::Asset::Native,
             amount,
         }),
@@ -253,15 +281,11 @@ fn create_fee_bump_envelope(
         tx: inner_tx,
         signatures: VecM::default(),
     };
-    let inner_envelope = TransactionEnvelope::Tx(inner_env.clone());
-    let inner_sig = sign_envelope(&inner_envelope, inner_source, network_id);
-    inner_env.signatures = vec![inner_sig].try_into().unwrap();
-
     let fee_source_id: AccountId = (&fee_source.public_key()).into();
     let fee_bump = FeeBumpTransaction {
         fee_source: muxed_from_account_id(&fee_source_id),
-        fee: outer_fee,
-        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+        fee: outer_fee as i64,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env.clone()),
         ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
     };
 
@@ -269,9 +293,30 @@ fn create_fee_bump_envelope(
         tx: fee_bump,
         signatures: VecM::default(),
     });
-    let outer_sig = sign_envelope(&envelope, fee_source, network_id);
+
+    let mut outer_sig = None;
+    if sign_outer && sign_outer_before_inner {
+        outer_sig = Some(sign_envelope(&envelope, fee_source, network_id));
+    }
+
+    if sign_inner {
+        let inner_envelope = TransactionEnvelope::Tx(inner_env.clone());
+        let inner_sig = sign_envelope(&inner_envelope, inner_source, network_id);
+        inner_env.signatures = vec![inner_sig].try_into().unwrap();
+    }
+
     if let TransactionEnvelope::TxFeeBump(ref mut env) = envelope {
-        env.signatures = vec![outer_sig].try_into().unwrap();
+        env.tx.inner_tx = FeeBumpTransactionInnerTx::Tx(inner_env.clone());
+    }
+
+    if sign_outer && !sign_outer_before_inner {
+        outer_sig = Some(sign_envelope(&envelope, fee_source, network_id));
+    }
+
+    if let TransactionEnvelope::TxFeeBump(ref mut env) = envelope {
+        if let Some(sig) = outer_sig {
+            env.signatures = vec![sig].try_into().unwrap();
+        }
     }
     envelope
 }
@@ -560,6 +605,148 @@ fn fee_bump_validity_valid_meta_matches_baseline() {
         fee_bump,
     );
     assert!(result.success);
+
+    assert_eq!(vec![tx_meta_hash(&meta)], expected);
+}
+
+#[test]
+fn fee_bump_validity_missing_outer_signature_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "fee bump transactions|protocol version 25|validity|bad signatures, signature missing",
+    );
+    assert_eq!(expected.len(), 1);
+
+    let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
+    let root_secret = SecretKey::from_seed(network_id.as_bytes());
+    let root_account_id: AccountId = (&root_secret.public_key()).into();
+    let fee_source_secret = secret_from_name("A");
+    let fee_source_id: AccountId = (&fee_source_secret.public_key()).into();
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+    let total_coins = 1_000_000_000_000_000_000i64;
+    let ledger_seq = 2u32;
+
+    let genesis = genesis_header(25, base_fee, base_reserve, total_coins);
+    let genesis_hash = compute_header_hash(&genesis).expect("genesis hash");
+    let header = test_header(
+        ledger_seq,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        genesis_hash,
+    );
+
+    let (root_key, root_entry) = account_entry(
+        root_account_id.clone(),
+        0,
+        total_coins,
+        ledger_seq - 1,
+    );
+    let acc_balance = 2 * base_reserve as i64;
+    let (fee_source_key, fee_source_entry) =
+        account_entry(fee_source_id.clone(), 0, acc_balance, ledger_seq - 1);
+    let mut entries = HashMap::new();
+    entries.insert(key_bytes(&root_key), root_entry);
+    entries.insert(key_bytes(&fee_source_key), fee_source_entry);
+
+    let root_seq = account_seq(&entries, &root_account_id);
+    let fee_bump = create_fee_bump_envelope_with_signatures(
+        &fee_source_secret,
+        &root_secret,
+        root_account_id.clone(),
+        2 * base_fee,
+        base_fee,
+        1,
+        root_seq + 1,
+        &network_id,
+        false,
+        true,
+        false,
+    );
+    let (meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        fee_bump,
+    );
+    assert!(!result.success);
+
+    assert_eq!(vec![tx_meta_hash(&meta)], expected);
+}
+
+#[test]
+fn fee_bump_validity_invalid_outer_signature_meta_matches_baseline() {
+    seed(12345).expect("seed short hash");
+    let expected = load_baseline_hashes(
+        "fee bump transactions|protocol version 25|validity|bad signatures, signature invalid",
+    );
+    assert_eq!(expected.len(), 1);
+
+    let network_id = NetworkId::from_passphrase("(V) (;,,;) (V)");
+    let root_secret = SecretKey::from_seed(network_id.as_bytes());
+    let root_account_id: AccountId = (&root_secret.public_key()).into();
+    let fee_source_secret = secret_from_name("A");
+    let fee_source_id: AccountId = (&fee_source_secret.public_key()).into();
+
+    let base_fee = 100u32;
+    let base_reserve = 100_000_000u32;
+    let total_coins = 1_000_000_000_000_000_000i64;
+    let ledger_seq = 2u32;
+
+    let genesis = genesis_header(25, base_fee, base_reserve, total_coins);
+    let genesis_hash = compute_header_hash(&genesis).expect("genesis hash");
+    let header = test_header(
+        ledger_seq,
+        25,
+        base_fee,
+        base_reserve,
+        total_coins,
+        genesis_hash,
+    );
+
+    let (root_key, root_entry) = account_entry(
+        root_account_id.clone(),
+        0,
+        total_coins,
+        ledger_seq - 1,
+    );
+    let acc_balance = 2 * base_reserve as i64;
+    let (fee_source_key, fee_source_entry) =
+        account_entry(fee_source_id.clone(), 0, acc_balance, ledger_seq - 1);
+    let mut entries = HashMap::new();
+    entries.insert(key_bytes(&root_key), root_entry);
+    entries.insert(key_bytes(&fee_source_key), fee_source_entry);
+
+    let root_seq = account_seq(&entries, &root_account_id);
+    let fee_bump = create_fee_bump_envelope_with_signatures(
+        &fee_source_secret,
+        &root_secret,
+        root_account_id.clone(),
+        2 * base_fee,
+        base_fee,
+        1,
+        root_seq + 1,
+        &network_id,
+        true,
+        true,
+        true,
+    );
+    let (meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        fee_bump,
+    );
+    assert!(!result.success);
 
     assert_eq!(vec![tx_meta_hash(&meta)], expected);
 }
