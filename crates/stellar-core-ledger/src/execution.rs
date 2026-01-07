@@ -2870,9 +2870,85 @@ fn build_entry_changes_with_hot_archive(
         final_updated.insert(key_bytes, entry.clone());
     }
 
-    // For Soroban operations, use footprint order (existing behavior)
-    if let Some(fp) = footprint {
-        // Determine ordering for updates
+    // For Soroban operations with change_order, use the order from e2e_invoke (tracked via delta)
+    // This preserves the exact order that C++ stellar-core produces from the Soroban host
+    if footprint.is_some() && !change_order.is_empty() {
+        use std::collections::HashSet;
+
+        let mut emitted_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        for change_ref in change_order {
+            match change_ref {
+                stellar_core_tx::ChangeRef::Created(idx) => {
+                    if *idx < created.len() {
+                        let entry = &created[*idx];
+                        let key_bytes = entry_key_bytes(entry);
+                        if !emitted_keys.contains(&key_bytes) {
+                            emitted_keys.insert(key_bytes);
+                            changes.push(LedgerEntryChange::Created(entry.clone()));
+                        }
+                    }
+                }
+                stellar_core_tx::ChangeRef::Updated(idx) => {
+                    if *idx < updated.len() {
+                        let entry = &updated[*idx];
+                        let key_bytes = entry_key_bytes(entry);
+                        if !emitted_keys.contains(&key_bytes) {
+                            emitted_keys.insert(key_bytes.clone());
+                            if let Ok(key) = crate::delta::entry_to_key(entry) {
+                                if hot_archive_restored_keys.contains(&key) {
+                                    if let Some(final_entry) = final_updated.get(&key_bytes) {
+                                        changes.push(LedgerEntryChange::Restored(final_entry.clone()));
+                                    }
+                                } else {
+                                    if let Some(state_entry) = state_overrides
+                                        .get(&key)
+                                        .cloned()
+                                        .or_else(|| state.snapshot_entry(&key))
+                                    {
+                                        changes.push(LedgerEntryChange::State(state_entry));
+                                    }
+                                    if let Some(final_entry) = final_updated.get(&key_bytes) {
+                                        changes.push(LedgerEntryChange::Updated(final_entry.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                stellar_core_tx::ChangeRef::Deleted(idx) => {
+                    if *idx < deleted.len() {
+                        let key = &deleted[*idx];
+                        let key_bytes = key_to_bytes(key);
+                        if !emitted_keys.contains(&key_bytes) {
+                            emitted_keys.insert(key_bytes);
+                            if hot_archive_restored_keys.contains(key) {
+                                if let Some(state_entry) = state_overrides
+                                    .get(key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(key))
+                                {
+                                    changes.push(LedgerEntryChange::Restored(state_entry));
+                                }
+                                changes.push(LedgerEntryChange::Removed(key.clone()));
+                            } else {
+                                if let Some(state_entry) = state_overrides
+                                    .get(key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(key))
+                                {
+                                    changes.push(LedgerEntryChange::State(state_entry));
+                                }
+                                changes.push(LedgerEntryChange::Removed(key.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(fp) = footprint {
+        // Fallback for Soroban operations without change_order - use footprint order
+        // Determine ordering for updates - use footprint read_write order
         let mut key_order = Vec::new();
         for key in fp.read_write.iter() {
             let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
@@ -2887,7 +2963,7 @@ fn build_entry_changes_with_hot_archive(
             }
         }
 
-        // Deleted entries first - use footprint order
+        // Deleted entries ordering - use footprint order
         let mut deleted_ordered = Vec::new();
         for key in fp.read_write.iter() {
             if deleted.contains(key) && !deleted_ordered.contains(key) {
@@ -2900,29 +2976,12 @@ fn build_entry_changes_with_hot_archive(
             }
         }
 
-        for key in deleted_ordered {
-            if hot_archive_restored_keys.contains(&key) {
-                if let Some(state_entry) = state_overrides
-                    .get(&key)
-                    .cloned()
-                    .or_else(|| state.snapshot_entry(&key))
-                {
-                    changes.push(LedgerEntryChange::Restored(state_entry));
-                }
-                changes.push(LedgerEntryChange::Removed(key.clone()));
-            } else {
-                if let Some(state_entry) = state_overrides
-                    .get(&key)
-                    .cloned()
-                    .or_else(|| state.snapshot_entry(&key))
-                {
-                    changes.push(LedgerEntryChange::State(state_entry));
-                }
-                changes.push(LedgerEntryChange::Removed(key.clone()));
-            }
+        // Created entries FIRST
+        for entry in created {
+            changes.push(LedgerEntryChange::Created(entry.clone()));
         }
 
-        // Updated entries
+        // Updated entries (with STATE before each)
         for key_bytes in key_order {
             if let Some(final_entry) = final_updated.get(&key_bytes) {
                 if let Ok(key) = crate::delta::entry_to_key(final_entry) {
@@ -2944,9 +3003,27 @@ fn build_entry_changes_with_hot_archive(
             }
         }
 
-        // Created entries last
-        for entry in created {
-            changes.push(LedgerEntryChange::Created(entry.clone()));
+        // Deleted entries last
+        for key in deleted_ordered {
+            if hot_archive_restored_keys.contains(&key) {
+                if let Some(state_entry) = state_overrides
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| state.snapshot_entry(&key))
+                {
+                    changes.push(LedgerEntryChange::Restored(state_entry));
+                }
+                changes.push(LedgerEntryChange::Removed(key.clone()));
+            } else {
+                if let Some(state_entry) = state_overrides
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| state.snapshot_entry(&key))
+                {
+                    changes.push(LedgerEntryChange::State(state_entry));
+                }
+                changes.push(LedgerEntryChange::Removed(key.clone()));
+            }
         }
     } else if !change_order.is_empty() {
         // For classic operations with change_order, use it to preserve execution order
