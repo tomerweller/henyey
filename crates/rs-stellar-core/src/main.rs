@@ -293,6 +293,17 @@ enum OfflineCommands {
         #[arg(long, default_value = "2025-12-18")]
         cdp_date: String,
     },
+
+    /// Debug: inspect an account in the bucket list at a checkpoint
+    DebugBucketEntry {
+        /// Checkpoint ledger sequence
+        #[arg(long)]
+        checkpoint: u32,
+
+        /// Account ID (hex)
+        #[arg(long)]
+        account: String,
+    },
 }
 
 #[tokio::main]
@@ -1952,10 +1963,33 @@ async fn cmd_verify_execution(
                 // from CDP's (e.g., fee calculations, refunds, or execution differences).
                 // Without syncing, these differences accumulate and cause subsequent failures.
                 let cdp_changes = extract_changes_from_meta(&tx_info.meta);
+
                 let cdp_changes_vec: stellar_xdr::curr::LedgerEntryChanges = cdp_changes
                     .try_into()
                     .unwrap_or_default();
                 executor.apply_ledger_entry_changes(&cdp_changes_vec);
+
+                // Apply Soroban fee refund from CDP's sorobanMeta
+                // The refund is calculated as: declared_fee - (non_refundable + refundable + rent)
+                if let stellar_xdr::curr::TransactionMeta::V4(v4) = &tx_info.meta {
+                    if let Some(ref soroban_meta) = v4.soroban_meta {
+                        if let stellar_xdr::curr::SorobanTransactionMetaExt::V1(meta_v1) = &soroban_meta.ext {
+                            let frame = stellar_core_tx::TransactionFrame::with_network(
+                                tx_info.envelope.clone(),
+                                stellar_core_common::NetworkId(config.network_id()),
+                            );
+                            let declared_fee = frame.declared_soroban_resource_fee();
+                            let actual_charged = meta_v1.total_non_refundable_resource_fee_charged
+                                + meta_v1.total_refundable_resource_fee_charged
+                                + meta_v1.rent_fee_charged;
+                            let refund = declared_fee.saturating_sub(actual_charged);
+                            if refund > 0 {
+                                let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+                                executor.apply_fee_refund(&fee_source_id, refund);
+                            }
+                        }
+                    }
+                }
 
                 let our_succeeded = match &exec_result {
                     Ok(result) => result.success,
@@ -2120,6 +2154,134 @@ async fn cmd_verify_execution(
     if transactions_mismatched > 0 {
         println!();
         println!("WARNING: {} transactions had Phase 2 execution differences!", transactions_mismatched);
+    }
+
+    Ok(())
+}
+
+/// Debug command to inspect a specific account in the bucket list at a checkpoint.
+async fn cmd_debug_bucket_entry(
+    config: AppConfig,
+    checkpoint_seq: u32,
+    account_hex: &str,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use stellar_xdr::curr::{AccountId, PublicKey, Uint256, LedgerKey, LedgerKeyAccount, LedgerEntryData};
+    use stellar_core_bucket::{BucketList, BucketManager, BucketEntry};
+    use stellar_core_common::Hash256;
+    use stellar_core_history::{HistoryArchive, is_checkpoint_ledger};
+
+    // Parse account hex to AccountId
+    let account_bytes = hex::decode(account_hex)?;
+    if account_bytes.len() != 32 {
+        anyhow::bail!("Account hex must be 32 bytes (64 hex chars)");
+    }
+    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(
+        Uint256(account_bytes.try_into().unwrap())
+    ));
+    let account_key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+
+    println!("Debug Bucket Entry Inspection");
+    println!("==============================");
+    println!("Checkpoint: {}", checkpoint_seq);
+    println!("Account: {}", account_hex);
+    println!();
+
+    // Verify checkpoint is valid
+    if !is_checkpoint_ledger(checkpoint_seq) {
+        anyhow::bail!("{} is not a valid checkpoint ledger", checkpoint_seq);
+    }
+
+    // Create archive client from config
+    let archive = config.history.archives
+        .iter()
+        .filter(|a| a.get_enabled)
+        .find_map(|a| HistoryArchive::new(&a.url).ok())
+        .ok_or_else(|| anyhow::anyhow!("No history archives available"))?;
+
+    println!("Archive: {}", config.history.archives[0].url);
+
+    // Get bucket list hashes at this checkpoint
+    let has_entry = archive.get_checkpoint_has(checkpoint_seq).await?;
+    let bucket_hashes: Vec<Hash256> = has_entry.current_buckets
+        .iter()
+        .flat_map(|level| vec![
+            Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+            Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+        ])
+        .collect();
+
+    println!("Loading bucket list...");
+
+    // Create bucket manager and load buckets
+    let bucket_dir = tempfile::tempdir()?;
+    let bucket_manager = Arc::new(BucketManager::new(bucket_dir.path().to_path_buf())?);
+
+    // Download all required buckets
+    let all_hashes: Vec<&Hash256> = bucket_hashes.iter()
+        .filter(|h: &&Hash256| !h.is_zero())
+        .collect();
+
+    println!("Downloading {} buckets...", all_hashes.len());
+    for hash in all_hashes {
+        if bucket_manager.load_bucket(hash).is_err() {
+            let bucket_data = archive.get_bucket(hash).await?;
+            bucket_manager.import_bucket(&bucket_data)?;
+        }
+    }
+
+    // Restore bucket list
+    let bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
+        bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+    })?;
+
+    println!("Bucket list hash: {}", bucket_list.hash().to_hex());
+    println!();
+
+    // Look up the account normally
+    println!("Normal lookup result:");
+    match bucket_list.get(&account_key)? {
+        Some(entry) => {
+            if let LedgerEntryData::Account(acc) = &entry.data {
+                println!("  Balance: {}", acc.balance);
+                println!("  Sequence: {}", acc.seq_num.0);
+                println!("  Last modified: {}", entry.last_modified_ledger_seq);
+            }
+        }
+        None => {
+            println!("  NOT FOUND");
+        }
+    }
+    println!();
+
+    // Find ALL occurrences across all buckets
+    println!("All occurrences in bucket list:");
+    let occurrences = bucket_list.find_all_occurrences(&account_key)?;
+    if occurrences.is_empty() {
+        println!("  No occurrences found in any bucket");
+    } else {
+        for (level, bucket_type, entry) in &occurrences {
+            println!("  Level {} {}: ", level, bucket_type);
+            match entry {
+                BucketEntry::Live(e) |
+                BucketEntry::Init(e) => {
+                    if let LedgerEntryData::Account(acc) = &e.data {
+                        println!("    Type: Live/Init");
+                        println!("    Balance: {}", acc.balance);
+                        println!("    Sequence: {}", acc.seq_num.0);
+                        println!("    Last modified: {}", e.last_modified_ledger_seq);
+                    }
+                }
+                BucketEntry::Dead(_) => {
+                    println!("    Type: Dead (deleted)");
+                }
+                BucketEntry::Metadata(_) => {
+                    println!("    Type: Metadata (unexpected)");
+                }
+            }
+        }
     }
 
     Ok(())
@@ -2442,6 +2604,12 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
             cdp_date,
         } => {
             cmd_verify_execution(config, from, to, stop_on_error, show_diff, &cdp_url, &cdp_date).await
+        }
+        OfflineCommands::DebugBucketEntry {
+            checkpoint,
+            account,
+        } => {
+            cmd_debug_bucket_entry(config, checkpoint, &account).await
         }
     }
 }

@@ -228,10 +228,23 @@ impl BucketList {
     /// Searches from the newest (level 0) to oldest levels.
     /// Returns the first matching entry found, or None if not found.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+        self.get_with_debug(key, false)
+    }
+
+    /// Look up an entry by its key with optional debug tracing.
+    pub fn get_with_debug(&self, key: &LedgerKey, debug: bool) -> Result<Option<LedgerEntry>> {
         // Search from newest to oldest
-        for level in &self.levels {
+        for (level_idx, level) in self.levels.iter().enumerate() {
             // Check curr bucket first (newer)
             if let Some(entry) = level.curr.get(key)? {
+                if debug {
+                    tracing::info!(
+                        level = level_idx,
+                        bucket = "curr",
+                        entry_type = ?std::mem::discriminant(&entry),
+                        "Found entry in bucket list"
+                    );
+                }
                 return match entry {
                     BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
                     BucketEntry::Dead(_) => Ok(None), // Entry is deleted
@@ -241,6 +254,14 @@ impl BucketList {
 
             // Then check snap bucket
             if let Some(entry) = level.snap.get(key)? {
+                if debug {
+                    tracing::info!(
+                        level = level_idx,
+                        bucket = "snap",
+                        entry_type = ?std::mem::discriminant(&entry),
+                        "Found entry in bucket list"
+                    );
+                }
                 return match entry {
                     BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
                     BucketEntry::Dead(_) => Ok(None), // Entry is deleted
@@ -249,7 +270,27 @@ impl BucketList {
             }
         }
 
+        if debug {
+            tracing::info!("Entry not found in any bucket");
+        }
         Ok(None)
+    }
+
+    /// Debug method to find ALL occurrences of a key across all buckets.
+    /// Returns a list of (level, bucket_type, entry) for each occurrence.
+    pub fn find_all_occurrences(&self, key: &LedgerKey) -> Result<Vec<(usize, &'static str, BucketEntry)>> {
+        let mut results = Vec::new();
+
+        for (level_idx, level) in self.levels.iter().enumerate() {
+            if let Some(entry) = level.curr.get(key)? {
+                results.push((level_idx, "curr", entry));
+            }
+            if let Some(entry) = level.snap.get(key)? {
+                results.push((level_idx, "snap", entry));
+            }
+        }
+
+        Ok(results)
     }
 
     /// Return all live entries as of the current bucket list state.

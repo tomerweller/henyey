@@ -881,6 +881,18 @@ impl TransactionExecutor {
         }
     }
 
+    /// Apply a fee refund to an account WITHOUT delta tracking.
+    ///
+    /// This is used during verification to sync the fee refund from CDP's
+    /// sorobanMeta.totalFeeRefund field, which is tracked separately from entry changes.
+    pub fn apply_fee_refund(&mut self, account_id: &AccountId, refund: i64) {
+        if let Some(acc) = self.state.get_account_mut(account_id) {
+            acc.balance += refund;
+        }
+        // Commit to clear snapshots so the refund is preserved for subsequent transactions
+        self.state.commit();
+    }
+
     /// Execute a transaction.
     ///
     /// # Arguments
@@ -964,6 +976,24 @@ impl TransactionExecutor {
 
         let delta_before_fee = delta_snapshot(&self.state);
 
+        // Capture STATE entries BEFORE modifications for correct change generation
+        // This is needed because flush_modified_entries updates snapshots to current values
+        let mut state_overrides: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
+        if let Some(acc) = self.state.get_account(&fee_source_id) {
+            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: fee_source_id.clone(),
+            });
+            state_overrides.insert(key, self.state.ledger_entry_for_account(acc));
+        }
+        if fee_source_id != inner_source_id {
+            if let Some(acc) = self.state.get_account(&inner_source_id) {
+                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: inner_source_id.clone(),
+                });
+                state_overrides.insert(key, self.state.ledger_entry_for_account(acc));
+            }
+        }
+
         // Deduct fee
         if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
             acc.balance -= fee;
@@ -988,7 +1018,7 @@ impl TransactionExecutor {
         let (created, updated, deleted, _change_order) =
             delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
         let fee_changes =
-            build_entry_changes_with_state(&self.state, &created, &updated, &deleted);
+            build_entry_changes_with_state_overrides(&self.state, &created, &updated, &deleted, &state_overrides);
 
         // Commit fee changes so they persist to subsequent transactions
         self.state.commit();
