@@ -131,7 +131,7 @@ pub fn entry_to_key(entry: &LedgerEntry) -> Result<LedgerKey> {
 }
 
 /// Serialize a ledger key to bytes for use as a map key.
-fn key_to_bytes(key: &LedgerKey) -> Result<Vec<u8>> {
+pub fn key_to_bytes(key: &LedgerKey) -> Result<Vec<u8>> {
     key.to_xdr(Limits::none())
         .map_err(|e| LedgerError::Serialization(e.to_string()))
 }

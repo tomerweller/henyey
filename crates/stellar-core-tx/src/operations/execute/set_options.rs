@@ -339,7 +339,11 @@ pub fn execute_set_options(
 
     let _ = source_account_mut;
     if let Some((sponsor_id, delta)) = sponsor_delta {
+        // C++ stellar-core records sponsor changes BEFORE source changes within SetOptions.
+        // Update sponsor, then flush sponsor first (before source) to match C++ order.
         state.update_num_sponsoring(&sponsor_id, delta)?;
+        // Flush sponsor first, source will be flushed by caller or next operation
+        state.flush_account(&sponsor_id);
     }
 
     Ok(make_result(SetOptionsResultCode::Success))

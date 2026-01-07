@@ -34,10 +34,16 @@ pub struct LedgerDelta {
     ledger_seq: u32,
     /// Entries created.
     created: Vec<LedgerEntry>,
-    /// Entries updated.
+    /// Entries updated (post-state after modification).
     updated: Vec<LedgerEntry>,
+    /// Pre-state for each updated entry (state before modification).
+    /// Parallel to `updated` - same length, same indices.
+    update_states: Vec<LedgerEntry>,
     /// Entries deleted.
     deleted: Vec<LedgerKey>,
+    /// Pre-state for each deleted entry (state before deletion).
+    /// Parallel to `deleted` - same length, same indices.
+    delete_states: Vec<LedgerEntry>,
     /// Fee charged.
     fee_charged: i64,
     /// Order in which changes were recorded (for preserving execution order in meta).
@@ -51,7 +57,9 @@ impl LedgerDelta {
             ledger_seq,
             created: Vec::new(),
             updated: Vec::new(),
+            update_states: Vec::new(),
             deleted: Vec::new(),
+            delete_states: Vec::new(),
             fee_charged: 0,
             change_order: Vec::new(),
         }
@@ -69,16 +77,23 @@ impl LedgerDelta {
         self.change_order.push(ChangeRef::Created(idx));
     }
 
-    /// Record an updated entry.
-    pub fn record_update(&mut self, entry: LedgerEntry) {
+    /// Record an updated entry with its pre-state.
+    ///
+    /// `pre_state` is the entry value BEFORE the modification.
+    /// `post_state` is the entry value AFTER the modification.
+    pub fn record_update(&mut self, pre_state: LedgerEntry, post_state: LedgerEntry) {
         let idx = self.updated.len();
-        self.updated.push(entry);
+        self.update_states.push(pre_state);
+        self.updated.push(post_state);
         self.change_order.push(ChangeRef::Updated(idx));
     }
 
-    /// Record a deleted entry.
-    pub fn record_delete(&mut self, key: LedgerKey) {
+    /// Record a deleted entry with its pre-state.
+    ///
+    /// `pre_state` is the entry value BEFORE deletion.
+    pub fn record_delete(&mut self, key: LedgerKey, pre_state: LedgerEntry) {
         let idx = self.deleted.len();
+        self.delete_states.push(pre_state);
         self.deleted.push(key);
         self.change_order.push(ChangeRef::Deleted(idx));
     }
@@ -93,14 +108,26 @@ impl LedgerDelta {
         &self.created
     }
 
-    /// Get all updated entries.
+    /// Get all updated entries (post-state after modification).
     pub fn updated_entries(&self) -> &[LedgerEntry] {
         &self.updated
+    }
+
+    /// Get all update pre-states (state before modification).
+    /// Parallel to `updated_entries()` - same length, same indices.
+    pub fn update_states(&self) -> &[LedgerEntry] {
+        &self.update_states
     }
 
     /// Get all deleted keys.
     pub fn deleted_keys(&self) -> &[LedgerKey] {
         &self.deleted
+    }
+
+    /// Get all delete pre-states (state before deletion).
+    /// Parallel to `deleted_keys()` - same length, same indices.
+    pub fn delete_states(&self) -> &[LedgerEntry] {
+        &self.delete_states
     }
 
     /// Get total fee charged.
@@ -132,7 +159,9 @@ impl LedgerDelta {
 
         self.created.extend(other.created);
         self.updated.extend(other.updated);
+        self.update_states.extend(other.update_states);
         self.deleted.extend(other.deleted);
+        self.delete_states.extend(other.delete_states);
         self.fee_charged += other.fee_charged;
 
         // Merge change order with adjusted indices
@@ -252,22 +281,36 @@ fn apply_meta_changes(meta: &TransactionMeta, delta: &mut LedgerDelta) -> Result
 }
 
 /// Apply a set of ledger entry changes to the delta.
+///
+/// This is used during catchup mode where we replay historical changes.
+/// For updates and deletes, we track the preceding STATE entry as the pre-state.
 fn apply_ledger_entry_changes(changes: &LedgerEntryChanges, delta: &mut LedgerDelta) -> Result<()> {
+    let mut pending_state: Option<LedgerEntry> = None;
+
     for change in changes.iter() {
         match change {
             LedgerEntryChange::Created(entry) => {
+                pending_state = None;
                 delta.record_create(entry.clone());
             }
             LedgerEntryChange::Updated(entry) => {
-                delta.record_update(entry.clone());
+                // Use the preceding STATE as pre_state, or the entry itself as fallback
+                let pre_state = pending_state.take().unwrap_or_else(|| entry.clone());
+                delta.record_update(pre_state, entry.clone());
             }
             LedgerEntryChange::Removed(key) => {
-                delta.record_delete(key.clone());
+                // Use the preceding STATE as pre_state, or create a placeholder if missing
+                if let Some(pre_state) = pending_state.take() {
+                    delta.record_delete(key.clone(), pre_state);
+                }
+                // If no STATE preceded this REMOVED, skip recording (shouldn't happen in valid meta)
             }
-            LedgerEntryChange::State(_) => {
-                // State entries are for debugging/diagnostics
+            LedgerEntryChange::State(entry) => {
+                // Store STATE for the next UPDATED/REMOVED
+                pending_state = Some(entry.clone());
             }
             LedgerEntryChange::Restored(entry) => {
+                pending_state = None;
                 delta.record_create(entry.clone());
             }
         }
