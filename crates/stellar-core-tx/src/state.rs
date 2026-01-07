@@ -2479,6 +2479,10 @@ impl LedgerStateManager {
     ///
     /// This is needed for operations that mutate entries through `get_*_mut`,
     /// which do not call `record_update` directly.
+    ///
+    /// After flushing, snapshots are updated to the current value so that
+    /// subsequent operations within the same transaction will use the correct
+    /// STATE value (matching C++ stellar-core behavior).
     pub fn flush_modified_entries(&mut self) {
         let modified_accounts = std::mem::take(&mut self.modified_accounts);
         for key in modified_accounts {
@@ -2493,6 +2497,8 @@ impl LedgerStateManager {
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let ledger_entry = self.account_to_ledger_entry(&entry);
                             self.delta.record_update(ledger_entry);
+                            // Update snapshot to current value for subsequent operations
+                            self.account_snapshots.insert(key, Some(entry));
                         }
                     }
                 }

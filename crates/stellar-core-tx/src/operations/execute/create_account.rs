@@ -106,6 +106,10 @@ pub fn execute_create_account(
         state.apply_account_entry_sponsorship(&mut new_account, &sponsor, account_multiplier)?;
     }
 
+    // Flush modified entries (source account, sponsor account) BEFORE creating the new account
+    // to ensure the change order matches C++ stellar-core: updates come before creates.
+    state.flush_modified_entries();
+
     state.create_account(new_account);
 
     Ok(make_result(CreateAccountResultCode::Success))
