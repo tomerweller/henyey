@@ -791,6 +791,8 @@ impl TransactionExecutor {
                 let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
 
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
+                // Try to load TTL entry - it may not exist for newly created entries
+                // or in older bucket lists before TTL tracking was added
                 self.load_entry(snapshot, &ttl_key)?;
             }
             _ => {}

@@ -282,9 +282,11 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
                     );
                 }
             } else {
-                tracing::warn!(
+                // TTL entries may not be present in older bucket lists or for newly created entries
+                // that haven't been checkpointed yet. This is not an error condition.
+                tracing::debug!(
                     key_type = if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
-                    "Soroban entry has NO TTL record"
+                    "Soroban entry has no TTL record in bucket list"
                 );
             }
             ttl

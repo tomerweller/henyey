@@ -212,12 +212,29 @@ pub fn replay_ledger_with_execution(
 
     let snapshot = LedgerSnapshot::empty(header.ledger_seq);
     let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
+    // Also include hot archive bucket list for archived entries and their TTLs
+    let hot_archive_ref = hot_archive_bucket_list
+        .as_ref()
+        .map(|ha| std::sync::Arc::new(std::sync::RwLock::new((*ha).clone())));
     let lookup_fn = std::sync::Arc::new(move |key: &LedgerKey| {
-        bucket_list_ref
+        // First try the live bucket list
+        if let Some(entry) = bucket_list_ref
             .read()
             .map_err(|_| LedgerError::Snapshot("bucket list lock poisoned".to_string()))?
             .get(key)
-            .map_err(LedgerError::Bucket)
+            .map_err(LedgerError::Bucket)?
+        {
+            return Ok(Some(entry));
+        }
+        // If not found and we have a hot archive, search there for archived entries and TTLs
+        if let Some(ref hot_archive) = hot_archive_ref {
+            return hot_archive
+                .read()
+                .map_err(|_| LedgerError::Snapshot("hot archive lock poisoned".to_string()))?
+                .get(key)
+                .map_err(LedgerError::Bucket);
+        }
+        Ok(None)
     });
     let snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
 
