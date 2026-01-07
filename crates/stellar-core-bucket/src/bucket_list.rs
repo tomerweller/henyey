@@ -98,18 +98,19 @@ impl BucketLevel {
         }
     }
 
-    /// Snap the current bucket: move curr→snap, return the old curr.
+    /// Snap the current bucket to become the new snapshot.
     ///
-    /// This matches C++ stellar-core's BucketLevel::snap() which:
-    /// 1. Moves curr to snap (replacing old snap)
-    /// 2. Sets curr to empty
-    /// 3. Returns the new snap (which is the old curr)
-    ///
-    /// The returned bucket is what flows to the next level during a spill.
+    /// This implements the bucket list spill behavior:
+    /// - Returns the OLD snap (which flows to the next level)
+    /// - Sets snap = old curr (curr becomes the new snap)
+    /// - Clears curr (ready for new entries)
     fn snap(&mut self) -> Bucket {
-        let old_curr = std::mem::replace(&mut self.curr, Bucket::empty());
-        self.snap = old_curr.clone();
-        old_curr
+        // Take old snap - this is what flows to the next level
+        let old_snap = std::mem::take(&mut self.snap);
+        // Move curr to snap (curr becomes empty via replace)
+        self.snap = std::mem::replace(&mut self.curr, Bucket::empty());
+        // Return old snap for merging into next level
+        old_snap
     }
 
     /// Prepare the next bucket for this level with explicit INIT normalization control.
@@ -409,25 +410,24 @@ impl BucketList {
         // Step 1: Process spills from highest level down to level 1
         // This matches C++ stellar-core's BucketListBase::addBatchInternal
         //
-        // The key insight is that snap() moves curr→snap and returns the OLD curr.
-        // This OLD curr (not old snap!) is what flows to the next level.
+        // The key insight is that snap() moves curr→snap and returns the OLD snap.
+        // This OLD snap is what flows to the next level.
         //
         // By processing from highest to lowest, we ensure each level's curr is
         // available to be snapped before any modifications occur.
         //
         // When multiple levels spill at once (e.g., at checkpoint boundaries),
-        // the snapped levels have empty currs, so the merge result is just
-        // the incoming spill. This is correct C++ behavior.
+        // entries cascade up through the levels correctly.
 
         for i in (1..BUCKET_LIST_LEVELS).rev() {
             if Self::level_should_spill(ledger_seq, i - 1) {
-                // Snap level i-1: moves curr→snap, returns OLD curr (new snap)
-                // This is what flows to level i
-                let spilling_curr = self.levels[i - 1].snap();
+                // Snap level i-1: moves curr→snap, returns OLD snap
+                // This OLD snap is what flows to level i
+                let spilling_snap = self.levels[i - 1].snap();
 
                 tracing::debug!(
                     level = i - 1,
-                    spilling_curr_hash = %spilling_curr.hash(),
+                    spilling_snap_hash = %spilling_snap.hash(),
                     new_snap_hash = %self.levels[i - 1].snap.hash(),
                     "Level snapped"
                 );
@@ -435,7 +435,7 @@ impl BucketList {
                 // Commit any pending merge at level i (promotes next→curr)
                 self.levels[i].commit();
 
-                // Prepare level i: merge curr with the spilling_curr from level i-1
+                // Prepare level i: merge curr with the spilling_snap from level i-1
                 // In C++ stellar-core, INIT normalization is tied to !keepDeadEntries:
                 // - Levels 0-9: keep_dead=true, so normalize_init=false (INIT stays INIT)
                 // - Level 10: keep_dead=false, so normalize_init=true (INIT becomes LIVE)
@@ -444,7 +444,7 @@ impl BucketList {
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
                     protocol_version,
-                    spilling_curr,
+                    spilling_snap,
                     keep_dead,
                     normalize_init,
                 )?;

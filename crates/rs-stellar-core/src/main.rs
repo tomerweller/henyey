@@ -1925,6 +1925,9 @@ async fn cmd_verify_execution(
                 phase1_fee_mismatches += phase1_mismatches as u32;
             }
 
+            // Track accounts that receive Soroban refunds so we can update the bucket list
+            let mut soroban_refund_accounts: Vec<stellar_xdr::curr::AccountId> = Vec::new();
+
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
@@ -1979,13 +1982,16 @@ async fn cmd_verify_execution(
                                 stellar_core_common::NetworkId(config.network_id()),
                             );
                             let declared_fee = frame.declared_soroban_resource_fee();
+                            // Note: rent_fee_charged is NOT included in actual_charged for refund calculation
+                            // The rent is paid separately from the refundable resource fee pool
                             let actual_charged = meta_v1.total_non_refundable_resource_fee_charged
-                                + meta_v1.total_refundable_resource_fee_charged
-                                + meta_v1.rent_fee_charged;
+                                + meta_v1.total_refundable_resource_fee_charged;
                             let refund = declared_fee.saturating_sub(actual_charged);
                             if refund > 0 {
                                 let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
                                 executor.apply_fee_refund(&fee_source_id, refund);
+                                // Track this account so we can update the bucket list with the refund
+                                soroban_refund_accounts.push(fee_source_id);
                             }
                         }
                     }
@@ -2102,9 +2108,44 @@ async fn cmd_verify_execution(
                 let upgrade_metas = extract_upgrade_metas(&lcm);
                 let (upgrade_init, upgrade_live, upgrade_dead) = extract_upgrade_changes(&upgrade_metas)?;
 
-                // Combine all changes
-                let all_init: Vec<LedgerEntry> = init_entries.into_iter().chain(upgrade_init).collect();
-                let all_live: Vec<LedgerEntry> = live_entries.into_iter().chain(upgrade_live).collect();
+                // Get current state of accounts that received Soroban refunds.
+                // These need to be included in the bucket list update because the refund
+                // is not captured in tx_changes_after - it's calculated separately.
+                let mut refund_entries: Vec<LedgerEntry> = Vec::new();
+                let mut refund_keys: std::collections::HashSet<LedgerKey> = std::collections::HashSet::new();
+                for account_id in &soroban_refund_accounts {
+                    if let Some(acc) = executor.state().get_account(account_id) {
+                        let entry = executor.state().ledger_entry_for_account(acc);
+                        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                            account_id: account_id.clone(),
+                        });
+                        refund_keys.insert(key);
+                        refund_entries.push(entry);
+                    }
+                }
+
+                // Combine all changes, but filter out CDP entries for accounts that received refunds
+                // (the refund entry will have the correct final balance)
+                // We need to filter both init_entries and live_entries in case the account
+                // was created in the same ledger or updated.
+                let filtered_init: Vec<LedgerEntry> = init_entries.into_iter()
+                    .chain(upgrade_init)
+                    .filter(|entry| {
+                        let key = stellar_core_ledger::entry_to_key(entry).unwrap();
+                        !refund_keys.contains(&key)
+                    })
+                    .collect();
+                let filtered_live: Vec<LedgerEntry> = live_entries.into_iter()
+                    .chain(upgrade_live)
+                    .filter(|entry| {
+                        let key = stellar_core_ledger::entry_to_key(entry).unwrap();
+                        !refund_keys.contains(&key)
+                    })
+                    .collect();
+                let all_init: Vec<LedgerEntry> = filtered_init;
+                let all_live: Vec<LedgerEntry> = filtered_live.into_iter()
+                    .chain(refund_entries)
+                    .collect();
                 let all_dead: Vec<LedgerKey> = dead_entries.into_iter().chain(upgrade_dead).collect();
 
                 // Apply to bucket list
