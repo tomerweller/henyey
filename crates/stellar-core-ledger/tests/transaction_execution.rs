@@ -841,7 +841,6 @@ fn test_fee_bump_result_encoding() {
         &stellar_core_tx::TransactionFrame::with_network(envelope, NetworkId::testnet()),
         &NetworkId::testnet(),
         &exec,
-        25,
     )
     .expect("build tx result");
 

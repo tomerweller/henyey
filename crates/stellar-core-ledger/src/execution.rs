@@ -352,8 +352,6 @@ pub struct TransactionExecutionResult {
     pub error: Option<String>,
     /// Failure reason for mapping to XDR result codes.
     pub failure: Option<ExecutionFailure>,
-    /// Whether the failure originates from the inner transaction (fee bump only).
-    pub failure_is_inner: bool,
     /// Transaction meta (for ledger close meta).
     pub tx_meta: Option<TransactionMeta>,
     /// Fee processing changes (for ledger close meta).
@@ -1009,7 +1007,6 @@ impl TransactionExecutor {
         deduct_fee: bool,
     ) -> Result<TransactionExecutionResult> {
         let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
-        let is_fee_bump = frame.is_fee_bump();
         let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
 
@@ -1025,7 +1022,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Invalid transaction structure".into()),
                 failure: Some(failure),
-                failure_is_inner: false,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1040,7 +1036,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Source account not found".into()),
                 failure: Some(ExecutionFailure::NoAccount),
-                failure_is_inner: false,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1054,7 +1049,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Source account not found".into()),
                 failure: Some(ExecutionFailure::NoAccount),
-                failure_is_inner: is_fee_bump,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1071,7 +1065,6 @@ impl TransactionExecutor {
                     operation_results: vec![],
                     error: Some("Source account not found".into()),
                     failure: Some(ExecutionFailure::NoAccount),
-                    failure_is_inner: is_fee_bump,
                     tx_meta: None,
                     fee_changes: None,
                 post_fee_changes: None,
@@ -1088,7 +1081,6 @@ impl TransactionExecutor {
                     operation_results: vec![],
                     error: Some("Source account not found".into()),
                     failure: Some(ExecutionFailure::NoAccount),
-                    failure_is_inner: is_fee_bump,
                     tx_meta: None,
                     fee_changes: None,
                 post_fee_changes: None,
@@ -1109,7 +1101,6 @@ impl TransactionExecutor {
                         operation_results: vec![],
                         error: Some("Source account not found".into()),
                         failure: Some(ExecutionFailure::NoAccount),
-                        failure_is_inner: is_fee_bump,
                         tx_meta: None,
                         fee_changes: None,
                 post_fee_changes: None,
@@ -1128,7 +1119,6 @@ impl TransactionExecutor {
                     operation_results: vec![],
                     error: Some("Insufficient fee".into()),
                     failure: Some(ExecutionFailure::InsufficientFee),
-                    failure_is_inner: false,
                     tx_meta: None,
                     fee_changes: None,
                 post_fee_changes: None,
@@ -1141,7 +1131,6 @@ impl TransactionExecutor {
                     operation_results: vec![],
                     error: Some("Insufficient fee".into()),
                     failure: Some(ExecutionFailure::InsufficientFee),
-                    failure_is_inner: false,
                     tx_meta: None,
                     fee_changes: None,
                 post_fee_changes: None,
@@ -1154,7 +1143,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Insufficient fee".into()),
                 failure: Some(ExecutionFailure::InsufficientFee),
-                failure_is_inner: false,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1181,7 +1169,6 @@ impl TransactionExecutor {
                     validation::ValidationError::TooLate { .. } => ExecutionFailure::TooLate,
                     _ => ExecutionFailure::OperationFailed,
                 }),
-                failure_is_inner: is_fee_bump,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1206,7 +1193,6 @@ impl TransactionExecutor {
                     }
                     _ => ExecutionFailure::OperationFailed,
                 }),
-                failure_is_inner: is_fee_bump,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1222,7 +1208,6 @@ impl TransactionExecutor {
                         operation_results: vec![],
                         error: Some("Minimum sequence number not met".into()),
                         failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                        failure_is_inner: is_fee_bump,
                         tx_meta: None,
                         fee_changes: None,
                 post_fee_changes: None,
@@ -1241,7 +1226,6 @@ impl TransactionExecutor {
                             operation_results: vec![],
                             error: Some("Minimum sequence age unavailable".into()),
                             failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                            failure_is_inner: is_fee_bump,
                             tx_meta: None,
                             fee_changes: None,
                 post_fee_changes: None,
@@ -1257,7 +1241,6 @@ impl TransactionExecutor {
                         operation_results: vec![],
                         error: Some("Minimum sequence age not met".into()),
                         failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                        failure_is_inner: is_fee_bump,
                         tx_meta: None,
                         fee_changes: None,
                 post_fee_changes: None,
@@ -1274,7 +1257,6 @@ impl TransactionExecutor {
                         operation_results: vec![],
                         error: Some("Minimum sequence ledger gap not met".into()),
                         failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                        failure_is_inner: is_fee_bump,
                         tx_meta: None,
                         fee_changes: None,
                 post_fee_changes: None,
@@ -1293,7 +1275,6 @@ impl TransactionExecutor {
                     operation_results: vec![],
                     error: Some("Bad sequence: equals starting sequence".into()),
                     failure: Some(ExecutionFailure::BadSequence),
-                    failure_is_inner: is_fee_bump,
                     tx_meta: None,
                     fee_changes: None,
                     post_fee_changes: None,
@@ -1307,7 +1288,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Bad sequence: sequence overflow".into()),
                 failure: Some(ExecutionFailure::BadSequence),
-                failure_is_inner: is_fee_bump,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1324,18 +1304,11 @@ impl TransactionExecutor {
                     frame.sequence_number()
                 )),
                 failure: Some(ExecutionFailure::BadSequence),
-                failure_is_inner: is_fee_bump,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
             });
         }
-
-        let inner_sig_invalid = is_fee_bump
-            && frame
-                .inner_signatures()
-                .iter()
-                .any(|sig| sig.signature.0.len() != 64);
 
         // Basic signature validation (master key only).
         if validation::validate_signatures(&frame, &validation_ctx).is_err() {
@@ -1345,7 +1318,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Invalid signature".into()),
                 failure: Some(ExecutionFailure::InvalidSignature),
-                failure_is_inner: inner_sig_invalid,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1368,7 +1340,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Invalid signature".into()),
                 failure: Some(ExecutionFailure::InvalidSignature),
-                failure_is_inner: false,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1390,7 +1361,6 @@ impl TransactionExecutor {
                     operation_results: vec![],
                     error: Some("Invalid inner signature".into()),
                     failure: Some(ExecutionFailure::InvalidSignature),
-                    failure_is_inner: true,
                     tx_meta: None,
                     fee_changes: None,
                 post_fee_changes: None,
@@ -1413,7 +1383,6 @@ impl TransactionExecutor {
                 operation_results: vec![],
                 error: Some("Invalid signature".into()),
                 failure: Some(ExecutionFailure::InvalidSignature),
-                failure_is_inner: false,
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
@@ -1439,7 +1408,6 @@ impl TransactionExecutor {
                         operation_results: vec![],
                         error: Some("Missing extra signer".into()),
                         failure: Some(ExecutionFailure::BadAuthExtra),
-                        failure_is_inner: is_fee_bump,
                         tx_meta: None,
                         fee_changes: None,
                 post_fee_changes: None,
@@ -1546,12 +1514,12 @@ impl TransactionExecutor {
         let mut seq_deleted = Vec::new();
 
         if self.protocol_version >= 10 {
-            // For fee bump transactions, C++ stellar-core's FeeBumpTransactionFrame::apply()
-            // creates a nested LedgerTxn and calls removeOneTimeSignerKeyFromFeeSource()
-            // followed by pushTxChangesBefore(). This creates a STATE/UPDATED pair for the
-            // fee source even if nothing changed. Capture the fee source state BEFORE the
-            // inner sequence bump to match this behavior.
-            let fee_bump_wrapper_changes = if frame.is_fee_bump() {
+            // For fee bump transactions in two-phase mode, C++ stellar-core's
+            // FeeBumpTransactionFrame::apply() creates a nested LedgerTxn and calls
+            // removeOneTimeSignerKeyFromFeeSource() followed by pushTxChangesBefore().
+            // This creates a STATE/UPDATED pair for the fee source even if nothing changed.
+            // We capture the fee source state BEFORE sequence bump to match this behavior.
+            let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
                 let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                     account_id: fee_source_id.clone(),
                 });
@@ -1606,25 +1574,18 @@ impl TransactionExecutor {
 
             // Merge all changes into tx_changes_before.
             // Order: fee_bump_wrapper_changes (fee source pre-seq-bump), fee_source_changes
-            // (if different), then seq_changes. For non-fee-bump transactions, merge fee_changes
-            // into tx_changes_before to match upstream classic behavior.
+            // (if different), fee_changes, then seq_changes.
             let mut combined = Vec::with_capacity(
-                fee_bump_wrapper_changes.len()
-                    + fee_source_changes.len()
-                    + fee_changes.len()
-                    + seq_changes.len(),
+                fee_bump_wrapper_changes.len() + fee_source_changes.len() + fee_changes.len() + seq_changes.len()
             );
             combined.extend(fee_bump_wrapper_changes);
             combined.extend(fee_source_changes);
-            if frame.is_fee_bump() {
-                combined.extend(seq_changes.iter().cloned());
-            } else {
-                combined.extend(fee_changes.iter().cloned());
-                combined.extend(seq_changes.iter().cloned());
-                // Clear fee_changes since they're now merged into tx_changes_before
-                fee_changes = empty_entry_changes();
-            }
+            combined.extend(fee_changes.iter().cloned());
+            combined.extend(seq_changes.iter().cloned());
             tx_changes_before = combined.try_into().unwrap_or_default();
+
+            // Clear fee_changes since they're now merged into tx_changes_before
+            fee_changes = empty_entry_changes();
         }
         // Persist sequence updates so failed transactions still consume sequence numbers.
         if self.protocol_version >= 10 {
@@ -1675,7 +1636,6 @@ impl TransactionExecutor {
         let mut soroban_return_value = None;
         let mut all_success = true;
         let mut failure = None;
-        let mut failure_is_inner = false;
         let mut orderbook_loaded = false;
         let op_invariant_snapshot = self
             .op_invariants
@@ -1766,14 +1726,12 @@ impl TransactionExecutor {
                                     op_result = insufficient_refundable_fee_result(op);
                                     all_success = false;
                                     failure = Some(ExecutionFailure::OperationFailed);
-                                    failure_is_inner = is_fee_bump;
                                 }
                             }
                         }
                         // Check if operation succeeded
                         if !is_operation_success(&op_result) {
                             all_success = false;
-                            failure_is_inner = is_fee_bump;
                             if matches!(op_result, OperationResult::OpNotSupported) {
                                 failure = Some(ExecutionFailure::NotSupported);
                             }
@@ -1850,7 +1808,6 @@ impl TransactionExecutor {
                         op_changes.push(empty_entry_changes());
                         op_events.push(Vec::new());
                         failure = Some(ExecutionFailure::NotSupported);
-                        failure_is_inner = is_fee_bump;
                     }
                 }
 
@@ -1863,7 +1820,6 @@ impl TransactionExecutor {
         {
             all_success = false;
             failure = Some(ExecutionFailure::BadSponsorship);
-            failure_is_inner = is_fee_bump;
         }
 
         if !all_success {
@@ -1946,7 +1902,6 @@ impl TransactionExecutor {
             } else {
                 Some(failure.unwrap_or(ExecutionFailure::OperationFailed))
             },
-            failure_is_inner,
             tx_meta: Some(tx_meta),
             fee_changes: Some(fee_changes),
             post_fee_changes: Some(post_fee_changes),
@@ -3064,7 +3019,6 @@ pub fn build_tx_result_pair(
     frame: &TransactionFrame,
     network_id: &NetworkId,
     exec: &TransactionExecutionResult,
-    protocol_version: u32,
 ) -> Result<TransactionResultPair> {
     let tx_hash = frame
         .hash(network_id)
@@ -3081,16 +3035,10 @@ pub fn build_tx_result_pair(
             InnerTransactionResultResult::TxFailed(op_results.clone().try_into().unwrap_or_default())
         };
 
-        let inner_fee_charged = if protocol_version >= 25 {
-            0
-        } else {
-            frame.inner_fee() as i64
-        };
-
         let inner_pair = InnerTransactionResultPair {
             transaction_hash: stellar_xdr::curr::Hash(inner_hash.0),
             result: InnerTransactionResult {
-                fee_charged: inner_fee_charged,
+                fee_charged: frame.inner_fee() as i64,
                 result: inner_result,
                 ext: InnerTransactionResultExt::V0,
             },
@@ -3098,12 +3046,8 @@ pub fn build_tx_result_pair(
 
         let result = if exec.success {
             TransactionResultResult::TxFeeBumpInnerSuccess(inner_pair)
-        } else if exec.failure_is_inner {
-            TransactionResultResult::TxFeeBumpInnerFailed(inner_pair)
-        } else if let Some(failure) = &exec.failure {
-            map_failure_to_result(failure)
         } else {
-            TransactionResultResult::TxFailed(op_results.clone().try_into().unwrap_or_default())
+            TransactionResultResult::TxFeeBumpInnerFailed(inner_pair)
         };
 
         TransactionResult {
@@ -3529,12 +3473,7 @@ pub fn execute_transaction_set_with_fee_mode(
             deduct_fee,
         )?;
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
-        let tx_result = build_tx_result_pair(
-            &frame,
-            &executor.network_id,
-            &result,
-            executor.protocol_version,
-        )?;
+        let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result)?;
         let tx_meta = result
             .tx_meta
             .clone()
