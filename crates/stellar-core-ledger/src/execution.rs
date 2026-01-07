@@ -1536,6 +1536,15 @@ impl TransactionExecutor {
             };
 
             let delta_before_seq = delta_snapshot(&self.state);
+            // Capture the current account state BEFORE modification for STATE entry.
+            // We can't use snapshot_entry() here because the snapshot might not exist yet.
+            // After flush_modified_entries, the snapshot is updated to the post-modification
+            // value, so we need to save the original here.
+            let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: inner_source_id.clone(),
+            });
+            let seq_state_override = self.state.get_entry(&inner_source_key);
+
             if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
                 acc.seq_num.0 += 1;
                 stellar_core_tx::state::update_account_seq_info(
@@ -1548,8 +1557,13 @@ impl TransactionExecutor {
             let delta_after_seq = delta_snapshot(&self.state);
             let (created, updated, deleted, _change_order) =
                 delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
+            // Use the pre-modification snapshot for STATE entry via state_overrides.
+            let mut seq_state_overrides = HashMap::new();
+            if let Some(entry) = seq_state_override {
+                seq_state_overrides.insert(inner_source_key.clone(), entry);
+            }
             let seq_changes =
-                build_entry_changes_with_state(&self.state, &created, &updated, &deleted);
+                build_entry_changes_with_state_overrides(&self.state, &created, &updated, &deleted, &seq_state_overrides);
             seq_created = created;
             seq_updated = updated;
             seq_deleted = deleted;
