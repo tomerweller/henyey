@@ -80,7 +80,7 @@ pub use frame::{muxed_to_account_id, muxed_to_ed25519, TransactionFrame};
 // Re-export apply types and functions
 pub use apply::{
     apply_fee_only, apply_from_history, apply_transaction_set_from_history,
-    account_id_to_key, entry_to_key, ApplyContext, AssetKey, LedgerDelta,
+    account_id_to_key, entry_to_key, ApplyContext, AssetKey, ChangeRef, LedgerDelta,
 };
 
 // Re-export result types

@@ -15,6 +15,18 @@ use crate::frame::TransactionFrame;
 use crate::result::{TxApplyResult, TxResultWrapper};
 use crate::Result;
 
+/// Represents the type and index of a change in the delta.
+/// Used to preserve execution order across different change types.
+#[derive(Clone, Copy, Debug)]
+pub enum ChangeRef {
+    /// A created entry (index into created vector)
+    Created(usize),
+    /// An updated entry (index into updated vector)
+    Updated(usize),
+    /// A deleted entry (index into deleted vector)
+    Deleted(usize),
+}
+
 /// Delta type alias for state changes.
 #[derive(Clone)]
 pub struct LedgerDelta {
@@ -28,6 +40,8 @@ pub struct LedgerDelta {
     deleted: Vec<LedgerKey>,
     /// Fee charged.
     fee_charged: i64,
+    /// Order in which changes were recorded (for preserving execution order in meta).
+    change_order: Vec<ChangeRef>,
 }
 
 impl LedgerDelta {
@@ -39,6 +53,7 @@ impl LedgerDelta {
             updated: Vec::new(),
             deleted: Vec::new(),
             fee_charged: 0,
+            change_order: Vec::new(),
         }
     }
 
@@ -49,17 +64,23 @@ impl LedgerDelta {
 
     /// Record a created entry.
     pub fn record_create(&mut self, entry: LedgerEntry) {
+        let idx = self.created.len();
         self.created.push(entry);
+        self.change_order.push(ChangeRef::Created(idx));
     }
 
     /// Record an updated entry.
     pub fn record_update(&mut self, entry: LedgerEntry) {
+        let idx = self.updated.len();
         self.updated.push(entry);
+        self.change_order.push(ChangeRef::Updated(idx));
     }
 
     /// Record a deleted entry.
     pub fn record_delete(&mut self, key: LedgerKey) {
+        let idx = self.deleted.len();
         self.deleted.push(key);
+        self.change_order.push(ChangeRef::Deleted(idx));
     }
 
     /// Add fee charged.
@@ -87,6 +108,11 @@ impl LedgerDelta {
         self.fee_charged
     }
 
+    /// Get the change order (for preserving execution order in meta).
+    pub fn change_order(&self) -> &[ChangeRef] {
+        &self.change_order
+    }
+
     /// Get the total number of changes.
     pub fn change_count(&self) -> usize {
         self.created.len() + self.updated.len() + self.deleted.len()
@@ -99,10 +125,25 @@ impl LedgerDelta {
 
     /// Merge another delta into this one.
     pub fn merge(&mut self, other: LedgerDelta) {
+        // Track offsets for adjusting indices in change_order
+        let created_offset = self.created.len();
+        let updated_offset = self.updated.len();
+        let deleted_offset = self.deleted.len();
+
         self.created.extend(other.created);
         self.updated.extend(other.updated);
         self.deleted.extend(other.deleted);
         self.fee_charged += other.fee_charged;
+
+        // Merge change order with adjusted indices
+        for change_ref in other.change_order {
+            let adjusted = match change_ref {
+                ChangeRef::Created(idx) => ChangeRef::Created(idx + created_offset),
+                ChangeRef::Updated(idx) => ChangeRef::Updated(idx + updated_offset),
+                ChangeRef::Deleted(idx) => ChangeRef::Deleted(idx + deleted_offset),
+            };
+            self.change_order.push(adjusted);
+        }
     }
 }
 
