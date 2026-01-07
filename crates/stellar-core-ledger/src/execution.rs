@@ -1492,7 +1492,7 @@ impl TransactionExecutor {
         let mut fee_created = Vec::new();
         let mut fee_updated = Vec::new();
         let mut fee_deleted = Vec::new();
-        let mut fee_changes = if !deduct_fee || fee == 0 {
+        let fee_changes = if !deduct_fee || fee == 0 {
             empty_entry_changes()
         } else {
             let delta_before_fee = delta_snapshot(&self.state);
@@ -1534,8 +1534,7 @@ impl TransactionExecutor {
             let fee_changes =
                 build_entry_changes_with_state(&self.state, &fee_created, &fee_updated, &fee_deleted);
 
-            // Fee processing happens before sequence updates in upstream. Commit here so
-            // txChangesBefore reflects the post-fee account state.
+            // Commit fee updates so txChangesBefore reflects the post-fee account state.
             self.state.commit();
             fee_changes
         };
@@ -1618,20 +1617,16 @@ impl TransactionExecutor {
                 vec![]
             };
 
-            // Merge all changes into tx_changes_before.
+            // Merge changes into tx_changes_before.
             // Order: fee_bump_wrapper_changes (fee source pre-seq-bump), fee_source_changes
-            // (if different), fee_changes, then seq_changes.
+            // (if different), then seq_changes. Fee changes remain in fee_processing.
             let mut combined = Vec::with_capacity(
-                fee_bump_wrapper_changes.len() + fee_source_changes.len() + fee_changes.len() + seq_changes.len()
+                fee_bump_wrapper_changes.len() + fee_source_changes.len() + seq_changes.len()
             );
             combined.extend(fee_bump_wrapper_changes);
             combined.extend(fee_source_changes);
-            combined.extend(fee_changes.iter().cloned());
             combined.extend(seq_changes.iter().cloned());
             tx_changes_before = combined.try_into().unwrap_or_default();
-
-            // Clear fee_changes since they're now merged into tx_changes_before
-            fee_changes = empty_entry_changes();
         }
         // Persist sequence updates so failed transactions still consume sequence numbers.
         if self.protocol_version >= 10 {
@@ -1670,6 +1665,7 @@ impl TransactionExecutor {
         // are available to the Soroban host.
         if let Some(ref data) = soroban_data {
             self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
+            self.clear_archived_entries_from_state(data);
         }
 
         self.state.clear_sponsorship_stack();
@@ -2434,19 +2430,6 @@ fn get_ttl_key_for_entry(key: &LedgerKey) -> Option<LedgerKey> {
     }
 }
 
-/// Compute the key hash for a Soroban entry (for matching with TTL entries).
-fn compute_entry_key_hash(entry: &LedgerEntry) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-
-    if let Ok(key) = crate::delta::entry_to_key(entry) {
-        if let Ok(bytes) = key.to_xdr(Limits::none()) {
-            let hash = Sha256::digest(&bytes);
-            return hash.to_vec();
-        }
-    }
-    Vec::new()
-}
-
 fn emit_classic_events_for_operation(
     op_event_manager: &mut OpEventManager,
     op: &Operation,
@@ -2855,10 +2838,6 @@ fn build_entry_changes_with_hot_archive(
             .ok()
             .and_then(|key| key.to_xdr(Limits::none()).ok())
             .unwrap_or_default()
-    }
-
-    fn key_to_bytes(key: &LedgerKey) -> Vec<u8> {
-        key.to_xdr(Limits::none()).unwrap_or_default()
     }
 
     let mut changes: Vec<LedgerEntryChange> = Vec::new();

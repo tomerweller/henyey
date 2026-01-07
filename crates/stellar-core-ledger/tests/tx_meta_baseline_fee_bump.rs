@@ -10,9 +10,10 @@ use stellar_core_ledger::execution::execute_transaction_set;
 use stellar_core_ledger::{compute_header_hash, entry_to_key, LedgerDelta, SnapshotBuilder, SnapshotHandle};
 use stellar_core_tx::{soroban::SorobanConfig, ClassicEventConfig};
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, FeeBumpTransaction, FeeBumpTransactionEnvelope,
-    FeeBumpTransactionInnerTx, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader,
-    LedgerKey, LedgerKeyAccount, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+    AccountEntry, AccountEntryExt, AccountId, CreateAccountOp, FeeBumpTransaction,
+    FeeBumpTransactionEnvelope, FeeBumpTransactionInnerTx, LedgerEntry, LedgerEntryData,
+    LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyAccount, MuxedAccount, Operation,
+    OperationBody, PaymentOp, Preconditions,
     PublicKey, SequenceNumber, SetOptionsOp, Signature as XdrSignature, SignatureHint, String32,
     Thresholds, TimePoint, Transaction, TransactionEnvelope, TransactionExt, TransactionMeta,
     TransactionResultMetaV1, TransactionV1Envelope, Uint256, VecM, WriteXdr, Limits,
@@ -220,6 +221,43 @@ fn create_set_options_envelope(
     envelope
 }
 
+fn create_account_envelope(
+    source: &SecretKey,
+    destination: AccountId,
+    starting_balance: i64,
+    base_fee: u32,
+    sequence: i64,
+    network_id: &NetworkId,
+) -> TransactionEnvelope {
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(sequence),
+        cond: Preconditions::None,
+        memo: stellar_xdr::curr::Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let source_sig = sign_envelope(&envelope, source, network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![source_sig].try_into().unwrap();
+    }
+    envelope
+}
+
 fn create_fee_bump_envelope(
     fee_source: &SecretKey,
     inner_source: &SecretKey,
@@ -233,7 +271,7 @@ fn create_fee_bump_envelope(
     let payment_op = Operation {
         source_account: None,
         body: OperationBody::Payment(PaymentOp {
-            destination,
+            destination: muxed_from_account_id(&destination),
             asset: stellar_xdr::curr::Asset::Native,
             amount,
         }),
@@ -260,7 +298,7 @@ fn create_fee_bump_envelope(
     let fee_source_id: AccountId = (&fee_source.public_key()).into();
     let fee_bump = FeeBumpTransaction {
         fee_source: muxed_from_account_id(&fee_source_id),
-        fee: outer_fee,
+        fee: outer_fee as i64,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
         ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
     };
@@ -387,14 +425,31 @@ fn fee_bump_inner_tx_failure_tx_level_meta_matches_baseline() {
         total_coins,
         ledger_seq - 1,
     );
-    let acc_balance = 2 * base_reserve as i64 + 3 * base_fee as i64;
-    let (fee_source_key, fee_source_entry) =
-        account_entry(fee_source_id.clone(), 0, acc_balance, ledger_seq - 1);
     let mut entries = HashMap::new();
     entries.insert(key_bytes(&root_key), root_entry);
-    entries.insert(key_bytes(&fee_source_key), fee_source_entry);
 
     let mut hashes = Vec::new();
+
+    let acc_balance = 2 * base_reserve as i64 + 3 * base_fee as i64;
+    let create_account = create_account_envelope(
+        &root_secret,
+        fee_source_id.clone(),
+        acc_balance,
+        base_fee,
+        1,
+        &network_id,
+    );
+    let (meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        create_account,
+    );
+    assert!(result.success);
+    hashes.push(tx_meta_hash(&meta));
 
     header = advance_header(&header, total_coins);
     let fee_source_seq = account_seq(&entries, &fee_source_id);
@@ -405,12 +460,18 @@ fn fee_bump_inner_tx_failure_tx_level_meta_matches_baseline() {
         fee_source_seq + 1,
         &network_id,
     );
-    let (meta, result) =
-        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, set_options);
+    let (meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        set_options,
+    );
     assert!(result.success);
     hashes.push(tx_meta_hash(&meta));
 
-    header = advance_header(&header, total_coins);
     let root_seq = account_seq(&entries, &root_account_id);
     let fee_bump = create_fee_bump_envelope(
         &fee_source_secret,
@@ -422,10 +483,16 @@ fn fee_bump_inner_tx_failure_tx_level_meta_matches_baseline() {
         root_seq + 1,
         &network_id,
     );
-    let (meta, result) =
-        execute_and_apply_with_result(&mut entries, &header, network_id, base_fee, base_reserve, 25, fee_bump);
+    let (_meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        fee_bump,
+    );
     assert!(!result.success);
-    hashes.push(tx_meta_hash(&meta));
 
     assert_eq!(hashes, expected);
 }
@@ -466,12 +533,28 @@ fn fee_bump_inner_tx_failure_op_level_meta_matches_baseline() {
         total_coins,
         ledger_seq - 1,
     );
-    let acc_balance = 2 * base_reserve as i64 + 3 * base_fee as i64;
-    let (fee_source_key, fee_source_entry) =
-        account_entry(fee_source_id.clone(), 0, acc_balance, ledger_seq - 1);
     let mut entries = HashMap::new();
     entries.insert(key_bytes(&root_key), root_entry);
-    entries.insert(key_bytes(&fee_source_key), fee_source_entry);
+
+    let acc_balance = 2 * base_reserve as i64 + 3 * base_fee as i64;
+    let create_account = create_account_envelope(
+        &root_secret,
+        fee_source_id.clone(),
+        acc_balance,
+        base_fee,
+        1,
+        &network_id,
+    );
+    let (meta, result) = execute_and_apply_with_result(
+        &mut entries,
+        &header,
+        network_id,
+        base_fee,
+        base_reserve,
+        25,
+        create_account,
+    );
+    assert!(result.success);
 
     let root_seq = account_seq(&entries, &root_account_id);
     let fee_bump = create_fee_bump_envelope(
@@ -484,7 +567,7 @@ fn fee_bump_inner_tx_failure_op_level_meta_matches_baseline() {
         root_seq + 1,
         &network_id,
     );
-    let (meta, result) = execute_and_apply_with_result(
+    let (_meta, result) = execute_and_apply_with_result(
         &mut entries,
         &header,
         network_id,
@@ -532,22 +615,16 @@ fn fee_bump_validity_valid_meta_matches_baseline() {
         total_coins,
         ledger_seq - 1,
     );
-    let acc_balance = 2 * base_reserve as i64 + 2 * base_fee as i64;
-    let (fee_source_key, fee_source_entry) =
-        account_entry(fee_source_id.clone(), 0, acc_balance, ledger_seq - 1);
     let mut entries = HashMap::new();
     entries.insert(key_bytes(&root_key), root_entry);
-    entries.insert(key_bytes(&fee_source_key), fee_source_entry);
 
-    let root_seq = account_seq(&entries, &root_account_id);
-    let fee_bump = create_fee_bump_envelope(
-        &fee_source_secret,
+    let acc_balance = 2 * base_reserve as i64 + 2 * base_fee as i64;
+    let create_account = create_account_envelope(
         &root_secret,
-        root_account_id.clone(),
-        2 * base_fee,
+        fee_source_id.clone(),
+        acc_balance,
         base_fee,
         1,
-        root_seq + 1,
         &network_id,
     );
     let (meta, result) = execute_and_apply_with_result(
@@ -557,7 +634,7 @@ fn fee_bump_validity_valid_meta_matches_baseline() {
         base_fee,
         base_reserve,
         25,
-        fee_bump,
+        create_account,
     );
     assert!(result.success);
 

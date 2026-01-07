@@ -1996,12 +1996,6 @@ async fn cmd_verify_execution(
                         }
                     }
                 }
-
-                let our_succeeded = match &exec_result {
-                    Ok(result) => result.success,
-                    Err(_) => false,
-                };
-
                 if in_test_range {
                     transactions_verified += 1;
 
