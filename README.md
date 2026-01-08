@@ -73,6 +73,33 @@ Supporting crates: crypto, common, work, historywork, simulation
 
 See [`PARITY_GAPS.md`](PARITY_GAPS.md) for the detailed, module-by-module gap list.
 
+## C++ Parity Summary
+
+Each crate has been analyzed against its C++ upstream counterpart. The table below summarizes implementation status and key gaps:
+
+| Crate | Status | Key Gaps |
+|-------|--------|----------|
+| [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | Core implemented | FutureBucket, HotArchiveBucket, BucketSnapshotManager |
+| [`stellar-core-overlay`](crates/stellar-core-overlay/README.md) | Core implemented | FlowControl, ItemFetcher, BanManager persistence |
+| [`stellar-core-common`](crates/stellar-core-common/README.md) | Core implemented | VirtualClock, logging system, math utilities |
+| [`stellar-core-db`](crates/stellar-core-db/README.md) | Core implemented | PostgreSQL support, query timers, data cleanup |
+| [`stellar-core-crypto`](crates/stellar-core-crypto/README.md) | Core implemented | BLAKE2, HMAC-SHA256, signature cache |
+| [`stellar-core-herder`](crates/stellar-core-herder/README.md) | Core implemented | Timer management, persistence, upgrades system |
+| [`stellar-core-work`](crates/stellar-core-work/README.md) | Core implemented | BatchWork, ConditionalWork, VirtualClock integration |
+| [`stellar-core-app`](crates/stellar-core-app/README.md) | Core implemented | Various CLI commands, Maintainer |
+| [`stellar-core-scp`](crates/stellar-core-scp/README.md) | Full protocol | State recovery, JSON output |
+| [`stellar-core-simulation`](crates/stellar-core-simulation/README.md) | Basic implemented | Multiple topologies, LoadGenerator |
+| [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | Core implemented | BatchDownloadWork, VerifyBucketWork |
+| [`stellar-core-invariant`](crates/stellar-core-invariant/README.md) | 16 invariants | BucketListIsConsistentWithDatabase |
+| [`stellar-core-history`](crates/stellar-core-history/README.md) | Core implemented | Persistent publish queue, CheckpointBuilder ACID |
+| [`stellar-core-tx`](crates/stellar-core-tx/README.md) | All 27 operations | SignatureChecker, TransactionMetaBuilder |
+| [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Core implemented | Nested LedgerTxn, parallel apply, module cache |
+| [`rs-stellar-core`](crates/rs-stellar-core/README.md) | Core commands | Various diagnostic commands |
+
+**Architectural Note**: The main pattern difference across crates is async Rust (Tokio) vs C++'s ASIO/VirtualClock. This affects timer management and asynchronous operation handling throughout.
+
+See each crate's README for detailed parity documentation including implemented features, gaps with priority ratings, and implementation notes.
+
 ## Requirements
 
 - **Rust**: 1.75+ (2021 edition)
