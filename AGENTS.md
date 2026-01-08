@@ -5,7 +5,7 @@
 - `crates/` contains the Rust workspace crates. Each module is a crate (e.g., `crates/stellar-core-ledger`, `crates/stellar-core-tx`, `crates/stellar-core-history`).
 - `crates/rs-stellar-core/` is the main binary crate; other crates are libraries.
 - Tests live alongside code in `crates/*/src` and in `crates/*/tests` for integration tests.
-- Docs live in crate `README.md` files plus top-level `README.md`, `SPEC.md`, and `DOCUMENTATION_ISSUES.md`.
+- Docs live in crate `README.md` files plus top-level `README.md` and `SPEC.md`.
 - Config examples are in `configs/` and `*.toml` at the repo root.
 
 ## Build, Test, and Development Commands
@@ -37,9 +37,10 @@
 
 ## Commit & Pull Request Guidelines
 
-- Commit messages are short, imperative, and sentence case (examples: “Implement disk-backed bucket storage”, “Optimize memory usage”).
+- Commit messages are short, imperative, and sentence case (examples: "Implement disk-backed bucket storage", "Optimize memory usage").
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
 - Link related issues or upstream references (e.g., stellar-core v25) where relevant.
+- When possible, fixes should be committed alongside regression tests that would have caught the bug.
 
 ## Configuration & Operational Notes
 
