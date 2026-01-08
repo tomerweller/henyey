@@ -71,33 +71,6 @@ Supporting crates: crypto, common, work, historywork, simulation
 - History archive replay and verification
 - BucketList state management
 
-## C++ Parity Summary
-
-Each crate has been analyzed against its C++ upstream counterpart. The table below summarizes implementation status and key gaps:
-
-| Crate | Status | Key Gaps |
-|-------|--------|----------|
-| [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | Core implemented | FutureBucket, HotArchiveBucket, BucketSnapshotManager |
-| [`stellar-core-overlay`](crates/stellar-core-overlay/README.md) | Core implemented | FlowControl, ItemFetcher, BanManager persistence |
-| [`stellar-core-common`](crates/stellar-core-common/README.md) | Core implemented | VirtualClock, logging system, math utilities |
-| [`stellar-core-db`](crates/stellar-core-db/README.md) | Core implemented | PostgreSQL support, query timers, data cleanup |
-| [`stellar-core-crypto`](crates/stellar-core-crypto/README.md) | Core implemented | BLAKE2, HMAC-SHA256, signature cache |
-| [`stellar-core-herder`](crates/stellar-core-herder/README.md) | Core implemented | Timer management, persistence, upgrades system |
-| [`stellar-core-work`](crates/stellar-core-work/README.md) | Core implemented | BatchWork, ConditionalWork, VirtualClock integration |
-| [`stellar-core-app`](crates/stellar-core-app/README.md) | Core implemented | Various CLI commands, Maintainer |
-| [`stellar-core-scp`](crates/stellar-core-scp/README.md) | Full protocol | State recovery, JSON output |
-| [`stellar-core-simulation`](crates/stellar-core-simulation/README.md) | Basic implemented | Multiple topologies, LoadGenerator |
-| [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | Core implemented | BatchDownloadWork, VerifyBucketWork |
-| [`stellar-core-invariant`](crates/stellar-core-invariant/README.md) | 16 invariants | BucketListIsConsistentWithDatabase |
-| [`stellar-core-history`](crates/stellar-core-history/README.md) | Core implemented | Persistent publish queue, CheckpointBuilder ACID |
-| [`stellar-core-tx`](crates/stellar-core-tx/README.md) | All 27 operations | SignatureChecker, TransactionMetaBuilder |
-| [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Core implemented | Nested LedgerTxn, parallel apply, module cache |
-| [`rs-stellar-core`](crates/rs-stellar-core/README.md) | Core commands | Various diagnostic commands |
-
-**Architectural Note**: The main pattern difference across crates is async Rust (Tokio) vs C++'s ASIO/VirtualClock. This affects timer management and asynchronous operation handling throughout.
-
-See each crate's README for detailed parity documentation including implemented features, gaps with priority ratings, and implementation notes.
-
 ## Requirements
 
 - **Rust**: 1.75+ (2021 edition)
@@ -224,44 +197,44 @@ rs-stellar-core/
 
 ### Core Infrastructure
 
-| Crate | Purpose |
-|-------|---------|
-| [`rs-stellar-core`](crates/rs-stellar-core/README.md) | CLI entrypoint, argument parsing, command dispatch |
-| [`stellar-core-app`](crates/stellar-core-app/README.md) | Application wiring, lifecycle management, run/catchup orchestration |
-| [`stellar-core-common`](crates/stellar-core-common/README.md) | Shared types, config helpers, time utilities |
-| [`stellar-core-crypto`](crates/stellar-core-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding |
-| [`stellar-core-db`](crates/stellar-core-db/README.md) | SQLite schema, migrations, query layer |
+| Crate | Purpose | Parity |
+|-------|---------|--------|
+| [`rs-stellar-core`](crates/rs-stellar-core/README.md) | CLI entrypoint, argument parsing, command dispatch | [~90%](crates/rs-stellar-core/PARITY_STATUS.md) |
+| [`stellar-core-app`](crates/stellar-core-app/README.md) | Application wiring, lifecycle management, run/catchup orchestration | [~85%](crates/stellar-core-app/PARITY_STATUS.md) |
+| [`stellar-core-common`](crates/stellar-core-common/README.md) | Shared types, config helpers, time utilities | [~95%](crates/stellar-core-common/PARITY_STATUS.md) |
+| [`stellar-core-crypto`](crates/stellar-core-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [~98%](crates/stellar-core-crypto/PARITY_STATUS.md) |
+| [`stellar-core-db`](crates/stellar-core-db/README.md) | SQLite schema, migrations, query layer | [~90%](crates/stellar-core-db/PARITY_STATUS.md) |
 
 ### Consensus Layer
 
-| Crate | Purpose |
-|-------|---------|
-| [`stellar-core-scp`](crates/stellar-core-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic |
-| [`stellar-core-herder`](crates/stellar-core-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers |
-| [`stellar-core-overlay`](crates/stellar-core-overlay/README.md) | P2P overlay network, peer management, message flooding |
+| Crate | Purpose | Parity |
+|-------|---------|--------|
+| [`stellar-core-scp`](crates/stellar-core-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [~90%](crates/stellar-core-scp/PARITY_STATUS.md) |
+| [`stellar-core-herder`](crates/stellar-core-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [~75%](crates/stellar-core-herder/PARITY_STATUS.md) |
+| [`stellar-core-overlay`](crates/stellar-core-overlay/README.md) | P2P overlay network, peer management, message flooding | [~70%](crates/stellar-core-overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
 
-| Crate | Purpose |
-|-------|---------|
-| [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Ledger close pipeline, state snapshots, delta tracking |
-| [`stellar-core-tx`](crates/stellar-core-tx/README.md) | Transaction validation and execution (classic + Soroban) |
-| [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | BucketList implementation, merges, on-disk state |
-| [`stellar-core-invariant`](crates/stellar-core-invariant/README.md) | Ledger transition validation, consistency checks |
+| Crate | Purpose | Parity |
+|-------|---------|--------|
+| [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Ledger close pipeline, state snapshots, delta tracking | [~85%](crates/stellar-core-ledger/PARITY_STATUS.md) |
+| [`stellar-core-tx`](crates/stellar-core-tx/README.md) | Transaction validation and execution (classic + Soroban) | [~80%](crates/stellar-core-tx/PARITY_STATUS.md) |
+| [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | BucketList implementation, merges, on-disk state | [~85%](crates/stellar-core-bucket/PARITY_STATUS.md) |
+| [`stellar-core-invariant`](crates/stellar-core-invariant/README.md) | Ledger transition validation, consistency checks | [~60%](crates/stellar-core-invariant/PARITY_STATUS.md) |
 
 ### History & Sync
 
-| Crate | Purpose |
-|-------|---------|
-| [`stellar-core-history`](crates/stellar-core-history/README.md) | History archive I/O, catchup, replay, verification |
-| [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | History work scheduling, publish/catchup task management |
+| Crate | Purpose | Parity |
+|-------|---------|--------|
+| [`stellar-core-history`](crates/stellar-core-history/README.md) | History archive I/O, catchup, replay, verification | [~85%](crates/stellar-core-history/PARITY_STATUS.md) |
+| [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | History work scheduling, publish/catchup task management | [~80%](crates/stellar-core-historywork/PARITY_STATUS.md) |
 
 ### Utilities
 
-| Crate | Purpose |
-|-------|---------|
-| [`stellar-core-work`](crates/stellar-core-work/README.md) | Generic DAG-based work scheduler |
-| [`stellar-core-simulation`](crates/stellar-core-simulation/README.md) | Deterministic test harness for overlay/SCP testing |
+| Crate | Purpose | Parity |
+|-------|---------|--------|
+| [`stellar-core-work`](crates/stellar-core-work/README.md) | Generic DAG-based work scheduler | [~90%](crates/stellar-core-work/PARITY_STATUS.md) |
+| [`stellar-core-simulation`](crates/stellar-core-simulation/README.md) | Deterministic test harness for overlay/SCP testing | [~75%](crates/stellar-core-simulation/PARITY_STATUS.md) |
 
 ## Design Constraints
 
