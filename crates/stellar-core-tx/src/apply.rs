@@ -483,12 +483,18 @@ mod tests {
         assert_eq!(delta.change_count(), 1);
         assert_eq!(delta.created_entries().len(), 1);
 
-        delta.record_update(entry.clone());
+        // record_update requires pre_state and post_state
+        let mut updated_entry = entry.clone();
+        if let LedgerEntryData::Account(ref mut acc) = updated_entry.data {
+            acc.balance = 2000000000;
+        }
+        delta.record_update(entry.clone(), updated_entry.clone());
         assert_eq!(delta.change_count(), 2);
         assert_eq!(delta.updated_entries().len(), 1);
 
         let key = LedgerKey::Account(LedgerKeyAccount { account_id });
-        delta.record_delete(key);
+        // record_delete requires key and pre_state
+        delta.record_delete(key, updated_entry);
         assert_eq!(delta.change_count(), 3);
         assert_eq!(delta.deleted_keys().len(), 1);
     }
