@@ -1720,9 +1720,14 @@ impl TransactionExecutor {
         // For Soroban transactions, load all footprint entries from the snapshot
         // before executing operations. This ensures contract data, code, and TTLs
         // are available to the Soroban host.
+        //
+        // NOTE: We no longer call clear_archived_entries_from_state() here because
+        // archived entries from the hot archive need to be available to the Soroban
+        // host for restoration. The previous approach of clearing them was designed
+        // for when all entries came from the live bucket list, but with hot archive
+        // support, archived entries are properly sourced and must be preserved.
         if let Some(ref data) = soroban_data {
             self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
-            self.clear_archived_entries_from_state(data);
         }
 
         self.state.clear_sponsorship_stack();
@@ -3390,6 +3395,8 @@ pub fn build_tx_result_pair(
     frame: &TransactionFrame,
     network_id: &NetworkId,
     exec: &TransactionExecutionResult,
+    base_fee: i64,
+    protocol_version: u32,
 ) -> Result<TransactionResultPair> {
     let tx_hash = frame
         .hash(network_id)
@@ -3406,10 +3413,21 @@ pub fn build_tx_result_pair(
             InnerTransactionResultResult::TxFailed(op_results.clone().try_into().unwrap_or_default())
         };
 
+        // Calculate inner fee_charged using C++ formula:
+        // Protocol < 25: min(inner_declared_fee, base_fee * num_inner_ops)
+        // Protocol >= 25: 0 (outer pays everything)
+        let inner_fee_charged = if protocol_version >= 25 {
+            0
+        } else {
+            let num_inner_ops = frame.operation_count() as i64;
+            let adjusted_fee = base_fee * std::cmp::max(1, num_inner_ops);
+            std::cmp::min(frame.inner_fee() as i64, adjusted_fee)
+        };
+
         let inner_pair = InnerTransactionResultPair {
             transaction_hash: stellar_xdr::curr::Hash(inner_hash.0),
             result: InnerTransactionResult {
-                fee_charged: frame.inner_fee() as i64,
+                fee_charged: inner_fee_charged,
                 result: inner_result,
                 ext: InnerTransactionResultExt::V0,
             },
@@ -3844,7 +3862,7 @@ pub fn execute_transaction_set_with_fee_mode(
             deduct_fee,
         )?;
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
-        let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result)?;
+        let tx_result = build_tx_result_pair(&frame, &executor.network_id, &result, tx_fee as i64, protocol_version)?;
         let tx_meta = result
             .tx_meta
             .clone()

@@ -43,7 +43,7 @@
 //! Dead entries (tombstones) shadow live entries, returning None.
 
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits, WriteXdr,
 };
@@ -237,6 +237,37 @@ pub struct BucketList {
     levels: Vec<BucketLevel>,
     /// The current ledger sequence number (last ledger added).
     ledger_seq: u32,
+}
+
+/// Deduplicate ledger entries by key, keeping only the last occurrence.
+/// This ensures that when the same entry is updated multiple times in a single
+/// ledger, only the final state is included in the bucket.
+fn deduplicate_entries(entries: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
+    // Use a HashMap to track the last position of each key
+    let mut key_positions: HashMap<Vec<u8>, usize> = HashMap::new();
+
+    // First pass: record the position of each key (later entries overwrite earlier ones)
+    for (idx, entry) in entries.iter().enumerate() {
+        if let Some(key) = ledger_entry_to_key(entry) {
+            if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                key_positions.insert(key_bytes, idx);
+            }
+        }
+    }
+
+    // Second pass: collect only entries at the recorded positions (final state of each key)
+    let positions: HashSet<usize> = key_positions.values().copied().collect();
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if positions.contains(&idx) {
+                Some(entry)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 impl BucketList {
@@ -442,14 +473,33 @@ impl BucketList {
                 entries.push(BucketEntry::Metadata(meta));
             }
 
+            // Deduplicate init_entries - keep only the last occurrence of each key
+            // This handles the case where the same entry is created and updated in the same ledger
+            let dedup_init = deduplicate_entries(init_entries);
             if use_init {
-                entries.extend(init_entries.into_iter().map(BucketEntry::Init));
+                entries.extend(dedup_init.into_iter().map(BucketEntry::Init));
             } else {
-                entries.extend(init_entries.into_iter().map(BucketEntry::Live));
+                entries.extend(dedup_init.into_iter().map(BucketEntry::Live));
             }
 
-            entries.extend(live_entries.into_iter().map(BucketEntry::Live));
-            entries.extend(dead_entries.into_iter().map(BucketEntry::Dead));
+            // Deduplicate live_entries - keep only the last occurrence of each key
+            // This handles the case where the same entry is updated multiple times in the same ledger
+            let dedup_live = deduplicate_entries(live_entries);
+            entries.extend(dedup_live.into_iter().map(BucketEntry::Live));
+
+            // Deduplicate dead_entries - keep only unique keys
+            let mut seen_dead: HashSet<Vec<u8>> = HashSet::new();
+            let dedup_dead: Vec<LedgerKey> = dead_entries
+                .into_iter()
+                .filter(|key| {
+                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                        seen_dead.insert(key_bytes)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
 
             Bucket::from_entries(entries)?
         };
@@ -528,6 +578,13 @@ impl BucketList {
         // Prepare level 0: merge curr with new entries
         // Don't normalize INIT entries at level 0 - they stay as INIT
         let keep_dead_0 = Self::keep_tombstone_entries(0);
+
+        // Debug: trace level 0 curr before prepare
+        if ledger_seq == 310231 {
+            eprintln!("[BUCKET_LIST] Before prepare: level 0 curr hash={}, len={}",
+                self.levels[0].curr.hash(), self.levels[0].curr.len());
+        }
+
         self.levels[0].prepare_with_normalization(
             ledger_seq,
             protocol_version,
@@ -535,7 +592,19 @@ impl BucketList {
             keep_dead_0,
             false, // don't normalize at level 0
         )?;
+
+        // Debug: trace level 0 after prepare
+        if ledger_seq == 310231 {
+            eprintln!("[BUCKET_LIST] After prepare: level 0 has pending merge");
+        }
+
         self.levels[0].commit();
+
+        // Debug: trace level 0 after commit
+        if ledger_seq == 310231 {
+            eprintln!("[BUCKET_LIST] After commit: level 0 curr hash={}, len={}",
+                self.levels[0].curr.hash(), self.levels[0].curr.len());
+        }
 
         // Step 3: Resolve any ready futures (commit all pending merges)
         // In C++ stellar-core, this is done by resolveAnyReadyFutures()
