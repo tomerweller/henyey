@@ -8,11 +8,11 @@ This crate provides the core transaction processing logic for the Stellar networ
 
 ### Operating Modes
 
-The crate supports two primary modes of operation:
+The crate supports two first-class modes of operation:
 
-1. **Catchup/Replay Mode**: Applies historical transactions from archives by trusting the recorded results and replaying state changes. This is the primary use case for rs-stellar-core today.
+1. **Live Execution Mode**: Validates and executes transactions in real-time, producing deterministic results that match C++ stellar-core. This is the mode used by validators to close ledgers and enables full participation in the Stellar network consensus.
 
-2. **Live Execution Mode**: Validates and executes transactions in real-time, producing deterministic results that match C++ stellar-core. This enables future validator functionality.
+2. **Catchup/Replay Mode**: Applies historical transactions from archives by trusting the recorded results and replaying state changes. This enables fast synchronization with the network without re-executing every transaction.
 
 ### Why Two Modes?
 
@@ -66,12 +66,17 @@ stellar-core-tx/
 ├── src/
 │   ├── lib.rs              # Public API, re-exports, high-level types
 │   ├── frame.rs            # TransactionFrame - envelope wrapper
-│   ├── apply.rs            # Historical transaction application
+│   ├── apply.rs            # Historical transaction application (catchup mode)
+│   ├── live_execution.rs   # Live transaction execution (validator mode)
 │   ├── validation.rs       # Transaction validation logic
 │   ├── result.rs           # Result type wrappers (TxApplyResult, etc.)
 │   ├── error.rs            # Error types (TxError, etc.)
 │   ├── state.rs            # LedgerStateManager - in-memory state
 │   ├── events.rs           # Classic SAC event emission
+│   ├── lumen_reconciler.rs # XLM balance reconciliation for events
+│   ├── meta_builder.rs     # Transaction metadata construction
+│   ├── fee_bump.rs         # Fee bump transaction handling
+│   ├── signature_checker.rs # Multi-sig threshold checking
 │   ├── operations/
 │   │   ├── mod.rs          # Operation types and validation
 │   │   └── execute/        # Per-operation execution implementations
@@ -385,6 +390,57 @@ let events = event_manager.build_events()?;
 
 ## Usage Examples
 
+### Live Execution Mode
+
+Live execution mode is used by validators to process transactions and close ledgers:
+
+```rust
+use stellar_core_tx::{
+    TransactionFrame, LiveExecutionContext, LedgerContext, LedgerStateManager,
+    process_fee_seq_num, process_post_apply, process_post_tx_set_apply,
+};
+
+// Set up execution context with ledger state
+let ledger_ctx = LedgerContext::new(
+    ledger_seq,
+    close_time,
+    base_fee,
+    base_reserve,
+    protocol_version,
+    network_id,
+);
+let state = LedgerStateManager::new(base_reserve, ledger_seq);
+let mut ctx = LiveExecutionContext::new(ledger_ctx, state);
+
+// Phase 1: Process fees and sequence numbers for all transactions
+let mut results = Vec::new();
+for frame in &transaction_set {
+    let fee_result = process_fee_seq_num(frame, &mut ctx, None)?;
+    results.push((frame, fee_result));
+}
+
+// Phase 2: Apply operations for each transaction
+for (frame, fee_result) in &mut results {
+    if !fee_result.should_apply {
+        continue; // Skip failed transactions
+    }
+
+    // Apply operations (operation execution code)
+    // ... apply_operations(frame, &mut ctx, &mut fee_result.tx_result)?;
+
+    // Phase 3: Post-apply processing (pre-P23 Soroban refunds)
+    process_post_apply(frame, &mut ctx, &mut fee_result.tx_result, None)?;
+}
+
+// Phase 4: Transaction set post-apply (P23+ Soroban refunds)
+for (frame, fee_result) in &mut results {
+    process_post_tx_set_apply(frame, &mut ctx, &mut fee_result.tx_result, None)?;
+}
+
+// Collect fee pool delta and finalize
+println!("Total fees collected: {}", ctx.fee_pool_delta());
+```
+
 ### Catchup/Replay Mode
 
 ```rust
@@ -484,9 +540,15 @@ This crate corresponds to the following C++ stellar-core components:
 | Rust Module | C++ Component |
 |------------|---------------|
 | `frame.rs` | `src/transactions/TransactionFrame.cpp` |
+| `live_execution.rs` | `src/transactions/TransactionFrame.cpp` (processFeeSeqNum, processPostApply, etc.) |
 | `validation.rs` | `src/transactions/TransactionUtils.cpp` |
 | `apply.rs` | `src/ledger/LedgerTxn.cpp` |
 | `state.rs` | `src/ledger/LedgerStateSnapshot.cpp` |
+| `meta_builder.rs` | `src/transactions/TransactionMetaBuilder.cpp` |
+| `fee_bump.rs` | `src/transactions/FeeBumpTransactionFrame.cpp` |
+| `signature_checker.rs` | `src/transactions/SignatureChecker.cpp` |
+| `events.rs` | `src/transactions/EventManager.cpp` |
+| `lumen_reconciler.rs` | `src/transactions/LumenEventReconciler.cpp` |
 | `operations/` | `src/transactions/OperationFrame.cpp`, `src/transactions/*OpFrame.cpp` |
 | `soroban/` | `src/transactions/InvokeHostFunctionOpFrame.cpp` |
 

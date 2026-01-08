@@ -294,6 +294,20 @@ impl FeeBumpFrame {
     pub fn declared_soroban_resource_fee(&self) -> i64 {
         self.frame.declared_soroban_resource_fee()
     }
+
+    /// Get a reference to the inner transaction frame.
+    ///
+    /// This provides access to the inner V1 transaction wrapped by this fee bump.
+    pub fn inner_frame(&self) -> &TransactionFrame {
+        &self.frame
+    }
+
+    /// Get the refundable fee for Soroban transactions.
+    ///
+    /// Delegates to the inner frame's refundable fee calculation.
+    pub fn refundable_fee(&self) -> Option<i64> {
+        self.frame.refundable_fee()
+    }
 }
 
 /// Validate fee bump specific rules.

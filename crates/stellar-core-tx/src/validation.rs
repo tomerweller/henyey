@@ -64,6 +64,7 @@ use crate::frame::TransactionFrame;
 ///
 /// All fields are public for flexibility, but be careful to ensure consistency
 /// (e.g., network ID should match the network you're connecting to).
+#[derive(Debug, Clone)]
 pub struct LedgerContext {
     /// Current ledger sequence number.
     pub sequence: u32,

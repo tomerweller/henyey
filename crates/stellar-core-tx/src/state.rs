@@ -1077,6 +1077,13 @@ impl LedgerStateManager {
         self.accounts.insert(key, entry);
     }
 
+    /// Add or update an account entry (convenience alias for set_account_no_tracking).
+    ///
+    /// Use this for setting up test state or initializing accounts.
+    pub fn put_account(&mut self, entry: AccountEntry) {
+        self.set_account_no_tracking(entry);
+    }
+
     /// Apply a ledger entry directly without delta tracking.
     ///
     /// This is used during verification to sync state with CDP without

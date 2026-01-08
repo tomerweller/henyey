@@ -6,18 +6,23 @@
 //!
 //! # Overview
 //!
-//! The crate is designed primarily for two modes of operation:
+//! The crate supports two first-class modes of operation:
 //!
-//! 1. **Catchup/Replay Mode**: Applies historical transactions from archives
-//!    by trusting the recorded results and replaying state changes.
+//! 1. **Live Execution Mode**: Validates and executes transactions in real-time,
+//!    producing deterministic results that match C++ stellar-core. This is the
+//!    mode used by validators to close ledgers.
 //!
-//! 2. **Live Execution Mode**: Validates and executes transactions in real-time,
-//!    producing deterministic results that match C++ stellar-core.
+//! 2. **Catchup/Replay Mode**: Applies historical transactions from archives
+//!    by trusting the recorded results and replaying state changes. This is used
+//!    for fast synchronization with the network.
 //!
 //! # Key Types
 //!
 //! - [`TransactionFrame`]: Wrapper around XDR `TransactionEnvelope` providing
 //!   convenient access to transaction properties and hash computation.
+//!
+//! - [`LiveExecutionContext`]: Context for live transaction execution including
+//!   ledger state, fee pool tracking, and protocol configuration.
 //!
 //! - [`LedgerDelta`]: Accumulates all state changes (creates, updates, deletes)
 //!   during transaction execution for later persistence.
@@ -27,6 +32,33 @@
 //!
 //! - [`LedgerStateManager`]: In-memory ledger state for transaction execution,
 //!   with support for snapshots and rollback.
+//!
+//! # Transaction Workflow (Live Execution Mode)
+//!
+//! ```ignore
+//! use stellar_core_tx::{
+//!     TransactionFrame, LiveExecutionContext, LedgerContext, LedgerStateManager,
+//!     process_fee_seq_num, process_post_apply, process_post_tx_set_apply,
+//! };
+//!
+//! // Set up execution context
+//! let ledger_ctx = LedgerContext::mainnet(ledger_seq, close_time);
+//! let state = LedgerStateManager::new(base_reserve, ledger_seq);
+//! let mut ctx = LiveExecutionContext::new(ledger_ctx, state);
+//!
+//! // Phase 1: Process fees and sequence numbers
+//! let fee_result = process_fee_seq_num(&frame, &mut ctx, None)?;
+//! let mut tx_result = fee_result.tx_result;
+//!
+//! // Phase 2: Apply operations (handled by operation modules)
+//! // ... apply operations ...
+//!
+//! // Phase 3: Post-apply (pre-P23 Soroban refunds)
+//! process_post_apply(&frame, &mut ctx, &mut tx_result, None)?;
+//!
+//! // Phase 4: Transaction set post-apply (P23+ Soroban refunds)
+//! process_post_tx_set_apply(&frame, &mut ctx, &mut tx_result, None)?;
+//! ```
 //!
 //! # Transaction Workflow (Catchup Mode)
 //!
@@ -85,6 +117,7 @@ mod error;
 mod events;
 pub mod fee_bump;
 mod frame;
+pub mod live_execution;
 pub mod lumen_reconciler;
 pub mod meta_builder;
 pub mod operations;
@@ -151,6 +184,14 @@ pub use fee_bump::{
     calculate_inner_fee_charged, extract_inner_hash_from_result, validate_fee_bump,
     verify_inner_signatures, wrap_inner_result_in_fee_bump, FeeBumpError, FeeBumpFrame,
     FeeBumpMutableTransactionResult,
+};
+
+// Re-export live execution types
+pub use live_execution::{
+    apply_transaction, process_fee_seq_num, process_fee_seq_num_fee_bump, process_post_apply,
+    process_post_apply_fee_bump, process_post_tx_set_apply, process_post_tx_set_apply_fee_bump,
+    process_seq_num, refund_soroban_fee, remove_one_time_signers, FeeSeqNumResult,
+    LiveExecutionContext,
 };
 
 /// Result type alias for transaction operations.

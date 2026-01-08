@@ -53,9 +53,13 @@ pub enum TxError {
     #[error("source account not found")]
     SourceAccountNotFound,
 
+    /// Account not found (with context).
+    #[error("account not found: {0}")]
+    AccountNotFound(String),
+
     /// Insufficient balance.
-    #[error("insufficient balance")]
-    InsufficientBalance,
+    #[error("insufficient balance: required {required}, available {available}")]
+    InsufficientBalance { required: i64, available: i64 },
 
     /// Operation failed.
     #[error("operation failed: {0}")]

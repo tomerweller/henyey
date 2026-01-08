@@ -268,6 +268,31 @@ impl TransactionFrame {
         self.total_fee()
     }
 
+    /// Get the refundable fee for Soroban transactions.
+    ///
+    /// The refundable fee is the portion of the Soroban resource fee that can be
+    /// refunded if not fully consumed during execution. For non-Soroban transactions,
+    /// returns `None`.
+    ///
+    /// # C++ Parity
+    ///
+    /// Matches `TransactionFrame::getRefundableFee()` in C++ stellar-core.
+    pub fn refundable_fee(&self) -> Option<i64> {
+        if !self.is_soroban() {
+            return None;
+        }
+
+        // The refundable fee is the Soroban resource fee.
+        // The inclusion fee is non-refundable; the resource fee covers compute,
+        // storage, and other costs that may be partially refunded.
+        let resource_fee = self.declared_soroban_resource_fee();
+        if resource_fee > 0 {
+            Some(resource_fee)
+        } else {
+            None
+        }
+    }
+
     /// Get the inner transaction's original fee (for fee bump).
     pub fn inner_fee(&self) -> u32 {
         match &self.envelope {

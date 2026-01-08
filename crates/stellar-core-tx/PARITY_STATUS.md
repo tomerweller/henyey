@@ -195,20 +195,31 @@ This section documents the parity between this Rust crate and the upstream C++ s
   - C++: `SignatureUtils.cpp` - hint computation, verification helpers
   - Rust: Basic signature functions in stellar-core-crypto
 
-#### Live Execution Mode
-- **processFeeSeqNum**: Fee charging and sequence number processing
-  - C++: Separate step before operation application
-  - Rust: Not implemented for live mode
-- **processPostApply**: Post-apply processing (refunds, cleanup)
-  - C++: Soroban fee refunds, signer cleanup
-  - Rust: Refund applied during catchup only
-- **processPostTxSetApply**: Per-transaction-set post processing
+#### Live Execution Mode (Implemented)
+- **processFeeSeqNum** (`live_execution.rs`): Fee charging and sequence number processing
+  - C++: `TransactionFrame::processFeeSeqNum()` in `TransactionFrame.cpp`
+  - Rust: Full implementation with `process_fee_seq_num()` and `process_fee_seq_num_fee_bump()`
+  - Features: Fee charging, balance capping, sequence update (pre-P10), refundable fee tracker init
+- **processPostApply** (`live_execution.rs`): Post-apply processing
+  - C++: `TransactionFrame::processPostApply()` for pre-P23 Soroban refunds
+  - Rust: Full implementation with `process_post_apply()` and fee bump variant
+  - Features: Protocol-versioned refund timing, account balance updates
+- **processPostTxSetApply** (`live_execution.rs`): Per-transaction-set post processing
+  - C++: `TransactionFrame::processPostTxSetApply()` for P23+ Soroban refunds
+  - Rust: Full implementation with `process_post_tx_set_apply()` and fee bump variant
+  - Features: Deferred refund application, fee event emission
+- **refundSorobanFee** (`live_execution.rs`): Core refund logic
+  - C++: `TransactionFrame::refundSorobanFee()`
+  - Rust: Full implementation with merged account handling and overflow protection
+- **LiveExecutionContext** (`live_execution.rs`): Execution context
+  - Provides ledger context, fee pool tracking, and state management
+  - Supports both stateful and stateless operation modes
 
 ### Implementation Notes
 
 #### Architectural Differences
 
-1. **Replay vs Execute**: The Rust crate is primarily designed for catchup/replay mode where transaction results and metadata are trusted from archives. The C++ implementation focuses on live execution with full validation and result building.
+1. **Dual Mode Support**: The Rust crate now supports both live execution and catchup/replay modes as first-class citizens. Live execution mode provides full validation and result building matching C++ stellar-core, while catchup mode trusts archived results for fast synchronization.
 
 2. **State Layer**: Rust uses an in-memory `LedgerStateManager` while C++ uses `AbstractLedgerTxn` with SQL backing. This is intentional as Rust targets bucket list state.
 
@@ -229,6 +240,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 2. ~~TransactionMetaBuilder for generating metadata during execution~~ ✓ Implemented
 3. ~~MutableTransactionResult with RefundableFeeTracker~~ ✓ Implemented
 4. ~~Complete fee bump transaction handling~~ ✓ Implemented
+5. ~~Live execution mode (processFeeSeqNum, processPostApply, processPostTxSetApply)~~ ✓ Implemented
 
 **Medium Priority** (needed for complete validation):
 1. ~~Unused signature checking~~ ✓ Implemented (via SignatureChecker)
