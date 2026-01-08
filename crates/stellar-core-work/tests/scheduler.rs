@@ -1,13 +1,26 @@
+//! Integration tests for the work scheduler.
+//!
+//! These tests verify the core functionality of the work scheduler including:
+//! - Dependency ordering
+//! - Retry behavior
+//! - Cancellation handling
+//! - Metrics and snapshots
+//! - Callback wrappers
+
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use stellar_core_work::{
     Work, WorkContext, WorkOutcome, WorkScheduler, WorkSchedulerConfig, WorkSequence,
-    WorkWithCallback,
+    WorkState, WorkWithCallback,
 };
 
+// ============================================================================
+// Test Work Item Implementations
+// ============================================================================
+
+/// A simple work item that logs its name when executed.
 struct LogWork {
     name: String,
     log: Arc<Mutex<Vec<String>>>,
@@ -25,6 +38,7 @@ impl Work for LogWork {
     }
 }
 
+/// A work item that fails on the first attempt and succeeds on retry.
 struct RetryWork {
     name: String,
     attempts: Arc<Mutex<u32>>,
@@ -40,13 +54,16 @@ impl Work for RetryWork {
         let mut attempts = self.attempts.lock().unwrap();
         *attempts += 1;
         if *attempts == 1 {
-            WorkOutcome::Retry { delay: Duration::from_millis(10) }
+            WorkOutcome::Retry {
+                delay: Duration::from_millis(10),
+            }
         } else {
             WorkOutcome::Success
         }
     }
 }
 
+/// A work item that checks for cancellation periodically.
 struct CancellableWork {
     name: String,
 }
@@ -68,45 +85,84 @@ impl Work for CancellableWork {
     }
 }
 
+// ============================================================================
+// Dependency Ordering Tests
+// ============================================================================
+
+/// Verifies that work items execute in dependency order.
 #[tokio::test]
 async fn test_dependency_ordering() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig { max_concurrency: 2, retry_delay: Duration::from_millis(1), event_tx: None });
 
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 2,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    // Create work item A with no dependencies
     let a = scheduler.add_work(
-        Box::new(LogWork { name: "a".to_string(), log: Arc::clone(&log) }),
+        Box::new(LogWork {
+            name: "a".to_string(),
+            log: Arc::clone(&log),
+        }),
         vec![],
         0,
     );
+
+    // Create work item B that depends on A
     let _b = scheduler.add_work(
-        Box::new(LogWork { name: "b".to_string(), log: Arc::clone(&log) }),
+        Box::new(LogWork {
+            name: "b".to_string(),
+            log: Arc::clone(&log),
+        }),
         vec![a],
         0,
     );
 
     scheduler.run_until_done().await;
 
+    // Verify A executed before B
     let log = log.lock().unwrap();
     assert_eq!(log.as_slice(), ["a", "b"]);
 }
 
+// ============================================================================
+// Retry Tests
+// ============================================================================
+
+/// Verifies that work items are retried when they return Retry outcome.
 #[tokio::test]
 async fn test_retry_then_success() {
     let attempts = Arc::new(Mutex::new(0u32));
-    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig { max_concurrency: 1, retry_delay: Duration::from_millis(1), event_tx: None });
+
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 1,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
 
     scheduler.add_work(
-        Box::new(RetryWork { name: "retry".to_string(), attempts: Arc::clone(&attempts) }),
+        Box::new(RetryWork {
+            name: "retry".to_string(),
+            attempts: Arc::clone(&attempts),
+        }),
         vec![],
-        1,
+        1, // Allow 1 retry
     );
 
     scheduler.run_until_done().await;
 
+    // Verify the work was attempted twice (initial + 1 retry)
     let attempts = *attempts.lock().unwrap();
     assert_eq!(attempts, 2);
 }
 
+// ============================================================================
+// Sequence Tests
+// ============================================================================
+
+/// Verifies that WorkSequence creates proper dependency chains.
 #[tokio::test]
 async fn test_work_sequence_ordering() {
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -116,8 +172,10 @@ async fn test_work_sequence_ordering() {
         retry_delay: Duration::from_millis(1),
         event_tx: None,
     });
+
     let mut sequence = WorkSequence::new();
 
+    // Add steps to the sequence
     for i in 0..2 {
         let work = Box::new(LogWork {
             name: format!("step-{}", i),
@@ -128,9 +186,15 @@ async fn test_work_sequence_ordering() {
 
     scheduler.run_until_done().await;
 
+    // Verify steps executed in order
     assert_eq!(log.lock().unwrap().as_slice(), ["step-0", "step-1"]);
 }
 
+// ============================================================================
+// Callback Tests
+// ============================================================================
+
+/// Verifies that WorkWithCallback invokes the callback after execution.
 #[tokio::test]
 async fn test_work_callback() {
     let callback_count = Arc::new(AtomicU32::new(0));
@@ -158,10 +222,16 @@ async fn test_work_callback() {
 
     scheduler.run_until_done().await;
 
+    // Verify the callback was invoked exactly once
     assert_eq!(callback_count.load(Ordering::SeqCst), 1);
     assert_eq!(log.lock().unwrap().as_slice(), ["callback"]);
 }
 
+// ============================================================================
+// Cancellation Tests
+// ============================================================================
+
+/// Verifies that work items can be cancelled via external token.
 #[tokio::test]
 async fn test_cancel_work() {
     let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
@@ -178,6 +248,7 @@ async fn test_cancel_work() {
         0,
     );
 
+    // Set up external cancellation after a short delay
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
@@ -187,9 +258,15 @@ async fn test_cancel_work() {
 
     scheduler.run_until_done_with_cancel(cancel).await;
 
-    assert_eq!(scheduler.state(id), Some(stellar_core_work::WorkState::Cancelled));
+    // Verify the work was cancelled
+    assert_eq!(scheduler.state(id), Some(WorkState::Cancelled));
 }
 
+// ============================================================================
+// Metrics and Snapshot Tests
+// ============================================================================
+
+/// Verifies that metrics and snapshots accurately reflect scheduler state.
 #[tokio::test]
 async fn test_metrics_snapshot() {
     let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
@@ -209,13 +286,15 @@ async fn test_metrics_snapshot() {
 
     scheduler.run_until_done().await;
 
+    // Verify metrics
     let metrics = scheduler.metrics();
     assert_eq!(metrics.total, 1);
     assert_eq!(metrics.success, 1);
     assert_eq!(metrics.failed, 0);
 
+    // Verify snapshot
     let snapshot = scheduler.snapshot();
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[0].name, "metrics");
-    assert_eq!(snapshot[0].state, stellar_core_work::WorkState::Success);
+    assert_eq!(snapshot[0].state, WorkState::Success);
 }

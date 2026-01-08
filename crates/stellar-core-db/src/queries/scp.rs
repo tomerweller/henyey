@@ -1,20 +1,43 @@
-//! SCP history queries.
+//! SCP (Stellar Consensus Protocol) history queries.
+//!
+//! This module provides database operations for SCP consensus state, including:
+//!
+//! - SCP envelopes: The signed consensus messages exchanged by validators
+//! - Quorum sets: The trust configurations that define consensus requirements
+//!
+//! SCP history is used for:
+//! - Catchup verification (proving ledger agreement)
+//! - Debugging consensus issues
+//! - History archive publishing
 
 use rusqlite::{params, Connection, OptionalExtension};
 use stellar_core_common::Hash256;
-use stellar_xdr::curr::{Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpQuorumSet, Uint256, WriteXdr};
+use stellar_xdr::curr::{
+    Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpQuorumSet, Uint256, WriteXdr,
+};
 
 use super::super::error::DbError;
 
-/// Trait for querying and storing SCP history.
+/// Query trait for SCP consensus state operations.
+///
+/// Provides methods for persisting and retrieving SCP envelopes and quorum sets.
 pub trait ScpQueries {
-    /// Store SCP envelopes for a ledger (replaces existing entries).
+    /// Stores SCP envelopes for a ledger.
+    ///
+    /// Replaces any existing envelopes for the ledger. Envelopes are stored
+    /// sorted by node ID for deterministic ordering.
     fn store_scp_history(&self, ledger_seq: u32, envelopes: &[ScpEnvelope]) -> Result<(), DbError>;
 
-    /// Load SCP envelopes for a ledger.
+    /// Loads SCP envelopes for a ledger.
+    ///
+    /// Returns envelopes sorted by node ID.
     fn load_scp_history(&self, ledger_seq: u32) -> Result<Vec<ScpEnvelope>, DbError>;
 
-    /// Store a quorum set by hash, updating last-seen ledger sequence.
+    /// Stores a quorum set by its hash.
+    ///
+    /// If the quorum set already exists, only updates the last-seen ledger
+    /// sequence if the new value is higher. This allows garbage collection
+    /// of old quorum sets that are no longer referenced.
     fn store_scp_quorum_set(
         &self,
         hash: &Hash256,
@@ -22,7 +45,9 @@ pub trait ScpQueries {
         quorum_set: &ScpQuorumSet,
     ) -> Result<(), DbError>;
 
-    /// Load a quorum set by hash.
+    /// Loads a quorum set by its hash.
+    ///
+    /// Returns `None` if no quorum set with the given hash is stored.
     fn load_scp_quorum_set(&self, hash: &Hash256) -> Result<Option<ScpQuorumSet>, DbError>;
 }
 
@@ -116,6 +141,7 @@ impl ScpQueries for Connection {
     }
 }
 
+/// Converts a NodeId to a hex string for database storage and sorting.
 fn node_id_hex(node_id: &NodeId) -> String {
     match &node_id.0 {
         PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => hex::encode(bytes),

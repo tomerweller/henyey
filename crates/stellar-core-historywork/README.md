@@ -1,47 +1,182 @@
 # stellar-core-historywork
 
-History work items that drive catchup and publish workflows.
+Work items for Stellar history archive download and publish workflows.
 
-## Scope
+## Overview
 
-- Download work: HAS, buckets, headers, transactions, results, and SCP history.
-- Verification hooks for header chain, bucket, tx-set, and tx-result hashes.
-- Publish scaffolding for HAS, buckets, headers, transactions, results, and SCP history.
-- Progress tracking via shared state (`get_progress`).
+This crate provides the building blocks for downloading and publishing Stellar
+history archive data. It implements a work-item based architecture that integrates
+with the `stellar-core-work` scheduler to orchestrate complex multi-step operations
+with proper dependency management and retry logic.
+
+History archives store snapshots of the Stellar ledger at regular checkpoint
+intervals (every 64 ledgers). This crate provides work items to:
+
+- **Download** history data: HAS, buckets, headers, transactions, results, and SCP
+- **Verify** downloaded data: hash verification and header chain validation
+- **Publish** history data: write checkpoint data back to archives
 
 ## Architecture
 
-- Work items are registered with `WorkScheduler` as a DAG of dependencies.
-- Download tasks populate shared state for HAS, buckets, and checkpoint files.
-- Verification tasks validate header chains and hash integrity before replay.
-- Publish tasks reuse the same graph, writing to `ArchiveWriter` targets.
+Work items are organized as a directed acyclic graph (DAG) of dependencies:
 
-## Key Concepts
+```
+                   +-------------+
+                   |  Fetch HAS  |
+                   +------+------+
+                          |
+          +---------------+---------------+
+          |               |               |
+          v               v               v
+   +------------+  +------------+  +------------+
+   |  Download  |  |  Download  |  |  Download  |
+   |  Buckets   |  |  Headers   |  |    SCP     |
+   +------------+  +------+-----+  +------------+
+                          |
+                   +------+------+
+                   v             v
+            +------------+ +------------+
+            |  Download  | |  Download  |
+            |Transactions| |  Results   |
+            +------------+ +------------+
+```
 
-- **CheckpointData**: in-memory snapshot of downloaded artifacts.
-- **ArchiveWriter**: abstraction for publishing checkpoints (local or remote).
-- **Progress state**: shared map for reporting status across work items.
-- **Work graph phases**: HAS -> buckets -> headers/tx/results/scp -> verify.
+All work items share state through `SharedHistoryState`, a thread-safe container
+that accumulates downloaded data as work progresses.
 
-## Status
+## Key Types
 
-Partial parity with upstream `src/historywork/*`. Metrics export wiring and
-full history replay integration remain.
+| Type | Description |
+|------|-------------|
+| `HistoryWorkState` | Shared container for downloaded history data |
+| `SharedHistoryState` | Thread-safe handle (`Arc<Mutex<...>>`) to work state |
+| `HistoryWorkBuilder` | Factory for registering work items with dependencies |
+| `HistoryWorkStage` | Enum identifying the current work stage for progress |
+| `ArchiveWriter` | Trait for publishing data to history archives |
+| `LocalArchiveWriter` | Filesystem implementation of `ArchiveWriter` |
+
+### Download Work Items
+
+| Work Item | Description | Dependencies |
+|-----------|-------------|--------------|
+| `GetHistoryArchiveStateWork` | Fetches the HAS JSON file | None |
+| `DownloadBucketsWork` | Downloads and verifies bucket files | HAS |
+| `DownloadLedgerHeadersWork` | Downloads and verifies headers | HAS |
+| `DownloadTransactionsWork` | Downloads and verifies transactions | Headers |
+| `DownloadTxResultsWork` | Downloads and verifies results | Headers, Transactions |
+| `DownloadScpHistoryWork` | Downloads SCP consensus history | Headers |
+
+### Publish Work Items
+
+| Work Item | Description |
+|-----------|-------------|
+| `PublishHistoryArchiveStateWork` | Publishes HAS JSON |
+| `PublishBucketsWork` | Publishes compressed bucket files |
+| `PublishLedgerHeadersWork` | Publishes compressed header XDR |
+| `PublishTransactionsWork` | Publishes compressed transaction XDR |
+| `PublishResultsWork` | Publishes compressed result XDR |
+| `PublishScpHistoryWork` | Publishes compressed SCP history XDR |
 
 ## Usage
 
-Use `HistoryWorkBuilder` to register download work with a
-`WorkScheduler`. For publish flows, use `register_publish()` with an
-`ArchiveWriter` implementation (e.g., `LocalArchiveWriter`).
-
-To feed catchup with pre-downloaded data, build a `CheckpointData` from the
-shared state and pass it to `catchup_to_ledger_with_checkpoint_data`:
+### Downloading Checkpoint Data
 
 ```rust
-let data = stellar_core_historywork::build_checkpoint_data(&state).await?;
-catchup_manager
-    .catchup_to_ledger_with_checkpoint_data(target, data)
-    .await?;
+use stellar_core_historywork::{
+    HistoryWorkBuilder, SharedHistoryState, build_checkpoint_data
+};
+use stellar_core_work::WorkScheduler;
+use std::sync::Arc;
+
+// Create shared state for work items
+let state: SharedHistoryState = Default::default();
+
+// Build and register work items
+let builder = HistoryWorkBuilder::new(archive, checkpoint, state.clone());
+let mut scheduler = WorkScheduler::new();
+let work_ids = builder.register(&mut scheduler);
+
+// Run the scheduler to completion
+scheduler.run_to_completion().await?;
+
+// Extract downloaded data for catchup
+let checkpoint_data = build_checkpoint_data(&state).await?;
 ```
 
-See tests in `crates/stellar-core-historywork/tests/` for examples.
+### Publishing Checkpoint Data
+
+```rust
+use stellar_core_historywork::{
+    HistoryWorkBuilder, LocalArchiveWriter, SharedHistoryState
+};
+use std::sync::Arc;
+use std::path::PathBuf;
+
+// Create a writer for the target archive
+let writer = Arc::new(LocalArchiveWriter::new(PathBuf::from("/var/stellar/history")));
+
+// Register publish work after download work
+let download_ids = builder.register(&mut scheduler);
+let publish_ids = builder.register_publish(&mut scheduler, writer, download_ids);
+
+// Run all work to completion
+scheduler.run_to_completion().await?;
+```
+
+### Monitoring Progress
+
+```rust
+use stellar_core_historywork::get_progress;
+
+let progress = get_progress(&state).await;
+if let Some(stage) = progress.stage {
+    println!("Stage: {:?}, Status: {}", stage, progress.message);
+}
+```
+
+### Custom Archive Writers
+
+Implement `ArchiveWriter` for custom storage backends:
+
+```rust
+use stellar_core_historywork::ArchiveWriter;
+use async_trait::async_trait;
+
+struct S3ArchiveWriter {
+    bucket: String,
+    client: S3Client,
+}
+
+#[async_trait]
+impl ArchiveWriter for S3ArchiveWriter {
+    async fn put_bytes(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.client.put_object(&self.bucket, path, data).await
+    }
+}
+```
+
+## Design Notes
+
+- **Parallel Downloads**: Bucket downloads use up to 16 concurrent requests,
+  matching the C++ stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit.
+
+- **Retry Logic**: Download work items are configured with 3 retries; publish
+  work items use 2 retries.
+
+- **Verification**: All downloaded data is verified against known hashes before
+  being stored in shared state.
+
+- **Memory Usage**: Downloaded data is held in memory. For large catchup ranges,
+  consider processing checkpoints incrementally.
+
+## Status
+
+This crate provides partial parity with upstream C++ stellar-core's
+`src/historywork/*`. Metrics export wiring and full history replay integration
+remain as future work.
+
+## See Also
+
+- `stellar-core-history` - History archive access and data structures
+- `stellar-core-work` - Work scheduler for async task orchestration
+- `stellar-core-bucket` - Bucket list implementation

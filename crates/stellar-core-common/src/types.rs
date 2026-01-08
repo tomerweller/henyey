@@ -1,17 +1,53 @@
 //! Common types for rs-stellar-core.
+//!
+//! This module provides fundamental types used throughout the codebase,
+//! particularly the [`Hash256`] type for cryptographic hashes.
 
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-/// 32-byte SHA-256 hash.
+/// A 32-byte SHA-256 hash.
+///
+/// This is the canonical hash type used throughout Stellar for ledger hashes,
+/// transaction hashes, network IDs, and other cryptographic identifiers.
+///
+/// # Examples
+///
+/// ```rust
+/// use stellar_core_common::Hash256;
+///
+/// // Hash some data
+/// let hash = Hash256::hash(b"hello world");
+/// assert!(!hash.is_zero());
+///
+/// // Convert to/from hex
+/// let hex_str = hash.to_hex();
+/// let parsed = Hash256::from_hex(&hex_str).unwrap();
+/// assert_eq!(hash, parsed);
+///
+/// // Create from raw bytes
+/// let zeros = Hash256::from_bytes([0u8; 32]);
+/// assert!(zeros.is_zero());
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Hash256(pub [u8; 32]);
 
 impl Hash256 {
-    /// Zero hash.
+    /// The zero hash (all bytes are 0x00).
+    ///
+    /// This is commonly used as a sentinel value or placeholder.
     pub const ZERO: Self = Self([0u8; 32]);
 
-    /// Hash arbitrary data.
+    /// Compute the SHA-256 hash of arbitrary data.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use stellar_core_common::Hash256;
+    ///
+    /// let hash = Hash256::hash(b"test data");
+    /// assert_eq!(hash.as_bytes().len(), 32);
+    /// ```
     pub fn hash(data: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(data);
@@ -21,23 +57,50 @@ impl Hash256 {
         Self(bytes)
     }
 
-    /// Hash XDR-encoded data.
-    pub fn hash_xdr<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Result<Self, stellar_xdr::curr::Error> {
+    /// Compute the SHA-256 hash of XDR-encoded data.
+    ///
+    /// This is a convenience method that first serializes the value to XDR format
+    /// and then computes its hash. This is the standard way to hash Stellar
+    /// protocol objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if XDR serialization fails.
+    pub fn hash_xdr<T: stellar_xdr::curr::WriteXdr>(
+        value: &T,
+    ) -> Result<Self, stellar_xdr::curr::Error> {
         let bytes = value.to_xdr(stellar_xdr::curr::Limits::none())?;
         Ok(Self::hash(&bytes))
     }
 
-    /// Get the raw bytes.
+    /// Returns a reference to the underlying 32-byte array.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
-    /// Create from raw bytes.
+    /// Creates a `Hash256` from a 32-byte array.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    /// Create from a hex string.
+    /// Creates a `Hash256` from a hexadecimal string.
+    ///
+    /// The string must be exactly 64 hex characters (representing 32 bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is not valid hex or not exactly 64 characters.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use stellar_core_common::Hash256;
+    ///
+    /// let hash = Hash256::from_hex(
+    ///     "0000000000000000000000000000000000000000000000000000000000000000"
+    /// ).unwrap();
+    /// assert!(hash.is_zero());
+    /// ```
     pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
         let bytes = hex::decode(s)?;
         if bytes.len() != 32 {
@@ -48,12 +111,16 @@ impl Hash256 {
         Ok(Self(arr))
     }
 
-    /// Convert to hex string.
+    /// Converts the hash to a lowercase hexadecimal string.
+    ///
+    /// The resulting string is always 64 characters long.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
-    /// Check if this is the zero hash.
+    /// Returns `true` if this is the zero hash.
+    ///
+    /// This is useful for checking sentinel values or uninitialized hashes.
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 32]
     }

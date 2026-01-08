@@ -1,34 +1,67 @@
 //! Catchup command implementation for rs-stellar-core.
 //!
-//! The catchup command synchronizes the node with the network by downloading
-//! history from archives and applying it to the local database.
+//! The catchup command synchronizes a node with the Stellar network by downloading
+//! ledger history from archives and applying it to rebuild local state. This is
+//! essential for:
 //!
-//! ## Usage
+//! - Initial node setup (bootstrapping from scratch)
+//! - Recovery after extended downtime
+//! - Rebuilding state after database corruption
+//!
+//! # Command Line Usage
 //!
 //! ```text
 //! rs-stellar-core catchup current        # Catch up to the latest ledger
 //! rs-stellar-core catchup 1000000        # Catch up to ledger 1000000
-//! rs-stellar-core catchup 1000000/100    # Catch up to ledger 1000000 with 100 ledgers of history
+//! rs-stellar-core catchup 1000000/100    # Catch up to ledger 1000000 with 100 ledgers history
 //! ```
 //!
-//! ## Modes
+//! # Catchup Modes
 //!
-//! - **minimal**: Download only the latest state (fastest)
-//! - **complete**: Download full history from genesis
-//! - **recent**: Download last N ledgers of history
+//! | Mode | Description | Use Case |
+//! |------|-------------|----------|
+//! | `minimal` | Download only the latest bucket state | Fast startup, no history needed |
+//! | `complete` | Download full history from genesis | Full archive node |
+//! | `recent:N` | Download last N ledgers of history | Balance of speed and history |
+//!
+//! # Process Overview
+//!
+//! 1. **Determine target**: Resolve "current" to latest checkpoint or use specified ledger
+//! 2. **Download state**: Fetch bucket files from history archives
+//! 3. **Apply buckets**: Rebuild ledger state from bucket snapshots
+//! 4. **Replay history**: Apply transactions to reach the target ledger
+//! 5. **Verify**: Validate the resulting state matches expected hashes
+//!
+//! # Progress Reporting
+//!
+//! Catchup provides detailed progress through the [`CatchupProgressCallback`] trait,
+//! with built-in implementations for logging ([`TracingProgressCallback`]) and
+//! console output ([`ConsoleProgressCallback`]).
 
 use crate::app::{App, CatchupResult, CatchupTarget};
 use crate::config::AppConfig;
 
 /// Catchup mode determining how much history to download.
+///
+/// The mode affects both download time and the amount of historical data
+/// available for queries after catchup completes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CatchupMode {
-    /// Download only the latest state (minimal sync time).
+    /// Download only the latest bucket state (fastest).
+    ///
+    /// This mode downloads the minimum data needed to participate in consensus.
+    /// Historical transaction data will not be available.
     #[default]
     Minimal,
     /// Download complete history from genesis.
+    ///
+    /// This mode downloads all historical data, enabling full transaction
+    /// history queries. This can take significant time and storage.
     Complete,
     /// Download the last N ledgers of history.
+    ///
+    /// A compromise between speed and history availability. The node will
+    /// have transaction history for the specified number of recent ledgers.
     Recent(u32),
 }
 
@@ -61,18 +94,33 @@ impl std::fmt::Display for CatchupMode {
     }
 }
 
-/// Options for the catchup command.
+/// Configuration options for the catchup command.
+///
+/// Controls the target ledger, history depth, verification, and performance
+/// settings for the catchup operation.
+///
+/// # Example
+///
+/// ```
+/// use stellar_core_app::CatchupOptions;
+/// use stellar_core_app::CatchupMode;
+///
+/// // Catch up to ledger 1000000 with recent history
+/// let options = CatchupOptions::to_ledger(1000000)
+///     .with_mode(CatchupMode::Recent(1000))
+///     .with_parallelism(16);
+/// ```
 #[derive(Debug, Clone)]
 pub struct CatchupOptions {
-    /// Target ledger specification.
+    /// Target ledger specification ("current" or a ledger number).
     pub target: String,
-    /// Catchup mode.
+    /// Catchup mode determining history depth.
     pub mode: CatchupMode,
-    /// Whether to verify history after catchup.
+    /// Whether to verify state hashes after catchup.
     pub verify: bool,
-    /// Number of parallel downloads.
+    /// Number of parallel archive downloads.
     pub parallelism: usize,
-    /// Whether to keep temporary files.
+    /// Whether to keep temporary download files (for debugging).
     pub keep_temp: bool,
 }
 
@@ -229,22 +277,38 @@ fn verify_catchup(result: &CatchupResult) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Progress callback for catchup operations.
+/// Callback trait for receiving catchup progress updates.
+///
+/// Implement this trait to receive notifications about catchup progress,
+/// phase changes, and completion. Useful for progress bars, logging,
+/// or integration with external monitoring systems.
+///
+/// # Thread Safety
+///
+/// Implementations must be `Send + Sync` as callbacks may be invoked from
+/// multiple async tasks.
 pub trait CatchupProgressCallback: Send + Sync {
-    /// Called when the catchup phase changes.
+    /// Called when the catchup phase changes (e.g., "Downloading buckets").
     fn on_phase_change(&self, phase: &str);
 
     /// Called periodically with progress update.
+    ///
+    /// - `current`: Number of items processed so far
+    /// - `total`: Total number of items (0 if unknown)
+    /// - `message`: Human-readable status message
     fn on_progress(&self, current: u64, total: u64, message: &str);
 
-    /// Called when catchup completes.
+    /// Called when catchup completes successfully.
     fn on_complete(&self, result: &CatchupResult);
 
-    /// Called if an error occurs.
+    /// Called if an error occurs during catchup.
     fn on_error(&self, error: &str);
 }
 
-/// Default progress callback that logs to tracing.
+/// Progress callback that logs to the tracing framework.
+///
+/// This is the default callback used when no custom callback is provided.
+/// Progress updates are logged at INFO level.
 pub struct TracingProgressCallback;
 
 impl CatchupProgressCallback for TracingProgressCallback {
@@ -274,7 +338,10 @@ impl CatchupProgressCallback for TracingProgressCallback {
     }
 }
 
-/// Console progress callback with pretty output.
+/// Progress callback with pretty console output including progress bars.
+///
+/// Displays a visual progress bar with elapsed time, percentage complete,
+/// and estimated time remaining. Suitable for interactive terminal use.
 pub struct ConsoleProgressCallback {
     start_time: std::time::Instant,
 }

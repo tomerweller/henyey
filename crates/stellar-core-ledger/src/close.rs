@@ -1,8 +1,22 @@
-//! LedgerCloseData - All data needed to close a ledger.
+//! Ledger close data structures and transaction set handling.
 //!
-//! This module contains the structures representing all the data
-//! needed to close a ledger, including the transaction set, results,
-//! and any protocol upgrades.
+//! This module provides the data structures needed for ledger close operations:
+//!
+//! - [`LedgerCloseData`]: Input data for closing a ledger (from SCP)
+//! - [`LedgerCloseResult`]: Output data from a successful ledger close
+//! - [`TransactionSetVariant`]: Classic or generalized transaction sets
+//! - [`UpgradeContext`]: Protocol upgrade handling
+//! - [`LedgerCloseStats`]: Statistics from ledger processing
+//!
+//! # Transaction Set Types
+//!
+//! Stellar supports two transaction set formats:
+//!
+//! - **Classic** (pre-Protocol 20): Simple list of transactions
+//! - **Generalized** (Protocol 20+): Phased execution with Soroban support
+//!
+//! The generalized format supports parallel execution stages for Soroban
+//! transactions and per-component fee overrides.
 
 use stellar_core_common::Hash256;
 use stellar_core_crypto::Sha256Hasher;
@@ -14,28 +28,56 @@ use stellar_xdr::curr::{
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-/// Data needed to close a ledger.
+/// Complete input data for closing a ledger.
 ///
-/// This is the complete set of data required to apply a ledger close,
-/// typically externalized by SCP consensus.
+/// This struct contains all the data needed to process a ledger close,
+/// typically received from SCP consensus after externalization. It includes
+/// the transaction set to apply, the agreed-upon close time, and any
+/// protocol upgrades that validators have voted to apply.
+///
+/// # Creation
+///
+/// Use [`LedgerCloseData::new`] to create an instance, then chain builder
+/// methods to add optional data:
+///
+/// ```ignore
+/// let close_data = LedgerCloseData::new(seq, tx_set, close_time, prev_hash)
+///     .with_upgrades(upgrades)
+///     .with_scp_history(scp_entries);
+/// ```
+///
+/// # SCP History
+///
+/// The optional `scp_history` field can be populated with SCP messages
+/// for inclusion in [`LedgerCloseMeta`]. This is useful for debugging
+/// consensus behavior and for history archive completeness.
 #[derive(Debug, Clone)]
 pub struct LedgerCloseData {
-    /// The ledger sequence being closed.
+    /// The sequence number of the ledger being closed.
     pub ledger_seq: u32,
 
-    /// The transaction set to apply.
+    /// The transaction set to apply during this ledger close.
     pub tx_set: TransactionSetVariant,
 
-    /// The close time for this ledger.
+    /// The agreed-upon close time (Unix timestamp in seconds).
+    ///
+    /// This must be greater than or equal to the previous ledger's close time.
     pub close_time: u64,
 
-    /// Protocol upgrades to apply (if any).
+    /// Protocol upgrades to apply at this ledger boundary.
+    ///
+    /// Upgrades take effect immediately and apply to this ledger's processing.
     pub upgrades: Vec<LedgerUpgrade>,
 
-    /// SCP history entries for this ledger close, if available.
+    /// SCP history entries for this ledger close (optional).
+    ///
+    /// When populated, these are included in the `LedgerCloseMeta` for
+    /// historical analysis of consensus behavior.
     pub scp_history: Vec<ScpHistoryEntry>,
 
-    /// Hash of the previous ledger.
+    /// Hash of the previous ledger header.
+    ///
+    /// Used to verify chain continuity and prevent forks.
     pub prev_ledger_hash: Hash256,
 }
 
@@ -91,12 +133,35 @@ impl LedgerCloseData {
     }
 }
 
-/// Variant of transaction set (pre-protocol 20 or generalized).
+/// Transaction set format variant.
+///
+/// Stellar uses two different transaction set formats depending on the
+/// protocol version:
+///
+/// # Classic (Pre-Protocol 20)
+///
+/// A simple list of transactions with no special structure. All transactions
+/// are executed sequentially in a deterministic order based on their hash.
+///
+/// # Generalized (Protocol 20+)
+///
+/// A structured format that supports:
+///
+/// - **Phases**: Separate classic and Soroban transaction phases
+/// - **Parallel stages**: Soroban transactions grouped for parallel execution
+/// - **Per-component fees**: Optional fee overrides for different components
+///
+/// The generalized format enables parallel execution of non-conflicting
+/// Soroban transactions while maintaining deterministic ordering.
 #[derive(Debug, Clone)]
 pub enum TransactionSetVariant {
-    /// Classic transaction set (pre-protocol 20).
+    /// Classic transaction set (pre-Protocol 20).
+    ///
+    /// A simple list of transactions executed sequentially.
     Classic(TransactionSet),
-    /// Generalized transaction set (protocol 20+).
+    /// Generalized transaction set (Protocol 20+).
+    ///
+    /// Supports phased execution and parallel Soroban processing.
     Generalized(GeneralizedTransactionSet),
 }
 
@@ -396,19 +461,40 @@ fn sorted_for_apply_parallel(
     result
 }
 
-/// Result of processing a ledger close.
+/// Result of successfully closing a ledger.
+///
+/// This struct contains all the output data from a ledger close operation,
+/// including the new ledger header, transaction results, and metadata for
+/// history archival.
+///
+/// # Header Hash
+///
+/// The `header_hash` is the SHA-256 hash of the XDR-encoded header. This
+/// hash becomes the `previous_ledger_hash` for the next ledger and is used
+/// to verify chain integrity.
+///
+/// # Transaction Results
+///
+/// The `tx_results` vector contains one entry per transaction in the same
+/// order as the input transaction set. Each entry includes the transaction
+/// hash and its result code.
 #[derive(Debug, Clone)]
 pub struct LedgerCloseResult {
-    /// The new ledger header.
+    /// The newly created ledger header.
     pub header: LedgerHeader,
 
-    /// Hash of the new header.
+    /// SHA-256 hash of the XDR-encoded header.
     pub header_hash: Hash256,
 
-    /// Transaction results.
+    /// Results for each transaction in the set.
+    ///
+    /// Order matches the transaction set order.
     pub tx_results: Vec<TransactionResultPair>,
 
-    /// Ledger close metadata (for history).
+    /// Full ledger close metadata for history archival.
+    ///
+    /// Contains transaction processing details, SCP history, and other
+    /// data needed for complete history archive reconstruction.
     pub meta: Option<LedgerCloseMeta>,
 }
 
@@ -454,13 +540,30 @@ impl LedgerCloseResult {
     }
 }
 
-/// Context for applying upgrades during ledger close.
+/// Context for applying protocol upgrades during ledger close.
+///
+/// Protocol upgrades allow the network to evolve without hard forks.
+/// Validators vote on upgrades, and when consensus is reached, the
+/// upgrade is applied at the ledger boundary.
+///
+/// # Supported Upgrades
+///
+/// - **Version**: Protocol version bump (enables new features)
+/// - **BaseFee**: Network-wide base fee per operation
+/// - **BaseReserve**: Minimum balance per entry
+/// - **MaxTxSetSize**: Maximum transactions per ledger
+/// - **Config**: Soroban configuration settings (Protocol 20+)
+///
+/// # Application Order
+///
+/// Upgrades are applied to the header in the order they appear in the list.
+/// Multiple upgrades of the same type will result in the last one winning.
 #[derive(Debug, Clone)]
 pub struct UpgradeContext {
-    /// The upgrades to apply.
+    /// List of upgrades to apply.
     pub upgrades: Vec<LedgerUpgrade>,
 
-    /// Current protocol version before upgrades.
+    /// Protocol version before any upgrades are applied.
     pub current_version: u32,
 }
 
@@ -551,34 +654,55 @@ impl UpgradeContext {
     }
 }
 
-/// Statistics about a ledger close.
+/// Statistics collected during ledger close processing.
+///
+/// These statistics are useful for monitoring ledger close performance,
+/// tracking transaction success rates, and understanding state changes.
+///
+/// # Usage
+///
+/// Statistics are accumulated during transaction processing and can be
+/// accessed via [`LedgerCloseContext::stats`].
+///
+/// ```ignore
+/// let ctx = manager.begin_close(close_data)?;
+/// ctx.apply_transactions()?;
+/// let result = ctx.commit()?;
+///
+/// // Stats are available in the context before commit
+/// println!("Processed {} transactions", ctx.stats().tx_count);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct LedgerCloseStats {
-    /// Number of transactions processed.
+    /// Total number of transactions processed (success + failure).
     pub tx_count: usize,
 
-    /// Number of operations executed.
+    /// Total number of operations executed across all transactions.
     pub op_count: usize,
 
-    /// Number of successful transactions.
+    /// Number of transactions that completed successfully.
     pub tx_success_count: usize,
 
-    /// Number of failed transactions.
+    /// Number of transactions that failed.
     pub tx_failed_count: usize,
 
-    /// Total fees charged.
+    /// Total fees collected from all transactions (in stroops).
+    ///
+    /// Fees are charged even for failed transactions.
     pub total_fees: i64,
 
-    /// Number of entries created.
+    /// Number of new ledger entries created.
     pub entries_created: usize,
 
-    /// Number of entries updated.
+    /// Number of existing entries modified.
     pub entries_updated: usize,
 
     /// Number of entries deleted.
     pub entries_deleted: usize,
 
-    /// Time taken to close the ledger (in milliseconds).
+    /// Wall-clock time to close the ledger (milliseconds).
+    ///
+    /// Measured from begin_close to commit completion.
     pub close_time_ms: u64,
 }
 

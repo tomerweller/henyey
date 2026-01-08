@@ -1,66 +1,142 @@
-//! Stellar key encoding (StrKey format).
+//! Stellar StrKey encoding and decoding.
 //!
-//! Stellar uses a base32 encoding with version bytes for different key types.
+//! StrKey is Stellar's human-readable key encoding format. It uses RFC 4648
+//! base32 encoding with a version byte prefix and CRC16 checksum suffix.
+//!
+//! # Format
+//!
+//! A StrKey consists of:
+//! 1. **Version byte**: Identifies the key type (determines the first character)
+//! 2. **Payload**: The raw key bytes (typically 32 bytes)
+//! 3. **Checksum**: CRC16-XModem of version + payload (2 bytes)
+//!
+//! The entire structure is then base32 encoded (no padding).
+//!
+//! # Key Types
+//!
+//! | Prefix | Type | Description |
+//! |--------|------|-------------|
+//! | G | Account ID | Ed25519 public key |
+//! | S | Secret Seed | Ed25519 secret key |
+//! | T | Pre-Auth TX | Pre-authorized transaction hash |
+//! | X | SHA256 Hash | SHA-256 hash used as signer |
+//! | M | Muxed Account | Account ID + 64-bit memo ID |
+//! | P | Signed Payload | Account ID + arbitrary payload |
+//!
+//! # Example
+//!
+//! ```
+//! use stellar_core_crypto::{encode_account_id, decode_account_id};
+//!
+//! let key = [0u8; 32];
+//! let strkey = encode_account_id(&key);
+//! assert!(strkey.starts_with('G'));
+//!
+//! let decoded = decode_account_id(&strkey).unwrap();
+//! assert_eq!(decoded, key);
+//! ```
 
 use crate::error::CryptoError;
 
-// Version bytes for different key types
-const VERSION_ACCOUNT_ID: u8 = 6 << 3; // 'G' prefix
-const VERSION_SEED: u8 = 18 << 3; // 'S' prefix
-const VERSION_PRE_AUTH_TX: u8 = 19 << 3; // 'T' prefix
-const VERSION_SHA256_HASH: u8 = 23 << 3; // 'X' prefix
-const VERSION_MUXED_ACCOUNT: u8 = 12 << 3; // 'M' prefix
-#[allow(dead_code)]
-const VERSION_SIGNED_PAYLOAD: u8 = 15 << 3; // 'P' prefix
+// Version bytes for different key types.
+// The version byte determines the first character after base32 encoding.
+// Computed as (character_index << 3) where character_index is the position
+// in the base32 alphabet that produces the desired prefix letter.
 
-/// Encode an account ID (G...).
+/// Version byte for account IDs (produces 'G' prefix).
+const VERSION_ACCOUNT_ID: u8 = 6 << 3;
+/// Version byte for secret seeds (produces 'S' prefix).
+const VERSION_SEED: u8 = 18 << 3;
+/// Version byte for pre-auth transaction hashes (produces 'T' prefix).
+const VERSION_PRE_AUTH_TX: u8 = 19 << 3;
+/// Version byte for SHA256 hashes (produces 'X' prefix).
+const VERSION_SHA256_HASH: u8 = 23 << 3;
+/// Version byte for muxed accounts (produces 'M' prefix).
+const VERSION_MUXED_ACCOUNT: u8 = 12 << 3;
+/// Version byte for signed payloads (produces 'P' prefix).
+#[allow(dead_code)]
+const VERSION_SIGNED_PAYLOAD: u8 = 15 << 3;
+
+/// Encodes an Ed25519 public key as a Stellar account ID (G...).
+///
+/// Account IDs are the standard way to represent Stellar accounts.
 pub fn encode_account_id(key: &[u8; 32]) -> String {
     encode_check(VERSION_ACCOUNT_ID, key)
 }
 
-/// Decode an account ID (G...).
+/// Decodes a Stellar account ID (G...) to raw key bytes.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidStrKey`] if the string is not a valid account ID.
 pub fn decode_account_id(s: &str) -> Result<[u8; 32], CryptoError> {
     decode_check(VERSION_ACCOUNT_ID, s, 32)
 }
 
-/// Encode a secret seed (S...).
+/// Encodes an Ed25519 secret key as a Stellar seed (S...).
+///
+/// Seeds are used to store and transmit secret keys securely.
 pub fn encode_secret_seed(seed: &[u8; 32]) -> String {
     encode_check(VERSION_SEED, seed)
 }
 
-/// Decode a secret seed (S...).
+/// Decodes a Stellar seed (S...) to raw key bytes.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidStrKey`] if the string is not a valid seed.
 pub fn decode_secret_seed(s: &str) -> Result<[u8; 32], CryptoError> {
     decode_check(VERSION_SEED, s, 32)
 }
 
-/// Encode a pre-auth transaction hash (T...).
+/// Encodes a pre-authorized transaction hash (T...).
+///
+/// Pre-auth transaction hashes allow transactions to be authorized before
+/// they are submitted to the network.
 pub fn encode_pre_auth_tx(hash: &[u8; 32]) -> String {
     encode_check(VERSION_PRE_AUTH_TX, hash)
 }
 
-/// Decode a pre-auth transaction hash (T...).
+/// Decodes a pre-authorized transaction hash (T...).
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidStrKey`] if the string is not a valid pre-auth TX.
 pub fn decode_pre_auth_tx(s: &str) -> Result<[u8; 32], CryptoError> {
     decode_check(VERSION_PRE_AUTH_TX, s, 32)
 }
 
-/// Encode a SHA256 hash (X...).
+/// Encodes a SHA256 hash as a StrKey (X...).
+///
+/// SHA256 hashes can be used as signers for accounts.
 pub fn encode_sha256_hash(hash: &[u8; 32]) -> String {
     encode_check(VERSION_SHA256_HASH, hash)
 }
 
-/// Decode a SHA256 hash (X...).
+/// Decodes a SHA256 hash StrKey (X...).
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidStrKey`] if the string is not a valid SHA256 hash.
 pub fn decode_sha256_hash(s: &str) -> Result<[u8; 32], CryptoError> {
     decode_check(VERSION_SHA256_HASH, s, 32)
 }
 
-/// Encode a muxed account (M...).
+/// Encodes a muxed account (M...).
+///
+/// Muxed accounts combine an account ID with a 64-bit memo ID, allowing
+/// a single account to have multiple virtual sub-accounts.
 pub fn encode_muxed_account(key: &[u8; 32], id: u64) -> String {
     let mut data = key.to_vec();
     data.extend_from_slice(&id.to_be_bytes());
     encode_check(VERSION_MUXED_ACCOUNT, &data)
 }
 
-/// Decode a muxed account (M...).
+/// Decodes a muxed account (M...) to key bytes and memo ID.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidStrKey`] if the string is not a valid muxed account.
 pub fn decode_muxed_account(s: &str) -> Result<([u8; 32], u64), CryptoError> {
     let data = decode_check_variable(VERSION_MUXED_ACCOUNT, s)?;
     if data.len() != 40 {
@@ -75,22 +151,28 @@ pub fn decode_muxed_account(s: &str) -> Result<([u8; 32], u64), CryptoError> {
     Ok((key, id))
 }
 
+/// Encodes data with a version byte and CRC16 checksum.
+///
+/// Format: base32(version || data || crc16(version || data))
 fn encode_check(version: u8, data: &[u8]) -> String {
     let mut payload = vec![version];
     payload.extend_from_slice(data);
 
-    // CRC16-XModem checksum
+    // Append CRC16-XModem checksum in little-endian
     let checksum = crc16_xmodem(&payload);
     payload.extend_from_slice(&checksum.to_le_bytes());
 
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &payload)
 }
 
+/// Decodes a fixed-length StrKey with version verification.
+///
+/// Verifies the version byte matches and the checksum is valid.
 fn decode_check<const N: usize>(expected_version: u8, s: &str, expected_len: usize) -> Result<[u8; N], CryptoError> {
     let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, s)
         .ok_or_else(|| CryptoError::InvalidStrKey("invalid base32".to_string()))?;
 
-    // Minimum: 1 version byte + N data bytes + 2 checksum bytes
+    // Expected: 1 version byte + expected_len data bytes + 2 checksum bytes
     if decoded.len() != 1 + expected_len + 2 {
         return Err(CryptoError::InvalidStrKey(format!(
             "length {} != {}",
@@ -107,7 +189,7 @@ fn decode_check<const N: usize>(expected_version: u8, s: &str, expected_len: usi
         )));
     }
 
-    // Verify checksum
+    // Verify CRC16 checksum
     let checksum_pos = decoded.len() - 2;
     let checksum = u16::from_le_bytes([decoded[checksum_pos], decoded[checksum_pos + 1]]);
     let computed = crc16_xmodem(&decoded[..checksum_pos]);
@@ -120,10 +202,14 @@ fn decode_check<const N: usize>(expected_version: u8, s: &str, expected_len: usi
     Ok(key)
 }
 
+/// Decodes a variable-length StrKey with version verification.
+///
+/// Used for key types with variable payload sizes (e.g., muxed accounts).
 fn decode_check_variable(expected_version: u8, s: &str) -> Result<Vec<u8>, CryptoError> {
     let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, s)
         .ok_or_else(|| CryptoError::InvalidStrKey("invalid base32".to_string()))?;
 
+    // Minimum: 1 version + 0 data + 2 checksum = 3 bytes
     if decoded.len() < 3 {
         return Err(CryptoError::InvalidStrKey("too short".to_string()));
     }
@@ -136,7 +222,7 @@ fn decode_check_variable(expected_version: u8, s: &str) -> Result<Vec<u8>, Crypt
         )));
     }
 
-    // Verify checksum
+    // Verify CRC16 checksum
     let checksum_pos = decoded.len() - 2;
     let checksum = u16::from_le_bytes([decoded[checksum_pos], decoded[checksum_pos + 1]]);
     let computed = crc16_xmodem(&decoded[..checksum_pos]);
@@ -147,7 +233,10 @@ fn decode_check_variable(expected_version: u8, s: &str) -> Result<Vec<u8>, Crypt
     Ok(decoded[1..checksum_pos].to_vec())
 }
 
-/// CRC16-XModem checksum.
+/// Computes the CRC16-XModem checksum of data.
+///
+/// CRC16-XModem uses polynomial 0x1021 with initial value 0.
+/// This is the checksum algorithm used by Stellar for StrKey encoding.
 fn crc16_xmodem(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for byte in data {

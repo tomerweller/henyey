@@ -1,11 +1,26 @@
 //! Herder state machine for consensus participation.
+//!
+//! This module defines the state machine that governs how the Herder participates
+//! in network consensus. The Herder progresses through distinct states as it
+//! synchronizes with the network and begins tracking or validating ledgers.
+//!
+//! # State Transitions
+//!
+//! ```text
+//! Booting -> Syncing -> Tracking
+//! ```
+//!
+//! - **Booting**: Initial state after startup, not connected to the network
+//! - **Syncing**: Catching up to the network via history archives
+//! - **Tracking**: Synchronized and following consensus in real-time
 
 use std::fmt;
 
 /// The state of the Herder with respect to network consensus.
 ///
 /// The Herder transitions through these states as it synchronizes with the network
-/// and begins participating in consensus.
+/// and begins participating in consensus. Each state determines which operations
+/// are permitted (e.g., receiving transactions, processing SCP envelopes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HerderState {
     /// Initial state after startup.

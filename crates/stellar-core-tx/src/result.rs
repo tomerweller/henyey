@@ -1,7 +1,27 @@
 //! Transaction and operation result types.
 //!
-//! This module provides wrappers around XDR result types for easier
-//! handling and inspection.
+//! This module provides wrapper types around XDR result structures for easier
+//! handling and inspection. The wrappers add convenience methods while preserving
+//! access to the underlying XDR data.
+//!
+//! # Key Types
+//!
+//! - [`TxApplyResult`]: Result of applying a single transaction, including success
+//!   status, fee charged, and detailed result.
+//!
+//! - [`TxResultWrapper`]: Wrapper around XDR `TransactionResult` with helper methods
+//!   for checking success, extracting operation results, and result codes.
+//!
+//! - [`OpResultWrapper`]: Wrapper around XDR `OperationResult` for checking operation
+//!   success and extracting result codes.
+//!
+//! - [`TxSetResultSummary`]: Aggregates statistics across multiple transactions for
+//!   reporting on transaction set application.
+//!
+//! # Result Codes
+//!
+//! The [`TxResultCode`] and [`OpResultCode`] enums provide typed access to result
+//! codes with human-readable names matching the Stellar documentation.
 
 use stellar_xdr::curr::{
     InnerTransactionResultResult, OperationResult, OperationResultTr, TransactionResult,

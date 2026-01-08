@@ -241,10 +241,9 @@ mod tests {
 
     #[test]
     fn test_bucket_path() {
-        let hash = Hash256::from_hex(
-            "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd",
-        )
-        .unwrap();
+        let hash =
+            Hash256::from_hex("e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd")
+                .unwrap();
 
         assert_eq!(
             bucket_path(&hash),

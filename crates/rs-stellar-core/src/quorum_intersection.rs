@@ -1,3 +1,42 @@
+//! Quorum intersection analysis for Stellar Consensus Protocol (SCP).
+//!
+//! This module provides functionality to verify that a network of SCP nodes
+//! enjoys quorum intersection - a critical safety property that ensures all
+//! quorums in the network share at least one common node.
+//!
+//! # Background
+//!
+//! In SCP, a quorum is a set of nodes where each node's quorum slice requirements
+//! are satisfied. For the network to maintain consensus safety, any two quorums
+//! must overlap (share at least one node). If this property doesn't hold,
+//! different parts of the network could agree on conflicting values.
+//!
+//! # Usage
+//!
+//! The main entry point is [`check_quorum_intersection_from_json`], which loads
+//! a network configuration from a JSON file and verifies the intersection property.
+//!
+//! ```text
+//! // Example JSON format:
+//! {
+//!     "nodes": [
+//!         {
+//!             "node": "GDKXE2OZM...",  // Public key in strkey format
+//!             "qset": {
+//!                 "t": 2,              // Threshold
+//!                 "v": ["GCEZWKCA5...", "GBLJNN7HG..."]  // Validators
+//!             }
+//!         }
+//!     ]
+//! }
+//! ```
+//!
+//! # Algorithm Complexity
+//!
+//! The algorithm enumerates all possible subsets of nodes (2^n) to find quorums,
+//! then checks all pairs for intersection. This is exponential in the number of
+//! nodes and is only practical for small networks (roughly < 20 nodes).
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -7,23 +46,35 @@ use stellar_core_scp::{is_quorum, is_quorum_slice};
 use stellar_core_scp::quorum_config::parse_node_id;
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
+/// JSON representation of the network configuration for quorum intersection analysis.
 #[derive(Debug, Deserialize)]
 struct QuorumIntersectionJson {
+    /// List of nodes with their quorum set configurations.
     nodes: Vec<NodeEntry>,
 }
 
+/// A single node entry from the JSON configuration.
 #[derive(Debug, Deserialize)]
 struct NodeEntry {
+    /// Node public key in strkey format (e.g., "GDKXE2OZM...").
     node: String,
+    /// The node's quorum set configuration.
     qset: QsetEntry,
 }
 
+/// Quorum set configuration from JSON.
 #[derive(Debug, Deserialize)]
 struct QsetEntry {
+    /// Threshold - minimum number of validators that must agree.
     t: u32,
+    /// List of validator public keys in strkey format.
     v: Vec<String>,
 }
 
+/// Parses a JSON quorum set entry into an SCP quorum set structure.
+///
+/// Converts validator public keys from strkey format to `NodeId` and
+/// constructs the corresponding `ScpQuorumSet`.
 fn parse_qset(entry: &QsetEntry) -> anyhow::Result<ScpQuorumSet> {
     let mut validators = Vec::with_capacity(entry.v.len());
     for node in &entry.v {
@@ -38,6 +89,17 @@ fn parse_qset(entry: &QsetEntry) -> anyhow::Result<ScpQuorumSet> {
     })
 }
 
+/// Loads a quorum map from a JSON file.
+///
+/// Reads the JSON file at the given path and constructs a mapping from
+/// node IDs to their quorum sets.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The file cannot be read
+/// - The JSON is malformed
+/// - Any node ID or quorum set is invalid
 fn load_quorum_map(path: &Path) -> anyhow::Result<HashMap<NodeId, ScpQuorumSet>> {
     let payload = fs::read_to_string(path)?;
     let json: QuorumIntersectionJson =
@@ -53,6 +115,11 @@ fn load_quorum_map(path: &Path) -> anyhow::Result<HashMap<NodeId, ScpQuorumSet>>
     Ok(map)
 }
 
+/// Checks if a set of nodes forms a valid quorum.
+///
+/// A set of nodes is a quorum if every node in the set has its quorum slice
+/// requirements satisfied by the set. This function picks an arbitrary node
+/// from the set and uses SCP's `is_quorum` check.
 fn is_quorum_for_set(nodes: &HashSet<NodeId>, qmap: &HashMap<NodeId, ScpQuorumSet>) -> bool {
     let Some(first) = nodes.iter().next() else {
         return false;
@@ -64,12 +131,28 @@ fn is_quorum_for_set(nodes: &HashSet<NodeId>, qmap: &HashMap<NodeId, ScpQuorumSe
     is_quorum(local_qset, nodes, |node_id| qmap.get(node_id).cloned())
 }
 
+/// Checks if the network enjoys quorum intersection.
+///
+/// Enumerates all possible node subsets, identifies which ones form valid
+/// quorums, and then verifies that every pair of quorums shares at least
+/// one common node.
+///
+/// # Algorithm
+///
+/// 1. Generate all 2^n - 1 non-empty subsets of nodes
+/// 2. For each subset, check if it forms a valid quorum
+/// 3. For all pairs of quorums, verify they are not disjoint
+///
+/// # Returns
+///
+/// `true` if all quorum pairs intersect, `false` otherwise.
 fn network_enjoys_quorum_intersection(qmap: &HashMap<NodeId, ScpQuorumSet>) -> bool {
     let nodes: Vec<NodeId> = qmap.keys().cloned().collect();
     if nodes.is_empty() {
         return false;
     }
 
+    // Enumerate all possible quorums by checking every subset
     let mut quorums: Vec<HashSet<NodeId>> = Vec::new();
     let total = nodes.len();
     for mask in 1..(1u64 << total) {
@@ -84,6 +167,7 @@ fn network_enjoys_quorum_intersection(qmap: &HashMap<NodeId, ScpQuorumSet>) -> b
         }
     }
 
+    // Check all pairs of quorums for intersection
     for i in 0..quorums.len() {
         for j in (i + 1)..quorums.len() {
             if quorums[i].is_disjoint(&quorums[j]) {
@@ -95,6 +179,27 @@ fn network_enjoys_quorum_intersection(qmap: &HashMap<NodeId, ScpQuorumSet>) -> b
     true
 }
 
+/// Loads a quorum configuration from JSON and checks for quorum intersection.
+///
+/// This is the main entry point for quorum intersection analysis. It:
+/// 1. Loads the network configuration from the JSON file
+/// 2. Verifies each node has a satisfiable quorum slice in the network
+/// 3. Checks that all quorums in the network intersect
+///
+/// # Arguments
+///
+/// * `path` - Path to the JSON configuration file
+///
+/// # Returns
+///
+/// * `Ok(true)` - Network enjoys quorum intersection (safe)
+/// * `Ok(false)` - Network does NOT enjoy quorum intersection (unsafe!)
+/// * `Err(_)` - Configuration error or unsatisfiable quorum slice
+///
+/// # Errors
+///
+/// Returns an error if any node's quorum set cannot be satisfied by the
+/// network (i.e., the node would be stuck and unable to reach consensus).
 pub fn check_quorum_intersection_from_json(path: &Path) -> anyhow::Result<bool> {
     let qmap = load_quorum_map(path)?;
     for (node, qset) in &qmap {
@@ -110,6 +215,7 @@ pub fn check_quorum_intersection_from_json(path: &Path) -> anyhow::Result<bool> 
     Ok(network_enjoys_quorum_intersection(&qmap))
 }
 
+/// Converts a node ID to its hexadecimal representation for display.
 fn node_id_to_hex(node: &NodeId) -> String {
     use stellar_xdr::curr::PublicKey;
     match node.0 {

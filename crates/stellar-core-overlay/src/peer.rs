@@ -1,6 +1,25 @@
 //! Peer connection handling for Stellar overlay.
 //!
-//! Represents a connected and authenticated peer with message send/receive.
+//! This module provides the [`Peer`] type which represents a fully authenticated
+//! connection to another Stellar node. A peer encapsulates:
+//!
+//! - The underlying TCP connection with message framing
+//! - Authentication state and MAC keys for message verification
+//! - Connection metadata (peer ID, address, versions)
+//! - Statistics tracking (messages sent/received, bytes transferred)
+//!
+//! # Lifecycle
+//!
+//! 1. **Connection**: Either [`Peer::connect`] (outbound) or [`Peer::accept`] (inbound)
+//! 2. **Handshake**: Hello/Auth message exchange establishes authenticated channel
+//! 3. **Message Exchange**: Use [`send`](Peer::send) and [`recv`](Peer::recv) for communication
+//! 4. **Disconnection**: Call [`close`](Peer::close) or let the peer drop
+//!
+//! # Flow Control
+//!
+//! Peers implement Stellar's flow control protocol. After receiving messages,
+//! you should call [`send_more_extended`](Peer::send_more_extended) to indicate
+//! capacity for more messages.
 
 use crate::{
     auth::AuthContext,
@@ -22,64 +41,75 @@ fn message_len(message: &StellarMessage) -> usize {
         .unwrap_or(0)
 }
 
-/// Peer connection state.
+/// Current state of a peer connection.
+///
+/// Tracks the connection lifecycle from initial connection through
+/// authentication to disconnection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
-    /// Connecting to peer.
+    /// TCP connection in progress (outbound only).
     Connecting,
-    /// Connected, handshake in progress.
+    /// TCP connected, Hello/Auth handshake in progress.
     Handshaking,
-    /// Fully authenticated and ready.
+    /// Handshake complete, peer is ready for message exchange.
     Authenticated,
-    /// Closing connection.
+    /// Connection is being closed.
     Closing,
-    /// Disconnected.
+    /// Connection has been closed.
     Disconnected,
 }
 
 impl PeerState {
-    /// Check if the peer is connected.
+    /// Returns true if the TCP connection is established.
+    ///
+    /// This includes both handshaking and authenticated states.
     pub fn is_connected(&self) -> bool {
         matches!(self, PeerState::Handshaking | PeerState::Authenticated)
     }
 
-    /// Check if the peer is ready to send/receive messages.
+    /// Returns true if the peer is fully authenticated and ready for messages.
     pub fn is_ready(&self) -> bool {
         matches!(self, PeerState::Authenticated)
     }
 }
 
-/// Statistics for a peer connection.
+/// Thread-safe statistics counters for a peer connection.
+///
+/// All counters use relaxed atomic ordering since exact accuracy
+/// is not critical for statistics.
 #[derive(Debug, Default)]
 pub struct PeerStats {
-    /// Messages sent.
+    /// Total number of messages sent to this peer.
     pub messages_sent: AtomicU64,
-    /// Messages received.
+    /// Total number of messages received from this peer.
     pub messages_received: AtomicU64,
-    /// Bytes sent.
+    /// Total bytes sent to this peer.
     pub bytes_sent: AtomicU64,
-    /// Bytes received.
+    /// Total bytes received from this peer.
     pub bytes_received: AtomicU64,
-    /// Unique flood messages received.
+    /// Unique flood messages received (first time seeing message).
     pub unique_flood_messages_recv: AtomicU64,
-    /// Duplicate flood messages received.
+    /// Duplicate flood messages received (already seen via another peer).
     pub duplicate_flood_messages_recv: AtomicU64,
-    /// Unique flood bytes received.
+    /// Bytes from unique flood messages.
     pub unique_flood_bytes_recv: AtomicU64,
-    /// Duplicate flood bytes received.
+    /// Bytes from duplicate flood messages.
     pub duplicate_flood_bytes_recv: AtomicU64,
-    /// Unique fetch messages received.
+    /// Unique fetch response messages received.
     pub unique_fetch_messages_recv: AtomicU64,
-    /// Duplicate fetch messages received.
+    /// Duplicate fetch response messages received.
     pub duplicate_fetch_messages_recv: AtomicU64,
-    /// Unique fetch bytes received.
+    /// Bytes from unique fetch responses.
     pub unique_fetch_bytes_recv: AtomicU64,
-    /// Duplicate fetch bytes received.
+    /// Bytes from duplicate fetch responses.
     pub duplicate_fetch_bytes_recv: AtomicU64,
 }
 
 impl PeerStats {
-    /// Get a snapshot of the stats.
+    /// Creates a point-in-time snapshot of all counters.
+    ///
+    /// The snapshot values may not be perfectly consistent with each other
+    /// since each counter is read independently.
     pub fn snapshot(&self) -> PeerStatsSnapshot {
         PeerStatsSnapshot {
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
@@ -102,7 +132,10 @@ impl PeerStats {
     }
 }
 
-/// Snapshot of peer statistics.
+/// Point-in-time snapshot of peer statistics.
+///
+/// All values are captured atomically but may not be perfectly consistent
+/// with each other (one counter might be slightly more up-to-date than another).
 #[derive(Debug, Clone)]
 pub struct PeerStatsSnapshot {
     pub messages_sent: u64,
@@ -119,26 +152,39 @@ pub struct PeerStatsSnapshot {
     pub duplicate_fetch_bytes_recv: u64,
 }
 
-/// Information about a connected peer.
+/// Static information about a connected peer.
+///
+/// This information is established during the Hello handshake and
+/// does not change for the lifetime of the connection.
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
-    /// Peer's node ID.
+    /// The peer's unique identifier (their public key).
     pub peer_id: PeerId,
-    /// Remote address.
+    /// The peer's network address (IP and port).
     pub address: SocketAddr,
-    /// Connection direction.
+    /// Whether we initiated this connection or they did.
     pub direction: ConnectionDirection,
-    /// Peer's version string.
+    /// The peer's software version string (e.g., "stellar-core v21.0.0").
     pub version_string: String,
-    /// Peer's overlay version.
+    /// The peer's overlay protocol version.
     pub overlay_version: u32,
-    /// Peer's ledger version.
+    /// The peer's ledger protocol version.
     pub ledger_version: u32,
-    /// When connection was established.
+    /// When this connection was established.
     pub connected_at: Instant,
 }
 
-/// An authenticated connection to a peer.
+/// A fully authenticated connection to a Stellar peer.
+///
+/// Handles message sending and receiving with automatic MAC authentication.
+/// Use [`Peer::connect`] for outbound connections or [`Peer::accept`] for inbound.
+///
+/// # Thread Safety
+///
+/// `Peer` is not `Sync` and should be accessed from a single task. For concurrent
+/// access, wrap it in a `Mutex` or use the [`OverlayManager`] which handles this.
+///
+/// [`OverlayManager`]: crate::OverlayManager
 pub struct Peer {
     /// Peer info.
     info: PeerInfo,
@@ -560,7 +606,10 @@ impl Peer {
     }
 }
 
-/// Handle for sending messages to a peer (used with split connections).
+/// A clonable handle for sending messages to a peer.
+///
+/// This is used internally when the peer connection is split for concurrent
+/// send/receive operations.
 #[derive(Clone)]
 pub struct PeerSender {
     peer_id: PeerId,
@@ -568,12 +617,14 @@ pub struct PeerSender {
 }
 
 impl PeerSender {
-    /// Create a new peer sender.
+    /// Creates a new peer sender with the given channel.
     pub fn new(peer_id: PeerId, tx: mpsc::Sender<StellarMessage>) -> Self {
         Self { peer_id, tx }
     }
 
-    /// Send a message.
+    /// Sends a message to the peer.
+    ///
+    /// Returns an error if the receiving end has been dropped.
     pub async fn send(&self, message: StellarMessage) -> Result<()> {
         self.tx
             .send(message)
@@ -581,7 +632,7 @@ impl PeerSender {
             .map_err(|_| OverlayError::ChannelSend)
     }
 
-    /// Get the peer ID.
+    /// Returns the peer ID this sender is associated with.
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
     }

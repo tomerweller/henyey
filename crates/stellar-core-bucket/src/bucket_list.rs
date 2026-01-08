@@ -1,13 +1,46 @@
 //! BucketList implementation - the full hierarchical bucket structure.
 //!
 //! The BucketList is Stellar's core data structure for storing ledger state.
-//! It consists of 11 levels, where each level contains two buckets (curr and snap).
+//! It consists of 11 levels (0-10), where each level contains two buckets:
 //!
-//! Spill boundaries follow stellar-core's `levelShouldSpill` rules based on
-//! level size and half-size, rather than a simple fixed period.
+//! - `curr`: The current bucket being filled with new entries
+//! - `snap`: The snapshot bucket from the previous spill
 //!
-//! This creates a log-structured merge tree that efficiently handles
-//! incremental updates while maintaining full history integrity.
+//! # Architecture
+//!
+//! The bucket list is a log-structured merge tree (LSM tree) optimized for
+//! Stellar's append-heavy workload. Lower levels update more frequently and
+//! contain recent data, while higher levels contain older, more stable data.
+//!
+//! ```text
+//! Level 0:  [curr] [snap]   <- Updates every 2 ledgers
+//! Level 1:  [curr] [snap]   <- Updates every 8 ledgers
+//! Level 2:  [curr] [snap]   <- Updates every 32 ledgers
+//! ...
+//! Level 10: [curr] [snap]   <- Never spills (top level)
+//! ```
+//!
+//! # Spill Mechanics
+//!
+//! When a level "spills", its `curr` bucket becomes its new `snap`, and
+//! the old `snap` is merged into the next level's `curr`. Spill boundaries
+//! follow stellar-core's `levelShouldSpill` rules:
+//!
+//! - `level_size(N)` = 4^(N+1): Size boundary for level N
+//! - `level_half(N)` = level_size(N) / 2: Half-size boundary
+//! - A level spills when the ledger is at a half or full size boundary
+//!
+//! # Hash Computation
+//!
+//! The bucket list hash is computed by hashing all level hashes together.
+//! Each level hash is `SHA256(curr_hash || snap_hash)`. This Merkle tree
+//! structure enables efficient integrity verification.
+//!
+//! # Entry Lookup
+//!
+//! Lookups search from level 0 to level 10, checking `curr` then `snap`
+//! at each level. The first match is returned (newer entries shadow older).
+//! Dead entries (tombstones) shadow live entries, returning None.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -28,20 +61,37 @@ use crate::eviction::{
 use crate::merge::merge_buckets_with_options;
 use crate::{BucketError, Result};
 
-/// Number of levels in the BucketList.
+/// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
 pub const BUCKET_LIST_LEVELS: usize = 11;
 
+/// First protocol version supporting INITENTRY and METAENTRY (CAP-0020).
 const FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY: u32 = 11;
+
+/// First protocol version supporting persistent eviction (CAP-0046/Soroban).
 const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 
-/// A level in the BucketList, containing curr and snap buckets.
+/// A single level in the BucketList, containing `curr` and `snap` buckets.
+///
+/// Each level maintains two buckets:
+/// - `curr`: Receives merged data from the level below when it spills
+/// - `snap`: Previous `curr` that was "snapped" during a spill
+///
+/// The level also has a `next` bucket used during merge operations to
+/// stage the result before committing it to `curr`.
+///
+/// # Spill Behavior
+///
+/// When a level spills:
+/// 1. The old `snap` is returned (flows to the next level)
+/// 2. `curr` becomes the new `snap`
+/// 3. `curr` is reset to empty (ready for new merges)
 #[derive(Clone, Debug)]
 pub struct BucketLevel {
-    /// The current bucket being filled.
+    /// The current bucket being filled with merged entries.
     pub curr: Bucket,
-    /// The snapshot from the previous merge.
+    /// The snapshot bucket from the previous spill.
     pub snap: Bucket,
-    /// The next bucket produced by a merge, awaiting commit.
+    /// Staged merge result awaiting commit (replaces `curr` on commit).
     next: Option<Bucket>,
     /// The level number (0-10).
     level: usize,
@@ -152,23 +202,40 @@ impl Default for BucketLevel {
     }
 }
 
-/// The complete BucketList structure.
+/// The complete BucketList structure representing all ledger state.
 ///
-/// Contains 11 levels of buckets that together represent
-/// the entire ledger state at a given point in time.
+/// The BucketList is Stellar's canonical on-disk state representation. It contains
+/// 11 levels of buckets that together hold every ledger entry in the network.
 ///
-/// Each level contains:
-/// - `curr`: The current bucket being filled
-/// - `snap`: The snapshot from the previous spill
+/// # Structure
 ///
-/// Spill frequency:
-/// - Level 0 spills every ledger
-/// - Level N spills every 2^(2N) ledgers
+/// Each level contains two buckets (`curr` and `snap`), and levels update at
+/// different frequencies based on their position:
+///
+/// | Level | Spill Period | Typical Contents              |
+/// |-------|--------------|-------------------------------|
+/// | 0     | 2 ledgers    | Very recent entries           |
+/// | 1     | 8 ledgers    | Recent entries                |
+/// | 2     | 32 ledgers   | Moderately recent entries     |
+/// | ...   | ...          | ...                           |
+/// | 10    | Never        | Oldest, most stable entries   |
+///
+/// # Key Operations
+///
+/// - [`add_batch`](BucketList::add_batch): Add entries from a closed ledger
+/// - [`get`](BucketList::get): Look up a ledger entry by key
+/// - [`hash`](BucketList::hash): Compute the Merkle root hash
+/// - [`scan_for_eviction_incremental`](BucketList::scan_for_eviction_incremental): Soroban eviction scan
+///
+/// # Thread Safety
+///
+/// BucketList is `Clone` but not `Send` or `Sync` by default. For concurrent
+/// access, wrap in appropriate synchronization primitives.
 #[derive(Clone)]
 pub struct BucketList {
-    /// The levels in the bucket list.
+    /// The 11 levels of the bucket list (indices 0-10).
     levels: Vec<BucketLevel>,
-    /// The current ledger sequence.
+    /// The current ledger sequence number (last ledger added).
     ledger_seq: u32,
 }
 
@@ -942,13 +1009,16 @@ impl std::fmt::Debug for BucketList {
 }
 
 /// Statistics about a BucketList.
+///
+/// Provides summary information about the bucket list state, useful for
+/// monitoring, debugging, and capacity planning.
 #[derive(Debug, Clone)]
 pub struct BucketListStats {
-    /// Number of levels.
+    /// Number of levels in the bucket list (always 11).
     pub num_levels: usize,
-    /// Total number of entries across all buckets.
+    /// Total number of entries across all buckets (including metadata).
     pub total_entries: usize,
-    /// Total number of non-empty buckets.
+    /// Total number of non-empty buckets (max 22: 11 levels * 2 buckets each).
     pub total_buckets: usize,
 }
 

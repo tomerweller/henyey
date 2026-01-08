@@ -8,43 +8,80 @@
 //! - Hierarchical organization with multiple levels
 //! - Support for live entries, dead entries, and init entries
 //!
-//! ## Structure
+//! # Structure
 //!
-//! The BucketList consists of multiple levels, where each level contains two buckets:
-//! - `curr`: The current bucket being filled
-//! - `snap`: The snapshot bucket from the previous merge
+//! The BucketList consists of 11 levels (0-10), where each level contains two buckets:
+//! - `curr`: The current bucket being filled with new entries
+//! - `snap`: The snapshot bucket from the previous spill
 //!
 //! Lower levels update more frequently, while higher levels contain older data
-//! and update less often (similar to a log-structured merge tree).
+//! and update less often (similar to a log-structured merge tree). This design
+//! optimizes for append-heavy workloads while maintaining efficient lookups.
 //!
-//! ## Spill Frequency
+//! # Spill Frequency
 //!
-//! Levels spill on a schedule derived from their size and half-size boundaries
-//! (see `BucketList::level_size` and `BucketList::level_half`). This matches
-//! stellar-core's `BucketListBase::levelShouldSpill` logic.
+//! Levels spill on a schedule derived from their size and half-size boundaries:
 //!
-//! ## Entry Types
+//! | Level | Size    | Half    | Spill Period |
+//! |-------|---------|---------|--------------|
+//! | 0     | 4       | 2       | 2 ledgers    |
+//! | 1     | 16      | 8       | 8 ledgers    |
+//! | 2     | 64      | 32      | 32 ledgers   |
+//! | ...   | ...     | ...     | ...          |
 //!
-//! - `LiveEntry`: A live ledger entry
-//! - `DeadEntry`: A tombstone marking deletion
-//! - `InitEntry`: Like LiveEntry but with different merge semantics
-//! - `Metadata`: Bucket metadata (protocol version, etc.)
+//! This matches stellar-core's `BucketListBase::levelShouldSpill` logic.
 //!
-//! ## Example
+//! # Entry Types
+//!
+//! Bucket entries come in four types, each with specific merge semantics:
+//!
+//! - [`BucketEntry::Live`]: A live ledger entry (the current state)
+//! - [`BucketEntry::Dead`]: A tombstone marking deletion (shadows older entries)
+//! - [`BucketEntry::Init`]: Like Live but with CAP-0020 merge semantics
+//! - [`BucketEntry::Metadata`]: Bucket metadata (protocol version, bucket list type)
+//!
+//! # Merge Semantics (CAP-0020)
+//!
+//! When buckets are merged, entries interact according to these rules:
+//!
+//! - `INIT + DEAD` = Both annihilated (nothing output)
+//! - `DEAD + INIT` = `LIVE` (recreation cancels tombstone)
+//! - `INIT + LIVE` = `INIT` with new value (preserves init status)
+//! - `LIVE + DEAD` = `DEAD` (deletion shadows old value)
+//!
+//! # Eviction (Soroban State Archival)
+//!
+//! For Soroban entries (ContractData, ContractCode), this crate provides
+//! incremental eviction scanning. Expired entries are either:
+//!
+//! - **Temporary entries**: Deleted immediately
+//! - **Persistent entries**: Archived to the hot archive bucket list
+//!
+//! See [`EvictionIterator`] and [`StateArchivalSettings`] for details.
+//!
+//! # Example
 //!
 //! ```ignore
 //! use stellar_core_bucket::{BucketList, BucketManager};
+//! use stellar_xdr::curr::BucketListType;
 //!
-//! // Create a bucket manager
+//! // Create a bucket manager for disk storage
 //! let manager = BucketManager::new("/tmp/buckets".into())?;
 //!
 //! // Create a new bucket list
 //! let mut bucket_list = BucketList::new();
 //!
 //! // Add entries from a closed ledger
-//! bucket_list.add_batch(1, protocol_version, BucketListType::Live, init_entries, live_entries, dead_entries)?;
+//! bucket_list.add_batch(
+//!     1,                          // ledger sequence
+//!     protocol_version,           // protocol version
+//!     BucketListType::Live,       // live vs hot archive
+//!     init_entries,               // newly created entries
+//!     live_entries,               // updated entries
+//!     dead_entries,               // deleted entries
+//! )?;
 //!
-//! // Look up an entry
+//! // Look up an entry by key
 //! if let Some(entry) = bucket_list.get(&key)? {
 //!     // Use the entry
 //! }
@@ -62,21 +99,56 @@ mod eviction;
 mod manager;
 mod merge;
 
-// Re-export main types
+// ============================================================================
+// Core bucket types
+// ============================================================================
+
 pub use bucket::Bucket;
 pub use bucket_list::{BucketLevel, BucketList, BucketListStats, BUCKET_LIST_LEVELS};
+
+// ============================================================================
+// Disk-backed storage
+// ============================================================================
+
 pub use disk_bucket::{DiskBucket, DiskBucketIter};
+
+// ============================================================================
+// Entry types and comparison
+// ============================================================================
+
 pub use entry::{compare_entries, compare_keys, ledger_entry_to_key, BucketEntry};
+
+// ============================================================================
+// Error handling
+// ============================================================================
+
 pub use error::BucketError;
+
+// ============================================================================
+// Eviction (Soroban state archival)
+// ============================================================================
+
 pub use eviction::{
     bucket_update_period, level_half, level_should_spill, level_size,
     update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
     DEFAULT_EVICTION_SCAN_SIZE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
 };
+
+// ============================================================================
+// Bucket management
+// ============================================================================
+
 pub use manager::{BucketManager, BucketManagerStats};
+
+// ============================================================================
+// Merge operations
+// ============================================================================
+
 pub use merge::{merge_buckets, merge_buckets_with_options, merge_multiple, MergeIterator};
 
 /// Result type for bucket operations.
+///
+/// This is a convenience alias for `std::result::Result<T, BucketError>`.
 pub type Result<T> = std::result::Result<T, BucketError>;
 
 #[cfg(test)]

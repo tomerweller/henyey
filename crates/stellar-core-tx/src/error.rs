@@ -1,8 +1,36 @@
-//! Error types for transaction operations.
+//! Error types for transaction processing.
+//!
+//! This module defines the main error type [`TxError`] used throughout the crate
+//! for handling failures in transaction validation, execution, and state operations.
+//!
+//! # Error Categories
+//!
+//! - **Validation errors**: Fee, sequence, signature, and structure issues
+//! - **Execution errors**: Operation failures, Soroban errors
+//! - **State errors**: Ledger access and crypto failures
+//! - **Internal errors**: XDR serialization and unexpected conditions
 
 use thiserror::Error;
 
-/// Errors that can occur during transaction operations.
+/// Errors that can occur during transaction processing.
+///
+/// This enum covers all error conditions that can arise during transaction
+/// validation, execution, and state management. It uses `thiserror` for
+/// convenient error message formatting and trait implementations.
+///
+/// # Example
+///
+/// ```ignore
+/// use stellar_core_tx::TxError;
+///
+/// fn process_tx() -> Result<(), TxError> {
+///     // ... processing logic ...
+///     Err(TxError::InsufficientFee {
+///         required: 200,
+///         provided: 100,
+///     })
+/// }
+/// ```
 #[derive(Debug, Error)]
 pub enum TxError {
     /// Transaction validation failed.

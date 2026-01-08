@@ -2,7 +2,35 @@
 //!
 //! The transaction queue holds pending transactions waiting to be included
 //! in a ledger. Transactions are ordered by fee (highest first) to maximize
-//! miner extractable value and network efficiency.
+//! network efficiency and incentivize appropriate fee bidding.
+//!
+//! # Overview
+//!
+//! The [`TransactionQueue`] is the central component for transaction mempool
+//! management. It handles:
+//!
+//! - **Transaction validation**: Structural, time bounds, and signature checks
+//! - **Fee-based ordering**: Higher-fee transactions are prioritized
+//! - **Sequence number handling**: Maintains contiguous sequences per account
+//! - **Lane-based limits**: Separate limits for classic, DEX, and Soroban transactions
+//! - **Eviction**: Lower-fee transactions are evicted when limits are exceeded
+//!
+//! # Transaction Set Building
+//!
+//! When building a transaction set for consensus, the queue:
+//!
+//! 1. Groups transactions by source account
+//! 2. Ensures contiguous sequence numbers (gaps break the chain)
+//! 3. Separates classic and Soroban transactions into different phases
+//! 4. Applies surge pricing when demand exceeds capacity
+//! 5. Produces a [`GeneralizedTransactionSet`] (protocol 20+) or legacy format
+//!
+//! # Sequence Number Rules
+//!
+//! For a given account, only transactions with contiguous sequence numbers
+//! can be included in the same ledger. Additionally, once a Soroban transaction
+//! appears in the sequence, subsequent classic transactions are excluded
+//! (Soroban and classic transactions execute in different phases).
 
 use parking_lot::RwLock;
 use std::cmp::Ordering;

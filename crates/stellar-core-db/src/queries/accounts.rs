@@ -1,33 +1,55 @@
 //! Account queries.
+//!
+//! This module provides database operations for Stellar accounts, which are
+//! the primary identity and balance holding entities on the network.
+//!
+//! Accounts contain:
+//! - Balance (in stroops, 1/10,000,000 of a lumen)
+//! - Sequence number (for transaction ordering)
+//! - Signing thresholds and signers
+//! - Optional extensions (liabilities, sponsorship)
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, Liabilities, PublicKey, Signer, Thresholds, ReadXdr,
-    WriteXdr, Limits,
+    AccountEntry, AccountEntryExt, AccountId, Liabilities, Limits, PublicKey, ReadXdr, Signer,
+    Thresholds, WriteXdr,
 };
 
 use super::super::error::DbError;
 
-/// Trait for querying and storing accounts.
+/// Query trait for account operations.
+///
+/// Provides methods for CRUD operations on the `accounts` table.
+/// Accounts are keyed by their public key (encoded as hex).
 pub trait AccountQueries {
-    /// Load an account by ID.
+    /// Loads an account by its account ID.
+    ///
+    /// Returns `None` if the account does not exist.
     fn load_account(&self, id: &AccountId) -> Result<Option<AccountEntry>, DbError>;
 
-    /// Store an account entry.
+    /// Stores an account entry in the database.
+    ///
+    /// If the account already exists, it is replaced.
+    /// The `last_modified` parameter records the ledger sequence where
+    /// this account was last changed.
     fn store_account(&self, entry: &AccountEntry, last_modified: u32) -> Result<(), DbError>;
 
-    /// Delete an account.
+    /// Deletes an account from the database.
+    ///
+    /// This is a no-op if the account does not exist.
     fn delete_account(&self, id: &AccountId) -> Result<(), DbError>;
 }
 
-/// Helper to encode AccountId as string (stellar address format using public key hex).
+/// Encodes an AccountId as a hex string for database storage.
 fn account_id_to_string(id: &AccountId) -> String {
     match &id.0 {
         PublicKey::PublicKeyTypeEd25519(key) => hex::encode(key.0),
     }
 }
 
-/// Helper to parse thresholds from hex string.
+/// Parses thresholds from a hex-encoded string.
+///
+/// Thresholds are 4 bytes: [master weight, low, medium, high].
 fn parse_thresholds(s: &str) -> Result<Thresholds, DbError> {
     let bytes = hex::decode(s).map_err(|e| {
         DbError::Integrity(format!("Invalid thresholds hex: {}", e))
@@ -38,12 +60,15 @@ fn parse_thresholds(s: &str) -> Result<Thresholds, DbError> {
     Ok(Thresholds([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-/// Helper to encode thresholds to hex string.
+/// Encodes thresholds as a hex string for database storage.
 fn thresholds_to_string(t: &Thresholds) -> String {
     hex::encode(t.0)
 }
 
-/// Helper to parse signers from JSON string.
+/// Parses signers from a JSON-encoded string.
+///
+/// Signers are stored as XDR bytes within a JSON array.
+/// Returns an empty vector if the input is None or empty.
 fn parse_signers(s: Option<String>) -> Result<Vec<Signer>, DbError> {
     match s {
         Some(json) if !json.is_empty() => {
@@ -61,7 +86,9 @@ fn parse_signers(s: Option<String>) -> Result<Vec<Signer>, DbError> {
     }
 }
 
-/// Helper to encode signers to JSON string.
+/// Encodes signers as a JSON string for database storage.
+///
+/// Returns `None` for empty signer lists to save storage space.
 fn signers_to_string(signers: &[Signer]) -> Option<String> {
     if signers.is_empty() {
         None

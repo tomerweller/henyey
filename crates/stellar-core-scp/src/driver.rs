@@ -1,8 +1,41 @@
 //! SCP driver trait defining callbacks for the SCP protocol.
 //!
-//! The SCPDriver trait is implemented by the Herder to connect SCP
-//! to the rest of the system. SCP itself is completely isolated and
-//! communicates only through this trait.
+//! The [`SCPDriver`] trait is the primary integration point between the SCP
+//! consensus protocol and the application layer (typically the Herder component).
+//! SCP itself is completely isolated and stateless with respect to application
+//! logic - all application-specific behavior is delegated through this trait.
+//!
+//! # Design Philosophy
+//!
+//! SCP is designed to be a pure consensus algorithm that:
+//! - Does not know how to validate transaction sets
+//! - Does not know how to persist data
+//! - Does not know how to communicate with peers
+//!
+//! The driver provides all of this context, making SCP reusable and testable.
+//!
+//! # Implementation Requirements
+//!
+//! Implementors must ensure that:
+//! - Value validation is deterministic across all nodes
+//! - Hash computations match the network's expectations
+//! - Timeouts increase appropriately to allow convergence
+//!
+//! # Example
+//!
+//! ```ignore
+//! struct MyHerder {
+//!     // ... application state
+//! }
+//!
+//! impl SCPDriver for MyHerder {
+//!     fn validate_value(&self, slot: u64, value: &Value, nomination: bool) -> ValidationLevel {
+//!         // Validate transaction set...
+//!         ValidationLevel::FullyValidated
+//!     }
+//!     // ... other methods
+//! }
+//! ```
 
 use std::time::Duration;
 
@@ -10,22 +43,56 @@ use stellar_core_common::Hash256;
 use stellar_xdr::curr::{NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, Value};
 
 /// Validation level for SCP values.
+///
+/// During consensus, values must be validated to ensure nodes agree
+/// on valid data. The validation level allows for deferred validation
+/// during nomination (when full context may not be available) while
+/// requiring full validation before externalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationLevel {
-    /// Invalid value - should be rejected.
+    /// The value is invalid and should be rejected.
+    ///
+    /// Invalid values are not voted for and not accepted from peers.
     Invalid,
-    /// Value may be valid but not fully validated yet.
-    /// This is used during nomination when we don't have full context.
+
+    /// The value may be valid but has not been fully validated yet.
+    ///
+    /// This is used during the nomination phase when full validation
+    /// may be expensive or require context not yet available. Values
+    /// at this level can participate in nomination but will require
+    /// full validation before being committed.
     MaybeValid,
-    /// Fully validated value.
+
+    /// The value has been fully validated and is known to be valid.
+    ///
+    /// Only fully validated values can be externalized (committed).
     FullyValidated,
 }
 
-/// Callback interface for SCP.
+/// Callback interface for the SCP consensus protocol.
 ///
-/// This trait is implemented by the Herder to connect SCP to the rest
-/// of the system. SCP is designed to be completely isolated, and all
-/// interactions happen through this trait.
+/// This trait is implemented by the application layer (typically the Herder)
+/// to connect SCP to the rest of the system. SCP is designed to be completely
+/// isolated from application logic, and all interactions happen through
+/// this trait.
+///
+/// # Thread Safety
+///
+/// Implementors must be `Send + Sync` as SCP may invoke callbacks from
+/// multiple contexts. Internal state should be protected appropriately.
+///
+/// # Callback Categories
+///
+/// The trait methods fall into several categories:
+///
+/// - **Validation**: [`validate_value`](Self::validate_value), [`extract_valid_value`](Self::extract_valid_value)
+/// - **Value Composition**: [`combine_candidates`](Self::combine_candidates)
+/// - **Quorum Set Lookup**: [`get_quorum_set`](Self::get_quorum_set), [`get_quorum_set_by_hash`](Self::get_quorum_set_by_hash)
+/// - **Cryptography**: [`sign_envelope`](Self::sign_envelope), [`verify_envelope`](Self::verify_envelope), [`hash_quorum_set`](Self::hash_quorum_set)
+/// - **Hash Computation**: [`compute_hash_node`](Self::compute_hash_node), [`compute_value_hash`](Self::compute_value_hash)
+/// - **Network**: [`emit_envelope`](Self::emit_envelope)
+/// - **Notifications**: [`nominating_value`](Self::nominating_value), [`value_externalized`](Self::value_externalized), etc.
+/// - **Timing**: [`compute_timeout`](Self::compute_timeout)
 pub trait SCPDriver: Send + Sync {
     /// Validate a value.
     ///

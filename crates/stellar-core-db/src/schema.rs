@@ -1,9 +1,38 @@
 //! Database schema definitions.
+//!
+//! This module contains the complete SQL schema for the stellar-core database.
+//! The schema is designed to be compatible with the C++ stellar-core database
+//! structure while being optimized for Rust access patterns.
+//!
+//! # Tables
+//!
+//! The schema includes tables for:
+//!
+//! - **State management**: `storestate` - key-value store for node configuration
+//! - **Ledger data**: `ledgerheaders` - block headers with sequence numbers and hashes
+//! - **Ledger entries**: `accounts`, `trustlines`, `offers`, `accountdata`,
+//!   `claimablebalance`, `liquiditypool` - the current state of the ledger
+//! - **Soroban**: `contractdata`, `contractcode`, `ttl` - smart contract state
+//! - **Transaction history**: `txhistory`, `txsets`, `txresults`, `txfeehistory`
+//! - **Consensus**: `scphistory`, `scpquorums`, `upgradehistory`
+//! - **Networking**: `peers`, `ban`
+//! - **Publishing**: `publishqueue`, `bucketlist`
+//!
+//! # Versioning
+//!
+//! The schema version is tracked in the `storestate` table and managed by
+//! the [`migrations`](crate::migrations) module.
 
-/// Schema version.
+/// Schema version constant.
+///
+/// Note: This is the initial schema version. The current version is tracked
+/// by [`CURRENT_VERSION`](crate::migrations::CURRENT_VERSION) in the migrations module.
 pub const SCHEMA_VERSION: i32 = 3;
 
-/// SQL to create the database schema.
+/// Complete SQL schema for initializing a fresh database.
+///
+/// This creates all tables and indexes needed for stellar-core operation.
+/// For existing databases, use the migration system instead of re-running this.
 pub const CREATE_SCHEMA: &str = r#"
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS storestate (
@@ -221,13 +250,45 @@ CREATE TABLE IF NOT EXISTS publishqueue (
 );
 "#;
 
-/// State keys for storestate table.
+/// Well-known keys for the `storestate` table.
+///
+/// The `storestate` table is a key-value store for persistent node state.
+/// These constants define the standard keys used by stellar-core.
 pub mod state_keys {
+    /// The sequence number of the last closed ledger.
+    ///
+    /// This is the primary indicator of the node's progress through the chain.
     pub const LAST_CLOSED_LEDGER: &str = "lastclosedledger";
+
+    /// JSON-encoded history archive state.
+    ///
+    /// Contains information about the last published checkpoint and the
+    /// state of the bucket list at that point.
     pub const HISTORY_ARCHIVE_STATE: &str = "historyarchivestate";
+
+    /// Current database schema version.
+    ///
+    /// Used by the migration system to track schema upgrades.
     pub const DATABASE_SCHEMA: &str = "databaseschema";
+
+    /// Network passphrase for transaction signing.
+    ///
+    /// Identifies which Stellar network this node is connected to
+    /// (e.g., "Public Global Stellar Network ; September 2015" for mainnet).
     pub const NETWORK_PASSPHRASE: &str = "networkpassphrase";
+
+    /// Target ledger version for protocol upgrades.
+    ///
+    /// Set when a protocol upgrade is pending.
     pub const LEDGER_UPGRADE_VERSION: &str = "ledgerupgradeversion";
+
+    /// Serialized SCP state for crash recovery.
+    ///
+    /// Contains the last known SCP state to resume consensus after restart.
     pub const LAST_SCP_DATA: &str = "lastscpdata";
+
+    /// Current SCP nomination/ballot state.
+    ///
+    /// Used for consensus state persistence.
     pub const SCP_STATE: &str = "scpstate";
 }

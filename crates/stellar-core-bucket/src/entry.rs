@@ -1,7 +1,37 @@
 //! BucketEntry implementation for bucket storage.
 //!
-//! This module handles bucket entries which can be live entries, dead entries
-//! (tombstones), init entries, or metadata entries.
+//! This module defines the [`BucketEntry`] type and associated utilities for
+//! working with entries stored in Stellar buckets. Bucket entries wrap ledger
+//! entries with additional metadata for merge semantics.
+//!
+//! # Entry Types
+//!
+//! | Type       | Description                                      | Merge Behavior              |
+//! |------------|--------------------------------------------------|-----------------------------|
+//! | `Live`     | An active ledger entry                           | Newer shadows older         |
+//! | `Dead`     | A tombstone marking deletion                     | Shadows any older entry     |
+//! | `Init`     | Entry created in this merge window (CAP-0020)    | Special annihilation rules  |
+//! | `Metadata` | Bucket metadata (protocol version, type)         | Merged by taking max version|
+//!
+//! # Key Ordering
+//!
+//! Entries in a bucket must be sorted by key for correct merge behavior.
+//! The ordering is determined by:
+//!
+//! 1. Entry type discriminant (Account < Trustline < Offer < ...)
+//! 2. Type-specific fields in lexicographic order
+//!
+//! See [`compare_keys`] for the detailed ordering rules.
+//!
+//! # Eviction Helpers
+//!
+//! This module also provides helper functions for Soroban state archival:
+//!
+//! - [`is_soroban_entry`]: Check if an entry is ContractData or ContractCode
+//! - [`is_temporary_entry`]: Check if a ContractData entry is temporary
+//! - [`is_persistent_entry`]: Check if an entry is persistent (archived on eviction)
+//! - [`get_ttl_key`]: Get the TTL key for a Soroban entry
+//! - [`is_ttl_expired`]: Check if a TTL entry has expired
 
 use std::cmp::Ordering;
 
@@ -13,24 +43,47 @@ use sha2::{Digest, Sha256};
 
 use crate::{BucketError, Result};
 
-/// An entry in a bucket.
+/// An entry stored in a bucket.
 ///
-/// Bucket entries are sorted by key for efficient merging and lookup.
-/// The entry types determine merge semantics:
-/// - LiveEntry: A live ledger entry
-/// - DeadEntry: A tombstone marking deletion
-/// - InitEntry: Like LiveEntry but with different merge semantics
-/// - Metadata: Bucket metadata (protocol version, etc.)
+/// Bucket entries wrap ledger entries with additional type information
+/// that controls merge semantics. Entries are sorted by key for efficient
+/// merging and binary search lookup.
+///
+/// # Entry Types and Merge Semantics (CAP-0020)
+///
+/// | Old Entry | New Entry | Result                           |
+/// |-----------|-----------|----------------------------------|
+/// | `Init`    | `Dead`    | Nothing (both annihilated)       |
+/// | `Dead`    | `Init`    | `Live` (recreation)              |
+/// | `Init`    | `Live`    | `Init` with new value            |
+/// | `Live`    | `Dead`    | `Dead` (if keeping tombstones)   |
+/// | `Live`    | `Live`    | Newer `Live` wins                |
+///
+/// The `Init` type is crucial for correctness: it marks entries created
+/// within a merge window so that subsequent deletions can be properly
+/// annihilated rather than leaving tombstones.
+///
+/// # Serialization
+///
+/// Bucket entries serialize to XDR's `BucketEntry` union type. The
+/// discriminant values are:
+/// - 0: `LIVEENTRY`
+/// - 1: `INITENTRY`
+/// - 2: `DEADENTRY`
+/// - 3: `METAENTRY`
 #[derive(Debug, Clone)]
 pub enum BucketEntry {
-    /// A live ledger entry.
+    /// A live ledger entry (the current state of this key).
     Live(LedgerEntry),
-    /// A dead (deleted) entry, identified by its key.
+    /// A tombstone marking that this key has been deleted.
     Dead(LedgerKey),
-    /// An initialization entry (for merge semantics).
-    /// Init entries are used to establish initial state that can be shadowed.
+    /// An initialization entry with special CAP-0020 merge semantics.
+    ///
+    /// Init entries mark entries created within a merge window. When an
+    /// Init entry is followed by a Dead entry, both are annihilated
+    /// (removed entirely) rather than leaving a tombstone.
     Init(LedgerEntry),
-    /// Bucket metadata (protocol version, etc.)
+    /// Bucket metadata (protocol version, bucket list type for p23+).
     Metadata(BucketMetadata),
 }
 
@@ -189,7 +242,25 @@ pub fn ledger_entry_to_key(entry: &LedgerEntry) -> Option<LedgerKey> {
 /// Compare two LedgerKeys for ordering.
 ///
 /// Keys are sorted first by type discriminant, then by type-specific fields.
-/// This ordering is critical for bucket merging to work correctly.
+/// This ordering is critical for bucket merging to work correctly and must
+/// match stellar-core's comparison exactly.
+///
+/// # Ordering Rules
+///
+/// 1. **By type discriminant** (as defined in `Stellar-ledger-entries.x`):
+///    - Account (0) < Trustline (1) < Offer (2) < Data (3) < ...
+///
+/// 2. **Within each type**, by type-specific fields in XDR order:
+///    - Account: by `account_id`
+///    - Trustline: by `account_id`, then `asset`
+///    - Offer: by `seller_id`, then `offer_id`
+///    - ContractData: by `contract`, then `key`, then `durability`
+///    - etc.
+///
+/// # Determinism
+///
+/// This function is deterministic and must produce the same ordering as
+/// stellar-core's C++ implementation to ensure bucket hashes match.
 pub fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     use stellar_xdr::curr::*;
 
@@ -405,12 +476,21 @@ pub fn compare_entries(a: &BucketEntry, b: &BucketEntry) -> Ordering {
 }
 
 // ============================================================================
-// Eviction helper functions
+// Eviction helper functions (Soroban State Archival)
 // ============================================================================
+//
+// These functions support the incremental eviction scan for Soroban entries.
+// Soroban uses a time-to-live (TTL) mechanism where entries expire and must
+// be either deleted (temporary) or archived (persistent).
 
 /// Check if a ledger entry is a Soroban entry (ContractData or ContractCode).
 ///
-/// These are the entry types that can be evicted and have associated TTL entries.
+/// Soroban entries are the only entry types subject to eviction and state
+/// archival. They have associated TTL entries that track when they expire.
+///
+/// # Returns
+///
+/// `true` if the entry is `ContractData` or `ContractCode`, `false` otherwise.
 pub fn is_soroban_entry(entry: &LedgerEntry) -> bool {
     matches!(
         entry.data,
@@ -423,9 +503,15 @@ pub fn is_soroban_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
-/// Check if a ledger entry is a temporary entry (temporary ContractData).
+/// Check if a ledger entry is a temporary Soroban entry.
 ///
-/// Temporary entries are deleted on eviction, not archived.
+/// Temporary entries (ContractData with `Temporary` durability) are deleted
+/// immediately on eviction and are NOT archived to the hot archive bucket list.
+///
+/// # Use Case
+///
+/// Temporary data is used for values that don't need to persist across
+/// archival, such as caches or ephemeral state.
 pub fn is_temporary_entry(entry: &LedgerEntry) -> bool {
     if let LedgerEntryData::ContractData(data) = &entry.data {
         data.durability == ContractDataDurability::Temporary
@@ -434,9 +520,16 @@ pub fn is_temporary_entry(entry: &LedgerEntry) -> bool {
     }
 }
 
-/// Check if a ledger entry is a persistent entry (ContractCode or persistent ContractData).
+/// Check if a ledger entry is a persistent Soroban entry.
 ///
-/// Persistent entries are archived to the hot archive on eviction.
+/// Persistent entries (ContractCode or ContractData with `Persistent` durability)
+/// are archived to the hot archive bucket list on eviction. They can later be
+/// restored to the live bucket list by paying for additional TTL.
+///
+/// # Persistent Entry Types
+///
+/// - All `ContractCode` entries (WASM code is always persistent)
+/// - `ContractData` entries with `Persistent` durability
 pub fn is_persistent_entry(entry: &LedgerEntry) -> bool {
     match &entry.data {
         LedgerEntryData::ContractCode(_) => true,
@@ -449,10 +542,19 @@ pub fn is_persistent_entry(entry: &LedgerEntry) -> bool {
 
 /// Get the TTL key for a Soroban entry.
 ///
-/// The TTL key contains a hash of the entry's key, used to look up the TTL entry
-/// that tracks when this entry expires.
+/// Each Soroban entry has an associated TTL entry that tracks its expiration.
+/// The TTL key is derived by hashing the original key with SHA-256.
 ///
-/// Returns None if the key is not a Soroban key (ContractData or ContractCode).
+/// # How TTL Works
+///
+/// TTL entries contain a `live_until_ledger_seq` field. When the current
+/// ledger exceeds this value, the entry is considered expired and will be
+/// evicted during the next eviction scan that encounters it.
+///
+/// # Returns
+///
+/// - `Some(LedgerKey::Ttl)` with the key hash for Soroban entries
+/// - `None` for non-Soroban entries (they don't have TTL)
 pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
     if !is_soroban_key(key) {
         return None;

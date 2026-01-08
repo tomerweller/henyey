@@ -1,39 +1,34 @@
 //! Transaction processing for rs-stellar-core.
 //!
-//! This crate handles transaction validation and execution, including:
+//! This crate provides the core transaction validation and execution logic for
+//! the Stellar network, supporting both classic Stellar operations and Soroban
+//! smart contract execution.
 //!
-//! - Transaction validation (signatures, fees, sequence numbers)
-//! - Operation execution (all Stellar operation types)
-//! - Soroban smart contract execution
-//! - Transaction result generation
+//! # Overview
 //!
-//! ## Overview
+//! The crate is designed primarily for two modes of operation:
 //!
-//! For catchup/sync mode, the main workflow is:
+//! 1. **Catchup/Replay Mode**: Applies historical transactions from archives
+//!    by trusting the recorded results and replaying state changes.
 //!
-//! 1. Parse transactions from history archives
-//! 2. Create `TransactionFrame` wrappers for each transaction
-//! 3. Apply the known results using `apply_from_history`
-//! 4. State changes are recorded in `LedgerDelta`
+//! 2. **Live Execution Mode**: Validates and executes transactions in real-time,
+//!    producing deterministic results that match C++ stellar-core.
 //!
-//! ## Classic Operations
+//! # Key Types
 //!
-//! - CreateAccount, Payment, PathPayment
-//! - ManageSellOffer, ManageBuyOffer, CreatePassiveSellOffer
-//! - SetOptions, ChangeTrust, AllowTrust
-//! - AccountMerge, Inflation, ManageData
-//! - BumpSequence, CreateClaimableBalance, ClaimClaimableBalance
-//! - BeginSponsoringFutureReserves, EndSponsoringFutureReserves
-//! - RevokeSponsorship, Clawback, SetTrustLineFlags
-//! - LiquidityPoolDeposit, LiquidityPoolWithdraw
+//! - [`TransactionFrame`]: Wrapper around XDR `TransactionEnvelope` providing
+//!   convenient access to transaction properties and hash computation.
 //!
-//! ## Soroban Operations
+//! - [`LedgerDelta`]: Accumulates all state changes (creates, updates, deletes)
+//!   during transaction execution for later persistence.
 //!
-//! - InvokeHostFunction: Smart contract execution
-//! - ExtendFootprintTtl: Extend state TTL
-//! - RestoreFootprint: Restore archived state
+//! - [`LedgerContext`]: Provides ledger-level context (sequence, close time,
+//!   base fee, network ID) needed for validation and execution.
 //!
-//! ## Example
+//! - [`LedgerStateManager`]: In-memory ledger state for transaction execution,
+//!   with support for snapshots and rollback.
+//!
+//! # Transaction Workflow (Catchup Mode)
 //!
 //! ```ignore
 //! use stellar_core_tx::{TransactionFrame, apply_from_history, LedgerDelta};
@@ -44,18 +39,46 @@
 //! let result: TransactionResult = /* from archive */;
 //! let meta: TransactionMeta = /* from archive */;
 //!
-//! // Create frame
+//! // Create frame wrapper
 //! let frame = TransactionFrame::new(envelope);
 //!
-//! // Apply from history
+//! // Apply historical transaction to accumulate state changes
 //! let mut delta = LedgerDelta::new(ledger_seq);
 //! let apply_result = apply_from_history(&frame, &result, &meta, &mut delta)?;
 //!
-//! // Delta now contains all state changes
+//! // Delta now contains all state changes to apply to the bucket list
 //! for entry in delta.created_entries() {
 //!     // Process created entries
 //! }
 //! ```
+//!
+//! # Classic Operations
+//!
+//! All standard Stellar operations are supported:
+//!
+//! - **Account**: `CreateAccount`, `AccountMerge`, `SetOptions`, `BumpSequence`
+//! - **Payments**: `Payment`, `PathPaymentStrictReceive`, `PathPaymentStrictSend`
+//! - **DEX**: `ManageSellOffer`, `ManageBuyOffer`, `CreatePassiveSellOffer`
+//! - **Trust**: `ChangeTrust`, `AllowTrust`, `SetTrustLineFlags`
+//! - **Data**: `ManageData`
+//! - **Claimable Balances**: `CreateClaimableBalance`, `ClaimClaimableBalance`
+//! - **Sponsorship**: `BeginSponsoringFutureReserves`, `EndSponsoringFutureReserves`, `RevokeSponsorship`
+//! - **Clawback**: `Clawback`, `ClawbackClaimableBalance`
+//! - **Liquidity Pools**: `LiquidityPoolDeposit`, `LiquidityPoolWithdraw`
+//! - **Deprecated**: `Inflation`
+//!
+//! # Soroban Operations
+//!
+//! Smart contract operations with protocol-versioned host integration:
+//!
+//! - `InvokeHostFunction`: Execute contract functions with full state access
+//! - `ExtendFootprintTtl`: Extend the time-to-live of contract state
+//! - `RestoreFootprint`: Restore archived contract state from hot archive
+//!
+//! # Protocol Versioning
+//!
+//! The crate supports multiple Stellar protocol versions and uses the correct
+//! soroban-env-host version for each protocol to ensure deterministic replay.
 
 mod apply;
 mod error;
@@ -104,33 +127,45 @@ pub use operations::{
 // Re-export state types
 pub use state::{LedgerReader, LedgerStateManager};
 
-/// Result type for transaction operations.
+/// Result type alias for transaction operations.
+///
+/// This is the standard Result type used throughout the crate, with [`TxError`]
+/// as the error type.
 pub type Result<T> = std::result::Result<T, TxError>;
 
-/// Transaction validation result.
+/// Summary result of transaction validation.
+///
+/// This enum provides a simplified view of validation outcomes, suitable for
+/// quick checks and logging. For detailed error information, use the
+/// [`ValidationError`] type returned by validation functions.
+///
+/// # Mapping from ValidationError
+///
+/// Each `ValidationResult` variant corresponds to one or more [`ValidationError`]
+/// variants. The [`From<ValidationError>`] implementation provides this mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationResult {
-    /// Transaction is valid and can be applied.
+    /// Transaction passed all validation checks.
     Valid,
-    /// Transaction has invalid signature(s).
+    /// Transaction has invalid or missing signature(s).
     InvalidSignature,
-    /// Transaction fee is too low.
+    /// Transaction fee is below the minimum required.
     InsufficientFee,
-    /// Source account sequence number is wrong.
+    /// Source account sequence number does not match expected.
     BadSequence,
-    /// Source account doesn't exist.
+    /// Source account does not exist in the ledger.
     NoAccount,
-    /// Source account has insufficient balance.
+    /// Source account has insufficient balance for the fee.
     InsufficientBalance,
-    /// Transaction has expired (time bounds).
+    /// Transaction's max time bound has passed.
     TooLate,
-    /// Transaction is not yet valid (time bounds).
+    /// Transaction's min time bound has not yet been reached.
     TooEarly,
-    /// Minimum sequence age or ledger gap not met.
+    /// Minimum sequence age or ledger gap precondition not met.
     BadMinSeqAgeOrGap,
-    /// Extra signer requirements not met.
+    /// Extra signer requirements specified in preconditions not met.
     BadAuthExtra,
-    /// Other validation error.
+    /// Other validation failure (structure, ledger bounds, etc.).
     Invalid,
 }
 
@@ -163,9 +198,28 @@ impl From<ValidationError> for ValidationResult {
     }
 }
 
-/// Validates a transaction before application.
+/// High-level transaction validator.
+///
+/// Provides a convenient interface for validating transaction envelopes
+/// against ledger context and optionally source account data.
+///
+/// # Example
+///
+/// ```ignore
+/// use stellar_core_tx::TransactionValidator;
+/// use stellar_xdr::curr::TransactionEnvelope;
+///
+/// let validator = TransactionValidator::testnet(1000, 1625000000);
+/// let envelope: TransactionEnvelope = /* ... */;
+///
+/// match validator.validate(&envelope) {
+///     ValidationResult::Valid => println!("Transaction is valid"),
+///     ValidationResult::InsufficientFee => println!("Fee too low"),
+///     other => println!("Validation failed: {:?}", other),
+/// }
+/// ```
 pub struct TransactionValidator {
-    /// Network context for validation.
+    /// Ledger context used for validation.
     context: LedgerContext,
 }
 
@@ -236,9 +290,23 @@ impl TransactionValidator {
     }
 }
 
-/// Executes transactions and produces results.
+/// Transaction executor for applying transactions.
+///
+/// Provides methods for executing transactions in different modes:
+///
+/// - **Historical replay**: Use [`apply_historical`](Self::apply_historical) with
+///   known results and metadata from archives.
+///
+/// - **Live execution**: Use [`execute_with_state`] (when available) with a
+///   state reader for full transaction execution.
+///
+/// # Note
+///
+/// The basic [`execute`](Self::execute) method is not fully implemented for live
+/// execution. For catchup mode, use `apply_historical`. For live execution,
+/// use the operation execution functions directly.
 pub struct TransactionExecutor {
-    /// Context for execution.
+    /// Execution context (ledger sequence, close time, etc.).
     #[allow(dead_code)]
     context: ApplyContext,
 }
@@ -276,14 +344,20 @@ impl TransactionExecutor {
     }
 }
 
-/// Result of executing a transaction (legacy compatibility).
+/// Simplified transaction execution result.
+///
+/// This is a convenience wrapper that provides easy access to the most
+/// commonly needed information from a transaction execution. For full
+/// details, use [`TxApplyResult`] and its [`TxResultWrapper`].
+///
+/// This type can be constructed from [`TxApplyResult`] via the [`From`] trait.
 #[derive(Debug, Clone)]
 pub struct TransactionResult {
-    /// The fee charged.
+    /// The fee charged in stroops.
     pub fee_charged: i64,
-    /// Result of each operation.
+    /// Result of each operation in the transaction.
     pub operation_results: Vec<OperationResult>,
-    /// Whether the transaction succeeded.
+    /// Whether the transaction as a whole succeeded.
     pub success: bool,
 }
 
@@ -311,29 +385,36 @@ impl From<TxApplyResult> for TransactionResult {
     }
 }
 
-/// Result of executing an operation.
+/// Simplified operation execution result.
+///
+/// Indicates whether an individual operation within a transaction succeeded
+/// or failed. For detailed operation-specific results, use the XDR
+/// `OperationResult` type from `stellar_xdr`.
 #[derive(Debug, Clone)]
 pub enum OperationResult {
-    /// Operation succeeded.
+    /// Operation completed successfully.
     Success,
-    /// Operation failed with a specific error.
+    /// Operation failed with an error.
     Failed(OperationError),
 }
 
-/// Operation-specific error types.
+/// Simplified operation error categories.
+///
+/// These are high-level error categories that cover the most common failure
+/// modes. For detailed error codes, use the XDR `OperationResult` variants.
 #[derive(Debug, Clone)]
 pub enum OperationError {
-    /// Generic operation failure.
+    /// Generic operation failure (no specific category).
     OpFailed,
-    /// Account doesn't exist.
+    /// Required account does not exist.
     NoAccount,
-    /// Insufficient balance.
+    /// Insufficient balance or reserve for the operation.
     Underfunded,
-    /// Line is full (trustline/offer limit).
+    /// Trustline or offer capacity exceeded.
     LineFull,
-    /// Asset is not authorized.
+    /// Asset authorization check failed.
     NotAuthorized,
-    /// Other operation-specific error.
+    /// Other operation-specific error with description.
     Other(String),
 }
 

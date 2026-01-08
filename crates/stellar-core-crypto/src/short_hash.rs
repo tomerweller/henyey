@@ -1,4 +1,40 @@
-//! Short hash utilities (SipHash-2-4).
+//! SipHash-2-4 short hashing for deterministic ordering.
+//!
+//! This module provides a process-global SipHash-2-4 hasher used for
+//! deterministic ordering of ledger entries in bucket lists and other
+//! data structures that require consistent ordering across nodes.
+//!
+//! # Why SipHash?
+//!
+//! SipHash-2-4 provides:
+//! - Fast hashing suitable for hash tables and ordering
+//! - Protection against hash-flooding DoS attacks
+//! - Deterministic output given the same key
+//!
+//! # Global Key Management
+//!
+//! The short hash key is initialized once per process:
+//!
+//! - By default, a random key is generated on first use
+//! - For tests or replay, [`seed`] can set a deterministic key
+//! - Once hashing begins, the key cannot be changed (to ensure consistency)
+//!
+//! # Thread Safety
+//!
+//! All functions in this module are thread-safe. The global key state is
+//! protected by a mutex.
+//!
+//! # Example
+//!
+//! ```
+//! use stellar_core_crypto::{compute_hash, initialize};
+//!
+//! // Initialize with a random key (optional, happens automatically)
+//! initialize();
+//!
+//! // Compute a short hash
+//! let hash = compute_hash(b"some data");
+//! ```
 
 use crate::random;
 use crate::CryptoError;
@@ -7,16 +43,22 @@ use std::hash::Hasher;
 use std::sync::{Mutex, OnceLock};
 use stellar_xdr::curr::{Limits, WriteXdr};
 
+/// Size of the SipHash key in bytes (128 bits).
 const KEY_BYTES: usize = 16;
 
+/// Internal state for the global short hash key.
 #[derive(Clone)]
 struct KeyState {
+    /// The 128-bit SipHash key.
     key: [u8; KEY_BYTES],
+    /// Whether any hashing has occurred (prevents reseeding).
     have_hashed: bool,
+    /// The explicit seed value if set via [`seed`], or 0 for random.
     explicit_seed: u32,
 }
 
 impl KeyState {
+    /// Creates a new key state with a random key.
     fn new() -> Self {
         Self {
             key: random::random_bytes(),
@@ -26,18 +68,41 @@ impl KeyState {
     }
 }
 
+/// Returns a reference to the global key state.
 fn key_state() -> &'static Mutex<KeyState> {
     static STATE: OnceLock<Mutex<KeyState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(KeyState::new()))
 }
 
-/// Initialize the short hash key with random bytes.
+/// Initializes the short hash key with fresh random bytes.
+///
+/// This is optional; the key is automatically initialized with random bytes
+/// on first use. Call this to explicitly reinitialize (e.g., at startup).
+///
+/// # Panics
+///
+/// Panics if the internal mutex is poisoned.
 pub fn initialize() {
     let mut state = key_state().lock().expect("short hash lock poisoned");
     state.key = random::random_bytes();
 }
 
-/// Seed the short hash key for deterministic tests.
+/// Seeds the short hash key with a deterministic value.
+///
+/// This is used for tests and replay scenarios where deterministic ordering
+/// is required. The seed is expanded to a 128-bit key.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::ShortHashSeedConflict`] if:
+/// - Hashing has already occurred with a different seed
+/// - The key was initialized randomly and hashing has begun
+///
+/// Calling `seed` multiple times with the same value is allowed.
+///
+/// # Panics
+///
+/// Panics if the internal mutex is poisoned.
 pub fn seed(seed: u32) -> Result<(), CryptoError> {
     let mut state = key_state().lock().expect("short hash lock poisoned");
     if state.have_hashed && state.explicit_seed != seed {
@@ -47,6 +112,7 @@ pub fn seed(seed: u32) -> Result<(), CryptoError> {
         });
     }
     state.explicit_seed = seed;
+    // Expand the 32-bit seed to a 128-bit key by repeating the byte pattern.
     for (i, byte) in state.key.iter_mut().enumerate() {
         let shift = i % std::mem::size_of::<u32>();
         *byte = (seed >> shift) as u8;
@@ -64,7 +130,14 @@ fn seed_key(seed: u32) -> [u8; KEY_BYTES] {
     key
 }
 
-/// Compute a SipHash-2-4 short hash for raw bytes.
+/// Computes a SipHash-2-4 hash of raw bytes.
+///
+/// This uses the process-global key. Once this function is called, the key
+/// is locked and cannot be reseeded with a different value.
+///
+/// # Panics
+///
+/// Panics if the internal mutex is poisoned.
 pub fn compute_hash(bytes: &[u8]) -> u64 {
     let mut state = key_state().lock().expect("short hash lock poisoned");
     state.have_hashed = true;
@@ -73,7 +146,18 @@ pub fn compute_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Compute a SipHash-2-4 short hash for XDR-encoded values.
+/// Computes a SipHash-2-4 hash of an XDR-encoded value.
+///
+/// The value is first serialized to XDR bytes, then hashed. This ensures
+/// consistent hashing of XDR types across the codebase.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::Xdr`] if XDR serialization fails.
+///
+/// # Panics
+///
+/// Panics if the internal mutex is poisoned.
 pub fn xdr_compute_hash<T: WriteXdr>(value: &T) -> Result<u64, CryptoError> {
     let bytes = value.to_xdr(Limits::none())?;
     Ok(compute_hash(&bytes))

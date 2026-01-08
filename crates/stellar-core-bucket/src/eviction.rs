@@ -90,14 +90,30 @@ pub const DEFAULT_STARTING_EVICTION_SCAN_LEVEL: u32 = 6;
 
 /// Eviction iterator that tracks the current scan position in the bucket list.
 ///
-/// This matches C++ stellar-core's `EvictionIterator` from NetworkConfig.
+/// The iterator maintains state between ledgers, allowing the eviction scan
+/// to resume where it left off. This enables incremental scanning without
+/// processing the entire bucket list in a single ledger.
+///
+/// # Persistence
+///
+/// The iterator state is typically stored in the ledger header or network
+/// config so it persists across restarts. This matches C++ stellar-core's
+/// `EvictionIterator` from NetworkConfig.
+///
+/// # Scan Order
+///
+/// The scan proceeds in this order:
+/// 1. Level N curr bucket
+/// 2. Level N snap bucket
+/// 3. Level N+1 curr bucket
+/// 4. ... (continues to top level, then wraps to starting level)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvictionIterator {
-    /// Current byte position within the bucket file/data.
+    /// Current byte offset (or entry index) within the bucket.
     pub bucket_file_offset: u32,
-    /// Which level of the bucket list (0 to NUM_LEVELS-1).
+    /// Current bucket list level being scanned (0 to NUM_LEVELS-1).
     pub bucket_list_level: u32,
-    /// Whether we're scanning the curr bucket (true) or snap bucket (false).
+    /// Whether scanning the curr bucket (true) or snap bucket (false).
     pub is_curr_bucket: bool,
 }
 
@@ -153,26 +169,51 @@ impl EvictionIterator {
 }
 
 /// Result of an eviction scan for a single ledger.
+///
+/// Contains the entries to archive, keys to delete, and updated iterator
+/// position for the next scan. The caller is responsible for:
+///
+/// 1. Adding `archived_entries` to the hot archive bucket list
+/// 2. Adding `evicted_keys` as dead entries to the live bucket list
+/// 3. Persisting `end_iterator` for the next ledger's scan
 #[derive(Debug, Default)]
 pub struct EvictionResult {
-    /// Persistent entries (ContractCode, persistent ContractData) to archive to hot archive.
+    /// Persistent entries to archive to the hot archive bucket list.
+    ///
+    /// These are ContractCode or persistent ContractData entries that have
+    /// expired but can be restored later by paying for TTL extension.
     pub archived_entries: Vec<LedgerEntry>,
-    /// Keys of all evicted entries (both temporary and persistent) to delete from live bucket list.
+    /// Keys of all evicted entries to delete from the live bucket list.
+    ///
+    /// Includes both temporary entries (deleted permanently) and persistent
+    /// entries (moved to hot archive). These become dead entries in the
+    /// live bucket list.
     pub evicted_keys: Vec<LedgerKey>,
-    /// Updated iterator position after the scan.
+    /// Updated iterator position for the next scan.
     pub end_iterator: EvictionIterator,
-    /// Number of bytes scanned.
+    /// Total bytes of entry data scanned during this ledger.
     pub bytes_scanned: u64,
-    /// Whether we completed scanning the requested bytes (false if hit EOF early).
+    /// Whether the scan completed its byte quota (vs hitting bucket end early).
     pub scan_complete: bool,
 }
 
-/// State archival settings for eviction.
+/// Configuration settings for Soroban state archival.
+///
+/// These settings control the eviction scan behavior and are typically
+/// sourced from network configuration (ConfigSetting entries).
 #[derive(Debug, Clone, Copy)]
 pub struct StateArchivalSettings {
-    /// Number of bytes to scan per ledger.
+    /// Maximum bytes to scan per ledger (default: 100 KB).
+    ///
+    /// Larger values process more entries per ledger but increase
+    /// ledger close time. The scan stops when this limit is reached,
+    /// even if in the middle of a bucket.
     pub eviction_scan_size: u64,
-    /// Minimum level to start scanning from.
+    /// Minimum bucket list level to scan (default: 6).
+    ///
+    /// Lower levels update too frequently to be worth scanning.
+    /// Level 6 updates every 2048 ledgers, giving entries reasonable
+    /// lifetime before they're scanned.
     pub starting_eviction_scan_level: u32,
 }
 

@@ -1,14 +1,33 @@
 //! Individual bucket implementation.
 //!
-//! A bucket is an immutable container of ledger entries, stored as gzipped XDR.
+//! A bucket is an immutable container of sorted ledger entries, stored as gzipped XDR.
 //! Buckets are identified by their content hash (SHA-256 of uncompressed contents).
 //!
-//! Buckets support two storage modes:
-//! - **InMemory**: All entries are loaded into memory (for normal operations, merging)
-//! - **DiskBacked**: Entries are stored on disk and loaded on-demand (for catchup)
+//! # Storage Modes
 //!
-//! The disk-backed mode is critical for mainnet where buckets can contain millions
-//! of entries. Loading all entries into memory would require many GB of RAM.
+//! Buckets support two storage modes to balance memory usage and performance:
+//!
+//! - **InMemory**: All entries are loaded into memory with a key index for O(1) lookups.
+//!   Best for normal operations, merging, and when entries need to be accessed repeatedly.
+//!
+//! - **DiskBacked**: Entries remain on disk with a compact index mapping key hashes to
+//!   file offsets. Entries are loaded on-demand when accessed. Essential for mainnet
+//!   catchup where buckets can contain millions of entries (potentially many GB).
+//!
+//! # XDR Format
+//!
+//! Bucket files use the XDR Record Marking Standard (RFC 5531). Each entry is prefixed
+//! with a 4-byte record mark: the high bit indicates "last fragment" (always set for
+//! buckets), and the remaining 31 bits contain the record length in bytes.
+//!
+//! The bucket hash is computed over the uncompressed XDR bytes, including record marks.
+//! This ensures hash consistency with stellar-core's bucket hash computation.
+//!
+//! # Thread Safety
+//!
+//! Buckets are immutable after creation and use `Arc` internally, making them safe
+//! to share across threads. The disk-backed mode uses file handles that are opened
+//! fresh for each operation to avoid contention.
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
@@ -26,16 +45,22 @@ use crate::disk_bucket::DiskBucket;
 use crate::entry::{compare_entries, compare_keys, BucketEntry};
 use crate::{BucketError, Result};
 
-/// Storage mode for bucket entries.
+/// Internal storage mode for bucket entries.
+///
+/// This enum is not public; users interact with buckets through the [`Bucket`]
+/// type which abstracts over both storage modes.
 #[derive(Clone)]
 enum BucketStorage {
-    /// All entries loaded in memory.
+    /// All entries loaded in memory with a key-to-index map for O(1) lookups.
     InMemory {
+        /// The sorted list of bucket entries.
         entries: Arc<Vec<BucketEntry>>,
+        /// Map from serialized key bytes to entry index for fast lookups.
         key_index: Arc<BTreeMap<Vec<u8>, usize>>,
     },
-    /// Entries stored on disk, loaded on-demand.
+    /// Entries stored on disk with a compact index for on-demand loading.
     DiskBacked {
+        /// The disk bucket implementation that handles file I/O.
         disk_bucket: Arc<DiskBucket>,
     },
 }
@@ -44,23 +69,48 @@ enum BucketStorage {
 ///
 /// Buckets are the fundamental storage unit in Stellar's BucketList.
 /// They are:
-/// - Immutable once created
-/// - Identified by their content hash
-/// - Stored as gzipped XDR on disk
-/// - Sorted by key for efficient merging and lookup
+/// - **Immutable** once created (content-addressable by hash)
+/// - **Identified** by their SHA-256 content hash
+/// - **Stored** as gzipped XDR on disk with record marking
+/// - **Sorted** by key for efficient merging and O(log n) binary search
 ///
-/// For memory efficiency during catchup, buckets can use disk-backed storage
-/// where entries are loaded on-demand rather than all at once.
+/// # Creating Buckets
+///
+/// Buckets can be created in several ways:
+/// - [`Bucket::empty()`]: Create an empty bucket (zero hash)
+/// - [`Bucket::from_entries()`]: Create from a list of entries (will be sorted)
+/// - [`Bucket::from_sorted_entries()`]: Create from pre-sorted entries (preserves order)
+/// - [`Bucket::load_from_file()`]: Load from a gzipped bucket file
+/// - [`Bucket::from_xdr_bytes()`]: Parse from uncompressed XDR bytes
+/// - [`Bucket::from_xdr_bytes_disk_backed()`]: Memory-efficient loading for catchup
+///
+/// # Storage Modes
+///
+/// For memory efficiency during catchup (when processing mainnet buckets with
+/// millions of entries), buckets can use disk-backed storage where entries
+/// are loaded on-demand rather than all at once.
+///
+/// Use [`Bucket::is_disk_backed()`] to check the storage mode.
+///
+/// # Entry Access
+///
+/// - [`Bucket::get()`]: Look up a raw bucket entry by key
+/// - [`Bucket::get_entry()`]: Look up a ledger entry (returns None for dead entries)
+/// - [`Bucket::iter()`]: Iterate over all entries
+/// - [`Bucket::entries()`]: Get entries as a slice (in-memory only, panics for disk-backed)
 #[derive(Clone)]
 pub struct Bucket {
-    /// The hash of this bucket's contents (uncompressed XDR).
+    /// The SHA-256 hash of this bucket's uncompressed XDR contents.
     hash: Hash256,
     /// The storage mode (in-memory or disk-backed).
     storage: BucketStorage,
 }
 
 impl Bucket {
-    /// Create an empty bucket.
+    /// Create an empty bucket with a zero hash.
+    ///
+    /// Empty buckets are special-cased in bucket list operations and don't
+    /// need to be stored on disk. The zero hash serves as a sentinel value.
     pub fn empty() -> Self {
         Self {
             hash: Hash256::ZERO,
@@ -73,7 +123,22 @@ impl Bucket {
 
     /// Create a bucket from a list of entries.
     ///
-    /// The entries will be sorted by key.
+    /// The entries will be sorted by key using [`compare_entries`]. This is the
+    /// standard way to create buckets when the entry order is not guaranteed.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - The bucket entries (will be sorted in place)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let entries = vec![
+    ///     BucketEntry::Live(account_entry),
+    ///     BucketEntry::Dead(deleted_key),
+    /// ];
+    /// let bucket = Bucket::from_entries(entries)?;
+    /// ```
     pub fn from_entries(mut entries: Vec<BucketEntry>) -> Result<Self> {
         // Sort entries by key
         entries.sort_by(compare_entries);
@@ -83,9 +148,20 @@ impl Bucket {
 
     /// Create a bucket from a list of pre-sorted entries.
     ///
-    /// **Warning**: The entries MUST already be sorted by key. This is intended for
-    /// entries extracted from disk-backed buckets that were already sorted by stellar-core.
-    /// Using unsorted entries will result in incorrect bucket behavior.
+    /// This method skips the sorting step, which is useful when entries are
+    /// already known to be in the correct order (e.g., extracted from another
+    /// bucket via iteration).
+    ///
+    /// # Safety
+    ///
+    /// The entries **must** already be sorted by key according to [`compare_entries`].
+    /// Using unsorted entries will result in incorrect bucket behavior:
+    /// - Lookups may fail to find existing entries
+    /// - Merges will produce incorrect results
+    /// - Hash verification may fail
+    ///
+    /// This is intended for entries extracted from disk-backed buckets that were
+    /// already sorted by stellar-core, or from bucket iteration which preserves order.
     pub fn from_sorted_entries(entries: Vec<BucketEntry>) -> Result<Self> {
         // Build key index
         let mut key_index = BTreeMap::new();
@@ -527,12 +603,24 @@ impl Bucket {
 }
 
 /// Iterator over bucket entries.
+///
+/// This iterator abstracts over both in-memory and disk-backed storage modes.
+/// For in-memory buckets, iteration is efficient (just cloning references).
+/// For disk-backed buckets, entries are read sequentially from disk.
+///
+/// # Performance
+///
+/// - **In-memory**: O(n) time, no I/O
+/// - **Disk-backed**: O(n) time with disk reads, sequential access pattern
+///
+/// The iterator yields owned [`BucketEntry`] values (cloned from in-memory
+/// storage or parsed from disk).
 pub enum BucketIter<'a> {
-    /// Iterating over in-memory entries.
+    /// Iterating over in-memory entries (efficient, just cloning).
     InMemory(std::slice::Iter<'a, BucketEntry>),
-    /// Iterating over disk-backed entries.
+    /// Iterating over disk-backed entries (reads from disk sequentially).
     DiskBacked(crate::disk_bucket::DiskBucketIter),
-    /// Empty iterator (for error cases).
+    /// Empty iterator (used for error recovery).
     Empty,
 }
 

@@ -1,7 +1,23 @@
 //! Download utilities for history archive files.
 //!
-//! This module provides utilities for downloading files from history archives,
-//! including retry logic, gzip decompression, and XDR stream parsing.
+//! This module provides HTTP download infrastructure for fetching data from
+//! history archives, including:
+//!
+//! - **Retry logic**: Automatic retries with configurable backoff
+//! - **Gzip decompression**: Most archive files are gzip-compressed
+//! - **XDR stream parsing**: Parse "record-marked" XDR streams
+//!
+//! # Record-Marked XDR Format
+//!
+//! History archives use a special XDR format where each record is prefixed
+//! with a 4-byte big-endian length. This allows streaming parsing without
+//! knowing the total number of records upfront.
+//!
+//! ```text
+//! [4-byte length][XDR record][4-byte length][XDR record]...
+//! ```
+//!
+//! The `parse_record_marked_xdr_stream` function handles this format.
 
 use std::io::Read;
 use std::time::Duration;
@@ -55,7 +71,7 @@ impl Default for DownloadConfig {
 pub fn create_client(timeout: Duration) -> Result<Client, HistoryError> {
     Client::builder()
         .timeout(timeout)
-        .gzip(false)  // Manual decompression for control
+        .gzip(false) // Manual decompression for control
         .build()
         .map_err(HistoryError::Http)
 }
@@ -175,7 +191,9 @@ pub fn parse_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, HistoryError>
     loop {
         match T::read_xdr(&mut limited) {
             Ok(entry) => entries.push(entry),
-            Err(stellar_xdr::curr::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(stellar_xdr::curr::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
                 // Normal end of stream
                 break;
             }
@@ -225,7 +243,8 @@ pub fn parse_length_prefixed_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T
         }
 
         let entry_data = &data[offset..offset + len];
-        let entry = T::from_xdr(entry_data, stellar_xdr::curr::Limits::none()).map_err(HistoryError::Xdr)?;
+        let entry = T::from_xdr(entry_data, stellar_xdr::curr::Limits::none())
+            .map_err(HistoryError::Xdr)?;
         entries.push(entry);
 
         offset += len;

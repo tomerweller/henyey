@@ -4,51 +4,208 @@ SQLite persistence layer for rs-stellar-core.
 
 ## Overview
 
-This crate provides schema management and query helpers for ledger headers, transactions, SCP history, peers, and operational metadata. SQLite is the only supported backend.
+This crate provides database abstraction for the Stellar blockchain node, handling persistent storage of:
+
+- **Ledger headers**: Block metadata including sequence numbers, hashes, and timestamps
+- **Transaction history**: Transaction bodies, results, and execution metadata
+- **SCP state**: Stellar Consensus Protocol envelopes and quorum sets
+- **Bucket list snapshots**: Merkle tree state at checkpoint ledgers
+- **Peer records**: Network peer discovery and connection tracking
+- **Operational state**: Node configuration and runtime state
 
 ## Architecture
 
-- `schema` defines the SQLite layout and versioning.
-- `migrate` handles schema upgrades at startup.
-- `queries/*` is the typed access layer used by app, overlay, and ledger.
-
-## Key Concepts
-
-- **Schema versioning**: tracked in the DB and validated on startup.
-- **History persistence**: headers, tx sets/results, and SCP envelopes stored for catchup.
-- **Peer cache**: outbound/inbound peer records for overlay stability.
-
-## Upstream Mapping
-
-- `src/database/*`
-- `src/persist/*`
-
-## Layout
+The crate is organized into the following modules:
 
 ```
 crates/stellar-core-db/
 ├── src/
-│   ├── lib.rs
-│   ├── migrate.rs
-│   ├── schema.rs
-│   ├── queries/
-│   └── error.rs
-└── tests/
+│   ├── lib.rs          # Main entry point and Database methods
+│   ├── error.rs        # Error types (DbError)
+│   ├── pool.rs         # Connection pool (Database struct)
+│   ├── schema.rs       # SQL schema definitions
+│   ├── migrations.rs   # Schema versioning and migrations
+│   └── queries/        # Typed query traits
+│       ├── mod.rs
+│       ├── accounts.rs     # Account CRUD
+│       ├── ban.rs          # Node ban list
+│       ├── bucket_list.rs  # Bucket list snapshots
+│       ├── history.rs      # Transaction history
+│       ├── ledger.rs       # Ledger headers
+│       ├── peers.rs        # Peer management
+│       ├── publish_queue.rs # History publishing queue
+│       ├── scp.rs          # SCP consensus state
+│       └── state.rs        # Key-value state storage
+└── README.md
 ```
 
-## Schema Notes
+## Key Types
 
-- Ledger headers, tx sets/results, SCP envelopes, and bucket list snapshots are stored for catchup and publish.
-- Peer discovery/backoff is persisted for overlay stability.
+| Type | Description |
+|------|-------------|
+| `Database` | Connection pool with high-level query methods |
+| `DbError` | Unified error type for all database operations |
+| `PooledConnection` | A connection borrowed from the pool |
+| `PeerRecord` | Network peer connection metadata |
 
-## Tests To Port
+### Query Traits
 
-From `src/database/test/`:
-- DB migration coverage
-- Ledger/header persistence
-- Peer list persistence and pruning
+Query functionality is organized into domain-specific traits:
+
+| Trait | Purpose |
+|-------|---------|
+| `LedgerQueries` | Ledger header storage and retrieval |
+| `HistoryQueries` | Transaction history and results |
+| `ScpQueries` | SCP envelopes and quorum sets |
+| `StateQueries` | Key-value state storage |
+| `AccountQueries` | Stellar account management |
+| `PeerQueries` | Network peer tracking |
+| `BucketListQueries` | Bucket list snapshots |
+| `PublishQueueQueries` | History archive publish queue |
+| `BanQueries` | Node ban list management |
+
+## Usage
+
+### Opening a Database
+
+```rust
+use stellar_core_db::Database;
+
+// Open a persistent database (creates if it doesn't exist)
+let db = Database::open("path/to/stellar.db")?;
+
+// Or use an in-memory database for testing
+let test_db = Database::open_in_memory()?;
+```
+
+### Querying Data
+
+The `Database` type provides convenience methods for common operations:
+
+```rust
+// Get the latest ledger
+if let Some(seq) = db.get_latest_ledger_seq()? {
+    println!("Latest ledger: {}", seq);
+}
+
+// Get a specific ledger header
+if let Some(header) = db.get_ledger_header(100)? {
+    println!("Ledger {} closed at {}", header.ledger_seq, header.scp_value.close_time.0);
+}
+
+// Check network passphrase
+if let Some(passphrase) = db.get_network_passphrase()? {
+    println!("Network: {}", passphrase);
+}
+```
+
+### Using Query Traits Directly
+
+For advanced use cases, you can use the query traits directly on connections:
+
+```rust
+use stellar_core_db::{Database, queries::LedgerQueries};
+
+let db = Database::open_in_memory()?;
+db.with_connection(|conn| {
+    // Use trait methods directly
+    let header = conn.load_ledger_header(100)?;
+    Ok(header)
+})?;
+```
+
+### Transactions
+
+For atomic operations, use the transaction wrapper:
+
+```rust
+db.transaction(|tx| {
+    // Multiple operations in a single transaction
+    tx.execute("INSERT INTO storestate (statename, state) VALUES ('key', 'value')", [])?;
+    tx.execute("UPDATE storestate SET state = 'new' WHERE statename = 'key'", [])?;
+    Ok(())
+})?;
+```
+
+## Schema Management
+
+The database uses a versioned schema with automatic migrations:
+
+- Schema version is tracked in the `storestate` table
+- Migrations run automatically when opening an existing database
+- New databases are initialized with the current schema version
+
+To manually check or upgrade the schema:
+
+```rust
+// Check current version
+let version = db.schema_version()?;
+
+// Explicitly run migrations (usually not needed)
+db.upgrade()?;
+```
+
+## Database Tables
+
+### Core State
+- `storestate` - Key-value configuration and state
+- `ledgerheaders` - Block headers with sequence, hash, timestamp
+
+### Ledger Entries
+- `accounts` - Stellar accounts with balances and settings
+- `trustlines` - Asset trust relationships
+- `offers` - DEX offers
+- `accountdata` - Account data entries
+- `claimablebalance` - Claimable balances
+- `liquiditypool` - AMM liquidity pools
+
+### Soroban (Smart Contracts)
+- `contractdata` - Contract storage
+- `contractcode` - WASM bytecode
+- `ttl` - Entry expiration tracking
+
+### History
+- `txhistory` - Individual transactions
+- `txsets` - Per-ledger transaction sets
+- `txresults` - Per-ledger transaction results
+- `txfeehistory` - Fee-related ledger changes
+
+### Consensus
+- `scphistory` - SCP envelopes per ledger
+- `scpquorums` - Quorum set definitions
+- `upgradehistory` - Protocol upgrade records
+
+### Operations
+- `peers` - Known network peers
+- `ban` - Banned node IDs
+- `publishqueue` - Pending history publications
+- `bucketlist` - Checkpoint bucket hashes
 
 ## Performance Notes
 
-- Use prepared statements for hot paths.
-- Batch writes during ledger close and history publish.
+The database is configured for optimal performance:
+
+- **WAL mode**: Enables concurrent reads during writes
+- **64MB cache**: Reduces disk I/O for frequently accessed data
+- **Connection pooling**: Up to 10 concurrent connections (file) or 1 (in-memory)
+
+For write-heavy operations, consider batching within transactions to reduce fsync overhead.
+
+## Upstream Mapping
+
+This crate corresponds to the following C++ stellar-core components:
+
+- `src/database/*` - Database abstraction
+- `src/persist/*` - Persistence layer
+
+## Testing
+
+Tests use in-memory databases for isolation and speed:
+
+```rust
+#[test]
+fn test_ledger_storage() {
+    let db = Database::open_in_memory().unwrap();
+    // Test operations...
+}
+```

@@ -1,10 +1,43 @@
 //! Bucket merging implementation.
 //!
-//! Merging is a critical operation in the BucketList that combines two buckets
-//! while handling shadowing semantics:
-//! - Newer entries shadow older entries with the same key
-//! - Dead entries (tombstones) can either be kept or removed based on context
-//! - Init entries have special merge semantics
+//! Merging is the fundamental operation that maintains bucket list integrity.
+//! When buckets are merged, entries from a newer bucket "shadow" entries from
+//! an older bucket with the same key.
+//!
+//! # Merge Operation
+//!
+//! The merge operation combines two sorted buckets into one, applying shadowing:
+//!
+//! ```text
+//! Old Bucket: [A=1, C=3, E=5]
+//! New Bucket: [B=2, C=30, D=4]
+//! Merged:     [A=1, B=2, C=30, D=4, E=5]
+//!            (C from new shadows C from old)
+//! ```
+//!
+//! # CAP-0020 INITENTRY Semantics
+//!
+//! The `Init` entry type (introduced in protocol 11) enables optimizations:
+//!
+//! - `INIT + DEAD` = Both entries are annihilated (nothing output)
+//! - `DEAD + INIT` = Becomes `LIVE` (recreation cancels tombstone)
+//! - `INIT + LIVE` = Becomes `INIT` with new value (preserves init status)
+//!
+//! This prevents tombstones from accumulating when entries are created and
+//! deleted within the same merge window.
+//!
+//! # Dead Entry Handling
+//!
+//! The `keep_dead_entries` parameter controls tombstone behavior:
+//!
+//! - `true`: Keep dead entries (needed at lower levels where they may still shadow)
+//! - `false`: Remove dead entries (safe at higher levels, reduces bucket size)
+//!
+//! # Normalization
+//!
+//! When entries cross level boundaries during a spill, `Init` entries are
+//! "normalized" to `Live`. This is because the init status is only relevant
+//! within the merge window where the entry was created.
 
 use std::cmp::Ordering;
 
@@ -301,16 +334,40 @@ fn merge_entries(
     }
 }
 
-/// Output iterator for streaming merge.
+/// Iterator that yields merged entries from two buckets.
 ///
-/// Note: For disk-backed buckets, entries are collected upfront. For in-memory
-/// buckets, this is still memory-efficient as it references existing entries.
+/// This iterator implements lazy/streaming merge, yielding one entry at a time.
+/// It's useful when you want to process merged entries without materializing
+/// the full merged bucket in memory.
+///
+/// # Memory Usage
+///
+/// For disk-backed buckets, entries are collected upfront (same as `merge_buckets`).
+/// For in-memory buckets, the iterator references existing entries without copying.
+///
+/// # Example
+///
+/// ```ignore
+/// let iter = MergeIterator::new(&old_bucket, &new_bucket, true, 20);
+/// for entry in iter {
+///     process_entry(entry);
+/// }
+/// ```
+///
+/// Note: Always normalizes `Init` entries to `Live` for backward compatibility.
+/// For more control, use `merge_buckets_with_options` instead.
 pub struct MergeIterator {
+    /// Entries from the older bucket (collected upfront).
     old_entries: Vec<BucketEntry>,
+    /// Entries from the newer bucket (collected upfront).
     new_entries: Vec<BucketEntry>,
+    /// Current index into old_entries.
     old_idx: usize,
+    /// Current index into new_entries.
     new_idx: usize,
+    /// Whether to keep dead entries in output.
     keep_dead_entries: bool,
+    /// Metadata entry to emit first (if any).
     output_metadata: Option<BucketEntry>,
 }
 

@@ -1,8 +1,60 @@
-//! Quorum tracking utilities.
+//! Quorum tracking utilities for consensus participation monitoring.
 //!
-//! This module contains two trackers:
-//! - `SlotQuorumTracker` tracks heard-from-quorum/v-blocking per slot.
-//! - `QuorumTracker` tracks the transitive quorum map and closest validators.
+//! This module provides two complementary quorum tracking mechanisms used by the
+//! Herder to monitor network participation and security.
+//!
+//! # Background
+//!
+//! In SCP (Stellar Consensus Protocol), quorum sets define which nodes a validator
+//! trusts. A node achieves consensus when it hears from a "quorum" - a set of nodes
+//! that satisfies the threshold requirements of its quorum set configuration.
+//!
+//! # Trackers
+//!
+//! ## [`SlotQuorumTracker`]
+//!
+//! Tracks which nodes have sent SCP messages for each slot and determines whether
+//! the node has "heard from quorum" or has a "v-blocking set" for a given slot.
+//!
+//! **Use cases:**
+//! - Consensus timing decisions (e.g., when to bump ballot counters)
+//! - Determining when enough validators have participated in a slot
+//! - V-blocking detection (can prevent consensus if they disagree)
+//!
+//! ## [`QuorumTracker`]
+//!
+//! Tracks the transitive quorum set - all nodes reachable through the quorum graph
+//! starting from the local node. Uses BFS to explore quorum relationships and
+//! maintains distance information.
+//!
+//! **Use cases:**
+//! - **Security validation**: Rejecting EXTERNALIZE messages from nodes not in our
+//!   transitive quorum (prevents fast-forward attacks)
+//! - **Closest validator tracking**: Identifying which direct validators are on the
+//!   shortest path to any given transitive quorum member
+//!
+//! # Example
+//!
+//! ```ignore
+//! use stellar_core_herder::quorum_tracker::{SlotQuorumTracker, QuorumTracker};
+//!
+//! // Track per-slot participation
+//! let mut slot_tracker = SlotQuorumTracker::new(Some(quorum_set), 12);
+//! slot_tracker.record_envelope(100, node_a);
+//! slot_tracker.record_envelope(100, node_b);
+//!
+//! if slot_tracker.has_quorum(100, |n| get_quorum_set(n)) {
+//!     println!("Heard from quorum for slot 100");
+//! }
+//!
+//! // Track transitive quorum membership
+//! let mut quorum_tracker = QuorumTracker::new(local_node_id);
+//! quorum_tracker.expand(&local_node_id, local_quorum_set);
+//!
+//! if quorum_tracker.is_node_definitely_in_quorum(&some_node) {
+//!     // Accept messages from this node
+//! }
+//! ```
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -10,10 +62,19 @@ use stellar_core_scp::{is_quorum, is_v_blocking, SlotIndex};
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
 /// Tracks quorum participation over recent slots.
+///
+/// This tracker monitors which nodes have sent SCP messages for each slot,
+/// enabling "heard from quorum" and "v-blocking" checks that drive consensus
+/// timing decisions.
+///
+/// The tracker automatically prunes old slots to bound memory usage.
 #[derive(Debug, Clone)]
 pub struct SlotQuorumTracker {
+    /// The local node's quorum set configuration.
     local_quorum_set: Option<ScpQuorumSet>,
+    /// Maximum number of slots to track before pruning oldest.
     max_slots: usize,
+    /// Map from slot index to the set of nodes heard from for that slot.
     slot_nodes: HashMap<SlotIndex, HashSet<NodeId>>,
 }
 
@@ -89,11 +150,17 @@ impl SlotQuorumTracker {
     }
 }
 
-/// Node metadata for transitive quorum tracking.
+/// Metadata about a node in the transitive quorum graph.
+///
+/// Stores information used for quorum security checks and path analysis.
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
+    /// The node's quorum set, if known.
     pub quorum_set: Option<ScpQuorumSet>,
+    /// Distance from the local node in the quorum graph (0 = local node).
     pub distance: usize,
+    /// The set of direct validators (distance 1) on the shortest path to this node.
+    /// Used to identify which direct connections are important for reaching this node.
     pub closest_validators: BTreeSet<NodeId>,
 }
 
@@ -106,10 +173,30 @@ pub enum QuorumTrackerError {
     ExpandFailed,
 }
 
-/// Tracks the transitive quorum map and closest validators.
+/// Tracks the transitive quorum set and path information.
+///
+/// The transitive quorum set includes all nodes reachable through the quorum
+/// graph starting from the local node. This tracker builds and maintains this
+/// set incrementally as quorum set information is learned from the network.
+///
+/// # Security
+///
+/// The primary security use is validating EXTERNALIZE messages. A node should
+/// only accept EXTERNALIZE messages from nodes in its transitive quorum set,
+/// preventing attackers outside the trust network from fast-forwarding the node
+/// to arbitrary slots.
+///
+/// # Algorithm
+///
+/// The tracker uses BFS-style expansion:
+/// 1. Start with the local node at distance 0
+/// 2. When a node's quorum set is learned, add all its members at distance + 1
+/// 3. Track which direct validators (distance 1) are on the path to each node
 #[derive(Debug, Clone)]
 pub struct QuorumTracker {
+    /// The local node's ID.
     local_node_id: NodeId,
+    /// Map from node ID to its quorum metadata.
     quorum: HashMap<NodeId, NodeInfo>,
 }
 

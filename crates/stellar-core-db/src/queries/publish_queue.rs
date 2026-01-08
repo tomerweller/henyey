@@ -1,18 +1,36 @@
 //! Publish queue queries.
+//!
+//! The publish queue tracks checkpoint ledgers that need to be published
+//! to history archives. When a checkpoint is reached (every 64 ledgers),
+//! the ledger is added to the queue. After successful publication, the
+//! ledger is removed from the queue.
+//!
+//! This allows the node to resume publishing after a restart without
+//! missing checkpoints.
 
 use rusqlite::{params, Connection};
 
 use super::super::error::DbError;
 
-/// Trait for querying and modifying the publishqueue table.
+/// Query trait for the history publish queue.
+///
+/// Provides methods for managing the queue of checkpoint ledgers
+/// pending publication to history archives.
 pub trait PublishQueueQueries {
-    /// Add a ledger to the publish queue.
+    /// Adds a checkpoint ledger to the publish queue.
+    ///
+    /// This is a no-op if the ledger is already in the queue.
     fn enqueue_publish(&self, ledger_seq: u32) -> Result<(), DbError>;
 
-    /// Remove a ledger from the publish queue.
+    /// Removes a checkpoint ledger from the publish queue.
+    ///
+    /// Called after successful publication. This is a no-op if the
+    /// ledger is not in the queue.
     fn remove_publish(&self, ledger_seq: u32) -> Result<(), DbError>;
 
-    /// Load queued ledgers (ordered).
+    /// Loads queued checkpoint ledgers in ascending order.
+    ///
+    /// Optionally limited to a maximum count.
     fn load_publish_queue(&self, limit: Option<usize>) -> Result<Vec<u32>, DbError>;
 }
 

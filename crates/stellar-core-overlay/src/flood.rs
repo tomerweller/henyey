@@ -1,7 +1,23 @@
-//! FloodGate for managing message propagation.
+//! Flood gate for managing message propagation and duplicate detection.
 //!
-//! Tracks seen messages by hash to prevent duplicate flooding.
-//! Uses TTL-based expiry to clean up old entries.
+//! The Stellar overlay network propagates certain message types (transactions,
+//! SCP messages, etc.) to all connected peers. To prevent infinite loops and
+//! reduce bandwidth, the [`FloodGate`] tracks which messages have been seen
+//! and from which peers.
+//!
+//! # Functionality
+//!
+//! - **Duplicate Detection**: Messages are identified by their SHA-256 hash.
+//!   If we've seen a message before, it's not flooded again.
+//!
+//! - **Peer Tracking**: Records which peers have sent each message, so we
+//!   don't forward messages back to peers that already have them.
+//!
+//! - **TTL-based Expiry**: Old entries are automatically cleaned up after
+//!   a configurable TTL (default 5 minutes) to prevent unbounded memory growth.
+//!
+//! - **Rate Limiting**: Soft limit on messages per second to prevent
+//!   overwhelming the node during traffic spikes.
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -15,25 +31,34 @@ use tracing::{debug, trace};
 use crate::PeerId;
 
 /// Default TTL for seen messages (5 minutes).
+///
+/// Messages older than this are forgotten, allowing them to be flooded again
+/// if re-received (which shouldn't normally happen).
 const DEFAULT_TTL_SECS: u64 = 300;
 
-/// Maximum number of entries before cleanup is forced.
+/// Maximum entries before forced cleanup.
+///
+/// Prevents unbounded memory growth under heavy traffic.
 const MAX_ENTRIES: usize = 100_000;
 
-/// Cleanup interval in seconds.
+/// How often to check for expired entries (1 minute).
 const CLEANUP_INTERVAL_SECS: u64 = 60;
-/// Default max messages per second (soft rate limit).
+
+/// Default rate limit (messages per second).
+///
+/// This is a soft limit - messages beyond this are dropped.
 const DEFAULT_RATE_LIMIT_PER_SEC: u64 = 1000;
 
-/// Entry for a seen message.
+/// Internal tracking entry for a seen message.
 struct SeenEntry {
     /// When the message was first seen.
     first_seen: Instant,
-    /// Peers that have sent us this message.
+    /// Set of peers that have sent us this message.
     peers: HashSet<PeerId>,
 }
 
 impl SeenEntry {
+    /// Creates a new entry with the current timestamp.
     fn new() -> Self {
         Self {
             first_seen: Instant::now(),
@@ -41,45 +66,66 @@ impl SeenEntry {
         }
     }
 
+    /// Records that a peer has sent this message.
     fn add_peer(&mut self, peer: PeerId) {
         self.peers.insert(peer);
     }
 
+    /// Returns true if this entry has exceeded its TTL.
     fn is_expired(&self, ttl: Duration) -> bool {
         self.first_seen.elapsed() > ttl
     }
 }
 
-/// FloodGate manages message propagation in the overlay network.
+/// Flood gate for tracking seen messages and preventing duplicates.
 ///
-/// It tracks which messages have been seen to prevent duplicate flooding
-/// and manages which peers should receive forwarded messages.
+/// The flood gate is the core of the overlay's message propagation system.
+/// It ensures that each unique message is only flooded once, while tracking
+/// which peers have already received each message.
+///
+/// # Thread Safety
+///
+/// All operations are thread-safe and can be called concurrently from
+/// multiple peer message handlers.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let gate = FloodGate::new();
+///
+/// // Check if we should flood a message
+/// let hash = compute_message_hash(&message);
+/// if gate.record_seen(hash, Some(peer_id)) {
+///     // First time seeing this - flood to other peers
+///     let forward_to = gate.get_forward_peers(&hash, &all_peers);
+/// }
+/// ```
 pub struct FloodGate {
-    /// Map of message hash -> seen entry.
+    /// Map of message hash to tracking entry.
     seen: DashMap<Hash256, SeenEntry>,
-    /// TTL for message expiry.
+    /// Time-to-live for message entries.
     ttl: Duration,
-    /// Last cleanup time.
+    /// Last time we ran cleanup.
     last_cleanup: RwLock<Instant>,
-    /// Total messages seen.
+    /// Counter: total messages processed.
     messages_seen: AtomicU64,
-    /// Total messages dropped (duplicates).
+    /// Counter: duplicate messages dropped.
     messages_dropped: AtomicU64,
-    /// Max messages allowed per second.
+    /// Maximum messages per second.
     rate_limit: u64,
-    /// Start time for the current rate window.
+    /// Start of current rate-limiting window.
     rate_window_start: RwLock<Instant>,
-    /// Count of messages seen in the current window.
+    /// Messages counted in current window.
     rate_window_count: AtomicU64,
 }
 
 impl FloodGate {
-    /// Create a new FloodGate with default TTL.
+    /// Creates a new flood gate with default settings (5 minute TTL).
     pub fn new() -> Self {
         Self::with_ttl(Duration::from_secs(DEFAULT_TTL_SECS))
     }
 
-    /// Create a new FloodGate with custom TTL.
+    /// Creates a new flood gate with a custom TTL.
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             seen: DashMap::new(),
@@ -93,14 +139,21 @@ impl FloodGate {
         }
     }
 
-    /// Check if a message should be flooded (not seen before).
+    /// Returns true if this message has not been seen before.
+    ///
+    /// This is a quick check that doesn't record the message - use
+    /// [`record_seen`](FloodGate::record_seen) to both check and record.
     pub fn should_flood(&self, message_hash: &Hash256) -> bool {
         !self.seen.contains_key(message_hash)
     }
 
-    /// Record that a message has been seen from a peer.
+    /// Records that a message has been seen, optionally from a specific peer.
     ///
-    /// Returns true if this is the first time seeing this message.
+    /// Returns `true` if this is the first time seeing this message (should flood),
+    /// or `false` if it's a duplicate (should drop).
+    ///
+    /// If `from_peer` is `Some`, that peer is recorded so we don't forward
+    /// the message back to them.
     pub fn record_seen(&self, message_hash: Hash256, from_peer: Option<PeerId>) -> bool {
         self.messages_seen.fetch_add(1, Ordering::Relaxed);
 
@@ -128,7 +181,10 @@ impl FloodGate {
         true
     }
 
-    /// Check if the current message rate is within limits.
+    /// Checks if another message is allowed under the rate limit.
+    ///
+    /// Returns `true` if we're within the rate limit, `false` if we've
+    /// exceeded it and should drop the message.
     pub fn allow_message(&self) -> bool {
         let now = Instant::now();
         {
@@ -143,7 +199,10 @@ impl FloodGate {
         count <= self.rate_limit
     }
 
-    /// Get peers to forward a message to (excluding peers that sent it to us).
+    /// Returns the list of peers to forward a message to.
+    ///
+    /// Excludes any peers that have already sent us this message (tracked
+    /// via [`record_seen`](FloodGate::record_seen)).
     pub fn get_forward_peers(
         &self,
         message_hash: &Hash256,
@@ -162,12 +221,15 @@ impl FloodGate {
             .collect()
     }
 
-    /// Check if a message has been seen.
+    /// Returns true if this message has been seen before.
     pub fn has_seen(&self, message_hash: &Hash256) -> bool {
         self.seen.contains_key(message_hash)
     }
 
-    /// Force cleanup of expired entries.
+    /// Forces immediate cleanup of expired entries.
+    ///
+    /// Normally cleanup happens automatically, but this can be called
+    /// to free memory immediately.
     pub fn cleanup(&self) {
         let now = Instant::now();
         let ttl = self.ttl;
@@ -183,7 +245,7 @@ impl FloodGate {
         *self.last_cleanup.write() = now;
     }
 
-    /// Maybe run cleanup if interval has passed or too many entries.
+    /// Runs cleanup if the interval has passed or we've exceeded max entries.
     fn maybe_cleanup(&self) {
         let should_cleanup = {
             let last = *self.last_cleanup.read();
@@ -196,7 +258,7 @@ impl FloodGate {
         }
     }
 
-    /// Get statistics.
+    /// Returns current statistics about the flood gate.
     pub fn stats(&self) -> FloodGateStats {
         FloodGateStats {
             seen_count: self.seen.len(),
@@ -205,7 +267,10 @@ impl FloodGate {
         }
     }
 
-    /// Clear all entries.
+    /// Clears all entries from the flood gate.
+    ///
+    /// Use with caution - this will allow previously-seen messages to be
+    /// flooded again.
     pub fn clear(&self) {
         self.seen.clear();
         *self.last_cleanup.write() = Instant::now();
@@ -218,19 +283,21 @@ impl Default for FloodGate {
     }
 }
 
-/// Statistics for FloodGate.
+/// Statistics snapshot from a [`FloodGate`].
 #[derive(Debug, Clone)]
 pub struct FloodGateStats {
-    /// Number of messages currently tracked.
+    /// Number of unique messages currently being tracked.
     pub seen_count: usize,
-    /// Total messages processed.
+    /// Total messages processed (including duplicates).
     pub total_messages: u64,
-    /// Messages dropped as duplicates.
+    /// Number of messages dropped as duplicates.
     pub dropped_messages: u64,
 }
 
 impl FloodGateStats {
-    /// Get the duplicate rate as a percentage.
+    /// Calculates the duplicate rate as a percentage.
+    ///
+    /// Returns 0.0 if no messages have been processed.
     pub fn duplicate_rate(&self) -> f64 {
         if self.total_messages == 0 {
             0.0
@@ -240,27 +307,31 @@ impl FloodGateStats {
     }
 }
 
-/// Helper to compute message hash.
+/// Computes the SHA-256 hash of a message for flood tracking.
+///
+/// This is the canonical hash used to identify messages across the network.
 pub fn compute_message_hash(message: &StellarMessage) -> Hash256 {
     use stellar_xdr::curr::{Limits, WriteXdr};
     let bytes = message.to_xdr(Limits::none()).unwrap_or_default();
     Hash256::hash(&bytes)
 }
 
-/// Message flood record for tracking which peers need a message.
+/// A message queued for flooding, with tracking metadata.
+///
+/// Used internally to track messages that need to be forwarded to peers.
 pub struct FloodRecord {
-    /// Message hash.
+    /// SHA-256 hash of the message.
     pub hash: Hash256,
-    /// The message.
+    /// The message to be flooded.
     pub message: StellarMessage,
-    /// When it was received.
+    /// When the message was received.
     pub received: Instant,
-    /// Peer that sent it.
+    /// The peer that sent us this message (if any).
     pub from_peer: Option<PeerId>,
 }
 
 impl FloodRecord {
-    /// Create a new flood record.
+    /// Creates a new flood record for a message.
     pub fn new(message: StellarMessage, from_peer: Option<PeerId>) -> Self {
         let hash = compute_message_hash(&message);
         Self {

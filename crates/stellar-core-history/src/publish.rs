@@ -1,22 +1,54 @@
-//! History archive publishing.
+//! History archive publishing for validators.
 //!
-//! This module handles publishing ledger data to history archives.
-//! Validators publish:
-//! - Ledger headers (organized in checkpoints)
-//! - Transaction sets
-//! - Transaction results
-//! - Bucket files
-//! - SCP messages
+//! This module enables validators to publish their ledger history to archives,
+//! making it available for other nodes to catch up from.
 //!
-//! Publishing is typically done at checkpoint boundaries (every 64 ledgers).
+//! # Overview
+//!
+//! When a validator closes a checkpoint (every 64 ledgers), it can publish:
+//!
+//! - **Ledger headers**: Metadata for each ledger in the checkpoint
+//! - **Transaction sets**: All transactions executed in the checkpoint
+//! - **Transaction results**: Outcomes of each transaction
+//! - **Bucket files**: Serialized ledger state at the checkpoint
+//! - **SCP messages**: Consensus protocol messages for verification
+//! - **HAS file**: History Archive State summarizing the checkpoint
+//!
+//! # Archive Layout
+//!
+//! Published files follow the standard archive structure:
+//!
+//! ```text
+//! history/AA/BB/CC/history-AABBCCDD.json    # HAS file
+//! ledger/AA/BB/CC/ledger-AABBCCDD.xdr.gz    # Ledger headers
+//! transactions/AA/BB/CC/transactions-AABBCCDD.xdr.gz
+//! results/AA/BB/CC/results-AABBCCDD.xdr.gz
+//! bucket/XX/YY/ZZ/bucket-{hash}.xdr.gz      # Bucket files
+//! ```
+//!
+//! Where AA/BB/CC are hex bytes of the checkpoint ledger sequence.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use stellar_core_history::publish::{PublishManager, PublishConfig};
+//!
+//! let config = PublishConfig {
+//!     local_path: "/var/stellar/history".into(),
+//!     network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+//!     ..Default::default()
+//! };
+//!
+//! let manager = PublishManager::new(config);
+//! // Call publish_checkpoint() at each checkpoint boundary
+//! ```
 
 use crate::{
     archive_state::{HASBucketLevel, HASBucketNext, HistoryArchiveState},
     checkpoint::is_checkpoint_ledger,
-    paths,
-    verify,
-    HistoryError, Result,
+    paths, verify, HistoryError, Result,
 };
+use std::path::{Path, PathBuf};
 use stellar_core_bucket::BucketList;
 use stellar_core_common::Hash256;
 use stellar_core_ledger::TransactionSetVariant;
@@ -24,7 +56,6 @@ use stellar_xdr::curr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, WriteXdr,
 };
-use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 /// Configuration for history publishing.
@@ -162,8 +193,12 @@ impl PublishManager {
                 ))
             })?;
             let tx_set = match &entry.ext {
-                TransactionHistoryEntryExt::V0 => TransactionSetVariant::Classic(entry.tx_set.clone()),
-                TransactionHistoryEntryExt::V1(set) => TransactionSetVariant::Generalized(set.clone()),
+                TransactionHistoryEntryExt::V0 => {
+                    TransactionSetVariant::Classic(entry.tx_set.clone())
+                }
+                TransactionHistoryEntryExt::V1(set) => {
+                    TransactionSetVariant::Generalized(set.clone())
+                }
             };
             verify::verify_tx_set(header, &tx_set)?;
 
@@ -283,7 +318,11 @@ impl PublishManager {
     }
 
     /// Write ledger headers to a file.
-    fn write_ledger_headers(&self, path: &Path, headers: &[LedgerHeaderHistoryEntry]) -> Result<()> {
+    fn write_ledger_headers(
+        &self,
+        path: &Path,
+        headers: &[LedgerHeaderHistoryEntry],
+    ) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use std::io::Write;
@@ -324,7 +363,11 @@ impl PublishManager {
         }
 
         encoder.finish()?;
-        debug!("Wrote {} transaction entries to {:?}", tx_entries.len(), path);
+        debug!(
+            "Wrote {} transaction entries to {:?}",
+            tx_entries.len(),
+            path
+        );
         Ok(())
     }
 

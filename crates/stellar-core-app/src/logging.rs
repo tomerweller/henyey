@@ -1,8 +1,51 @@
-//! Logging setup for rs-stellar-core.
+//! Logging setup and progress tracking for rs-stellar-core.
 //!
-//! Configures tracing-subscriber with appropriate log levels and formats.
-//! Supports both text and JSON output formats, and provides progress
-//! reporting utilities for long-running operations like catchup.
+//! This module provides:
+//!
+//! - **Logging initialization**: Configure the global tracing subscriber with
+//!   appropriate log levels, formats, and filters
+//! - **Progress tracking**: Utilities for reporting progress during long-running
+//!   operations like catchup
+//!
+//! # Log Formats
+//!
+//! Two output formats are supported:
+//!
+//! - **Text** ([`LogFormat::Text`]): Human-readable format with optional ANSI colors,
+//!   suitable for terminal output
+//! - **JSON** ([`LogFormat::Json`]): Structured JSON format suitable for log aggregation
+//!   systems like Elasticsearch or Loki
+//!
+//! # Example
+//!
+//! ```no_run
+//! use stellar_core_app::logging::{LogConfig, init};
+//!
+//! // Initialize with default settings (INFO level, text format)
+//! init(&LogConfig::default()).expect("Failed to initialize logging");
+//!
+//! // Or use verbose debug configuration
+//! init(&LogConfig::verbose()).expect("Failed to initialize logging");
+//! ```
+//!
+//! # Progress Tracking
+//!
+//! For long-running operations, use [`ProgressTracker`] for general progress
+//! or [`CatchupProgress`] for catchup-specific progress reporting:
+//!
+//! ```
+//! use stellar_core_app::logging::ProgressTracker;
+//! use std::time::Duration;
+//!
+//! let tracker = ProgressTracker::with_total("downloading", 100)
+//!     .with_report_interval(Duration::from_secs(1));
+//!
+//! for i in 0..100 {
+//!     // ... do work ...
+//!     tracker.inc();
+//! }
+//! tracker.complete();
+//! ```
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,28 +54,47 @@ use std::time::{Duration, Instant};
 use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Log output format.
+/// Log output format selection.
+///
+/// Determines how log messages are formatted for output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LogFormat {
-    /// Human-readable text format.
+    /// Human-readable text format with optional ANSI colors.
+    ///
+    /// Example output:
+    /// ```text
+    /// 2024-01-15T10:30:00Z INFO stellar_core_app::run Ledger closed seq=12345
+    /// ```
     #[default]
     Text,
-    /// Structured JSON format.
+    /// Structured JSON format for machine parsing.
+    ///
+    /// Example output:
+    /// ```json
+    /// {"timestamp":"2024-01-15T10:30:00Z","level":"INFO","target":"stellar_core_app::run","message":"Ledger closed","seq":12345}
+    /// ```
     Json,
 }
 
-/// Logging configuration.
+/// Logging configuration options.
+///
+/// Controls log level, output format, and additional metadata inclusion.
+/// Use the constructor methods for common configurations:
+///
+/// - [`LogConfig::default()`] - INFO level, text format, colors enabled
+/// - [`LogConfig::verbose()`] - DEBUG level with source locations
+/// - [`LogConfig::json()`] - Production-ready JSON format
 #[derive(Debug, Clone)]
 pub struct LogConfig {
-    /// Log level (trace, debug, info, warn, error).
+    /// Minimum log level to output.
     pub level: Level,
-    /// Output format.
+    /// Output format (text or JSON).
     pub format: LogFormat,
-    /// Enable ANSI colors (for text format).
+    /// Enable ANSI color codes (text format only).
     pub ansi_colors: bool,
-    /// Include source location in logs.
+    /// Include file/line source locations in output.
     pub with_source_location: bool,
-    /// Include thread IDs in logs.
+    /// Include thread IDs in output.
     pub with_thread_ids: bool,
 }
 
@@ -128,7 +190,32 @@ pub fn init(config: &LogConfig) -> anyhow::Result<()> {
 
 /// Progress tracker for long-running operations.
 ///
-/// Provides periodic progress updates with rate estimation.
+/// Provides periodic progress updates with rate estimation and ETA calculation.
+/// Updates are rate-limited to avoid log spam while still providing visibility
+/// into operation progress.
+///
+/// # Features
+///
+/// - Tracks items processed with optional total count
+/// - Calculates processing rate (items/second)
+/// - Estimates time remaining when total is known
+/// - Rate-limits log output to configurable intervals
+///
+/// # Example
+///
+/// ```
+/// use stellar_core_app::logging::ProgressTracker;
+/// use std::time::Duration;
+///
+/// let tracker = ProgressTracker::with_total("processing", 1000)
+///     .with_report_interval(Duration::from_secs(5));
+///
+/// for i in 0..1000 {
+///     // Process item...
+///     tracker.inc();
+/// }
+/// tracker.complete();
+/// ```
 #[derive(Debug)]
 pub struct ProgressTracker {
     /// Description of the operation.
@@ -266,7 +353,10 @@ impl ProgressTracker {
     }
 }
 
-/// Progress tracker for catchup operations.
+/// Specialized progress tracker for catchup operations.
+///
+/// Tracks progress through the various phases of catchup (downloading,
+/// applying, replaying) with phase-specific metrics and logging.
 #[derive(Debug)]
 pub struct CatchupProgress {
     /// Current phase of catchup.
@@ -286,23 +376,26 @@ pub struct CatchupProgress {
 }
 
 /// Phase of the catchup operation.
+///
+/// Represents the current stage of the catchup process. Phases progress
+/// in order from `Initializing` through to `Complete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchupPhase {
-    /// Initializing catchup.
+    /// Setting up catchup parameters and targets.
     Initializing,
-    /// Downloading history archive state.
+    /// Fetching history archive state (HAS) file.
     DownloadingState,
-    /// Downloading buckets.
+    /// Downloading bucket files from archives.
     DownloadingBuckets,
-    /// Applying buckets to ledger state.
+    /// Applying downloaded buckets to rebuild ledger state.
     ApplyingBuckets,
-    /// Downloading ledger headers and transactions.
+    /// Downloading ledger headers and transaction sets.
     DownloadingLedgers,
-    /// Replaying transactions.
+    /// Replaying transactions to advance to target ledger.
     ReplayingLedgers,
-    /// Verifying final state.
+    /// Verifying final state against expected hashes.
     Verifying,
-    /// Catchup complete.
+    /// Catchup completed successfully.
     Complete,
 }
 

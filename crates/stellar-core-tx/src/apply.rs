@@ -1,8 +1,91 @@
 //! Transaction application for replay/catchup mode.
 //!
-//! During catchup, we apply transactions by replaying the historical results
-//! from the archive. We don't re-execute the transactions; instead, we apply
-//! the state changes recorded in the transaction meta.
+//! This module handles applying transactions during catchup/replay by trusting
+//! the historical results from the archive rather than re-executing transactions.
+//!
+//! # Overview
+//!
+//! During catchup, we have access to:
+//! - The original transaction envelope
+//! - The recorded result (success/failure, fee charged, operation results)
+//! - The transaction metadata (state changes: creates, updates, deletes)
+//!
+//! Instead of re-executing the transaction (which would require the exact
+//! ledger state and could differ due to protocol changes), we apply the
+//! recorded state changes directly. This is both faster and guaranteed to
+//! produce the same ledger hash as the original execution.
+//!
+//! # Why Replay Instead of Re-execute?
+//!
+//! Re-executing historical transactions is problematic for several reasons:
+//!
+//! 1. **Protocol Evolution**: Older transactions may have been validated under
+//!    different rules. Re-execution with current code could reject valid
+//!    historical transactions or produce different results.
+//!
+//! 2. **State Dependencies**: Full execution requires the exact ledger state
+//!    at the time of original execution, which may not be available.
+//!
+//! 3. **Soroban Determinism**: Smart contract execution depends on PRNG seeds
+//!    and network configuration that must match exactly.
+//!
+//! 4. **Performance**: Replaying metadata is significantly faster than
+//!    re-executing complex operations like path payments or contract calls.
+//!
+//! # Key Types
+//!
+//! - [`LedgerDelta`]: Accumulates state changes during transaction application.
+//!   Tracks creates, updates, and deletes with their pre-states for proper
+//!   metadata generation.
+//!
+//! - [`ApplyContext`]: Provides ledger context (sequence, close time, protocol
+//!   version, network ID) needed for transaction application.
+//!
+//! - [`ChangeRef`]: References a change by type and index, preserving the exact
+//!   order of state modifications for correct metadata construction.
+//!
+//! # Change Ordering
+//!
+//! The order of changes in transaction metadata is significant:
+//!
+//! ```text
+//! Transaction Meta Structure:
+//! +---------------------------+
+//! | tx_changes_before         |  <- Fee deduction, sequence bump
+//! +---------------------------+
+//! | operation[0].changes      |  <- First operation's state changes
+//! | operation[1].changes      |  <- Second operation's state changes
+//! | ...                       |
+//! +---------------------------+
+//! | tx_changes_after          |  <- Post-operation adjustments
+//! +---------------------------+
+//! ```
+//!
+//! [`LedgerDelta`] preserves this ordering through `change_order`, allowing
+//! metadata to be reconstructed exactly as recorded.
+//!
+//! # Usage Example
+//!
+//! ```ignore
+//! use stellar_core_tx::{apply_from_history, LedgerDelta, TransactionFrame};
+//!
+//! let frame = TransactionFrame::new(envelope);
+//! let mut delta = LedgerDelta::new(ledger_seq);
+//!
+//! // Apply the historical transaction
+//! let result = apply_from_history(&frame, &tx_result, &tx_meta, &mut delta)?;
+//!
+//! // Delta now contains all state changes in execution order
+//! for entry in delta.created_entries() {
+//!     bucket_list.add(entry)?;
+//! }
+//! for entry in delta.updated_entries() {
+//!     bucket_list.update(entry)?;
+//! }
+//! for key in delta.deleted_keys() {
+//!     bucket_list.delete(key)?;
+//! }
+//! ```
 
 use stellar_xdr::curr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
@@ -15,19 +98,53 @@ use crate::frame::TransactionFrame;
 use crate::result::{TxApplyResult, TxResultWrapper};
 use crate::Result;
 
-/// Represents the type and index of a change in the delta.
-/// Used to preserve execution order across different change types.
+/// Reference to a change in a [`LedgerDelta`], preserving execution order.
+///
+/// During transaction execution, changes (creates, updates, deletes) can be
+/// interleaved. This enum tracks the order so that changes can be replayed
+/// in the correct sequence when building transaction metadata.
 #[derive(Clone, Copy, Debug)]
 pub enum ChangeRef {
-    /// A created entry (index into created vector)
+    /// Index into the delta's created entries vector.
     Created(usize),
-    /// An updated entry (index into updated vector)
+    /// Index into the delta's updated entries vector.
     Updated(usize),
-    /// A deleted entry (index into deleted vector)
+    /// Index into the delta's deleted entries vector.
     Deleted(usize),
 }
 
-/// Delta type alias for state changes.
+/// Accumulator for ledger state changes during transaction execution.
+///
+/// `LedgerDelta` collects all creates, updates, and deletes that occur during
+/// transaction execution. It maintains both the new state (for updates) and
+/// the pre-state (for building proper transaction metadata).
+///
+/// # Structure
+///
+/// - **Created**: New entries that didn't exist before
+/// - **Updated**: Modified entries (stores both pre-state and post-state)
+/// - **Deleted**: Removed entries (stores key and pre-state)
+///
+/// # Order Preservation
+///
+/// The `change_order` field tracks the sequence of changes, which is important
+/// for generating correct transaction metadata that matches C++ stellar-core.
+///
+/// # Example
+///
+/// ```ignore
+/// let mut delta = LedgerDelta::new(ledger_seq);
+///
+/// // Record changes during execution
+/// delta.record_create(new_account_entry);
+/// delta.record_update(old_balance, new_balance);
+/// delta.record_delete(trustline_key, trustline_entry);
+///
+/// // Access changes for bucket list updates
+/// for entry in delta.created_entries() {
+///     bucket_list.add(entry)?;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct LedgerDelta {
     /// Ledger sequence this delta applies to.

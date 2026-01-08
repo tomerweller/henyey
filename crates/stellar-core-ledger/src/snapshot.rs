@@ -1,10 +1,26 @@
-//! LedgerSnapshot - Point-in-time read-only view of ledger state.
+//! Point-in-time snapshots of ledger state.
 //!
-//! LedgerSnapshot provides a consistent, immutable view of the ledger
-//! state at a specific point in time. This is essential for:
-//! - Concurrent reads during ledger close
-//! - Historical state queries
-//! - Transaction validation against frozen state
+//! This module provides [`LedgerSnapshot`] and related types for capturing
+//! and querying ledger state at specific points in time. Snapshots are
+//! essential for:
+//!
+//! - **Concurrent reads during ledger close**: Transaction processing reads
+//!   from a frozen snapshot while writes accumulate in the delta
+//! - **Historical state queries**: Access past ledger states for analysis
+//! - **Transaction validation**: Validate transactions against consistent state
+//!
+//! # Snapshot Hierarchy
+//!
+//! - [`LedgerSnapshot`]: The actual point-in-time state (header + cached entries)
+//! - [`SnapshotHandle`]: Thread-safe wrapper with optional lookup functions
+//! - [`SnapshotBuilder`]: Fluent API for constructing snapshots
+//! - [`SnapshotManager`]: Lifecycle management and retention policy
+//!
+//! # Lazy Loading
+//!
+//! Snapshots can be configured with lookup functions that lazily fetch entries
+//! not in the cache. This allows efficient snapshots that don't need to copy
+//! the entire ledger state upfront.
 
 use crate::{LedgerError, Result};
 use parking_lot::RwLock;
@@ -24,22 +40,35 @@ fn key_to_bytes(key: &LedgerKey) -> Result<Vec<u8>> {
 
 /// A point-in-time snapshot of ledger state.
 ///
-/// This provides a consistent, read-only view of the ledger at a specific
-/// sequence number. The snapshot is immutable and can be safely shared
-/// across threads for concurrent reads.
+/// `LedgerSnapshot` provides a consistent, read-only view of the ledger
+/// at a specific sequence number. The snapshot is immutable after creation
+/// and can be safely shared across threads for concurrent reads.
+///
+/// # Cached vs. Full State
+///
+/// A snapshot contains a cache of entries, which may be a subset of the
+/// full ledger state. Use [`SnapshotHandle`] with a lookup function to
+/// enable lazy loading of entries not in the cache.
+///
+/// # Thread Safety
+///
+/// The snapshot itself is immutable after creation. For shared ownership
+/// across threads, wrap in an [`Arc`] or use [`SnapshotHandle`].
 #[derive(Debug)]
 pub struct LedgerSnapshot {
-    /// The ledger sequence of this snapshot.
+    /// The ledger sequence number this snapshot represents.
     ledger_seq: u32,
 
-    /// The ledger header at this sequence.
+    /// The complete ledger header at this sequence.
     header: LedgerHeader,
 
-    /// Hash of the ledger header.
+    /// SHA-256 hash of the XDR-encoded header.
     header_hash: Hash256,
 
-    /// Cached entries for fast lookup.
-    /// This may be a subset of the full ledger state.
+    /// Cached entries keyed by XDR-encoded LedgerKey.
+    ///
+    /// This may be a subset of the full ledger state. Entries not in
+    /// this cache can be loaded via the lookup function in SnapshotHandle.
     entries: HashMap<Vec<u8>, LedgerEntry>,
 }
 
@@ -172,23 +201,46 @@ impl Clone for LedgerSnapshot {
     }
 }
 
-/// A callback for looking up entries not in the snapshot cache.
+/// Callback type for lazy entry lookup (e.g., from bucket list).
 pub type EntryLookupFn = Arc<dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync>;
+
+/// Callback type for historical header lookup (e.g., from database).
 pub type LedgerHeaderLookupFn = Arc<dyn Fn(u32) -> Result<Option<LedgerHeader>> + Send + Sync>;
+
+/// Callback type for full entry enumeration (e.g., bucket list scan).
 pub type EntriesLookupFn = Arc<dyn Fn() -> Result<Vec<LedgerEntry>> + Send + Sync>;
 
-/// A thread-safe handle to a ledger snapshot.
+/// Thread-safe handle to a ledger snapshot with optional lazy loading.
 ///
-/// This allows multiple readers to share a snapshot without copying.
-/// Optionally includes a lookup function for entries not in the cache.
+/// `SnapshotHandle` wraps a [`LedgerSnapshot`] in an `Arc` for efficient
+/// sharing across threads, and optionally provides lookup functions for
+/// entries not in the snapshot's cache.
+///
+/// # Lookup Functions
+///
+/// Three optional lookup functions can be configured:
+///
+/// - **Entry lookup**: Fetches individual entries (e.g., from bucket list)
+/// - **Header lookup**: Fetches historical headers (e.g., from database)
+/// - **Entries scan**: Returns all live entries (e.g., for full state analysis)
+///
+/// # Example
+///
+/// ```ignore
+/// let handle = SnapshotHandle::with_lookup(snapshot, bucket_list_lookup);
+///
+/// // Entry lookup falls through to bucket list if not cached
+/// let entry = handle.get_entry(&key)?;
+/// ```
 #[derive(Clone)]
 pub struct SnapshotHandle {
+    /// The underlying snapshot (shared via Arc).
     inner: Arc<LedgerSnapshot>,
-    /// Optional lookup function for entries not in cache (e.g., bucket list lookup).
+    /// Optional fallback for entry lookups not in cache.
     lookup_fn: Option<EntryLookupFn>,
-    /// Optional lookup function for historical ledger headers.
+    /// Optional lookup for historical ledger headers.
     header_lookup_fn: Option<LedgerHeaderLookupFn>,
-    /// Optional lookup function for all live entries (e.g., bucket list scan).
+    /// Optional enumeration of all live entries.
     entries_fn: Option<EntriesLookupFn>,
 }
 
@@ -326,11 +378,27 @@ impl SnapshotHandle {
     }
 }
 
-/// A builder for creating snapshots.
+/// Fluent builder for constructing [`LedgerSnapshot`] instances.
+///
+/// Use this builder when you need to construct a snapshot programmatically
+/// with specific entries preloaded.
+///
+/// # Example
+///
+/// ```ignore
+/// let snapshot = SnapshotBuilder::new(ledger_seq)
+///     .with_header(header, header_hash)
+///     .add_entry(key, entry)?
+///     .build()?;
+/// ```
 pub struct SnapshotBuilder {
+    /// Target ledger sequence.
     ledger_seq: u32,
+    /// Optional header (required for build, optional for build_with_default_header).
     header: Option<LedgerHeader>,
+    /// Hash of the header.
     header_hash: Hash256,
+    /// Preloaded entries.
     entries: HashMap<Vec<u8>, LedgerEntry>,
 }
 
@@ -419,15 +487,26 @@ impl SnapshotBuilder {
     }
 }
 
-/// Manager for snapshot lifecycle.
+/// Manager for snapshot lifecycle and retention.
 ///
-/// This manages the creation and retention of snapshots,
-/// ensuring old snapshots are cleaned up appropriately.
+/// `SnapshotManager` handles the creation, storage, and cleanup of
+/// ledger snapshots. It enforces a configurable retention policy,
+/// automatically pruning old snapshots when the limit is exceeded.
+///
+/// # Retention Policy
+///
+/// When the number of snapshots exceeds `max_snapshots`, the oldest
+/// snapshots (by ledger sequence) are removed to make room for new ones.
+///
+/// # Thread Safety
+///
+/// All methods are safe to call from multiple threads. The internal
+/// storage is protected by an RwLock.
 pub struct SnapshotManager {
-    /// Currently active snapshots, keyed by ledger sequence.
+    /// Active snapshots indexed by ledger sequence.
     snapshots: RwLock<HashMap<u32, SnapshotHandle>>,
 
-    /// Maximum number of snapshots to retain.
+    /// Maximum number of snapshots to retain before pruning.
     max_snapshots: usize,
 }
 

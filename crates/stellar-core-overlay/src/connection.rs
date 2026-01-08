@@ -1,9 +1,19 @@
-//! TCP connection handling for Stellar overlay.
+//! Low-level TCP connection handling for the Stellar overlay.
 //!
-//! Manages the low-level TCP connections, including:
-//! - Accepting incoming connections
-//! - Connecting to outbound peers
-//! - Framed message reading/writing
+//! This module provides the transport layer for overlay connections:
+//!
+//! - [`Connection`] - A single TCP connection with framed message I/O
+//! - [`Listener`] - Accepts incoming TCP connections on a port
+//! - [`ConnectionPool`] - Tracks connection counts against limits
+//!
+//! # Architecture
+//!
+//! Connections wrap a TCP stream with the [`MessageCodec`] for automatic
+//! length-prefixed framing. The higher-level [`Peer`] type handles
+//! authentication and message processing on top of a `Connection`.
+//!
+//! [`MessageCodec`]: crate::MessageCodec
+//! [`Peer`]: crate::Peer
 
 use crate::{
     codec::{MessageCodec, MessageFrame},
@@ -18,40 +28,60 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, trace};
 
-/// Direction of a connection.
+/// Direction of a peer connection.
+///
+/// Used to determine the initiator/acceptor roles during key derivation
+/// in the authentication handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionDirection {
-    /// We initiated the connection.
+    /// We initiated the connection (we are the "initiator" in key derivation).
     Outbound,
-    /// They connected to us.
+    /// The peer connected to us (we are the "acceptor" in key derivation).
     Inbound,
 }
 
 impl ConnectionDirection {
-    /// Whether we called the remote peer.
+    /// Returns true if we initiated this connection.
+    ///
+    /// This determines our role in the authentication key derivation.
     pub fn we_called_remote(&self) -> bool {
         matches!(self, ConnectionDirection::Outbound)
     }
 }
 
-/// A TCP connection to a peer.
+/// A TCP connection to a peer with framed message I/O.
+///
+/// Wraps a TCP stream with the [`MessageCodec`] for automatic message framing.
+/// Provides async methods for sending and receiving [`AuthenticatedMessage`]s.
+///
+/// # Lifecycle
+///
+/// 1. Create via [`Connection::connect`] (outbound) or from [`Listener::accept`] (inbound)
+/// 2. Use [`send`](Connection::send) and [`recv`](Connection::recv) for message I/O
+/// 3. Call [`close`](Connection::close) when done (or drop the connection)
+///
+/// [`MessageCodec`]: crate::MessageCodec
+/// [`AuthenticatedMessage`]: stellar_xdr::curr::AuthenticatedMessage
 pub struct Connection {
-    /// The framed codec for reading/writing messages.
+    /// Framed stream for message encoding/decoding.
     framed: Framed<TcpStream, MessageCodec>,
-    /// Remote peer address.
+    /// Remote peer's socket address.
     remote_addr: SocketAddr,
-    /// Connection direction.
+    /// Whether we initiated or accepted this connection.
     direction: ConnectionDirection,
-    /// Whether the connection is closed.
+    /// True if the connection has been closed.
     closed: bool,
 }
 
 impl Connection {
-    /// Create a new connection from a TCP stream.
+    /// Creates a connection from an existing TCP stream.
+    ///
+    /// Configures TCP_NODELAY to reduce latency and wraps the stream
+    /// with the message codec.
     pub fn new(stream: TcpStream, direction: ConnectionDirection) -> Result<Self> {
         let remote_addr = stream.peer_addr()?;
 
-        // Configure TCP options
+        // Disable Nagle's algorithm for lower latency
         stream.set_nodelay(true)?;
 
         let framed = Framed::new(stream, MessageCodec::new());
@@ -64,7 +94,12 @@ impl Connection {
         })
     }
 
-    /// Connect to a peer with timeout.
+    /// Connects to a peer address with a timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionTimeout` if the connection is not established
+    /// within `timeout_secs`, or `ConnectionFailed` for other errors.
     pub async fn connect(addr: &PeerAddress, timeout_secs: u64) -> Result<Self> {
         debug!("Connecting to peer: {}", addr);
 
@@ -80,44 +115,50 @@ impl Connection {
         Self::new(stream, ConnectionDirection::Outbound)
     }
 
-    /// Get the remote address.
+    /// Returns the remote peer's socket address.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
-    /// Get the connection direction.
+    /// Returns whether this is an inbound or outbound connection.
     pub fn direction(&self) -> ConnectionDirection {
         self.direction
     }
 
-    /// Whether we initiated this connection.
+    /// Returns true if we initiated this connection.
     pub fn we_called_remote(&self) -> bool {
         self.direction.we_called_remote()
     }
 
-    /// Check if the connection is closed.
+    /// Returns true if the connection has been closed.
     pub fn is_closed(&self) -> bool {
         self.closed
     }
 
-    /// Send a message.
+    /// Sends an authenticated message to the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PeerDisconnected` if the connection is already closed,
+    /// or a codec error if encoding fails.
     pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<()> {
         if self.closed {
-            return Err(OverlayError::PeerDisconnected("connection closed".to_string()));
+            return Err(OverlayError::PeerDisconnected(
+                "connection closed".to_string(),
+            ));
         }
 
         trace!("Sending message to {}", self.remote_addr);
 
-        self.framed
-            .send(message)
-            .await
-            .map_err(|e| {
-                self.closed = true;
-                e
-            })
+        self.framed.send(message).await.map_err(|e| {
+            self.closed = true;
+            e
+        })
     }
 
-    /// Receive a message.
+    /// Receives the next message from the peer.
+    ///
+    /// Returns `Ok(None)` if the connection was closed cleanly by the peer.
     pub async fn recv(&mut self) -> Result<Option<MessageFrame>> {
         if self.closed {
             debug!("recv called but connection already closed");
@@ -126,7 +167,10 @@ impl Connection {
 
         match self.framed.next().await {
             Some(Ok(frame)) => {
-                debug!("Received message from {} ({} bytes)", self.remote_addr, frame.raw_len);
+                debug!(
+                    "Received message from {} ({} bytes)",
+                    self.remote_addr, frame.raw_len
+                );
                 Ok(Some(frame))
             }
             Some(Err(e)) => {
@@ -142,7 +186,11 @@ impl Connection {
         }
     }
 
-    /// Receive a message with timeout.
+    /// Receives a message with a timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionTimeout` if no message is received within `timeout_secs`.
     pub async fn recv_timeout(&mut self, timeout_secs: u64) -> Result<Option<MessageFrame>> {
         let recv_timeout = Duration::from_secs(timeout_secs);
 
@@ -150,27 +198,28 @@ impl Connection {
             Ok(result) => result,
             Err(_) => {
                 self.closed = true;
-                Err(OverlayError::ConnectionTimeout("receive timeout".to_string()))
+                Err(OverlayError::ConnectionTimeout(
+                    "receive timeout".to_string(),
+                ))
             }
         }
     }
 
-    /// Close the connection.
+    /// Closes the connection.
+    ///
+    /// This marks the connection as closed. The underlying TCP stream
+    /// will be closed when the connection is dropped.
     pub async fn close(&mut self) {
         if !self.closed {
             self.closed = true;
-            // The TcpStream will be closed when framed is dropped
             debug!("Closed connection to {}", self.remote_addr);
         }
     }
 
-    /// Split into send and receive halves.
-    pub fn split(
-        self,
-    ) -> (
-        ConnectionSender,
-        ConnectionReceiver,
-    ) {
+    /// Splits the connection into separate send and receive halves.
+    ///
+    /// This allows concurrent sending and receiving on the same connection.
+    pub fn split(self) -> (ConnectionSender, ConnectionReceiver) {
         let (sink, stream) = self.framed.split();
         (
             ConnectionSender {
@@ -185,37 +234,49 @@ impl Connection {
     }
 }
 
-/// Send half of a connection.
+/// Send half of a split connection.
+///
+/// Created by [`Connection::split`]. Allows sending messages without
+/// holding a lock on the full connection.
 pub struct ConnectionSender {
     sink: futures::stream::SplitSink<Framed<TcpStream, MessageCodec>, AuthenticatedMessage>,
     remote_addr: SocketAddr,
 }
 
 impl ConnectionSender {
-    /// Send a message.
+    /// Sends a message to the peer.
     pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<()> {
         trace!("Sending message to {}", self.remote_addr);
         self.sink.send(message).await
     }
 
-    /// Get the remote address.
+    /// Returns the remote peer's socket address.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 }
 
-/// Receive half of a connection.
+/// Receive half of a split connection.
+///
+/// Created by [`Connection::split`]. Allows receiving messages without
+/// holding a lock on the full connection.
 pub struct ConnectionReceiver {
     stream: futures::stream::SplitStream<Framed<TcpStream, MessageCodec>>,
     remote_addr: SocketAddr,
 }
 
 impl ConnectionReceiver {
-    /// Receive a message.
+    /// Receives the next message from the peer.
+    ///
+    /// Returns `Ok(None)` if the connection was closed.
     pub async fn recv(&mut self) -> Result<Option<MessageFrame>> {
         match self.stream.next().await {
             Some(Ok(frame)) => {
-                trace!("Received message from {} ({} bytes)", self.remote_addr, frame.raw_len);
+                trace!(
+                    "Received message from {} ({} bytes)",
+                    self.remote_addr,
+                    frame.raw_len
+                );
                 Ok(Some(frame))
             }
             Some(Err(e)) => Err(e),
@@ -223,20 +284,27 @@ impl ConnectionReceiver {
         }
     }
 
-    /// Get the remote address.
+    /// Returns the remote peer's socket address.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 }
 
-/// TCP listener for incoming connections.
+/// TCP listener for accepting incoming peer connections.
+///
+/// Binds to a port and accepts new connections, wrapping them as
+/// inbound [`Connection`]s.
 pub struct Listener {
     listener: TcpListener,
     local_addr: SocketAddr,
 }
 
 impl Listener {
-    /// Bind to a port.
+    /// Binds to the specified port on all interfaces (0.0.0.0).
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if the port is already in use or binding fails.
     pub async fn bind(port: u16) -> Result<Self> {
         let addr = format!("0.0.0.0:{}", port);
         let listener = TcpListener::bind(&addr).await?;
@@ -250,12 +318,15 @@ impl Listener {
         })
     }
 
-    /// Get the local address.
+    /// Returns the local address the listener is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Accept an incoming connection.
+    /// Accepts the next incoming connection.
+    ///
+    /// Blocks until a new connection arrives, then returns it as an
+    /// inbound [`Connection`].
     pub async fn accept(&self) -> Result<Connection> {
         let (stream, remote_addr) = self.listener.accept().await?;
         debug!("Accepted connection from {}", remote_addr);
@@ -264,14 +335,19 @@ impl Listener {
     }
 }
 
-/// Connection pool for managing multiple connections.
+/// Thread-safe connection counter for enforcing connection limits.
+///
+/// Used to track inbound and outbound connection counts separately,
+/// ensuring we don't exceed configured limits.
 pub struct ConnectionPool {
+    /// Maximum number of connections allowed.
     max_connections: usize,
+    /// Current number of active connections.
     current_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ConnectionPool {
-    /// Create a new connection pool.
+    /// Creates a new connection pool with the given limit.
     pub fn new(max_connections: usize) -> Self {
         Self {
             max_connections,
@@ -279,12 +355,15 @@ impl ConnectionPool {
         }
     }
 
-    /// Check if we can accept more connections.
+    /// Returns true if there's room for another connection.
     pub fn can_accept(&self) -> bool {
         self.current_count.load(std::sync::atomic::Ordering::Relaxed) < self.max_connections
     }
 
-    /// Try to reserve a connection slot.
+    /// Attempts to reserve a connection slot.
+    ///
+    /// Returns true if a slot was reserved, false if the limit is reached.
+    /// Uses atomic compare-and-swap for thread safety.
     pub fn try_reserve(&self) -> bool {
         let mut current = self.current_count.load(std::sync::atomic::Ordering::Relaxed);
         loop {
@@ -303,13 +382,15 @@ impl ConnectionPool {
         }
     }
 
-    /// Release a connection slot.
+    /// Releases a previously reserved connection slot.
+    ///
+    /// Call this when a connection is closed.
     pub fn release(&self) {
         self.current_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Get current connection count.
+    /// Returns the current number of connections.
     pub fn count(&self) -> usize {
         self.current_count.load(std::sync::atomic::Ordering::Relaxed)
     }

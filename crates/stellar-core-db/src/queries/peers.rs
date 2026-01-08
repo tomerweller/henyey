@@ -1,18 +1,41 @@
 //! Peer record queries for the peers table.
+//!
+//! This module provides database operations for network peer management.
+//! The peer table tracks known network peers with their connection state,
+//! enabling persistent peer discovery and connection retry logic.
+//!
+//! # Peer Types
+//!
+//! Peers are categorized by type (typically inbound vs outbound connections).
+//! The type value is application-defined but typically:
+//! - 0: Inbound (peer connected to us)
+//! - 1: Preferred (configured preferred peers)
+//! - 2: Outbound (we connected to peer)
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::super::error::DbError;
 
 /// Database representation of a peer record.
+///
+/// Tracks connection metadata for a network peer, including retry
+/// scheduling and failure counting for connection management.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerRecord {
+    /// Unix timestamp of when to next attempt connection.
+    ///
+    /// Used for exponential backoff on connection failures.
     pub next_attempt: i64,
+    /// Number of consecutive connection failures.
+    ///
+    /// Used for pruning persistently unreachable peers.
     pub num_failures: u32,
+    /// The type/category of this peer (application-defined).
     pub peer_type: i32,
 }
 
 impl PeerRecord {
+    /// Creates a new peer record with the given parameters.
     pub fn new(next_attempt: i64, num_failures: u32, peer_type: i32) -> Self {
         Self {
             next_attempt,
@@ -22,21 +45,35 @@ impl PeerRecord {
     }
 }
 
-/// Trait for querying and modifying the peers table.
+/// Query trait for peer management operations.
+///
+/// Provides methods for CRUD operations on the `peers` table, as well as
+/// specialized queries for peer selection during connection attempts.
 pub trait PeerQueries {
-    /// Load a peer record by address.
+    /// Loads a peer record by host and port.
+    ///
+    /// Returns `None` if the peer is not in the database.
     fn load_peer(&self, host: &str, port: u16) -> Result<Option<PeerRecord>, DbError>;
 
-    /// Insert or update a peer record.
+    /// Stores or updates a peer record.
+    ///
+    /// If a peer with the same host/port exists, it is replaced.
     fn store_peer(&self, host: &str, port: u16, record: PeerRecord) -> Result<(), DbError>;
 
-    /// Load peer records (optionally limited).
+    /// Loads peer records, optionally limited to a maximum count.
     fn load_peers(
         &self,
         limit: Option<usize>,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
-    /// Load random peers matching constraints.
+    /// Loads random peers matching the specified constraints.
+    ///
+    /// Filters by:
+    /// - `max_failures`: Maximum allowed failure count
+    /// - `now`: Current timestamp (only peers with `next_attempt <= now`)
+    /// - `peer_type`: Optional specific peer type to match
+    ///
+    /// Results are randomized to distribute connection attempts.
     fn load_random_peers(
         &self,
         limit: usize,
@@ -45,7 +82,9 @@ pub trait PeerQueries {
         peer_type: Option<i32>,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
-    /// Load random peers excluding an inbound type.
+    /// Loads random outbound peers (excludes the specified inbound type).
+    ///
+    /// Respects both failure count and next attempt time constraints.
     fn load_random_peers_any_outbound(
         &self,
         limit: usize,
@@ -54,7 +93,9 @@ pub trait PeerQueries {
         inbound_type: i32,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
-    /// Load random peers excluding an inbound type (ignores next attempt).
+    /// Loads random outbound peers, ignoring next attempt time.
+    ///
+    /// Useful for aggressive peer discovery when the peer table is sparse.
     fn load_random_peers_any_outbound_max_failures(
         &self,
         limit: usize,
@@ -62,7 +103,7 @@ pub trait PeerQueries {
         inbound_type: i32,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
-    /// Load random peers for an exact type (ignores next attempt).
+    /// Loads random peers of a specific type, ignoring next attempt time.
     fn load_random_peers_by_type_max_failures(
         &self,
         limit: usize,
@@ -70,7 +111,9 @@ pub trait PeerQueries {
         peer_type: i32,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
-    /// Remove peers with too many failures.
+    /// Removes peers that have exceeded the failure threshold.
+    ///
+    /// Used for garbage collection of persistently unreachable peers.
     fn remove_peers_with_failures(&self, min_failures: u32) -> Result<(), DbError>;
 }
 

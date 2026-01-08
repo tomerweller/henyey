@@ -1,28 +1,63 @@
 //! Database schema migrations.
 //!
 //! This module provides a migration system for upgrading the database schema
-//! between versions. Each migration is a SQL script that transforms the schema.
+//! between versions. Each migration is a SQL script that transforms the schema
+//! from one version to the next.
+//!
+//! # Migration Strategy
+//!
+//! Migrations are applied sequentially, one version at a time. Each migration
+//! is executed in a transaction to ensure atomicity. If a migration fails,
+//! the database is left in its previous state.
+//!
+//! # Adding New Migrations
+//!
+//! To add a new migration:
+//!
+//! 1. Increment [`CURRENT_VERSION`]
+//! 2. Add a new [`Migration`] entry to the [`MIGRATIONS`] array
+//! 3. The `from_version` should be the previous `CURRENT_VERSION`
+//! 4. Provide idempotent SQL (use `IF NOT EXISTS`, `IF EXISTS`, etc.)
+//!
+//! # Version Compatibility
+//!
+//! The migration system will refuse to open a database with a schema version
+//! newer than [`CURRENT_VERSION`], preventing data corruption from version
+//! mismatches.
 
 use crate::{DbError, Result};
 use rusqlite::Connection;
 use tracing::info;
 
-/// Current schema version.
+/// Current database schema version.
+///
+/// This should be incremented whenever a new migration is added.
+/// The database initialization and migration system uses this to
+/// determine if upgrades are needed.
 pub const CURRENT_VERSION: i32 = 5;
 
-/// A database migration.
+/// Represents a single database migration.
+///
+/// Each migration transforms the schema from one version to the next.
+/// Migrations should be designed to be idempotent where possible.
 struct Migration {
-    /// Version this migration upgrades FROM.
+    /// The schema version this migration upgrades FROM.
     from_version: i32,
-    /// Version this migration upgrades TO.
+    /// The schema version this migration upgrades TO.
     to_version: i32,
-    /// SQL to execute for the upgrade.
+    /// SQL statements to execute for the upgrade.
+    ///
+    /// Should use `IF NOT EXISTS`/`IF EXISTS` for idempotency.
     upgrade_sql: &'static str,
-    /// Description of what this migration does.
+    /// Human-readable description of what this migration does.
     description: &'static str,
 }
 
-/// All available migrations.
+/// Registry of all available migrations.
+///
+/// Migrations are ordered by version and applied sequentially.
+/// Each migration must have `from_version` equal to the previous
+/// migration's `to_version`.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         from_version: 1,
@@ -84,7 +119,14 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-/// Get the current schema version from the database.
+/// Retrieves the current schema version from the database.
+///
+/// Returns version 1 if no version is recorded (assumed to be the initial
+/// schema before versioning was introduced).
+///
+/// # Errors
+///
+/// Returns an error if the stored version string cannot be parsed as an integer.
 pub fn get_schema_version(conn: &Connection) -> Result<i32> {
     let result: std::result::Result<String, _> = conn.query_row(
         "SELECT state FROM storestate WHERE statename = 'databaseschema'",
@@ -106,7 +148,9 @@ pub fn get_schema_version(conn: &Connection) -> Result<i32> {
     }
 }
 
-/// Set the schema version in the database.
+/// Records the schema version in the database.
+///
+/// This is called after each successful migration to update the version tracker.
 pub fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO storestate (statename, state) VALUES ('databaseschema', ?)",
@@ -115,13 +159,25 @@ pub fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
     Ok(())
 }
 
-/// Check if the database needs migration.
+/// Checks if the database requires migration.
+///
+/// Returns `true` if the database schema version is older than [`CURRENT_VERSION`].
 pub fn needs_migration(conn: &Connection) -> Result<bool> {
     let current = get_schema_version(conn)?;
     Ok(current < CURRENT_VERSION)
 }
 
-/// Run all necessary migrations to bring the database up to date.
+/// Runs all necessary migrations to bring the database up to date.
+///
+/// Migrations are applied sequentially, each in its own transaction.
+/// If the database is already at [`CURRENT_VERSION`], this is a no-op.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The database version is newer than [`CURRENT_VERSION`]
+/// - A required migration is not found
+/// - Any migration SQL fails to execute
 pub fn run_migrations(conn: &Connection) -> Result<()> {
     let mut current_version = get_schema_version(conn)?;
 
@@ -172,7 +228,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Verify the database schema is compatible with this version.
+/// Verifies the database schema is compatible with this software version.
+///
+/// This is called during initialization to ensure the database can be safely used.
+///
+/// # Errors
+///
+/// Returns an error if the schema version is:
+/// - Older than [`CURRENT_VERSION`] (migrations should be run first)
+/// - Newer than [`CURRENT_VERSION`] (software upgrade required)
 pub fn verify_schema(conn: &Connection) -> Result<()> {
     let version = get_schema_version(conn)?;
 
@@ -193,7 +257,13 @@ pub fn verify_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Initialize a fresh database with the current schema.
+/// Initializes a fresh database with the current schema.
+///
+/// This creates all tables from [`CREATE_SCHEMA`](crate::schema::CREATE_SCHEMA)
+/// and sets the schema version to [`CURRENT_VERSION`].
+///
+/// Should only be called on empty databases. For existing databases,
+/// use [`run_migrations`] instead.
 pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Create the schema
     conn.execute_batch(crate::schema::CREATE_SCHEMA)?;

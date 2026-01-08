@@ -1,15 +1,39 @@
 //! Disk-backed bucket implementation for memory-efficient storage.
 //!
 //! This module provides a bucket implementation that stores entries on disk
-//! and uses an index for efficient lookups, similar to stellar-core's approach.
+//! and uses a compact index for efficient lookups. This is essential for
+//! processing mainnet buckets during catchup, where buckets can contain
+//! millions of entries that would require many GB of RAM if loaded entirely.
 //!
-//! Instead of loading all entries into memory, we:
-//! 1. Store the bucket XDR file on disk
-//! 2. Build an index mapping keys to file offsets
-//! 3. Read entries from disk on-demand
+//! # How It Works
 //!
-//! This reduces memory usage from O(entries) to O(unique_keys) for the index,
-//! which is much smaller since we only store key hashes and offsets.
+//! Instead of loading all entries into memory, the disk bucket:
+//!
+//! 1. **Stores** the raw XDR bucket file on disk (uncompressed)
+//! 2. **Builds** an index mapping the first 8 bytes of each key's SHA-256 hash
+//!    to the file offset and length of the entry
+//! 3. **Reads** entries on-demand from disk when accessed
+//!
+//! # Memory Efficiency
+//!
+//! Memory usage is reduced from O(entries) to O(unique_keys * 16 bytes):
+//! - 8 bytes for the key hash prefix
+//! - 8 bytes for the offset and length (IndexEntry)
+//!
+//! For a bucket with 1 million entries, this is roughly 16 MB for the index
+//! instead of potentially several GB for all entry data.
+//!
+//! # Trade-offs
+//!
+//! - **Slower lookups**: Each lookup requires disk I/O
+//! - **No in-memory slice access**: Must use iteration instead
+//! - **Hash collision risk**: The 8-byte key hash may collide (rare, handled by verification)
+//!
+//! # Usage
+//!
+//! Disk buckets are created via [`Bucket::from_xdr_bytes_disk_backed`] and are
+//! transparent to most bucket operations. Check [`Bucket::is_disk_backed`] to
+//! determine the storage mode.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -25,10 +49,13 @@ use stellar_core_common::Hash256;
 use crate::entry::BucketEntry;
 use crate::{BucketError, Result};
 
-/// Entry in the bucket index: offset and length in the file.
+/// Entry in the bucket index: file offset and record length.
+///
+/// This is a compact 12-byte structure (with padding) that stores the
+/// location of an entry in the bucket file.
 #[derive(Debug, Clone, Copy)]
 struct IndexEntry {
-    /// Byte offset in the bucket file where this entry starts.
+    /// Byte offset in the bucket file where this entry's record mark starts.
     offset: u64,
     /// Length of the XDR record (not including the 4-byte record mark).
     length: u32,
@@ -36,21 +63,38 @@ struct IndexEntry {
 
 /// A disk-backed bucket that stores entries on disk with an in-memory index.
 ///
-/// This is much more memory efficient than the in-memory Bucket for large buckets.
-/// The index maps key hashes to file offsets, allowing O(1) lookups with minimal
-/// memory overhead.
+/// This implementation is designed for memory efficiency when processing
+/// large buckets during catchup. Instead of loading all entries into memory,
+/// it maintains a compact index and reads entries on-demand.
+///
+/// # Index Structure
+///
+/// The index maps the first 8 bytes of each key's SHA-256 hash to an
+/// `IndexEntry` containing the file offset and record length. This uses
+/// a `BTreeMap` for ordered iteration and reasonable lookup performance.
+///
+/// # Hash Collisions
+///
+/// Since we only use 8 bytes of the key hash, collisions are possible
+/// (probability ~1 in 2^64). The `get()` method handles this by verifying
+/// the actual key matches after loading the entry from disk.
+///
+/// # File Access Pattern
+///
+/// Each lookup opens the file fresh, seeks to the offset, and reads the
+/// entry. This avoids file handle contention but may be slower than a
+/// cached approach for repeated accesses to the same bucket.
 #[derive(Clone)]
 pub struct DiskBucket {
-    /// The hash of this bucket's contents.
+    /// The SHA-256 hash of this bucket's contents (for verification).
     hash: Hash256,
-    /// Path to the bucket file on disk.
+    /// Path to the bucket file on disk (uncompressed XDR).
     file_path: PathBuf,
-    /// Index mapping key hashes to (offset, length) in the file.
-    /// Key is the first 8 bytes of SHA256(key_xdr) for compact storage.
+    /// Index mapping 8-byte key hash prefixes to file locations.
     index: Arc<BTreeMap<u64, IndexEntry>>,
-    /// Number of entries in this bucket.
+    /// Total number of entries in this bucket.
     entry_count: usize,
-    /// Cached file handle for reads (wrapped in RwLock for thread safety).
+    /// Reserved for future file handle caching.
     #[allow(dead_code)]
     file_cache: Arc<RwLock<Option<File>>>,
 }
@@ -333,9 +377,26 @@ impl std::fmt::Debug for DiskBucket {
 }
 
 /// Iterator over entries in a disk bucket.
+///
+/// This iterator reads the entire bucket file into memory once and then
+/// parses entries sequentially. While this temporarily uses more memory
+/// than on-demand reads, it provides efficient sequential access.
+///
+/// # Format Detection
+///
+/// The iterator automatically detects whether the bucket uses XDR record
+/// marking (RFC 5531) or raw XDR format, handling both transparently.
+///
+/// # Error Handling
+///
+/// Parse errors for individual entries are returned as `Result` items.
+/// Callers should handle or filter these appropriately.
 pub struct DiskBucketIter {
+    /// The complete bucket file contents.
     bytes: Vec<u8>,
+    /// Current byte offset in the file.
     offset: usize,
+    /// Whether the file uses XDR record marks (vs raw XDR stream).
     uses_record_marks: bool,
 }
 

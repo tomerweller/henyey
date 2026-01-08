@@ -1,24 +1,50 @@
 //! Catchup manager for synchronizing from history archives.
 //!
-//! The catchup process allows a node to synchronize with the Stellar network
-//! by downloading and applying history from trusted archives.
+//! This module provides the [`CatchupManager`] which orchestrates the complete
+//! process of synchronizing a node with the Stellar network using history archives.
 //!
-//! ## Catchup Process
+//! # Overview
 //!
-//! 1. Find the latest checkpoint <= target ledger
-//! 2. Download the History Archive State (HAS) for that checkpoint
-//! 3. Download all buckets referenced in the HAS
-//! 4. Apply buckets to build the initial ledger state
-//! 5. Download ledger headers, transactions, and results for the checkpoint
-//! 6. Verify the header chain
-//! 7. Replay ledgers from the checkpoint to the target
+//! Catchup is the process of downloading historical data and rebuilding ledger
+//! state to match the current network. This is required when:
 //!
-//! ## Key Insight
+//! - Starting a new node from scratch
+//! - Recovering a node that fell too far behind
+//! - Rebuilding state after data corruption
 //!
-//! During catchup, we re-execute transactions against the bucket list state to
-//! reconstruct ledger changes while still verifying history data. This keeps
-//! bucket list evolution consistent with transaction effects and lets us check
-//! tx set and tx result hashes against the headers.
+//! # Catchup Process
+//!
+//! The catchup process follows these steps:
+//!
+//! 1. **Find checkpoint**: Locate the latest checkpoint at or before the target ledger
+//! 2. **Download HAS**: Fetch the History Archive State describing that checkpoint
+//! 3. **Download buckets**: Fetch all bucket files referenced in the HAS
+//! 4. **Apply buckets**: Build the initial ledger state from bucket entries
+//! 5. **Download ledger data**: Fetch headers, transactions, and results
+//! 6. **Verify chain**: Validate the cryptographic hash chain
+//! 7. **Replay ledgers**: Re-execute transactions from checkpoint to target
+//!
+//! # Re-execution vs Metadata Replay
+//!
+//! During catchup, we **re-execute** transactions against the bucket list state
+//! rather than simply applying `TransactionMeta` from archives. This approach:
+//!
+//! - Keeps bucket list evolution consistent with transaction effects
+//! - Allows verification of transaction set and result hashes
+//! - Works with traditional archives that do not include `TransactionMeta`
+//!
+//! The trade-off is that re-execution may produce slightly different internal
+//! results than the original execution (e.g., different Soroban error codes),
+//! though the final state should match. For exact verification, use CDP data
+//! with `TransactionMeta`.
+//!
+//! # Protocol 23+ Considerations
+//!
+//! Starting with protocol 23, state archival introduces complexity:
+//!
+//! - Evicted entries move from live bucket list to hot archive
+//! - Incremental eviction scan must run each ledger for correct hashes
+//! - Bucket list hash = SHA256(live_hash || hot_archive_hash)
 
 use crate::{
     archive::HistoryArchive,
@@ -27,6 +53,9 @@ use crate::{
     replay::{self, LedgerReplayResult, ReplayConfig, ReplayedLedgerState},
     verify, CatchupOutput, CatchupResult, HistoryError, Result,
 };
+use sha2::Digest;
+use std::collections::HashMap;
+use std::sync::Arc;
 use stellar_core_bucket::{BucketList, BucketManager};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
@@ -35,60 +64,77 @@ use stellar_core_invariant::{
     LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerSeqIncrement,
     LiabilitiesMatchOffers, OrderBookIsNotCrossed,
 };
-use sha2::Digest;
 use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::{
     GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry,
-    TransactionHistoryEntry, TransactionHistoryResultEntry, TransactionHistoryEntryExt,
+    TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
     TransactionHistoryResultEntryExt, TransactionMeta, TransactionResultPair, TransactionResultSet,
     TransactionSet, TransactionSetV1, WriteXdr,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Status of a catchup operation.
+/// Current status of a catchup operation.
+///
+/// This enum represents the discrete phases of the catchup process,
+/// allowing callers to track progress and provide user feedback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchupStatus {
-    /// Not started.
+    /// Catchup has not started yet.
     Pending,
-    /// Downloading History Archive State.
+    /// Downloading the History Archive State (HAS) file.
     DownloadingHAS,
-    /// Downloading bucket files.
+    /// Downloading bucket files from the archive.
     DownloadingBuckets,
-    /// Applying buckets to build initial state.
+    /// Applying downloaded buckets to build initial ledger state.
     ApplyingBuckets,
-    /// Downloading ledger data.
+    /// Downloading ledger headers, transactions, and results.
     DownloadingLedgers,
-    /// Verifying downloaded data.
+    /// Verifying cryptographic hashes and chain integrity.
     Verifying,
-    /// Replaying ledgers.
+    /// Re-executing transactions to reach target ledger.
     Replaying,
     /// Catchup completed successfully.
     Completed,
-    /// Catchup failed.
+    /// Catchup failed (check error for details).
     Failed,
 }
 
-/// Progress information for a catchup operation.
+/// Detailed progress information for a catchup operation.
+///
+/// This struct provides fine-grained progress tracking, useful for
+/// displaying progress bars or status updates to users during the
+/// potentially long-running catchup process.
 #[derive(Debug, Clone)]
 pub struct CatchupProgress {
-    /// Current status.
+    /// Current phase of the catchup process.
     pub status: CatchupStatus,
-    /// Current step (1-based).
+
+    /// Current step number (1-based index into the 7-step process).
     pub current_step: u32,
-    /// Total number of steps.
+
+    /// Total number of steps in the catchup process (currently 7).
     pub total_steps: u32,
-    /// For bucket downloads: number of buckets downloaded.
+
+    /// Number of bucket files downloaded so far.
+    ///
+    /// Only meaningful when `status` is `DownloadingBuckets`.
     pub buckets_downloaded: u32,
-    /// For bucket downloads: total buckets to download.
+
+    /// Total number of bucket files to download.
+    ///
+    /// Only meaningful when `status` is `DownloadingBuckets`.
     pub buckets_total: u32,
-    /// For ledger replay: current ledger being replayed.
+
+    /// Current ledger being processed during replay.
+    ///
+    /// Only meaningful when `status` is `Replaying` or `DownloadingLedgers`.
     pub current_ledger: u32,
-    /// For ledger replay: target ledger.
+
+    /// Target ledger sequence for this catchup operation.
     pub target_ledger: u32,
-    /// Human-readable status message.
+
+    /// Human-readable description of current activity.
     pub message: String,
 }
 
@@ -108,27 +154,76 @@ impl Default for CatchupProgress {
 }
 
 /// Pre-downloaded checkpoint data for catchup.
+///
+/// This struct holds all the data needed for catchup when it has been
+/// pre-fetched (e.g., for testing or when using an alternative data source).
+/// Pass this to [`CatchupManager::catchup_to_ledger_with_checkpoint_data`]
+/// to skip the download phase.
 #[derive(Debug, Clone)]
 pub struct CheckpointData {
+    /// The History Archive State describing this checkpoint.
     pub has: HistoryArchiveState,
+
+    /// Downloaded bucket files keyed by their hash.
     pub buckets: HashMap<Hash256, Vec<u8>>,
+
+    /// Ledger headers for the checkpoint range.
     pub headers: Vec<LedgerHeaderHistoryEntry>,
+
+    /// Transaction history entries for the checkpoint.
     pub transactions: Vec<TransactionHistoryEntry>,
+
+    /// Transaction result entries for the checkpoint.
     pub tx_results: Vec<TransactionHistoryResultEntry>,
+
+    /// SCP history entries for consensus verification.
     pub scp_history: Vec<ScpHistoryEntry>,
 }
 
-/// Manager for catching up from history archives.
+/// Manager for synchronizing ledger state from history archives.
+///
+/// The `CatchupManager` orchestrates the complete catchup process:
+/// downloading data from archives, verifying integrity, and replaying
+/// transactions to reach a target ledger.
+///
+/// # Usage
+///
+/// ```no_run
+/// use stellar_core_history::{CatchupManager, archive::HistoryArchive};
+/// use stellar_core_bucket::BucketManager;
+/// use stellar_core_db::Database;
+///
+/// # async fn example() -> Result<(), stellar_core_history::HistoryError> {
+/// let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")?;
+/// let bucket_manager = BucketManager::new("/tmp/buckets".into());
+/// let db = Database::open_or_create("/tmp/stellar.db")?;
+///
+/// let mut manager = CatchupManager::new(vec![archive], bucket_manager, db);
+/// let output = manager.catchup_to_ledger(1000000).await?;
+///
+/// println!("Caught up to ledger {}", output.result.ledger_seq);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Thread Safety
+///
+/// The `CatchupManager` is not `Send` or `Sync` due to its mutable progress
+/// tracking. Create a new manager for each catchup operation.
 pub struct CatchupManager {
-    /// Available history archives.
+    /// History archives to download from (tried in order with failover).
     archives: Vec<Arc<HistoryArchive>>,
-    /// Bucket manager for bucket operations.
+
+    /// Manager for bucket file storage and retrieval.
     bucket_manager: Arc<BucketManager>,
-    /// Database for persistence.
+
+    /// Database for persisting ledger state and history.
     db: Arc<Database>,
-    /// Current catchup progress.
+
+    /// Current progress information for status reporting.
     progress: CatchupProgress,
-    /// Replay configuration.
+
+    /// Configuration for the replay phase.
     replay_config: ReplayConfig,
 }
 
@@ -140,11 +235,7 @@ impl CatchupManager {
     /// * `archives` - List of history archives to use (will try in order)
     /// * `bucket_manager` - Manager for bucket file operations
     /// * `db` - Database for persisting ledger state
-    pub fn new(
-        archives: Vec<HistoryArchive>,
-        bucket_manager: BucketManager,
-        db: Database,
-    ) -> Self {
+    pub fn new(archives: Vec<HistoryArchive>, bucket_manager: BucketManager, db: Database) -> Self {
         Self {
             archives: archives.into_iter().map(Arc::new).collect(),
             bucket_manager: Arc::new(bucket_manager),
@@ -198,15 +289,25 @@ impl CatchupManager {
         self.progress.target_ledger = target;
 
         // Step 1: Find the latest checkpoint <= target
-        let checkpoint_seq = checkpoint::latest_checkpoint_before_or_at(target)
-            .ok_or_else(|| HistoryError::CatchupFailed(
-                format!("target ledger {} is before first checkpoint", target)
-            ))?;
+        let checkpoint_seq =
+            checkpoint::latest_checkpoint_before_or_at(target).ok_or_else(|| {
+                HistoryError::CatchupFailed(format!(
+                    "target ledger {} is before first checkpoint",
+                    target
+                ))
+            })?;
 
-        info!("Using checkpoint {} for catchup to {}", checkpoint_seq, target);
+        info!(
+            "Using checkpoint {} for catchup to {}",
+            checkpoint_seq, target
+        );
 
         // Step 2: Download the History Archive State
-        self.update_progress(CatchupStatus::DownloadingHAS, 1, "Downloading History Archive State");
+        self.update_progress(
+            CatchupStatus::DownloadingHAS,
+            1,
+            "Downloading History Archive State",
+        );
         let has = self.download_has(checkpoint_seq).await?;
         verify::verify_has_structure(&has)?;
         verify::verify_has_checkpoint(&has, checkpoint_seq)?;
@@ -218,19 +319,32 @@ impl CatchupManager {
         }
 
         // Step 3: Download all buckets referenced in the HAS
-        self.update_progress(CatchupStatus::DownloadingBuckets, 2, "Downloading bucket files");
+        self.update_progress(
+            CatchupStatus::DownloadingBuckets,
+            2,
+            "Downloading bucket files",
+        );
         let bucket_hashes = has.unique_bucket_hashes();
         let buckets_total = bucket_hashes.len() as u32;
         self.progress.buckets_total = buckets_total;
         let buckets = self.download_buckets(&bucket_hashes).await?;
 
         // Step 4: Apply buckets to build initial state
-        self.update_progress(CatchupStatus::ApplyingBuckets, 3, "Applying buckets to build initial state");
-        let (mut bucket_list, mut hot_archive_bucket_list) = self.apply_buckets(&has, &buckets).await?;
+        self.update_progress(
+            CatchupStatus::ApplyingBuckets,
+            3,
+            "Applying buckets to build initial state",
+        );
+        let (mut bucket_list, mut hot_archive_bucket_list) =
+            self.apply_buckets(&has, &buckets).await?;
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         // Step 5: Download ledger data from checkpoint to target
-        self.update_progress(CatchupStatus::DownloadingLedgers, 4, "Downloading ledger data");
+        self.update_progress(
+            CatchupStatus::DownloadingLedgers,
+            4,
+            "Downloading ledger data",
+        );
         let ledger_data = self.download_ledger_data(checkpoint_seq, target).await?;
 
         // Step 6: Verify the header chain
@@ -248,18 +362,28 @@ impl CatchupManager {
 
         let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
             // Catching up to exactly a checkpoint - download and use the checkpoint header
-            info!("Catching up to checkpoint {} (no ledgers to replay)", checkpoint_seq);
+            info!(
+                "Catching up to checkpoint {} (no ledgers to replay)",
+                checkpoint_seq
+            );
             let checkpoint_header = self.download_checkpoint_header(checkpoint_seq).await?;
             let header_hash = verify::compute_header_hash(&checkpoint_header)?;
             (checkpoint_header, header_hash, 0)
         } else {
             // Replay ledgers to reach target
             let final_state = self
-                .replay_ledgers(&mut bucket_list, hot_archive_bucket_list.as_mut(), &ledger_data, network_id)
+                .replay_ledgers(
+                    &mut bucket_list,
+                    hot_archive_bucket_list.as_mut(),
+                    &ledger_data,
+                    network_id,
+                )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
             // Get the final header from replay
-            let final_header = self.download_checkpoint_header(target).await
+            let final_header = self
+                .download_checkpoint_header(target)
+                .await
                 .unwrap_or_else(|_| {
                     // Construct a minimal header from replay state if download fails
                     warn!("Could not download final header, using replay state");
@@ -269,7 +393,9 @@ impl CatchupManager {
         };
 
         // Verify the final state matches expected bucket list hash
-        if let Err(e) = self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list) {
+        if let Err(e) =
+            self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)
+        {
             warn!("Final state verification warning: {}", e);
             // Don't fail on verification mismatch during catchup
             // as the bucket list may not be fully updated yet
@@ -310,12 +436,13 @@ impl CatchupManager {
         info!("Starting catchup to ledger {} with checkpoint data", target);
         self.progress.target_ledger = target;
 
-        let checkpoint_seq = checkpoint::latest_checkpoint_before_or_at(target).ok_or_else(|| {
-            HistoryError::CatchupFailed(format!(
-                "target ledger {} is before first checkpoint",
-                target
-            ))
-        })?;
+        let checkpoint_seq =
+            checkpoint::latest_checkpoint_before_or_at(target).ok_or_else(|| {
+                HistoryError::CatchupFailed(format!(
+                    "target ledger {} is before first checkpoint",
+                    target
+                ))
+            })?;
 
         if data.has.current_ledger != checkpoint_seq {
             return Err(HistoryError::CatchupFailed(format!(
@@ -420,7 +547,12 @@ impl CatchupManager {
             (checkpoint_header, header_hash, 0)
         } else {
             let final_state = self
-                .replay_ledgers(&mut bucket_list, hot_archive_bucket_list.as_mut(), &ledger_data, network_id)
+                .replay_ledgers(
+                    &mut bucket_list,
+                    hot_archive_bucket_list.as_mut(),
+                    &ledger_data,
+                    network_id,
+                )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
             let final_header = data
@@ -432,7 +564,9 @@ impl CatchupManager {
             (final_header, final_state.ledger_hash, ledgers_applied)
         };
 
-        if let Err(e) = self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list) {
+        if let Err(e) =
+            self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)
+        {
             warn!("Final state verification warning: {}", e);
         }
 
@@ -461,7 +595,10 @@ impl CatchupManager {
         self.progress.status = status;
         self.progress.current_step = step;
         self.progress.message = message.to_string();
-        debug!("Catchup progress: step {}/{} - {}", step, self.progress.total_steps, message);
+        debug!(
+            "Catchup progress: step {}/{} - {}",
+            step, self.progress.total_steps, message
+        );
     }
 
     /// Download the History Archive State for a checkpoint.
@@ -470,7 +607,11 @@ impl CatchupManager {
             match archive.get_checkpoint_has(checkpoint_seq).await {
                 Ok(has) => return Ok(has),
                 Err(e) => {
-                    warn!("Failed to download HAS from archive {}: {}", archive.base_url(), e);
+                    warn!(
+                        "Failed to download HAS from archive {}: {}",
+                        archive.base_url(),
+                        e
+                    );
                     continue;
                 }
             }
@@ -512,10 +653,7 @@ impl CatchupManager {
     /// This pre-downloads buckets to disk (not memory) so apply_buckets can
     /// load them quickly. Uses parallel downloads for speed while keeping
     /// memory usage low by saving directly to disk.
-    async fn download_buckets(
-        &mut self,
-        hashes: &[Hash256],
-    ) -> Result<Vec<(Hash256, Vec<u8>)>> {
+    async fn download_buckets(&mut self, hashes: &[Hash256]) -> Result<Vec<(Hash256, Vec<u8>)>> {
         use futures::stream::{self, StreamExt};
 
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
@@ -537,10 +675,7 @@ impl CatchupManager {
         self.progress.buckets_total = hashes.len() as u32;
 
         if to_download.is_empty() {
-            info!(
-                "All {} buckets already cached on disk",
-                hashes.len()
-            );
+            info!("All {} buckets already cached on disk", hashes.len());
             return Ok(Vec::new());
         }
 
@@ -575,15 +710,13 @@ impl CatchupManager {
                                     warn!("Failed to save bucket {} to disk: {}", hash, e);
                                     continue;
                                 }
-                                let count = downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                let count = downloaded
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
                                 if count % 5 == 0 || count == total_to_download as u32 {
                                     info!("Downloaded {}/{} buckets", count, total_to_download);
                                 }
-                                debug!(
-                                    "Pre-downloaded bucket {} ({} bytes)",
-                                    hash,
-                                    data.len()
-                                );
+                                debug!("Pre-downloaded bucket {} ({} bytes)", hash, data.len());
                                 return Ok(());
                             }
                             Err(e) => {
@@ -611,10 +744,7 @@ impl CatchupManager {
         }
 
         self.progress.buckets_downloaded = hashes.len() as u32;
-        info!(
-            "Pre-downloaded all {} buckets to disk",
-            total_to_download
-        );
+        info!("Pre-downloaded all {} buckets to disk", total_to_download);
 
         // Return empty - buckets are on disk, not in memory
         Ok(Vec::new())
@@ -627,7 +757,12 @@ impl CatchupManager {
             match archive.get_bucket(hash).await {
                 Ok(data) => return Ok(data),
                 Err(e) => {
-                    warn!("Failed to download bucket {} from archive {}: {}", hash, archive.base_url(), e);
+                    warn!(
+                        "Failed to download bucket {} from archive {}: {}",
+                        hash,
+                        archive.base_url(),
+                        e
+                    );
                     continue;
                 }
             }
@@ -820,9 +955,7 @@ impl CatchupManager {
                 let snap_hash = snap.unwrap_or(Hash256::ZERO);
                 info!(
                     "HAS level {} hashes: curr={}, snap={}",
-                    level_idx,
-                    curr_hash,
-                    snap_hash
+                    level_idx, curr_hash, snap_hash
                 );
                 live_hashes.push(curr_hash);
                 live_hashes.push(snap_hash);
@@ -834,14 +967,13 @@ impl CatchupManager {
         }
 
         // Restore the live bucket list
-        let bucket_list = BucketList::restore_from_hashes(&live_hashes, load_bucket)
-            .map_err(|e| HistoryError::CatchupFailed(format!("Failed to restore live bucket list: {}", e)))?;
+        let bucket_list =
+            BucketList::restore_from_hashes(&live_hashes, load_bucket).map_err(|e| {
+                HistoryError::CatchupFailed(format!("Failed to restore live bucket list: {}", e))
+            })?;
 
         // Log the restored bucket list hash
-        info!(
-            "Live bucket list restored hash: {}",
-            bucket_list.hash()
-        );
+        info!("Live bucket list restored hash: {}", bucket_list.hash());
         info!(
             "Live bucket list restored: {} total entries",
             bucket_list.stats().total_entries
@@ -875,7 +1007,12 @@ impl CatchupManager {
             }
 
             let hot_bucket_list = BucketList::restore_from_hashes(&hot_hashes, load_bucket)
-                .map_err(|e| HistoryError::CatchupFailed(format!("Failed to restore hot archive bucket list: {}", e)))?;
+                .map_err(|e| {
+                    HistoryError::CatchupFailed(format!(
+                        "Failed to restore hot archive bucket list: {}",
+                        e
+                    ))
+                })?;
 
             info!(
                 "Hot archive bucket list restored: {} total entries",
@@ -927,14 +1064,9 @@ impl CatchupManager {
                 checkpoint_cache.insert(checkpoint, downloaded);
             }
 
-            let cache = checkpoint_cache
-                .get(&checkpoint)
-                .ok_or_else(|| {
-                    HistoryError::CatchupFailed(format!(
-                        "missing checkpoint cache for {}",
-                        checkpoint
-                    ))
-                })?;
+            let cache = checkpoint_cache.get(&checkpoint).ok_or_else(|| {
+                HistoryError::CatchupFailed(format!("missing checkpoint cache for {}", checkpoint))
+            })?;
 
             let header = cache
                 .headers
@@ -971,7 +1103,7 @@ impl CatchupManager {
                         // Create empty GeneralizedTransactionSet with proper phases
                         // Phase 0: empty classic phase (V0 with no components)
                         // Phase 1: empty soroban phase (V1 with no stages)
-                        use stellar_xdr::curr::{TransactionPhase, ParallelTxsComponent, VecM};
+                        use stellar_xdr::curr::{ParallelTxsComponent, TransactionPhase, VecM};
 
                         // Empty classic phase (no components)
                         let classic_phase = TransactionPhase::V0(VecM::default());
@@ -981,12 +1113,14 @@ impl CatchupManager {
                             execution_stages: VecM::default(),
                         });
 
-                        TransactionSetVariant::Generalized(
-                            GeneralizedTransactionSet::V1(TransactionSetV1 {
+                        TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(
+                            TransactionSetV1 {
                                 previous_ledger_hash: header.previous_ledger_hash.clone(),
-                                phases: vec![classic_phase, soroban_phase].try_into().unwrap_or_default(),
-                            })
-                        )
+                                phases: vec![classic_phase, soroban_phase]
+                                    .try_into()
+                                    .unwrap_or_default(),
+                            },
+                        ))
                     } else {
                         TransactionSetVariant::Classic(TransactionSet {
                             previous_ledger_hash: header.previous_ledger_hash.clone(),
@@ -1165,26 +1299,30 @@ impl CatchupManager {
                     let header_xdr = data.header.to_xdr(stellar_xdr::curr::Limits::none())?;
                     conn.store_ledger_header(&data.header, &header_xdr)?;
 
-                    let tx_history_entry = data.tx_history_entry.clone().unwrap_or_else(|| {
-                        match &data.tx_set {
-                            TransactionSetVariant::Classic(set) => TransactionHistoryEntry {
-                                ledger_seq: data.header.ledger_seq,
-                                tx_set: set.clone(),
-                                ext: TransactionHistoryEntryExt::V0,
-                            },
-                            TransactionSetVariant::Generalized(set) => {
-                                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
-                                TransactionHistoryEntry {
+                    let tx_history_entry =
+                        data.tx_history_entry
+                            .clone()
+                            .unwrap_or_else(|| match &data.tx_set {
+                                TransactionSetVariant::Classic(set) => TransactionHistoryEntry {
                                     ledger_seq: data.header.ledger_seq,
-                                    tx_set: TransactionSet {
-                                        previous_ledger_hash: set_v1.previous_ledger_hash.clone(),
-                                        txs: Default::default(),
-                                    },
-                                    ext: TransactionHistoryEntryExt::V1(set.clone()),
+                                    tx_set: set.clone(),
+                                    ext: TransactionHistoryEntryExt::V0,
+                                },
+                                TransactionSetVariant::Generalized(set) => {
+                                    let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) =
+                                        set;
+                                    TransactionHistoryEntry {
+                                        ledger_seq: data.header.ledger_seq,
+                                        tx_set: TransactionSet {
+                                            previous_ledger_hash: set_v1
+                                                .previous_ledger_hash
+                                                .clone(),
+                                            txs: Default::default(),
+                                        },
+                                        ext: TransactionHistoryEntryExt::V1(set.clone()),
+                                    }
                                 }
-                            }
-                        }
-                    });
+                            });
                     conn.store_tx_history_entry(data.header.ledger_seq, &tx_history_entry)?;
 
                     let tx_result_entry = data.tx_result_entry.clone().unwrap_or_else(|| {
@@ -1221,8 +1359,7 @@ impl CatchupManager {
                         let tx_id = tx_hash.to_hex();
 
                         let tx_body = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
-                        let tx_result_xdr =
-                            tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
+                        let tx_result_xdr = tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
 
                         conn.store_transaction(
                             data.header.ledger_seq,
@@ -1330,7 +1467,9 @@ impl CatchupManager {
                 Err(e) => {
                     warn!(
                         "Failed to download header {} from archive {}: {}",
-                        ledger_seq, archive.base_url(), e
+                        ledger_seq,
+                        archive.base_url(),
+                        e
                     );
                     continue;
                 }
@@ -1367,7 +1506,9 @@ impl CatchupManager {
         // Start at the configured starting level (default: level 6)
         let mut eviction_iterator: Option<EvictionIterator> = if self.replay_config.run_eviction {
             Some(EvictionIterator::new(
-                self.replay_config.eviction_settings.starting_eviction_scan_level,
+                self.replay_config
+                    .eviction_settings
+                    .starting_eviction_scan_level,
             ))
         } else {
             None
@@ -1408,7 +1549,8 @@ impl CatchupManager {
 
             // Update eviction iterator for next ledger
             eviction_iterator = result.eviction_iterator;
-            if let (Some(prev_header), Some(manager)) = (last_header.as_ref(), invariants.as_ref()) {
+            if let (Some(prev_header), Some(manager)) = (last_header.as_ref(), invariants.as_ref())
+            {
                 let full_entries = bucket_list.live_entries()?;
                 let bucket_list_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
                     let mut hasher = sha2::Sha256::new();
@@ -1431,14 +1573,12 @@ impl CatchupManager {
                     full_entries: Some(&full_entries),
                     op_events: None,
                 };
-                manager
-                    .check_all(&ctx)
-                    .map_err(|err| {
-                        HistoryError::CatchupFailed(format!(
-                            "replay invariant failed at ledger {}: {}",
-                            data.header.ledger_seq, err
-                        ))
-                    })?;
+                manager.check_all(&ctx).map_err(|err| {
+                    HistoryError::CatchupFailed(format!(
+                        "replay invariant failed at ledger {}: {}",
+                        data.header.ledger_seq, err
+                    ))
+                })?;
             }
 
             debug!(
@@ -1466,7 +1606,10 @@ impl CatchupManager {
             replay::verify_replay_consistency(&final_header, &bucket_list_hash)?;
         }
 
-        Ok(ReplayedLedgerState::from_header(&final_header, final_result.ledger_hash))
+        Ok(ReplayedLedgerState::from_header(
+            &final_header,
+            final_result.ledger_hash,
+        ))
     }
 }
 
@@ -1627,7 +1770,9 @@ fn create_header_from_replay_state(
     replay_state: &ReplayedLedgerState,
     bucket_list: &BucketList,
 ) -> LedgerHeader {
-    use stellar_xdr::curr::{Hash, StellarValue, StellarValueExt, TimePoint, VecM, LedgerHeaderExt};
+    use stellar_xdr::curr::{
+        Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+    };
 
     LedgerHeader {
         ledger_version: replay_state.protocol_version,

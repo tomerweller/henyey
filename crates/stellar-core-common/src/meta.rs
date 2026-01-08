@@ -1,4 +1,35 @@
 //! Ledger metadata normalization utilities.
+//!
+//! This module provides functions for normalizing ledger close metadata to
+//! enable deterministic hashing. Different validators may produce transaction
+//! metadata with ledger entry changes in different orders, but the final
+//! ledger state should be identical. Normalizing the metadata allows for
+//! consistent hashing across nodes.
+//!
+//! # Why Normalization?
+//!
+//! When a ledger closes, the transaction metadata includes all ledger entry
+//! changes (creates, updates, deletes). The order of these changes may vary
+//! between validators due to implementation differences in map iteration order
+//! or parallel execution. Normalization sorts these changes deterministically
+//! so that the metadata hash is consistent.
+//!
+//! # Sorting Order
+//!
+//! Changes are sorted by:
+//! 1. Ledger entry key (XDR-encoded bytes)
+//! 2. Change type (State, Created, Updated, Removed, Restored)
+//! 3. Full change hash (for stability when keys and types are equal)
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use stellar_core_common::meta::normalize_ledger_close_meta;
+//!
+//! let mut meta = fetch_ledger_close_meta();
+//! normalize_ledger_close_meta(&mut meta)?;
+//! // meta is now in canonical sorted order
+//! ```
 
 use crate::Hash256;
 use stellar_xdr::curr::{
@@ -8,6 +39,10 @@ use stellar_xdr::curr::{
     LedgerKeyTrustLine, LedgerKeyTtl, Limits, TransactionMeta, WriteXdr,
 };
 
+/// Extracts the ledger key from a ledger entry.
+///
+/// The ledger key uniquely identifies an entry in the ledger and is used
+/// for sorting ledger entry changes.
 fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
     match &entry.data {
         LedgerEntryData::Account(account) => LedgerKey::Account(LedgerKeyAccount {
@@ -52,6 +87,7 @@ fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
     }
 }
 
+/// Extracts the ledger key from a ledger entry change.
 fn change_key(change: &LedgerEntryChange) -> LedgerKey {
     match change {
         LedgerEntryChange::State(entry) => ledger_entry_key(entry),
@@ -62,6 +98,9 @@ fn change_key(change: &LedgerEntryChange) -> LedgerKey {
     }
 }
 
+/// Returns a numeric order value for change types to ensure consistent sorting.
+///
+/// Order: State(0) < Created(1) < Updated(2) < Removed(3) < Restored(4)
 fn change_type_order(change: &LedgerEntryChange) -> u8 {
     match change {
         LedgerEntryChange::State(_) => 0,
@@ -72,6 +111,10 @@ fn change_type_order(change: &LedgerEntryChange) -> u8 {
     }
 }
 
+/// Sorts a list of ledger entry changes into canonical order.
+///
+/// Changes are sorted by (key_bytes, change_type, change_hash) to ensure
+/// deterministic ordering regardless of the original order.
 fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::curr::Error> {
     let mut entries: Vec<(Vec<u8>, u8, [u8; 32], LedgerEntryChange)> = changes
         .0
@@ -111,7 +154,15 @@ fn normalize_ops_v2(ops: &mut stellar_xdr::curr::VecM<stellar_xdr::curr::Operati
     }
 }
 
-/// Normalize transaction meta for deterministic hashing.
+/// Normalizes transaction metadata for deterministic hashing.
+///
+/// This sorts all ledger entry changes within the transaction metadata
+/// into canonical order. This ensures that the same transaction will
+/// produce the same metadata hash regardless of execution order.
+///
+/// # Errors
+///
+/// Returns an error if XDR serialization fails during sorting.
 pub fn normalize_transaction_meta(
     meta: &mut TransactionMeta,
 ) -> Result<(), stellar_xdr::curr::Error> {
@@ -142,7 +193,16 @@ pub fn normalize_transaction_meta(
     Ok(())
 }
 
-/// Normalize ledger close meta for deterministic hashing.
+/// Normalizes ledger close metadata for deterministic hashing.
+///
+/// This normalizes all transaction metadata and upgrade metadata within
+/// a ledger close, ensuring consistent ordering across all validators.
+/// After normalization, the metadata can be hashed to produce a consistent
+/// result regardless of the original ordering.
+///
+/// # Errors
+///
+/// Returns an error if XDR serialization fails during sorting.
 pub fn normalize_ledger_close_meta(
     meta: &mut LedgerCloseMeta,
 ) -> Result<(), stellar_xdr::curr::Error> {

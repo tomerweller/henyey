@@ -1,10 +1,30 @@
-//! LedgerManager - Core ledger state management.
+//! Core ledger state management and coordination.
 //!
-//! The LedgerManager is responsible for:
-//! - Managing the current ledger state
-//! - Loading and storing ledger entries
-//! - Coordinating ledger close operations
-//! - Maintaining consistency between bucket list and database
+//! This module provides [`LedgerManager`], the central component for managing
+//! ledger state in rs-stellar-core. It coordinates between multiple subsystems
+//! to ensure consistent state transitions during ledger close.
+//!
+//! # Responsibilities
+//!
+//! The [`LedgerManager`] is responsible for:
+//!
+//! - **State Management**: Maintaining the current ledger header and entry cache
+//! - **Bucket List Integration**: Updating the Merkle tree of ledger entries
+//! - **Transaction Execution**: Coordinating transaction processing via [`LedgerCloseContext`]
+//! - **Invariant Validation**: Enforcing ledger invariants on every close
+//! - **Snapshot Management**: Providing consistent point-in-time views for queries
+//!
+//! # Thread Safety
+//!
+//! The [`LedgerManager`] uses internal locking (`RwLock`) to allow concurrent
+//! reads while serializing writes. Multiple threads can safely query the current
+//! state while ledger close operations are serialized.
+//!
+//! # Hot Archive Support
+//!
+//! Starting with Protocol 23, the manager supports a hot archive bucket list
+//! for state archival. This stores archived/evicted entries separately from
+//! the live bucket list, and both contribute to the header's bucket list hash.
 
 use crate::{
     close::{LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext},
@@ -71,25 +91,54 @@ fn prepend_fee_event(
     }
 }
 
-/// Configuration for the LedgerManager.
+/// Configuration options for the [`LedgerManager`].
+///
+/// This struct controls various aspects of ledger processing behavior,
+/// including validation, persistence, and event emission.
+///
+/// # Defaults
+///
+/// The default configuration enables all validation and persistence,
+/// which is appropriate for production use. For testing, you may want
+/// to disable certain validations for faster execution.
 #[derive(Debug, Clone)]
 pub struct LedgerManagerConfig {
-    /// Maximum number of snapshots to retain.
+    /// Maximum number of historical snapshots to retain.
+    ///
+    /// Older snapshots are automatically pruned when this limit is exceeded.
+    /// Set to 0 to disable snapshot retention (not recommended for production).
     pub max_snapshots: usize,
 
-    /// Whether to validate bucket list hashes.
+    /// Whether to validate bucket list hashes against header values.
+    ///
+    /// When enabled, the computed bucket list hash is verified against the
+    /// expected hash in the ledger header. Disable for replay-only scenarios
+    /// where hash verification is not needed.
     pub validate_bucket_hash: bool,
 
-    /// Whether to validate invariants on ledger close.
+    /// Whether to validate ledger invariants on every close.
+    ///
+    /// Invariants include conservation of lumens, valid entry states,
+    /// and consistent sub-entry counts. Disable for performance in
+    /// trusted replay scenarios.
     pub validate_invariants: bool,
 
-    /// Whether to persist to database.
+    /// Whether to persist ledger state to the database.
+    ///
+    /// When enabled, ledger headers and other metadata are written to
+    /// the database after each close. Disable for in-memory-only operation.
     pub persist_to_db: bool,
 
-    /// Whether to emit classic contract events.
+    /// Whether to emit classic (non-Soroban) contract events.
+    ///
+    /// When enabled, SAC (Stellar Asset Contract) events are generated
+    /// for classic operations like payments and trustline changes.
     pub emit_classic_events: bool,
 
-    /// Whether to backfill Stellar asset events pre-protocol 23.
+    /// Whether to backfill Stellar Asset events for pre-protocol 23 ledgers.
+    ///
+    /// When enabled during catchup, classic events are generated for
+    /// historical ledgers that predate native event support.
     pub backfill_stellar_asset_events: bool,
 }
 
@@ -107,56 +156,98 @@ impl Default for LedgerManagerConfig {
 }
 
 /// Internal state of the ledger manager.
+///
+/// This struct holds the mutable state that changes with each ledger close.
+/// It is protected by an RwLock for thread-safe access.
 struct LedgerState {
-    /// Current ledger header.
+    /// Current ledger header (the most recently closed ledger).
     header: LedgerHeader,
 
-    /// Hash of the current header.
+    /// SHA-256 hash of the current header's XDR encoding.
     header_hash: Hash256,
 
-    /// Whether the ledger has been initialized.
+    /// Whether the ledger manager has been initialized.
+    ///
+    /// The manager must be initialized (via `initialize_from_buckets` or
+    /// by loading from database) before ledger close operations can begin.
     initialized: bool,
 }
 
-/// The core ledger manager.
+/// The core ledger manager for rs-stellar-core.
 ///
-/// This manages all ledger state, coordinating between:
-/// - In-memory state cache
-/// - Bucket list for Merkle tree integrity
-/// - Database for persistence
+/// `LedgerManager` is the central coordinator for all ledger state operations.
+/// It manages the lifecycle of ledger closes, from receiving externalized
+/// transaction sets to committing the new ledger state.
+///
+/// # Architecture
+///
+/// The manager coordinates between several subsystems:
+///
+/// - **Bucket List**: The Merkle tree of all ledger entries, providing
+///   cryptographic integrity for the state
+/// - **Entry Cache**: In-memory cache of recently accessed entries for
+///   fast lookups during transaction processing
+/// - **Database**: Persistent storage for ledger headers and metadata
+/// - **Invariant Manager**: Validates ledger state consistency
+/// - **Snapshot Manager**: Provides point-in-time views for concurrent access
+///
+/// # Initialization
+///
+/// Before use, the manager must be initialized via one of:
+///
+/// - [`initialize_from_buckets`](Self::initialize_from_buckets): For catchup from history archives
+/// - [`reinitialize_from_buckets`](Self::reinitialize_from_buckets): For re-syncing after falling behind
+///
+/// # Ledger Close Flow
+///
+/// 1. Call [`begin_close`](Self::begin_close) with the externalized data
+/// 2. Use the returned [`LedgerCloseContext`] to apply transactions
+/// 3. Call [`commit`](LedgerCloseContext::commit) to finalize the ledger
+///
+/// # Thread Safety
+///
+/// All public methods are safe to call from multiple threads. Internal state
+/// is protected by RwLocks to allow concurrent reads during ledger processing.
 pub struct LedgerManager {
-    /// Database for persistence.
+    /// Database handle for persistent storage.
     db: Database,
 
-    /// Bucket manager for bucket list operations.
+    /// Bucket manager for bucket file operations.
     #[allow(dead_code)]
     bucket_manager: Arc<BucketManager>,
 
-    /// Bucket list for ledger state (wrapped in Arc for sharing with snapshots).
+    /// Live bucket list containing all current ledger entries.
+    ///
+    /// Wrapped in Arc for efficient sharing with snapshots.
     bucket_list: Arc<RwLock<BucketList>>,
 
-    /// Hot archive bucket list for Protocol 23+ (stores archived/evicted entries).
+    /// Hot archive bucket list for Protocol 23+ state archival.
+    ///
+    /// Contains archived/evicted entries. When present, its hash is combined
+    /// with the live bucket list hash for the header's bucket_list_hash.
     hot_archive_bucket_list: Arc<RwLock<Option<BucketList>>>,
 
-    /// Network passphrase for transaction signing.
+    /// Network passphrase (e.g., "Public Global Stellar Network ; September 2015").
     network_passphrase: String,
 
-    /// Network ID derived from passphrase.
+    /// Network ID derived from SHA-256 of the passphrase.
     network_id: NetworkId,
 
-    /// Current ledger state.
+    /// Current mutable ledger state.
     state: RwLock<LedgerState>,
 
-    /// In-memory entry cache.
+    /// In-memory cache of recently accessed ledger entries.
+    ///
+    /// Keys are XDR-encoded LedgerKey bytes.
     entry_cache: RwLock<HashMap<Vec<u8>, LedgerEntry>>,
 
-    /// Snapshot manager.
+    /// Manager for point-in-time snapshots.
     snapshots: SnapshotManager,
 
-    /// Invariant manager.
+    /// Manager for ledger invariant validation.
     invariants: RwLock<InvariantManager>,
 
-    /// Configuration.
+    /// Configuration options.
     config: LedgerManagerConfig,
 }
 
@@ -740,23 +831,59 @@ impl LedgerManager {
     }
 }
 
-/// Statistics about the ledger manager.
+/// Runtime statistics about the ledger manager.
+///
+/// Use [`LedgerManager::stats`] to obtain current statistics for monitoring
+/// and debugging purposes.
 #[derive(Debug, Clone)]
 pub struct LedgerManagerStats {
-    /// Current ledger sequence.
+    /// Current ledger sequence number.
     pub ledger_seq: u32,
 
-    /// Number of entries in cache.
+    /// Number of entries currently in the in-memory cache.
+    ///
+    /// A high value may indicate memory pressure; consider tuning cache
+    /// eviction if this grows unbounded.
     pub cached_entries: usize,
 
-    /// Number of active snapshots.
+    /// Number of active point-in-time snapshots.
+    ///
+    /// Snapshots are retained for historical queries and are automatically
+    /// pruned based on the configured maximum.
     pub active_snapshots: usize,
 }
 
-/// Context for closing a ledger.
+/// Context for closing a single ledger.
 ///
-/// This is returned by `LedgerManager::begin_close()` and provides
-/// methods for applying transactions and committing the ledger.
+/// This struct is returned by [`LedgerManager::begin_close`] and provides
+/// the interface for processing transactions and finalizing the ledger.
+///
+/// # Lifecycle
+///
+/// 1. **Created**: Obtained from `LedgerManager::begin_close()`
+/// 2. **Transaction Processing**: Call [`apply_transactions`](Self::apply_transactions)
+///    to execute the transaction set
+/// 3. **Finalization**: Either [`commit`](Self::commit) to finalize or
+///    [`abort`](Self::abort) to discard changes
+///
+/// # State Isolation
+///
+/// The context holds a snapshot of the ledger state at the time of creation.
+/// All reads during transaction processing see this consistent snapshot,
+/// while writes are accumulated in a [`LedgerDelta`] until commit.
+///
+/// # Example
+///
+/// ```ignore
+/// let mut ctx = manager.begin_close(close_data)?;
+///
+/// // Apply all transactions from the set
+/// let results = ctx.apply_transactions()?;
+///
+/// // Check results and commit
+/// let close_result = ctx.commit()?;
+/// println!("Closed ledger {}", close_result.ledger_seq());
+/// ```
 pub struct LedgerCloseContext<'a> {
     manager: &'a LedgerManager,
     close_data: LedgerCloseData,

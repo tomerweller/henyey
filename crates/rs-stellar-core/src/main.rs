@@ -4,20 +4,56 @@
 //! validator node, catching up from history archives, and performing other
 //! Stellar network operations.
 //!
-//! ## Usage
+//! # Quick Start
 //!
-//! ```text
-//! rs-stellar-core run                     # Run the node
-//! rs-stellar-core catchup current         # Catch up to latest ledger
-//! rs-stellar-core catchup 1000000         # Catch up to specific ledger
-//! rs-stellar-core new-db                  # Create a new database
-//! rs-stellar-core info                    # Print node information
+//! ```bash
+//! # Run a node on testnet (default)
+//! rs-stellar-core --testnet run
+//!
+//! # Catch up to the latest ledger
+//! rs-stellar-core --testnet catchup current
+//!
+//! # Generate a new keypair
+//! rs-stellar-core new-keypair
 //! ```
 //!
-//! ## Configuration
+//! # Commands
 //!
-//! Configuration can be provided via a TOML file or environment variables.
-//! See `rs-stellar-core --help` for more details.
+//! The CLI provides the following main commands:
+//!
+//! - **run**: Start the node (as watcher, full node, or validator)
+//! - **catchup**: Catch up from history archives to a specific ledger
+//! - **new-db**: Create a new database
+//! - **upgrade-db**: Upgrade database schema
+//! - **new-keypair**: Generate a new node keypair
+//! - **info**: Print node information
+//! - **verify-history**: Verify history archives
+//! - **publish-history**: Publish history to archives (validators only)
+//! - **check-quorum-intersection**: Verify quorum intersection from JSON
+//! - **sample-config**: Print sample configuration
+//! - **offline**: Offline utilities (XDR tools, replay testing)
+//!
+//! # Configuration
+//!
+//! Configuration can be provided via:
+//! - A TOML configuration file (`--config <FILE>`)
+//! - Built-in network defaults (`--testnet` or `--mainnet`)
+//! - Environment variables (prefixed with `STELLAR_`)
+//!
+//! See `rs-stellar-core sample-config` for an example configuration.
+//!
+//! # Architecture
+//!
+//! This crate is a thin CLI wrapper around the [`stellar_core_app`] crate,
+//! which contains the core application logic. The CLI handles:
+//!
+//! - Argument parsing with `clap`
+//! - Configuration loading and merging
+//! - Logging initialization
+//! - Command dispatch
+//!
+//! The actual node implementation, catchup logic, and subsystem coordination
+//! are handled by the underlying library crates.
 
 mod quorum_intersection;
 
@@ -1123,6 +1159,10 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     Ok(())
 }
 
+/// Builds SCP history entries for a checkpoint range from the database.
+///
+/// Collects SCP envelopes and quorum sets for each ledger in the range,
+/// packaging them into the format required for history archive publishing.
 fn build_scp_history_entries(
     db: &stellar_core_db::Database,
     start_ledger: u32,
@@ -1176,6 +1216,9 @@ fn build_scp_history_entries(
     Ok(entries)
 }
 
+/// Writes SCP history entries to a gzip-compressed XDR file.
+///
+/// Creates the file at the standard history archive path for SCP data.
 fn write_scp_history_file(
     base_dir: &std::path::Path,
     checkpoint: u32,
@@ -1202,6 +1245,9 @@ fn write_scp_history_file(
     Ok(())
 }
 
+/// Extracts the quorum set hash from an SCP statement.
+///
+/// Different SCP pledge types store the quorum set hash in different fields.
 fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> Option<stellar_xdr::curr::Hash> {
     match &statement.pledges {
         stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => {
@@ -1219,13 +1265,21 @@ fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> Option<st
     }
 }
 
+/// Configuration for publishing to a remote archive via shell commands.
 #[derive(Clone)]
 struct CommandArchiveTarget {
+    /// Human-readable name for the archive.
     name: String,
+    /// Shell command template for uploading files ({0} = local path, {1} = remote path).
     put: String,
+    /// Optional shell command template for creating directories ({0} = remote dir).
     mkdir: Option<String>,
 }
 
+/// Uploads a local publish directory to a remote archive using shell commands.
+///
+/// Iterates through all files in the directory, creating remote directories
+/// as needed, then uploads each file using the configured put command.
 fn upload_publish_directory(
     target: &CommandArchiveTarget,
     publish_dir: &std::path::Path,
@@ -1261,6 +1315,7 @@ fn upload_publish_directory(
     Ok(())
 }
 
+/// Recursively collects all files under a directory.
 fn collect_files(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1280,6 +1335,7 @@ fn collect_files(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBu
     Ok(files)
 }
 
+/// Converts a path to a Unix-style string with forward slashes.
 fn path_to_unix_string(path: &std::path::Path) -> anyhow::Result<String> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -1289,16 +1345,19 @@ fn path_to_unix_string(path: &std::path::Path) -> anyhow::Result<String> {
     Ok(parts.join("/"))
 }
 
+/// Renders a put command template with local and remote paths.
 fn render_put_command(template: &str, local_path: &std::path::Path, remote_path: &str) -> String {
     template
         .replace("{0}", local_path.to_string_lossy().as_ref())
         .replace("{1}", remote_path)
 }
 
+/// Renders a mkdir command template with the remote directory.
 fn render_mkdir_command(template: &str, remote_dir: &str) -> String {
     template.replace("{0}", remote_dir)
 }
 
+/// Executes a shell command and returns an error if it fails.
 fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
     use std::process::Command;
 
@@ -1310,12 +1369,29 @@ fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Replay bucket list test - validates bucket list implementation using CDP metadata.
+/// Replays bucket list changes from CDP metadata to validate our implementation.
 ///
 /// This test takes the exact ledger entry changes from CDP (what C++ stellar-core produced)
 /// and applies them to our bucket list implementation. This isolates bucket list testing
-/// from transaction execution, allowing us to verify spill timing, merge logic, and hash
-/// computation independently.
+/// from transaction execution, allowing us to verify:
+///
+/// - **Spill timing**: When entries move from level N to level N+1
+/// - **Merge logic**: How entries are combined during level merges
+/// - **Hash computation**: Final bucket list hash calculation
+///
+/// The test downloads the bucket list state at a checkpoint, then replays each
+/// ledger's changes and compares the resulting hash against the expected hash
+/// from history.
+///
+/// # Arguments
+///
+/// * `config` - Application configuration with history archive URLs
+/// * `from` - Start ledger sequence (defaults to recent checkpoint)
+/// * `to` - End ledger sequence (defaults to latest available)
+/// * `stop_on_error` - Stop immediately on first hash mismatch
+/// * `live_only` - Only test live bucket list (ignore hot archive)
+/// * `cdp_url` - CDP data lake URL
+/// * `cdp_date` - CDP date partition
 async fn cmd_replay_bucket_list(
     config: AppConfig,
     from: Option<u32>,
@@ -1594,11 +1670,35 @@ async fn cmd_replay_bucket_list(
     Ok(())
 }
 
-/// Verify transaction execution by comparing our results against CDP metadata.
+/// Verifies transaction execution by comparing results against CDP metadata.
 ///
 /// This test re-executes transactions and compares the resulting ledger entry changes
 /// against what C++ stellar-core produced (from CDP). Differences indicate execution
-/// divergence that needs investigation (e.g., Soroban host differences).
+/// divergence that needs investigation.
+///
+/// The verification process:
+///
+/// 1. Restores bucket list state from a checkpoint before the test range
+/// 2. For each ledger, executes transactions using our implementation
+/// 3. Compares the resulting ledger entry changes against CDP metadata
+/// 4. Reports any mismatches in detail
+///
+/// This is useful for debugging:
+///
+/// - **Soroban host differences**: Different contract execution results
+/// - **Classic operation differences**: Account balance, trustline, or offer issues
+/// - **Fee calculation differences**: Incorrect fee charging or refunds
+/// - **TTL/expiration differences**: State archival timing issues
+///
+/// # Arguments
+///
+/// * `config` - Application configuration with history archive URLs
+/// * `from` - Start ledger sequence (defaults to recent checkpoint)
+/// * `to` - End ledger sequence (defaults to latest available)
+/// * `stop_on_error` - Stop immediately on first mismatch
+/// * `show_diff` - Show detailed diff of mismatched entries
+/// * `cdp_url` - CDP data lake URL
+/// * `cdp_date` - CDP date partition
 async fn cmd_verify_execution(
     config: AppConfig,
     from: Option<u32>,
@@ -2229,7 +2329,17 @@ async fn cmd_verify_execution(
     Ok(())
 }
 
-/// Debug command to inspect a specific account in the bucket list at a checkpoint.
+/// Inspects a specific account entry in the bucket list at a checkpoint.
+///
+/// This debugging tool shows all occurrences of an account across all bucket
+/// levels, helping diagnose issues like shadowed entries or incorrect lookups.
+/// It displays both the normal lookup result and a full scan across all buckets.
+///
+/// # Arguments
+///
+/// * `config` - Application configuration with history archive URLs
+/// * `checkpoint_seq` - Checkpoint ledger sequence to inspect
+/// * `account_hex` - Account public key as 64-character hex string
 async fn cmd_debug_bucket_entry(
     config: AppConfig,
     checkpoint_seq: u32,
@@ -2393,8 +2503,14 @@ fn extract_upgrade_changes(
     Ok((init_entries, live_entries, dead_entries))
 }
 
-/// Convert a LedgerEntryChange to a sortable key for order-independent comparison.
-/// Returns (change_type_order, key_xdr) for canonical sorting.
+/// Converts a `LedgerEntryChange` to a sortable key for order-independent comparison.
+///
+/// Returns `(change_type_order, key_xdr)` where:
+/// - `change_type_order` is 0=State, 1=Created, 2=Updated, 3=Removed, 4=Restored
+/// - `key_xdr` is the XDR-serialized ledger key
+///
+/// This enables consistent sorting since C++ stellar-core uses UnorderedMap with
+/// a random hash mixer, producing non-deterministic ordering across runs.
 fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (u8, Vec<u8>) {
     use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, WriteXdr, Limits};
 
@@ -2474,11 +2590,17 @@ fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (u8, Vec<u8
     }
 }
 
-/// Compare two lists of ledger entry changes in an order-independent manner.
+/// Compares two lists of ledger entry changes in an order-independent manner.
+///
 /// C++ stellar-core's UnorderedMap uses RandHasher with a random gMixer per process,
 /// so metadata entry ordering is non-deterministic between different runs.
 /// This comparison sorts changes by (type, key) before comparing.
-/// Returns (matches, differences) where differences contains descriptions of mismatches.
+///
+/// # Returns
+///
+/// `(matches, differences)` where:
+/// - `matches` is true if the lists are semantically equivalent
+/// - `differences` contains descriptions of any mismatches
 fn compare_entry_changes(
     our_changes: &[stellar_xdr::curr::LedgerEntryChange],
     cdp_changes: &[stellar_xdr::curr::LedgerEntryChange],
@@ -2948,7 +3070,12 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
     }
 }
 
-/// Convert a Stellar key between formats.
+/// Converts Stellar keys between formats.
+///
+/// Handles the following formats:
+/// - `G...` - Public key (strkey) -> displays hex
+/// - `S...` - Secret seed (strkey) -> displays public key (not raw secret)
+/// - 64 hex chars - Hex public key -> displays strkey
 fn convert_key(key: &str) -> anyhow::Result<()> {
     let key = key.trim();
 
@@ -2984,7 +3111,9 @@ fn convert_key(key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decode XDR from base64.
+/// Decodes XDR from base64 and prints it in debug format.
+///
+/// Supports: LedgerHeader, TransactionEnvelope, TransactionResult
 fn decode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use stellar_xdr::curr::ReadXdr;
@@ -3013,7 +3142,10 @@ fn decode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Encode a value to XDR.
+/// Encodes a value to XDR and prints it as base64.
+///
+/// Supports: LedgerHeader, TransactionEnvelope, TransactionResult,
+/// AccountId, MuxedAccount, Asset, Hash, Uint256
 fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use stellar_xdr::curr::{WriteXdr, Limits};
@@ -3124,7 +3256,10 @@ fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print bucket information.
+/// Prints information about bucket files.
+///
+/// If given a directory, lists all bucket files with their sizes.
+/// If given a single file, prints its metadata.
 fn bucket_info(path: &PathBuf) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("Bucket path does not exist: {}", path.display());
@@ -3166,7 +3301,10 @@ fn bucket_info(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check quorum intersection from JSON.
+/// Checks quorum intersection from a JSON network configuration.
+///
+/// Loads the quorum set definitions and verifies that the network enjoys
+/// quorum intersection (all quorums share at least one node).
 fn cmd_check_quorum_intersection(path: &PathBuf) -> anyhow::Result<()> {
     let enjoys = quorum_intersection::check_quorum_intersection_from_json(path.as_path())?;
     if enjoys {

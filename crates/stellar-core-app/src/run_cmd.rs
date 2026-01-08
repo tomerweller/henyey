@@ -1,20 +1,44 @@
 //! Run command implementation for rs-stellar-core.
 //!
 //! The run command starts the node and keeps it synchronized with the network.
-//! It handles:
+//! This is the primary operational mode for a Stellar Core node.
 //!
-//! - Initial catchup if necessary
-//! - Peer connections and message handling
-//! - Consensus tracking (or participation for validators)
-//! - Ledger close and state updates
+//! # Responsibilities
 //!
-//! ## Usage
+//! The run command handles:
+//! - **Catchup**: Automatically catching up from history if the node is behind
+//! - **Peer Management**: Connecting to peers and handling disconnections
+//! - **Consensus**: Tracking SCP consensus (or participating for validators)
+//! - **Ledger Close**: Applying externalized ledgers to update state
+//! - **HTTP API**: Serving status and control endpoints
+//!
+//! # Command Line Usage
 //!
 //! ```text
 //! rs-stellar-core run                    # Run as a full node
 //! rs-stellar-core run --validator        # Run as a validator
 //! rs-stellar-core run --watcher          # Run as a watcher (no catchup)
 //! ```
+//!
+//! # Running Modes
+//!
+//! | Mode | Description | Consensus Role |
+//! |------|-------------|----------------|
+//! | `Full` | Standard node with catchup | Tracks consensus |
+//! | `Validator` | Active consensus participant | Votes in SCP |
+//! | `Watcher` | Observe-only, no catchup | Passive observer |
+//!
+//! # HTTP Status Server
+//!
+//! When enabled, the [`StatusServer`] provides REST endpoints for monitoring
+//! and control. Key endpoints include:
+//!
+//! - `GET /info` - Node information and version
+//! - `GET /metrics` - Prometheus-format metrics
+//! - `GET /peers` - Connected peer list
+//! - `GET /ledger` - Current ledger state
+//! - `POST /tx` - Submit transactions
+//! - `POST /shutdown` - Graceful shutdown
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,15 +65,27 @@ use tokio::sync::broadcast;
 use crate::app::{App, AppState, CatchupTarget, SurveyReport};
 use crate::config::AppConfig;
 
-/// Node running mode.
+/// Node running mode determining behavior and consensus participation.
+///
+/// The mode affects whether the node catches up from history, participates
+/// in consensus, and how aggressively it maintains synchronization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunMode {
-    /// Full node: catch up, sync, and track consensus.
+    /// Full node: catches up from history and tracks consensus.
+    ///
+    /// This is the default mode suitable for most use cases. The node
+    /// maintains full ledger state and can serve queries.
     #[default]
     Full,
-    /// Validator: participate in consensus.
+    /// Validator: actively participates in SCP consensus.
+    ///
+    /// Requires a valid `node_seed` and properly configured quorum set.
+    /// The node will vote on ledger values and sign SCP messages.
     Validator,
-    /// Watcher: observe only, no catchup.
+    /// Watcher: observe-only mode without catchup.
+    ///
+    /// Useful for monitoring the network without maintaining full state.
+    /// The node connects to peers but does not sync from history.
     Watcher,
 }
 
@@ -63,16 +99,21 @@ impl std::fmt::Display for RunMode {
     }
 }
 
-/// Options for the run command.
+/// Configuration options for the run command.
+///
+/// Controls the running mode, synchronization behavior, and catchup policy.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
-    /// Running mode.
+    /// Running mode (full, validator, or watcher).
     pub mode: RunMode,
-    /// Whether to force catchup even if state exists.
+    /// Force catchup even if local state exists.
     pub force_catchup: bool,
-    /// Wait for catchup to complete before starting.
+    /// Block until the node is fully synced before returning from run.
     pub wait_for_sync: bool,
-    /// Maximum ledger age before forcing catchup.
+    /// Maximum ledger age (in ledgers) before triggering automatic catchup.
+    ///
+    /// If the local ledger is more than this many ledgers behind, catchup
+    /// will be triggered. Default is 300 (~25 minutes at 5s close time).
     pub max_ledger_age: u32,
 }
 
@@ -309,22 +350,25 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// Node metrics and status.
+/// Current node status and metrics.
+///
+/// Provides a snapshot of the node's operational state, useful for
+/// monitoring and health checks. Available via the `/status` HTTP endpoint.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NodeStatus {
-    /// Current ledger sequence.
+    /// Current ledger sequence number.
     pub ledger_seq: u32,
-    /// Current ledger hash.
+    /// Hash of the current ledger header (hex-encoded).
     pub ledger_hash: Option<String>,
-    /// Number of connected peers.
+    /// Number of currently connected peers.
     pub peer_count: usize,
-    /// Current consensus state.
+    /// Current SCP consensus state (e.g., "tracking", "synced").
     pub consensus_state: String,
-    /// Transactions in the pending queue.
+    /// Number of transactions in the pending queue.
     pub pending_tx_count: usize,
-    /// Uptime in seconds.
+    /// Node uptime in seconds since startup.
     pub uptime_secs: u64,
-    /// Application state.
+    /// Current application state (see [`AppState`]).
     pub state: String,
 }
 
@@ -344,7 +388,24 @@ impl std::fmt::Display for NodeStatus {
     }
 }
 
-/// Node runner that manages the run lifecycle.
+/// High-level node runner that manages the complete run lifecycle.
+///
+/// Wraps an [`App`] instance and provides a simpler interface for running
+/// the node. Handles startup, shutdown coordination, and status queries.
+///
+/// # Example
+///
+/// ```no_run
+/// use stellar_core_app::{AppConfig, RunOptions};
+/// use stellar_core_app::run_cmd::NodeRunner;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let config = AppConfig::testnet();
+/// let runner = NodeRunner::new(config, RunOptions::default()).await?;
+/// runner.run().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct NodeRunner {
     app: Arc<App>,
     options: RunOptions,

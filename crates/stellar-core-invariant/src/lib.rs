@@ -1,4 +1,80 @@
-//! Invariant framework for rs-stellar-core.
+//! Invariant framework for validating ledger state transitions in rs-stellar-core.
+//!
+//! This crate provides a comprehensive framework for defining and executing invariant checks
+//! that validate the correctness of ledger state transitions during ledger close operations.
+//! Invariants are pure validation functions that verify properties that must hold true
+//! after every ledger transition.
+//!
+//! # Overview
+//!
+//! The invariant framework consists of three main components:
+//!
+//! 1. **[`Invariant`] trait**: The core abstraction that all invariants implement. Each invariant
+//!    has a name, a check function, and a strictness level.
+//!
+//! 2. **[`InvariantManager`]**: A registry that holds multiple invariants and runs them all
+//!    against an [`InvariantContext`] during ledger close.
+//!
+//! 3. **[`InvariantContext`]**: The context passed to invariants containing all information
+//!    needed for validation, including previous/current headers, entry changes, and deltas.
+//!
+//! # Strictness Levels
+//!
+//! Invariants can be either strict or non-strict:
+//!
+//! - **Strict invariants**: Violations cause ledger close to fail immediately. These are used
+//!   for critical properties that must never be violated.
+//!
+//! - **Non-strict invariants**: Violations are logged but do not halt ledger close. These are
+//!   used for properties that may temporarily fail during development or testing.
+//!
+//! # Built-in Invariants
+//!
+//! This crate provides several invariant implementations:
+//!
+//! ## Header Invariants
+//! - [`LedgerSeqIncrement`]: Validates that ledger sequence increments by exactly 1.
+//! - [`BucketListHashMatchesHeader`]: Validates that the computed bucket list hash matches
+//!   the header.
+//! - [`CloseTimeNondecreasing`]: Validates that close time never decreases.
+//! - [`ConservationOfLumens`]: Validates that total coins and fee pool follow recorded deltas.
+//!
+//! ## Entry Invariants
+//! - [`LedgerEntryIsValid`]: Comprehensive validation of ledger entry fields and constraints.
+//! - [`LastModifiedLedgerSeqMatchesHeader`]: Validates entry timestamps match current header.
+//! - [`SponsorshipCountIsValid`]: Validates sponsorship accounting across entries.
+//! - [`AccountSubEntriesCountIsValid`]: Validates account subentry counts match actual entries.
+//!
+//! ## Order Book Invariants
+//! - [`LiabilitiesMatchOffers`]: Validates liabilities are consistent with offers.
+//! - [`OrderBookIsNotCrossed`]: Validates the order book has no crossed offers.
+//!
+//! ## Liquidity Pool Invariants
+//! - [`ConstantProductInvariant`]: Validates constant-product AMM pools maintain k = x * y.
+//!
+//! ## Soroban Invariants
+//! - [`EventsAreConsistentWithEntryDiffs`]: Validates SAC events match ledger entry changes.
+//!
+//! # Example Usage
+//!
+//! ```ignore
+//! use stellar_core_invariant::{InvariantManager, InvariantContext, LedgerSeqIncrement};
+//!
+//! let mut manager = InvariantManager::new();
+//! manager.add(LedgerSeqIncrement);
+//!
+//! // During ledger close, create context and check all invariants
+//! let result = manager.check_all(&ctx);
+//! if let Err(e) = result {
+//!     // Handle invariant violation
+//! }
+//! ```
+//!
+//! # Protocol Version Awareness
+//!
+//! Many invariants are protocol-version aware and adjust their validation logic based on
+//! the `ledger_version` in the current header. This ensures backward compatibility as
+//! new features are introduced in newer protocol versions.
 
 use stellar_core_common::Hash256;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -10,20 +86,58 @@ use stellar_xdr::curr::{
 use thiserror::Error;
 use tracing::error;
 
+/// Error type returned when an invariant check fails.
+///
+/// This error includes both the name of the invariant that failed and a detailed
+/// description of what went wrong, making it easy to diagnose issues during
+/// development and testing.
 #[derive(Debug, Error)]
 pub enum InvariantError {
+    /// An invariant check failed.
+    ///
+    /// - `name`: The name of the invariant that was violated.
+    /// - `details`: A human-readable description of what specifically failed.
     #[error("invariant {name} failed: {details}")]
     Violated { name: String, details: String },
 }
 
+/// Represents a change to a ledger entry during a ledger transition.
+///
+/// This enum captures all possible state transitions for a ledger entry:
+/// creation, update, or deletion. Each variant carries the relevant entry
+/// data to allow invariants to validate both the before and after states.
+///
+/// # Variants
+///
+/// - [`Created`](Self::Created): A new entry was added to the ledger.
+/// - [`Updated`](Self::Updated): An existing entry was modified.
+/// - [`Deleted`](Self::Deleted): An entry was removed from the ledger.
 #[derive(Debug, Clone)]
 pub enum LedgerEntryChange {
-    Created { current: LedgerEntry },
-    Updated { previous: LedgerEntry, current: LedgerEntry },
-    Deleted { previous: LedgerEntry },
+    /// A new ledger entry was created.
+    Created {
+        /// The newly created entry.
+        current: LedgerEntry,
+    },
+    /// An existing ledger entry was updated.
+    Updated {
+        /// The entry state before the update.
+        previous: LedgerEntry,
+        /// The entry state after the update.
+        current: LedgerEntry,
+    },
+    /// A ledger entry was deleted.
+    Deleted {
+        /// The entry that was deleted.
+        previous: LedgerEntry,
+    },
 }
 
 impl LedgerEntryChange {
+    /// Returns the current (post-change) state of the entry, if it exists.
+    ///
+    /// Returns `Some` for [`Created`](Self::Created) and [`Updated`](Self::Updated) changes,
+    /// and `None` for [`Deleted`](Self::Deleted) changes since the entry no longer exists.
     pub fn current_entry(&self) -> Option<&LedgerEntry> {
         match self {
             LedgerEntryChange::Created { current } => Some(current),
@@ -32,6 +146,10 @@ impl LedgerEntryChange {
         }
     }
 
+    /// Returns the previous (pre-change) state of the entry, if it existed.
+    ///
+    /// Returns `Some` for [`Updated`](Self::Updated) and [`Deleted`](Self::Deleted) changes,
+    /// and `None` for [`Created`](Self::Created) changes since there was no prior state.
     pub fn previous_entry(&self) -> Option<&LedgerEntry> {
         match self {
             LedgerEntryChange::Created { .. } => None,
@@ -41,39 +159,184 @@ impl LedgerEntryChange {
     }
 }
 
-/// Context passed to invariants.
+/// Context passed to invariants during validation.
+///
+/// This struct contains all the information an invariant needs to validate
+/// a ledger transition. It provides access to both the previous and current
+/// ledger headers, all entry changes, and optional additional context for
+/// specialized invariants.
+///
+/// # Fields
+///
+/// The context is divided into several categories:
+///
+/// ## Header Information
+/// - `prev_header`: The ledger header before the transition.
+/// - `curr_header`: The ledger header after the transition.
+///
+/// ## Computed Values
+/// - `bucket_list_hash`: The computed hash of the bucket list after the transition.
+/// - `fee_pool_delta`: Net change in the fee pool during this ledger.
+/// - `total_coins_delta`: Net change in total coins during this ledger.
+///
+/// ## Entry Changes
+/// - `changes`: All ledger entry changes that occurred during the transition.
+///
+/// ## Optional Context
+/// - `full_entries`: Complete snapshot of certain entry types (e.g., offers for order book checks).
+/// - `op_events`: Soroban contract events for SAC consistency checks.
 pub struct InvariantContext<'a> {
+    /// The ledger header from the previous ledger (before the transition).
     pub prev_header: &'a LedgerHeader,
+    /// The ledger header from the current ledger (after the transition).
     pub curr_header: &'a LedgerHeader,
+    /// The computed bucket list hash, which should match `curr_header.bucket_list_hash`.
     pub bucket_list_hash: Hash256,
+    /// Net change in the fee pool during this ledger close.
     pub fee_pool_delta: i64,
+    /// Net change in total coins (lumens) during this ledger close.
     pub total_coins_delta: i64,
+    /// All ledger entry changes that occurred during this ledger transition.
     pub changes: &'a [LedgerEntryChange],
+    /// Optional complete list of entries for invariants that need full state access
+    /// (e.g., [`OrderBookIsNotCrossed`] needs all offers).
     pub full_entries: Option<&'a [LedgerEntry]>,
+    /// Optional contract events for Soroban operation-level invariant checks.
     pub op_events: Option<&'a [ContractEvent]>,
 }
 
+/// The core trait that all invariant validators must implement.
+///
+/// An invariant represents a property of the ledger state that must hold true
+/// after every ledger transition. Implementations of this trait define:
+///
+/// 1. A unique name for identification and error reporting.
+/// 2. The validation logic that checks whether the property holds.
+/// 3. Whether violations should halt ledger close (strict) or just log warnings.
+///
+/// # Implementation Requirements
+///
+/// - Invariants must be thread-safe (`Send + Sync`) to allow concurrent validation.
+/// - The `check` method should be pure and only read from the provided context.
+/// - Invariants should fail fast on the first violation found.
+///
+/// # Example
+///
+/// ```ignore
+/// struct MyInvariant;
+///
+/// impl Invariant for MyInvariant {
+///     fn name(&self) -> &str {
+///         "MyInvariant"
+///     }
+///
+///     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
+///         // Validation logic here
+///         Ok(())
+///     }
+///
+///     fn is_strict(&self) -> bool {
+///         false // Non-strict: violations are logged but don't halt processing
+///     }
+/// }
+/// ```
 pub trait Invariant: Send + Sync {
+    /// Returns the unique name of this invariant.
+    ///
+    /// This name is used in error messages and logging to identify which
+    /// invariant failed.
     fn name(&self) -> &str;
+
+    /// Validates the invariant against the given context.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - The invariant context containing all information about the ledger transition.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the invariant holds.
+    /// * `Err(InvariantError::Violated { .. })` if the invariant is violated.
     fn check(&self, ctx: &InvariantContext) -> Result<(), InvariantError>;
+
+    /// Returns whether this invariant is strict.
+    ///
+    /// - **Strict invariants** (returns `true`, the default): Violations cause
+    ///   [`InvariantManager::check_all`] to return an error immediately.
+    ///
+    /// - **Non-strict invariants** (returns `false`): Violations are logged
+    ///   but do not halt processing. Useful for invariants under development
+    ///   or for detecting issues that don't affect consensus.
     fn is_strict(&self) -> bool {
         true
     }
 }
 
+/// Registry and executor for multiple invariants.
+///
+/// The `InvariantManager` collects invariants and runs them all against a given
+/// [`InvariantContext`]. It handles the distinction between strict and non-strict
+/// invariants, failing immediately on strict violations while logging non-strict ones.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut manager = InvariantManager::new();
+///
+/// // Add built-in invariants
+/// manager.add(LedgerSeqIncrement);
+/// manager.add(BucketListHashMatchesHeader);
+/// manager.add(ConservationOfLumens);
+///
+/// // Run all invariants during ledger close
+/// manager.check_all(&ctx)?;
+/// ```
+///
+/// # Execution Order
+///
+/// Invariants are checked in the order they were added. The first strict invariant
+/// to fail will cause `check_all` to return immediately with that error.
 pub struct InvariantManager {
     invariants: Vec<Box<dyn Invariant>>,
 }
 
 impl InvariantManager {
+    /// Creates a new empty invariant manager.
     pub fn new() -> Self {
         Self { invariants: Vec::new() }
     }
 
+    /// Adds an invariant to the manager.
+    ///
+    /// Invariants are checked in the order they are added.
+    ///
+    /// # Arguments
+    ///
+    /// * `invariant` - The invariant to add. Must implement [`Invariant`] and have
+    ///   a `'static` lifetime (no borrowed data).
     pub fn add<I: Invariant + 'static>(&mut self, invariant: I) {
         self.invariants.push(Box::new(invariant));
     }
 
+    /// Runs all registered invariants against the given context.
+    ///
+    /// This method iterates through all invariants in registration order and
+    /// calls their `check` method.
+    ///
+    /// # Behavior
+    ///
+    /// - **Strict invariant fails**: Returns the error immediately.
+    /// - **Non-strict invariant fails**: Logs the error and continues checking.
+    /// - **All invariants pass**: Returns `Ok(())`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - The context containing ledger transition information.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if all strict invariants pass.
+    /// * `Err(InvariantError)` if any strict invariant fails.
     pub fn check_all(&self, ctx: &InvariantContext) -> Result<(), InvariantError> {
         for inv in &self.invariants {
             match inv.check(ctx) {
@@ -94,7 +357,21 @@ impl InvariantManager {
     }
 }
 
-/// Invariant: ledger sequence increments by 1.
+impl Default for InvariantManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Validates that the ledger sequence number increments by exactly 1.
+///
+/// This is a fundamental invariant that ensures ledger continuity. Each new ledger
+/// must have a sequence number exactly one greater than its predecessor.
+///
+/// # Strictness
+///
+/// This is a **strict** invariant (the default). Violations indicate a fundamental
+/// error in ledger processing that would break consensus.
 pub struct LedgerSeqIncrement;
 
 impl Invariant for LedgerSeqIncrement {
@@ -117,7 +394,18 @@ impl Invariant for LedgerSeqIncrement {
     }
 }
 
-/// Invariant: bucket list hash matches header field.
+/// Validates that the computed bucket list hash matches the header.
+///
+/// The bucket list is the persistent data structure that stores all ledger entries.
+/// After applying all changes for a ledger, the bucket list hash is recomputed and
+/// must match the hash stored in the ledger header.
+///
+/// # Strictness
+///
+/// This is a **strict** invariant. A mismatch indicates that either:
+/// - The bucket list was corrupted or incorrectly modified.
+/// - The header hash was computed incorrectly.
+/// - There's a bug in the bucket list implementation.
 pub struct BucketListHashMatchesHeader;
 
 impl Invariant for BucketListHashMatchesHeader {
@@ -137,7 +425,20 @@ impl Invariant for BucketListHashMatchesHeader {
     }
 }
 
-/// Invariant: ledger total coins and fee pool follow the recorded deltas.
+/// Validates conservation of lumens across ledger transitions.
+///
+/// This invariant checks that:
+/// 1. `curr_header.total_coins == prev_header.total_coins + total_coins_delta`
+/// 2. `curr_header.fee_pool == prev_header.fee_pool + fee_pool_delta`
+///
+/// This ensures that lumens (XLM) are neither created nor destroyed unexpectedly,
+/// and that fee accounting is correct.
+///
+/// # Strictness
+///
+/// This is a **non-strict** invariant. While conservation is critical, the invariant
+/// is marked non-strict because delta tracking is complex and may have edge cases
+/// during development.
 pub struct ConservationOfLumens;
 
 impl Invariant for ConservationOfLumens {
@@ -190,7 +491,67 @@ impl Invariant for ConservationOfLumens {
     }
 }
 
-/// Invariant: basic ledger entry sanity checks.
+/// Comprehensive validation of ledger entry fields and constraints.
+///
+/// This is the most extensive invariant, checking a wide variety of properties
+/// for each type of ledger entry. It validates:
+///
+/// ## Account Entries
+/// - Balance and sequence number are non-negative.
+/// - `num_sub_entries` does not exceed `i32::MAX`.
+/// - Account flags are within the valid mask for the protocol version.
+/// - Home domain contains only valid ASCII characters.
+/// - Signers are in strictly increasing order by key.
+/// - Signer weights are valid (non-zero, within range).
+/// - Extension fields are only present at appropriate protocol versions.
+///
+/// ## Trustline Entries
+/// - Asset is not native (trustlines are for non-native assets only).
+/// - Asset code is valid (alphanumeric, proper padding).
+/// - Limit is positive and balance is within range.
+/// - Flags are within the valid mask.
+/// - Clawback flag cannot be enabled on an existing trustline.
+/// - Pool share trustlines have no liabilities.
+///
+/// ## Offer Entries
+/// - Offer ID, amount, and price components are positive.
+/// - Selling and buying assets are valid.
+/// - Flags are within the valid mask.
+///
+/// ## Claimable Balance Entries
+/// - Must be sponsored.
+/// - Has at least one claimant.
+/// - Amount is positive and asset is valid.
+/// - Claim predicates are valid (proper nesting, valid time bounds).
+/// - Cannot be modified after creation (immutable).
+///
+/// ## Liquidity Pool Entries
+/// - Cannot be sponsored.
+/// - Assets are valid and in lexicographic order.
+/// - Fee is exactly 30 basis points.
+/// - Reserves and pool shares are non-negative.
+/// - Parameters cannot change after creation.
+///
+/// ## Contract Code Entries
+/// - Hash matches the actual code content.
+/// - Code and hash cannot be modified after creation.
+///
+/// ## TTL Entries
+/// - Key hash cannot change.
+/// - Live-until sequence cannot decrease.
+///
+/// ## Data Entries
+/// - Name is non-empty and contains valid ASCII characters.
+///
+/// # Protocol Version Awareness
+///
+/// Many checks are conditional on the protocol version in the current header.
+/// For example, v1 extensions are only allowed from protocol 14+.
+///
+/// # Strictness
+///
+/// This is a **non-strict** invariant due to its complexity and the number of
+/// edge cases being discovered during development.
 pub struct LedgerEntryIsValid;
 
 impl Invariant for LedgerEntryIsValid {
@@ -665,7 +1026,23 @@ impl Invariant for LedgerEntryIsValid {
     }
 }
 
-/// Invariant: sponsorship counts match sponsored entries.
+/// Validates that sponsorship accounting is consistent across entries.
+///
+/// Stellar supports sponsorship, where one account can pay the base reserve
+/// for entries owned by another account. This invariant ensures:
+///
+/// - Each account's `num_sponsoring` field matches the number of entries it sponsors.
+/// - Each account's `num_sponsored` field matches the number of its entries being sponsored.
+/// - Changes in sponsorship counts match the changes in sponsored entries.
+///
+/// # Protocol Version
+///
+/// Sponsorship was introduced in protocol 14. This invariant is a no-op for earlier versions.
+///
+/// # Strictness
+///
+/// This is a **non-strict** invariant. Sponsorship accounting is complex and may have
+/// edge cases during development.
 pub struct SponsorshipCountIsValid;
 
 impl Invariant for SponsorshipCountIsValid {
@@ -769,7 +1146,24 @@ impl Invariant for SponsorshipCountIsValid {
     }
 }
 
-/// Invariant: account num_sub_entries matches changes in subentries.
+/// Validates that account subentry counts match actual subentries.
+///
+/// Each account has a `num_sub_entries` field that tracks how many subentries
+/// (trustlines, offers, data entries, signers) it owns. This invariant ensures:
+///
+/// - Changes to `num_sub_entries` match the actual subentry changes.
+/// - Deleted accounts have no remaining subentries (other than signers).
+/// - Pool share trustlines count as 2 subentries.
+///
+/// # Implementation Details
+///
+/// The invariant tracks both the recorded `num_sub_entries` delta and the
+/// calculated delta from actual subentry changes, ensuring they match.
+///
+/// # Strictness
+///
+/// This is a **non-strict** invariant. Subentry accounting has complex edge cases,
+/// particularly around account deletion.
 pub struct AccountSubEntriesCountIsValid;
 
 impl Invariant for AccountSubEntriesCountIsValid {
@@ -831,7 +1225,34 @@ impl Invariant for AccountSubEntriesCountIsValid {
     }
 }
 
-/// Invariant: liabilities remain consistent with offer changes and entry balances.
+/// Validates that liabilities are consistent with offers and entry balances.
+///
+/// When accounts create offers on the DEX, they incur "liabilities" representing
+/// the potential asset transfers if the offers are filled. This invariant ensures:
+///
+/// ## Liability Consistency
+/// - Changes in account/trustline liabilities match changes in offer liabilities.
+/// - Selling liabilities = sum of amounts potentially sold by active offers.
+/// - Buying liabilities = sum of amounts potentially bought by active offers.
+///
+/// ## Authorization Rules
+/// - Fully unauthorized trustlines must have zero liabilities.
+/// - "Authorized to maintain liabilities" trustlines cannot increase liabilities.
+///
+/// ## Balance Constraints
+/// - Account balance >= minimum balance + selling liabilities.
+/// - Account balance + buying liabilities <= `i64::MAX`.
+/// - Trustline balance >= selling liabilities.
+/// - Trustline limit - balance >= buying liabilities.
+///
+/// # Protocol Version
+///
+/// Liabilities were introduced in protocol 10. This invariant is a no-op for earlier versions.
+///
+/// # Strictness
+///
+/// This is a **non-strict** invariant due to the complexity of liability calculations
+/// and the many edge cases involved.
 pub struct LiabilitiesMatchOffers;
 
 impl Invariant for LiabilitiesMatchOffers {
@@ -888,6 +1309,11 @@ impl Invariant for LiabilitiesMatchOffers {
     }
 }
 
+/// A lightweight view of an offer used for order book crossing checks.
+///
+/// This struct extracts only the fields needed for price comparison and
+/// ordering in the order book. Offers are sorted by price (best first),
+/// then by passive status (active before passive), then by offer ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OfferView {
     price: stellar_xdr::curr::Price,
@@ -992,7 +1418,27 @@ fn check_order_book_crossed(
     Ok(())
 }
 
-/// Invariant: order book should not be crossed.
+/// Validates that the order book is not crossed (no immediately matchable offers).
+///
+/// A "crossed" order book has a buy offer with a price at or above a sell offer's
+/// price for the same asset pair. Such offers should have been matched during
+/// transaction execution.
+///
+/// # Passive Offers
+///
+/// Passive offers are an exception: they can coexist at equal prices without
+/// being matched. This is by design to allow market makers to provide liquidity
+/// without immediately trading against each other.
+///
+/// # Requirements
+///
+/// This invariant requires `full_entries` to be set in the context, containing
+/// all offer entries in the ledger. If not provided, the check is skipped.
+///
+/// # Strictness
+///
+/// This is a **strict** invariant. A crossed order book indicates a bug in the
+/// offer matching logic.
 pub struct OrderBookIsNotCrossed;
 
 impl Invariant for OrderBookIsNotCrossed {
@@ -1037,7 +1483,29 @@ impl Invariant for OrderBookIsNotCrossed {
     }
 }
 
-/// Invariant: constant-product liquidity pools do not decrease k.
+/// Validates that constant-product liquidity pools maintain the AMM invariant.
+///
+/// Stellar's liquidity pools use the constant-product market maker formula where
+/// `k = reserve_a * reserve_b`. After any swap operation, `k` must not decrease
+/// (it typically increases slightly due to fees).
+///
+/// # Exception: Withdrawals
+///
+/// When liquidity providers withdraw from a pool, `k` will decrease because reserves
+/// decrease. This is valid if `total_pool_shares` also decreases, indicating a
+/// legitimate withdrawal rather than a swap violation.
+///
+/// # Mathematical Property
+///
+/// For any swap that exchanges `dx` of asset A for `dy` of asset B:
+/// ```text
+/// (reserve_a + dx) * (reserve_b - dy) >= reserve_a * reserve_b
+/// ```
+///
+/// # Strictness
+///
+/// This is a **strict** invariant. Violations indicate a bug in the AMM swap logic
+/// that could allow economic exploits.
 pub struct ConstantProductInvariant;
 
 impl Invariant for ConstantProductInvariant {
@@ -1099,8 +1567,36 @@ impl Invariant for ConstantProductInvariant {
     }
 }
 
-/// Invariant: contract events match ledger entry diffs for SAC balance changes.
+/// Validates that Stellar Asset Contract (SAC) events match ledger entry changes.
+///
+/// When Soroban contracts interact with Stellar assets via the SAC interface,
+/// they emit events for operations like transfers, mints, and burns. This invariant
+/// ensures that:
+///
+/// - `transfer` events have matching balance changes in sender and receiver entries.
+/// - `mint` events have matching balance increases.
+/// - `burn` and `clawback` events have matching balance decreases.
+/// - `set_authorized` events match trustline authorization changes.
+///
+/// # Event Types Validated
+///
+/// - `transfer`: Amount moves from one address to another.
+/// - `mint`: New tokens created for an address.
+/// - `burn`: Tokens destroyed from an address.
+/// - `clawback`: Tokens removed from an address by the issuer.
+/// - `set_authorized`: Trustline authorization status changed.
+///
+/// # Requirements
+///
+/// This invariant requires `op_events` to be set in the context. If not provided,
+/// the check is skipped.
+///
+/// # Strictness
+///
+/// This is a **strict** invariant. Mismatches between events and entry changes
+/// indicate either event emission bugs or entry update bugs in the SAC implementation.
 pub struct EventsAreConsistentWithEntryDiffs {
+    /// The network ID is needed to compute SAC contract addresses from assets.
     network_id: Hash256,
 }
 
@@ -1164,8 +1660,17 @@ impl Invariant for EventsAreConsistentWithEntryDiffs {
     }
 }
 
+/// Aggregates balance changes and authorization updates from SAC events.
+///
+/// This struct accumulates the net effect of all SAC events for comparison
+/// against actual ledger entry changes. For each (address, asset) pair,
+/// it tracks:
+/// - The net balance change from transfers, mints, burns, and clawbacks.
+/// - The final authorization state from set_authorized events.
 struct AggregatedEvents {
+    /// Maps address -> asset -> net balance change from events.
     event_amounts: HashMap<ScAddress, HashMap<Asset, i128>>,
+    /// Maps address -> asset -> final authorization state (if changed).
     is_authorized: HashMap<ScAddress, HashMap<Asset, Option<bool>>>,
 }
 
@@ -1224,6 +1729,10 @@ impl AggregatedEvents {
     }
 }
 
+/// Aggregates SAC events into balance changes and authorization updates.
+///
+/// Processes transfer, mint, burn, clawback, and set_authorized events,
+/// accumulating the net balance changes per (address, asset) pair.
 fn aggregate_event_diffs(
     network_id: &Hash256,
     stellar_asset_contract_ids: &mut HashMap<ContractId, Asset>,
@@ -1323,6 +1832,9 @@ fn aggregate_event_diffs(
     Some(res)
 }
 
+/// Verifies that a ledger entry change matches accumulated event deltas.
+///
+/// Returns `Some(error_message)` if there's a mismatch, `None` if valid.
 fn verify_events_delta(
     agg: &mut AggregatedEvents,
     stellar_asset_contract_ids: &HashMap<ContractId, Asset>,
@@ -1491,6 +2003,7 @@ fn verify_events_delta(
     None
 }
 
+/// Checks that trustline authorization changes match event emissions.
 fn check_authorization(
     agg: &AggregatedEvents,
     owner: &ScAddress,
@@ -1528,6 +2041,10 @@ fn check_authorization(
     true
 }
 
+/// Extracts and validates the asset from a SAC event.
+///
+/// Parses the asset string from the event topics and verifies that the
+/// contract ID matches the expected SAC address for that asset.
 fn get_asset_from_event(event: &ContractEvent, network_id: &Hash256) -> Option<Asset> {
     let contract_id = event.contract_id.as_ref()?;
     let (topics, _) = match &event.body {
@@ -1579,6 +2096,7 @@ fn get_asset_from_event(event: &ContractEvent, network_id: &Hash256) -> Option<A
     Some(asset)
 }
 
+/// Computes the SAC contract ID for an asset.
 fn get_asset_contract_id(network_id: &Hash256, asset: &Asset) -> Option<ContractId> {
     let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
         network_id: Hash::from(*network_id),
@@ -1588,6 +2106,7 @@ fn get_asset_contract_id(network_id: &Hash256, asset: &Asset) -> Option<Contract
     Some(ContractId(Hash::from(hash)))
 }
 
+/// Extracts a string from an ScVal::Symbol.
 fn scval_symbol_string(val: &ScVal) -> Option<String> {
     match val {
         ScVal::Symbol(sym) => Some(String::from_utf8_lossy(sym.0.as_vec().as_slice()).into_owned()),
@@ -1595,6 +2114,7 @@ fn scval_symbol_string(val: &ScVal) -> Option<String> {
     }
 }
 
+/// Extracts an address from an ScVal::Address.
 fn scval_address(val: &ScVal) -> Option<ScAddress> {
     match val {
         ScVal::Address(addr) => Some(addr.clone()),
@@ -1602,6 +2122,7 @@ fn scval_address(val: &ScVal) -> Option<ScAddress> {
     }
 }
 
+/// Extracts an amount from event data (either I128 or Map with "amount" key).
 fn get_amount_from_data(data: &ScVal) -> i128 {
     match data {
         ScVal::I128(parts) => i128_from_parts(parts),
@@ -1621,6 +2142,7 @@ fn get_amount_from_data(data: &ScVal) -> i128 {
     }
 }
 
+/// Extracts the address from a SAC balance key (Vec[Symbol("Balance"), Address]).
 fn get_address_from_balance_key(key: &ScVal) -> Option<ScAddress> {
     let ScVal::Vec(Some(vec)) = key else {
         return None;
@@ -1631,6 +2153,7 @@ fn get_address_from_balance_key(key: &ScVal) -> Option<ScAddress> {
     scval_address(&vec[1])
 }
 
+/// Extracts the balance amount from a SAC contract data entry.
 fn contract_balance_amount(entry: Option<&LedgerEntry>) -> i128 {
     let Some(entry) = entry else {
         return 0;
@@ -1657,11 +2180,24 @@ fn contract_balance_amount(entry: Option<&LedgerEntry>) -> i128 {
     }
 }
 
+/// Converts Int128Parts (hi/lo) to a native i128.
 fn i128_from_parts(parts: &stellar_xdr::curr::Int128Parts) -> i128 {
     (i128::from(parts.hi) << 64) | i128::from(parts.lo)
 }
 
 
+/// Updates sponsorship counters based on a ledger entry change.
+///
+/// Processes both the current and previous entry states to calculate the net
+/// change in sponsorship relationships. This function is used by
+/// [`SponsorshipCountIsValid`] to track sponsorship deltas.
+///
+/// # Arguments
+///
+/// * `change` - The ledger entry change to process.
+/// * `num_sponsoring` - Map tracking changes in "sponsoring" counts per account.
+/// * `num_sponsored` - Map tracking changes in "sponsored" counts per account.
+/// * `claimable_balance_reserve` - Running count of claimable balance reserves.
 fn update_changed_sponsorship_counts(
     change: &LedgerEntryChange,
     num_sponsoring: &mut HashMap<AccountId, i64>,
@@ -1689,6 +2225,19 @@ fn update_changed_sponsorship_counts(
     Ok(())
 }
 
+/// Updates sponsorship counters for a single ledger entry.
+///
+/// Extracts sponsorship information from the entry and updates the provided
+/// counter maps. The `sign` parameter controls whether we're adding (+1 for
+/// current entries) or subtracting (-1 for previous entries).
+///
+/// # Sponsorship Multipliers
+///
+/// Different entry types have different sponsorship multipliers:
+/// - Accounts: 2 (base reserve units)
+/// - Pool share trustlines: 2
+/// - Regular trustlines, offers, data entries: 1
+/// - Claimable balances: number of claimants
 fn update_sponsorship_counters(
     entry: &LedgerEntry,
     num_sponsoring: &mut HashMap<AccountId, i64>,
@@ -1742,6 +2291,10 @@ fn update_sponsorship_counters(
     Ok(())
 }
 
+/// Extracts sponsoring/sponsored counts from an account entry.
+///
+/// Reads the `num_sponsoring` and `num_sponsored` fields from an account's
+/// v2 extension and applies them to the running totals with the given sign.
 fn get_delta_sponsoring_and_sponsored(
     entry: Option<&LedgerEntry>,
     num_sponsoring: &mut i64,
@@ -1761,6 +2314,7 @@ fn get_delta_sponsoring_and_sponsored(
     Ok(())
 }
 
+/// Returns the sponsoring account ID for an entry, if sponsored.
 fn entry_sponsoring_id(entry: &LedgerEntry) -> Option<&AccountId> {
     match &entry.ext {
         stellar_xdr::curr::LedgerEntryExt::V1(ext) => ext.sponsoring_id.0.as_ref(),
@@ -1768,6 +2322,7 @@ fn entry_sponsoring_id(entry: &LedgerEntry) -> Option<&AccountId> {
     }
 }
 
+/// Returns the v2 extension from an account entry, if present.
 fn account_entry_ext_v2(
     account: &stellar_xdr::curr::AccountEntry,
 ) -> Option<&stellar_xdr::curr::AccountEntryExtensionV2> {
@@ -1780,6 +2335,10 @@ fn account_entry_ext_v2(
     }
 }
 
+/// Returns the sponsorship multiplier for an entry type.
+///
+/// This determines how many "reserve units" a sponsored entry counts for.
+/// Returns `None` for entry types that cannot be sponsored.
 fn get_sponsorship_multiplier(entry: &LedgerEntry) -> Option<i64> {
     match &entry.data {
         LedgerEntryData::Account(_) => Some(2),
@@ -1799,6 +2358,7 @@ fn get_sponsorship_multiplier(entry: &LedgerEntry) -> Option<i64> {
     }
 }
 
+/// Returns the owning account ID for an entry, if applicable.
 fn entry_account_id(entry: &LedgerEntry) -> Option<AccountId> {
     match &entry.data {
         LedgerEntryData::Account(account) => Some(account.account_id.clone()),
@@ -1809,13 +2369,25 @@ fn entry_account_id(entry: &LedgerEntry) -> Option<AccountId> {
     }
 }
 
+/// Tracks subentry count changes for an account during invariant validation.
+///
+/// This struct compares the recorded `num_sub_entries` delta against the
+/// calculated delta from actual subentry changes to detect inconsistencies.
 #[derive(Debug, Default)]
 struct SubEntriesChange {
+    /// Change in the account's `num_sub_entries` field.
     num_sub_entries: i32,
+    /// Change in the number of signers (tracked separately for account deletion checks).
     signers: i32,
+    /// Calculated change based on actual trustline/offer/data entry changes.
     calculated_sub_entries: i32,
 }
 
+/// Updates subentry tracking based on a ledger entry change.
+///
+/// Processes account entries to track `num_sub_entries` changes, and processes
+/// subentry types (trustlines, offers, data entries) to calculate the expected
+/// subentry delta.
 fn update_changed_subentries(
     subentries: &mut HashMap<AccountId, SubEntriesChange>,
     change: &LedgerEntryChange,
@@ -1886,6 +2458,9 @@ fn update_changed_subentries(
     Ok(())
 }
 
+/// Calculates the subentry count delta for a change.
+///
+/// Pool share trustlines count as 2 subentries; all others count as 1.
 fn calculate_subentry_delta(
     current: Option<&LedgerEntry>,
     previous: Option<&LedgerEntry>,
@@ -1900,6 +2475,7 @@ fn calculate_subentry_delta(
     delta
 }
 
+/// Returns true if the entry is a pool share trustline.
 fn is_pool_share_trustline(entry: &LedgerEntry) -> bool {
     matches!(
         entry.data,
@@ -1910,6 +2486,7 @@ fn is_pool_share_trustline(entry: &LedgerEntry) -> bool {
     )
 }
 
+/// Validates that signers are sorted in strictly increasing order by key.
 fn signers_strictly_increasing(
     signers: &stellar_xdr::curr::VecM<stellar_xdr::curr::Signer, 20>,
 ) -> bool {
@@ -1925,10 +2502,17 @@ fn signers_strictly_increasing(
     true
 }
 
+/// Returns true if the byte is an ASCII alphanumeric character.
 fn is_ascii_alphanumeric(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
 }
 
+/// Validates an asset code.
+///
+/// Asset codes must:
+/// - Contain only ASCII alphanumeric characters
+/// - Be left-padded (non-zero bytes before zero padding)
+/// - Have at least `min_non_zero` non-zero characters
 fn asset_code_valid(code: &[u8], min_non_zero: usize) -> bool {
     let mut zeros = false;
     let mut non_zero = 0;
@@ -1948,6 +2532,7 @@ fn asset_code_valid(code: &[u8], min_non_zero: usize) -> bool {
     non_zero >= min_non_zero
 }
 
+/// Validates an asset (native or credit).
 fn asset_valid(asset: &stellar_xdr::curr::Asset) -> bool {
     match asset {
         stellar_xdr::curr::Asset::Native => true,
@@ -1960,6 +2545,7 @@ fn asset_valid(asset: &stellar_xdr::curr::Asset) -> bool {
     }
 }
 
+/// Validates a trustline asset (excludes native, includes pool shares).
 fn trustline_asset_valid(asset: &stellar_xdr::curr::TrustLineAsset, protocol: u32) -> bool {
     match asset {
         stellar_xdr::curr::TrustLineAsset::Native => false,
@@ -1973,6 +2559,9 @@ fn trustline_asset_valid(asset: &stellar_xdr::curr::TrustLineAsset, protocol: u3
     }
 }
 
+/// Validates account flags against the protocol version mask.
+///
+/// Also enforces that clawback requires revocable (protocol 17+).
 fn account_flags_valid(flags: u32, protocol: u32) -> bool {
     let mask = if protocol < 17 {
         stellar_xdr::curr::MASK_ACCOUNT_FLAGS
@@ -1992,6 +2581,9 @@ fn account_flags_valid(flags: u32, protocol: u32) -> bool {
     true
 }
 
+/// Validates trustline flags against the protocol version mask.
+///
+/// Also enforces mutual exclusion of authorized and authorized-to-maintain-liabilities.
 fn trustline_flags_valid(flags: u32, protocol: u32) -> bool {
     let mask = if protocol < 13 {
         stellar_xdr::curr::MASK_TRUSTLINE_FLAGS
@@ -2014,6 +2606,7 @@ fn trustline_flags_valid(flags: u32, protocol: u32) -> bool {
     true
 }
 
+/// Creates a liabilities invariant error with the given details.
 fn liabilities_error(details: impl Into<String>) -> InvariantError {
     InvariantError::Violated {
         name: "LiabilitiesMatchOffers".to_string(),
@@ -2021,11 +2614,13 @@ fn liabilities_error(details: impl Into<String>) -> InvariantError {
     }
 }
 
+/// Returns true if the trustline is fully authorized.
 fn is_trustline_authorized(entry: &stellar_xdr::curr::TrustLineEntry) -> bool {
     let flag = stellar_xdr::curr::TrustLineFlags::AuthorizedFlag as u32;
     (entry.flags & flag) != 0
 }
 
+/// Returns true if the trustline is authorized to maintain liabilities only.
 fn is_trustline_authorized_to_maintain_liabilities(
     entry: &stellar_xdr::curr::TrustLineEntry,
 ) -> bool {
@@ -2033,6 +2628,7 @@ fn is_trustline_authorized_to_maintain_liabilities(
     (entry.flags & flag) != 0
 }
 
+/// Extracts liabilities from an account entry (returns zero if no v1 extension).
 fn account_liabilities(
     entry: &stellar_xdr::curr::AccountEntry,
 ) -> stellar_xdr::curr::Liabilities {
@@ -2042,6 +2638,7 @@ fn account_liabilities(
     }
 }
 
+/// Extracts liabilities from a trustline entry (returns zero if no v1 extension).
 fn trustline_liabilities(
     entry: &stellar_xdr::curr::TrustLineEntry,
 ) -> stellar_xdr::curr::Liabilities {
@@ -2051,6 +2648,7 @@ fn trustline_liabilities(
     }
 }
 
+/// Extracts (num_sponsoring, num_sponsored) from an account entry.
 fn account_sponsorship_counts(
     entry: &stellar_xdr::curr::AccountEntry,
 ) -> (i64, i64) {
@@ -2065,6 +2663,7 @@ fn account_sponsorship_counts(
     }
 }
 
+/// Converts an Asset to a TrustLineAsset.
 fn asset_to_trustline_asset(
     asset: &stellar_xdr::curr::Asset,
 ) -> stellar_xdr::curr::TrustLineAsset {
@@ -2079,6 +2678,7 @@ fn asset_to_trustline_asset(
     }
 }
 
+/// Returns true if the account is the issuer of the asset.
 fn is_issuer(account: &AccountId, asset: &stellar_xdr::curr::Asset) -> bool {
     match asset {
         stellar_xdr::curr::Asset::Native => false,
@@ -2087,6 +2687,10 @@ fn is_issuer(account: &AccountId, asset: &stellar_xdr::curr::Asset) -> bool {
     }
 }
 
+/// Validates trustline authorization constraints.
+///
+/// - Fully unauthorized trustlines must have zero liabilities.
+/// - "Authorized to maintain liabilities" trustlines cannot increase liabilities.
 fn check_trustline_authorization(change: &LedgerEntryChange) -> Result<(), InvariantError> {
     let Some(current) = change.current_entry() else {
         return Ok(());
@@ -2125,6 +2729,7 @@ fn check_trustline_authorization(change: &LedgerEntryChange) -> Result<(), Invar
     Ok(())
 }
 
+/// Accumulates liability changes from account, trustline, and offer entries.
 fn accumulate_liabilities_delta(
     delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
     change: &LedgerEntryChange,
@@ -2134,6 +2739,7 @@ fn accumulate_liabilities_delta(
     Ok(())
 }
 
+/// Adds or subtracts liabilities from the delta map for a single entry.
 fn add_or_subtract_liabilities(
     delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
     entry: Option<&LedgerEntry>,
@@ -2194,6 +2800,7 @@ fn add_or_subtract_liabilities(
     Ok(())
 }
 
+/// Updates the liability delta for a specific account/asset pair.
 fn update_liability_delta(
     delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
     account: &AccountId,
@@ -2218,6 +2825,10 @@ fn update_liability_delta(
     Ok(())
 }
 
+/// Validates that balances and limits can accommodate liabilities.
+///
+/// For accounts: balance >= min_balance + selling_liabilities
+/// For trustlines: balance >= selling_liabilities, limit - balance >= buying_liabilities
 fn check_balance_and_limit(
     header: &LedgerHeader,
     change: &LedgerEntryChange,
@@ -2273,6 +2884,9 @@ fn check_balance_and_limit(
     Ok(())
 }
 
+/// Determines whether account balance/liability constraints should be checked.
+///
+/// Checks are needed when balance decreased or liabilities increased.
 fn should_check_account(
     current: &stellar_xdr::curr::AccountEntry,
     previous: Option<&stellar_xdr::curr::AccountEntry>,
@@ -2294,6 +2908,7 @@ fn should_check_account(
     }
 }
 
+/// Calculates the minimum balance for an account.
 fn minimum_balance(
     header: &LedgerHeader,
     account: &stellar_xdr::curr::AccountEntry,
@@ -2310,6 +2925,9 @@ fn minimum_balance(
     )
 }
 
+/// Calculates minimum balance given raw counts.
+///
+/// Formula: (2 + num_sub_entries + num_sponsoring - num_sponsored) * base_reserve
 fn minimum_balance_with_counts(
     protocol: u32,
     num_sub_entries: i64,
@@ -2341,23 +2959,30 @@ fn minimum_balance_with_counts(
         .ok_or_else(|| liabilities_error("minimum balance overflow"))
 }
 
+/// Rounding mode for liability calculations.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LiabilitiesRounding {
+    /// Standard rounding behavior.
     Normal,
 }
 
+/// Rounding direction for division in liability calculations.
 #[derive(Clone, Copy)]
 enum LiabilitiesRound {
+    /// Round toward zero.
     Down,
+    /// Round away from zero.
     Up,
 }
 
+/// Multiplies two i64 values using i128 to avoid overflow.
 fn liabilities_big_multiply(lhs: i64, rhs: i64) -> i128 {
     let lhs = lhs as i128;
     let rhs = rhs as i128;
     lhs.saturating_mul(rhs)
 }
 
+/// Divides n by d with specified rounding, returning error on overflow.
 fn liabilities_big_divide(
     n: i128,
     d: i128,
@@ -2382,6 +3007,7 @@ fn liabilities_big_divide(
     Ok(value as i64)
 }
 
+/// Calculates the offer value (minimum of send*n and receive*d).
 fn liabilities_calculate_offer_value(
     price_n: i32,
     price_d: i32,
@@ -2393,6 +3019,11 @@ fn liabilities_calculate_offer_value(
     send_value.min(receive_value)
 }
 
+/// Computes exchange amounts using protocol 10+ logic.
+///
+/// Returns (wheat_receive, sheep_send) - the amounts that would be exchanged
+/// given the price and constraints. Uses "wheat/sheep" terminology from the
+/// original C++ implementation.
 fn exchange_v10_without_price_error_thresholds(
     price: stellar_xdr::curr::Price,
     max_wheat_send: i64,
@@ -2482,6 +3113,7 @@ fn exchange_v10_without_price_error_thresholds(
     Ok((wheat_receive, sheep_send))
 }
 
+/// Calculates the buying liabilities incurred by an offer.
 fn offer_buying_liabilities(
     offer: &stellar_xdr::curr::OfferEntry,
 ) -> Result<i64, InvariantError> {
@@ -2496,6 +3128,7 @@ fn offer_buying_liabilities(
     Ok(sheep_send)
 }
 
+/// Calculates the selling liabilities incurred by an offer.
 fn offer_selling_liabilities(
     offer: &stellar_xdr::curr::OfferEntry,
 ) -> Result<i64, InvariantError> {
@@ -2510,11 +3143,13 @@ fn offer_selling_liabilities(
     Ok(wheat_receive)
 }
 
+/// Returns true if the trustline has clawback enabled.
 fn trustline_clawback_enabled(trust: &stellar_xdr::curr::TrustLineEntry) -> bool {
     let flag = stellar_xdr::curr::TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
     (trust.flags & flag) != 0
 }
 
+/// Returns true if the claimable balance has clawback enabled.
 fn claimable_balance_clawback_enabled(entry: &stellar_xdr::curr::ClaimableBalanceEntry) -> bool {
     match &entry.ext {
         stellar_xdr::curr::ClaimableBalanceEntryExt::V1(ext) => {
@@ -2527,6 +3162,7 @@ fn claimable_balance_clawback_enabled(entry: &stellar_xdr::curr::ClaimableBalanc
     }
 }
 
+/// Validates claimable balance flags against the allowed mask.
 fn claimable_balance_flags_valid(entry: &stellar_xdr::curr::ClaimableBalanceEntry) -> bool {
     match &entry.ext {
         stellar_xdr::curr::ClaimableBalanceEntryExt::V1(ext) => {
@@ -2536,6 +3172,7 @@ fn claimable_balance_flags_valid(entry: &stellar_xdr::curr::ClaimableBalanceEntr
     }
 }
 
+/// Validates a claim predicate (recursive, max depth 4).
 fn validate_claim_predicate(pred: &stellar_xdr::curr::ClaimPredicate, depth: u32) -> bool {
     if depth > 4 {
         return false;
@@ -2561,29 +3198,46 @@ fn validate_claim_predicate(pred: &stellar_xdr::curr::ClaimPredicate, depth: u32
     }
 }
 
+/// Validates that bytes contain only printable ASCII (0x20-0x7e).
 fn string_is_valid(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| *byte > 0x1f && *byte < 0x7f)
 }
 
+/// Validates a String32 contains only printable ASCII.
 fn string32_is_valid(name: &stellar_xdr::curr::String32) -> bool {
     let inner: &stellar_xdr::curr::StringM<32> = name.as_ref();
     let bytes: &[u8] = inner.as_ref();
     string_is_valid(bytes)
 }
 
+/// Returns true if the String64 is empty.
 fn string64_is_empty(name: &stellar_xdr::curr::String64) -> bool {
     let inner: &stellar_xdr::curr::StringM<64> = name.as_ref();
     let bytes: &[u8] = inner.as_ref();
     bytes.is_empty()
 }
 
+/// Validates a String64 contains only printable ASCII.
 fn string64_is_valid(name: &stellar_xdr::curr::String64) -> bool {
     let inner: &stellar_xdr::curr::StringM<64> = name.as_ref();
     let bytes: &[u8] = inner.as_ref();
     string_is_valid(bytes)
 }
 
-/// Invariant: ledger close time does not move backwards.
+/// Validates that ledger close time never decreases.
+///
+/// The ledger close time is the timestamp when the ledger was finalized.
+/// Time must be monotonically non-decreasing across ledgers to ensure
+/// proper operation of time-based features like:
+///
+/// - Claimable balance time predicates.
+/// - Time-bounded transactions.
+/// - Any smart contract logic that depends on timestamps.
+///
+/// # Strictness
+///
+/// This is a **strict** invariant. Decreasing time would break time-dependent
+/// logic throughout the network.
 pub struct CloseTimeNondecreasing;
 
 impl Invariant for CloseTimeNondecreasing {
@@ -2604,7 +3258,19 @@ impl Invariant for CloseTimeNondecreasing {
     }
 }
 
-/// Invariant: ledger entry last_modified_ledger_seq matches current header.
+/// Validates that modified entries have correct `last_modified_ledger_seq`.
+///
+/// Every ledger entry has a `last_modified_ledger_seq` field that records the
+/// ledger sequence in which it was last modified. When an entry is created or
+/// updated, this field must be set to the current ledger sequence.
+///
+/// This invariant checks that all entries in the current changes have their
+/// `last_modified_ledger_seq` set to `curr_header.ledger_seq`.
+///
+/// # Strictness
+///
+/// This is a **non-strict** invariant. While the timestamp should be correct,
+/// mismatches don't affect consensus and may occur during development.
 pub struct LastModifiedLedgerSeqMatchesHeader;
 
 impl Invariant for LastModifiedLedgerSeqMatchesHeader {

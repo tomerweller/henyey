@@ -1,30 +1,63 @@
-//! LedgerDelta - Track entry changes during ledger close.
+//! Change tracking for ledger close operations.
 //!
-//! LedgerDelta accumulates all changes to ledger entries during the
-//! processing of a single ledger. These changes are then used to:
-//! - Update the bucket list
-//! - Generate transaction metadata
-//! - Update the database
+//! This module provides [`LedgerDelta`], which accumulates all state changes
+//! during the processing of a single ledger. The delta serves as the
+//! transaction log for the ledger close, enabling:
+//!
+//! - **Bucket list updates**: Changes are applied to the Merkle tree
+//! - **Transaction metadata**: Change history for each transaction
+//! - **Database updates**: Persistent storage synchronization
+//! - **Invariant checking**: Validation of state consistency
+//!
+//! # Change Semantics
+//!
+//! The delta tracks three types of changes via [`EntryChange`]:
+//!
+//! - **Created**: New entries that didn't exist before
+//! - **Updated**: Existing entries with modified values
+//! - **Deleted**: Entries that have been removed
+//!
+//! # Change Coalescing
+//!
+//! When multiple operations affect the same entry within a ledger, changes
+//! are coalesced to produce the minimal final diff:
+//!
+//! - Create + Update = Create (with final value)
+//! - Create + Delete = No change (entry never existed in previous state)
+//! - Update + Update = Update (original previous, final current)
+//! - Update + Delete = Delete (original previous)
 
 use crate::{LedgerError, Result};
 use std::collections::HashMap;
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, WriteXdr};
 
-/// Represents a change to a single ledger entry.
+/// Represents a single change to a ledger entry.
+///
+/// Each change captures enough information to:
+/// - Apply the change to the bucket list (forward)
+/// - Reconstruct the previous state (backward)
+/// - Generate transaction metadata
+///
+/// # Bucket List Categories
+///
+/// Changes map to bucket list update categories:
+/// - `Created` entries go to the "init" batch
+/// - `Updated` entries go to the "live" batch
+/// - `Deleted` entries go to the "dead" batch
 #[derive(Debug, Clone)]
 pub enum EntryChange {
-    /// A new entry was created.
+    /// A new entry was created (did not exist in previous ledger state).
     Created(LedgerEntry),
-    /// An existing entry was updated.
+    /// An existing entry was modified.
     Updated {
-        /// The entry before the update.
+        /// The entry value before the update (for rollback/metadata).
         previous: LedgerEntry,
-        /// The entry after the update.
+        /// The entry value after the update.
         current: LedgerEntry,
     },
-    /// An entry was deleted.
+    /// An entry was deleted (existed in previous state, now gone).
     Deleted {
-        /// The entry that was deleted.
+        /// The entry that was deleted (for rollback/metadata).
         previous: LedgerEntry,
     },
 }
@@ -73,7 +106,17 @@ impl EntryChange {
     }
 }
 
-/// Extract the ledger key from an entry.
+/// Extract the ledger key from a ledger entry.
+///
+/// Each ledger entry type has a corresponding key type that uniquely
+/// identifies it. This function extracts the appropriate key fields
+/// from the entry data.
+///
+/// # Supported Entry Types
+///
+/// - Account, Trustline, Offer, Data
+/// - ClaimableBalance, LiquidityPool
+/// - ContractData, ContractCode, ConfigSetting, Ttl (Soroban)
 pub fn entry_to_key(entry: &LedgerEntry) -> Result<LedgerKey> {
     use stellar_xdr::curr::LedgerEntryData;
 
@@ -130,31 +173,59 @@ pub fn entry_to_key(entry: &LedgerEntry) -> Result<LedgerKey> {
     Ok(key)
 }
 
-/// Serialize a ledger key to bytes for use as a map key.
+/// Serialize a ledger key to bytes for use as a hash map key.
+///
+/// Uses XDR encoding to produce a canonical byte representation of the key.
+/// This ensures consistent hashing regardless of how the key was constructed.
 pub fn key_to_bytes(key: &LedgerKey) -> Result<Vec<u8>> {
     key.to_xdr(Limits::none())
         .map_err(|e| LedgerError::Serialization(e.to_string()))
 }
 
-/// Tracks all changes to ledger entries during a ledger close.
+/// Accumulator for all ledger entry changes during a single ledger close.
 ///
-/// This accumulates creates, updates, and deletes, then provides
-/// a consolidated view of all changes for bucket list and database updates.
+/// `LedgerDelta` provides a transactional view of state changes, allowing
+/// multiple operations to modify entries with automatic change coalescing.
+/// The final delta represents the minimal diff between the previous and
+/// new ledger state.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut delta = LedgerDelta::new(ledger_seq);
+///
+/// // Record changes during transaction processing
+/// delta.record_create(new_account)?;
+/// delta.record_update(old_trustline, new_trustline)?;
+/// delta.record_delete(expired_offer)?;
+///
+/// // Get categorized changes for bucket list update
+/// let init_entries = delta.init_entries();   // Created
+/// let live_entries = delta.live_entries();   // Updated
+/// let dead_entries = delta.dead_entries();   // Deleted
+/// ```
+///
+/// # Deterministic Ordering
+///
+/// Changes are tracked in insertion order to ensure deterministic iteration.
+/// This is critical for producing consistent bucket list updates across nodes.
 #[derive(Debug)]
 pub struct LedgerDelta {
-    /// The ledger sequence being modified.
+    /// The ledger sequence this delta applies to.
     ledger_seq: u32,
 
-    /// All entry changes, keyed by serialized LedgerKey.
+    /// All entry changes, keyed by XDR-encoded LedgerKey.
     changes: HashMap<Vec<u8>, EntryChange>,
 
-    /// Order in which changes were recorded (for deterministic iteration).
+    /// Keys in the order changes were first recorded (for deterministic iteration).
     change_order: Vec<Vec<u8>>,
 
-    /// Total fees collected during this ledger.
+    /// Net change to the fee pool (positive = fees collected).
     fee_pool_delta: i64,
 
-    /// Total coins burned (via fee charging).
+    /// Net change to total coins in circulation.
+    ///
+    /// Typically zero, but can change due to inflation or fee burns.
     total_coins_delta: i64,
 }
 

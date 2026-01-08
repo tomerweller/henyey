@@ -1,23 +1,41 @@
 //! Ledger header queries.
+//!
+//! This module provides database operations for ledger headers, which contain
+//! the metadata for each closed ledger including sequence numbers, timestamps,
+//! hashes, and protocol version information.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use stellar_core_common::Hash256;
-use stellar_xdr::curr::{LedgerHeader, ReadXdr, Limits};
+use stellar_xdr::curr::{LedgerHeader, Limits, ReadXdr};
 
 use super::super::error::DbError;
 
-/// Trait for querying and storing ledger headers.
+/// Query trait for ledger header operations.
+///
+/// Provides methods for storing and retrieving ledger headers from the
+/// `ledgerheaders` table. Headers are stored as XDR blobs along with
+/// indexed columns for efficient querying.
 pub trait LedgerQueries {
-    /// Load a ledger header by sequence number.
+    /// Loads a ledger header by its sequence number.
+    ///
+    /// Returns `None` if no ledger with the given sequence exists.
     fn load_ledger_header(&self, seq: u32) -> Result<Option<LedgerHeader>, DbError>;
 
-    /// Store a ledger header.
+    /// Stores a ledger header in the database.
+    ///
+    /// The raw XDR data is stored along with extracted fields for indexing.
+    /// If a header with the same sequence already exists, it is replaced.
     fn store_ledger_header(&self, header: &LedgerHeader, data: &[u8]) -> Result<(), DbError>;
 
-    /// Get the latest ledger sequence number.
+    /// Returns the highest ledger sequence number in the database.
+    ///
+    /// Returns `None` if no ledgers have been stored.
     fn get_latest_ledger_seq(&self) -> Result<Option<u32>, DbError>;
 
-    /// Get the hash of a ledger by sequence number.
+    /// Returns the hash of a ledger by its sequence number.
+    ///
+    /// The hash is computed from the XDR-encoded header data.
+    /// Returns `None` if the ledger is not found.
     fn get_ledger_hash(&self, seq: u32) -> Result<Option<Hash256>, DbError>;
 }
 

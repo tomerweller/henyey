@@ -1,25 +1,42 @@
 //! State queries for the storestate table.
+//!
+//! The `storestate` table is a simple key-value store used for persistent
+//! node configuration and runtime state. It stores values like the network
+//! passphrase, last closed ledger, and SCP state.
+//!
+//! See [`state_keys`](crate::schema::state_keys) for well-known key constants.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::super::error::DbError;
 use super::super::schema::state_keys;
 
-/// Trait for querying and modifying the storestate table.
+/// Query trait for the storestate key-value table.
+///
+/// Provides generic get/set/delete operations as well as convenience
+/// methods for commonly accessed state values.
 pub trait StateQueries {
-    /// Get a state value by key.
+    /// Retrieves a state value by key.
+    ///
+    /// Returns `None` if the key does not exist.
     fn get_state(&self, key: &str) -> Result<Option<String>, DbError>;
 
-    /// Set a state value.
+    /// Stores a state value.
+    ///
+    /// If the key already exists, the value is replaced.
     fn set_state(&self, key: &str, value: &str) -> Result<(), DbError>;
 
-    /// Delete a state value.
+    /// Deletes a state value.
+    ///
+    /// This is a no-op if the key does not exist.
     fn delete_state(&self, key: &str) -> Result<(), DbError>;
 
-    /// Get the last closed ledger sequence number.
+    /// Returns the last closed ledger sequence number.
+    ///
+    /// This is the primary indicator of the node's progress through the chain.
     fn get_last_closed_ledger(&self) -> Result<Option<u32>, DbError>;
 
-    /// Set the last closed ledger sequence number.
+    /// Records the last closed ledger sequence number.
     fn set_last_closed_ledger(&self, seq: u32) -> Result<(), DbError>;
 }
 

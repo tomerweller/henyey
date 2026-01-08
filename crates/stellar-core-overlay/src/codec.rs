@@ -1,64 +1,112 @@
 //! Message codec for Stellar overlay protocol.
 //!
-//! Implements length-prefixed message framing for XDR-encoded messages.
-//! Each message is prefixed with a 4-byte big-endian length field.
+//! This module implements the framing layer for Stellar network messages.
+//! Each message on the wire is prefixed with a 4-byte big-endian length field:
+//!
+//! ```text
+//! +----------------+------------------+
+//! | Length (4 bytes) | XDR Message Body |
+//! +----------------+------------------+
+//! ```
+//!
+//! # Length Field Format
+//!
+//! The length field has special semantics:
+//! - **Bit 31 (MSB)**: Authentication flag. When set, the message has a valid MAC.
+//!   When clear (e.g., Hello/Auth during handshake), the MAC field is all zeros.
+//! - **Bits 0-30**: Actual message body length in bytes.
+//!
+//! # Message Size Limits
+//!
+//! - Minimum: 12 bytes (at least the authenticated message header)
+//! - Maximum: 32 MB (prevents memory exhaustion attacks)
 
 use crate::{OverlayError, Result};
 use bytes::{Buf, BufMut, BytesMut};
 use stellar_xdr::curr::{AuthenticatedMessage, Limits, ReadXdr, WriteXdr};
 use tokio_util::codec::{Decoder, Encoder};
 
-/// Maximum message size (32 MB).
+/// Maximum message size (32 MB) - prevents memory exhaustion.
 const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 
-/// Minimum message size (at least auth message header).
+/// Minimum message size - must fit at least the authenticated message header.
 const MIN_MESSAGE_SIZE: usize = 12;
 
-/// A framed message from the network.
+/// A framed message received from the network.
+///
+/// Contains the decoded message along with metadata about how it was received.
 #[derive(Debug)]
 pub struct MessageFrame {
-    /// The authenticated message.
+    /// The decoded authenticated message wrapper.
     pub message: AuthenticatedMessage,
-    /// Raw bytes for debugging.
+
+    /// Size of the message body in bytes (not including length prefix).
     pub raw_len: usize,
-    /// Whether the message has authentication bit set (bit 31 of length).
+
+    /// Whether bit 31 was set in the length prefix.
+    ///
+    /// When true, the message has a valid MAC that should be verified.
+    /// When false (Hello/Auth during handshake), the MAC field is zeros.
     pub is_authenticated: bool,
 }
 
 impl MessageFrame {
-    /// Create a new message frame.
+    /// Creates a new message frame with the given parameters.
     pub fn new(message: AuthenticatedMessage, raw_len: usize, is_authenticated: bool) -> Self {
-        Self { message, raw_len, is_authenticated }
+        Self {
+            message,
+            raw_len,
+            is_authenticated,
+        }
     }
 }
 
-/// Codec for encoding/decoding Stellar overlay messages.
+/// Codec for encoding and decoding Stellar overlay messages.
 ///
-/// Messages are length-prefixed with a 4-byte big-endian length.
+/// Implements tokio's `Encoder` and `Decoder` traits for use with framed
+/// TCP streams. Handles the length-prefixed framing protocol automatically.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use tokio_util::codec::Framed;
+/// use stellar_core_overlay::MessageCodec;
+///
+/// let framed = Framed::new(tcp_stream, MessageCodec::new());
+/// ```
 #[derive(Debug, Default)]
 pub struct MessageCodec {
-    /// Current decode state.
+    /// Current state of the decoder state machine.
     decode_state: DecodeState,
 }
 
+/// Internal state machine for streaming message decoding.
 #[derive(Debug, Default)]
 enum DecodeState {
-    /// Waiting for length prefix.
+    /// Waiting for the 4-byte length prefix.
     #[default]
     ReadingLength,
-    /// Reading message body of given length, with authentication flag.
-    ReadingBody { len: usize, is_authenticated: bool },
+    /// Have length, waiting for the message body.
+    ReadingBody {
+        /// Expected message body length.
+        len: usize,
+        /// Whether bit 31 was set (message has valid MAC).
+        is_authenticated: bool,
+    },
 }
 
 impl MessageCodec {
-    /// Create a new message codec.
+    /// Creates a new message codec with initial state.
     pub fn new() -> Self {
         Self {
             decode_state: DecodeState::ReadingLength,
         }
     }
 
-    /// Encode a message to bytes.
+    /// Encodes a message to bytes with length prefix.
+    ///
+    /// Returns a `Vec<u8>` containing the 4-byte length prefix followed by
+    /// the XDR-encoded message body.
     pub fn encode_message(message: &AuthenticatedMessage) -> Result<Vec<u8>> {
         let xdr_bytes = message.to_xdr(Limits::none())?;
         let len = xdr_bytes.len() as u32;
@@ -70,7 +118,9 @@ impl MessageCodec {
         Ok(buf)
     }
 
-    /// Decode bytes to a message.
+    /// Decodes XDR bytes to an authenticated message.
+    ///
+    /// The input should be the raw message body without the length prefix.
     pub fn decode_message(bytes: &[u8]) -> Result<AuthenticatedMessage> {
         AuthenticatedMessage::from_xdr(bytes, Limits::none())
             .map_err(|e| OverlayError::Message(format!("failed to decode XDR: {}", e)))
@@ -169,18 +219,25 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
     }
 }
 
-/// Helper functions for message encoding.
+/// Helper functions for working with Stellar messages.
+///
+/// Provides utilities for message classification, hashing, and display.
 pub mod helpers {
     use super::*;
     use stellar_xdr::curr::StellarMessage;
 
-    /// Calculate the hash of a StellarMessage for flood tracking.
+    /// Computes the SHA-256 hash of a message for flood tracking.
+    ///
+    /// The hash is computed over the XDR-encoded message bytes.
     pub fn message_hash(message: &StellarMessage) -> stellar_core_common::Hash256 {
         let bytes = message.to_xdr(Limits::none()).unwrap_or_default();
         stellar_core_common::Hash256::hash(&bytes)
     }
 
-    /// Check if a message type should be flooded.
+    /// Returns true if this message type should be flooded to peers.
+    ///
+    /// Flood messages are propagated to all connected peers (except the sender)
+    /// to ensure network-wide distribution.
     pub fn is_flood_message(message: &StellarMessage) -> bool {
         matches!(
             message,
@@ -195,12 +252,17 @@ pub mod helpers {
         )
     }
 
-    /// Check if a message is a handshake message.
+    /// Returns true if this is a handshake message (Hello or Auth).
+    ///
+    /// Handshake messages are handled specially during connection setup
+    /// and should not be processed after authentication is complete.
     pub fn is_handshake_message(message: &StellarMessage) -> bool {
         matches!(message, StellarMessage::Hello(_) | StellarMessage::Auth(_))
     }
 
-    /// Get a human-readable name for a message type.
+    /// Returns a human-readable name for the message type.
+    ///
+    /// Useful for logging and debugging.
     pub fn message_type_name(message: &StellarMessage) -> &'static str {
         match message {
             StellarMessage::ErrorMsg(_) => "ERROR",

@@ -1,8 +1,28 @@
 //! SCP driver integration for the Herder.
 //!
-//! This module implements the SCPDriver trait callbacks that integrate
+//! This module implements the [`SCPDriver`] trait callbacks that integrate
 //! the SCP consensus protocol with the Herder's transaction processing
 //! and ledger management.
+//!
+//! # Overview
+//!
+//! The [`ScpDriver`] is the bridge between the SCP consensus layer and the
+//! Herder's application logic. It provides:
+//!
+//! - **Value validation**: Checking that proposed SCP values are valid
+//!   (close time is reasonable, transaction set exists, upgrades are valid)
+//! - **Candidate combination**: Merging multiple candidate values into one
+//! - **Envelope signing/verification**: Cryptographic operations for SCP messages
+//! - **Transaction set caching**: Storing and retrieving transaction sets by hash
+//! - **Externalization tracking**: Recording when slots are externalized
+//! - **Quorum set management**: Storing and looking up quorum sets by node or hash
+//!
+//! # Key Components
+//!
+//! - [`ScpDriver`]: Main driver struct managing caches and cryptographic operations
+//! - [`HerderScpCallback`]: Wrapper implementing the SCP callback trait
+//! - [`ExternalizedSlot`]: Records a slot that has reached consensus
+//! - [`PendingTxSet`]: Tracks transaction sets we need but haven't received yet
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,8 +1,42 @@
-//! Transaction validation for catchup mode.
+//! Transaction validation logic.
 //!
-//! This module provides basic validation checks for transactions during catchup.
-//! During catchup, we trust the historical results from the archive, so we only
-//! perform minimal validation to ensure data integrity.
+//! This module provides validation functions for Stellar transactions, including:
+//!
+//! - **Structure validation**: Ensures transaction envelopes are well-formed
+//! - **Fee validation**: Checks minimum fee requirements
+//! - **Time bounds validation**: Verifies transaction is within valid time range
+//! - **Ledger bounds validation**: Verifies transaction is within valid ledger range
+//! - **Sequence validation**: Checks source account sequence number
+//! - **Signature validation**: Verifies cryptographic signatures
+//! - **Soroban validation**: Validates Soroban-specific resources and footprints
+//!
+//! # Validation Modes
+//!
+//! Two validation modes are provided:
+//!
+//! - [`validate_basic`]: Minimal checks suitable for catchup/replay mode where
+//!   historical results are trusted. Does not require account data.
+//!
+//! - [`validate_full`]: Complete validation including signatures and account
+//!   balance checks. Required for live transaction submission.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use stellar_core_tx::validation::{validate_basic, LedgerContext};
+//!
+//! let context = LedgerContext::testnet(1000, current_time);
+//! let frame = TransactionFrame::new(envelope);
+//!
+//! match validate_basic(&frame, &context) {
+//!     Ok(()) => println!("Transaction is valid"),
+//!     Err(errors) => {
+//!         for err in errors {
+//!             println!("Validation error: {}", err);
+//!         }
+//!     }
+//! }
+//! ```
 
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_crypto::{verify_hash, PublicKey, Signature};
@@ -12,23 +46,41 @@ use stellar_xdr::curr::{
 
 use crate::frame::TransactionFrame;
 
-/// Ledger context for validation.
+/// Ledger context for transaction validation and execution.
+///
+/// This structure provides all the ledger-level information needed to validate
+/// and execute transactions. It includes network parameters, timing information,
+/// and protocol version.
+///
+/// # Construction
+///
+/// Use the convenience constructors for common networks:
+/// - [`LedgerContext::testnet`]: Testnet with default parameters
+/// - [`LedgerContext::mainnet`]: Mainnet with default parameters
+/// - [`LedgerContext::new`]: Custom configuration
+///
+/// # Fields
+///
+/// All fields are public for flexibility, but be careful to ensure consistency
+/// (e.g., network ID should match the network you're connecting to).
 pub struct LedgerContext {
-    /// Current ledger sequence.
+    /// Current ledger sequence number.
     pub sequence: u32,
-    /// Ledger close time (Unix timestamp).
+    /// Ledger close time as Unix timestamp (seconds since epoch).
     pub close_time: u64,
-    /// Base fee in stroops.
+    /// Base fee per operation in stroops (1 stroop = 0.0000001 XLM).
     pub base_fee: u32,
-    /// Base reserve in stroops.
+    /// Base reserve per ledger entry in stroops.
     pub base_reserve: u32,
-    /// Protocol version.
+    /// Protocol version number (e.g., 21, 22, 23, ...).
     pub protocol_version: u32,
-    /// Network ID.
+    /// Network identifier (mainnet, testnet, or custom).
     pub network_id: NetworkId,
-    /// PRNG seed for Soroban contract execution.
-    /// This is computed as subSha256(txSetHash, txIndex) per the C++ stellar-core spec.
-    /// None means use a default (incorrect) seed for compatibility.
+    /// PRNG seed for deterministic Soroban contract execution.
+    ///
+    /// This is computed as `subSha256(txSetHash, txIndex)` per the C++ stellar-core
+    /// specification. If `None`, a fallback seed is used which may produce different
+    /// results from C++ stellar-core.
     pub soroban_prng_seed: Option<[u8; 32]>,
 }
 
@@ -101,36 +153,70 @@ impl LedgerContext {
     }
 }
 
-/// Validation result with detailed error information.
+/// Detailed validation error information.
+///
+/// Each variant provides specific information about why validation failed,
+/// including the expected vs actual values where applicable. This enables
+/// detailed error reporting and debugging.
+///
+/// These errors can be converted to [`ValidationResult`](crate::ValidationResult)
+/// for simplified handling via the `From` trait implementation.
 #[derive(Debug, Clone)]
 pub enum ValidationError {
-    /// Transaction has invalid structure.
+    /// Transaction envelope has invalid structure or missing required fields.
     InvalidStructure(String),
-    /// Invalid signature(s).
+    /// One or more signatures are cryptographically invalid.
     InvalidSignature,
-    /// Missing required signatures.
+    /// Required signatures are missing (insufficient weight).
     MissingSignatures,
-    /// Bad sequence number.
-    BadSequence { expected: i64, actual: i64 },
-    /// Insufficient fee.
-    InsufficientFee { required: u32, provided: u32 },
-    /// Source account not found.
+    /// Sequence number mismatch.
+    BadSequence {
+        /// Expected sequence (source account seq + 1).
+        expected: i64,
+        /// Actual sequence in the transaction.
+        actual: i64,
+    },
+    /// Transaction fee is below the minimum required.
+    InsufficientFee {
+        /// Minimum required fee in stroops.
+        required: u32,
+        /// Fee provided in the transaction.
+        provided: u32,
+    },
+    /// Source account does not exist in the ledger.
     SourceAccountNotFound,
-    /// Insufficient balance for fee.
+    /// Source account balance is insufficient to pay the fee.
     InsufficientBalance,
-    /// Transaction is too late (time bounds).
-    TooLate { max_time: u64, ledger_time: u64 },
-    /// Transaction is too early (time bounds).
-    TooEarly { min_time: u64, ledger_time: u64 },
-    /// Ledger bounds not satisfied.
-    BadLedgerBounds { min: u32, max: u32, current: u32 },
-    /// Min account sequence not met.
+    /// Transaction's maxTime has passed.
+    TooLate {
+        /// Maximum time allowed by the transaction.
+        max_time: u64,
+        /// Ledger close time.
+        ledger_time: u64,
+    },
+    /// Transaction's minTime has not yet been reached.
+    TooEarly {
+        /// Minimum time required by the transaction.
+        min_time: u64,
+        /// Ledger close time.
+        ledger_time: u64,
+    },
+    /// Ledger sequence is outside the allowed range.
+    BadLedgerBounds {
+        /// Minimum ledger allowed.
+        min: u32,
+        /// Maximum ledger allowed.
+        max: u32,
+        /// Current ledger sequence.
+        current: u32,
+    },
+    /// Source account sequence is below the required minimum.
     BadMinAccountSequence,
-    /// Min account sequence age not met.
+    /// Minimum time since last sequence bump not met.
     BadMinAccountSequenceAge,
-    /// Min account sequence ledger gap not met.
+    /// Minimum ledger gap since last sequence bump not met.
     BadMinAccountSequenceLedgerGap,
-    /// Extra signers requirement not met.
+    /// Required extra signers not present.
     ExtraSignersNotMet,
 }
 

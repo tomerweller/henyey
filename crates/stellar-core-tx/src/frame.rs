@@ -1,4 +1,31 @@
 //! Transaction frame - wrapper around TransactionEnvelope.
+//!
+//! This module provides the [`TransactionFrame`] type, which wraps XDR transaction
+//! envelopes and provides convenient accessors for transaction properties.
+//!
+//! # Key Features
+//!
+//! - Unified API for all transaction envelope types (V0, V1, FeeBump)
+//! - Transaction hash computation with network ID
+//! - Resource extraction for surge pricing and limits
+//! - Soroban transaction detection and data access
+//!
+//! # Example
+//!
+//! ```ignore
+//! use stellar_core_tx::TransactionFrame;
+//! use stellar_core_common::NetworkId;
+//!
+//! let frame = TransactionFrame::new(envelope);
+//!
+//! // Access transaction properties
+//! println!("Fee: {}", frame.fee());
+//! println!("Sequence: {}", frame.sequence_number());
+//! println!("Operations: {}", frame.operation_count());
+//!
+//! // Compute transaction hash
+//! let hash = frame.hash(&NetworkId::testnet())?;
+//! ```
 
 use stellar_core_common::{Hash256, NetworkId, Resource};
 use stellar_core_crypto::sha256;
@@ -15,15 +42,37 @@ use stellar_xdr::curr::Limits;
 
 use crate::{Result, TxError};
 
-/// A wrapper around a TransactionEnvelope that provides convenient access
-/// to transaction properties and operations.
+/// Wrapper around a TransactionEnvelope providing unified access to transaction data.
+///
+/// `TransactionFrame` abstracts over the different transaction envelope versions
+/// (V0, V1, and FeeBump) to provide a consistent API. It handles:
+///
+/// - Extracting common properties (source, fee, sequence, operations)
+/// - Computing transaction hashes with network ID binding
+/// - Detecting Soroban vs. classic transactions
+/// - Extracting resource requirements for fee calculation
+///
+/// # Transaction Types
+///
+/// - **V0 Transactions**: Legacy format with raw Ed25519 public key as source
+/// - **V1 Transactions**: Modern format with MuxedAccount support
+/// - **FeeBump Transactions**: Wraps an inner transaction with a higher fee
+///
+/// # Hash Computation
+///
+/// The transaction hash is computed by hashing the `TransactionSignaturePayload`,
+/// which includes the network ID. This ensures signatures are network-specific.
+///
+/// ```ignore
+/// let hash = frame.hash(&NetworkId::mainnet())?;
+/// ```
 #[derive(Debug, Clone)]
 pub struct TransactionFrame {
-    /// The underlying transaction envelope.
+    /// The underlying XDR transaction envelope.
     envelope: TransactionEnvelope,
-    /// Cached transaction hash (computed on demand).
+    /// Cached transaction hash (lazily computed).
     hash: Option<Hash256>,
-    /// Network ID used for hash computation.
+    /// Network ID used when computing the cached hash.
     network_id: Option<NetworkId>,
 }
 

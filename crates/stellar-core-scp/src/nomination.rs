@@ -1,9 +1,34 @@
 //! Nomination protocol implementation for SCP.
 //!
-//! The nomination protocol is the first phase of SCP consensus.
-//! Nodes propose candidate values and vote to accept them. Once
-//! a quorum accepts a set of values, they are combined into a
-//! composite value that enters the ballot protocol.
+//! The nomination protocol is the first phase of SCP consensus, where nodes
+//! propose and vote on candidate values. The goal is to produce a set of
+//! confirmed candidate values that can then be used in the ballot protocol.
+//!
+//! # Protocol Overview
+//!
+//! 1. **Vote**: Nodes vote for values they propose or receive from leaders
+//! 2. **Accept**: A value is accepted when a v-blocking set accepts it,
+//!    or when a quorum has voted or accepted it
+//! 3. **Confirm**: A value is confirmed (becomes a candidate) when a quorum
+//!    has accepted it
+//!
+//! # Value Progression
+//!
+//! ```text
+//! [Proposed] --vote--> [Voted] --accept--> [Accepted] --ratify--> [Candidate]
+//! ```
+//!
+//! # Round Leaders
+//!
+//! Each nomination round has a set of leaders determined by a deterministic
+//! priority function. Leaders' values are prioritized during nomination.
+//! The leader set grows over rounds to ensure progress.
+//!
+//! # Composite Value
+//!
+//! Once candidates are confirmed, they are combined into a single composite
+//! value (via the driver's `combine_candidates` method) which is then used
+//! to start the ballot protocol.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,36 +42,80 @@ use crate::driver::{SCPDriver, ValidationLevel};
 use crate::quorum::{hash_quorum_set, is_blocking_set, is_quorum};
 use crate::EnvelopeState;
 
-/// State of the nomination protocol for a slot.
+/// State machine for the nomination protocol phase.
+///
+/// The `NominationProtocol` tracks all state needed for the nomination phase
+/// of SCP consensus, including voted values, accepted values, confirmed
+/// candidates, and the latest messages from each node.
+///
+/// # State Categories
+///
+/// - **Votes**: Values this node has voted for
+/// - **Accepted**: Values accepted (confirmed by v-blocking or quorum)
+/// - **Candidates**: Values confirmed by quorum (ready for ballot protocol)
+///
+/// # Monotonicity
+///
+/// Nomination statements are monotonic: a newer statement must contain
+/// all values from previous statements plus at least one new value.
 #[derive(Debug)]
 pub struct NominationProtocol {
-    /// Current nomination round.
+    /// Current nomination round number (increases on timeout).
     round: u32,
-    /// Values we've voted for.
+
+    /// Values this node has voted for.
+    ///
+    /// Values are added when we nominate them ourselves or adopt them
+    /// from round leaders.
     votes: Vec<Value>,
-    /// Values we've accepted.
+
+    /// Values this node has accepted.
+    ///
+    /// A value is accepted when either:
+    /// - A v-blocking set of nodes has accepted it
+    /// - A quorum has voted for or accepted it
     accepted: Vec<Value>,
-    /// Values that have been ratified by a quorum.
+
+    /// Values confirmed by quorum (candidates for ballot protocol).
+    ///
+    /// These are values where a quorum has accepted them. Once we have
+    /// candidates, they are combined into a composite value.
     candidates: Vec<Value>,
-    /// Nomination started flag.
+
+    /// Whether nomination has been started.
     started: bool,
-    /// Nomination stopped flag (moving to ballot).
+
+    /// Whether nomination has been stopped (transitioning to ballot).
     stopped: bool,
-    /// Latest composite value (combination of accepted values).
+
+    /// The latest composite value combining all candidates.
+    ///
+    /// This value is passed to the ballot protocol when candidates
+    /// are confirmed.
     latest_composite: Option<Value>,
-    /// Previous slot value (for priority hashing).
+
+    /// The previous slot's value, used for priority hash computation.
     previous_value: Option<Value>,
-    /// Number of nomination timeouts.
+
+    /// Count of nomination timeouts (used for round progression).
     timer_exp_count: u32,
-    /// Latest nomination envelopes from each node.
+
+    /// Latest nomination envelope from each node in the network.
     latest_nominations: HashMap<NodeId, ScpEnvelope>,
-    /// Round leaders (nodes we're nominating values from).
+
+    /// Set of nodes that are leaders for the current round.
+    ///
+    /// Leaders are determined by a priority function based on the
+    /// previous value and round number.
     round_leaders: HashSet<NodeId>,
-    /// Last local envelope we built.
+
+    /// The last envelope we constructed locally.
     last_envelope: Option<ScpEnvelope>,
-    /// Last local envelope we emitted.
+
+    /// The last envelope we actually emitted to the network.
     last_envelope_emit: Option<ScpEnvelope>,
-    /// Whether the slot is fully validated.
+
+    /// Whether the slot is fully validated (affects envelope emission).
     fully_validated: bool,
 }
 

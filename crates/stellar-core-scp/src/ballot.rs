@@ -1,11 +1,44 @@
 //! Ballot protocol implementation for SCP.
 //!
-//! The ballot protocol is the second phase of SCP consensus.
-//! After nomination produces a composite value, nodes use the
-//! ballot protocol to agree on that exact value through:
-//! - PREPARE: Vote to prepare a ballot
-//! - CONFIRM: Confirm a ballot is prepared
-//! - EXTERNALIZE: Commit to the value
+//! The ballot protocol is the second phase of SCP consensus, following the
+//! nomination phase. After nomination produces a composite value, nodes use
+//! the ballot protocol to achieve Byzantine agreement on that exact value.
+//!
+//! # Protocol Phases
+//!
+//! The ballot protocol progresses through three phases:
+//!
+//! 1. **PREPARE**: Nodes vote to prepare ballots. A ballot is "prepared" when
+//!    nodes agree it's safe to commit (no conflicting ballot can be committed).
+//!
+//! 2. **CONFIRM**: Nodes confirm that a ballot is prepared. This phase ensures
+//!    the network agrees that a particular ballot is prepared.
+//!
+//! 3. **EXTERNALIZE**: Once a ballot is confirmed prepared, nodes commit to
+//!    its value. This is the final state where consensus is reached.
+//!
+//! # Ballot Structure
+//!
+//! A ballot `<n, x>` consists of:
+//! - `n`: A counter (increases on timeout to try new ballots)
+//! - `x`: The consensus value
+//!
+//! Ballots with the same value but different counters are "compatible".
+//! The protocol ensures only compatible ballots can be committed.
+//!
+//! # Key State Variables
+//!
+//! Following the SCP whitepaper notation:
+//! - `b`: Current ballot we're working on
+//! - `p`: Highest prepared ballot
+//! - `p'`: Second-highest prepared ballot (if incompatible with p)
+//! - `h`: Highest ballot we can confirm prepared
+//! - `c`: Commit ballot (lowest ballot we can commit)
+//!
+//! # Safety Guarantees
+//!
+//! The ballot protocol ensures that if any node externalizes a value,
+//! all other nodes will externalize the same value (or not externalize at all).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,46 +54,100 @@ use crate::quorum::{hash_quorum_set, is_blocking_set, is_quorum, is_quorum_set_s
 use crate::EnvelopeState;
 
 /// Phase of the ballot protocol.
+///
+/// The ballot protocol progresses through these phases in order.
+/// Once in the Externalize phase, the slot has reached consensus
+/// and the value is final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BallotPhase {
-    /// Preparing a ballot.
+    /// Preparing ballots - voting to confirm a ballot is safe to commit.
+    ///
+    /// In this phase, nodes exchange PREPARE messages to establish
+    /// which ballots are prepared (safe to commit).
     Prepare,
-    /// Confirming a prepared ballot.
+
+    /// Confirming a prepared ballot - agreeing on which ballot to commit.
+    ///
+    /// In this phase, nodes exchange CONFIRM messages to agree on
+    /// a commit range. Transition occurs when accept-commit is achieved.
     Confirm,
-    /// Externalized (consensus reached).
+
+    /// Externalized - consensus has been reached.
+    ///
+    /// This is the terminal state. The committed value is final and
+    /// will not change. Nodes broadcast EXTERNALIZE messages.
     Externalize,
 }
 
-/// State of the ballot protocol for a slot.
+/// State machine for the ballot protocol phase.
+///
+/// The `BallotProtocol` implements the second phase of SCP consensus,
+/// tracking all state needed to progress from PREPARE through CONFIRM
+/// to EXTERNALIZE.
+///
+/// # Whitepaper Correspondence
+///
+/// This implementation follows the SCP whitepaper. Key state variables:
+/// - `current_ballot` corresponds to `b` (current ballot)
+/// - `prepared` corresponds to `p` (highest prepared ballot)
+/// - `prepared_prime` corresponds to `p'` (second-highest prepared, incompatible with p)
+/// - `high_ballot` corresponds to `h` (highest confirmable ballot)
+/// - `commit` corresponds to `c` (commit ballot)
 #[derive(Debug)]
 pub struct BallotProtocol {
-    /// Current ballot we're working on.
+    /// Current ballot we're working on (`b` in the whitepaper).
+    ///
+    /// The ballot counter increases on timeout; the value comes from nomination.
     current_ballot: Option<ScpBallot>,
-    /// Highest prepared ballot (p in the whitepaper).
+
+    /// Highest prepared ballot (`p` in the whitepaper).
+    ///
+    /// A ballot is prepared when we've accepted it as prepared.
     prepared: Option<ScpBallot>,
-    /// Second highest prepared ballot (p' in the whitepaper).
+
+    /// Second-highest prepared ballot (`p'` in the whitepaper).
+    ///
+    /// Only set if it's incompatible with `prepared`. Used to prevent
+    /// committing conflicting values.
     prepared_prime: Option<ScpBallot>,
-    /// Highest ballot we can confirm prepare (h in the whitepaper).
+
+    /// Highest ballot we can confirm prepared (`h` in the whitepaper).
+    ///
+    /// When h is set and c <= h, we can move to confirm phase.
     high_ballot: Option<ScpBallot>,
-    /// Commit ballot (c in the whitepaper).
+
+    /// Commit ballot (`c` in the whitepaper).
+    ///
+    /// The lowest ballot counter at which we can commit the value.
     commit: Option<ScpBallot>,
-    /// Current phase.
+
+    /// Current protocol phase.
     phase: BallotPhase,
-    /// Latest envelopes from each node.
+
+    /// Latest ballot envelope from each node.
     latest_envelopes: HashMap<NodeId, ScpEnvelope>,
-    /// Value being confirmed/externalized.
+
+    /// The consensus value (from the current or commit ballot).
     value: Option<Value>,
-    /// Value override set when confirming prepared/commit.
+
+    /// Override value set when confirming prepared/commit.
+    ///
+    /// Used to ensure we commit the correct value when switching ballots.
     value_override: Option<Value>,
-    /// Whether we've heard from quorum in current round.
+
+    /// Whether we've heard from a quorum for the current ballot.
     heard_from_quorum: bool,
-    /// Recursion level for advance_slot.
+
+    /// Recursion depth counter for `advance_slot` (prevents infinite loops).
     current_message_level: u32,
-    /// Last local envelope we built.
+
+    /// Last envelope we constructed locally.
     last_envelope: Option<ScpEnvelope>,
-    /// Last local envelope we emitted.
+
+    /// Last envelope we actually emitted to the network.
     last_envelope_emit: Option<ScpEnvelope>,
-    /// Whether the slot is fully validated.
+
+    /// Whether values are fully validated (affects envelope emission).
     fully_validated: bool,
 }
 

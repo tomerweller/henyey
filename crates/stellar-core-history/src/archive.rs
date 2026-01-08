@@ -7,7 +7,8 @@
 use reqwest::Client;
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{
-    LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry,
+    LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
+    TransactionHistoryResultEntry,
 };
 use tracing::debug;
 use url::Url;
@@ -123,9 +124,8 @@ impl HistoryArchive {
         debug!(url = %url, "Fetching root HAS");
 
         let bytes = download_with_retries(&self.client, url.as_str(), &self.config).await?;
-        let text = String::from_utf8(bytes.to_vec()).map_err(|e| {
-            HistoryError::InvalidResponse(format!("Invalid UTF-8 in HAS: {}", e))
-        })?;
+        let text = String::from_utf8(bytes.to_vec())
+            .map_err(|e| HistoryError::InvalidResponse(format!("Invalid UTF-8 in HAS: {}", e)))?;
 
         HistoryArchiveState::from_json(&text)
     }
@@ -142,15 +142,17 @@ impl HistoryArchive {
     /// # Returns
     ///
     /// The parsed `HistoryArchiveState` for the checkpoint.
-    pub async fn get_checkpoint_has(&self, ledger: u32) -> Result<HistoryArchiveState, HistoryError> {
+    pub async fn get_checkpoint_has(
+        &self,
+        ledger: u32,
+    ) -> Result<HistoryArchiveState, HistoryError> {
         let path = checkpoint_path("history", ledger, "json");
         let url = self.make_url(&path)?;
         debug!(url = %url, ledger = ledger, "Fetching checkpoint HAS");
 
         let bytes = download_with_retries(&self.client, url.as_str(), &self.config).await?;
-        let text = String::from_utf8(bytes.to_vec()).map_err(|e| {
-            HistoryError::InvalidResponse(format!("Invalid UTF-8 in HAS: {}", e))
-        })?;
+        let text = String::from_utf8(bytes.to_vec())
+            .map_err(|e| HistoryError::InvalidResponse(format!("Invalid UTF-8 in HAS: {}", e)))?;
 
         HistoryArchiveState::from_json(&text)
     }
@@ -379,19 +381,24 @@ mod tests {
 
     #[test]
     fn test_new_archive() {
-        let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001");
+        let archive =
+            HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001");
         assert!(archive.is_ok());
     }
 
     #[test]
     fn test_new_archive_trailing_slash() {
-        let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001/").unwrap();
+        let archive =
+            HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001/")
+                .unwrap();
         assert!(archive.base_url().path().ends_with('/'));
     }
 
     #[test]
     fn test_new_archive_no_trailing_slash() {
-        let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001").unwrap();
+        let archive =
+            HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")
+                .unwrap();
         // Should have trailing slash added
         assert!(archive.base_url().path().ends_with('/'));
     }
@@ -404,15 +411,21 @@ mod tests {
 
     #[test]
     fn test_make_url() {
-        let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001").unwrap();
+        let archive =
+            HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")
+                .unwrap();
 
-        let url = archive.make_url(".well-known/stellar-history.json").unwrap();
+        let url = archive
+            .make_url(".well-known/stellar-history.json")
+            .unwrap();
         assert_eq!(
             url.as_str(),
             "https://history.stellar.org/prd/core-testnet/core_testnet_001/.well-known/stellar-history.json"
         );
 
-        let url = archive.make_url("ledger/00/00/00/ledger-0000003f.xdr.gz").unwrap();
+        let url = archive
+            .make_url("ledger/00/00/00/ledger-0000003f.xdr.gz")
+            .unwrap();
         assert_eq!(
             url.as_str(),
             "https://history.stellar.org/prd/core-testnet/core_testnet_001/ledger/00/00/00/ledger-0000003f.xdr.gz"
@@ -423,14 +436,20 @@ mod tests {
     fn test_testnet_constants() {
         assert_eq!(testnet::ARCHIVE_URLS.len(), 3);
         assert!(testnet::ARCHIVE_URLS[0].contains("core_testnet"));
-        assert_eq!(testnet::NETWORK_PASSPHRASE, "Test SDF Network ; September 2015");
+        assert_eq!(
+            testnet::NETWORK_PASSPHRASE,
+            "Test SDF Network ; September 2015"
+        );
     }
 
     #[test]
     fn test_mainnet_constants() {
         assert_eq!(mainnet::ARCHIVE_URLS.len(), 3);
         assert!(mainnet::ARCHIVE_URLS[0].contains("core_live"));
-        assert_eq!(mainnet::NETWORK_PASSPHRASE, "Public Global Stellar Network ; September 2015");
+        assert_eq!(
+            mainnet::NETWORK_PASSPHRASE,
+            "Public Global Stellar Network ; September 2015"
+        );
     }
 
     // Integration tests that require network access would go in tests/ directory

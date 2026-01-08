@@ -1,22 +1,80 @@
 //! CDP Data Lake client for fetching LedgerCloseMeta.
 //!
-//! This module implements SEP-0054 for reading ledger metadata from
-//! Stellar's Composable Data Platform (CDP) data lakes stored in S3.
+//! This module implements [SEP-0054] for reading ledger metadata from
+//! Stellar's Composable Data Platform (CDP) data lakes stored in cloud
+//! object storage (S3, GCS, etc.).
 //!
-//! Reference: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0054.md
+//! # Overview
+//!
+//! The CDP provides streaming access to `LedgerCloseMeta` - comprehensive
+//! metadata about each closed ledger including:
+//!
+//! - Transaction envelopes and results in execution order
+//! - Detailed ledger entry changes (TransactionMeta)
+//! - Evicted keys and upgrade metadata
+//!
+//! This is more detailed than what traditional history archives provide,
+//! making it useful for:
+//!
+//! - Indexers that need full transaction metadata
+//! - Analytics pipelines processing ledger changes
+//! - Replay with complete TransactionMeta verification
+//!
+//! # Data Organization
+//!
+//! CDP data is organized by date partition and ledger range:
+//!
+//! ```text
+//! {base_url}/{date}/
+//!   {inverted_start}--{start}-{end}/  # Partition (64000 ledgers)
+//!     {inverted_seq}--{seq}.xdr.zst   # Single ledger (zstd compressed)
+//! ```
+//!
+//! The inverted prefix ensures lexicographic ordering matches chronological
+//! ordering when listing objects in descending order.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use stellar_core_history::cdp::CdpDataLake;
+//!
+//! # async fn example() -> Result<(), stellar_core_history::HistoryError> {
+//! let cdp = CdpDataLake::new(
+//!     "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet",
+//!     "2025-01-07",
+//! );
+//!
+//! let meta = cdp.get_ledger_close_meta(310079).await?;
+//! let header = stellar_core_history::cdp::extract_ledger_header(&meta);
+//! println!("Ledger {} closed at {}", header.ledger_seq, header.scp_value.close_time.0);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [SEP-0054]: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0054.md
 
 use crate::{HistoryError, Result};
-use stellar_xdr::curr::{LedgerCloseMeta, Limits, ReadXdr, WriteXdr};
 use std::io::Read;
+use stellar_xdr::curr::{LedgerCloseMeta, Limits, ReadXdr, WriteXdr};
 
-/// CDP data lake client for fetching LedgerCloseMeta from S3-compatible storage.
+/// CDP data lake client for fetching `LedgerCloseMeta` from cloud object storage.
+///
+/// This client fetches ledger metadata from S3-compatible storage following the
+/// SEP-0054 specification. Each ledger's metadata is stored as a zstd-compressed
+/// XDR file containing a `LedgerCloseMetaBatch`.
 #[derive(Debug, Clone)]
 pub struct CdpDataLake {
-    /// Base URL for the data lake (e.g., "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet")
+    /// Base URL for the data lake.
+    ///
+    /// Example: `https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet`
     base_url: String,
-    /// HTTP client
+
+    /// HTTP client for fetching data.
     client: reqwest::Client,
-    /// Date partition to use (e.g., "2025-12-18")
+
+    /// Date partition to query (format: `YYYY-MM-DD`).
+    ///
+    /// CDP data is partitioned by date for efficient querying and data lifecycle management.
     date_partition: String,
 }
 
@@ -217,7 +275,21 @@ impl CdpDataLake {
     }
 }
 
-/// Extract TransactionMeta from LedgerCloseMeta for replay.
+/// Extract transaction metadata from a `LedgerCloseMeta`.
+///
+/// Returns the `TransactionMeta` for each transaction in execution order.
+/// This contains the detailed ledger entry changes made by each transaction,
+/// which is essential for:
+///
+/// - Accurate state reconstruction during replay
+/// - Building change feeds for indexers
+/// - Debugging transaction execution
+///
+/// # Note
+///
+/// The returned metadata is in transaction **apply order**, which may differ
+/// from the order in the transaction set for protocol versions with parallel
+/// execution phases.
 pub fn extract_transaction_metas(
     meta: &LedgerCloseMeta,
 ) -> Vec<stellar_xdr::curr::TransactionMeta> {
@@ -240,22 +312,55 @@ pub fn extract_transaction_metas(
     }
 }
 
-/// Transaction processing info - combines envelope, result, and meta in apply order.
+/// Complete transaction processing information in apply order.
+///
+/// This struct combines all the data needed to fully understand a transaction's
+/// execution: the original envelope, the result, and the detailed metadata
+/// showing what changed.
+///
+/// All fields are aligned by transaction - the envelope, result, and meta at
+/// index N all correspond to the same transaction.
 #[derive(Debug, Clone)]
 pub struct TransactionProcessingInfo {
-    /// The transaction envelope
+    /// The transaction envelope containing the transaction body and signatures.
     pub envelope: stellar_xdr::curr::TransactionEnvelope,
-    /// The transaction result
+
+    /// The transaction result pair containing the hash and result code.
     pub result: stellar_xdr::curr::TransactionResultPair,
-    /// The transaction metadata (ledger entry changes)
+
+    /// The transaction metadata containing all ledger entry changes.
+    ///
+    /// This includes changes from both the transaction body and any
+    /// Soroban contract invocations.
     pub meta: stellar_xdr::curr::TransactionMeta,
-    /// Fee changes meta
+
+    /// Fee-related ledger entry changes.
+    ///
+    /// These changes are applied before the transaction body and include
+    /// fee deduction from the source account.
     pub fee_meta: stellar_xdr::curr::LedgerEntryChanges,
 }
 
-/// Extract all transaction processing info in apply order from LedgerCloseMeta.
-/// This ensures envelope, result, and meta are all aligned.
-/// The network_id is needed to compute the correct transaction hash for matching.
+/// Extract complete transaction processing info in apply order.
+///
+/// This function aligns transaction envelopes with their results and metadata,
+/// ensuring all data for a given transaction is grouped together. This is more
+/// complex than it sounds because:
+///
+/// 1. Transaction sets may be ordered differently than apply order
+/// 2. Generalized transaction sets (protocol 20+) use phases
+/// 3. Transaction hashes require network-aware computation
+///
+/// # Arguments
+///
+/// * `meta` - The `LedgerCloseMeta` to extract from
+/// * `network_id` - The 32-byte network ID for hash computation
+///
+/// # Returns
+///
+/// A vector of [`TransactionProcessingInfo`] in transaction apply order.
+/// If some transactions cannot be matched (e.g., hash mismatch), a warning
+/// is logged and those transactions are omitted.
 pub fn extract_transaction_processing(
     meta: &LedgerCloseMeta,
     network_id: &[u8; 32],
@@ -265,7 +370,8 @@ pub fn extract_transaction_processing(
             // V0 has a simpler structure - tx_set.txs and tx_processing should align
             let txs = &v0.tx_set.txs;
             let processing_count = v0.tx_processing.len();
-            let result: Vec<_> = v0.tx_processing
+            let result: Vec<_> = v0
+                .tx_processing
                 .iter()
                 .enumerate()
                 .filter_map(|(i, tp)| {
@@ -294,7 +400,8 @@ pub fn extract_transaction_processing(
             let tx_map = build_tx_hash_map_with_network(&txs, network_id);
             let processing_count = v1.tx_processing.len();
 
-            let result: Vec<_> = v1.tx_processing
+            let result: Vec<_> = v1
+                .tx_processing
                 .iter()
                 .filter_map(|tp| {
                     let tx_hash = tp.result.transaction_hash.0;
@@ -321,7 +428,8 @@ pub fn extract_transaction_processing(
             let tx_map = build_tx_hash_map_with_network(&txs, network_id);
             let processing_count = v2.tx_processing.len();
 
-            let result: Vec<_> = v2.tx_processing
+            let result: Vec<_> = v2
+                .tx_processing
                 .iter()
                 .filter_map(|tp| {
                     let tx_hash = tp.result.transaction_hash.0;
@@ -420,16 +528,14 @@ fn extract_txs_from_generalized_set(
             v1.phases
                 .iter()
                 .flat_map(|phase| match phase {
-                    stellar_xdr::curr::TransactionPhase::V0(components) => {
-                        components
-                            .iter()
-                            .flat_map(|c| match c {
-                                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                                    comp,
-                                ) => comp.txs.iter().cloned().collect::<Vec<_>>(),
-                            })
-                            .collect::<Vec<_>>()
-                    }
+                    stellar_xdr::curr::TransactionPhase::V0(components) => components
+                        .iter()
+                        .flat_map(|c| match c {
+                            stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                comp,
+                            ) => comp.txs.iter().cloned().collect::<Vec<_>>(),
+                        })
+                        .collect::<Vec<_>>(),
                     stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                         // V1 phase contains parallel/Soroban transactions in execution_stages
                         let mut txs = Vec::new();
@@ -471,9 +577,7 @@ pub fn extract_transaction_results(
 
 /// Extract evicted ledger keys from LedgerCloseMeta (V2 only).
 /// These are entries that were evicted from the live bucket list.
-pub fn extract_evicted_keys(
-    meta: &LedgerCloseMeta,
-) -> Vec<stellar_xdr::curr::LedgerKey> {
+pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::LedgerKey> {
     match meta {
         LedgerCloseMeta::V0(_) | LedgerCloseMeta::V1(_) => Vec::new(),
         LedgerCloseMeta::V2(v2) => v2.evicted_keys.to_vec(),
@@ -482,9 +586,7 @@ pub fn extract_evicted_keys(
 
 /// Extract upgrade changes from LedgerCloseMeta.
 /// These are ledger entry changes from protocol upgrades (not from transactions).
-pub fn extract_upgrade_metas(
-    meta: &LedgerCloseMeta,
-) -> Vec<stellar_xdr::curr::UpgradeEntryMeta> {
+pub fn extract_upgrade_metas(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::UpgradeEntryMeta> {
     match meta {
         LedgerCloseMeta::V0(v0) => v0.upgrades_processing.to_vec(),
         LedgerCloseMeta::V1(v1) => v1.upgrades_processing.to_vec(),
@@ -498,10 +600,7 @@ mod tests {
 
     #[test]
     fn test_partition_calculation() {
-        let cdp = CdpDataLake::new(
-            "https://example.com/stellar/ledgers/testnet",
-            "2025-12-18",
-        );
+        let cdp = CdpDataLake::new("https://example.com/stellar/ledgers/testnet", "2025-12-18");
 
         // Ledger 310079 should be in partition 256000-319999
         assert_eq!(cdp.partition_for_ledger(310079), "FFFC17FF--256000-319999");
@@ -515,10 +614,7 @@ mod tests {
 
     #[test]
     fn test_batch_filename() {
-        let cdp = CdpDataLake::new(
-            "https://example.com/stellar/ledgers/testnet",
-            "2025-12-18",
-        );
+        let cdp = CdpDataLake::new("https://example.com/stellar/ledgers/testnet", "2025-12-18");
 
         // Ledger 310079 -> inverted = 0xFFFB44C0
         assert_eq!(cdp.batch_filename(310079), "FFFB44C0--310079.xdr.zst");

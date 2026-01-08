@@ -1,4 +1,41 @@
-//! Survey data manager for time-sliced overlay surveys.
+//! Survey data manager for time-sliced overlay network surveys.
+//!
+//! This module implements the time-sliced survey protocol used to collect
+//! network topology data from Stellar nodes. Surveys provide visibility into:
+//!
+//! - Network connectivity (peer counts, connection directions)
+//! - Message latency between nodes
+//! - Bandwidth usage and message statistics
+//! - Node health indicators (sync status, dropped peers)
+//!
+//! # Survey Phases
+//!
+//! A survey operates in two phases:
+//!
+//! 1. **Collecting** ([`SurveyPhase::Collecting`]): Nodes accumulate statistics
+//!    about their peers over a time window (up to 30 minutes)
+//!
+//! 2. **Reporting** ([`SurveyPhase::Reporting`]): The surveyor requests topology
+//!    data from participating nodes (up to 3 hours)
+//!
+//! # Protocol Flow
+//!
+//! ```text
+//! Surveyor                    Nodes
+//!    |                          |
+//!    |--- StartCollecting ----->|  Begin accumulating stats
+//!    |         ...              |  (time passes)
+//!    |--- StopCollecting ------>|  Finalize stats, enter reporting
+//!    |                          |
+//!    |<-- TopologyRequest ----->|  Exchange peer data
+//!    |<-- TopologyResponse -----|
+//! ```
+//!
+//! # Security
+//!
+//! - Surveys are authenticated using node signatures
+//! - Nodes can configure allowed surveyor keys
+//! - Rate limiting prevents abuse
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -17,17 +54,30 @@ const REPORTING_PHASE_MAX_DURATION: Duration = Duration::from_secs(3 * 60 * 60);
 const DEFAULT_HISTOGRAM_SAMPLES: usize = 1024;
 const TIME_SLICED_PEERS_MAX: usize = 25;
 
+/// Current phase of a time-sliced survey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SurveyPhase {
+    /// Actively collecting peer statistics during the survey window.
     Collecting,
+    /// Survey collection complete; responding to topology requests.
     Reporting,
+    /// No survey is active.
     Inactive,
 }
 
+/// Rate limiter and deduplication tracker for survey messages.
+///
+/// Prevents survey abuse by:
+/// - Limiting the number of survey requests per ledger per surveyor
+/// - Tracking which request/response pairs have been processed
+/// - Ignoring messages with stale ledger numbers
 #[derive(Debug)]
 pub struct SurveyMessageLimiter {
+    /// Number of ledgers after which messages are considered stale.
     num_ledgers_before_ignore: u32,
+    /// Maximum requests allowed per surveyor per ledger.
     max_request_limit: u32,
+    /// Tracks (ledger -> surveyor -> surveyed -> seen) for deduplication.
     record_map: BTreeMap<u32, HashMap<NodeId, HashMap<NodeId, bool>>>,
 }
 
@@ -265,21 +315,49 @@ struct CollectingPeerData {
     latency_ms: LatencyHistogram,
 }
 
+/// Manager for collecting and reporting time-sliced survey data.
+///
+/// This struct handles the complete survey lifecycle for a single node:
+///
+/// 1. **Start collecting**: Initialize statistics tracking for all connected peers
+/// 2. **During collection**: Record latency samples, message counts, byte counts
+/// 3. **Stop collecting**: Finalize statistics and transition to reporting phase
+/// 4. **Reporting**: Respond to topology requests with collected data
+///
+/// The data collected includes:
+/// - Per-peer message and byte counts (delta from survey start)
+/// - Latency measurements (median values)
+/// - Node-level metrics (sync losses, peer churn)
+/// - SCP latency samples (first-to-self, self-to-other)
 #[derive(Debug)]
 pub struct SurveyDataManager {
+    /// Current survey phase.
     phase: SurveyPhase,
+    /// When collection started.
     collect_start: Option<Instant>,
+    /// When collection ended.
     collect_end: Option<Instant>,
+    /// Survey nonce for correlation.
     nonce: Option<u32>,
+    /// Public key of the surveyor node.
     surveyor_id: Option<NodeId>,
+    /// Node-level statistics being collected.
     collecting_node: Option<CollectingNodeData>,
+    /// Per-peer statistics for inbound connections.
     collecting_inbound: HashMap<PeerId, CollectingPeerData>,
+    /// Per-peer statistics for outbound connections.
     collecting_outbound: HashMap<PeerId, CollectingPeerData>,
+    /// Finalized node data for reporting.
     final_node: Option<TimeSlicedNodeData>,
+    /// Finalized inbound peer data for reporting.
     final_inbound: Vec<TimeSlicedPeerData>,
+    /// Finalized outbound peer data for reporting.
     final_outbound: Vec<TimeSlicedPeerData>,
+    /// Whether this node is a validator.
     is_validator: bool,
+    /// Maximum inbound peer connections.
     max_inbound: u32,
+    /// Maximum outbound peer connections.
     max_outbound: u32,
 }
 

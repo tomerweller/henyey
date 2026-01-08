@@ -1,4 +1,53 @@
 //! Surge pricing lane configuration and priority queue helpers.
+//!
+//! This module implements the surge pricing mechanism used by Stellar to manage
+//! transaction set construction when demand exceeds capacity. Transactions are
+//! organized into lanes (e.g., generic, DEX, Soroban) with independent resource
+//! limits, and are prioritized by fee rate within each lane.
+//!
+//! # Overview
+//!
+//! When the network is under heavy load, more transactions may be submitted than can
+//! fit in a single ledger. Surge pricing ensures that:
+//!
+//! 1. Higher-fee transactions are prioritized
+//! 2. Different transaction types don't crowd each other out
+//! 3. Resource limits are respected across multiple dimensions
+//!
+//! # Concepts
+//!
+//! ## Lanes
+//!
+//! Lanes partition transactions by type, each with independent resource limits:
+//!
+//! - **Generic Lane (0)**: Catches all transactions not assigned to specialized lanes
+//! - **DEX Lane (1)**: For transactions containing DEX operations (ManageSellOffer, etc.)
+//! - **Soroban Lane**: For smart contract transactions (handled separately)
+//!
+//! The generic lane acts as an "umbrella" - its limits apply to all transactions
+//! regardless of their specific lane assignment.
+//!
+//! ## Lane Configurations
+//!
+//! Different [`SurgePricingLaneConfig`] implementations define lane assignment rules:
+//!
+//! - [`DexLimitingLaneConfig`]: Separates DEX transactions into their own lane with
+//!   independent limits, preventing DEX traffic from crowding out other transactions
+//! - [`SorobanGenericLaneConfig`]: Single-lane config for Soroban transactions with
+//!   multi-dimensional resource limits (instructions, memory, etc.)
+//! - [`OpsOnlyLaneConfig`]: Simple operation-count-only lane config for queue limits
+//!
+//! ## Priority Queue
+//!
+//! The [`SurgePricingPriorityQueue`] manages transaction selection by fee priority,
+//! supporting eviction of lower-fee transactions when limits are exceeded.
+//!
+//! ## Fee Rate Comparison
+//!
+//! Transactions are compared by their fee rate (fee / operation count), not absolute
+//! fee. This ensures fair comparison between transactions of different sizes. Ties
+//! are broken deterministically using a seeded hash to ensure consistent ordering
+//! across nodes.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -11,17 +60,39 @@ use stellar_core_tx::TransactionFrame;
 
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
 
+/// Lane index for generic (non-specialized) transactions.
 pub(crate) const GENERIC_LANE: usize = 0;
+
+/// Lane index for DEX (decentralized exchange) transactions.
 pub(crate) const DEX_LANE: usize = 1;
 
+/// Trait for lane configuration strategies.
+///
+/// Different lane configurations determine how transactions are assigned to lanes
+/// and what resource limits apply to each lane. Implementations define:
+///
+/// - How to classify transactions into lanes (based on operation types, etc.)
+/// - What resource limits apply to each lane
+/// - How to measure a transaction's resource consumption
 pub(crate) trait SurgePricingLaneConfig {
+    /// Determine which lane a transaction belongs to based on its contents.
     fn get_lane(&self, frame: &TransactionFrame) -> usize;
+
+    /// Get the resource limits for each lane.
     fn lane_limits(&self) -> &[Resource];
+
+    /// Update the generic lane's resource limit (used during dynamic adjustments).
     #[allow(dead_code)]
     fn update_generic_lane_limit(&mut self, limit: Resource);
+
+    /// Calculate the resources consumed by a transaction.
     fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource;
 }
 
+/// Lane configuration that separates DEX transactions into their own lane.
+///
+/// This prevents high-volume DEX trading from crowding out other transaction
+/// types. The DEX lane has its own resource limit independent of the generic lane.
 pub(crate) struct DexLimitingLaneConfig {
     lane_limits: Vec<Resource>,
     use_byte_limit: bool,
@@ -63,6 +134,11 @@ impl SurgePricingLaneConfig for DexLimitingLaneConfig {
     }
 }
 
+/// Lane configuration for Soroban smart contract transactions.
+///
+/// Soroban transactions have multi-dimensional resource limits including
+/// instructions, memory, and ledger entry counts. This config applies those
+/// limits to a single lane.
 pub(crate) struct SorobanGenericLaneConfig {
     lane_limits: Vec<Resource>,
 }
@@ -96,6 +172,10 @@ impl SurgePricingLaneConfig for SorobanGenericLaneConfig {
     }
 }
 
+/// Simple lane configuration that only considers operation count.
+///
+/// Used for queue admission limits where the primary concern is
+/// limiting total operations rather than multi-dimensional resources.
 pub(crate) struct OpsOnlyLaneConfig {
     lane_limits: Vec<Resource>,
 }
@@ -127,6 +207,11 @@ impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
     }
 }
 
+/// An entry in the surge pricing priority queue.
+///
+/// Wraps a [`QueuedTransaction`] with the fee and ordering information needed
+/// for priority queue operations. Entries are ordered by fee rate (fee/ops),
+/// with tie-breaking based on a deterministic hash to ensure consistent ordering.
 #[derive(Clone)]
 pub(crate) struct QueueEntry {
     total_fee: u64,
@@ -182,14 +267,40 @@ impl Ord for QueueEntry {
     }
 }
 
+/// Result of visiting a transaction during priority queue iteration.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VisitTxResult {
+    /// Transaction was skipped (e.g., sequence gap).
     Skipped,
+    /// Transaction was rejected (e.g., validation failure).
     Rejected,
+    /// Transaction was successfully processed.
     Processed,
 }
 
+/// Priority queue for surge pricing transaction selection.
+///
+/// Manages transactions across multiple lanes, selecting highest-fee transactions
+/// while respecting per-lane resource limits. Supports eviction of lower-fee
+/// transactions when queue limits are exceeded.
+///
+/// # Algorithm
+///
+/// The queue maintains separate ordered sets for each lane. When selecting
+/// transactions:
+///
+/// 1. Find the highest-fee transaction across all active lanes
+/// 2. Check if it fits within both its specific lane limit AND the generic lane limit
+/// 3. If it fits, add it to the result and update both limits
+/// 4. If it doesn't fit, mark that lane as having transactions that didn't fit
+/// 5. Repeat until no more transactions can be added
+///
+/// # Eviction
+///
+/// When adding a transaction that would exceed limits, the queue can evict
+/// lower-fee transactions to make room. This ensures high-fee transactions
+/// are always prioritized.
 pub(crate) struct SurgePricingPriorityQueue {
     lane_config: Box<dyn SurgePricingLaneConfig>,
     lane_limits: Vec<Resource>,

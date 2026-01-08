@@ -1,12 +1,36 @@
-//! Verification utilities for history catchup.
+//! Cryptographic verification utilities for history data.
 //!
-//! This module provides functions to verify the integrity of history data:
+//! This module provides functions to verify the integrity of all data downloaded
+//! from history archives. Verification is essential for security: while we download
+//! from trusted archives, we cryptographically verify everything to detect corruption
+//! or tampering.
 //!
-//! - Header chain verification (previous hash linkage)
-//! - Bucket hash verification (content matches expected hash)
-//! - Ledger hash verification (header hash matches bucket list)
+//! # Verification Layers
 //!
-//! Verification is critical for security - we trust but verify history from archives.
+//! ## Header Chain Verification
+//!
+//! Ledger headers form a cryptographic hash chain where each header contains
+//! `previous_ledger_hash` - the SHA-256 hash of the previous header. This
+//! ensures that any modification to historical headers would be detected.
+//!
+//! ## Bucket Hash Verification
+//!
+//! Each bucket file is identified by its SHA-256 content hash. After downloading,
+//! we verify that `SHA256(bucket_content) == expected_hash`. This prevents both
+//! accidental corruption and malicious substitution.
+//!
+//! ## Transaction Set Verification
+//!
+//! The transaction set hash in the SCP value must match the hash of the
+//! downloaded transaction set. For classic sets, this is computed over the
+//! concatenation of previous_ledger_hash and transaction XDR. For generalized
+//! sets, it is the hash of the entire set XDR.
+//!
+//! ## Bucket List Hash Verification
+//!
+//! The final verification: the computed bucket list hash from our reconstructed
+//! state must match `header.bucket_list_hash`. This proves that we have correctly
+//! rebuilt the entire ledger state.
 
 use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
 use stellar_core_common::Hash256;
@@ -293,15 +317,9 @@ pub fn verify_scp_history_entries(entries: &[ScpHistoryEntry]) -> Result<()> {
 
 fn scp_quorum_set_hash(statement: &ScpStatement) -> Option<stellar_xdr::curr::Hash> {
     match &statement.pledges {
-        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => {
-            Some(nom.quorum_set_hash.clone())
-        }
-        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => {
-            Some(prep.quorum_set_hash.clone())
-        }
-        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => {
-            Some(conf.quorum_set_hash.clone())
-        }
+        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => Some(nom.quorum_set_hash.clone()),
+        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => Some(prep.quorum_set_hash.clone()),
+        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => Some(conf.quorum_set_hash.clone()),
         stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
             Some(ext.commit_quorum_set_hash.clone())
         }

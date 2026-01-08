@@ -1,14 +1,65 @@
-//! Hashing utilities.
+//! SHA-256 hashing utilities.
+//!
+//! This module provides SHA-256 hash computation in both single-shot and
+//! streaming modes. All functions return [`Hash256`], a 32-byte hash value.
+//!
+//! # Single-shot Hashing
+//!
+//! For hashing data that is available all at once:
+//!
+//! ```
+//! use stellar_core_crypto::sha256;
+//!
+//! let hash = sha256(b"hello world");
+//! ```
+//!
+//! # Streaming Hashing
+//!
+//! For hashing data that arrives in chunks (e.g., reading from a file):
+//!
+//! ```
+//! use stellar_core_crypto::Sha256Hasher;
+//!
+//! let mut hasher = Sha256Hasher::new();
+//! hasher.update(b"hello ");
+//! hasher.update(b"world");
+//! let hash = hasher.finalize();
+//! ```
 
 use sha2::{Digest, Sha256};
 use stellar_core_common::Hash256;
 
-/// Compute SHA-256 hash of data.
+/// Computes the SHA-256 hash of the given data.
+///
+/// This is a convenience function for single-shot hashing. For streaming
+/// hashing of large or chunked data, use [`Sha256Hasher`] instead.
+///
+/// # Example
+///
+/// ```
+/// use stellar_core_crypto::sha256;
+///
+/// let hash = sha256(b"stellar");
+/// assert_eq!(hash.as_bytes().len(), 32);
+/// ```
 pub fn sha256(data: &[u8]) -> Hash256 {
     Hash256::hash(data)
 }
 
-/// Compute SHA-256 hash of multiple data chunks.
+/// Computes the SHA-256 hash of multiple data chunks.
+///
+/// This is equivalent to concatenating all chunks and hashing the result,
+/// but avoids the memory allocation of creating an intermediate buffer.
+///
+/// # Example
+///
+/// ```
+/// use stellar_core_crypto::{sha256, sha256_multi};
+///
+/// let hash1 = sha256(b"helloworld");
+/// let hash2 = sha256_multi(&[b"hello", b"world"]);
+/// assert_eq!(hash1, hash2);
+/// ```
 pub fn sha256_multi(chunks: &[&[u8]]) -> Hash256 {
     let mut hasher = Sha256::new();
     for chunk in chunks {
@@ -20,25 +71,43 @@ pub fn sha256_multi(chunks: &[&[u8]]) -> Hash256 {
     Hash256(bytes)
 }
 
-/// A streaming SHA-256 hasher.
+/// A streaming SHA-256 hasher for incremental hash computation.
+///
+/// Use this when you need to hash data that is not available all at once,
+/// such as when reading from a stream or processing data in chunks.
+///
+/// # Example
+///
+/// ```
+/// use stellar_core_crypto::Sha256Hasher;
+///
+/// let mut hasher = Sha256Hasher::new();
+/// hasher.update(b"chunk 1");
+/// hasher.update(b"chunk 2");
+/// let hash = hasher.finalize();
+/// ```
 pub struct Sha256Hasher {
     inner: Sha256,
 }
 
 impl Sha256Hasher {
-    /// Create a new hasher.
+    /// Creates a new SHA-256 hasher.
     pub fn new() -> Self {
         Self {
             inner: Sha256::new(),
         }
     }
 
-    /// Update the hasher with data.
+    /// Feeds data into the hasher.
+    ///
+    /// This method can be called multiple times to incrementally add data.
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
-    /// Finalize and return the hash.
+    /// Consumes the hasher and returns the computed hash.
+    ///
+    /// After calling this method, the hasher cannot be used again.
     pub fn finalize(self) -> Hash256 {
         let result = self.inner.finalize();
         let mut bytes = [0u8; 32];

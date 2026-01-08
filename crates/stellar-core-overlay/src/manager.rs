@@ -1,10 +1,36 @@
-//! OverlayManager for managing all peer connections.
+//! Overlay manager for coordinating peer connections and message routing.
 //!
-//! Handles:
-//! - Accepting incoming connections
-//! - Connecting to outbound peers
-//! - Broadcasting messages
-//! - Message routing
+//! The [`OverlayManager`] is the primary interface for the overlay network subsystem.
+//! It handles all aspects of peer-to-peer networking:
+//!
+//! - **Connection Management**: Establishes and maintains TCP connections to peers,
+//!   respecting configured limits for inbound and outbound connections
+//!
+//! - **Peer Discovery**: Learns about new peers from connected nodes and maintains
+//!   a pool of known addresses to connect to
+//!
+//! - **Message Routing**: Receives messages from peers and distributes them to
+//!   subscribers, while also sending outbound messages to appropriate peers
+//!
+//! - **Flood Control**: Uses the [`FloodGate`] to prevent duplicate message
+//!   propagation while ensuring all peers receive new messages
+//!
+//! # Architecture
+//!
+//! The manager runs several background tasks:
+//!
+//! 1. **Listener task**: Accepts incoming connections (if enabled)
+//! 2. **Connector task**: Initiates outbound connections to maintain target peer count
+//! 3. **Peer tasks**: One per connected peer, handles message I/O
+//! 4. **Advertiser task**: Periodically sends peer lists to connected nodes
+//!
+//! # Flow Control
+//!
+//! The overlay implements Stellar's flow control protocol using `SendMore` and
+//! `SendMoreExtended` messages. This prevents peers from overwhelming each other
+//! with messages during high-traffic periods.
+//!
+//! [`FloodGate`]: crate::FloodGate
 
 use crate::{
     codec::helpers,
@@ -45,23 +71,55 @@ fn is_fetch_message(message: &StellarMessage) -> bool {
     )
 }
 
-/// Message received from the overlay.
+/// A message received from a connected peer via the overlay network.
+///
+/// These messages are delivered to subscribers of the overlay manager's
+/// broadcast channel. The `from_peer` field identifies the sender.
 #[derive(Debug, Clone)]
 pub struct OverlayMessage {
-    /// The peer that sent the message.
+    /// The peer that sent this message.
     pub from_peer: PeerId,
-    /// The message.
+    /// The Stellar protocol message.
     pub message: StellarMessage,
 }
 
-/// Snapshot of a connected peer.
+/// A snapshot of a connected peer's info and statistics.
+///
+/// Provides a point-in-time view of a peer's state without holding any locks.
 #[derive(Debug, Clone)]
 pub struct PeerSnapshot {
+    /// Static information about the peer (ID, address, version).
     pub info: PeerInfo,
+    /// Message and byte counters.
     pub stats: PeerStatsSnapshot,
 }
 
-/// Manager for all peer connections.
+/// Central manager for all peer connections in the overlay network.
+///
+/// The overlay manager is the main entry point for networking operations.
+/// It handles connection lifecycle, message routing, and peer discovery.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// // Create and start the manager
+/// let config = OverlayConfig::testnet();
+/// let local_node = LocalNode::new_testnet(secret_key);
+/// let mut manager = OverlayManager::new(config, local_node)?;
+/// manager.start().await?;
+///
+/// // Subscribe to messages
+/// let mut rx = manager.subscribe();
+/// while let Ok(msg) = rx.recv().await {
+///     handle_message(msg);
+/// }
+///
+/// // Broadcast a message
+/// manager.broadcast(StellarMessage::Transaction(tx)).await?;
+///
+/// // Shutdown
+/// manager.shutdown().await?;
+/// ```
 pub struct OverlayManager {
     /// Configuration.
     config: OverlayConfig,
@@ -1344,16 +1402,18 @@ impl Drop for OverlayManager {
     }
 }
 
-/// Overlay statistics.
+/// Summary statistics for the overlay network.
+///
+/// Provides a high-level view of overlay health and activity.
 #[derive(Debug, Clone)]
 pub struct OverlayStats {
-    /// Number of connected peers.
+    /// Total number of connected peers (inbound + outbound).
     pub connected_peers: usize,
-    /// Number of inbound connections.
+    /// Number of peers that connected to us.
     pub inbound_peers: usize,
-    /// Number of outbound connections.
+    /// Number of peers we connected to.
     pub outbound_peers: usize,
-    /// Flood gate statistics.
+    /// Message flooding statistics.
     pub flood_stats: FloodGateStats,
 }
 

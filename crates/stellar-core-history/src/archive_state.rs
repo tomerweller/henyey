@@ -200,7 +200,10 @@ impl HistoryArchiveState {
     /// # Returns
     ///
     /// A tuple of (current_hash, snapshot_hash) if the level exists.
-    pub fn bucket_hashes_at_level(&self, level: usize) -> Option<(Option<Hash256>, Option<Hash256>)> {
+    pub fn bucket_hashes_at_level(
+        &self,
+        level: usize,
+    ) -> Option<(Option<Hash256>, Option<Hash256>)> {
         self.current_buckets.get(level).map(|bucket_level| {
             let zero_hash = "0".repeat(64);
 
@@ -229,7 +232,10 @@ impl HistoryArchiveState {
     /// # Returns
     ///
     /// A tuple of (current_hash, snapshot_hash) if the level exists.
-    pub fn hot_archive_bucket_hashes_at_level(&self, level: usize) -> Option<(Option<Hash256>, Option<Hash256>)> {
+    pub fn hot_archive_bucket_hashes_at_level(
+        &self,
+        level: usize,
+    ) -> Option<(Option<Hash256>, Option<Hash256>)> {
         let hot_buckets = self.hot_archive_buckets.as_ref()?;
         hot_buckets.get(level).map(|bucket_level| {
             let zero_hash = "0".repeat(64);
@@ -252,7 +258,9 @@ impl HistoryArchiveState {
 
     /// Check if this HAS contains hot archive buckets.
     pub fn has_hot_archive_buckets(&self) -> bool {
-        self.hot_archive_buckets.as_ref().map_or(false, |v| !v.is_empty())
+        self.hot_archive_buckets
+            .as_ref()
+            .map_or(false, |v| !v.is_empty())
     }
 
     /// Get the number of hot archive bucket levels.

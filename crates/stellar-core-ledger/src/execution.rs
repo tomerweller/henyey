@@ -1,7 +1,38 @@
 //! Transaction execution during ledger close.
 //!
-//! This module integrates the transaction processing from stellar-core-tx
-//! with the ledger close process.
+//! This module bridges the ledger close process with the transaction processing
+//! layer (`stellar-core-tx`). It handles:
+//!
+//! - Loading required state from snapshots into the execution environment
+//! - Executing transactions in the correct order with proper fee handling
+//! - Recording state changes to the [`LedgerDelta`]
+//! - Generating transaction metadata for history
+//!
+//! # Execution Flow
+//!
+//! 1. **State Loading**: Required accounts, trustlines, and other entries are
+//!    loaded from the snapshot into the [`LedgerStateManager`]
+//!
+//! 2. **Fee Charging**: Transaction fees are charged upfront, even for
+//!    transactions that will fail validation
+//!
+//! 3. **Operation Execution**: Each operation is executed in sequence,
+//!    with results collected for the transaction result
+//!
+//! 4. **State Recording**: Changes are recorded to the [`LedgerDelta`]
+//!    for later application to the bucket list
+//!
+//! # Soroban Support
+//!
+//! For Protocol 20+, this module handles Soroban smart contract execution:
+//!
+//! - Loading contract data and code from the footprint
+//! - Configuring the Soroban host with network parameters
+//! - Computing resource fees and rent
+//! - Processing contract events
+//!
+//! [`LedgerDelta`]: crate::LedgerDelta
+//! [`LedgerStateManager`]: stellar_core_tx::LedgerStateManager
 
 use std::collections::{HashMap, HashSet};
 

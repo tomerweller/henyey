@@ -4,6 +4,19 @@
 //! for slots that are not yet active. Once a slot becomes active (the node
 //! has caught up to that point), the pending envelopes are released for
 //! processing.
+//!
+//! # Overview
+//!
+//! When a node is catching up or when SCP messages arrive for future ledger slots,
+//! those envelopes cannot be processed immediately. The [`PendingEnvelopes`] manager
+//! buffers these envelopes and releases them when the appropriate slot becomes active.
+//!
+//! # Key Features
+//!
+//! - **Deduplication**: Tracks envelope hashes to prevent duplicate processing
+//! - **Slot Distance Limits**: Rejects envelopes too far ahead of the current slot
+//! - **Expiration**: Automatically evicts old envelopes based on configurable age limits
+//! - **Per-Slot Limits**: Prevents memory exhaustion by limiting envelopes per slot
 
 use dashmap::DashMap;
 use parking_lot::RwLock;

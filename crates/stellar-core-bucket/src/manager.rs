@@ -1,10 +1,42 @@
 //! BucketManager - manages bucket files on disk.
 //!
-//! The BucketManager handles:
-//! - Creating buckets from entries (sort, serialize, compress, write)
-//! - Loading buckets by hash
-//! - Caching loaded buckets in memory
-//! - Cleaning up unused bucket files
+//! The `BucketManager` is responsible for the lifecycle of bucket files,
+//! providing a high-level interface for bucket operations.
+//!
+//! # Responsibilities
+//!
+//! - **Creating** buckets from entries (sort, serialize, compress, write to disk)
+//! - **Loading** buckets by content hash (from cache or disk)
+//! - **Caching** frequently accessed buckets in memory
+//! - **Merging** buckets and storing the results
+//! - **Garbage collecting** unused bucket files
+//!
+//! # File Layout
+//!
+//! Bucket files are stored in a configurable directory with names derived
+//! from their content hash:
+//!
+//! ```text
+//! <bucket_dir>/
+//!   <hash1>.bucket.gz
+//!   <hash2>.bucket.gz
+//!   ...
+//! ```
+//!
+//! Files are gzip-compressed XDR. The hash is computed from the uncompressed
+//! content (including XDR record marks).
+//!
+//! # Caching
+//!
+//! The manager maintains an in-memory cache of recently accessed buckets.
+//! The cache uses a simple eviction policy (random eviction when full).
+//! For production use, consider a more sophisticated LRU policy.
+//!
+//! # Thread Safety
+//!
+//! The manager uses `RwLock` for the cache, making it safe for concurrent
+//! reads with exclusive writes. File operations are atomic (write to temp,
+//! then rename).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,17 +53,41 @@ use crate::{BucketError, Result};
 
 /// Manager for bucket files on disk.
 ///
-/// The BucketManager is responsible for:
-/// - Storing bucket files in a directory
-/// - Loading buckets by their content hash
-/// - Caching buckets in memory
-/// - Creating new buckets from entries
+/// The `BucketManager` provides the main interface for working with buckets
+/// on disk. It handles all the complexity of serialization, compression,
+/// caching, and file management.
+///
+/// # Example
+///
+/// ```ignore
+/// use stellar_core_bucket::{BucketManager, BucketEntry};
+///
+/// // Create a manager
+/// let manager = BucketManager::new("/path/to/buckets".into())?;
+///
+/// // Create a bucket from entries
+/// let entries = vec![BucketEntry::Live(some_entry)];
+/// let bucket = manager.create_bucket(entries)?;
+///
+/// // Later, load the bucket by hash
+/// let loaded = manager.load_bucket(&bucket.hash())?;
+///
+/// // Garbage collect unused buckets
+/// let active_hashes = bucket_list.all_bucket_hashes();
+/// manager.retain_buckets(&active_hashes)?;
+/// ```
+///
+/// # Cache Behavior
+///
+/// The manager caches buckets in memory up to `max_cache_size`. When the
+/// cache is full, a random entry is evicted. All cache operations are
+/// thread-safe via `RwLock`.
 pub struct BucketManager {
     /// Directory where bucket files are stored.
     bucket_dir: PathBuf,
-    /// Cache of loaded buckets, keyed by hash.
+    /// Cache of loaded buckets, keyed by content hash.
     cache: RwLock<HashMap<Hash256, Arc<Bucket>>>,
-    /// Maximum number of buckets to cache.
+    /// Maximum number of buckets to keep in cache.
     max_cache_size: usize,
 }
 
@@ -365,13 +421,15 @@ impl std::fmt::Debug for BucketManager {
 }
 
 /// Statistics about a BucketManager.
+///
+/// Provides insight into the manager's state for monitoring and debugging.
 #[derive(Debug, Clone)]
 pub struct BucketManagerStats {
-    /// Number of buckets in the cache.
+    /// Number of buckets currently held in the in-memory cache.
     pub cached_buckets: usize,
-    /// Number of bucket files on disk.
+    /// Number of bucket files on disk (may include garbage).
     pub disk_buckets: usize,
-    /// The bucket directory path.
+    /// The directory where bucket files are stored.
     pub bucket_dir: PathBuf,
 }
 

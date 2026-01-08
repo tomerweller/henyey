@@ -1,9 +1,21 @@
 //! Error types for history operations.
+//!
+//! This module defines the error types used throughout the history crate.
+//! Errors are categorized by their source:
+//!
+//! - **Network errors**: HTTP failures, timeouts, unavailable archives
+//! - **Parsing errors**: Malformed XDR, JSON, or URL data
+//! - **Verification errors**: Hash mismatches, broken chains, invalid sequences
+//! - **Catchup errors**: Process failures during synchronization
 
 use stellar_core_common::Hash256;
 use thiserror::Error;
 
 /// Errors that can occur during history operations.
+///
+/// These errors cover the full range of failures that can occur when
+/// interacting with history archives, from network issues to data
+/// integrity problems.
 #[derive(Debug, Error)]
 pub enum HistoryError {
     /// Archive not reachable.

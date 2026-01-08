@@ -15,7 +15,7 @@ use stellar_core_history::{
     archive::HistoryArchive,
     archive_state::{HASBucketLevel, HistoryArchiveState},
     catchup::{CatchupManagerBuilder, CatchupOptions},
-    paths::{checkpoint_path},
+    paths::checkpoint_path,
     verify,
 };
 use stellar_core_ledger::TransactionSetVariant;
@@ -126,9 +126,8 @@ async fn test_catchup_replay_bucket_hash_verification() {
         previous_ledger_hash: Hash(*header63_hash.as_bytes()),
         txs: VecM::default(),
     };
-    let tx_set_hash =
-        verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
-            .expect("tx set hash");
+    let tx_set_hash = verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
+        .expect("tx set hash");
 
     let result_set = TransactionResultSet {
         results: VecM::default(),
@@ -242,21 +241,23 @@ async fn test_catchup_replay_bucket_hash_verification() {
     );
 
     let fixtures = Arc::new(fixtures);
-    let app = Router::new()
-        .route(
-            "/*path",
-            get(
-                |Path(path): Path<String>, State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
-                    let key = path.trim_start_matches('/');
-                    if let Some(body) = state.get(key) {
-                        (StatusCode::OK, body.clone())
-                    } else {
-                        (StatusCode::NOT_FOUND, Vec::new())
-                    }
-                },
-            ),
-        )
-        .with_state(Arc::clone(&fixtures));
+    let app =
+        Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        let key = path.trim_start_matches('/');
+                        if let Some(body) = state.get(key) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
 
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -291,12 +292,12 @@ async fn test_catchup_replay_bucket_hash_verification() {
         .build()
         .expect("catchup manager");
 
-    let output = manager
-        .catchup_to_ledger(target)
-        .await
-        .expect("catchup");
+    let output = manager.catchup_to_ledger(target).await.expect("catchup");
 
     assert_eq!(output.result.ledger_seq, target);
     assert_eq!(output.result.ledgers_applied, 1);
-    assert_eq!(output.header.bucket_list_hash.0, *replay_bucket_hash.as_bytes());
+    assert_eq!(
+        output.header.bucket_list_hash.0,
+        *replay_bucket_hash.as_bytes()
+    );
 }

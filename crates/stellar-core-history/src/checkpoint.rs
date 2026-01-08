@@ -11,7 +11,9 @@
 //! - Checkpoint 127 contains ledgers 64-127
 //! - Checkpoint 191 contains ledgers 128-191
 
-pub use crate::paths::{bucket_path, checkpoint_ledger, checkpoint_path, is_checkpoint_ledger, CHECKPOINT_FREQUENCY};
+pub use crate::paths::{
+    bucket_path, checkpoint_ledger, checkpoint_path, is_checkpoint_ledger, CHECKPOINT_FREQUENCY,
+};
 
 /// Alias for checkpoint_ledger to match naming convention.
 ///

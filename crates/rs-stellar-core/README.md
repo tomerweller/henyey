@@ -8,19 +8,36 @@ This crate provides:
 
 - Command-line interface (CLI) for all node operations
 - Thin wrapper around `stellar-core-app` for runtime orchestration
+- Offline tools for XDR manipulation and replay testing
+
+## Quick Start
+
+```bash
+# Run a node on testnet (default)
+rs-stellar-core --testnet run
+
+# Catch up to the current ledger
+rs-stellar-core --testnet catchup current
+
+# Generate a new keypair
+rs-stellar-core new-keypair
+
+# Print sample configuration
+rs-stellar-core sample-config > config.toml
+```
 
 ## Architecture
 
-- CLI parsing builds a `Config` and dispatches to `stellar-core-app` commands.
-- Run modes (watcher/validator) initialize overlay, herder, ledger, and history subsystems.
-- Catchup and offline tooling reuse historywork/history pipelines for deterministic replay.
-- HTTP endpoints expose app state and control hooks (status, peers, surveys).
+- CLI parsing builds a `Config` and dispatches to `stellar-core-app` commands
+- Run modes (watcher/validator) initialize overlay, herder, ledger, and history subsystems
+- Catchup and offline tooling reuse historywork/history pipelines for deterministic replay
+- HTTP endpoints expose app state and control hooks (status, peers, surveys)
 
 ## Key Concepts
 
-- **Run modes**: watcher vs validator, derived from config and CLI flags.
-- **Catchup modes**: minimal vs complete, controlled by checkpoint selection.
-- **Offline tools**: deterministic replay and XDR utilities for parity debugging.
+- **Run modes**: watcher vs validator, derived from config and CLI flags
+- **Catchup modes**: minimal vs complete, controlled by checkpoint selection
+- **Offline tools**: deterministic replay and XDR utilities for parity debugging
 
 ## CLI Usage
 
@@ -33,9 +50,9 @@ rs-stellar-core [OPTIONS] <COMMAND>
 | Option | Description |
 |--------|-------------|
 | `-c, --config <FILE>` | Path to configuration file |
-| `-v, --verbose` | Enable verbose logging |
-| `--trace` | Enable trace logging |
-| `--log-format <FORMAT>` | Log format: text or json |
+| `-v, --verbose` | Enable verbose logging (debug level) |
+| `--trace` | Enable trace logging (most verbose) |
+| `--log-format <FORMAT>` | Log format: `text` or `json` |
 | `--testnet` | Use testnet configuration |
 | `--mainnet` | Use mainnet configuration |
 
@@ -49,11 +66,14 @@ Start the node:
 # Run with testnet defaults
 rs-stellar-core --testnet run
 
-# Run as validator
+# Run as validator (participate in consensus)
 rs-stellar-core --testnet run --validator
 
-# Run with HTTP server on custom port
-rs-stellar-core --testnet run --http-port 8080
+# Run as watcher (observe only, no catchup)
+rs-stellar-core --testnet run --watcher
+
+# Force catchup even if state exists
+rs-stellar-core --testnet run --force-catchup
 ```
 
 #### catchup
@@ -67,8 +87,11 @@ rs-stellar-core --testnet catchup current
 # Catch up to specific ledger
 rs-stellar-core --testnet catchup 1000000
 
-# Minimal mode (fastest)
+# Minimal mode (fastest, only latest state)
 rs-stellar-core --testnet catchup current --mode minimal
+
+# Complete mode (full history from genesis)
+rs-stellar-core --testnet catchup current --mode complete
 
 # With parallel downloads
 rs-stellar-core --testnet catchup current --parallelism 16
@@ -83,6 +106,8 @@ Create a new database:
 
 ```bash
 rs-stellar-core --testnet new-db
+rs-stellar-core --testnet new-db --force  # Overwrite existing
+rs-stellar-core --testnet new-db /path/to/db.sqlite
 ```
 
 #### upgrade-db
@@ -99,6 +124,16 @@ Generate a new node keypair:
 
 ```bash
 rs-stellar-core new-keypair
+```
+
+Output:
+```
+Generated new keypair:
+
+Public Key:  GDKXE2OZM...
+Secret Seed: SB7BVQG...
+
+IMPORTANT: Store the secret seed securely! It cannot be recovered.
 ```
 
 #### info
@@ -118,6 +153,13 @@ rs-stellar-core --testnet verify-history
 rs-stellar-core --testnet verify-history --from 1000 --to 2000
 ```
 
+Checks:
+- HAS (History Archive State) structure validity
+- Checkpoint ledger hash chains
+- Transaction set hashes
+- Transaction result hashes
+- SCP history entries
+
 #### publish-history
 
 Publish history to archives (validators only):
@@ -127,73 +169,126 @@ rs-stellar-core --config config.toml publish-history
 rs-stellar-core --config config.toml publish-history --force
 ```
 
+Supports both local file archives and remote archives via shell commands.
+
+#### check-quorum-intersection
+
+Check quorum intersection from a JSON file:
+
+```bash
+rs-stellar-core check-quorum-intersection network.json
+```
+
+Verifies that a network enjoys quorum intersection (all quorums share at least
+one node). This is a critical safety property for SCP.
+
 #### sample-config
 
 Print sample configuration:
 
 ```bash
+rs-stellar-core sample-config
 rs-stellar-core sample-config > config.toml
 ```
 
 #### offline
 
-Offline utilities:
+Offline utilities that don't require network access:
+
+##### convert-key
+
+Convert key formats:
 
 ```bash
-# Convert key formats
+# StrKey to hex
 rs-stellar-core offline convert-key GDKXE2OZM...
 
-# Decode XDR
-rs-stellar-core offline decode-xdr --type LedgerHeader <base64>
-
-# Encode to XDR
-rs-stellar-core offline encode-xdr --type AccountId GDKXE2OZM...
-rs-stellar-core offline encode-xdr --type Asset "USD:GDKXE2OZM..."
-rs-stellar-core offline encode-xdr --type Hash <64-char-hex>
-
-# Bucket info
-rs-stellar-core offline bucket-info /path/to/buckets
+# Hex to strkey
+rs-stellar-core offline convert-key a1b2c3d4...
 ```
 
-##### replay-test
+##### decode-xdr
 
-Test ledger hash parity by replaying ledgers from history archives offline.
-This is useful for debugging hash mismatches without connecting to the live network.
+Decode XDR from base64:
 
 ```bash
-# Test recent ledgers (default: ~1000 ledgers back)
-rs-stellar-core --testnet offline replay-test
-
-# Test a specific ledger range
-rs-stellar-core --testnet offline replay-test --from 310000 --to 311000
-
-# Stop on first mismatch (for debugging)
-rs-stellar-core --testnet offline replay-test --from 310000 --stop-on-error
-
-# Compare transaction results for detailed mismatch info
-rs-stellar-core --testnet offline replay-test --from 310000 --compare-results
-
-# Skip invariant checking (faster)
-rs-stellar-core --testnet offline replay-test --from 310000 --skip-invariants
+rs-stellar-core offline decode-xdr --type LedgerHeader <base64>
+rs-stellar-core offline decode-xdr --type TransactionEnvelope <base64>
+rs-stellar-core offline decode-xdr --type TransactionResult <base64>
 ```
 
-Options:
-- `--from <LEDGER>`: Start ledger sequence (defaults to ~16 checkpoints back)
-- `--to <LEDGER>`: End ledger sequence (defaults to latest available)
-- `--stop-on-error`: Stop on first hash mismatch
-- `--compare-results`: Compare transaction results against history
-- `--skip-invariants`: Skip invariant checking for faster testing
+##### encode-xdr
 
-The command downloads bucket list state at the start checkpoint, then replays
-each ledger by re-executing transactions and comparing the resulting bucket
-list hash against the expected hash from history. This helps identify:
-- Transaction execution differences
-- Bucket list update differences
-- Fee pool or total coins calculation differences
+Encode values to XDR:
+
+```bash
+rs-stellar-core offline encode-xdr --type AccountId GDKXE2OZM...
+rs-stellar-core offline encode-xdr --type Asset "USD:GDKXE2OZM..."
+rs-stellar-core offline encode-xdr --type Asset native
+rs-stellar-core offline encode-xdr --type Hash <64-char-hex>
+```
+
+##### bucket-info
+
+Print bucket file/directory information:
+
+```bash
+rs-stellar-core offline bucket-info /path/to/buckets
+rs-stellar-core offline bucket-info /path/to/bucket.xdr
+```
+
+##### replay-bucket-list
+
+Test bucket list implementation by replaying ledger changes from CDP:
+
+```bash
+# Test recent ledgers
+rs-stellar-core --testnet offline replay-bucket-list
+
+# Test a specific ledger range
+rs-stellar-core --testnet offline replay-bucket-list --from 310000 --to 311000
+
+# Stop on first mismatch
+rs-stellar-core --testnet offline replay-bucket-list --stop-on-error
+
+# Test only live bucket list (ignore hot archive)
+rs-stellar-core --testnet offline replay-bucket-list --live-only
+```
+
+This validates bucket list implementation (spills, merges, hash computation)
+using exact ledger changes from CDP metadata.
+
+##### verify-execution
+
+Test transaction execution by comparing results against CDP:
+
+```bash
+# Test recent ledgers
+rs-stellar-core --testnet offline verify-execution
+
+# Test a specific range
+rs-stellar-core --testnet offline verify-execution --from 310000 --to 311000
+
+# Stop on first mismatch with detailed diff
+rs-stellar-core --testnet offline verify-execution --stop-on-error --show-diff
+```
+
+This re-executes transactions and compares the resulting ledger entry changes
+against what C++ stellar-core produced (from CDP).
+
+##### debug-bucket-entry
+
+Inspect a specific account in the bucket list:
+
+```bash
+rs-stellar-core --testnet offline debug-bucket-entry \
+  --checkpoint 310000 \
+  --account a1b2c3d4e5f6...  # 64-char hex
+```
 
 ## HTTP API
 
-When running, the node exposes an HTTP API:
+When running, the node exposes an HTTP API (default port 11626):
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -220,41 +315,31 @@ When running, the node exposes an HTTP API:
 | `/shutdown` | POST | Request graceful shutdown |
 | `/health` | GET | Health check |
 
-### Submit Transaction
+### Example Usage
 
+Submit a transaction:
 ```bash
 curl -X POST http://localhost:11626/tx \
   -H "Content-Type: application/json" \
   -d '{"tx": "<base64-xdr>"}'
 ```
 
-### Check Health
-
+Check health:
 ```bash
 curl http://localhost:11626/health
 ```
 
-## Application Architecture
-
-```
-+------------------+
-|       App        |
-|------------------|
-| - config         |
-| - database       |
-| - bucket_manager |
-| - overlay        |
-| - herder         |
-| - ledger_manager |
-+------------------+
-        |
-        v
-+------------------+     +------------------+
-|  Status Server   |     |  Overlay Network |
-+------------------+     +------------------+
+Get node info:
+```bash
+curl http://localhost:11626/info
 ```
 
 ## Configuration
+
+Configuration can be provided via:
+- TOML file (`--config <FILE>`)
+- Built-in network defaults (`--testnet` or `--mainnet`)
+- Environment variables (prefixed with `STELLAR_`)
 
 ### Example Configuration
 
@@ -273,8 +358,13 @@ path = "stellar.db"
 port = 11626
 enabled = true
 
+[buckets]
+directory = "buckets"
+cache_size = 100  # Number of buckets to cache in memory
+
 [history]
 [[history.archives]]
+name = "sdf-testnet"
 url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
 get = true
 put = false
@@ -294,6 +384,17 @@ validators = [
 ]
 ```
 
+### Environment Variables
+
+Override configuration values with environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `STELLAR_DATABASE_PATH` | Database file path |
+| `STELLAR_HTTP_PORT` | HTTP server port |
+| `STELLAR_NODE_NAME` | Node name |
+| `STELLAR_NETWORK_PASSPHRASE` | Network passphrase |
+
 ## Exit Codes
 
 | Code | Description |
@@ -306,30 +407,58 @@ validators = [
 
 ## Logging
 
-Logs use the `tracing` framework:
+Logs use the `tracing` framework with configurable levels and formats:
 
 ```bash
-# Verbose output
+# Verbose output (debug level)
 rs-stellar-core --verbose run
 
-# Trace output
+# Trace output (most verbose)
 rs-stellar-core --trace run
 
-# JSON format
+# JSON format (for log aggregation)
 rs-stellar-core --log-format json run
 
-# Filter by module
+# Filter by module with RUST_LOG
 RUST_LOG=stellar_core_overlay=debug rs-stellar-core run
+RUST_LOG=stellar_core_ledger=trace,stellar_core_tx=debug rs-stellar-core run
 ```
+
+## Debugging Tips
+
+### Hash Mismatch Investigation
+
+When ledger hashes don't match the network:
+
+1. Use `offline verify-execution` to compare transaction execution
+2. Use `offline replay-bucket-list` to isolate bucket list vs execution issues
+3. Use `offline debug-bucket-entry` to inspect specific accounts
+4. Use the header_compare binary for detailed header field comparison
+
+### CDP Data Lake
+
+The verification tools use CDP (Crypto Data Platform) for ground truth:
+- Contains exact transaction metadata from C++ stellar-core
+- Partitioned by date for historical access
+- Default URL points to AWS public testnet data
+
+If you see "epoch mismatch" errors, the network may have been reset since the
+CDP date. Try a more recent CDP date or switch to mainnet.
+
+## Source Files
+
+- `src/main.rs` - CLI entry point and command handlers
+- `src/quorum_intersection.rs` - Quorum intersection analysis
+- `src/bin/header_compare.rs` - Header comparison debugging tool
 
 ## Dependencies
 
-- `clap` - CLI parsing
+- `clap` - CLI argument parsing
 - `axum` - HTTP server
 - `tokio` - Async runtime
-- `tracing` - Logging
-- `serde` - Configuration
-- All stellar-core-* crates
+- `tracing` - Structured logging
+- `serde` - Configuration serialization
+- All `stellar-core-*` library crates
 
 ## License
 

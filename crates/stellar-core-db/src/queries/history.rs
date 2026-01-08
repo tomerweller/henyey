@@ -1,32 +1,51 @@
 //! Transaction history queries.
+//!
+//! This module provides database operations for transaction history, including:
+//!
+//! - Individual transaction records (`txhistory` table)
+//! - Transaction sets per ledger (`txsets` table)
+//! - Transaction results per ledger (`txresults` table)
+//!
+//! Transaction sets and results are used for history archive publishing
+//! and catchup operations.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{
     Limits, ReadXdr, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 
 use super::super::error::DbError;
 
-/// A record of a transaction stored in history.
+/// A stored transaction record.
+///
+/// Contains all the data needed to reconstruct a transaction's execution,
+/// including the original transaction body, execution result, and metadata.
 #[derive(Debug, Clone)]
 pub struct TxRecord {
-    /// The transaction ID (hash).
+    /// The transaction ID (hash), hex-encoded.
     pub tx_id: String,
     /// The ledger sequence number where this transaction was included.
     pub ledger_seq: u32,
-    /// The index of this transaction within the ledger.
+    /// The index of this transaction within the ledger's transaction set.
     pub tx_index: u32,
-    /// The XDR-encoded transaction body.
+    /// The XDR-encoded transaction envelope.
     pub body: Vec<u8>,
     /// The XDR-encoded transaction result.
     pub result: Vec<u8>,
-    /// The XDR-encoded transaction meta (optional).
+    /// The XDR-encoded transaction metadata (optional).
+    ///
+    /// Contains ledger entry changes and other execution details.
     pub meta: Option<Vec<u8>>,
 }
 
-/// Trait for querying and storing transaction history.
+/// Query trait for transaction history operations.
+///
+/// Provides methods for storing and retrieving individual transactions
+/// as well as per-ledger transaction sets and results.
 pub trait HistoryQueries {
-    /// Store a transaction in history.
+    /// Stores a transaction in the history table.
+    ///
+    /// If a transaction with the same ID already exists, it is replaced.
     fn store_transaction(
         &self,
         ledger_seq: u32,
@@ -37,30 +56,42 @@ pub trait HistoryQueries {
         meta: Option<&[u8]>,
     ) -> Result<(), DbError>;
 
-    /// Load a transaction by ID.
+    /// Loads a transaction by its ID (hash).
+    ///
+    /// Returns `None` if the transaction is not found.
     fn load_transaction(&self, tx_id: &str) -> Result<Option<TxRecord>, DbError>;
 
-    /// Store a transaction history entry (tx set).
+    /// Stores a transaction history entry (transaction set) for a ledger.
+    ///
+    /// Used for history archive publishing. Contains all transactions
+    /// that were applied in the ledger.
     fn store_tx_history_entry(
         &self,
         ledger_seq: u32,
         entry: &TransactionHistoryEntry,
     ) -> Result<(), DbError>;
 
-    /// Load a transaction history entry (tx set).
+    /// Loads a transaction history entry for a ledger.
+    ///
+    /// Returns `None` if no entry exists for the given ledger.
     fn load_tx_history_entry(
         &self,
         ledger_seq: u32,
     ) -> Result<Option<TransactionHistoryEntry>, DbError>;
 
-    /// Store a transaction history result entry (tx results).
+    /// Stores transaction results for a ledger.
+    ///
+    /// Used for history archive publishing. Contains the execution
+    /// results for all transactions in the ledger.
     fn store_tx_result_entry(
         &self,
         ledger_seq: u32,
         entry: &TransactionHistoryResultEntry,
     ) -> Result<(), DbError>;
 
-    /// Load a transaction history result entry (tx results).
+    /// Loads transaction results for a ledger.
+    ///
+    /// Returns `None` if no entry exists for the given ledger.
     fn load_tx_result_entry(
         &self,
         ledger_seq: u32,

@@ -1,9 +1,35 @@
 //! Quorum set configuration and validation utilities.
 //!
-//! This module provides utilities for:
-//! - Converting configuration to XDR quorum sets
-//! - Validating quorum set configurations
-//! - Well-known validator configurations
+//! This module provides utilities for working with quorum set configurations,
+//! including parsing from configuration files, validation, and conversion to
+//! the XDR format used by SCP.
+//!
+//! # Configuration Format
+//!
+//! Quorum sets are configured with:
+//! - A threshold percentage (e.g., 67% means 2/3 of validators must agree)
+//! - A list of validator public keys (in strkey or hex format)
+//! - Optional inner sets for hierarchical trust structures
+//!
+//! # Validator Key Formats
+//!
+//! Validator public keys can be specified as:
+//! - **Strkey format**: `GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y`
+//! - **Hex format**: 64-character hex string of the raw public key bytes
+//!
+//! # Well-Known Validators
+//!
+//! The [`known_validators`] module provides public keys for well-known
+//! validators on testnet and mainnet, useful for getting started.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use stellar_core_scp::quorum_config::{testnet_quorum_config, config_to_quorum_set};
+//!
+//! let config = testnet_quorum_config();
+//! let quorum_set = config_to_quorum_set(&config)?;
+//! ```
 
 use stellar_core_common::config::QuorumSetConfig;
 use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
@@ -11,16 +37,35 @@ use tracing::warn;
 
 use crate::{get_all_nodes, is_quorum_set_sane, is_valid_quorum_set};
 
-/// Errors that can occur when parsing quorum set configuration.
+/// Errors that can occur when parsing or validating quorum set configuration.
+///
+/// These errors indicate problems with the quorum set configuration that
+/// would prevent safe consensus operation.
 #[derive(Debug, Clone)]
 pub enum QuorumConfigError {
-    /// Invalid validator public key format.
+    /// The validator public key is malformed or uses an unsupported format.
+    ///
+    /// Valid formats are:
+    /// - Stellar strkey (starts with 'G', 56 characters)
+    /// - Hex-encoded public key (64 characters)
     InvalidPublicKey(String),
-    /// Invalid threshold value.
-    InvalidThreshold { threshold: u32, validator_count: usize },
-    /// Quorum set structure is invalid.
+
+    /// The threshold value is invalid for the given number of validators.
+    ///
+    /// Threshold must be > 0 and <= the total number of validators/inner sets.
+    InvalidThreshold {
+        /// The specified threshold value.
+        threshold: u32,
+        /// The number of validators available.
+        validator_count: usize,
+    },
+
+    /// The quorum set structure is invalid (e.g., too deeply nested).
     InvalidStructure(String),
-    /// Quorum intersection check failed.
+
+    /// The quorum sets do not have sufficient intersection for safety.
+    ///
+    /// For SCP to be safe, all nodes' quorum sets must intersect.
     NoQuorumIntersection,
 }
 
@@ -176,24 +221,48 @@ pub fn validate_quorum_config(config: &QuorumSetConfig) -> Result<(), QuorumConf
 }
 
 /// Well-known validators for Stellar networks.
+///
+/// This module provides public keys for SDF-operated validators on testnet
+/// and mainnet. These can be used as a starting point for configuring
+/// quorum sets, but production deployments should carefully consider their
+/// trust topology.
+///
+/// # Security Note
+///
+/// For production use, carefully consider which validators you trust.
+/// SDF validators are provided as a convenience, but decentralization
+/// requires trusting multiple independent organizations.
 pub mod known_validators {
-    /// SDF's testnet validators.
+    /// SDF's testnet validators (3 validators operated by SDF).
+    ///
+    /// These are the core validators for the Stellar testnet. Using all
+    /// three with a 67% threshold provides Byzantine fault tolerance
+    /// for up to 1 faulty validator.
     pub const TESTNET_VALIDATORS: &[&str] = &[
-        // SDF testnet core servers
         "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y", // core1
         "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP", // core2
         "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z", // core3
     ];
 
-    /// SDF's mainnet validators (Tier 1 only).
+    /// SDF's mainnet validators (Tier 1 validators operated by SDF).
+    ///
+    /// Note: For production mainnet use, you should configure a more
+    /// diverse set of validators from multiple organizations.
     pub const MAINNET_SDF_VALIDATORS: &[&str] = &[
         "GCGB2S2KGYARPVIA37HBER46GJSTA276NAJMGRY7DXVQ6JR7RMQMJ", // sdf1
         "GCM6QMP3DLBER46NSEBVR6T6RNXOQCWPZ4ZQWOXJH3OPCY4DJXXOH", // sdf2
         "GABMKJM6I25XI4K7U6XWMULOUQIQ27BCTMLS6BYYSOWKTBUXVRJSXHYQ", // sdf3
     ];
 
-    /// Recommended threshold percentages.
-    pub const RECOMMENDED_THRESHOLD_PERCENT: u32 = 67; // 2/3 + 1
+    /// Recommended threshold percentage (67%, providing Byzantine fault tolerance).
+    ///
+    /// With 67% threshold, the network can tolerate up to 1/3 faulty validators.
+    pub const RECOMMENDED_THRESHOLD_PERCENT: u32 = 67;
+
+    /// Minimum safe threshold percentage (51%).
+    ///
+    /// Below 51%, the network may not have proper quorum intersection,
+    /// compromising safety guarantees.
     pub const MINIMUM_SAFE_THRESHOLD_PERCENT: u32 = 51;
 }
 

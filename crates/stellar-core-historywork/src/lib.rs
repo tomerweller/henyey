@@ -1,4 +1,94 @@
-//! History work items for rs-stellar-core.
+//! History work items for Stellar Core catchup and publish workflows.
+//!
+//! This crate provides the building blocks for downloading and publishing Stellar
+//! history archive data. It implements a work-item based architecture that integrates
+//! with the [`stellar_core_work`] scheduler to orchestrate complex multi-step operations
+//! with proper dependency management and retry logic.
+//!
+//! # Overview
+//!
+//! History archives store snapshots of the Stellar ledger at regular checkpoint intervals
+//! (every 64 ledgers). This crate provides work items to:
+//!
+//! - **Download** history data: HAS (History Archive State), buckets, ledger headers,
+//!   transactions, transaction results, and SCP consensus history
+//! - **Verify** downloaded data: hash verification for buckets, header chain validation,
+//!   and transaction set integrity checks
+//! - **Publish** history data: write checkpoint data back to archives for archival nodes
+//!
+//! # Architecture
+//!
+//! Work items are organized as a directed acyclic graph (DAG) of dependencies:
+//!
+//! ```text
+//!                    ┌─────────────┐
+//!                    │  Fetch HAS  │
+//!                    └──────┬──────┘
+//!                           │
+//!           ┌───────────────┼───────────────┐
+//!           │               │               │
+//!           ▼               ▼               ▼
+//!    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+//!    │  Download   │ │  Download   │ │  Download   │
+//!    │  Buckets    │ │  Headers    │ │    SCP      │
+//!    └─────────────┘ └──────┬──────┘ └─────────────┘
+//!                           │
+//!                    ┌──────┴──────┐
+//!                    ▼             ▼
+//!             ┌─────────────┐ ┌─────────────┐
+//!             │  Download   │ │  Download   │
+//!             │Transactions │ │  Results    │
+//!             └─────────────┘ └─────────────┘
+//! ```
+//!
+//! All work items share state through [`SharedHistoryState`], a thread-safe container
+//! that accumulates downloaded data as work progresses.
+//!
+//! # Usage
+//!
+//! ## Downloading checkpoint data
+//!
+//! Use [`HistoryWorkBuilder`] to register download work items with a scheduler:
+//!
+//! ```rust,ignore
+//! use stellar_core_historywork::{HistoryWorkBuilder, SharedHistoryState};
+//! use stellar_core_work::WorkScheduler;
+//!
+//! // Create shared state for work items
+//! let state: SharedHistoryState = Default::default();
+//!
+//! // Build and register work items
+//! let builder = HistoryWorkBuilder::new(archive, checkpoint, state.clone());
+//! let work_ids = builder.register(&mut scheduler);
+//!
+//! // Run the scheduler to completion
+//! scheduler.run_to_completion().await?;
+//!
+//! // Extract downloaded data for catchup
+//! let checkpoint_data = build_checkpoint_data(&state).await?;
+//! ```
+//!
+//! ## Publishing checkpoint data
+//!
+//! For archival nodes that need to publish history:
+//!
+//! ```rust,ignore
+//! use stellar_core_historywork::{HistoryWorkBuilder, LocalArchiveWriter};
+//!
+//! // Create a writer for the target archive
+//! let writer = Arc::new(LocalArchiveWriter::new(archive_path));
+//!
+//! // Register publish work after download work completes
+//! let download_ids = builder.register(&mut scheduler);
+//! let publish_ids = builder.register_publish(&mut scheduler, writer, download_ids);
+//! ```
+//!
+//! # Key Types
+//!
+//! - [`HistoryWorkState`]: Shared container for downloaded history data
+//! - [`HistoryWorkBuilder`]: Factory for registering work items with proper dependencies
+//! - [`ArchiveWriter`]: Trait for publishing data to history archives
+//! - [`CheckpointData`]: Complete snapshot of a checkpoint for catchup operations
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,39 +114,137 @@ use stellar_xdr::curr::{
     TransactionHistoryResultEntry, WriteXdr,
 };
 
-/// Shared state between history work items.
+/// Shared state container for history work items.
+///
+/// This struct accumulates data as download work items complete. Each field
+/// is populated by its corresponding download work item and consumed by
+/// either verification steps or the final [`build_checkpoint_data`] call.
+///
+/// # Thread Safety
+///
+/// This type is wrapped in [`SharedHistoryState`] (an `Arc<Mutex<...>>`) for
+/// safe sharing between concurrent work items. Work items acquire the lock
+/// briefly to read dependencies or write their output.
+///
+/// # Fields
+///
+/// - `has`: The History Archive State describing the checkpoint's bucket list
+/// - `buckets`: Raw bucket data keyed by hash, used to reconstruct ledger state
+/// - `headers`: Ledger headers for all ledgers in the checkpoint range
+/// - `transactions`: Transaction sets for each ledger
+/// - `tx_results`: Transaction results (meta) for each ledger
+/// - `scp_history`: SCP consensus messages for the checkpoint
+/// - `progress`: Current work stage and status message for monitoring
 #[derive(Debug, Default)]
 pub struct HistoryWorkState {
+    /// The History Archive State (HAS) for this checkpoint.
+    ///
+    /// Contains the bucket list structure that describes the complete ledger
+    /// state at the checkpoint boundary.
     pub has: Option<HistoryArchiveState>,
+
+    /// Downloaded bucket data, keyed by SHA-256 hash.
+    ///
+    /// Buckets contain the actual ledger entries (accounts, trustlines, etc.)
+    /// organized in a multi-level structure for efficient incremental updates.
     pub buckets: HashMap<Hash256, Vec<u8>>,
+
+    /// Ledger header history entries for the checkpoint range.
+    ///
+    /// Contains headers for 64 consecutive ledgers, linking each ledger to
+    /// its predecessor via the `previous_ledger_hash` field.
     pub headers: Vec<LedgerHeaderHistoryEntry>,
+
+    /// Transaction history entries containing transaction sets.
+    ///
+    /// Each entry contains all transactions applied in a single ledger,
+    /// either as a classic transaction set or a generalized (phase-based) set.
     pub transactions: Vec<TransactionHistoryEntry>,
+
+    /// Transaction result entries containing execution results and metadata.
+    ///
+    /// Stores the outcome of each transaction including fee charges,
+    /// operation results, and ledger changes.
     pub tx_results: Vec<TransactionHistoryResultEntry>,
+
+    /// SCP consensus history for the checkpoint.
+    ///
+    /// Records the consensus messages exchanged to close each ledger,
+    /// useful for auditing and debugging consensus behavior.
     pub scp_history: Vec<ScpHistoryEntry>,
+
+    /// Current progress indicator for monitoring work execution.
     pub progress: HistoryWorkProgress,
 }
 
+/// Thread-safe handle to shared history work state.
+///
+/// This type alias wraps [`HistoryWorkState`] in an `Arc<Mutex<...>>` for
+/// safe sharing between work items. Use `state.lock().await` to access
+/// the underlying state.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let state: SharedHistoryState = Default::default();
+///
+/// // In a work item:
+/// let mut guard = state.lock().await;
+/// guard.has = Some(downloaded_has);
+/// ```
 pub type SharedHistoryState = Arc<Mutex<HistoryWorkState>>;
 
+/// Identifies the current stage of history work execution.
+///
+/// This enum is used for progress reporting and monitoring. Each variant
+/// corresponds to a specific work item in the download or publish pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryWorkStage {
+    /// Fetching the History Archive State (HAS) JSON file.
     FetchHas,
+    /// Downloading bucket files referenced by the HAS.
     DownloadBuckets,
+    /// Downloading ledger header XDR files.
     DownloadHeaders,
+    /// Downloading transaction set XDR files.
     DownloadTransactions,
+    /// Downloading transaction result XDR files.
     DownloadResults,
+    /// Downloading SCP consensus history XDR files.
     DownloadScp,
+    /// Publishing the History Archive State to the target archive.
     PublishHas,
+    /// Publishing bucket files to the target archive.
     PublishBuckets,
+    /// Publishing ledger header files to the target archive.
     PublishHeaders,
+    /// Publishing transaction files to the target archive.
     PublishTransactions,
+    /// Publishing transaction result files to the target archive.
     PublishResults,
+    /// Publishing SCP history files to the target archive.
     PublishScp,
 }
 
+/// Progress indicator for history work execution.
+///
+/// This struct provides a snapshot of the current work stage and a
+/// human-readable status message. Use [`get_progress`] to retrieve
+/// the current progress from shared state.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let progress = get_progress(&state).await;
+/// if let Some(stage) = progress.stage {
+///     println!("Stage: {:?}, Status: {}", stage, progress.message);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct HistoryWorkProgress {
+    /// The current work stage, if any work is in progress.
     pub stage: Option<HistoryWorkStage>,
+    /// Human-readable status message describing the current operation.
     pub message: String,
 }
 
@@ -69,13 +257,32 @@ impl Default for HistoryWorkProgress {
     }
 }
 
+/// Updates the progress indicator in shared state.
+///
+/// This is an internal helper used by work items to report their current
+/// stage and status message.
 async fn set_progress(state: &SharedHistoryState, stage: HistoryWorkStage, message: &str) {
     let mut guard = state.lock().await;
     guard.progress.stage = Some(stage);
     guard.progress.message = message.to_string();
 }
 
-/// Work to fetch the History Archive State (HAS).
+/// Work item to fetch the History Archive State (HAS) for a checkpoint.
+///
+/// The HAS is a JSON document that describes the complete bucket list structure
+/// at a checkpoint boundary. It is the starting point for catchup operations,
+/// as it lists all bucket hashes needed to reconstruct ledger state.
+///
+/// This work item must complete before any other download work can proceed,
+/// as the HAS is required to know which buckets to download.
+///
+/// # Dependencies
+///
+/// None - this is the root of the download work graph.
+///
+/// # Output
+///
+/// On success, populates `state.has` with the parsed [`HistoryArchiveState`].
 pub struct GetHistoryArchiveStateWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
@@ -83,6 +290,13 @@ pub struct GetHistoryArchiveStateWork {
 }
 
 impl GetHistoryArchiveStateWork {
+    /// Creates a new HAS download work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to fetch from
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state to store the downloaded HAS
     pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
@@ -111,13 +325,38 @@ impl Work for GetHistoryArchiveStateWork {
     }
 }
 
-/// Work to download and verify buckets referenced in HAS.
+/// Work item to download and verify bucket files referenced in the HAS.
+///
+/// Buckets contain the actual ledger entries (accounts, trustlines, offers,
+/// contract data, etc.) organized in a multi-level structure. This work item
+/// downloads all unique buckets referenced by the HAS and verifies each
+/// bucket's SHA-256 hash.
+///
+/// # Parallelism
+///
+/// Downloads are performed concurrently with up to 16 parallel requests,
+/// matching the C++ stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit.
+///
+/// # Dependencies
+///
+/// Requires [`GetHistoryArchiveStateWork`] to complete first, as the HAS
+/// contains the list of bucket hashes to download.
+///
+/// # Output
+///
+/// On success, populates `state.buckets` with a map of hash -> bucket data.
 pub struct DownloadBucketsWork {
     archive: Arc<HistoryArchive>,
     state: SharedHistoryState,
 }
 
 impl DownloadBucketsWork {
+    /// Creates a new bucket download work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to fetch buckets from
+    /// * `state` - Shared state containing the HAS and where buckets will be stored
     pub fn new(archive: Arc<HistoryArchive>, state: SharedHistoryState) -> Self {
         Self { archive, state }
     }
@@ -188,7 +427,24 @@ impl Work for DownloadBucketsWork {
     }
 }
 
-/// Work to download ledger headers for a checkpoint.
+/// Work item to download and verify ledger headers for a checkpoint.
+///
+/// Downloads the ledger header history file for a checkpoint range (64 ledgers)
+/// and verifies the header chain integrity by checking that each header's
+/// `previous_ledger_hash` matches the hash of the preceding header.
+///
+/// Ledger headers are essential for:
+/// - Verifying transaction set hashes
+/// - Verifying transaction result hashes
+/// - Establishing the ledger sequence and timing
+///
+/// # Dependencies
+///
+/// Requires [`GetHistoryArchiveStateWork`] to complete first.
+///
+/// # Output
+///
+/// On success, populates `state.headers` with verified header entries.
 pub struct DownloadLedgerHeadersWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
@@ -196,6 +452,13 @@ pub struct DownloadLedgerHeadersWork {
 }
 
 impl DownloadLedgerHeadersWork {
+    /// Creates a new ledger headers download work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to fetch headers from
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state where headers will be stored
     pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
@@ -228,7 +491,24 @@ impl Work for DownloadLedgerHeadersWork {
     }
 }
 
-/// Work to download transaction sets for a checkpoint.
+/// Work item to download and verify transaction sets for a checkpoint.
+///
+/// Downloads the transaction history file containing all transactions applied
+/// during the checkpoint range. Each transaction set is verified against its
+/// corresponding ledger header's `tx_set_result_hash`.
+///
+/// Transaction sets come in two variants:
+/// - Classic: original format with a simple list of transactions
+/// - Generalized: phase-based format supporting Soroban transactions
+///
+/// # Dependencies
+///
+/// Requires [`DownloadLedgerHeadersWork`] to complete first, as headers are
+/// needed to verify transaction set hashes.
+///
+/// # Output
+///
+/// On success, populates `state.transactions` with verified transaction entries.
 pub struct DownloadTransactionsWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
@@ -236,6 +516,13 @@ pub struct DownloadTransactionsWork {
 }
 
 impl DownloadTransactionsWork {
+    /// Creates a new transactions download work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to fetch transactions from
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state where transactions will be stored
     pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
@@ -283,7 +570,27 @@ impl Work for DownloadTransactionsWork {
     }
 }
 
-/// Work to download transaction results for a checkpoint.
+/// Work item to download and verify transaction results for a checkpoint.
+///
+/// Downloads the transaction results history file containing the execution
+/// outcomes and ledger changes (metadata) for all transactions in the
+/// checkpoint range. Each result set is verified against its corresponding
+/// ledger header's result hash.
+///
+/// Transaction results include:
+/// - Fee charges and refunds
+/// - Operation-level success/failure results
+/// - Ledger entry changes (creates, updates, deletes)
+/// - Soroban contract execution metadata
+///
+/// # Dependencies
+///
+/// Requires both [`DownloadLedgerHeadersWork`] and [`DownloadTransactionsWork`]
+/// to complete first.
+///
+/// # Output
+///
+/// On success, populates `state.tx_results` with verified result entries.
 pub struct DownloadTxResultsWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
@@ -291,6 +598,13 @@ pub struct DownloadTxResultsWork {
 }
 
 impl DownloadTxResultsWork {
+    /// Creates a new transaction results download work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to fetch results from
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state where results will be stored
     pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
@@ -333,7 +647,23 @@ impl Work for DownloadTxResultsWork {
     }
 }
 
-/// Work to download SCP history for a checkpoint.
+/// Work item to download SCP consensus history for a checkpoint.
+///
+/// Downloads the SCP history file containing the consensus protocol messages
+/// exchanged to close each ledger in the checkpoint range. This data is
+/// optional for catchup but useful for:
+///
+/// - Auditing consensus behavior and vote distribution
+/// - Debugging network issues or validator performance
+/// - Historical analysis of the consensus process
+///
+/// # Dependencies
+///
+/// Requires [`DownloadLedgerHeadersWork`] to complete first.
+///
+/// # Output
+///
+/// On success, populates `state.scp_history` with SCP entries.
 pub struct DownloadScpHistoryWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
@@ -341,6 +671,13 @@ pub struct DownloadScpHistoryWork {
 }
 
 impl DownloadScpHistoryWork {
+    /// Creates a new SCP history download work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to fetch SCP history from
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state where SCP history will be stored
     pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
@@ -369,22 +706,71 @@ impl Work for DownloadScpHistoryWork {
     }
 }
 
-/// Archive writer for publish operations.
+/// Trait for writing data to a history archive.
+///
+/// This trait abstracts the storage backend for publish operations, allowing
+/// the same publish work items to write to local filesystems, cloud storage,
+/// or any other destination.
+///
+/// # Implementing Custom Writers
+///
+/// Implement this trait for custom storage backends:
+///
+/// ```rust,ignore
+/// use stellar_core_historywork::ArchiveWriter;
+///
+/// struct S3ArchiveWriter {
+///     bucket: String,
+///     client: S3Client,
+/// }
+///
+/// #[async_trait]
+/// impl ArchiveWriter for S3ArchiveWriter {
+///     async fn put_bytes(&self, path: &str, data: &[u8]) -> Result<()> {
+///         self.client.put_object(&self.bucket, path, data).await
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ArchiveWriter: Send + Sync {
+    /// Writes raw bytes to the given path in the archive.
+    ///
+    /// The path is relative to the archive root and follows the standard
+    /// history archive directory structure (e.g., `bucket/00/00/00/...`).
+    ///
+    /// Implementations should create any necessary parent directories.
     async fn put_bytes(&self, path: &str, data: &[u8]) -> Result<()>;
 }
 
-/// Local filesystem archive writer (for tests/local publish).
+/// Local filesystem implementation of [`ArchiveWriter`].
+///
+/// Writes history archive files to a local directory. Primarily useful for:
+/// - Local testing and development
+/// - Populating a local archive for offline use
+/// - Debugging publish operations
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use stellar_core_historywork::LocalArchiveWriter;
+/// use std::path::PathBuf;
+///
+/// let writer = LocalArchiveWriter::new(PathBuf::from("/var/stellar/history"));
+/// writer.put_bytes("history/00/00/00/history-0000003f.json", &json_bytes).await?;
+/// ```
 pub struct LocalArchiveWriter {
     base_dir: PathBuf,
 }
 
 impl LocalArchiveWriter {
+    /// Creates a new local archive writer with the given base directory.
+    ///
+    /// All paths written through this writer will be relative to this directory.
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
 
+    /// Resolves a relative archive path to an absolute filesystem path.
     fn full_path(&self, path: &str) -> PathBuf {
         self.base_dir.join(path)
     }
@@ -402,6 +788,10 @@ impl ArchiveWriter for LocalArchiveWriter {
     }
 }
 
+/// Compresses data using gzip with default compression level.
+///
+/// History archive files are stored gzip-compressed to reduce bandwidth
+/// and storage requirements.
 fn gzip_bytes(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     use std::io::Write;
@@ -409,6 +799,10 @@ fn gzip_bytes(data: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
+/// Serializes a slice of XDR-encodable entries into concatenated binary form.
+///
+/// History archive files contain sequences of XDR-encoded entries without
+/// length prefixes, relying on XDR's self-delimiting format.
 fn serialize_entries<T: WriteXdr>(entries: &[T]) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     for entry in entries {
@@ -418,7 +812,15 @@ fn serialize_entries<T: WriteXdr>(entries: &[T]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Work to publish the History Archive State (HAS).
+/// Work item to publish the History Archive State (HAS) to an archive.
+///
+/// Serializes the HAS to JSON format and writes it to the standard history
+/// archive path. The HAS is the entry point for catchup operations and must
+/// be published last to ensure all referenced data is available.
+///
+/// # Dependencies
+///
+/// Requires [`GetHistoryArchiveStateWork`] to have completed with a valid HAS.
 pub struct PublishHistoryArchiveStateWork {
     writer: Arc<dyn ArchiveWriter>,
     checkpoint: u32,
@@ -426,6 +828,13 @@ pub struct PublishHistoryArchiveStateWork {
 }
 
 impl PublishHistoryArchiveStateWork {
+    /// Creates a new HAS publish work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - The archive writer to publish to
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state containing the HAS to publish
     pub fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             writer,
@@ -464,19 +873,39 @@ impl Work for PublishHistoryArchiveStateWork {
     }
 }
 
-/// Work to publish bucket files from downloaded state.
+/// Work item to publish bucket files from downloaded state.
+///
+/// Compresses each bucket with gzip and writes it to the standard bucket
+/// directory structure (e.g., `bucket/00/00/00/bucket-<hash>.xdr.gz`).
+///
+/// # Dependencies
+///
+/// Requires [`DownloadBucketsWork`] to have completed with valid bucket data.
 pub struct PublishBucketsWork {
     writer: Arc<dyn ArchiveWriter>,
     state: SharedHistoryState,
 }
 
 impl PublishBucketsWork {
+    /// Creates a new bucket publish work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - The archive writer to publish to
+    /// * `state` - Shared state containing the buckets to publish
     pub fn new(writer: Arc<dyn ArchiveWriter>, state: SharedHistoryState) -> Self {
         Self { writer, state }
     }
 }
 
-/// Work to publish ledger headers.
+/// Work item to publish ledger headers to an archive.
+///
+/// Serializes ledger headers to XDR format, compresses with gzip, and writes
+/// to the standard checkpoint path (e.g., `ledger/00/00/00/ledger-0000003f.xdr.gz`).
+///
+/// # Dependencies
+///
+/// Requires [`DownloadLedgerHeadersWork`] to have completed with valid headers.
 pub struct PublishLedgerHeadersWork {
     writer: Arc<dyn ArchiveWriter>,
     checkpoint: u32,
@@ -484,6 +913,13 @@ pub struct PublishLedgerHeadersWork {
 }
 
 impl PublishLedgerHeadersWork {
+    /// Creates a new ledger headers publish work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - The archive writer to publish to
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state containing the headers to publish
     pub fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             writer,
@@ -524,7 +960,14 @@ impl Work for PublishLedgerHeadersWork {
     }
 }
 
-/// Work to publish transaction history entries.
+/// Work item to publish transaction history entries to an archive.
+///
+/// Serializes transaction entries to XDR format, compresses with gzip, and writes
+/// to the standard checkpoint path (e.g., `transactions/00/00/00/transactions-0000003f.xdr.gz`).
+///
+/// # Dependencies
+///
+/// Requires [`DownloadTransactionsWork`] to have completed with valid transactions.
 pub struct PublishTransactionsWork {
     writer: Arc<dyn ArchiveWriter>,
     checkpoint: u32,
@@ -532,6 +975,13 @@ pub struct PublishTransactionsWork {
 }
 
 impl PublishTransactionsWork {
+    /// Creates a new transactions publish work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - The archive writer to publish to
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state containing the transactions to publish
     pub fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             writer,
@@ -584,7 +1034,15 @@ impl Work for PublishTransactionsWork {
     }
 }
 
-/// Work to publish transaction results.
+/// Work item to publish transaction results to an archive.
+///
+/// Serializes transaction result entries to XDR format, compresses with gzip,
+/// and writes to the standard checkpoint path
+/// (e.g., `results/00/00/00/results-0000003f.xdr.gz`).
+///
+/// # Dependencies
+///
+/// Requires [`DownloadTxResultsWork`] to have completed with valid results.
 pub struct PublishResultsWork {
     writer: Arc<dyn ArchiveWriter>,
     checkpoint: u32,
@@ -592,6 +1050,13 @@ pub struct PublishResultsWork {
 }
 
 impl PublishResultsWork {
+    /// Creates a new transaction results publish work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - The archive writer to publish to
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state containing the results to publish
     pub fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             writer,
@@ -601,7 +1066,14 @@ impl PublishResultsWork {
     }
 }
 
-/// Work to publish SCP history entries.
+/// Work item to publish SCP consensus history to an archive.
+///
+/// Serializes SCP history entries to XDR format, compresses with gzip, and
+/// writes to the standard checkpoint path (e.g., `scp/00/00/00/scp-0000003f.xdr.gz`).
+///
+/// # Dependencies
+///
+/// Requires [`DownloadScpHistoryWork`] to have completed with valid SCP history.
 pub struct PublishScpHistoryWork {
     writer: Arc<dyn ArchiveWriter>,
     checkpoint: u32,
@@ -609,6 +1081,13 @@ pub struct PublishScpHistoryWork {
 }
 
 impl PublishScpHistoryWork {
+    /// Creates a new SCP history publish work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - The archive writer to publish to
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state containing the SCP history to publish
     pub fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             writer,
@@ -717,28 +1196,80 @@ impl Work for PublishBucketsWork {
     }
 }
 
-/// IDs for registered history work items.
+/// IDs for registered download work items.
+///
+/// Returned by [`HistoryWorkBuilder::register`] to identify the work items
+/// in the scheduler. These IDs can be used to:
+/// - Query work status
+/// - Add dependent work items
+/// - Pass to [`HistoryWorkBuilder::register_publish`] as dependencies
 #[derive(Debug, Clone, Copy)]
 pub struct HistoryWorkIds {
+    /// ID of the HAS download work item.
     pub has: WorkId,
+    /// ID of the bucket download work item.
     pub buckets: WorkId,
+    /// ID of the ledger headers download work item.
     pub headers: WorkId,
+    /// ID of the transactions download work item.
     pub transactions: WorkId,
+    /// ID of the transaction results download work item.
     pub tx_results: WorkId,
+    /// ID of the SCP history download work item.
     pub scp_history: WorkId,
 }
 
+/// IDs for registered publish work items.
+///
+/// Returned by [`HistoryWorkBuilder::register_publish`] to identify the
+/// publish work items in the scheduler.
 #[derive(Debug, Clone, Copy)]
 pub struct PublishWorkIds {
+    /// ID of the HAS publish work item.
     pub has: WorkId,
+    /// ID of the bucket publish work item.
     pub buckets: WorkId,
+    /// ID of the ledger headers publish work item.
     pub headers: WorkId,
+    /// ID of the transactions publish work item.
     pub transactions: WorkId,
+    /// ID of the transaction results publish work item.
     pub results: WorkId,
+    /// ID of the SCP history publish work item.
     pub scp_history: WorkId,
 }
 
-/// Builder for registering history work items with the scheduler.
+/// Builder for registering history work items with a scheduler.
+///
+/// This is the primary interface for setting up history download and publish
+/// workflows. It creates work items with the correct dependency relationships
+/// and registers them with a [`WorkScheduler`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use stellar_core_historywork::{HistoryWorkBuilder, SharedHistoryState};
+/// use stellar_core_work::WorkScheduler;
+/// use std::sync::Arc;
+///
+/// // Create shared state and builder
+/// let state: SharedHistoryState = Default::default();
+/// let builder = HistoryWorkBuilder::new(archive.clone(), checkpoint, state.clone());
+///
+/// // Register download work items
+/// let mut scheduler = WorkScheduler::new();
+/// let download_ids = builder.register(&mut scheduler);
+///
+/// // Optionally register publish work items
+/// let writer = Arc::new(LocalArchiveWriter::new(output_path));
+/// let publish_ids = builder.register_publish(&mut scheduler, writer, download_ids);
+///
+/// // Run all work to completion
+/// scheduler.run_to_completion().await?;
+///
+/// // Build checkpoint data from completed downloads
+/// let data = build_checkpoint_data(&state).await?;
+/// ```
 pub struct HistoryWorkBuilder {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
@@ -746,6 +1277,13 @@ pub struct HistoryWorkBuilder {
 }
 
 impl HistoryWorkBuilder {
+    /// Creates a new history work builder.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to download from
+    /// * `checkpoint` - The checkpoint ledger sequence number
+    /// * `state` - Shared state that will be populated by download work
     pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
@@ -754,6 +1292,15 @@ impl HistoryWorkBuilder {
         }
     }
 
+    /// Registers download work items with the scheduler.
+    ///
+    /// Creates and registers all download work items (HAS, buckets, headers,
+    /// transactions, results, SCP) with proper dependency ordering. Each work
+    /// item is configured with 3 retry attempts.
+    ///
+    /// # Returns
+    ///
+    /// [`HistoryWorkIds`] containing the scheduler IDs for all registered work.
     pub fn register(&self, scheduler: &mut WorkScheduler) -> HistoryWorkIds {
         let has_id = scheduler.add_work(
             Box::new(GetHistoryArchiveStateWork::new(
@@ -824,6 +1371,21 @@ impl HistoryWorkBuilder {
         }
     }
 
+    /// Registers publish work items with the scheduler.
+    ///
+    /// Creates and registers all publish work items, each depending on its
+    /// corresponding download work item. Each publish work item is configured
+    /// with 2 retry attempts.
+    ///
+    /// # Arguments
+    ///
+    /// * `scheduler` - The work scheduler to register with
+    /// * `writer` - The archive writer to publish data to
+    /// * `deps` - Work IDs from a prior [`register`] call to use as dependencies
+    ///
+    /// # Returns
+    ///
+    /// [`PublishWorkIds`] containing the scheduler IDs for all registered work.
     pub fn register_publish(
         &self,
         scheduler: &mut WorkScheduler,
@@ -900,7 +1462,15 @@ impl HistoryWorkBuilder {
     }
 }
 
-/// Helper for retrieving the HAS from shared state.
+// ============================================================================
+// Helper functions for accessing shared state
+// ============================================================================
+
+/// Retrieves the History Archive State from shared state.
+///
+/// # Errors
+///
+/// Returns an error if the HAS has not been downloaded yet.
 pub async fn get_has(state: &SharedHistoryState) -> Result<HistoryArchiveState> {
     let guard = state.lock().await;
     guard
@@ -909,7 +1479,11 @@ pub async fn get_has(state: &SharedHistoryState) -> Result<HistoryArchiveState> 
         .ok_or_else(|| anyhow::anyhow!("HAS not available"))
 }
 
-/// Helper for retrieving buckets from shared state.
+/// Retrieves downloaded buckets from shared state.
+///
+/// # Errors
+///
+/// Returns an error if buckets have not been downloaded yet.
 pub async fn get_buckets(state: &SharedHistoryState) -> Result<HashMap<Hash256, Vec<u8>>> {
     let guard = state.lock().await;
     if guard.buckets.is_empty() {
@@ -918,6 +1492,11 @@ pub async fn get_buckets(state: &SharedHistoryState) -> Result<HashMap<Hash256, 
     Ok(guard.buckets.clone())
 }
 
+/// Retrieves downloaded ledger headers from shared state.
+///
+/// # Errors
+///
+/// Returns an error if headers have not been downloaded yet.
 pub async fn get_headers(state: &SharedHistoryState) -> Result<Vec<LedgerHeaderHistoryEntry>> {
     let guard = state.lock().await;
     if guard.headers.is_empty() {
@@ -926,6 +1505,11 @@ pub async fn get_headers(state: &SharedHistoryState) -> Result<Vec<LedgerHeaderH
     Ok(guard.headers.clone())
 }
 
+/// Retrieves downloaded transactions from shared state.
+///
+/// # Errors
+///
+/// Returns an error if transactions have not been downloaded yet.
 pub async fn get_transactions(state: &SharedHistoryState) -> Result<Vec<TransactionHistoryEntry>> {
     let guard = state.lock().await;
     if guard.transactions.is_empty() {
@@ -934,6 +1518,11 @@ pub async fn get_transactions(state: &SharedHistoryState) -> Result<Vec<Transact
     Ok(guard.transactions.clone())
 }
 
+/// Retrieves downloaded transaction results from shared state.
+///
+/// # Errors
+///
+/// Returns an error if transaction results have not been downloaded yet.
 pub async fn get_tx_results(state: &SharedHistoryState) -> Result<Vec<TransactionHistoryResultEntry>> {
     let guard = state.lock().await;
     if guard.tx_results.is_empty() {
@@ -942,6 +1531,11 @@ pub async fn get_tx_results(state: &SharedHistoryState) -> Result<Vec<Transactio
     Ok(guard.tx_results.clone())
 }
 
+/// Retrieves downloaded SCP history from shared state.
+///
+/// # Errors
+///
+/// Returns an error if SCP history has not been downloaded yet.
 pub async fn get_scp_history(state: &SharedHistoryState) -> Result<Vec<ScpHistoryEntry>> {
     let guard = state.lock().await;
     if guard.scp_history.is_empty() {
@@ -950,12 +1544,33 @@ pub async fn get_scp_history(state: &SharedHistoryState) -> Result<Vec<ScpHistor
     Ok(guard.scp_history.clone())
 }
 
+/// Retrieves the current progress indicator from shared state.
+///
+/// This function never fails and returns default progress if no work
+/// has started yet.
 pub async fn get_progress(state: &SharedHistoryState) -> HistoryWorkProgress {
     let guard = state.lock().await;
     guard.progress.clone()
 }
 
-/// Build checkpoint data for catchup from the shared history work state.
+/// Builds a complete [`CheckpointData`] snapshot from shared state.
+///
+/// This is the primary way to extract downloaded data for use in catchup
+/// operations. Call this after all download work items have completed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // After scheduler completes all work...
+/// let checkpoint_data = build_checkpoint_data(&state).await?;
+/// catchup_manager
+///     .catchup_to_ledger_with_checkpoint_data(target, checkpoint_data)
+///     .await?;
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if the HAS is not available (other fields may be empty).
 pub async fn build_checkpoint_data(state: &SharedHistoryState) -> Result<CheckpointData> {
     let guard = state.lock().await;
     let has = guard

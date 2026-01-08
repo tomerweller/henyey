@@ -1,4 +1,29 @@
-//! Classic event emission for Stellar assets.
+//! Classic event emission for Stellar Asset Contract (SAC) events.
+//!
+//! This module handles emission of SEP-0041 (Stellar Token Standard) compatible
+//! events for classic Stellar operations involving assets. These events provide
+//! a unified interface for tracking asset movements regardless of whether they
+//! occur through classic operations or Soroban contracts.
+//!
+//! # Event Types
+//!
+//! - **transfer**: Asset moved between two non-issuer accounts
+//! - **mint**: Asset issued from the issuer to a recipient
+//! - **burn**: Asset returned to the issuer
+//! - **clawback**: Asset forcibly returned to the issuer
+//! - **set_authorized**: Trustline authorization status changed
+//! - **fee**: Transaction fee payment (at transaction level)
+//!
+//! # Protocol Versioning
+//!
+//! - Protocol 23+: Classic events are natively emitted
+//! - Pre-Protocol 23: Events can be backfilled for historical analysis
+//!
+//! # Key Types
+//!
+//! - [`OpEventManager`]: Manages events for a single operation
+//! - [`TxEventManager`]: Manages transaction-level events (fees)
+//! - [`ClassicEventConfig`]: Configuration for event emission behavior
 
 use stellar_core_common::NetworkId;
 use stellar_core_crypto::PublicKey as StrKeyPublicKey;

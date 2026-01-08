@@ -1,7 +1,48 @@
 //! Quorum set operations for SCP.
 //!
-//! This module provides utilities for working with quorum sets,
-//! including checking if a set of nodes forms a quorum or blocking set.
+//! This module provides core utilities for working with quorum sets in the
+//! Stellar Consensus Protocol. Quorum sets define which validators a node
+//! trusts and how consensus decisions are made.
+//!
+//! # Key Concepts
+//!
+//! ## Quorum Slice
+//!
+//! A quorum slice is a set of nodes that a particular node trusts for consensus.
+//! Each node defines its own quorum slice. A slice is satisfied when at least
+//! `threshold` of its members (validators or inner sets) agree.
+//!
+//! ## Quorum
+//!
+//! A quorum is a set of nodes where every member's quorum slice is satisfied
+//! by other members of the set. Quorums are used to confirm values - when a
+//! quorum agrees, the decision is irreversible.
+//!
+//! ## Blocking Set (V-Blocking)
+//!
+//! A blocking set intersects every quorum slice, meaning it can prevent
+//! any quorum from being formed. Blocking sets are used to accept values -
+//! if a blocking set accepts a value, the node must accept it too.
+//!
+//! # Quorum Set Structure
+//!
+//! A quorum set consists of:
+//! - `threshold`: Minimum number of members that must agree
+//! - `validators`: Direct validator nodes in the slice
+//! - `inner_sets`: Nested quorum sets (for hierarchical trust)
+//!
+//! # Example
+//!
+//! ```ignore
+//! // A 2-of-3 quorum set
+//! let qs = simple_quorum_set(2, vec![node_a, node_b, node_c]);
+//!
+//! // Check if nodes form a quorum
+//! let nodes = HashSet::from([node_a, node_b]);
+//! if is_quorum(&qs, &nodes, get_quorum_set) {
+//!     // Nodes form a quorum
+//! }
+//! ```
 
 use std::collections::HashSet;
 

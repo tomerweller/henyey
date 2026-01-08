@@ -3,10 +3,36 @@
 //! The Herder is the central coordinator that drives consensus and manages
 //! the transition between ledgers. It integrates with:
 //!
-//! - SCP for consensus
-//! - Overlay for network communication
-//! - Ledger for state management
-//! - Transaction processing
+//! - **SCP**: For Byzantine fault-tolerant consensus
+//! - **Overlay**: For network communication (receiving transactions and SCP envelopes)
+//! - **Ledger**: For state management and validation
+//! - **Transaction processing**: Managing the pending transaction queue
+//!
+//! # Architecture
+//!
+//! The Herder owns several key components:
+//!
+//! - [`TransactionQueue`]: Pending transactions waiting for consensus
+//! - [`PendingEnvelopes`]: SCP envelopes for future slots
+//! - [`ScpDriver`]: Callbacks for SCP consensus
+//! - [`SCP`]: The consensus protocol instance (validators only)
+//!
+//! # Operating Modes
+//!
+//! The Herder operates in two modes:
+//!
+//! - **Observer mode**: Tracks consensus by observing EXTERNALIZE messages from
+//!   validators in the quorum. Does not vote or propose values.
+//! - **Validator mode**: Actively participates in consensus by proposing transaction
+//!   sets and voting. Requires a secret key and quorum set configuration.
+//!
+//! # Security: EXTERNALIZE Validation
+//!
+//! EXTERNALIZE messages can fast-forward a node's tracking slot, which is necessary
+//! for catching up to the network. To prevent attacks, two security checks are applied:
+//!
+//! 1. **Quorum membership**: Sender must be in our transitive quorum set
+//! 2. **Slot distance limit**: Slot must be within [`MAX_EXTERNALIZE_SLOT_DISTANCE`] of current
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,46 +69,70 @@ use crate::Result;
 const MAX_EXTERNALIZE_SLOT_DISTANCE: u64 = 1000;
 
 /// Result of receiving an SCP envelope.
+///
+/// Indicates what happened when the Herder processed an incoming SCP envelope.
+/// The caller can use this to decide whether to broadcast the envelope to peers
+/// or take other actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopeState {
-    /// Envelope was processed successfully.
+    /// Envelope was processed successfully and is new.
     Valid,
-    /// Envelope is for a future slot and was buffered.
+    /// Envelope is for a future slot and was buffered for later processing.
     Pending,
-    /// Envelope is a duplicate.
+    /// Envelope was already seen/processed.
     Duplicate,
-    /// Envelope is for an old slot.
+    /// Envelope is for a slot older than our current tracking slot.
     TooOld,
-    /// Envelope has invalid signature.
+    /// Envelope has an invalid cryptographic signature.
     InvalidSignature,
-    /// Envelope is invalid.
+    /// Envelope is structurally invalid or failed validation.
     Invalid,
 }
 
 /// Configuration for the Herder.
+///
+/// Controls the Herder's behavior including validator mode, queue limits,
+/// quorum configuration, and timing parameters.
 #[derive(Debug, Clone)]
 pub struct HerderConfig {
-    /// Maximum number of pending transactions.
+    /// Maximum number of pending transactions in the queue.
     pub max_pending_transactions: usize,
+
     /// Whether this node should participate in consensus as a validator.
+    ///
+    /// When `true`, the node will propose values and vote in SCP.
+    /// Requires `local_quorum_set` to be configured and a secret key to be provided.
     pub is_validator: bool,
-    /// Target ledger close time in seconds.
+
+    /// Target ledger close time in seconds (typically 5 for Stellar mainnet).
     pub ledger_close_time: u32,
-    /// Our node's public key.
+
+    /// Our node's public key (derived from secret key for validators).
     pub node_public_key: PublicKey,
-    /// Network ID hash.
+
+    /// Network ID hash (unique per network: mainnet, testnet, etc.).
     pub network_id: Hash256,
-    /// Maximum number of slots to keep externalized values for.
+
+    /// Maximum number of externalized slots to keep in memory.
+    ///
+    /// Older slots are cleaned up to prevent unbounded memory growth.
     pub max_externalized_slots: usize,
-    /// Pending envelope configuration.
+
+    /// Configuration for the pending envelope buffer.
     pub pending_config: PendingConfig,
-    /// Transaction queue configuration.
+
+    /// Configuration for the transaction queue.
     pub tx_queue_config: TxQueueConfig,
-    /// Local quorum set configuration.
+
+    /// Local quorum set for consensus (required for validators).
+    ///
+    /// Defines which validators we trust and the threshold requirements.
     pub local_quorum_set: Option<ScpQuorumSet>,
-    /// Maximum transactions per transaction set.
+
+    /// Maximum operations allowed in a transaction set.
     pub max_tx_set_size: usize,
-    /// Proposed protocol upgrades to include in nominations.
+
+    /// Protocol upgrades this validator proposes to include in nominations.
     pub proposed_upgrades: Vec<stellar_xdr::curr::LedgerUpgrade>,
 }
 
@@ -108,11 +158,38 @@ impl Default for HerderConfig {
 
 /// The main Herder that coordinates consensus.
 ///
-/// This is the central component that:
-/// - Receives transactions from the network
-/// - Receives SCP envelopes from the network
-/// - Drives consensus for ledger close
-/// - Tracks externalized values
+/// This is the central component that bridges the overlay network and the ledger
+/// manager through SCP consensus. It:
+///
+/// - Receives transactions from the network and queues them for inclusion
+/// - Receives SCP envelopes and processes them through consensus
+/// - Proposes transaction sets when acting as a validator
+/// - Tracks externalized values and triggers ledger close
+/// - Manages the state machine (Booting -> Syncing -> Tracking)
+///
+/// # Thread Safety
+///
+/// The Herder is designed to be shared across threads. Internal state is protected
+/// by appropriate synchronization primitives (`RwLock`, `DashMap`).
+///
+/// # Example
+///
+/// ```ignore
+/// use stellar_core_herder::{Herder, HerderConfig};
+///
+/// // Create a non-validator herder
+/// let config = HerderConfig::default();
+/// let herder = Herder::new(config);
+///
+/// // Start syncing when catchup begins
+/// herder.start_syncing();
+///
+/// // Bootstrap after catchup completes
+/// herder.bootstrap(ledger_seq);
+///
+/// // Process incoming SCP envelopes
+/// let state = herder.receive_scp_envelope(envelope);
+/// ```
 pub struct Herder {
     /// Configuration.
     config: HerderConfig,

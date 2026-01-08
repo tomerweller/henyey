@@ -1,16 +1,52 @@
-//! Ledger replay for history catchup.
+//! Ledger replay for history catchup and verification.
 //!
-//! This module handles replaying ledgers from history during catchup.
+//! This module provides functions to replay ledgers from history archives,
+//! reconstructing ledger state by re-executing transactions or applying
+//! transaction metadata.
 //!
-//! Key approach: During catchup, we re-execute transactions against the current
-//! bucket list to reconstruct state changes, while still verifying history data.
-//! This keeps the bucket list consistent with transaction effects and lets us
-//! validate both the tx set hash and tx result set hash from the headers.
+//! # Replay Strategies
 //!
-//! We still support a metadata-only replay path (`replay_ledger`) for tests and
-//! future alternative flows.
+//! There are two approaches to replaying ledgers:
+//!
+//! ## Re-execution Replay (`replay_ledger_with_execution`)
+//!
+//! Re-executes transactions against the current bucket list state. This:
+//!
+//! - Reconstructs state changes from transaction logic
+//! - Validates transaction set and result hashes against headers
+//! - Works with traditional archives (no `TransactionMeta` needed)
+//! - May produce slightly different internal results than original execution
+//!
+//! This is the **default approach** used during catchup.
+//!
+//! ## Metadata Replay (`replay_ledger`)
+//!
+//! Applies `TransactionMeta` directly from archives. This:
+//!
+//! - Uses exact entry changes from the original execution
+//! - Requires archives that include `TransactionMeta` (e.g., CDP)
+//! - Produces identical results to the original execution
+//! - Used for testing and specialized replay scenarios
+//!
+//! # Verification
+//!
+//! During replay, we verify:
+//!
+//! - Transaction set hash matches header's `scp_value.tx_set_hash`
+//! - Transaction result hash matches header's `tx_set_result_hash`
+//! - Bucket list hash matches header's `bucket_list_hash` (at checkpoints)
+//!
+//! # Protocol 23+ Eviction
+//!
+//! Starting with protocol 23, incremental eviction scan runs each ledger:
+//!
+//! 1. Scan portion of bucket list based on `EvictionIterator` position
+//! 2. Move expired entries from live bucket list to hot archive
+//! 3. Update `EvictionIterator` ConfigSettingEntry
+//! 4. Combined hash = SHA256(live_hash || hot_archive_hash)
 
 use crate::{verify, HistoryError, Result};
+use sha2::{Digest, Sha256};
 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_invariant::LedgerEntryChange;
@@ -19,62 +55,114 @@ use stellar_core_ledger::{
     LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle, TransactionSetVariant,
 };
 use stellar_xdr::curr::{
-    BucketListType, ConfigSettingEntry, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerHeader, LedgerKey, TransactionEnvelope, TransactionMeta, TransactionResultPair,
-    TransactionResultSet, WriteXdr, EvictionIterator as XdrEvictionIterator,
+    BucketListType, ConfigSettingEntry, EvictionIterator as XdrEvictionIterator, LedgerEntry,
+    LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, TransactionEnvelope, TransactionMeta,
+    TransactionResultPair, TransactionResultSet, WriteXdr,
 };
-use sha2::{Digest, Sha256};
 
 /// The result of replaying a single ledger.
+///
+/// This contains both summary statistics and the actual ledger entry changes
+/// that should be applied to the bucket list.
 #[derive(Debug, Clone)]
 pub struct LedgerReplayResult {
-    /// The ledger sequence that was replayed.
+    /// The ledger sequence number that was replayed.
     pub sequence: u32,
-    /// Protocol version for this ledger.
+
+    /// Protocol version active during this ledger.
     pub protocol_version: u32,
-    /// Hash of the ledger after replay.
+
+    /// SHA-256 hash of the ledger header.
     pub ledger_hash: Hash256,
-    /// Number of transactions in the ledger.
+
+    /// Number of transactions executed in this ledger.
     pub tx_count: u32,
-    /// Number of operations in the ledger.
+
+    /// Total number of operations across all transactions.
     pub op_count: u32,
-    /// Change in fee pool during the replayed ledger.
+
+    /// Net change to the fee pool (positive = fees collected).
     pub fee_pool_delta: i64,
-    /// Change in total coins during the replayed ledger.
+
+    /// Net change to total coins (should be 0 for conservation).
     pub total_coins_delta: i64,
-    /// Init entries to apply to the bucket list.
+
+    /// New entries to add to the bucket list with `INITENTRY` flag.
+    ///
+    /// Init entries represent newly created ledger entries that did not
+    /// exist before this ledger.
     pub init_entries: Vec<LedgerEntry>,
-    /// Live entries to apply to the bucket list.
+
+    /// Updated entries to add to the bucket list with `LIVEENTRY` flag.
+    ///
+    /// Live entries represent modifications to existing ledger entries.
     pub live_entries: Vec<LedgerEntry>,
-    /// Keys to mark as dead in the bucket list.
+
+    /// Keys of entries to mark as deleted with `DEADENTRY` flag.
     pub dead_entries: Vec<LedgerKey>,
-    /// Detailed entry changes for invariants.
+
+    /// Detailed change records for invariant checking.
+    ///
+    /// This provides before/after state for each changed entry,
+    /// which is needed by some invariants (e.g., conservation of lumens).
     pub changes: Vec<LedgerEntryChange>,
-    /// Updated eviction iterator after this ledger (for incremental eviction).
+
+    /// Updated eviction iterator position after this ledger.
+    ///
+    /// Only present when running eviction scan (protocol 23+).
+    /// Should be passed to the next ledger's replay call.
     pub eviction_iterator: Option<EvictionIterator>,
 }
 
-/// Configuration for ledger replay.
+/// Configuration for ledger replay behavior and verification.
+///
+/// This controls what verification checks are performed during replay
+/// and whether optional features like event emission are enabled.
 #[derive(Debug, Clone)]
 pub struct ReplayConfig {
-    /// Whether to verify transaction results.
+    /// Verify that computed transaction results match header hashes.
+    ///
+    /// When enabled, the replay will fail if the transaction result set
+    /// hash does not match `header.tx_set_result_hash`. This is disabled
+    /// by default because re-execution may produce different result codes
+    /// than the original execution (especially for Soroban).
     pub verify_results: bool,
-    /// Whether to verify bucket list hashes.
+
+    /// Verify that bucket list hash matches header at checkpoints.
+    ///
+    /// This is the primary verification that ensures correct state
+    /// reconstruction. Verification only runs at checkpoint boundaries
+    /// (ledger % 64 == 63) because intermediate states may differ.
     pub verify_bucket_list: bool,
-    /// Whether to enforce invariants during replay.
+
+    /// Run ledger invariants after each ledger.
+    ///
+    /// Invariants check properties like conservation of lumens,
+    /// valid ledger entry structure, and sequence number progression.
     pub verify_invariants: bool,
 
-    /// Whether to emit classic contract events.
+    /// Emit classic contract events during replay.
+    ///
+    /// When enabled, generates events for classic operations like
+    /// payments and trustline changes. Useful for indexers.
     pub emit_classic_events: bool,
 
-    /// Whether to backfill Stellar asset events pre-protocol 23.
+    /// Generate Stellar asset events for pre-protocol 23 ledgers.
+    ///
+    /// Protocol 23 introduced standardized asset events. This option
+    /// generates equivalent events for earlier ledgers.
     pub backfill_stellar_asset_events: bool,
 
-    /// Whether to run incremental eviction scan during replay.
-    /// This is required for correct bucket list hash verification in protocol 23+.
+    /// Run incremental eviction scan during replay.
+    ///
+    /// Required for correct bucket list hash verification in protocol 23+.
+    /// The eviction scan moves expired entries from the live bucket list
+    /// to the hot archive bucket list.
     pub run_eviction: bool,
 
-    /// State archival settings for eviction scan.
+    /// Configuration for the eviction scan algorithm.
+    ///
+    /// Controls parameters like the starting level and scan rate.
     pub eviction_settings: StateArchivalSettings,
 }
 
@@ -162,7 +250,9 @@ pub fn replay_ledger(
         };
         let xdr = result_set
             .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e)))?;
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e))
+            })?;
         verify::verify_tx_result_set(header, &xdr)?;
     }
 
@@ -246,17 +336,13 @@ pub fn replay_ledger_with_execution(
     let soroban_base_prng_seed = tx_set.hash();
     let op_invariants = if config.verify_invariants {
         let entries = bucket_list.live_entries().map_err(|e| {
-            HistoryError::CatchupFailed(format!(
-                "failed to build op invariants state: {}",
-                e
-            ))
+            HistoryError::CatchupFailed(format!("failed to build op invariants state: {}", e))
         })?;
-        Some(OperationInvariantRunner::new(entries, header.clone(), *network_id).map_err(|e| {
-            HistoryError::CatchupFailed(format!(
-                "failed to build op invariants state: {}",
-                e
-            ))
-        })?)
+        Some(
+            OperationInvariantRunner::new(entries, header.clone(), *network_id).map_err(|e| {
+                HistoryError::CatchupFailed(format!("failed to build op invariants state: {}", e))
+            })?,
+        )
     } else {
         None
     };
@@ -290,7 +376,9 @@ pub fn replay_ledger_with_execution(
         };
         let xdr = result_set
             .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e)))?;
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e))
+            })?;
         if let Err(err) = verify::verify_tx_result_set(header, &xdr) {
             if let Some(expected) = expected_tx_results {
                 log_tx_result_mismatch(header, expected, &tx_results, &transactions);
@@ -304,22 +392,18 @@ pub fn replay_ledger_with_execution(
     let changes = delta
         .changes()
         .map(|change| match change {
-            stellar_core_ledger::EntryChange::Created(entry) => {
-                LedgerEntryChange::Created {
-                    current: entry.clone(),
-                }
-            }
+            stellar_core_ledger::EntryChange::Created(entry) => LedgerEntryChange::Created {
+                current: entry.clone(),
+            },
             stellar_core_ledger::EntryChange::Updated { previous, current } => {
                 LedgerEntryChange::Updated {
                     previous: previous.clone(),
                     current: current.clone(),
                 }
             }
-            stellar_core_ledger::EntryChange::Deleted { previous } => {
-                LedgerEntryChange::Deleted {
-                    previous: previous.clone(),
-                }
-            }
+            stellar_core_ledger::EntryChange::Deleted { previous } => LedgerEntryChange::Deleted {
+                previous: previous.clone(),
+            },
         })
         .collect::<Vec<_>>();
     let init_entries = delta.init_entries();
@@ -510,7 +594,10 @@ pub fn replay_ledger_with_execution(
     }
 
     let tx_count = results.len() as u32;
-    let op_count: u32 = results.iter().map(|r| r.operation_results.len() as u32).sum();
+    let op_count: u32 = results
+        .iter()
+        .map(|r| r.operation_results.len() as u32)
+        .sum();
     let ledger_hash = verify::compute_header_hash(header)?;
 
     Ok(LedgerReplayResult {
@@ -547,11 +634,8 @@ fn log_tx_result_mismatch(
     }
 
     let limit = expected.len().min(actual.len());
-    for (idx, (expected_item, actual_item)) in expected
-        .iter()
-        .zip(actual.iter())
-        .take(limit)
-        .enumerate()
+    for (idx, (expected_item, actual_item)) in
+        expected.iter().zip(actual.iter()).take(limit).enumerate()
     {
         let expected_hash = Hash256::hash_xdr(expected_item).unwrap_or(Hash256::ZERO);
         let actual_hash = Hash256::hash_xdr(actual_item).unwrap_or(Hash256::ZERO);
@@ -594,7 +678,9 @@ fn summarize_operations(tx: &TransactionEnvelope) -> Vec<String> {
         TransactionEnvelope::TxV0(env) => env.tx.operations.as_slice(),
         TransactionEnvelope::Tx(env) => env.tx.operations.as_slice(),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.as_slice(),
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                inner.tx.operations.as_slice()
+            }
         },
     };
 
@@ -823,7 +909,12 @@ fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
 /// * `config` - Replay configuration
 /// * `progress_callback` - Optional callback for progress updates
 pub fn replay_ledgers<F>(
-    ledgers: &[(LedgerHeader, TransactionSetVariant, Vec<TransactionResultPair>, Vec<TransactionMeta>)],
+    ledgers: &[(
+        LedgerHeader,
+        TransactionSetVariant,
+        Vec<TransactionResultPair>,
+        Vec<TransactionMeta>,
+    )],
     config: &ReplayConfig,
     mut progress_callback: Option<F>,
 ) -> Result<Vec<LedgerReplayResult>>
@@ -919,8 +1010,8 @@ mod tests {
     use stellar_core_bucket::BucketList;
     use stellar_core_common::NetworkId;
     use stellar_xdr::curr::{
-        GeneralizedTransactionSet, Hash, StellarValue, TimePoint, TransactionResultSet, TransactionSet,
-        TransactionSetV1, VecM, WriteXdr,
+        GeneralizedTransactionSet, Hash, StellarValue, TimePoint, TransactionResultSet,
+        TransactionSet, TransactionSetV1, VecM, WriteXdr,
     };
 
     fn make_test_header(seq: u32) -> LedgerHeader {
@@ -948,11 +1039,7 @@ mod tests {
         }
     }
 
-    fn make_header_with_hashes(
-        seq: u32,
-        tx_set_hash: Hash,
-        tx_result_hash: Hash,
-    ) -> LedgerHeader {
+    fn make_header_with_hashes(seq: u32, tx_set_hash: Hash, tx_result_hash: Hash) -> LedgerHeader {
         let mut header = make_test_header(seq);
         header.scp_value.tx_set_hash = tx_set_hash;
         header.tx_set_result_hash = tx_result_hash;
@@ -1030,11 +1117,7 @@ mod tests {
         let tx_metas = vec![];
 
         let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
-        let header = make_header_with_hashes(
-            100,
-            Hash([1u8; 32]),
-            Hash(*tx_set_hash.as_bytes()),
-        );
+        let header = make_header_with_hashes(100, Hash([1u8; 32]), Hash(*tx_set_hash.as_bytes()));
 
         // Must enable verify_results to test tx_set hash validation
         let config = ReplayConfig {
@@ -1053,11 +1136,7 @@ mod tests {
 
         let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
 
-        let header = make_header_with_hashes(
-            100,
-            Hash(*tx_set_hash.as_bytes()),
-            Hash([2u8; 32]),
-        );
+        let header = make_header_with_hashes(100, Hash(*tx_set_hash.as_bytes()), Hash([2u8; 32]));
 
         // Must enable verify_results to test tx_result hash validation
         let config = ReplayConfig {

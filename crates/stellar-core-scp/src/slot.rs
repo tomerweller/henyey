@@ -1,7 +1,32 @@
 //! Per-slot consensus state for SCP.
 //!
-//! Each slot (typically corresponding to a ledger sequence number)
-//! maintains its own nomination and ballot protocol state.
+//! Each slot in SCP represents an independent consensus instance, typically
+//! corresponding to a ledger sequence number in Stellar. This module provides
+//! the [`Slot`] struct which manages the complete consensus state for a single
+//! slot, including both the nomination and ballot protocol phases.
+//!
+//! # Slot Lifecycle
+//!
+//! 1. **Creation**: Slot is created when first needed (either via nomination
+//!    or when receiving an envelope for that slot)
+//! 2. **Nomination**: Nodes propose and vote on candidate values
+//! 3. **Ballot Protocol**: Once candidates are confirmed, nodes vote on ballots
+//!    to agree on a single value
+//! 4. **Externalization**: When consensus is reached, the slot is externalized
+//!    and its value becomes final
+//!
+//! # State Transitions
+//!
+//! ```text
+//! [New] --> [Nominating] --> [Ballot: Prepare] --> [Ballot: Confirm] --> [Externalized]
+//!                                    |                    |
+//!                                    +--(timeout)---------+
+//! ```
+//!
+//! # Force Externalization
+//!
+//! During catchup from historical data, slots can be force-externalized with
+//! known values, bypassing the consensus process entirely.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,30 +38,53 @@ use crate::driver::SCPDriver;
 use crate::nomination::NominationProtocol;
 use crate::EnvelopeState;
 
-/// Per-slot consensus state.
+/// Per-slot consensus state managing nomination and ballot protocols.
 ///
-/// Manages the nomination and ballot protocols for a single slot.
+/// A `Slot` encapsulates all the state needed to reach consensus on a single
+/// value for a given slot index. Each slot progresses independently through
+/// the nomination phase (where candidates are proposed) and the ballot phase
+/// (where a single value is agreed upon).
+///
+/// # Fields
+///
+/// The slot maintains:
+/// - Nomination protocol state for collecting and voting on candidate values
+/// - Ballot protocol state for the prepare/confirm/externalize phases
+/// - Envelope history for all received SCP messages
+/// - Validation state tracking
 #[derive(Debug)]
 pub struct Slot {
-    /// The slot index (typically ledger sequence number).
+    /// The slot index (typically corresponds to ledger sequence number).
     slot_index: u64,
-    /// Local node ID.
+
+    /// The local node's identifier (public key).
     local_node_id: NodeId,
-    /// Local quorum set.
+
+    /// The local node's quorum set configuration.
     local_quorum_set: ScpQuorumSet,
-    /// Whether we're a validator.
+
+    /// Whether this node is a validator (actively participates in consensus).
     is_validator: bool,
-    /// Nomination protocol state.
+
+    /// State machine for the nomination protocol phase.
     nomination: NominationProtocol,
-    /// Ballot protocol state.
+
+    /// State machine for the ballot protocol phase.
     ballot: BallotProtocol,
-    /// All envelopes received for this slot.
+
+    /// History of all envelopes received for this slot, grouped by sender.
     envelopes: HashMap<NodeId, Vec<ScpEnvelope>>,
-    /// Externalized value (if consensus reached).
+
+    /// The externalized value if consensus has been reached, None otherwise.
     externalized_value: Option<Value>,
-    /// Whether nomination was triggered.
+
+    /// Whether nomination has been explicitly started for this slot.
     nomination_started: bool,
-    /// Whether we've fully externalized.
+
+    /// Whether all values in this slot have been fully validated.
+    ///
+    /// This affects whether local envelopes are emitted to the network.
+    /// When false, the node defers broadcasting its own statements.
     fully_validated: bool,
 }
 

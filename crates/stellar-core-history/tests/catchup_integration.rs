@@ -152,15 +152,22 @@ async fn test_catchup_against_local_archive_checkpoint() {
     fixtures.insert(bucket_path_str, gzip_bytes(&bucket_data));
 
     let fixtures = Arc::new(fixtures);
-    let app = Router::new()
-        .route("/*path", get(|Path(path): Path<String>, State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
-            if let Some(body) = state.get(&path) {
-                (StatusCode::OK, body.clone())
-            } else {
-                (StatusCode::NOT_FOUND, Vec::new())
-            }
-        }))
-        .with_state(Arc::clone(&fixtures));
+    let app =
+        Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        if let Some(body) = state.get(&path) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
 
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,

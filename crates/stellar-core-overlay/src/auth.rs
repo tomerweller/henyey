@@ -1,12 +1,40 @@
 //! Authentication for Stellar overlay connections.
 //!
-//! Implements X25519 key exchange with HMAC-SHA256 message authentication.
-//! The handshake follows the Stellar overlay protocol:
+//! This module implements the Stellar overlay authentication protocol, which uses
+//! X25519 key exchange with HMAC-SHA256 message authentication. The protocol ensures
+//! that:
 //!
-//! 1. Both peers exchange Hello messages with their public key and auth cert
-//! 2. Both peers derive shared secrets from X25519 key exchange
-//! 3. Both peers send Auth messages to complete handshake
-//! 4. All subsequent messages are authenticated with HMAC-SHA256
+//! - Both peers prove ownership of their Ed25519 identity keys
+//! - All messages after handshake are authenticated to prevent tampering
+//! - Messages cannot be replayed (sequence numbers prevent replay attacks)
+//!
+//! # Handshake Protocol
+//!
+//! The handshake follows this sequence:
+//!
+//! 1. **Hello Exchange**: Both peers send `Hello` messages containing:
+//!    - Their Ed25519 public key (node identity)
+//!    - An ephemeral X25519 public key for key exchange
+//!    - An authentication certificate (signature over the ephemeral key)
+//!    - A random nonce for key derivation
+//!
+//! 2. **Key Derivation**: Both peers:
+//!    - Verify the peer's auth certificate signature
+//!    - Perform X25519 Diffie-Hellman to derive a shared secret
+//!    - Use HKDF to derive separate MAC keys for each direction
+//!
+//! 3. **Auth Exchange**: Both peers send `Auth` messages with a valid MAC
+//!    to prove they derived the correct keys
+//!
+//! 4. **Authenticated Channel**: All subsequent messages include:
+//!    - A sequence number (prevents replay)
+//!    - An HMAC-SHA256 over the sequence and message content
+//!
+//! # Key Types
+//!
+//! - [`AuthCert`] - Authentication certificate containing ephemeral key and signature
+//! - [`AuthContext`] - Manages handshake state and message authentication
+//! - [`AuthState`] - Current state of the authentication handshake
 
 use crate::{LocalNode, OverlayError, PeerId, Result};
 use hmac::{Hmac, Mac};
@@ -22,23 +50,47 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Authentication certificate containing ephemeral key and signature.
+/// Authentication certificate for the overlay handshake.
+///
+/// An `AuthCert` binds an ephemeral X25519 public key to a node's Ed25519 identity.
+/// The signature proves that the owner of the Ed25519 key generated this ephemeral key,
+/// preventing man-in-the-middle attacks during key exchange.
+///
+/// The certificate has a limited lifetime (typically 1 hour) to limit the window
+/// for potential key compromise.
+///
+/// # Signature Format
+///
+/// The signature is computed over the SHA-256 hash of:
+/// ```text
+/// network_id (32 bytes) || ENVELOPE_TYPE_AUTH (4 bytes, big-endian) ||
+/// expiration (8 bytes, big-endian) || ephemeral_pubkey (32 bytes)
+/// ```
 #[derive(Debug, Clone)]
 pub struct AuthCert {
-    /// Ephemeral X25519 public key.
+    /// Ephemeral X25519 public key for Diffie-Hellman key exchange.
     pub pubkey: [u8; 32],
-    /// Expiration time (Unix timestamp).
+
+    /// Expiration time as Unix timestamp (seconds since epoch).
+    ///
+    /// Certificates are rejected if current time exceeds this value.
     pub expiration: u64,
-    /// Signature over (network_id || ENVELOPE_TYPE_AUTH || expiration || pubkey).
+
+    /// Ed25519 signature (64 bytes) over the certificate data.
     pub sig: [u8; 64],
 }
 
 impl AuthCert {
-    /// Create a new auth cert with an ephemeral key.
-    pub fn new(
-        local_node: &LocalNode,
-        ephemeral_secret: &EphemeralSecret,
-    ) -> Self {
+    /// Creates a new authentication certificate.
+    ///
+    /// Generates a signature binding the ephemeral X25519 key to the local node's
+    /// Ed25519 identity. The certificate expires 1 hour from creation.
+    ///
+    /// # Arguments
+    ///
+    /// * `local_node` - The local node's identity and network configuration
+    /// * `ephemeral_secret` - The ephemeral X25519 secret key (public key is derived)
+    pub fn new(local_node: &LocalNode, ephemeral_secret: &EphemeralSecret) -> Self {
         let ephemeral_public = X25519PublicKey::from(ephemeral_secret);
         let pubkey = *ephemeral_public.as_bytes();
 
@@ -59,8 +111,10 @@ impl AuthCert {
         }
     }
 
-    /// Sign the auth cert data.
-    /// stellar-core signs the SHA-256 hash of the XDR-serialized data.
+    /// Signs the certificate data using the local node's Ed25519 key.
+    ///
+    /// Following stellar-core's implementation, we sign the SHA-256 hash of
+    /// the concatenated certificate fields, not the raw data.
     fn sign_cert(local_node: &LocalNode, expiration: u64, pubkey: &[u8; 32]) -> [u8; 64] {
         let mut data = Vec::with_capacity(32 + 4 + 8 + 32);
         data.extend_from_slice(local_node.network_id.as_bytes());
@@ -74,8 +128,21 @@ impl AuthCert {
         *signature.as_bytes()
     }
 
-    /// Verify an auth cert from a peer.
-    pub fn verify(&self, network_id: &stellar_core_common::NetworkId, peer_public_key: &PublicKey) -> Result<()> {
+    /// Verifies this certificate was signed by the given peer.
+    ///
+    /// Checks that:
+    /// 1. The certificate has not expired
+    /// 2. The signature is valid for the peer's public key and network ID
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthenticationFailed` if the certificate is expired or
+    /// the signature is invalid.
+    pub fn verify(
+        &self,
+        network_id: &stellar_core_common::NetworkId,
+        peer_public_key: &PublicKey,
+    ) -> Result<()> {
         // Check expiration
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -87,32 +154,31 @@ impl AuthCert {
             ));
         }
 
-        // Verify signature - stellar-core signs the SHA-256 hash of the data
+        // Reconstruct the signed data
         let mut data = Vec::with_capacity(32 + 4 + 8 + 32);
         data.extend_from_slice(network_id.as_bytes());
         data.extend_from_slice(&(EnvelopeType::Auth as i32).to_be_bytes());
         data.extend_from_slice(&self.expiration.to_be_bytes());
         data.extend_from_slice(&self.pubkey);
 
+        // Verify signature over the hash (matching stellar-core's approach)
         let hash = Hash256::hash(&data);
         let sig = stellar_core_crypto::Signature::from_bytes(self.sig);
-        peer_public_key
-            .verify(hash.as_bytes(), &sig)
-            .map_err(|_| OverlayError::AuthenticationFailed("invalid auth cert signature".to_string()))
+        peer_public_key.verify(hash.as_bytes(), &sig).map_err(|_| {
+            OverlayError::AuthenticationFailed("invalid auth cert signature".to_string())
+        })
     }
 
-    /// Convert to XDR.
+    /// Converts this certificate to XDR format.
     pub fn to_xdr(&self) -> XdrAuthCert {
         XdrAuthCert {
-            pubkey: Curve25519Public {
-                key: self.pubkey,
-            },
+            pubkey: Curve25519Public { key: self.pubkey },
             expiration: self.expiration,
             sig: xdr::Signature(self.sig.to_vec().try_into().unwrap()),
         }
     }
 
-    /// Parse from XDR.
+    /// Parses a certificate from XDR format.
     pub fn from_xdr(xdr: &XdrAuthCert) -> Self {
         let mut sig = [0u8; 64];
         let sig_len = xdr.sig.0.len().min(64);
@@ -126,63 +192,104 @@ impl AuthCert {
     }
 }
 
-/// Authentication state for a connection.
+/// Current state of the authentication handshake.
+///
+/// Tracks the progress of the Hello/Auth message exchange between peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthState {
-    /// Initial state, no Hello received.
+    /// Initial state - no messages exchanged yet.
     Initial,
-    /// Hello sent, waiting for peer's Hello.
+    /// We have sent our Hello, waiting for peer's Hello.
     HelloSent,
-    /// Hello received, need to send Auth.
+    /// We have received peer's Hello, ready to send Auth.
     HelloReceived,
-    /// Auth sent, waiting for peer's Auth.
+    /// We have sent Auth, waiting for peer's Auth.
     AuthSent,
-    /// Fully authenticated.
+    /// Handshake complete - both peers have exchanged Hello and Auth.
     Authenticated,
-    /// Authentication failed.
+    /// Authentication failed due to an error.
     Failed,
 }
 
-/// Authentication context for a connection.
+/// Authentication context for a peer connection.
 ///
-/// Manages the handshake state and derives keys for message authentication.
+/// Manages the complete authentication handshake lifecycle:
+///
+/// 1. Generates ephemeral keys and authentication certificates
+/// 2. Processes incoming Hello messages and verifies peer certificates
+/// 3. Derives MAC keys using HKDF from the X25519 shared secret
+/// 4. Wraps outgoing messages with sequence numbers and MACs
+/// 5. Unwraps and verifies incoming messages
+///
+/// # Key Derivation
+///
+/// The MAC keys are derived using HKDF (RFC 5869):
+/// - Extract: `PRK = HMAC-SHA256(salt=zeros, IKM=shared_secret || A_pub || B_pub)`
+/// - Expand: `key = HMAC-SHA256(PRK, prefix || nonce1 || nonce2 || 0x01)`
+///
+/// Where A is the initiator (outbound) and B is the acceptor (inbound).
+/// Each direction has a separate key derived with different prefixes.
 pub struct AuthContext {
-    /// Local node info.
+    /// Local node identity and configuration.
     local_node: LocalNode,
-    /// Our ephemeral secret key.
+
+    /// Our ephemeral X25519 secret key (consumed during key exchange).
     our_ephemeral_secret: Option<EphemeralSecret>,
-    /// Our ephemeral public key.
+
+    /// Our ephemeral X25519 public key.
     our_ephemeral_public: Option<X25519PublicKey>,
-    /// Our auth cert.
+
+    /// Our authentication certificate.
     our_auth_cert: Option<AuthCert>,
-    /// Our nonce from Hello.
+
+    /// Random nonce we sent in our Hello message.
     our_nonce: [u8; 32],
-    /// Peer's nonce from Hello.
+
+    /// Nonce received from peer's Hello message.
     peer_nonce: Option<[u8; 32]>,
-    /// Peer's auth cert.
+
+    /// Peer's authentication certificate.
     peer_auth_cert: Option<AuthCert>,
-    /// Peer's public key.
+
+    /// Peer's Ed25519 public key (identity).
     peer_public_key: Option<PublicKey>,
-    /// Peer's node ID.
+
+    /// Peer's node ID (derived from public key).
     peer_id: Option<PeerId>,
-    /// Shared secret from X25519.
+
+    /// X25519 shared secret (result of Diffie-Hellman).
     shared_secret: Option<SharedSecret>,
-    /// Sending MAC key.
+
+    /// HMAC key for messages we send.
     send_mac_key: Option<HmacSha256Key>,
-    /// Receiving MAC key.
+
+    /// HMAC key for messages we receive.
     recv_mac_key: Option<HmacSha256Key>,
-    /// Sending sequence number.
+
+    /// Next sequence number for outgoing messages.
     send_sequence: u64,
-    /// Receiving sequence number.
+
+    /// Expected sequence number for incoming messages.
     recv_sequence: u64,
-    /// Current auth state.
+
+    /// Current state of the handshake.
     state: AuthState,
-    /// Whether we initiated the connection.
+
+    /// True if we initiated the connection (outbound).
     we_called_remote: bool,
 }
 
 impl AuthContext {
-    /// Create a new auth context.
+    /// Creates a new authentication context for a connection.
+    ///
+    /// Generates ephemeral keys and prepares the authentication certificate.
+    /// The `we_called_remote` parameter determines which role we play in
+    /// key derivation (initiator vs acceptor).
+    ///
+    /// # Arguments
+    ///
+    /// * `local_node` - Our node's identity and configuration
+    /// * `we_called_remote` - True if we initiated the connection (outbound)
     pub fn new(local_node: LocalNode, we_called_remote: bool) -> Self {
         // Generate ephemeral key pair
         let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
@@ -212,22 +319,25 @@ impl AuthContext {
         }
     }
 
-    /// Get current auth state.
+    /// Returns the current authentication state.
     pub fn state(&self) -> AuthState {
         self.state
     }
 
-    /// Check if fully authenticated.
+    /// Returns true if the handshake is complete and the channel is authenticated.
     pub fn is_authenticated(&self) -> bool {
         self.state == AuthState::Authenticated
     }
 
-    /// Get the peer's ID if available.
+    /// Returns the peer's ID if the Hello has been processed.
     pub fn peer_id(&self) -> Option<&PeerId> {
         self.peer_id.as_ref()
     }
 
-    /// Create a Hello message for sending.
+    /// Creates a Hello message to send to the peer.
+    ///
+    /// The Hello message contains our identity, protocol versions, and
+    /// authentication certificate with ephemeral key.
     pub fn create_hello(&self) -> Hello {
         let public_key = self.local_node.xdr_public_key();
 
@@ -244,7 +354,22 @@ impl AuthContext {
         }
     }
 
-    /// Process a received Hello message.
+    /// Processes a received Hello message from the peer.
+    ///
+    /// This is the core of the authentication handshake. It:
+    /// 1. Verifies the peer is on the same network
+    /// 2. Checks protocol version compatibility
+    /// 3. Verifies the peer's authentication certificate
+    /// 4. Performs X25519 key exchange to derive the shared secret
+    /// 5. Derives separate MAC keys for each direction
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Network ID doesn't match (wrong network)
+    /// - Peer's overlay version is below our minimum
+    /// - Auth certificate signature is invalid or expired
+    /// - Key derivation fails
     pub fn process_hello(&mut self, hello: &Hello) -> Result<()> {
         // Check network ID
         let network_id_bytes = hello.network_id.0;
@@ -295,14 +420,19 @@ impl AuthContext {
         Ok(())
     }
 
-    /// Derive MAC keys from shared secret using HKDF.
+    /// Derives MAC keys from the shared secret using HKDF.
     ///
-    /// stellar-core derives MAC keys as follows:
-    /// 1. K = HKDF_extract(ECDH(A_sec,B_pub) || A_pub || B_pub)
-    /// 2. SendKey = HKDF_expand(K, send_prefix || local_nonce || remote_nonce)
-    /// 3. RecvKey = HKDF_expand(K, recv_prefix || remote_nonce || local_nonce)
+    /// Follows stellar-core's key derivation scheme:
     ///
-    /// Where prefix is 0 for A→B messages and 1 for B→A messages.
+    /// 1. **Extract phase**: `PRK = HKDF_extract(ECDH_result || A_pub || B_pub)`
+    ///    where A is the initiator and B is the acceptor
+    ///
+    /// 2. **Expand phase** for each direction:
+    ///    - `SendKey = HKDF_expand(PRK, prefix || local_nonce || peer_nonce)`
+    ///    - `RecvKey = HKDF_expand(PRK, prefix || peer_nonce || local_nonce)`
+    ///
+    /// The prefix is 0 for A->B messages and 1 for B->A messages, ensuring
+    /// each direction has a unique key.
     fn derive_mac_keys(
         &self,
         shared_secret: &SharedSecret,
@@ -354,8 +484,17 @@ impl AuthContext {
         Ok((send_key, recv_key))
     }
 
-    /// HKDF-Expand: derive a key from PRK using prefix and nonces.
-    fn hkdf_expand(&self, prk: &[u8; 32], prefix: u8, nonce1: &[u8; 32], nonce2: &[u8; 32]) -> HmacSha256Key {
+    /// HKDF-Expand: derives a MAC key from the PRK using prefix and nonces.
+    ///
+    /// Computes `T(1) = HMAC-SHA256(PRK, info || 0x01)` where
+    /// `info = prefix || nonce1 || nonce2`.
+    fn hkdf_expand(
+        &self,
+        prk: &[u8; 32],
+        prefix: u8,
+        nonce1: &[u8; 32],
+        nonce2: &[u8; 32],
+    ) -> HmacSha256Key {
         // info = prefix || nonce1 || nonce2
         let mut info = Vec::with_capacity(1 + 32 + 32);
         info.push(prefix);
@@ -371,21 +510,28 @@ impl AuthContext {
         HmacSha256Key { key }
     }
 
-    /// Mark that we sent Hello.
+    /// Marks that we have sent our Hello message.
+    ///
+    /// Call this after successfully sending the Hello to update state tracking.
     pub fn hello_sent(&mut self) {
         if self.state == AuthState::Initial {
             self.state = AuthState::HelloSent;
         }
     }
 
-    /// Mark that we sent Auth.
+    /// Marks that we have sent our Auth message.
+    ///
+    /// Call this after successfully sending the Auth to update state tracking.
     pub fn auth_sent(&mut self) {
         if self.state == AuthState::HelloReceived {
             self.state = AuthState::AuthSent;
         }
     }
 
-    /// Process received Auth message.
+    /// Processes a received Auth message, completing the handshake.
+    ///
+    /// After this succeeds, the connection is fully authenticated and
+    /// all messages will be verified with MACs.
     pub fn process_auth(&mut self) -> Result<()> {
         // AUTH messages consume sequence 0 on both sides
         // So first post-auth messages use sequence 1
@@ -397,7 +543,14 @@ impl AuthContext {
         Ok(())
     }
 
-    /// Wrap a message with MAC authentication.
+    /// Wraps a message with sequence number and MAC for sending.
+    ///
+    /// This should only be called after authentication is complete.
+    /// Each call increments the sequence number to prevent replay attacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the send MAC key is not established.
     pub fn wrap_message(&mut self, message: StellarMessage) -> Result<AuthenticatedMessage> {
         let send_key = self.send_mac_key.as_ref()
             .ok_or_else(|| OverlayError::AuthenticationFailed("send key not established".to_string()))?;
@@ -415,12 +568,28 @@ impl AuthContext {
         }))
     }
 
-    /// Unwrap and verify a message MAC.
+    /// Unwraps and verifies a received message.
     ///
-    /// The `message_is_authenticated` flag indicates whether bit 31 was set in the message length
-    /// prefix. When set, the message has a valid MAC that should be verified. When clear (e.g.,
-    /// during handshake or for certain message types), the MAC is all zeros and should not be verified.
-    pub fn unwrap_message(&mut self, auth_msg: AuthenticatedMessage, message_is_authenticated: bool) -> Result<StellarMessage> {
+    /// Checks the sequence number and MAC to ensure the message is authentic
+    /// and has not been replayed.
+    ///
+    /// # Arguments
+    ///
+    /// * `auth_msg` - The authenticated message wrapper from the wire
+    /// * `message_is_authenticated` - Whether bit 31 was set in the length prefix,
+    ///   indicating the message has a valid MAC. During handshake (Hello/Auth),
+    ///   this is false and the MAC field contains zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The sequence number doesn't match the expected value
+    /// - The MAC verification fails
+    pub fn unwrap_message(
+        &mut self,
+        auth_msg: AuthenticatedMessage,
+        message_is_authenticated: bool,
+    ) -> Result<StellarMessage> {
         match auth_msg {
             AuthenticatedMessage::V0(v0) => {
                 let msg_type = match &v0.message {
@@ -482,7 +651,9 @@ impl AuthContext {
         }
     }
 
-    /// Compute HMAC-SHA256 for a message.
+    /// Computes the HMAC-SHA256 for a message.
+    ///
+    /// The MAC is computed over: `sequence (8 bytes, big-endian) || message_xdr`
     fn compute_mac(
         &self,
         key: &HmacSha256Key,
@@ -504,8 +675,10 @@ impl AuthContext {
         Ok(HmacSha256Mac { mac: mac_bytes })
     }
 
-    /// Create an unauthenticated message for Hello.
-    /// Hello messages have sequence 0 and zero MAC.
+    /// Wraps a Hello message without MAC authentication.
+    ///
+    /// Hello messages are sent before keys are established, so they use
+    /// sequence 0 and an all-zero MAC field.
     pub fn wrap_unauthenticated(&self, message: StellarMessage) -> AuthenticatedMessage {
         // Hello message uses sequence 0 and zero MAC
         AuthenticatedMessage::V0(AuthenticatedMessageV0 {
@@ -515,8 +688,11 @@ impl AuthContext {
         })
     }
 
-    /// Create an Auth message with proper MAC but sequence 0.
-    /// Auth messages have sequence 0 but a real MAC.
+    /// Wraps an Auth message with MAC but sequence 0.
+    ///
+    /// Auth messages are special: they use sequence 0 (like Hello) but include
+    /// a valid MAC to prove we derived the correct keys. This proves to the peer
+    /// that we successfully completed the key exchange.
     pub fn wrap_auth_message(&self, message: StellarMessage) -> Result<AuthenticatedMessage> {
         let send_key = self.send_mac_key.as_ref()
             .ok_or_else(|| OverlayError::AuthenticationFailed("send key not established".to_string()))?;

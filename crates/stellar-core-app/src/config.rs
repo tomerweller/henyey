@@ -1,13 +1,81 @@
-//! Configuration loading for rs-stellar-core.
+//! Configuration loading and validation for rs-stellar-core.
 //!
-//! Supports loading configuration from TOML files with environment variable overrides.
-//! Provides sensible defaults for testnet and mainnet configurations.
+//! This module provides a comprehensive configuration system that supports:
+//!
+//! - Loading configuration from TOML files
+//! - Environment variable overrides (prefixed with `RS_STELLAR_CORE_`)
+//! - Pre-configured defaults for testnet and mainnet
+//! - Validation of configuration values
+//! - A builder API for programmatic configuration
+//!
+//! # Configuration Sections
+//!
+//! The configuration is organized into logical sections:
+//!
+//! | Section | Description |
+//! |---------|-------------|
+//! | `node` | Node identity, validator mode, and quorum set |
+//! | `network` | Network passphrase and protocol parameters |
+//! | `database` | SQLite database path and connection pool |
+//! | `buckets` | Bucket storage directory and cache settings |
+//! | `history` | History archive URLs for catchup |
+//! | `overlay` | P2P network settings and known peers |
+//! | `logging` | Log level, format, and output options |
+//! | `http` | HTTP status server configuration |
+//! | `surge_pricing` | Transaction lane byte allowances |
+//! | `events` | Classic event emission settings |
+//!
+//! # Example Configuration
+//!
+//! ```toml
+//! [node]
+//! name = "my-validator"
+//! node_seed = "S..."  # Required for validators
+//! is_validator = true
+//!
+//! [network]
+//! passphrase = "Test SDF Network ; September 2015"
+//!
+//! [database]
+//! path = "/var/lib/stellar/stellar.db"
+//!
+//! [[history.archives]]
+//! name = "sdf1"
+//! url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+//! ```
+//!
+//! # Environment Overrides
+//!
+//! Configuration values can be overridden using environment variables:
+//!
+//! - `RS_STELLAR_CORE_NODE_NAME` - Node name
+//! - `RS_STELLAR_CORE_NODE_SEED` - Node secret seed
+//! - `RS_STELLAR_CORE_NETWORK_PASSPHRASE` - Network passphrase
+//! - `RS_STELLAR_CORE_DATABASE_PATH` - Database file path
+//! - `RS_STELLAR_CORE_LOG_LEVEL` - Log level (trace, debug, info, warn, error)
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use stellar_core_crypto;
 
 /// Main application configuration.
+///
+/// This struct represents the complete configuration for a Stellar Core node.
+/// It can be loaded from a TOML file using [`AppConfig::from_file`], or constructed
+/// programmatically using [`ConfigBuilder`].
+///
+/// # Defaults
+///
+/// Use [`AppConfig::testnet()`] or [`AppConfig::mainnet()`] for pre-configured
+/// defaults that include known validators and history archives.
+///
+/// # Validation
+///
+/// Call [`AppConfig::validate()`] to check configuration consistency before use.
+/// This validates that:
+/// - Validators have a node seed configured
+/// - At least one history archive is configured
+/// - Quorum set configuration is valid for validators
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Node identity and behavior.
@@ -56,6 +124,15 @@ pub struct AppConfig {
 }
 
 /// Node identity and behavior configuration.
+///
+/// Defines the node's identity (keypair), whether it participates in consensus
+/// as a validator, and its quorum set configuration for SCP.
+///
+/// # Validator Requirements
+///
+/// If `is_validator` is true, the following must also be set:
+/// - `node_seed`: The secret seed for signing SCP messages
+/// - `quorum_set`: A valid quorum set with sufficient validators
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Node name for identification in logs.
@@ -90,7 +167,23 @@ impl Default for NodeConfig {
     }
 }
 
-/// Quorum set configuration.
+/// Quorum set configuration for SCP consensus.
+///
+/// Defines the set of validators this node trusts and the threshold required
+/// for agreement. Supports hierarchical quorum sets with inner sets for
+/// organizational structure.
+///
+/// # Threshold Calculation
+///
+/// The `threshold_percent` is applied to the total number of validators and
+/// inner sets. For example, with 3 validators and `threshold_percent = 67`,
+/// the threshold would be `ceil(3 * 0.67) = 2`.
+///
+/// # Safety
+///
+/// A well-configured quorum set should satisfy safety and liveness properties.
+/// See the [SCP paper](https://www.stellar.org/papers/stellar-consensus-protocol)
+/// for guidance on quorum set design.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuorumSetConfig {
     /// Threshold percentage (0-100).
@@ -353,7 +446,22 @@ pub struct HistoryArchiveEntry {
     pub mkdir: Option<String>,
 }
 
-/// Overlay network configuration.
+/// Overlay P2P network configuration.
+///
+/// Controls peer connections, transaction flooding, and survey authorization.
+/// The overlay network is responsible for propagating transactions and SCP
+/// messages between nodes.
+///
+/// # Connection Limits
+///
+/// - `max_inbound_peers`: Maximum connections accepted from other nodes
+/// - `max_outbound_peers`: Maximum connections initiated to other nodes
+/// - `target_outbound_peers`: Target number of outbound connections to maintain
+///
+/// # Transaction Flooding
+///
+/// The `flood_*` parameters control how transactions are advertised and
+/// requested between peers to optimize bandwidth usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayConfig {
     /// Port to listen on for peer connections.
@@ -883,7 +991,23 @@ impl AppConfig {
     }
 }
 
-/// Builder for AppConfig.
+/// Fluent builder for constructing [`AppConfig`] programmatically.
+///
+/// Provides a convenient API for building configurations without TOML files,
+/// useful for tests and embedded usage.
+///
+/// # Example
+///
+/// ```
+/// use stellar_core_app::config::ConfigBuilder;
+///
+/// let config = ConfigBuilder::new()
+///     .node_name("test-node")
+///     .database_path("/tmp/stellar.db")
+///     .peer_port(11626)
+///     .log_level("debug")
+///     .build();
+/// ```
 #[derive(Debug, Default)]
 pub struct ConfigBuilder {
     config: AppConfig,

@@ -1,65 +1,72 @@
 //! SCP coordination and ledger close orchestration for rs-stellar-core.
 //!
-//! The Herder is the central coordinator that:
+//! The Herder is the central coordinator that bridges the overlay network and the
+//! ledger manager through SCP (Stellar Consensus Protocol). It manages the flow
+//! from receiving transactions and SCP messages, through consensus, to triggering
+//! ledger close.
 //!
-//! - Drives the SCP consensus protocol
-//! - Collects transactions from the overlay network
-//! - Proposes transaction sets for consensus
-//! - Triggers ledger close when consensus is reached
-//! - Manages the transition between ledgers
+//! # Crate Overview
 //!
-//! ## Architecture
+//! This crate provides:
+//!
+//! - [`Herder`]: The main coordinator for consensus and ledger close
+//! - [`TransactionQueue`]: Pending transaction management with surge pricing
+//! - [`TransactionSet`]: A set of transactions for a ledger
+//! - [`HerderState`]: The state machine for the Herder
+//! - [`HerderConfig`]: Configuration options for the Herder
+//! - [`EnvelopeState`]: Result of receiving an SCP envelope
+//!
+//! # Architecture
 //!
 //! ```text
-//! +------------------+
-//! |     Herder       |
-//! |------------------|
-//! | - state          |  <-- HerderState (Booting/Syncing/Tracking)
-//! | - tx_queue       |  <-- TransactionQueue
-//! | - pending        |  <-- PendingEnvelopes
-//! | - scp_driver     |  <-- ScpDriver
-//! +------------------+
-//!         |
-//!         v
 //! +------------------+     +------------------+
-//! |   SCP Protocol   | <-> |  Overlay Network |
+//! |  Overlay Network | --> |      Herder      |
 //! +------------------+     +------------------+
-//!         |
-//!         v
-//! +------------------+
-//! |  Ledger Manager  |
-//! +------------------+
+//!                                |
+//!          +---------------------+---------------------+
+//!          |                     |                     |
+//!          v                     v                     v
+//! +------------------+  +------------------+  +------------------+
+//! | TransactionQueue |  | PendingEnvelopes |  |    ScpDriver     |
+//! +------------------+  +------------------+  +------------------+
+//!          |                                          |
+//!          v                                          v
+//! +------------------+                       +------------------+
+//! |   Surge Pricing  |                       |  SCP Consensus   |
+//! +------------------+                       +------------------+
 //! ```
 //!
-//! ## State Machine
+//! # State Machine
 //!
 //! The Herder progresses through states:
 //!
 //! 1. **Booting**: Initial state, not connected to network
 //! 2. **Syncing**: Catching up with the network via history archives
-//! 3. **Tracking**: Synchronized and following consensus
+//! 3. **Tracking**: Synchronized and following consensus in real-time
 //!
-//! ## For Testnet Sync
+//! # Operating Modes
 //!
-//! After catchup completes:
-//! 1. Call `herder.bootstrap(ledger_seq)` to transition to Tracking
-//! 2. SCP envelopes from overlay are processed via `receive_scp_envelope`
-//! 3. Externalized values are tracked to keep the node synced
+//! - **Observer mode**: Tracks consensus by observing EXTERNALIZE messages from
+//!   validators in the quorum. Does not vote or propose values.
+//! - **Validator mode**: Actively participates in consensus by proposing transaction
+//!   sets and voting. Requires a secret key and quorum set configuration.
 //!
-//! ## Example
+//! # Example
 //!
 //! ```ignore
-//! use stellar_core_herder::{Herder, HerderConfig};
+//! use stellar_core_herder::{Herder, HerderConfig, HerderState};
 //!
-//! // Create herder
+//! // Create a non-validator herder
 //! let config = HerderConfig::default();
 //! let herder = Herder::new(config);
 //!
 //! // Start syncing (when catchup begins)
 //! herder.start_syncing();
+//! assert_eq!(herder.state(), HerderState::Syncing);
 //!
 //! // After catchup completes
 //! herder.bootstrap(ledger_seq);
+//! assert_eq!(herder.state(), HerderState::Tracking);
 //!
 //! // Process incoming SCP envelopes
 //! let state = herder.receive_scp_envelope(envelope);
@@ -67,6 +74,17 @@
 //! // Process incoming transactions
 //! let result = herder.receive_transaction(tx);
 //! ```
+//!
+//! # Modules
+//!
+//! - [`error`]: Error types for Herder operations
+//! - [`herder`]: Main Herder implementation
+//! - [`pending`]: Pending SCP envelope management
+//! - [`quorum_tracker`]: Quorum participation tracking
+//! - [`scp_driver`]: SCP integration callbacks
+//! - [`state`]: Herder state machine
+//! - [`surge_pricing`]: Lane configuration and priority queues
+//! - [`tx_queue`]: Transaction queue and set building
 
 mod error;
 mod herder;
@@ -95,31 +113,52 @@ pub use tx_queue::{
 pub type Result<T> = std::result::Result<T, HerderError>;
 
 /// A pending transaction waiting to be included in a ledger.
+///
+/// Tracks metadata about a transaction received from the network, including
+/// when it was first seen and how many times it has been broadcast.
 #[derive(Debug)]
 pub struct PendingTransaction {
-    /// The transaction envelope.
+    /// The transaction envelope containing the transaction and signatures.
     pub envelope: stellar_xdr::curr::TransactionEnvelope,
-    /// When this transaction was received.
+    /// When this transaction was first received from the network.
     pub received_at: std::time::Instant,
-    /// Number of times this transaction was seen.
+    /// Number of times this transaction has been seen/broadcast.
     pub broadcast_count: u32,
 }
 
 /// A value that has been externalized by SCP.
+///
+/// Represents the consensus output for a specific ledger slot, containing
+/// the information needed to close the ledger.
 #[derive(Debug, Clone)]
 pub struct ExternalizedValue {
-    /// The ledger sequence.
+    /// The ledger sequence number this value is for.
     pub ledger_seq: u32,
-    /// The transaction set hash.
+    /// Hash of the transaction set agreed upon by consensus.
     pub tx_set_hash: stellar_core_common::Hash256,
-    /// The close time.
+    /// The ledger close time agreed upon by consensus (Unix timestamp).
     pub close_time: u64,
 }
 
 /// Trait for Herder callbacks.
+///
+/// Implementers receive notifications from the Herder when ledgers should be
+/// closed or messages should be broadcast. This allows the Herder to remain
+/// decoupled from the specific ledger and overlay implementations.
 #[async_trait::async_trait]
 pub trait HerderCallback: Send + Sync {
-    /// Called when a ledger should be closed.
+    /// Called when consensus has been reached and a ledger should be closed.
+    ///
+    /// # Arguments
+    ///
+    /// * `ledger_seq` - The sequence number of the ledger to close
+    /// * `tx_set` - The agreed-upon transaction set
+    /// * `close_time` - The ledger close time
+    /// * `upgrades` - Any protocol upgrades to apply
+    ///
+    /// # Returns
+    ///
+    /// The hash of the new ledger header after closing.
     async fn close_ledger(
         &self,
         ledger_seq: u32,
@@ -128,10 +167,14 @@ pub trait HerderCallback: Send + Sync {
         upgrades: Vec<stellar_xdr::curr::UpgradeType>,
     ) -> Result<stellar_core_common::Hash256>;
 
-    /// Called to validate a proposed transaction set.
+    /// Called to validate a proposed transaction set before voting.
+    ///
+    /// Returns `true` if the transaction set is valid and should be voted for.
     async fn validate_tx_set(&self, tx_set_hash: &stellar_core_common::Hash256) -> bool;
 
-    /// Called when an SCP message should be broadcast.
+    /// Called when an SCP message should be broadcast to the network.
+    ///
+    /// The implementer should relay this envelope to connected peers.
     async fn broadcast_scp_message(&self, envelope: stellar_xdr::curr::ScpEnvelope);
 }
 

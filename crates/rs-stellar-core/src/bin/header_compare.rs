@@ -1,3 +1,30 @@
+//! Header comparison utility for debugging ledger hash mismatches.
+//!
+//! This binary compares ledger headers between a local database and a history
+//! archive, helping identify discrepancies in ledger state. This is useful for
+//! debugging hash mismatches during catchup or replay testing.
+//!
+//! # Usage
+//!
+//! ```bash
+//! header_compare --ledger 310000 --config testnet.toml
+//! header_compare --ledger 310000 --config testnet.toml --compare-results
+//! ```
+//!
+//! # Output
+//!
+//! The tool displays a side-by-side comparison of header fields including:
+//! - Ledger hash
+//! - Previous ledger hash
+//! - Protocol version
+//! - Close time
+//! - Transaction set hash
+//! - Bucket list hash
+//! - Fee pool and total coins
+//!
+//! When `--compare-results` is specified, it also compares transaction result
+//! sets to identify individual transaction execution differences.
+
 use clap::Parser;
 use stellar_core_app::config::AppConfig;
 use stellar_core_common::Hash256;
@@ -6,22 +33,23 @@ use stellar_core_ledger::compute_header_hash;
 use stellar_xdr::curr::{LedgerHeader, TransactionHistoryResultEntry, WriteXdr};
 use std::path::PathBuf;
 
+/// CLI arguments for the header comparison tool.
 #[derive(Parser)]
 #[command(about = "Compare local and archive ledger headers")]
 struct Args {
-    /// Ledger sequence to compare.
+    /// Ledger sequence number to compare.
     #[arg(long)]
     ledger: u32,
 
-    /// Path to config file.
+    /// Path to the configuration file.
     #[arg(long, default_value = "testnet-validator.toml")]
     config: PathBuf,
 
-    /// Optional database path override.
+    /// Optional database path override (defaults to config value).
     #[arg(long)]
     db: Option<PathBuf>,
 
-    /// Compare transaction result sets between local DB and archive.
+    /// Also compare transaction result sets between local DB and archive.
     #[arg(long)]
     compare_results: bool,
 }
@@ -74,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prints a ledger header in a human-readable format.
+///
+/// Displays all relevant header fields including hashes, protocol version,
+/// timing, and network parameters.
 fn print_header(label: &str, header: &LedgerHeader, hash: &Hash256) {
     println!("{}:", label);
     println!("  hash: {}", hash.to_hex());
@@ -94,6 +126,14 @@ fn print_header(label: &str, header: &LedgerHeader, hash: &Hash256) {
     println!("  upgrades: {}", header.scp_value.upgrades.len());
 }
 
+/// Compares transaction results between local database and archive.
+///
+/// Fetches transaction results for the specified ledger from both the local
+/// database and the history archive, then compares them transaction by
+/// transaction. Any differences (in fee charged or result code) are printed.
+///
+/// This helps identify which specific transactions produced different results
+/// when debugging execution divergence.
 async fn compare_tx_results(
     db: &stellar_core_db::Database,
     archive: &HistoryArchive,
@@ -152,6 +192,7 @@ async fn compare_tx_results(
     Ok(())
 }
 
+/// Prints the hash of a transaction result set for comparison.
 fn print_tx_result_hash(label: &str, entry: &TransactionHistoryResultEntry) {
     let bytes = entry
         .tx_result_set

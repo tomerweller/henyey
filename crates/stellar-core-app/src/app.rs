@@ -1,12 +1,43 @@
-//! Application struct and component initialization for rs-stellar-core.
+//! Core application struct and component initialization for rs-stellar-core.
 //!
-//! The App struct is the main entry point that coordinates all subsystems:
-//! - Database for persistent storage
-//! - BucketManager for ledger state
-//! - LedgerManager for ledger operations
-//! - HistoryManager for archive access
-//! - OverlayManager for P2P networking
-//! - Herder for consensus coordination
+//! This module contains the [`App`] struct, which is the central coordinator for all
+//! Stellar Core subsystems. It manages the lifecycle of:
+//!
+//! - **Database**: SQLite persistence for ledger headers, transactions, and state
+//! - **BucketManager**: Merkle tree storage for ledger entry snapshots
+//! - **LedgerManager**: Ledger close operations and state transitions
+//! - **OverlayManager**: P2P network connections and message routing
+//! - **Herder**: SCP consensus coordination and transaction queue management
+//!
+//! # Application Lifecycle
+//!
+//! The typical lifecycle of an App instance:
+//!
+//! 1. **Initialization** ([`App::new`]): Load configuration, open database, initialize
+//!    subsystems, and restore state from disk
+//! 2. **Catchup** ([`App::catchup`]): If behind, download and apply history from archives
+//! 3. **Run** ([`App::run`]): Enter the main event loop, processing peer messages
+//!    and participating in consensus
+//! 4. **Shutdown** ([`App::shutdown`]): Gracefully stop all subsystems
+//!
+//! # State Machine
+//!
+//! The application transitions through these states (see [`AppState`]):
+//!
+//! ```text
+//! Initializing -> CatchingUp -> Synced <-> Validating
+//!                     ^            |
+//!                     |            v
+//!                     +--- ShuttingDown
+//! ```
+//!
+//! # Consensus Integration
+//!
+//! For validator nodes, the App coordinates SCP message flow:
+//! - Receives SCP envelopes from peers via the overlay
+//! - Passes them to the Herder for processing
+//! - Broadcasts locally-generated envelopes back to peers
+//! - Triggers ledger close when consensus is reached
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -122,18 +153,30 @@ fn decode_upgrades(upgrades: Vec<UpgradeType>) -> Vec<LedgerUpgrade> {
         .collect()
 }
 
-/// Application state.
+/// Application lifecycle state.
+///
+/// Represents the current phase of the application's operation. State transitions
+/// are logged and can be observed via the HTTP status endpoint.
+///
+/// # State Transitions
+///
+/// - `Initializing` -> `CatchingUp`: When catchup is required
+/// - `Initializing` -> `Synced`: When already up-to-date
+/// - `CatchingUp` -> `Synced`: When catchup completes successfully
+/// - `Synced` -> `Validating`: When consensus participation begins (validators only)
+/// - `Synced` -> `CatchingUp`: When node falls behind and needs to re-sync
+/// - Any -> `ShuttingDown`: When shutdown is requested
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
-    /// Application is initializing.
+    /// Application is initializing subsystems and loading state from disk.
     Initializing,
-    /// Application is catching up from history.
+    /// Application is downloading and applying history from archives.
     CatchingUp,
-    /// Application is synced and tracking consensus.
+    /// Application is synced with the network and tracking consensus.
     Synced,
-    /// Application is running as a validator.
+    /// Application is actively participating in consensus as a validator.
     Validating,
-    /// Application is shutting down.
+    /// Application is gracefully shutting down.
     ShuttingDown,
 }
 
@@ -149,12 +192,20 @@ impl std::fmt::Display for AppState {
     }
 }
 
+/// Report of survey topology data collected from a single peer.
 #[derive(Debug, Serialize)]
 pub struct SurveyPeerReport {
+    /// Public key of the peer that provided this report (hex-encoded).
     pub peer_id: String,
+    /// Topology response containing peer statistics and node data.
     pub response: TopologyResponseBodyV2,
 }
 
+/// Aggregated network survey report.
+///
+/// Contains both local node survey data and responses collected from peers
+/// during a time-sliced overlay survey. This data is used for network
+/// topology analysis and monitoring.
 #[derive(Debug, Serialize)]
 pub struct SurveyReport {
     pub phase: SurveyPhase,
@@ -168,7 +219,31 @@ pub struct SurveyReport {
     pub bad_response_nodes: Vec<String>,
 }
 
-/// The main application struct.
+/// The main application struct coordinating all Stellar Core subsystems.
+///
+/// `App` is the central component that:
+/// - Owns all long-lived subsystem handles (database, bucket manager, ledger manager, etc.)
+/// - Manages the application lifecycle (initialization, catchup, run, shutdown)
+/// - Routes messages between the overlay network and consensus components
+/// - Handles transaction submission and flooding
+/// - Provides HTTP API endpoints for monitoring and control
+///
+/// # Thread Safety
+///
+/// `App` is designed to be shared across async tasks via `Arc<App>`. Internal
+/// state is protected by appropriate locks (`RwLock`, `Mutex`).
+///
+/// # Creating an App
+///
+/// ```no_run
+/// use stellar_core_app::{App, AppConfig};
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let config = AppConfig::testnet();
+/// let app = App::new(config).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct App {
     /// Application configuration.
     config: AppConfig,

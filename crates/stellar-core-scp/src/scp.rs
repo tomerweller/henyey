@@ -1,7 +1,45 @@
-//! Main SCP driver implementation.
+//! Main SCP implementation coordinating consensus across multiple slots.
 //!
-//! This module provides the main `SCP` struct that coordinates
-//! consensus across multiple slots.
+//! This module provides the [`SCP`] struct, which is the primary entry point
+//! for using the Stellar Consensus Protocol. It manages per-slot state and
+//! coordinates the nomination and ballot protocols.
+//!
+//! # Architecture
+//!
+//! ```text
+//! +-------+     +------+     +------------------+
+//! |  SCP  | --> | Slot | --> | NominationProtocol |
+//! +-------+     +------+     +------------------+
+//!                   |
+//!                   +------> | BallotProtocol |
+//!                            +----------------+
+//! ```
+//!
+//! - [`SCP`] owns a map of slots, keyed by slot index (ledger sequence number)
+//! - Each [`Slot`](crate::slot::Slot) contains independent nomination and ballot protocol state
+//! - The [`SCPDriver`](crate::driver::SCPDriver) provides application-specific callbacks
+//!
+//! # Usage
+//!
+//! ```ignore
+//! let scp = SCP::new(node_id, true, quorum_set, driver);
+//!
+//! // Start nominating a value for a slot
+//! scp.nominate(slot_index, value, &prev_value);
+//!
+//! // Process incoming messages
+//! let state = scp.receive_envelope(envelope);
+//!
+//! // Check if consensus was reached
+//! if let Some(value) = scp.get_externalized_value(slot_index) {
+//!     // Apply the consensus value
+//! }
+//! ```
+//!
+//! # Memory Management
+//!
+//! Old slots are automatically purged when the slot count exceeds `max_slots`.
+//! Use [`purge_slots`](SCP::purge_slots) for explicit cleanup of historical slots.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,23 +52,45 @@ use crate::driver::SCPDriver;
 use crate::slot::Slot;
 use crate::EnvelopeState;
 
-/// Main SCP driver that manages slots and coordinates consensus.
+/// Main SCP coordinator that manages consensus across multiple slots.
 ///
-/// This is the primary interface for interacting with SCP.
-/// It manages per-slot state and delegates to the driver for
-/// application-specific behavior.
+/// The `SCP` struct is the primary entry point for using the Stellar Consensus
+/// Protocol. It manages per-slot state, routes incoming messages to the
+/// appropriate slot, and coordinates transitions between the nomination
+/// and ballot phases.
+///
+/// # Type Parameters
+///
+/// * `D` - The driver type implementing [`SCPDriver`](crate::driver::SCPDriver)
+///
+/// # Thread Safety
+///
+/// `SCP` uses interior mutability with `RwLock` for the slot map, allowing
+/// concurrent read access to slot state while serializing writes.
+///
+/// # Validators vs Watchers
+///
+/// - **Validators** (`is_validator = true`): Actively participate in consensus
+///   by nominating values and voting on ballots
+/// - **Watchers** (`is_validator = false`): Only observe consensus, tracking
+///   externalized values without voting
 pub struct SCP<D: SCPDriver> {
-    /// Local node identifier.
+    /// Local node identifier (public key).
     local_node_id: NodeId,
-    /// Whether this node is a validator.
+
+    /// Whether this node is a validator (participates in consensus).
     is_validator: bool,
-    /// Local quorum set.
+
+    /// Local quorum set configuration defining trusted validators.
     local_quorum_set: ScpQuorumSet,
-    /// Per-slot state.
+
+    /// Per-slot consensus state, keyed by slot index.
     slots: RwLock<HashMap<u64, Slot>>,
-    /// Driver callbacks.
+
+    /// Application driver for callbacks and application-specific logic.
     driver: Arc<D>,
-    /// Maximum number of slots to keep in memory.
+
+    /// Maximum number of slots to retain in memory before cleanup.
     max_slots: usize,
 }
 
@@ -359,22 +419,46 @@ impl<D: SCPDriver> SCP<D> {
     }
 }
 
-/// Summary of slot state for debugging.
+/// Summary of a slot's consensus state for debugging and monitoring.
+///
+/// This struct provides a snapshot of the key state indicators for a slot,
+/// useful for debugging, logging, and monitoring consensus progress.
 #[derive(Debug, Clone)]
 pub struct SlotState {
-    /// Slot index.
+    /// The slot index (typically corresponds to ledger sequence number).
     pub slot_index: u64,
-    /// Whether externalized.
+
+    /// Whether this slot has externalized (reached consensus).
+    ///
+    /// Once externalized, the slot's value is final and will not change.
     pub is_externalized: bool,
-    /// Whether currently nominating.
+
+    /// Whether the nomination phase is currently active.
+    ///
+    /// Nomination stops when a composite value is produced or when
+    /// explicitly stopped to transition to the ballot phase.
     pub is_nominating: bool,
-    /// Whether we've heard from quorum for the current ballot.
+
+    /// Whether we've heard from a quorum for the current ballot.
+    ///
+    /// This indicates whether sufficient nodes have voted on the
+    /// current ballot to potentially make progress.
     pub heard_from_quorum: bool,
-    /// Current ballot phase.
+
+    /// The current phase of the ballot protocol.
+    ///
+    /// Progresses from Prepare -> Confirm -> Externalize.
     pub ballot_phase: crate::ballot::BallotPhase,
-    /// Current nomination round.
+
+    /// The current nomination round number.
+    ///
+    /// Increases each time nomination times out or is restarted.
     pub nomination_round: u32,
-    /// Current ballot round (ballot counter), if any.
+
+    /// The current ballot counter, if a ballot is active.
+    ///
+    /// The ballot counter increases on timeouts to help the network
+    /// converge on a common ballot.
     pub ballot_round: Option<u32>,
 }
 

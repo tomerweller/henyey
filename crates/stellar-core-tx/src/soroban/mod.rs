@@ -3,24 +3,84 @@
 //! This module provides the integration layer between the transaction processor
 //! and Soroban smart contract execution. It handles:
 //!
-//! - Budget tracking for CPU and memory
-//! - Storage interface for contract state
-//! - Event recording
-//! - Host function execution via soroban-env-host
+//! - Budget tracking for CPU and memory consumption
+//! - Storage interface for contract state (persistent and temporary)
+//! - Event recording (contract events, system events, diagnostics)
+//! - Host function execution via `soroban-env-host`
 //!
-//! ## Architecture
+//! # Architecture
 //!
-//! For full Soroban execution:
-//! 1. Create a `Host` with storage adapter connected to our bucket list
-//! 2. Load the contract WASM and invoke functions via soroban-env-host
-//! 3. Capture state changes and events
-//! 4. Apply changes back to our ledger state
+//! Soroban execution follows this pipeline:
 //!
-//! ## Protocol Versioning
+//! ```text
+//! Transaction with InvokeHostFunction
+//!            |
+//!            v
+//! +---------------------+
+//! | Footprint Validation |  <- Verify declared read/write keys
+//! +---------------------+
+//!            |
+//!            v
+//! +---------------------+
+//! | Build Storage Map    |  <- Load entries from bucket list
+//! +---------------------+
+//!            |
+//!            v
+//! +---------------------+
+//! | Execute via e2e_invoke |  <- soroban-env-host execution
+//! +---------------------+
+//!            |
+//!            v
+//! +---------------------+
+//! | Collect Changes      |  <- Storage changes, events, fees
+//! +---------------------+
+//!            |
+//!            v
+//! Apply to LedgerDelta
+//! ```
+//!
+//! # Protocol Versioning
 //!
 //! The `protocol` submodule provides protocol-versioned host implementations.
-//! Each protocol version uses the exact same soroban-env-host version as
-//! C++ stellar-core to ensure deterministic replay.
+//! Each protocol version uses the exact same `soroban-env-host` version as
+//! C++ stellar-core to ensure deterministic replay:
+//!
+//! | Protocol | soroban-env-host Version |
+//! |----------|-------------------------|
+//! | 24       | `soroban-env-host-p24`  |
+//! | 25+      | `soroban-env-host-p25`  |
+//!
+//! This versioning is critical because:
+//! - Host function semantics may change between versions
+//! - Cost model parameters differ per protocol
+//! - PRNG behavior must match exactly for determinism
+//!
+//! # Key Components
+//!
+//! - [`SorobanConfig`]: Network configuration for Soroban execution including
+//!   cost parameters, TTL limits, and fee configuration.
+//!
+//! - [`SorobanBudget`]: Tracks resource consumption (CPU, memory, I/O) against
+//!   declared limits to enforce execution bounds.
+//!
+//! - [`SorobanStorage`]: Provides the storage interface for contract state,
+//!   tracking reads and writes during execution.
+//!
+//! - [`execute_host_function`]: Main entry point for executing Soroban
+//!   operations, handling protocol version dispatch.
+//!
+//! # Entry TTL and Archival
+//!
+//! Soroban entries (ContractData, ContractCode) have time-to-live (TTL) values:
+//!
+//! - **Temporary entries**: Short-lived, cheaper storage. Automatically deleted
+//!   when TTL expires.
+//!
+//! - **Persistent entries**: Long-lived storage. When TTL expires, entries move
+//!   to the "hot archive" and can be restored via `RestoreFootprint`.
+//!
+//! The storage adapter checks TTL values and excludes expired entries from the
+//! snapshot, matching C++ stellar-core behavior.
 
 mod budget;
 mod events;

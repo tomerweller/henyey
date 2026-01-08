@@ -1,20 +1,42 @@
 //! Bucket list snapshot queries.
+//!
+//! The bucket list is a Merkle tree structure that stores all ledger entries
+//! in Stellar. At checkpoint ledgers (every 64 ledgers), the bucket hashes
+//! are saved to enable state reconstruction during catchup.
+//!
+//! # Structure
+//!
+//! The bucket list has multiple levels, each containing two buckets:
+//! - `curr`: The current bucket being filled with new entries
+//! - `snap`: A snapshot of the previous level's merged state
+//!
+//! This structure allows efficient merging and pruning of ledger state.
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use stellar_core_common::Hash256;
 
 use super::super::error::DbError;
 
-/// Trait for querying and storing bucket list snapshots.
+/// Query trait for bucket list snapshot operations.
+///
+/// Provides methods for storing and retrieving bucket list state at
+/// checkpoint ledgers.
 pub trait BucketListQueries {
-    /// Store a bucket list snapshot for a ledger sequence.
+    /// Stores bucket list levels for a ledger.
+    ///
+    /// Each level is stored as a (curr_hash, snap_hash) pair. Existing
+    /// data for the ledger is replaced.
     fn store_bucket_list(
         &self,
         ledger_seq: u32,
         levels: &[(Hash256, Hash256)],
     ) -> Result<(), DbError>;
 
-    /// Load a bucket list snapshot by ledger sequence.
+    /// Loads bucket list levels for a ledger.
+    ///
+    /// Returns `None` if no snapshot exists for the given ledger.
+    /// The returned vector contains (curr_hash, snap_hash) pairs
+    /// indexed by level number.
     fn load_bucket_list(
         &self,
         ledger_seq: u32,
