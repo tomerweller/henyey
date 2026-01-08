@@ -85,6 +85,7 @@ mod error;
 mod events;
 pub mod fee_bump;
 mod frame;
+pub mod lumen_reconciler;
 pub mod meta_builder;
 pub mod operations;
 mod result;
@@ -97,7 +98,12 @@ pub mod validation;
 pub use error::TxError;
 pub use events::{
     make_account_address, make_claimable_balance_address, make_muxed_account_address,
-    ClassicEventConfig, OpEventManager, TxEventManager,
+    ClassicEventConfig, EventManagerHierarchy, OpEventManager, TxEventManager,
+};
+
+// Re-export lumen reconciler types
+pub use lumen_reconciler::{
+    reconcile_events, LumenEventReconciler, ReconcilerConfig,
 };
 
 // Re-export frame types

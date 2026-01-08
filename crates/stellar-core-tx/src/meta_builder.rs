@@ -463,7 +463,7 @@ impl OperationMetaBuilder {
     }
 
     /// Finalize into OperationMetaV2 (for V4 meta with per-op events).
-    pub fn finalize_v4(self) -> OperationMetaV2 {
+    pub fn finalize_v4(mut self) -> OperationMetaV2 {
         let events = self.event_manager.finalize();
         OperationMetaV2 {
             ext: ExtensionPoint::V0,
@@ -803,7 +803,7 @@ impl TransactionMetaBuilder {
     }
 
     /// Finalize to V4 meta (modern Soroban, per-op events).
-    fn finalize_v4(self, success: bool) -> TransactionMeta {
+    fn finalize_v4(mut self, success: bool) -> TransactionMeta {
         // For V4, we need OperationMetaV2 with per-operation events
         let operations: Vec<OperationMetaV2> = self
             .operation_builders

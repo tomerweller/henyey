@@ -180,13 +180,15 @@ This section documents the parity between this Rust crate and the upstream C++ s
   - Rust: Not needed - bucket list only
 - **TransactionBridge**: Bridge between transaction frames and database
 
-#### Event Management (Full Implementation)
+#### Event Management (Implemented)
 - **EventManager hierarchy**: Full C++ EventManager/OpEventManager/TxEventManager structure
   - C++: `EventManager.cpp` - 500+ lines with LumenEventReconciler
-  - Rust: Simplified event managers without full reconciliation
+  - Rust: Full implementation in `events.rs` with `OpEventManager`, `TxEventManager`, and `EventManagerHierarchy`
+  - Features: finalization guards, insert-at-beginning for mint events, disabled mode for performance
 - **LumenEventReconciler**: XLM balance reconciliation for event emission
   - C++: `LumenEventReconciler.cpp` - reconciles XLM movements for fee events
-  - Rust: Direct fee event emission without reconciliation
+  - Rust: Full implementation in `lumen_reconciler.rs` with `LumenEventReconciler` and `ReconcilerConfig`
+  - Features: pre-protocol 8 balance tracking, account delta calculation, mint event insertion
 
 #### Signature Utilities
 - **SignatureUtils**: Signature verification helpers
@@ -216,7 +218,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 5. **Meta Building**: Rust now has `TransactionMetaBuilder` for live execution mode, matching C++ behavior. The catchup mode still parses metadata from archives.
 
-6. **Event Reconciliation**: C++ uses `LumenEventReconciler` to ensure fee events are correctly attributed. Rust emits fee events directly without reconciliation, which may produce different event sequences in edge cases.
+6. **Event Reconciliation**: Rust now has a full `LumenEventReconciler` implementation matching C++ behavior for pre-protocol 8 XLM balance tracking, ensuring fee events are correctly attributed with proper mint event insertion at the beginning of event lists.
 
 7. **Fee Bump Handling**: Rust now has a dedicated `FeeBumpFrame` wrapper that provides fee bump-specific functionality matching C++ `FeeBumpTransactionFrame`. The implementation includes proper inner transaction hash tracking, protocol-versioned fee logic, and result wrapping.
 
@@ -232,11 +234,11 @@ This section documents the parity between this Rust crate and the upstream C++ s
 1. ~~Unused signature checking~~ ✓ Implemented (via SignatureChecker)
 2. ~~One-time signer removal~~ ✓ Implemented
 3. ~~DiagnosticEventManager integration~~ ✓ Implemented
-4. LumenEventReconciler for event consistency
+4. ~~LumenEventReconciler for event consistency~~ ✓ Implemented
 
 **Low Priority** (not needed for current use cases):
 1. Parallel execution infrastructure
 2. SQL database integration
 3. TransactionBridge
 
-**All high-priority gaps for validator mode have been addressed.**
+**All high-priority and medium-priority gaps have been addressed.**
