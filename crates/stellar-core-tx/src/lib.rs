@@ -84,6 +84,7 @@ mod apply;
 mod error;
 mod events;
 mod frame;
+pub mod meta_builder;
 pub mod operations;
 mod result;
 pub mod signature_checker;
@@ -131,6 +132,12 @@ pub use operations::{
 
 // Re-export state types
 pub use state::{LedgerReader, LedgerStateManager};
+
+// Re-export meta builder types
+pub use meta_builder::{
+    DiagnosticConfig, DiagnosticEventManager, ExecutionMetrics, OperationMetaBuilder,
+    TransactionMetaBuilder,
+};
 
 /// Result type alias for transaction operations.
 ///

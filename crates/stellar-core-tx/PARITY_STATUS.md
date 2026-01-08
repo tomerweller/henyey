@@ -50,6 +50,33 @@ This section documents the parity between this Rust crate and the upstream C++ s
   - Sponsorship cleanup when removing sponsored signers
   - Protocol 7 bypass (matches C++ behavior)
 
+#### Transaction Metadata Building (Newly Implemented)
+- **TransactionMetaBuilder** (`meta_builder.rs`): Full meta construction for live execution
+  - Creates OperationMetaBuilder for each operation
+  - Manages transaction-level and operation-level events
+  - Supports V2, V3, and V4 TransactionMeta XDR formats
+  - `push_tx_changes_before()` and `push_tx_changes_after()` for tx-level changes
+  - `set_non_refundable_resource_fee()` and `set_refundable_fee_tracker()` for Soroban
+  - One-time `finalize(success)` produces final TransactionMeta XDR
+- **OperationMetaBuilder** (`meta_builder.rs`): Per-operation metadata
+  - Records ledger changes: `record_create()`, `record_update()`, `record_delete()`, `record_restore()`
+  - Manages OpEventManager for operation-level contract events
+  - Soroban return value tracking via `set_soroban_return_value()`
+  - `finalize_v2()` for V2/V3 meta, `finalize_v4()` for V4 meta with per-op events
+- **DiagnosticEventManager** (`meta_builder.rs`): Diagnostic event collection
+  - `create_for_apply()` for Soroban transaction apply phase
+  - `create_for_validation()` for transaction submission validation
+  - `push_error()` for validation/execution errors (ScError, message, args)
+  - `push_metrics()` for execution metrics (CPU, memory, I/O)
+  - `push_event()` and `push_events()` for Soroban host diagnostic events
+  - Disabled mode is complete no-op for performance
+- **DiagnosticConfig**: Configuration for diagnostic event collection
+  - `enable_soroban_diagnostic_events` for apply phase
+  - `enable_diagnostics_for_tx_submission` for validation phase
+- **ExecutionMetrics**: Struct for execution metrics diagnostic events
+  - cpu_insn, mem_byte, ledger_read_byte, ledger_write_byte
+  - emit_event, emit_event_byte, invoke_time_nsecs
+
 #### Transaction Application (Catchup Mode)
 - **LedgerDelta**: State change accumulation with proper ordering
 - **Change ordering preservation**: ChangeRef tracking for metadata construction
@@ -125,15 +152,6 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - **ThreadParallelApplyLedgerState**: Thread-local ledger state for parallel apply
 - **TxEffects**: Per-transaction effect tracking for parallel merge
 
-#### Transaction Metadata Building
-- **TransactionMetaBuilder**: Full meta construction during live execution
-  - C++: `TransactionMeta.cpp` - builds meta during apply, manages operation builders
-  - Rust: Meta is parsed from archive, not built during execution
-- **OperationMetaBuilder**: Per-operation meta with event management
-- **DiagnosticEventManager**: Diagnostic event collection during validation/apply
-  - C++: Tracks validation errors, budget exceedance, etc.
-  - Rust: Diagnostic events extracted from soroban-env-host only
-
 #### Fee Bump Transactions
 - **FeeBumpTransactionFrame**: Separate frame class for fee bump handling
   - C++: `FeeBumpTransactionFrame.cpp` - 600+ lines of fee bump-specific logic
@@ -178,24 +196,24 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 3. **Protocol Versioning**: Rust uses separate `soroban-env-host-p24` and `soroban-env-host-p25` crates, while C++ uses version-aware code paths within a single codebase.
 
-4. **Signature Checking**: The C++ `SignatureChecker` is a stateful class that tracks which signatures have been used across the transaction. The Rust implementation does per-signature verification without this tracking, which could allow replay of signatures across operations (though this is caught by other validation).
+4. **Signature Checking**: The Rust `SignatureChecker` now matches C++ behavior with stateful tracking of which signatures have been used across the transaction, weight accumulation, and threshold checking.
 
-5. **Meta Building**: C++ builds transaction metadata during execution. Rust parses it from archives. For full live execution, Rust would need a `TransactionMetaBuilder` equivalent.
+5. **Meta Building**: Rust now has `TransactionMetaBuilder` for live execution mode, matching C++ behavior. The catchup mode still parses metadata from archives.
 
 6. **Event Reconciliation**: C++ uses `LumenEventReconciler` to ensure fee events are correctly attributed. Rust emits fee events directly without reconciliation, which may produce different event sequences in edge cases.
 
 #### Priority Gaps for Full Parity
 
 **High Priority** (needed for validator mode):
-1. SignatureChecker with weight accumulation and threshold checking
-2. TransactionMetaBuilder for generating metadata during execution
-3. MutableTransactionResult with RefundableFeeTracker
+1. ~~SignatureChecker with weight accumulation and threshold checking~~ ✓ Implemented
+2. ~~TransactionMetaBuilder for generating metadata during execution~~ ✓ Implemented
+3. ~~MutableTransactionResult with RefundableFeeTracker~~ ✓ Implemented
 4. Complete fee bump transaction handling
 
 **Medium Priority** (needed for complete validation):
-1. Unused signature checking
-2. One-time signer removal
-3. DiagnosticEventManager integration
+1. ~~Unused signature checking~~ ✓ Implemented (via SignatureChecker)
+2. ~~One-time signer removal~~ ✓ Implemented
+3. ~~DiagnosticEventManager integration~~ ✓ Implemented
 4. LumenEventReconciler for event consistency
 
 **Low Priority** (not needed for current use cases):
