@@ -668,6 +668,152 @@ impl LedgerStateManager {
         self.get_account(account_id).map(sponsorship_counts)
     }
 
+    // ========================================================================
+    // One-time (Pre-Auth TX) Signer Removal
+    // ========================================================================
+
+    /// Remove a one-time (pre-auth TX) signer from all source accounts in a transaction.
+    ///
+    /// Pre-auth TX signers are automatically consumed when a transaction they
+    /// authorized is applied. This method removes the signer from all accounts
+    /// that participated in the transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx_hash` - The transaction hash (used to create the signer key)
+    /// * `source_accounts` - All source account IDs in the transaction
+    /// * `protocol_version` - Current protocol version
+    ///
+    /// # Note
+    ///
+    /// This is a no-op for protocol version 7 (matches C++ behavior).
+    pub fn remove_one_time_signers_from_all_sources(
+        &mut self,
+        tx_hash: &stellar_core_common::Hash256,
+        source_accounts: &[AccountId],
+        protocol_version: u32,
+    ) {
+        // Protocol 7 bypass (matches C++ behavior)
+        if protocol_version == 7 {
+            return;
+        }
+
+        // Create the pre-auth TX signer key from the transaction hash
+        let signer_key = stellar_xdr::curr::SignerKey::PreAuthTx(
+            stellar_xdr::curr::Uint256(tx_hash.0),
+        );
+
+        // Remove from each source account
+        for account_id in source_accounts {
+            self.remove_account_signer(account_id, &signer_key);
+        }
+    }
+
+    /// Remove a specific signer from an account.
+    ///
+    /// This handles the removal of any signer type and properly updates:
+    /// - The signers vector
+    /// - The num_sub_entries count
+    /// - The sponsorship tracking (if the signer was sponsored)
+    ///
+    /// # Returns
+    ///
+    /// `true` if the signer was found and removed, `false` otherwise.
+    pub fn remove_account_signer(
+        &mut self,
+        account_id: &AccountId,
+        signer_key: &stellar_xdr::curr::SignerKey,
+    ) -> bool {
+        // Get mutable access to the account
+        let Some(account) = self.get_account_mut(account_id) else {
+            return false; // Account may have been removed (e.g., by merge)
+        };
+
+        // Find the signer index
+        let signer_idx = account
+            .signers
+            .iter()
+            .position(|s| &s.key == signer_key);
+
+        let Some(idx) = signer_idx else {
+            return false; // Signer not found
+        };
+
+        // Remove the signer from the vec
+        let mut new_signers: Vec<stellar_xdr::curr::Signer> =
+            account.signers.iter().cloned().collect();
+        new_signers.remove(idx);
+        account.signers = new_signers.try_into().unwrap_or_default();
+
+        // Decrement num_sub_entries
+        if account.num_sub_entries > 0 {
+            account.num_sub_entries -= 1;
+        }
+
+        // Handle sponsorship cleanup if applicable
+        // The signer sponsorship is stored in the account's extension
+        self.remove_signer_sponsorship(account_id, idx);
+
+        true
+    }
+
+    /// Remove sponsorship tracking for a signer at the given index.
+    ///
+    /// When a signer is sponsored, the sponsoring account's ID is stored in
+    /// the account's `signer_sponsoring_i_ds` vector (in AccountEntryExtensionV2).
+    /// Removing a signer requires cleaning up this sponsorship relationship
+    /// and updating the sponsor's `num_sponsoring` count.
+    fn remove_signer_sponsorship(&mut self, account_id: &AccountId, signer_index: usize) {
+        // Get the account to check for sponsorship
+        let Some(account) = self.get_account(account_id) else {
+            return;
+        };
+
+        // Check if the account has extension v2 with signer sponsorships
+        let sponsor_id = match &account.ext {
+            AccountEntryExt::V1(v1) => match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => {
+                    // Check if this signer index has a sponsor
+                    if signer_index < v2.signer_sponsoring_i_ds.len() {
+                        v2.signer_sponsoring_i_ds[signer_index].0.clone()
+                    } else {
+                        None
+                    }
+                }
+                AccountEntryExtensionV1Ext::V0 => None,
+            },
+            AccountEntryExt::V0 => None,
+        };
+
+        // If there was a sponsor, update the counts
+        if let Some(sponsor) = sponsor_id {
+            // Decrement sponsor's num_sponsoring
+            if let Err(e) = self.update_num_sponsoring(&sponsor, -1) {
+                // Log error but don't fail - this is cleanup
+                tracing::warn!("Failed to update num_sponsoring during signer removal: {}", e);
+            }
+
+            // Decrement sponsored account's num_sponsored
+            if let Err(e) = self.update_num_sponsored(account_id, -1) {
+                tracing::warn!("Failed to update num_sponsored during signer removal: {}", e);
+            }
+
+            // Remove the sponsorship entry from signer_sponsoring_i_ds
+            if let Some(account) = self.get_account_mut(account_id) {
+                if let AccountEntryExt::V1(v1) = &mut account.ext {
+                    if let AccountEntryExtensionV1Ext::V2(v2) = &mut v1.ext {
+                        if signer_index < v2.signer_sponsoring_i_ds.len() {
+                            let mut ids: Vec<_> =
+                                v2.signer_sponsoring_i_ds.iter().cloned().collect();
+                            ids.remove(signer_index);
+                            v2.signer_sponsoring_i_ds = ids.try_into().unwrap_or_default();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn ledger_entry_ext_for(&self, key: &LedgerKey) -> LedgerEntryExt {
         if let Some(sponsor) = self.entry_sponsorships.get(key) {
             LedgerEntryExt::V1(LedgerEntryExtensionV1 {

@@ -86,6 +86,7 @@ mod events;
 mod frame;
 pub mod operations;
 mod result;
+pub mod signature_checker;
 pub mod soroban;
 pub mod state;
 pub mod validation;
@@ -108,9 +109,12 @@ pub use apply::{
 
 // Re-export result types
 pub use result::{
-    OpResultCode, OpResultWrapper, TxApplyResult, TxResultCode, TxResultWrapper,
-    TxSetResultSummary,
+    MutableTransactionResult, OpResultCode, OpResultWrapper, RefundableFeeError,
+    RefundableFeeTracker, TxApplyResult, TxResultCode, TxResultWrapper, TxSetResultSummary,
 };
+
+// Re-export signature checker types
+pub use signature_checker::{collect_signers_for_account, SignatureChecker};
 
 // Re-export validation types and functions
 pub use validation::{
@@ -121,7 +125,8 @@ pub use validation::{
 
 // Re-export operation types
 pub use operations::{
-    get_operation_source, validate_operation, OperationType, OperationValidationError,
+    get_needed_threshold, get_operation_source, get_threshold_level, validate_operation,
+    OperationType, OperationValidationError, ThresholdLevel,
 };
 
 // Re-export state types

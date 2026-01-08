@@ -524,6 +524,383 @@ impl std::fmt::Display for OpResultCode {
     }
 }
 
+// ============================================================================
+// Mutable Transaction Result Types (for live execution)
+// ============================================================================
+
+/// Tracks refundable resources and fees for Soroban transactions.
+///
+/// During Soroban transaction execution, various resources are consumed (events,
+/// rent fees, etc.) that may be partially refundable if not fully used. This
+/// tracker accumulates consumption and calculates the final refund amount.
+///
+/// # Example
+///
+/// ```ignore
+/// let mut tracker = RefundableFeeTracker::new(1000);
+///
+/// // During execution, consume resources
+/// tracker.consume_rent_fee(100);
+/// tracker.consume_events_size(50);
+///
+/// // Calculate refund
+/// let refund = tracker.get_fee_refund(); // max - consumed
+/// ```
+#[derive(Debug, Clone)]
+pub struct RefundableFeeTracker {
+    /// Maximum refundable fee (from transaction).
+    max_refundable_fee: i64,
+    /// Consumed contract events size in bytes.
+    consumed_events_size_bytes: u32,
+    /// Consumed rent fee.
+    consumed_rent_fee: i64,
+    /// Total consumed refundable fee.
+    consumed_refundable_fee: i64,
+}
+
+impl RefundableFeeTracker {
+    /// Create a new tracker with the given maximum refundable fee.
+    pub fn new(max_refundable_fee: i64) -> Self {
+        Self {
+            max_refundable_fee,
+            consumed_events_size_bytes: 0,
+            consumed_rent_fee: 0,
+            consumed_refundable_fee: 0,
+        }
+    }
+
+    /// Consume rent fee from the refundable budget.
+    ///
+    /// Returns `Ok(())` if within budget, `Err` if rent fee exceeds available.
+    pub fn consume_rent_fee(&mut self, rent_fee: i64) -> Result<(), RefundableFeeError> {
+        self.consumed_rent_fee += rent_fee;
+
+        if self.max_refundable_fee < self.consumed_rent_fee {
+            return Err(RefundableFeeError::RentFeeExceeded {
+                consumed: self.consumed_rent_fee,
+                max: self.max_refundable_fee,
+            });
+        }
+
+        // Update total consumed
+        self.consumed_refundable_fee = self.consumed_rent_fee;
+        Ok(())
+    }
+
+    /// Consume contract events size.
+    ///
+    /// This is tracked separately and factored into the refundable fee calculation.
+    pub fn consume_events_size(&mut self, size_bytes: u32) {
+        self.consumed_events_size_bytes += size_bytes;
+    }
+
+    /// Update the total consumed refundable fee based on a computed value.
+    ///
+    /// This is called after computing the actual resource fee based on consumption.
+    ///
+    /// Returns `Ok(())` if within budget, `Err` if total exceeds maximum.
+    pub fn update_consumed_refundable_fee(&mut self, refundable_fee: i64) -> Result<(), RefundableFeeError> {
+        self.consumed_refundable_fee = self.consumed_rent_fee + refundable_fee;
+
+        if self.max_refundable_fee < self.consumed_refundable_fee {
+            return Err(RefundableFeeError::RefundableFeeExceeded {
+                consumed: self.consumed_refundable_fee,
+                max: self.max_refundable_fee,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Get the fee refund (max - consumed).
+    ///
+    /// This is the amount that should be credited back to the fee source account.
+    pub fn get_fee_refund(&self) -> i64 {
+        self.max_refundable_fee - self.consumed_refundable_fee
+    }
+
+    /// Get the maximum refundable fee.
+    pub fn max_refundable_fee(&self) -> i64 {
+        self.max_refundable_fee
+    }
+
+    /// Get the consumed rent fee.
+    pub fn consumed_rent_fee(&self) -> i64 {
+        self.consumed_rent_fee
+    }
+
+    /// Get the total consumed refundable fee.
+    pub fn consumed_refundable_fee(&self) -> i64 {
+        self.consumed_refundable_fee
+    }
+
+    /// Get the consumed events size in bytes.
+    pub fn consumed_events_size_bytes(&self) -> u32 {
+        self.consumed_events_size_bytes
+    }
+
+    /// Reset all consumed fees to 0 (for error cases).
+    ///
+    /// When a transaction fails, all consumed fees are reset so that the
+    /// maximum refund is returned to the fee source.
+    pub fn reset_consumed_fee(&mut self) {
+        self.consumed_events_size_bytes = 0;
+        self.consumed_rent_fee = 0;
+        self.consumed_refundable_fee = 0;
+    }
+}
+
+/// Error type for refundable fee tracking.
+#[derive(Debug, Clone)]
+pub enum RefundableFeeError {
+    /// Rent fee consumption exceeded the available refundable limit.
+    RentFeeExceeded {
+        consumed: i64,
+        max: i64,
+    },
+    /// Total refundable fee consumption exceeded the available limit.
+    RefundableFeeExceeded {
+        consumed: i64,
+        max: i64,
+    },
+}
+
+impl std::fmt::Display for RefundableFeeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RentFeeExceeded { consumed, max } => {
+                write!(f, "rent fee {} exceeded refundable limit {}", consumed, max)
+            }
+            Self::RefundableFeeExceeded { consumed, max } => {
+                write!(f, "refundable fee {} exceeded limit {}", consumed, max)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RefundableFeeError {}
+
+/// Mutable transaction result for use during transaction execution.
+///
+/// This wrapper allows modifying the result as the transaction progresses,
+/// including setting error codes and managing refundable fee tracking.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Create a result for execution
+/// let mut result = MutableTransactionResult::new(fee_charged);
+///
+/// // Initialize refundable fee tracking for Soroban
+/// result.initialize_refundable_fee_tracker(max_refundable_fee);
+///
+/// // Set operation results as they complete
+/// result.set_operation_result(0, op_result);
+///
+/// // On error, set error code (resets refundable fees)
+/// result.set_error(TransactionResultCode::TxFailed);
+///
+/// // Finalize and extract the XDR result
+/// result.finalize_fee_refund(protocol_version);
+/// let xdr_result = result.into_xdr();
+/// ```
+#[derive(Debug, Clone)]
+pub struct MutableTransactionResult {
+    /// The underlying XDR result being built.
+    inner: TransactionResult,
+    /// Optional refundable fee tracker for Soroban transactions.
+    refundable_fee_tracker: Option<RefundableFeeTracker>,
+}
+
+impl MutableTransactionResult {
+    /// Create a new mutable result with the given fee charged.
+    pub fn new(fee_charged: i64) -> Self {
+        Self {
+            inner: TransactionResult {
+                fee_charged,
+                result: TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
+                ext: stellar_xdr::curr::TransactionResultExt::V0,
+            },
+            refundable_fee_tracker: None,
+        }
+    }
+
+    /// Create a new error result with the given code.
+    pub fn create_error(code: stellar_xdr::curr::TransactionResultCode, fee_charged: i64) -> Self {
+        use stellar_xdr::curr::TransactionResultCode::*;
+
+        let result = match code {
+            TxFeeBumpInnerSuccess => TransactionResultResult::TxFeeBumpInnerSuccess(
+                stellar_xdr::curr::InnerTransactionResultPair {
+                    transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    result: stellar_xdr::curr::InnerTransactionResult {
+                        fee_charged: 0,
+                        result: stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(
+                            vec![].try_into().unwrap(),
+                        ),
+                        ext: stellar_xdr::curr::InnerTransactionResultExt::V0,
+                    },
+                },
+            ),
+            TxFeeBumpInnerFailed => TransactionResultResult::TxFeeBumpInnerFailed(
+                stellar_xdr::curr::InnerTransactionResultPair {
+                    transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    result: stellar_xdr::curr::InnerTransactionResult {
+                        fee_charged: 0,
+                        result: stellar_xdr::curr::InnerTransactionResultResult::TxFailed(
+                            vec![].try_into().unwrap(),
+                        ),
+                        ext: stellar_xdr::curr::InnerTransactionResultExt::V0,
+                    },
+                },
+            ),
+            TxSuccess => TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
+            TxFailed => TransactionResultResult::TxFailed(vec![].try_into().unwrap()),
+            TxTooEarly => TransactionResultResult::TxTooEarly,
+            TxTooLate => TransactionResultResult::TxTooLate,
+            TxMissingOperation => TransactionResultResult::TxMissingOperation,
+            TxBadSeq => TransactionResultResult::TxBadSeq,
+            TxBadAuth => TransactionResultResult::TxBadAuth,
+            TxInsufficientBalance => TransactionResultResult::TxInsufficientBalance,
+            TxNoAccount => TransactionResultResult::TxNoAccount,
+            TxInsufficientFee => TransactionResultResult::TxInsufficientFee,
+            TxBadAuthExtra => TransactionResultResult::TxBadAuthExtra,
+            TxInternalError => TransactionResultResult::TxInternalError,
+            TxNotSupported => TransactionResultResult::TxNotSupported,
+            TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
+            TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
+            TxMalformed => TransactionResultResult::TxMalformed,
+            TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
+        };
+
+        Self {
+            inner: TransactionResult {
+                fee_charged,
+                result,
+                ext: stellar_xdr::curr::TransactionResultExt::V0,
+            },
+            refundable_fee_tracker: None,
+        }
+    }
+
+    /// Create a new success result with preallocated operation results.
+    pub fn create_success(fee_charged: i64, op_count: usize) -> Self {
+        let results = vec![
+            OperationResult::OpInner(OperationResultTr::Payment(
+                stellar_xdr::curr::PaymentResult::Success,
+            ));
+            op_count
+        ];
+
+        Self {
+            inner: TransactionResult {
+                fee_charged,
+                result: TransactionResultResult::TxSuccess(results.try_into().unwrap_or_default()),
+                ext: stellar_xdr::curr::TransactionResultExt::V0,
+            },
+            refundable_fee_tracker: None,
+        }
+    }
+
+    /// Set an error code on this result.
+    ///
+    /// This also resets any consumed refundable fees (for Soroban) so that
+    /// the maximum refund is returned to the fee source.
+    pub fn set_error(&mut self, code: stellar_xdr::curr::TransactionResultCode) {
+        use stellar_xdr::curr::TransactionResultCode::*;
+
+        self.inner.result = match code {
+            TxSuccess => TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
+            TxFailed => TransactionResultResult::TxFailed(vec![].try_into().unwrap()),
+            TxTooEarly => TransactionResultResult::TxTooEarly,
+            TxTooLate => TransactionResultResult::TxTooLate,
+            TxMissingOperation => TransactionResultResult::TxMissingOperation,
+            TxBadSeq => TransactionResultResult::TxBadSeq,
+            TxBadAuth => TransactionResultResult::TxBadAuth,
+            TxInsufficientBalance => TransactionResultResult::TxInsufficientBalance,
+            TxNoAccount => TransactionResultResult::TxNoAccount,
+            TxInsufficientFee => TransactionResultResult::TxInsufficientFee,
+            TxBadAuthExtra => TransactionResultResult::TxBadAuthExtra,
+            TxInternalError => TransactionResultResult::TxInternalError,
+            TxNotSupported => TransactionResultResult::TxNotSupported,
+            TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
+            TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
+            TxMalformed => TransactionResultResult::TxMalformed,
+            TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
+            _ => TransactionResultResult::TxInternalError, // Fee bump handled separately
+        };
+
+        // Reset refundable fees on error
+        if let Some(ref mut tracker) = self.refundable_fee_tracker {
+            tracker.reset_consumed_fee();
+        }
+    }
+
+    /// Initialize refundable fee tracker for Soroban transactions.
+    pub fn initialize_refundable_fee_tracker(&mut self, max_refundable_fee: i64) {
+        self.refundable_fee_tracker = Some(RefundableFeeTracker::new(max_refundable_fee));
+    }
+
+    /// Get a mutable reference to the refundable fee tracker.
+    pub fn refundable_fee_tracker_mut(&mut self) -> Option<&mut RefundableFeeTracker> {
+        self.refundable_fee_tracker.as_mut()
+    }
+
+    /// Get a reference to the refundable fee tracker.
+    pub fn refundable_fee_tracker(&self) -> Option<&RefundableFeeTracker> {
+        self.refundable_fee_tracker.as_ref()
+    }
+
+    /// Finalize the fee refund and update fee_charged.
+    ///
+    /// Should be called after transaction execution completes. This applies
+    /// the refund (if any) to reduce the fee_charged.
+    pub fn finalize_fee_refund(&mut self, _protocol_version: u32) {
+        if let Some(ref tracker) = self.refundable_fee_tracker {
+            self.inner.fee_charged -= tracker.get_fee_refund();
+        }
+    }
+
+    /// Check if this result represents success.
+    pub fn is_success(&self) -> bool {
+        matches!(
+            self.inner.result,
+            TransactionResultResult::TxSuccess(_)
+                | TransactionResultResult::TxFeeBumpInnerSuccess(_)
+        )
+    }
+
+    /// Get the result code.
+    pub fn result_code(&self) -> TxResultCode {
+        TxResultWrapper::from_xdr(self.inner.clone()).result_code()
+    }
+
+    /// Get the fee charged.
+    pub fn fee_charged(&self) -> i64 {
+        self.inner.fee_charged
+    }
+
+    /// Set the fee charged.
+    pub fn set_fee_charged(&mut self, fee_charged: i64) {
+        self.inner.fee_charged = fee_charged;
+    }
+
+    /// Consume and return the final XDR result.
+    pub fn into_xdr(self) -> TransactionResult {
+        self.inner
+    }
+
+    /// Get a reference to the underlying XDR result.
+    pub fn as_xdr(&self) -> &TransactionResult {
+        &self.inner
+    }
+
+    /// Convert to a TxResultWrapper.
+    pub fn into_wrapper(self) -> TxResultWrapper {
+        TxResultWrapper::from_xdr(self.inner)
+    }
+}
+
 /// Summary of transaction results for a transaction set.
 #[derive(Debug, Clone, Default)]
 pub struct TxSetResultSummary {
@@ -655,5 +1032,148 @@ mod tests {
         assert_eq!(TxResultCode::TxSuccess.name(), "txSuccess");
         assert_eq!(TxResultCode::TxBadSeq.name(), "txBadSeq");
         assert_eq!(OpResultCode::OpBadAuth.name(), "opBadAuth");
+    }
+
+    // RefundableFeeTracker tests
+    #[test]
+    fn test_refundable_fee_tracker_new() {
+        let tracker = RefundableFeeTracker::new(1000);
+        assert_eq!(tracker.max_refundable_fee(), 1000);
+        assert_eq!(tracker.consumed_rent_fee(), 0);
+        assert_eq!(tracker.consumed_refundable_fee(), 0);
+        assert_eq!(tracker.get_fee_refund(), 1000);
+    }
+
+    #[test]
+    fn test_refundable_fee_tracker_consume_rent() {
+        let mut tracker = RefundableFeeTracker::new(1000);
+
+        assert!(tracker.consume_rent_fee(100).is_ok());
+        assert_eq!(tracker.consumed_rent_fee(), 100);
+        assert_eq!(tracker.get_fee_refund(), 900);
+
+        assert!(tracker.consume_rent_fee(200).is_ok());
+        assert_eq!(tracker.consumed_rent_fee(), 300);
+        assert_eq!(tracker.get_fee_refund(), 700);
+    }
+
+    #[test]
+    fn test_refundable_fee_tracker_rent_exceeds_max() {
+        let mut tracker = RefundableFeeTracker::new(100);
+
+        let result = tracker.consume_rent_fee(200);
+        assert!(result.is_err());
+
+        if let Err(RefundableFeeError::RentFeeExceeded { consumed, max }) = result {
+            assert_eq!(consumed, 200);
+            assert_eq!(max, 100);
+        } else {
+            panic!("expected RentFeeExceeded error");
+        }
+    }
+
+    #[test]
+    fn test_refundable_fee_tracker_reset() {
+        let mut tracker = RefundableFeeTracker::new(1000);
+
+        tracker.consume_rent_fee(100).unwrap();
+        tracker.consume_events_size(50);
+        assert_eq!(tracker.consumed_rent_fee(), 100);
+        assert_eq!(tracker.consumed_events_size_bytes(), 50);
+
+        tracker.reset_consumed_fee();
+        assert_eq!(tracker.consumed_rent_fee(), 0);
+        assert_eq!(tracker.consumed_events_size_bytes(), 0);
+        assert_eq!(tracker.get_fee_refund(), 1000);
+    }
+
+    #[test]
+    fn test_refundable_fee_tracker_update_consumed() {
+        let mut tracker = RefundableFeeTracker::new(1000);
+
+        tracker.consume_rent_fee(200).unwrap();
+        assert!(tracker.update_consumed_refundable_fee(300).is_ok());
+        assert_eq!(tracker.consumed_refundable_fee(), 500); // rent + refundable
+        assert_eq!(tracker.get_fee_refund(), 500);
+    }
+
+    // MutableTransactionResult tests
+    #[test]
+    fn test_mutable_result_new() {
+        let result = MutableTransactionResult::new(100);
+        assert!(result.is_success());
+        assert_eq!(result.fee_charged(), 100);
+        assert!(result.refundable_fee_tracker().is_none());
+    }
+
+    #[test]
+    fn test_mutable_result_set_error() {
+        let mut result = MutableTransactionResult::new(100);
+        assert!(result.is_success());
+
+        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        assert!(!result.is_success());
+        assert_eq!(result.result_code(), TxResultCode::TxBadSeq);
+    }
+
+    #[test]
+    fn test_mutable_result_error_resets_refundable_fees() {
+        let mut result = MutableTransactionResult::new(1000);
+        result.initialize_refundable_fee_tracker(500);
+
+        // Consume some fees
+        if let Some(tracker) = result.refundable_fee_tracker_mut() {
+            tracker.consume_rent_fee(200).unwrap();
+        }
+        assert_eq!(result.refundable_fee_tracker().unwrap().consumed_rent_fee(), 200);
+
+        // Set error should reset consumed fees
+        result.set_error(stellar_xdr::curr::TransactionResultCode::TxFailed);
+        assert_eq!(result.refundable_fee_tracker().unwrap().consumed_rent_fee(), 0);
+        assert_eq!(result.refundable_fee_tracker().unwrap().get_fee_refund(), 500);
+    }
+
+    #[test]
+    fn test_mutable_result_finalize_fee_refund() {
+        let mut result = MutableTransactionResult::new(1000);
+        result.initialize_refundable_fee_tracker(400);
+
+        // Consume some fees
+        if let Some(tracker) = result.refundable_fee_tracker_mut() {
+            tracker.consume_rent_fee(100).unwrap();
+        }
+
+        // Refund should be 400 - 100 = 300
+        result.finalize_fee_refund(21);
+
+        // Fee charged should be reduced by refund
+        assert_eq!(result.fee_charged(), 700); // 1000 - 300
+    }
+
+    #[test]
+    fn test_mutable_result_into_xdr() {
+        let result = MutableTransactionResult::new(100);
+        let xdr = result.into_xdr();
+
+        assert_eq!(xdr.fee_charged, 100);
+        assert!(matches!(xdr.result, TransactionResultResult::TxSuccess(_)));
+    }
+
+    #[test]
+    fn test_mutable_result_create_success() {
+        let result = MutableTransactionResult::create_success(200, 3);
+        assert!(result.is_success());
+        assert_eq!(result.fee_charged(), 200);
+    }
+
+    #[test]
+    fn test_mutable_result_create_error() {
+        let result = MutableTransactionResult::create_error(
+            stellar_xdr::curr::TransactionResultCode::TxNoAccount,
+            50,
+        );
+        assert!(!result.is_success());
+        assert_eq!(result.fee_charged(), 50);
+        assert_eq!(result.result_code(), TxResultCode::TxNoAccount);
     }
 }

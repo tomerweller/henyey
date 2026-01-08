@@ -553,6 +553,118 @@ pub fn get_operation_source<'a>(
     op.source_account.as_ref().unwrap_or(tx_source)
 }
 
+/// Authorization threshold level required for an operation.
+///
+/// Stellar accounts have three configurable threshold levels that determine
+/// how much signer weight is required to authorize different types of operations.
+/// The thresholds are stored in the account's `thresholds` field:
+///
+/// - `thresholds[0]`: Master key weight
+/// - `thresholds[1]`: Low threshold
+/// - `thresholds[2]`: Medium threshold
+/// - `thresholds[3]`: High threshold
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThresholdLevel {
+    /// Low threshold - for less sensitive operations.
+    ///
+    /// Operations: `AllowTrust`, `SetTrustLineFlags`, `BumpSequence`,
+    /// `ClaimClaimableBalance`, `Inflation`, `ExtendFootprintTtl`, `RestoreFootprint`
+    Low,
+
+    /// Medium threshold - for most standard operations.
+    ///
+    /// Operations: `CreateAccount`, `Payment`, `PathPayment*`, `ManageOffer*`,
+    /// `ChangeTrust`, `ManageData`, `CreateClaimableBalance`, sponsorship ops,
+    /// `Clawback*`, `LiquidityPool*`, `InvokeHostFunction`
+    Medium,
+
+    /// High threshold - for sensitive operations that modify account security.
+    ///
+    /// Operations: `AccountMerge`, `SetOptions` (when modifying thresholds/signers)
+    High,
+}
+
+impl ThresholdLevel {
+    /// Get the threshold index in the account's thresholds array.
+    ///
+    /// Returns the index (1-3) into the account's `thresholds` field.
+    /// Note: index 0 is the master key weight, not a threshold.
+    pub fn index(&self) -> usize {
+        match self {
+            ThresholdLevel::Low => 1,
+            ThresholdLevel::Medium => 2,
+            ThresholdLevel::High => 3,
+        }
+    }
+}
+
+/// Get the threshold level required for an operation.
+///
+/// This determines how much signer weight is needed to authorize the operation,
+/// based on the C++ stellar-core implementation.
+///
+/// # Threshold Assignments
+///
+/// - **Low**: Operations that don't significantly affect account security:
+///   `AllowTrust`, `SetTrustLineFlags`, `BumpSequence`, `ClaimClaimableBalance`,
+///   `Inflation`, `ExtendFootprintTtl`, `RestoreFootprint`
+///
+/// - **Medium**: Most standard operations including payments, offers, and data
+///
+/// - **High**: Operations that can affect account security:
+///   `AccountMerge`, `SetOptions` (when modifying thresholds, weights, or signers)
+pub fn get_threshold_level(op: &Operation) -> ThresholdLevel {
+    match &op.body {
+        // LOW threshold operations
+        OperationBody::AllowTrust(_) => ThresholdLevel::Low,
+        OperationBody::SetTrustLineFlags(_) => ThresholdLevel::Low,
+        OperationBody::BumpSequence(_) => ThresholdLevel::Low,
+        OperationBody::ClaimClaimableBalance(_) => ThresholdLevel::Low,
+        OperationBody::Inflation => ThresholdLevel::Low,
+        OperationBody::ExtendFootprintTtl(_) => ThresholdLevel::Low,
+        OperationBody::RestoreFootprint(_) => ThresholdLevel::Low,
+
+        // HIGH threshold operations
+        OperationBody::AccountMerge(_) => ThresholdLevel::High,
+        OperationBody::SetOptions(set_options) => {
+            // SetOptions requires HIGH threshold when modifying thresholds or signers
+            if set_options.master_weight.is_some()
+                || set_options.low_threshold.is_some()
+                || set_options.med_threshold.is_some()
+                || set_options.high_threshold.is_some()
+                || set_options.signer.is_some()
+            {
+                ThresholdLevel::High
+            } else {
+                ThresholdLevel::Medium
+            }
+        }
+
+        // All other operations use MEDIUM threshold
+        _ => ThresholdLevel::Medium,
+    }
+}
+
+/// Get the needed weight for an operation from the source account.
+///
+/// Looks up the threshold value from the account's `thresholds` array
+/// based on the threshold level required for the operation.
+///
+/// # Arguments
+///
+/// * `account` - The account entry containing threshold configuration
+/// * `level` - The threshold level required
+///
+/// # Returns
+///
+/// The threshold value (0-255) as an i32.
+pub fn get_needed_threshold(
+    account: &stellar_xdr::curr::AccountEntry,
+    level: ThresholdLevel,
+) -> i32 {
+    account.thresholds.0[level.index()] as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,5 +824,222 @@ mod tests {
         };
 
         assert!(validate_create_claimable_balance(&op).is_err());
+    }
+
+    #[test]
+    fn test_threshold_level_index() {
+        assert_eq!(ThresholdLevel::Low.index(), 1);
+        assert_eq!(ThresholdLevel::Medium.index(), 2);
+        assert_eq!(ThresholdLevel::High.index(), 3);
+    }
+
+    #[test]
+    fn test_low_threshold_operations() {
+        // AllowTrust
+        let allow_trust_op = Operation {
+            source_account: None,
+            body: OperationBody::AllowTrust(AllowTrustOp {
+                trustor: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(
+                    stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+                ),
+                authorize: 1,
+            }),
+        };
+        assert_eq!(get_threshold_level(&allow_trust_op), ThresholdLevel::Low);
+
+        // BumpSequence
+        let bump_seq_op = Operation {
+            source_account: None,
+            body: OperationBody::BumpSequence(BumpSequenceOp {
+                bump_to: stellar_xdr::curr::SequenceNumber(100),
+            }),
+        };
+        assert_eq!(get_threshold_level(&bump_seq_op), ThresholdLevel::Low);
+
+        // ClaimClaimableBalance
+        let claim_op = Operation {
+            source_account: None,
+            body: OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp {
+                balance_id: stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+                    stellar_xdr::curr::Hash([0u8; 32]),
+                ),
+            }),
+        };
+        assert_eq!(get_threshold_level(&claim_op), ThresholdLevel::Low);
+
+        // Inflation
+        let inflation_op = Operation {
+            source_account: None,
+            body: OperationBody::Inflation,
+        };
+        assert_eq!(get_threshold_level(&inflation_op), ThresholdLevel::Low);
+    }
+
+    #[test]
+    fn test_medium_threshold_operations() {
+        // Payment
+        let payment_op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+        assert_eq!(get_threshold_level(&payment_op), ThresholdLevel::Medium);
+
+        // CreateAccount
+        let create_account_op = Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                starting_balance: 10_000_000,
+            }),
+        };
+        assert_eq!(get_threshold_level(&create_account_op), ThresholdLevel::Medium);
+
+        // ChangeTrust
+        let change_trust_op = Operation {
+            source_account: None,
+            body: OperationBody::ChangeTrust(ChangeTrustOp {
+                line: stellar_xdr::curr::ChangeTrustAsset::Native,
+                limit: 1000,
+            }),
+        };
+        assert_eq!(get_threshold_level(&change_trust_op), ThresholdLevel::Medium);
+
+        // ManageData
+        let manage_data_op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
+                data_value: Some(b"value".to_vec().try_into().unwrap()),
+            }),
+        };
+        assert_eq!(get_threshold_level(&manage_data_op), ThresholdLevel::Medium);
+    }
+
+    #[test]
+    fn test_high_threshold_operations() {
+        // AccountMerge
+        let account_merge_op = Operation {
+            source_account: None,
+            body: OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([0u8; 32]))),
+        };
+        assert_eq!(get_threshold_level(&account_merge_op), ThresholdLevel::High);
+
+        // SetOptions with threshold change
+        let set_options_threshold_op = Operation {
+            source_account: None,
+            body: OperationBody::SetOptions(SetOptionsOp {
+                inflation_dest: None,
+                clear_flags: None,
+                set_flags: None,
+                master_weight: None,
+                low_threshold: Some(10),
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: None,
+                signer: None,
+            }),
+        };
+        assert_eq!(get_threshold_level(&set_options_threshold_op), ThresholdLevel::High);
+
+        // SetOptions with signer change
+        let set_options_signer_op = Operation {
+            source_account: None,
+            body: OperationBody::SetOptions(SetOptionsOp {
+                inflation_dest: None,
+                clear_flags: None,
+                set_flags: None,
+                master_weight: None,
+                low_threshold: None,
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: None,
+                signer: Some(stellar_xdr::curr::Signer {
+                    key: stellar_xdr::curr::SignerKey::Ed25519(Uint256([0u8; 32])),
+                    weight: 10,
+                }),
+            }),
+        };
+        assert_eq!(get_threshold_level(&set_options_signer_op), ThresholdLevel::High);
+
+        // SetOptions with master weight change
+        let set_options_master_op = Operation {
+            source_account: None,
+            body: OperationBody::SetOptions(SetOptionsOp {
+                inflation_dest: None,
+                clear_flags: None,
+                set_flags: None,
+                master_weight: Some(5),
+                low_threshold: None,
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: None,
+                signer: None,
+            }),
+        };
+        assert_eq!(get_threshold_level(&set_options_master_op), ThresholdLevel::High);
+    }
+
+    #[test]
+    fn test_set_options_medium_threshold() {
+        // SetOptions without security-related changes uses MEDIUM threshold
+        let set_options_basic_op = Operation {
+            source_account: None,
+            body: OperationBody::SetOptions(SetOptionsOp {
+                inflation_dest: Some(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])))),
+                clear_flags: None,
+                set_flags: None,
+                master_weight: None,
+                low_threshold: None,
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: None,
+                signer: None,
+            }),
+        };
+        assert_eq!(get_threshold_level(&set_options_basic_op), ThresholdLevel::Medium);
+
+        // SetOptions with only home domain change
+        let set_options_domain_op = Operation {
+            source_account: None,
+            body: OperationBody::SetOptions(SetOptionsOp {
+                inflation_dest: None,
+                clear_flags: None,
+                set_flags: None,
+                master_weight: None,
+                low_threshold: None,
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: Some(stellar_xdr::curr::String32::try_from(b"example.com".to_vec()).unwrap()),
+                signer: None,
+            }),
+        };
+        assert_eq!(get_threshold_level(&set_options_domain_op), ThresholdLevel::Medium);
+    }
+
+    #[test]
+    fn test_get_needed_threshold() {
+        use stellar_xdr::curr::{AccountEntry, AccountEntryExt, SequenceNumber, String32, Thresholds, VecM};
+
+        let account = AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            balance: 1000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([10, 1, 5, 10]), // master=10, low=1, med=5, high=10
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        };
+
+        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Low), 1);
+        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Medium), 5);
+        assert_eq!(get_needed_threshold(&account, ThresholdLevel::High), 10);
     }
 }

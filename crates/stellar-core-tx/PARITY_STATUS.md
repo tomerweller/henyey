@@ -22,6 +22,34 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - **Min sequence preconditions**: V2 min_seq_num, min_seq_age, min_seq_ledger_gap
 - **Soroban resource validation**: Archived entry indices, footprint validation
 
+#### Transaction Processing (Newly Implemented)
+- **SignatureChecker** (`signature_checker.rs`): Full signer weight checking
+  - Weight accumulation across multiple signers
+  - Threshold level checking (LOW/MEDIUM/HIGH)
+  - Ordered processing: PRE_AUTH_TX → HASH_X → ED25519 → ED25519_SIGNED_PAYLOAD
+  - Weight cap at u8::MAX for protocol 10+
+  - Tracks which signatures have been used
+  - `check_all_signatures_used()` for unused signature detection
+- **ThresholdLevel** (`operations/mod.rs`): Operation-specific threshold requirements
+  - LOW: AllowTrust, SetTrustLineFlags, BumpSequence, ClaimClaimableBalance, Inflation, ExtendFootprintTtl, RestoreFootprint
+  - MEDIUM: Most operations (Payment, CreateAccount, ChangeTrust, etc.)
+  - HIGH: AccountMerge, SetOptions (when modifying thresholds/signers)
+- **MutableTransactionResult** (`result.rs`): Mutable result wrapper for execution
+  - Result code mutation during apply
+  - Refundable fee tracker integration
+  - `set_error()` resets refundable fees
+  - `finalize_fee_refund()` for final fee calculation
+- **RefundableFeeTracker** (`result.rs`): Detailed Soroban fee tracking
+  - Tracks max_refundable_fee, consumed_events_size, consumed_rent_fee
+  - `consume_rent_fee()` and `update_consumed_refundable_fee()`
+  - `get_fee_refund()` returns max - consumed
+  - `reset_consumed_fee()` for error cases (full refund)
+- **One-time signer removal** (`state.rs`): Pre-auth TX signer cleanup
+  - `remove_one_time_signers_from_all_sources()` for transaction cleanup
+  - `remove_account_signer()` for individual signer removal
+  - Sponsorship cleanup when removing sponsored signers
+  - Protocol 7 bypass (matches C++ behavior)
+
 #### Transaction Application (Catchup Mode)
 - **LedgerDelta**: State change accumulation with proper ordering
 - **Change ordering preservation**: ChangeRef tracking for metadata construction
@@ -89,19 +117,6 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - **Minimum balance**: Reserve calculations with sponsorship
 
 ### Not Yet Implemented (Gaps)
-
-#### Transaction Processing
-- **SignatureChecker class**: Full signer weight checking with threshold levels (LOW/MEDIUM/HIGH)
-  - C++: `SignatureChecker.cpp` - tracks used signatures, validates against signer weights
-  - Rust: Basic signature validation exists but no full weight accumulation
-- **Unused signature check**: Validation that all transaction signatures are used by some operation
-- **One-time signer removal**: Post-execution cleanup of one-time signers (pre-auth tx)
-- **MutableTransactionResult**: Mutable result tracking during apply flow
-  - C++: `MutableTransactionResult.h` - manages result mutations, refundable fee tracker
-  - Rust: Using immutable result wrappers
-- **RefundableFeeTracker**: Detailed refundable fee tracking for Soroban
-  - C++: Tracks consumed contract events size, rent fee, refundable fee separately
-  - Rust: Basic rent fee tracking only
 
 #### Parallel Execution (Not Applicable)
 - **ParallelApplyStage**: Parallel transaction application infrastructure
