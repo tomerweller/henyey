@@ -27,6 +27,7 @@
 - Any observable behavior must be deterministic and identical to stellar-core (v25.x / p25).
 - Align behavior by comparing against upstream test vectors and edge cases; do not introduce new semantics.
 - For protocol or consensus behavior, consult `.upstream-v25/` to mirror upstream decisions and sequencing.
+- Update the relevant crate's `PARITY_STATUS.md` and the parity column in the main `README.md` Crate Overview when implementing or removing functionality that affects C++ parity.
 
 ## Testing Guidelines
 
