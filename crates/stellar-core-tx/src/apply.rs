@@ -5,10 +5,10 @@
 //! the state changes recorded in the transaction meta.
 
 use stellar_xdr::curr::{
-    AccountEntry, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerKey,
-    LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyContractData,
-    LedgerKeyData, LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl,
-    TransactionMeta, TransactionResult,
+    AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
+    LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyContractCode,
+    LedgerKeyContractData, LedgerKeyData, LedgerKeyLiquidityPool, LedgerKeyOffer,
+    LedgerKeyTrustLine, LedgerKeyTtl, TransactionMeta, TransactionResult,
 };
 
 use crate::frame::TransactionFrame;
@@ -148,6 +148,24 @@ impl LedgerDelta {
     /// Check if this delta has any changes.
     pub fn has_changes(&self) -> bool {
         !self.created.is_empty() || !self.updated.is_empty() || !self.deleted.is_empty()
+    }
+
+    /// Apply a fee refund to the most recent update of a specific account.
+    ///
+    /// This modifies the balance in the post-state of the most recent account update.
+    /// If no update exists for this account, the refund is not applied.
+    pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) {
+        use stellar_xdr::curr::LedgerEntryData;
+
+        // Find the last update for this account and modify its balance
+        for entry in self.updated.iter_mut().rev() {
+            if let LedgerEntryData::Account(acc) = &mut entry.data {
+                if &acc.account_id == account_id {
+                    acc.balance += refund;
+                    return;
+                }
+            }
+        }
     }
 
     /// Merge another delta into this one.

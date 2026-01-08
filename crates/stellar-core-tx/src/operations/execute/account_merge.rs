@@ -84,6 +84,13 @@ pub fn execute_account_merge(
         state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 2)?;
     }
 
+    // Flush ALL account changes EXCEPT the source being deleted, before recording deletion.
+    // C++ stellar-core records all pending account STATE/UPDATED pairs
+    // (e.g., destination balance update, any accounts from previous ops in multi-op tx)
+    // before the source deletion.
+    // The source account should NOT be flushed as STATE/UPDATED since it's about to be deleted.
+    state.flush_all_accounts_except(Some(source));
+
     // Delete source account
     state.delete_account(source);
 

@@ -1882,13 +1882,75 @@ async fn cmd_verify_execution(
             // Execute each transaction and compare (using aligned envelope/result/meta)
             let mut ledger_matched = true;
 
+            // Capture ledger-start TTL entries for all Soroban read footprint entries.
+            // This is needed because when multiple transactions access the same entry,
+            // C++ produces STATE (ledger-start) / UPDATED (current) pairs for each tx,
+            // even if that specific tx didn't change the TTL.
+            let mut ledger_start_ttls: std::collections::HashMap<stellar_xdr::curr::Hash, stellar_xdr::curr::LedgerEntry> = std::collections::HashMap::new();
+            for tx_info in tx_processing.iter() {
+                let frame = stellar_core_tx::TransactionFrame::with_network(
+                    tx_info.envelope.clone(),
+                    stellar_core_common::NetworkId(config.network_id()),
+                );
+                if let Some(soroban_data) = frame.soroban_data() {
+                    for key in soroban_data.resources.footprint.read_only.iter()
+                        .chain(soroban_data.resources.footprint.read_write.iter())
+                    {
+                        // Compute key_hash for TTL lookup
+                        match key {
+                            stellar_xdr::curr::LedgerKey::ContractData(_) | stellar_xdr::curr::LedgerKey::ContractCode(_) => {
+                                use stellar_xdr::curr::{WriteXdr, Limits};
+                                if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                                    let hash_bytes = stellar_core_crypto::sha256(&key_bytes);
+                                    let key_hash = stellar_xdr::curr::Hash(*hash_bytes.as_bytes());
+                                    if !ledger_start_ttls.contains_key(&key_hash) {
+                                        // Look up TTL from snapshot (ledger-start value)
+                                        let ttl_key = stellar_xdr::curr::LedgerKey::Ttl(
+                                            stellar_xdr::curr::LedgerKeyTtl { key_hash: key_hash.clone() }
+                                        );
+                                        if let Ok(Some(entry)) = snapshot_handle.get_entry(&ttl_key) {
+                                            if matches!(&entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
+                                                ledger_start_ttls.insert(key_hash, entry);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
             // Two-phase transaction processing matching C++ stellar-core:
             // Phase 1: Process all fees first (modifies state for all fee sources)
             // Phase 2: Apply all transactions (with deduct_fee=false since fees already processed)
 
             // Phase 1: Process fees for all transactions and compare with CDP
+            // Also save pre-fee state for fee sources to use in Phase 2 metadata
             let mut phase1_mismatches = 0;
+            let mut fee_source_pre_states: Vec<Option<stellar_xdr::curr::LedgerEntry>> = Vec::new();
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
+                // For fee bump transactions with separate fee source, save the pre-fee state
+                // This is needed for the STATE entry in Phase 2's tx_changes_before
+                let frame = stellar_core_tx::TransactionFrame::with_network(
+                    tx_info.envelope.clone(),
+                    stellar_core_common::NetworkId(config.network_id()),
+                );
+                let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+                let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
+                let pre_fee_state = if frame.is_fee_bump() && fee_source_id != inner_source_id {
+                    let fee_source_key = stellar_xdr::curr::LedgerKey::Account(
+                        stellar_xdr::curr::LedgerKeyAccount {
+                            account_id: fee_source_id.clone(),
+                        }
+                    );
+                    executor.get_entry(&fee_source_key)
+                } else {
+                    None
+                };
+                fee_source_pre_states.push(pre_fee_state);
+
                 let fee_result = executor.process_fee_only(
                     &snapshot_handle,
                     &tx_info.envelope,
@@ -1926,7 +1988,8 @@ async fn cmd_verify_execution(
             }
 
             // Track accounts that receive Soroban refunds so we can update the bucket list
-            let mut soroban_refund_accounts: Vec<stellar_xdr::curr::AccountId> = Vec::new();
+            // Note: Soroban refunds are already included in CDP's tx_changes_after,
+            // so we don't need to track or apply them separately.
 
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
@@ -1940,12 +2003,16 @@ async fn cmd_verify_execution(
                 };
 
                 // Execute the transaction without fee deduction (fees processed in phase 1)
-                let exec_result = executor.execute_transaction_with_fee_mode(
+                // Pass the pre-fee state for fee bump transactions so the STATE entry
+                // in tx_changes_before shows the correct pre-fee value
+                let fee_source_pre_state = fee_source_pre_states.get(tx_idx).cloned().flatten();
+                let exec_result = executor.execute_transaction_with_fee_mode_and_pre_state(
                     &snapshot_handle,
                     &tx_info.envelope,
                     cdp_header.base_fee,
                     prng_seed,
                     false, // deduct_fee = false - fees already processed
+                    fee_source_pre_state,
                 );
 
                 // Check if CDP transaction succeeded
@@ -1972,30 +2039,9 @@ async fn cmd_verify_execution(
                     .unwrap_or_default();
                 executor.apply_ledger_entry_changes(&cdp_changes_vec);
 
-                // Apply Soroban fee refund from CDP's sorobanMeta
-                // The refund is calculated as: declared_fee - (non_refundable + refundable + rent)
-                if let stellar_xdr::curr::TransactionMeta::V4(v4) = &tx_info.meta {
-                    if let Some(ref soroban_meta) = v4.soroban_meta {
-                        if let stellar_xdr::curr::SorobanTransactionMetaExt::V1(meta_v1) = &soroban_meta.ext {
-                            let frame = stellar_core_tx::TransactionFrame::with_network(
-                                tx_info.envelope.clone(),
-                                stellar_core_common::NetworkId(config.network_id()),
-                            );
-                            let declared_fee = frame.declared_soroban_resource_fee();
-                            // Note: rent_fee_charged is NOT included in actual_charged for refund calculation
-                            // The rent is paid separately from the refundable resource fee pool
-                            let actual_charged = meta_v1.total_non_refundable_resource_fee_charged
-                                + meta_v1.total_refundable_resource_fee_charged;
-                            let refund = declared_fee.saturating_sub(actual_charged);
-                            if refund > 0 {
-                                let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
-                                executor.apply_fee_refund(&fee_source_id, refund);
-                                // Track this account so we can update the bucket list with the refund
-                                soroban_refund_accounts.push(fee_source_id);
-                            }
-                        }
-                    }
-                }
+                // Note: Soroban refunds are already included in CDP's tx_changes_after,
+                // so no separate refund application is needed.
+
                 if in_test_range {
                     transactions_verified += 1;
 
@@ -2004,7 +2050,26 @@ async fn cmd_verify_execution(
                     // in tx_changes_before when deduct_fee=false (two-phase mode).
 
                     match exec_result {
-                        Ok(result) => {
+                        Ok(mut result) => {
+                            // For Soroban transactions, augment our metadata with missing read footprint TTL entries.
+                            // C++ produces STATE/UPDATED for read footprint TTL entries using ledger-start values,
+                            // even if the specific transaction didn't change the TTL.
+                            let frame = stellar_core_tx::TransactionFrame::with_network(
+                                tx_info.envelope.clone(),
+                                stellar_core_common::NetworkId(config.network_id()),
+                            );
+                            if let Some(soroban_data) = frame.soroban_data() {
+                                if let Some(ref mut our_meta) = result.tx_meta {
+                                    augment_soroban_ttl_metadata(
+                                        our_meta,
+                                        &soroban_data.resources.footprint,
+                                        &ledger_start_ttls,
+                                        executor,
+                                        seq,
+                                    );
+                                }
+                            }
+
                             // Deep comparison of transaction meta if both are available
                             let (meta_matches, meta_diffs) = match &result.tx_meta {
                                 Some(our_meta) => {
@@ -2093,6 +2158,7 @@ async fn cmd_verify_execution(
 
             // Apply changes to bucket list for next ledger using CDP metadata
             // This ensures subsequent ledgers have correct state for lookups
+            // Note: CDP metadata already includes Soroban refunds in tx_changes_after
             {
                 // Extract metas from tx_processing
                 let tx_metas: Vec<_> = tx_processing.iter().map(|tp| tp.meta.clone()).collect();
@@ -2102,43 +2168,12 @@ async fn cmd_verify_execution(
                 let upgrade_metas = extract_upgrade_metas(&lcm);
                 let (upgrade_init, upgrade_live, upgrade_dead) = extract_upgrade_changes(&upgrade_metas)?;
 
-                // Get current state of accounts that received Soroban refunds.
-                // These need to be included in the bucket list update because the refund
-                // is not captured in tx_changes_after - it's calculated separately.
-                let mut refund_entries: Vec<LedgerEntry> = Vec::new();
-                let mut refund_keys: std::collections::HashSet<LedgerKey> = std::collections::HashSet::new();
-                for account_id in &soroban_refund_accounts {
-                    if let Some(acc) = executor.state().get_account(account_id) {
-                        let entry = executor.state().ledger_entry_for_account(acc);
-                        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                            account_id: account_id.clone(),
-                        });
-                        refund_keys.insert(key);
-                        refund_entries.push(entry);
-                    }
-                }
-
-                // Combine all changes, but filter out CDP entries for accounts that received refunds
-                // (the refund entry will have the correct final balance)
-                // We need to filter both init_entries and live_entries in case the account
-                // was created in the same ledger or updated.
-                let filtered_init: Vec<LedgerEntry> = init_entries.into_iter()
+                // Combine all changes
+                let all_init: Vec<LedgerEntry> = init_entries.into_iter()
                     .chain(upgrade_init)
-                    .filter(|entry| {
-                        let key = stellar_core_ledger::entry_to_key(entry).unwrap();
-                        !refund_keys.contains(&key)
-                    })
                     .collect();
-                let filtered_live: Vec<LedgerEntry> = live_entries.into_iter()
+                let all_live: Vec<LedgerEntry> = live_entries.into_iter()
                     .chain(upgrade_live)
-                    .filter(|entry| {
-                        let key = stellar_core_ledger::entry_to_key(entry).unwrap();
-                        !refund_keys.contains(&key)
-                    })
-                    .collect();
-                let all_init: Vec<LedgerEntry> = filtered_init;
-                let all_live: Vec<LedgerEntry> = filtered_live.into_iter()
-                    .chain(refund_entries)
                     .collect();
                 let all_dead: Vec<LedgerKey> = dead_entries.into_iter().chain(upgrade_dead).collect();
 
@@ -2358,7 +2393,91 @@ fn extract_upgrade_changes(
     Ok((init_entries, live_entries, dead_entries))
 }
 
-/// Compare two lists of ledger entry changes.
+/// Convert a LedgerEntryChange to a sortable key for order-independent comparison.
+/// Returns (change_type_order, key_xdr) for canonical sorting.
+fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (u8, Vec<u8>) {
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, WriteXdr, Limits};
+
+    fn entry_to_key_xdr(entry: &stellar_xdr::curr::LedgerEntry) -> Vec<u8> {
+        // Extract the key from the entry and serialize it
+        let key = match &entry.data {
+            stellar_xdr::curr::LedgerEntryData::Account(a) => {
+                LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: a.account_id.clone(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::Trustline(t) => {
+                LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+                    account_id: t.account_id.clone(),
+                    asset: t.asset.clone(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::Offer(o) => {
+                LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                    seller_id: o.seller_id.clone(),
+                    offer_id: o.offer_id,
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::Data(d) => {
+                LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+                    account_id: d.account_id.clone(),
+                    data_name: d.data_name.clone(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::ClaimableBalance(cb) => {
+                LedgerKey::ClaimableBalance(stellar_xdr::curr::LedgerKeyClaimableBalance {
+                    balance_id: cb.balance_id.clone(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::LiquidityPool(lp) => {
+                LedgerKey::LiquidityPool(stellar_xdr::curr::LedgerKeyLiquidityPool {
+                    liquidity_pool_id: lp.liquidity_pool_id.clone(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+                    contract: cd.contract.clone(),
+                    key: cd.key.clone(),
+                    durability: cd.durability.clone(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                    hash: cc.hash.clone(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                // Use discriminant as the config setting ID
+                LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                    config_setting_id: cs.discriminant(),
+                })
+            }
+            stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                    key_hash: ttl.key_hash.clone(),
+                })
+            }
+        };
+        key.to_xdr(Limits::none()).unwrap_or_default()
+    }
+
+    fn key_to_xdr(key: &LedgerKey) -> Vec<u8> {
+        key.to_xdr(Limits::none()).unwrap_or_default()
+    }
+
+    match change {
+        LedgerEntryChange::State(entry) => (0, entry_to_key_xdr(entry)),
+        LedgerEntryChange::Created(entry) => (1, entry_to_key_xdr(entry)),
+        LedgerEntryChange::Updated(entry) => (2, entry_to_key_xdr(entry)),
+        LedgerEntryChange::Removed(key) => (3, key_to_xdr(key)),
+        LedgerEntryChange::Restored(entry) => (4, entry_to_key_xdr(entry)),
+    }
+}
+
+/// Compare two lists of ledger entry changes in an order-independent manner.
+/// C++ stellar-core's UnorderedMap uses RandHasher with a random gMixer per process,
+/// so metadata entry ordering is non-deterministic between different runs.
+/// This comparison sorts changes by (type, key) before comparing.
 /// Returns (matches, differences) where differences contains descriptions of mismatches.
 fn compare_entry_changes(
     our_changes: &[stellar_xdr::curr::LedgerEntryChange],
@@ -2377,8 +2496,14 @@ fn compare_entry_changes(
         ));
     }
 
-    // Compare individual changes
-    for (i, (our, cdp)) in our_changes.iter().zip(cdp_changes.iter()).enumerate() {
+    // Sort both lists by (change_type, key_xdr) for order-independent comparison
+    let mut our_sorted: Vec<_> = our_changes.iter().collect();
+    let mut cdp_sorted: Vec<_> = cdp_changes.iter().collect();
+    our_sorted.sort_by_key(|c| change_sort_key(c));
+    cdp_sorted.sort_by_key(|c| change_sort_key(c));
+
+    // Compare individual changes after sorting
+    for (i, (our, cdp)) in our_sorted.iter().zip(cdp_sorted.iter()).enumerate() {
         let our_xdr = our.to_xdr(Limits::none()).unwrap_or_default();
         let cdp_xdr = cdp.to_xdr(Limits::none()).unwrap_or_default();
 
@@ -2393,22 +2518,155 @@ fn compare_entry_changes(
     }
 
     // Report any extra changes on either side
-    if our_changes.len() > cdp_changes.len() {
-        for (i, change) in our_changes.iter().skip(cdp_changes.len()).enumerate() {
-            diffs.push(format!("Extra our change {}: {}", cdp_changes.len() + i, describe_change(change)));
+    if our_sorted.len() > cdp_sorted.len() {
+        for (i, change) in our_sorted.iter().skip(cdp_sorted.len()).enumerate() {
+            diffs.push(format!("Extra our change {}: {}", cdp_sorted.len() + i, describe_change(change)));
         }
     }
-    if cdp_changes.len() > our_changes.len() {
-        for (i, change) in cdp_changes.iter().skip(our_changes.len()).enumerate() {
-            diffs.push(format!("Extra CDP change {}: {}", our_changes.len() + i, describe_change(change)));
+    if cdp_sorted.len() > our_sorted.len() {
+        for (i, change) in cdp_sorted.iter().skip(our_sorted.len()).enumerate() {
+            diffs.push(format!("Extra CDP change {}: {}", our_sorted.len() + i, describe_change(change)));
         }
     }
 
     (diffs.is_empty(), diffs)
 }
 
+/// Augment Soroban transaction metadata with missing read footprint TTL entries.
+///
+/// C++ stellar-core produces STATE (ledger-start) / UPDATED (current) pairs for ALL
+/// entries in the read footprint whose TTL changed during the ledger, even if the
+/// specific transaction didn't change the TTL. This function adds those missing entries.
+fn augment_soroban_ttl_metadata(
+    meta: &mut stellar_xdr::curr::TransactionMeta,
+    footprint: &stellar_xdr::curr::LedgerFootprint,
+    ledger_start_ttls: &std::collections::HashMap<stellar_xdr::curr::Hash, stellar_xdr::curr::LedgerEntry>,
+    executor: &stellar_core_ledger::execution::TransactionExecutor,
+    ledger_seq: u32,
+) {
+    use stellar_xdr::curr::{LedgerEntry, LedgerEntryChange, LedgerEntryData, LedgerKey, Limits, WriteXdr};
+
+    // Get the operation changes from metadata - we need to convert to Vec to extend
+    let (existing_changes, rebuild_meta) = match meta {
+        stellar_xdr::curr::TransactionMeta::V3(v3) => {
+            if v3.operations.is_empty() { return; }
+            (v3.operations[0].changes.iter().cloned().collect::<Vec<_>>(), true)
+        }
+        stellar_xdr::curr::TransactionMeta::V4(v4) => {
+            if v4.operations.is_empty() { return; }
+            (v4.operations[0].changes.iter().cloned().collect::<Vec<_>>(), true)
+        }
+        _ => return,
+    };
+
+    if !rebuild_meta { return; }
+
+    // Collect existing TTL key_hashes from our metadata
+    let mut existing_ttl_hashes: std::collections::HashSet<stellar_xdr::curr::Hash> = std::collections::HashSet::new();
+    for change in existing_changes.iter() {
+        match change {
+            LedgerEntryChange::State(entry) | LedgerEntryChange::Updated(entry) | LedgerEntryChange::Created(entry) => {
+                if let LedgerEntryData::Ttl(ttl) = &entry.data {
+                    existing_ttl_hashes.insert(ttl.key_hash.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // For each entry in the footprint, check if we need to add TTL STATE/UPDATED
+    let mut additional_changes: Vec<LedgerEntryChange> = Vec::new();
+    for key in footprint.read_only.iter().chain(footprint.read_write.iter()) {
+        match key {
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
+                if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                    let hash_bytes = stellar_core_crypto::sha256(&key_bytes);
+                    let key_hash = stellar_xdr::curr::Hash(*hash_bytes.as_bytes());
+
+                    // Skip if we already have this TTL in our changes
+                    if existing_ttl_hashes.contains(&key_hash) {
+                        continue;
+                    }
+
+                    // Get ledger-start TTL entry (full LedgerEntry with correct last_modified)
+                    let ledger_start_entry = match ledger_start_ttls.get(&key_hash) {
+                        Some(entry) => entry,
+                        None => continue, // No ledger-start TTL, skip
+                    };
+
+                    // Extract the TTL data from ledger-start entry
+                    let ledger_start_ttl = match &ledger_start_entry.data {
+                        LedgerEntryData::Ttl(ttl) => ttl,
+                        _ => continue,
+                    };
+
+                    // Get current TTL value from executor state
+                    let current_ttl = match executor.state().get_ttl(&key_hash) {
+                        Some(ttl) => ttl,
+                        None => continue, // No current TTL, skip
+                    };
+
+                    // Only add if TTL changed during the ledger
+                    if ledger_start_ttl.live_until_ledger_seq != current_ttl.live_until_ledger_seq {
+                        // Use the ledger-start entry's last_modified for STATE
+                        let state_entry = ledger_start_entry.clone();
+                        // Build UPDATED entry with current values and current ledger's last_modified
+                        let updated_entry = LedgerEntry {
+                            last_modified_ledger_seq: ledger_seq,
+                            data: LedgerEntryData::Ttl(current_ttl.clone()),
+                            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                        };
+                        additional_changes.push(LedgerEntryChange::State(state_entry));
+                        additional_changes.push(LedgerEntryChange::Updated(updated_entry));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // If we have additional changes, rebuild the entire meta structure
+    if !additional_changes.is_empty() {
+        let mut all_changes = existing_changes;
+        all_changes.extend(additional_changes);
+
+        // Convert to LedgerEntryChanges
+        let new_changes: stellar_xdr::curr::LedgerEntryChanges = match all_changes.try_into() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Rebuild the meta with the new changes
+        match meta {
+            stellar_xdr::curr::TransactionMeta::V3(v3) => {
+                if !v3.operations.is_empty() {
+                    // Clone the operations and update the first one's changes
+                    let mut ops: Vec<stellar_xdr::curr::OperationMeta> = v3.operations.iter().cloned().collect();
+                    ops[0].changes = new_changes;
+                    if let Ok(new_ops) = ops.try_into() {
+                        v3.operations = new_ops;
+                    }
+                }
+            }
+            stellar_xdr::curr::TransactionMeta::V4(v4) => {
+                if !v4.operations.is_empty() {
+                    // Clone the operations and update the first one's changes
+                    let mut ops: Vec<stellar_xdr::curr::OperationMetaV2> = v4.operations.iter().cloned().collect();
+                    ops[0].changes = new_changes;
+                    if let Ok(new_ops) = ops.try_into() {
+                        v4.operations = new_ops;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Compare transaction meta to find differences in ledger entry changes.
 /// For fee bump transactions with separate fee source, fee_changes from Phase 1 should be prepended.
+/// Uses order-independent comparison since C++ stellar-core's UnorderedMap iteration order
+/// is non-deterministic (depends on RandHasher's gMixer random value).
 fn compare_transaction_meta(
     our_meta: &stellar_xdr::curr::TransactionMeta,
     cdp_meta: &stellar_xdr::curr::TransactionMeta,
@@ -2437,14 +2695,31 @@ fn compare_transaction_meta(
         ));
     }
 
-    // Compare individual changes if showing diffs
+    // Sort both lists by (change_type, key_xdr) for order-independent comparison
+    let mut our_sorted: Vec<_> = our_changes.iter().collect();
+    let mut cdp_sorted: Vec<_> = cdp_changes.iter().collect();
+    our_sorted.sort_by_key(|c| change_sort_key(c));
+    cdp_sorted.sort_by_key(|c| change_sort_key(c));
+
+    // Compare individual changes after sorting
     if show_diff {
-        for (i, (our, cdp)) in our_changes.iter().zip(cdp_changes.iter()).enumerate() {
+        for (i, (our, cdp)) in our_sorted.iter().zip(cdp_sorted.iter()).enumerate() {
             let our_xdr = our.to_xdr(Limits::none()).unwrap_or_default();
             let cdp_xdr = cdp.to_xdr(Limits::none()).unwrap_or_default();
 
             if our_xdr != cdp_xdr {
                 diffs.push(format!("Change {} differs", i));
+            }
+        }
+    } else {
+        // Even without showing diffs, still need to check if changes match
+        for (our, cdp) in our_sorted.iter().zip(cdp_sorted.iter()) {
+            let our_xdr = our.to_xdr(Limits::none()).unwrap_or_default();
+            let cdp_xdr = cdp.to_xdr(Limits::none()).unwrap_or_default();
+
+            if our_xdr != cdp_xdr {
+                diffs.push("Content mismatch".to_string());
+                break;
             }
         }
     }
@@ -2513,6 +2788,12 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                     t.balance, entry.last_modified_ledger_seq
                 )
             }
+            LedgerEntryData::Offer(o) => {
+                format!(
+                    "Offer({}) amount={} lm={}",
+                    o.offer_id, o.amount, entry.last_modified_ledger_seq
+                )
+            }
             LedgerEntryData::ContractData(cd) => {
                 let contract_hex = match &cd.contract {
                     stellar_xdr::curr::ScAddress::Contract(contract_id) => {
@@ -2527,9 +2808,27 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
             }
             LedgerEntryData::ContractCode(cc) => {
                 let hash_hex = hex::encode(&cc.hash.0[0..4]);
+                // Show ext (cost inputs) for debugging
+                let ext_info = match &cc.ext {
+                    stellar_xdr::curr::ContractCodeEntryExt::V0 => "ext=V0".to_string(),
+                    stellar_xdr::curr::ContractCodeEntryExt::V1(v1) => {
+                        format!("ext=V1(n_insns={} n_fns={} n_globals={} n_tbl_entries={} n_types={} n_data_seg_bytes={} n_elem_segs={} n_imports={} n_exports={} n_data_segs={})",
+                            v1.cost_inputs.n_instructions,
+                            v1.cost_inputs.n_functions,
+                            v1.cost_inputs.n_globals,
+                            v1.cost_inputs.n_table_entries,
+                            v1.cost_inputs.n_types,
+                            v1.cost_inputs.n_data_segment_bytes,
+                            v1.cost_inputs.n_elem_segments,
+                            v1.cost_inputs.n_imports,
+                            v1.cost_inputs.n_exports,
+                            v1.cost_inputs.n_data_segments,
+                        )
+                    }
+                };
                 format!(
-                    "ContractCode({}...) lm={}",
-                    hash_hex, entry.last_modified_ledger_seq
+                    "ContractCode({}...) {} lm={}",
+                    hash_hex, ext_info, entry.last_modified_ledger_seq
                 )
             }
             LedgerEntryData::Ttl(ttl) => {

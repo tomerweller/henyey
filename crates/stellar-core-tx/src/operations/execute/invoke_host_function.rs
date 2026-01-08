@@ -4,8 +4,9 @@
 //! which executes Soroban smart contract functions.
 
 use stellar_xdr::curr::{
-    AccountId, ContractCodeEntry, ContractCodeEntryExt, ContractEvent, DiagnosticEvent, Hash,
-    HostFunction, InvokeHostFunctionOp, InvokeHostFunctionResult, InvokeHostFunctionResultCode,
+    AccountId, ContractCodeCostInputs, ContractCodeEntry, ContractCodeEntryExt,
+    ContractCodeEntryV1, ContractEvent, DiagnosticEvent, ExtensionPoint, Hash, HostFunction,
+    InvokeHostFunctionOp, InvokeHostFunctionResult, InvokeHostFunctionResultCode,
     InvokeHostFunctionSuccessPreImage, LedgerKey, LedgerKeyContractCode, Limits, OperationResult,
     OperationResultTr, ScVal, SorobanTransactionData, TtlEntry, WriteXdr,
 };
@@ -15,9 +16,6 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 use super::{OperationExecutionResult, SorobanOperationMeta};
-
-/// Default TTL for newly created contract entries (in ledgers).
-const DEFAULT_CONTRACT_TTL: u32 = 518400; // ~30 days at 5-second ledger close
 
 /// Execute an InvokeHostFunction operation.
 ///
@@ -68,7 +66,7 @@ pub fn execute_invoke_host_function(
         }
         HostFunction::UploadContractWasm(wasm) => {
             // WASM upload can be handled locally without full host
-            execute_upload_wasm(wasm, source, state, context)
+            execute_upload_wasm(wasm, source, state, context, soroban_config)
         }
     }
 }
@@ -172,6 +170,7 @@ fn execute_upload_wasm(
     _source: &AccountId,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
+    soroban_config: &SorobanConfig,
 ) -> Result<OperationExecutionResult> {
     use sha2::{Digest, Sha256};
 
@@ -189,27 +188,118 @@ fn execute_upload_wasm(
         )));
     }
 
-    // Create the contract code entry
+    // Create TTL for the code FIRST (matches C++ stellar-core ordering).
+    // Contract code is a persistent entry, so it uses min_persistent_entry_ttl.
+    // The live_until is inclusive, so we subtract 1 to match C++ stellar-core.
+    let code_key_hash = compute_contract_code_key_hash(&code_hash);
+    let live_until = context.sequence + soroban_config.min_persistent_entry_ttl - 1;
+    let ttl_entry = TtlEntry {
+        key_hash: code_key_hash,
+        live_until_ledger_seq: live_until,
+    };
+    state.create_ttl(ttl_entry);
+
+    // Extract cost inputs from the WASM for V1 extension.
+    // This matches C++ stellar-core behavior for protocol 22+.
+    let cost_inputs = extract_wasm_cost_inputs(wasm.as_slice());
+
+    // Create the contract code entry SECOND (matches C++ stellar-core ordering).
     let code_entry = ContractCodeEntry {
-        ext: ContractCodeEntryExt::V0,
+        ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
+            ext: ExtensionPoint::V0,
+            cost_inputs,
+        }),
         hash: code_hash.clone(),
         code: wasm.clone(),
     };
     state.create_contract_code(code_entry);
-
-    // Create TTL for the code
-    let code_key_hash = compute_contract_code_key_hash(&code_hash);
-    let ttl_entry = TtlEntry {
-        key_hash: code_key_hash,
-        live_until_ledger_seq: context.sequence + DEFAULT_CONTRACT_TTL,
-    };
-    state.create_ttl(ttl_entry);
 
     // Return success with the code hash
     Ok(OperationExecutionResult::new(make_result(
         InvokeHostFunctionResultCode::Success,
         code_hash,
     )))
+}
+
+/// Extract cost inputs from WASM bytecode.
+///
+/// This parses the WASM module and extracts various metrics needed for
+/// cost calculation, matching how C++ stellar-core (via soroban-env-host)
+/// computes these values.
+fn extract_wasm_cost_inputs(wasm: &[u8]) -> ContractCodeCostInputs {
+    use wasmparser::{Parser, Payload::*};
+
+    let mut costs = ContractCodeCostInputs {
+        ext: ExtensionPoint::V0,
+        n_instructions: 0,
+        n_functions: 0,
+        n_globals: 0,
+        n_table_entries: 0,
+        n_types: 0,
+        n_data_segments: 0,
+        n_elem_segments: 0,
+        n_imports: 0,
+        n_exports: 0,
+        n_data_segment_bytes: 0,
+    };
+
+    // Parse the WASM and count various elements
+    let parser = Parser::new(0);
+    for section in parser.parse_all(wasm) {
+        let section = match section {
+            Ok(s) => s,
+            Err(_) => continue, // Skip malformed sections
+        };
+
+        match section {
+            TypeSection(s) => {
+                costs.n_types = costs.n_types.saturating_add(s.count());
+            }
+            ImportSection(s) => {
+                costs.n_imports = costs.n_imports.saturating_add(s.count());
+            }
+            FunctionSection(s) => {
+                costs.n_functions = costs.n_functions.saturating_add(s.count());
+            }
+            TableSection(s) => {
+                for table in s {
+                    if let Ok(table) = table {
+                        costs.n_table_entries =
+                            costs.n_table_entries.saturating_add(table.ty.initial);
+                    }
+                }
+            }
+            GlobalSection(s) => {
+                costs.n_globals = costs.n_globals.saturating_add(s.count());
+            }
+            ExportSection(s) => {
+                costs.n_exports = costs.n_exports.saturating_add(s.count());
+            }
+            ElementSection(s) => {
+                costs.n_elem_segments = costs.n_elem_segments.saturating_add(s.count());
+            }
+            DataSection(s) => {
+                costs.n_data_segments = costs.n_data_segments.saturating_add(s.count());
+                for d in s {
+                    if let Ok(d) = d {
+                        costs.n_data_segment_bytes = costs
+                            .n_data_segment_bytes
+                            .saturating_add(d.data.len() as u32);
+                    }
+                }
+            }
+            CodeSectionEntry(s) => {
+                if let Ok(ops) = s.get_operators_reader() {
+                    for _op in ops {
+                        costs.n_instructions = costs.n_instructions.saturating_add(1);
+                    }
+                }
+            }
+            _ => {} // Ignore other sections
+        }
+    }
+
+    costs
 }
 
 /// Compute the hash of a ledger key for TTL lookup.
@@ -274,7 +364,35 @@ fn apply_soroban_storage_changes(
     state: &mut LedgerStateManager,
     changes: &[crate::soroban::StorageChange],
 ) {
-    for change in changes {
+    // Reorder changes so that Soroban entry creates/updates come before classic entry updates.
+    // The Soroban host returns changes in key order (Account=0 < ContractData=6 < TTL=9),
+    // but C++ stellar-core uses hash-based iteration which produces a different order.
+    // To match C++ behavior where creates appear before SAC updates in the tx meta,
+    // we process Soroban entries first, then classic entries.
+    let (soroban_changes, classic_changes): (Vec<_>, Vec<_>) = changes.iter().partition(|change| {
+        if let Some(entry) = &change.new_entry {
+            matches!(&entry.data,
+                stellar_xdr::curr::LedgerEntryData::ContractData(_) |
+                stellar_xdr::curr::LedgerEntryData::ContractCode(_) |
+                stellar_xdr::curr::LedgerEntryData::Ttl(_)
+            )
+        } else {
+            // Deletions - check the key type
+            matches!(&change.key,
+                LedgerKey::ContractData(_) |
+                LedgerKey::ContractCode(_) |
+                LedgerKey::Ttl(_)
+            )
+        }
+    });
+
+    // Apply Soroban changes first (creates/updates to contract data, code, TTL)
+    for change in &soroban_changes {
+        apply_soroban_storage_change(state, change);
+    }
+
+    // Then apply classic changes (Account, Trustline updates from SAC)
+    for change in &classic_changes {
         apply_soroban_storage_change(state, change);
     }
 }
@@ -347,7 +465,28 @@ fn apply_soroban_storage_change(
                 }
             }
         }
+    } else if let Some(live_until) = change.live_until {
+        // TTL-only change: the data entry wasn't modified, but its TTL was bumped.
+        // This happens when a contract reads an entry and its TTL gets auto-extended.
+        let key_hash = compute_key_hash(&change.key);
+        let existing_ttl = state.get_ttl(&key_hash);
+        let ttl_changed = existing_ttl
+            .map(|t| t.live_until_ledger_seq != live_until)
+            .unwrap_or(true);
+
+        if ttl_changed {
+            let ttl = TtlEntry {
+                key_hash,
+                live_until_ledger_seq: live_until,
+            };
+            if existing_ttl.is_some() {
+                state.update_ttl(ttl);
+            } else {
+                state.create_ttl(ttl);
+            }
+        }
     } else {
+        // Deletion case: new_entry is None and live_until is None
         match &change.key {
             LedgerKey::ContractData(key) => {
                 state.delete_contract_data(&key.contract, &key.key, key.durability.clone());

@@ -753,6 +753,11 @@ impl TransactionExecutor {
         Ok(false)
     }
 
+    /// Get a ledger entry from the current state (if loaded).
+    pub fn get_entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        self.state.get_entry(key)
+    }
+
     /// Load all entries from a Soroban footprint into the state manager.
     ///
     /// This is essential for Soroban transaction execution - the footprint specifies
@@ -1030,6 +1035,11 @@ impl TransactionExecutor {
     ///
     /// When `deduct_fee` is false, fee validation still occurs but no fee
     /// processing changes are applied to the state or delta.
+    ///
+    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` can be provided
+    /// to use as the STATE entry in tx_changes_before. This is needed because the current
+    /// state may already be post-fee-processing (synced with CDP's fee_meta), but we need
+    /// to emit the pre-fee state for the STATE entry to match C++ stellar-core behavior.
     pub fn execute_transaction_with_fee_mode(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -1037,6 +1047,33 @@ impl TransactionExecutor {
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
+    ) -> Result<TransactionExecutionResult> {
+        self.execute_transaction_with_fee_mode_and_pre_state(
+            snapshot,
+            tx_envelope,
+            base_fee,
+            soroban_prng_seed,
+            deduct_fee,
+            None,
+        )
+    }
+
+    /// Execute a transaction with configurable fee deduction and optional pre-fee state.
+    ///
+    /// When `deduct_fee` is false, fee validation still occurs but no fee
+    /// processing changes are applied to the state or delta.
+    ///
+    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
+    /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
+    /// in tx_changes_before to match C++ stellar-core behavior.
+    pub fn execute_transaction_with_fee_mode_and_pre_state(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+        fee_source_pre_state: Option<LedgerEntry>,
     ) -> Result<TransactionExecutionResult> {
         let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
         let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
@@ -1555,6 +1592,13 @@ impl TransactionExecutor {
                     account_id: fee_source_id.clone(),
                 });
                 if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
+                    // Both STATE and UPDATED use the same (current) state value.
+                    // In C++ stellar-core, the fee bump wrapper's tx_changes_before captures
+                    // the fee source state AFTER fee processing (which happened in fee_meta).
+                    // This is just for removeOneTimeSignerKeyFromFeeSource() which doesn't
+                    // change the balance - hence STATE and UPDATED have the same value.
+                    // We ignore fee_source_pre_state as it's not needed.
+                    let _ = fee_source_pre_state; // Explicitly ignore the parameter
                     vec![
                         LedgerEntryChange::State(fee_source_entry.clone()),
                         LedgerEntryChange::Updated(fee_source_entry),
@@ -1654,13 +1698,19 @@ impl TransactionExecutor {
 
         // Execute operations
         let mut operation_results = Vec::new();
-        let mut op_changes = Vec::with_capacity(frame.operations().len());
-        let mut op_events: Vec<Vec<ContractEvent>> = Vec::with_capacity(frame.operations().len());
+        let num_ops = frame.operations().len();
+        let mut op_changes = Vec::with_capacity(num_ops);
+        let mut op_events: Vec<Vec<ContractEvent>> = Vec::with_capacity(num_ops);
         let mut diagnostic_events: Vec<DiagnosticEvent> = Vec::new();
         let mut soroban_return_value = None;
         let mut all_success = true;
         let mut failure = None;
         let mut orderbook_loaded = false;
+
+        // For multi-operation transactions, C++ stellar-core records STATE/UPDATED
+        // for every accessed entry per operation, even if values are identical.
+        // For single-operation transactions, it only records if values changed.
+        self.state.set_multi_op_mode(num_ops > 1);
         let op_invariant_snapshot = self
             .op_invariants
             .as_ref()
@@ -1884,17 +1934,12 @@ impl TransactionExecutor {
         if let Some(tracker) = refundable_fee_tracker {
             let refund = tracker.refund_amount();
             if refund > 0 {
-                let delta_before_refund = delta_snapshot(&self.state);
-                if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
-                    acc.balance += refund;
-                }
+                // Apply refund directly to the last account update in the delta.
+                // In C++ stellar-core, the refund is NOT a separate meta change - it's
+                // incorporated into the final account balance of the existing update.
+                // We need to update the most recent account entry in the delta to include the refund.
+                self.state.apply_refund_to_delta(&fee_source_id, refund);
                 self.state.delta_mut().add_fee(-refund);
-                self.state.flush_modified_entries();
-                let delta_after_refund = delta_snapshot(&self.state);
-                let delta_changes =
-                    delta_changes_between(self.state.delta(), delta_before_refund, delta_after_refund);
-                post_fee_changes =
-                    build_entry_changes_with_state(&self.state, &delta_changes.created, &delta_changes.updated, &delta_changes.deleted);
             }
             let stage = if self.protocol_version >= 23 {
                 TransactionEventStage::AfterAllTxs
@@ -2871,168 +2916,185 @@ fn build_entry_changes_with_hot_archive(
         final_updated.insert(key_bytes, entry.clone());
     }
 
-    // For Soroban operations with change_order, use the order from e2e_invoke (tracked via delta)
-    // This preserves the exact order that C++ stellar-core produces from the Soroban host
-    if footprint.is_some() && !change_order.is_empty() {
+    // For Soroban operations with footprint, use change_order but sort consecutive Soroban creates by key_hash.
+    // For classic operations, use change_order to preserve execution order.
+    // Key insight: change_order captures the execution sequence. For Soroban, we must preserve
+    // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
+    // (TTL, ContractData, ContractCode) by their associated key_hash to match C++ behavior.
+    if let Some(_fp) = footprint {
         use std::collections::HashSet;
 
-        let mut emitted_keys: HashSet<Vec<u8>> = HashSet::new();
+        fn is_soroban_entry(entry: &LedgerEntry) -> bool {
+            matches!(&entry.data,
+                stellar_xdr::curr::LedgerEntryData::Ttl(_) |
+                stellar_xdr::curr::LedgerEntryData::ContractData(_) |
+                stellar_xdr::curr::LedgerEntryData::ContractCode(_)
+            )
+        }
+
+        // Track which keys have been created (for deduplication)
+        let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        // Process change_order to preserve execution sequence
+        // Collect groups of changes: either single updates/deletes or consecutive Soroban creates
+        enum ChangeGroup {
+            SingleUpdate { idx: usize },
+            SingleDelete { idx: usize },
+            SorobanCreates { indices: Vec<usize> },
+            ClassicCreate { idx: usize },
+        }
+
+        let mut groups: Vec<ChangeGroup> = Vec::new();
+        let mut pending_soroban_creates: Vec<usize> = Vec::new();
 
         for change_ref in change_order {
             match change_ref {
                 stellar_core_tx::ChangeRef::Created(idx) => {
                     if *idx < created.len() {
                         let entry = &created[*idx];
-                        let key_bytes = entry_key_bytes(entry);
-                        if !emitted_keys.contains(&key_bytes) {
-                            emitted_keys.insert(key_bytes);
-                            changes.push(LedgerEntryChange::Created(entry.clone()));
+                        if is_soroban_entry(entry) {
+                            pending_soroban_creates.push(*idx);
+                        } else {
+                            // Flush any pending Soroban creates before this classic create
+                            if !pending_soroban_creates.is_empty() {
+                                groups.push(ChangeGroup::SorobanCreates { indices: std::mem::take(&mut pending_soroban_creates) });
+                            }
+                            groups.push(ChangeGroup::ClassicCreate { idx: *idx });
                         }
                     }
                 }
                 stellar_core_tx::ChangeRef::Updated(idx) => {
-                    if *idx < updated.len() {
-                        let entry = &updated[*idx];
-                        let key_bytes = entry_key_bytes(entry);
-                        if !emitted_keys.contains(&key_bytes) {
-                            emitted_keys.insert(key_bytes.clone());
-                            if let Ok(key) = crate::delta::entry_to_key(entry) {
-                                if hot_archive_restored_keys.contains(&key) {
-                                    if let Some(final_entry) = final_updated.get(&key_bytes) {
-                                        changes.push(LedgerEntryChange::Restored(final_entry.clone()));
-                                    }
-                                } else {
-                                    if let Some(state_entry) = state_overrides
-                                        .get(&key)
-                                        .cloned()
-                                        .or_else(|| state.snapshot_entry(&key))
-                                    {
-                                        changes.push(LedgerEntryChange::State(state_entry));
-                                    }
-                                    if let Some(final_entry) = final_updated.get(&key_bytes) {
-                                        changes.push(LedgerEntryChange::Updated(final_entry.clone()));
-                                    }
-                                }
-                            }
-                        }
+                    // Flush any pending Soroban creates before this update
+                    if !pending_soroban_creates.is_empty() {
+                        groups.push(ChangeGroup::SorobanCreates { indices: std::mem::take(&mut pending_soroban_creates) });
                     }
+                    groups.push(ChangeGroup::SingleUpdate { idx: *idx });
                 }
                 stellar_core_tx::ChangeRef::Deleted(idx) => {
-                    if *idx < deleted.len() {
-                        let key = &deleted[*idx];
-                        let key_bytes = key_to_bytes(key).unwrap_or_default();
-                        if !emitted_keys.contains(&key_bytes) {
-                            emitted_keys.insert(key_bytes.clone());
-                            if hot_archive_restored_keys.contains(key) {
-                                if let Some(state_entry) = state_overrides
-                                    .get(key)
-                                    .cloned()
-                                    .or_else(|| state.snapshot_entry(key))
-                                {
-                                    changes.push(LedgerEntryChange::Restored(state_entry));
+                    // Flush any pending Soroban creates before this delete
+                    if !pending_soroban_creates.is_empty() {
+                        groups.push(ChangeGroup::SorobanCreates { indices: std::mem::take(&mut pending_soroban_creates) });
+                    }
+                    groups.push(ChangeGroup::SingleDelete { idx: *idx });
+                }
+            }
+        }
+
+        // Flush any remaining Soroban creates
+        if !pending_soroban_creates.is_empty() {
+            groups.push(ChangeGroup::SorobanCreates { indices: pending_soroban_creates });
+        }
+
+        // Process each group
+        for group in groups {
+            match group {
+                ChangeGroup::SorobanCreates { indices } => {
+                    // C++ groups TTL entries with their associated ContractData/ContractCode.
+                    // Sort by (associated_key_hash, type_order) where TTL comes before its data.
+                    use sha2::{Digest, Sha256};
+
+                    fn get_associated_hash_and_type(entry: &LedgerEntry) -> (Vec<u8>, u8) {
+                        match &entry.data {
+                            stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                                // TTL: associated_hash is key_hash, type_order=0 (first)
+                                (ttl.key_hash.0.to_vec(), 0)
+                            }
+                            stellar_xdr::curr::LedgerEntryData::ContractData(_) |
+                            stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
+                                // Data/Code: associated_hash is SHA256 of key XDR, type_order=1 (second)
+                                if let Ok(key) = crate::delta::entry_to_key(entry) {
+                                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                                        let key_hash = Sha256::digest(&key_bytes);
+                                        return (key_hash.to_vec(), 1);
+                                    }
                                 }
-                                changes.push(LedgerEntryChange::Removed(key.clone()));
+                                (Vec::new(), 1)
+                            }
+                            _ => (Vec::new(), 2)
+                        }
+                    }
+
+                    let mut entries_with_sort: Vec<(usize, (Vec<u8>, u8))> = indices
+                        .into_iter()
+                        .map(|idx| (idx, get_associated_hash_and_type(&created[idx])))
+                        .collect();
+
+                    // Sort by associated_hash (groups TTL with its data), then type_order (TTL=0 first)
+                    entries_with_sort.sort_by(|(_, a), (_, b)| a.cmp(b));
+
+                    for (idx, _) in entries_with_sort {
+                        let entry = &created[idx];
+                        let key_bytes = entry_key_bytes(entry);
+                        if !created_keys.contains(&key_bytes) {
+                            created_keys.insert(key_bytes);
+                            changes.push(LedgerEntryChange::Created(entry.clone()));
+                        }
+                    }
+                }
+                ChangeGroup::ClassicCreate { idx } => {
+                    let entry = &created[idx];
+                    let key_bytes = entry_key_bytes(entry);
+                    if !created_keys.contains(&key_bytes) {
+                        created_keys.insert(key_bytes);
+                        changes.push(LedgerEntryChange::Created(entry.clone()));
+                    }
+                }
+                ChangeGroup::SingleUpdate { idx } => {
+                    if idx < updated.len() {
+                        let post_state = &updated[idx];
+                        if let Ok(key) = crate::delta::entry_to_key(post_state) {
+                            if hot_archive_restored_keys.contains(&key) {
+                                changes.push(LedgerEntryChange::Restored(post_state.clone()));
                             } else {
-                                if let Some(state_entry) = state_overrides
-                                    .get(key)
-                                    .cloned()
-                                    .or_else(|| state.snapshot_entry(key))
-                                {
+                                // Get pre-state from update_states or snapshot
+                                let pre_state = if idx < update_states.len() {
+                                    Some(update_states[idx].clone())
+                                } else {
+                                    state_overrides.get(&key).cloned().or_else(|| state.snapshot_entry(&key))
+                                };
+                                if let Some(state_entry) = pre_state {
                                     changes.push(LedgerEntryChange::State(state_entry));
                                 }
-                                changes.push(LedgerEntryChange::Removed(key.clone()));
+                                changes.push(LedgerEntryChange::Updated(post_state.clone()));
                             }
                         }
                     }
                 }
-            }
-        }
-    } else if let Some(fp) = footprint {
-        // Fallback for Soroban operations without change_order - use footprint order
-        // Determine ordering for updates - use footprint read_write order
-        let mut key_order = Vec::new();
-        for key in fp.read_write.iter() {
-            let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-            if final_updated.contains_key(&key_bytes) && !key_order.contains(&key_bytes) {
-                key_order.push(key_bytes);
-            }
-        }
-        // Add any entries not in footprint
-        for key_bytes in final_updated.keys() {
-            if !key_order.contains(key_bytes) {
-                key_order.push(key_bytes.clone());
-            }
-        }
-
-        // Deleted entries ordering - use footprint order
-        let mut deleted_ordered = Vec::new();
-        for key in fp.read_write.iter() {
-            if deleted.contains(key) && !deleted_ordered.contains(key) {
-                deleted_ordered.push(key.clone());
-            }
-        }
-        for key in deleted {
-            if !deleted_ordered.contains(key) {
-                deleted_ordered.push(key.clone());
-            }
-        }
-
-        // Created entries FIRST
-        for entry in created {
-            changes.push(LedgerEntryChange::Created(entry.clone()));
-        }
-
-        // Updated entries (with STATE before each)
-        for key_bytes in key_order {
-            if let Some(final_entry) = final_updated.get(&key_bytes) {
-                if let Ok(key) = crate::delta::entry_to_key(final_entry) {
-                    if hot_archive_restored_keys.contains(&key) {
-                        changes.push(LedgerEntryChange::Restored(final_entry.clone()));
-                    } else {
-                        if let Some(state_entry) = state_overrides
-                            .get(&key)
-                            .cloned()
-                            .or_else(|| state.snapshot_entry(&key))
-                        {
-                            changes.push(LedgerEntryChange::State(state_entry));
+                ChangeGroup::SingleDelete { idx } => {
+                    if idx < deleted.len() {
+                        let key = &deleted[idx];
+                        if hot_archive_restored_keys.contains(key) {
+                            let pre_state = if idx < delete_states.len() {
+                                Some(delete_states[idx].clone())
+                            } else {
+                                state_overrides.get(key).cloned().or_else(|| state.snapshot_entry(key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::Restored(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Removed(key.clone()));
+                        } else {
+                            let pre_state = if idx < delete_states.len() {
+                                Some(delete_states[idx].clone())
+                            } else {
+                                state_overrides.get(key).cloned().or_else(|| state.snapshot_entry(key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::State(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Removed(key.clone()));
                         }
-                        changes.push(LedgerEntryChange::Updated(final_entry.clone()));
                     }
-                } else {
-                    changes.push(LedgerEntryChange::Updated(final_entry.clone()));
                 }
-            }
-        }
-
-        // Deleted entries last
-        for key in deleted_ordered {
-            if hot_archive_restored_keys.contains(&key) {
-                if let Some(state_entry) = state_overrides
-                    .get(&key)
-                    .cloned()
-                    .or_else(|| state.snapshot_entry(&key))
-                {
-                    changes.push(LedgerEntryChange::Restored(state_entry));
-                }
-                changes.push(LedgerEntryChange::Removed(key.clone()));
-            } else {
-                if let Some(state_entry) = state_overrides
-                    .get(&key)
-                    .cloned()
-                    .or_else(|| state.snapshot_entry(&key))
-                {
-                    changes.push(LedgerEntryChange::State(state_entry));
-                }
-                changes.push(LedgerEntryChange::Removed(key.clone()));
             }
         }
     } else if !change_order.is_empty() {
-        // For classic operations with change_order, use it to preserve execution order
-        // This matches C++ stellar-core which emits STATE/UPDATED pairs for EACH modification
-        // (not deduplicated by key - each operation gets its own change entry)
+        // For classic operations with change_order, use it to preserve execution order.
+        // Only deduplicate creates - once an entry is created, subsequent references are updates.
+        // Updates are NOT deduplicated - each update in change_order gets its own STATE/UPDATED pair.
         use std::collections::HashSet;
 
-        // Only deduplicate creates - once an entry is created, subsequent references are updates
+        // Track which keys have been created to avoid duplicate creates
         let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
 
         for change_ref in change_order {
@@ -3051,6 +3113,7 @@ fn build_entry_changes_with_hot_archive(
                 stellar_core_tx::ChangeRef::Updated(idx) => {
                     if *idx < updated.len() {
                         let post_state = &updated[*idx];
+
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
                             if hot_archive_restored_keys.contains(&key) {
                                 // Use entry value for hot archive restored entries

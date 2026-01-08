@@ -129,6 +129,11 @@ pub struct LedgerStateManager {
     op_entry_snapshots: HashMap<LedgerKey, LedgerEntry>,
     /// Whether op-level snapshots are active.
     op_snapshots_active: bool,
+    /// Whether we're in a multi-operation transaction.
+    /// When true, flush_modified_entries records STATE/UPDATED for every access,
+    /// even if values are identical. C++ stellar-core records per-operation entries
+    /// for multi-op transactions but not for single-op transactions.
+    multi_op_mode: bool,
     /// Active sponsorship stack for the current transaction.
     sponsorship_stack: Vec<SponsorshipContext>,
     /// Changes made during execution.
@@ -206,6 +211,7 @@ impl LedgerStateManager {
             entry_last_modified: HashMap::new(),
             op_entry_snapshots: HashMap::new(),
             op_snapshots_active: false,
+            multi_op_mode: false,
             sponsorship_stack: Vec::new(),
             delta: LedgerDelta::new(ledger_seq),
             modified_accounts: Vec::new(),
@@ -284,6 +290,16 @@ impl LedgerStateManager {
     pub fn end_op_snapshot(&mut self) -> HashMap<LedgerKey, LedgerEntry> {
         self.op_snapshots_active = false;
         std::mem::take(&mut self.op_entry_snapshots)
+    }
+
+    /// Set multi-operation mode.
+    ///
+    /// When enabled, flush_modified_entries records STATE/UPDATED for every
+    /// accessed entry even if values are identical. C++ stellar-core records
+    /// per-operation entries for multi-op transactions but not for single-op
+    /// transactions.
+    pub fn set_multi_op_mode(&mut self, enabled: bool) {
+        self.multi_op_mode = enabled;
     }
 
     fn capture_op_snapshot_for_key(&mut self, key: &LedgerKey) {
@@ -899,12 +915,11 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.accounts.insert(key, entry);
+        self.accounts.insert(key, entry.clone());
 
-        // Track modification
-        if !self.modified_accounts.contains(&key) {
-            self.modified_accounts.push(key);
-        }
+        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
+        // The update was already recorded above, so the snapshot should reflect the new state.
+        self.account_snapshots.insert(key, Some(entry));
     }
 
     /// Set an account entry directly without delta tracking.
@@ -1201,12 +1216,11 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.trustlines.insert(key.clone(), entry);
+        self.trustlines.insert(key.clone(), entry.clone());
 
-        // Track modification
-        if !self.modified_trustlines.contains(&key) {
-            self.modified_trustlines.push(key);
-        }
+        // Do NOT add to modified_trustlines since we already recorded the update.
+        // This prevents flush_modified_entries from recording a duplicate.
+        // Classic operations use get_trustline_mut() which tracks modifications separately.
     }
 
     /// Delete a trustline entry.
@@ -1350,7 +1364,7 @@ impl LedgerStateManager {
             offer_id: entry.offer_id,
         });
 
-        // Save snapshot if not already saved
+        // Save snapshot if not already saved (for rollback purposes)
         if !self.offer_snapshots.contains_key(&key) {
             let snapshot = self.offers.get(&key).cloned();
             self.offer_snapshots.insert(key, snapshot);
@@ -1358,25 +1372,23 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state (current value BEFORE this update)
+        // Get pre-state from current state (value BEFORE this specific update)
         let pre_state = self.offers.get(&key)
             .map(|offer| self.offer_to_ledger_entry(offer));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
-        // Record in delta with pre-state
+        // Record in delta - each update gets its own STATE/UPDATED pair
         let post_state = self.offer_to_ledger_entry(&entry);
         if let Some(pre) = pre_state {
             self.delta.record_update(pre, post_state);
         }
 
         // Update state
-        self.offers.insert(key, entry);
+        self.offers.insert(key, entry.clone());
 
-        // Track modification
-        if !self.modified_offers.contains(&key) {
-            self.modified_offers.push(key);
-        }
+        // Do NOT track in modified_offers since we already recorded the update
+        // This prevents flush_modified_entries from recording a duplicate
     }
 
     /// Delete an offer entry.
@@ -1686,12 +1698,10 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.contract_data.insert(key.clone(), entry);
+        self.contract_data.insert(key.clone(), entry.clone());
 
-        // Track modification
-        if !self.modified_contract_data.contains(&key) {
-            self.modified_contract_data.push(key);
-        }
+        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
+        self.contract_data_snapshots.insert(key, Some(entry));
     }
 
     /// Delete a contract data entry.
@@ -1815,7 +1825,10 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.contract_code.insert(key, entry);
+        self.contract_code.insert(key, entry.clone());
+
+        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
+        self.contract_code_snapshots.insert(key, Some(entry));
 
         // Track modification
         if !self.modified_contract_code.contains(&key) {
@@ -1937,7 +1950,10 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.ttl_entries.insert(key, entry);
+        self.ttl_entries.insert(key, entry.clone());
+
+        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
+        self.ttl_snapshots.insert(key, Some(entry));
 
         // Track modification
         if !self.modified_ttl.contains(&key) {
@@ -1978,7 +1994,10 @@ impl LedgerStateManager {
                 self.delta.record_update(pre_state, post_state);
 
                 // Update state
-                self.ttl_entries.insert(key, updated);
+                self.ttl_entries.insert(key, updated.clone());
+
+                // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
+                self.ttl_snapshots.insert(key, Some(updated));
 
                 // Track modification
                 if !self.modified_ttl.contains(&key) {
@@ -2421,6 +2440,21 @@ impl LedgerStateManager {
         self.delta.has_changes()
     }
 
+    /// Apply a fee refund to the most recent account update in the delta.
+    ///
+    /// In C++ stellar-core, fee refunds are NOT separate meta changes - they're
+    /// incorporated into the final account balance of the existing update.
+    /// This method finds the most recent update to the account and adds the refund.
+    pub fn apply_refund_to_delta(&mut self, account_id: &AccountId, refund: i64) {
+        // Find the most recent update to this account in the delta and add the refund
+        self.delta.apply_refund_to_account(account_id, refund);
+        // Also update the in-memory account state (without recording a new delta)
+        let key = account_id_to_bytes(account_id);
+        if let Some(acc) = self.accounts.get_mut(&key) {
+            acc.balance += refund;
+        }
+    }
+
     // ==================== Rollback Support ====================
 
     /// Rollback all changes since the state manager was created.
@@ -2601,6 +2635,54 @@ impl LedgerStateManager {
         self.modified_liquidity_pools.clear();
     }
 
+    /// Flush all pending account changes to the delta, excluding a specific account.
+    ///
+    /// This flushes only accounts, not trustlines or other entry types.
+    /// Used when an operation needs to ensure all account changes are recorded
+    /// before recording trustline changes (e.g., before deleting a trustline).
+    ///
+    /// The `exclude` parameter specifies an account to skip (e.g., an account
+    /// that's about to be deleted). If None, all accounts are flushed.
+    pub fn flush_all_accounts_except(&mut self, exclude: Option<&AccountId>) {
+        let exclude_key = exclude.map(crate::account_id_to_key);
+        let modified_accounts = std::mem::take(&mut self.modified_accounts);
+        let mut remaining = Vec::new();
+        for key in modified_accounts {
+            if exclude_key == Some(key) {
+                // Keep excluded account in modified list (will be handled by delete)
+                remaining.push(key);
+                continue;
+            }
+            if let Some(snapshot) = self.account_snapshots.get(&key) {
+                if let Some(snapshot_entry) = snapshot {
+                    if let Some(entry) = self.accounts.get(&key).cloned() {
+                        let should_record = self.multi_op_mode || &entry != snapshot_entry;
+                        if should_record {
+                            let pre_state = self.account_to_ledger_entry(snapshot_entry);
+                            let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+                                account_id: entry.account_id.clone(),
+                            });
+                            self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
+                            let post_state = self.account_to_ledger_entry(&entry);
+                            self.delta.record_update(pre_state, post_state);
+                            self.account_snapshots.insert(key, Some(entry));
+                        }
+                    }
+                }
+            }
+        }
+        self.modified_accounts = remaining;
+    }
+
+    /// Flush all pending account changes to the delta.
+    ///
+    /// This flushes only accounts, not trustlines or other entry types.
+    /// Used when an operation needs to ensure all account changes are recorded
+    /// before recording trustline changes (e.g., before deleting a trustline).
+    pub fn flush_all_accounts(&mut self) {
+        self.flush_all_accounts_except(None);
+    }
+
     /// Flush a specific account's changes to the delta.
     ///
     /// This allows operations to control the order of STATE/UPDATED pairs,
@@ -2614,7 +2696,10 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.account_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.accounts.get(&key).cloned() {
-                        if &entry != snapshot_entry {
+                        // For single-operation transactions, only record if entry actually changed.
+                        // For multi-operation transactions, record for every access.
+                        let should_record = self.multi_op_mode || &entry != snapshot_entry;
+                        if should_record {
                             let pre_state = self.account_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::Account(LedgerKeyAccount {
                                 account_id: account_id.clone(),
@@ -2646,9 +2731,11 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.account_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.accounts.get(&key).cloned() {
-                        // Only record update if entry actually changed from snapshot
-                        if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
+                        // For single-operation transactions, only record if entry actually changed.
+                        // For multi-operation transactions, record for every access (even if no change)
+                        // because C++ stellar-core records per-operation entries for multi-op txs.
+                        let should_record = self.multi_op_mode || &entry != snapshot_entry;
+                        if should_record {
                             let pre_state = self.account_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::Account(LedgerKeyAccount {
                                 account_id: entry.account_id.clone(),
@@ -2669,9 +2756,10 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.trustline_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.trustlines.get(&key).cloned() {
-                        // Only record update if entry actually changed from snapshot
-                        if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
+                        // For single-operation transactions, only record if entry actually changed.
+                        // For multi-operation transactions, record for every access.
+                        let should_record = self.multi_op_mode || &entry != snapshot_entry;
+                        if should_record {
                             let pre_state = self.trustline_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
                                 account_id: entry.account_id.clone(),

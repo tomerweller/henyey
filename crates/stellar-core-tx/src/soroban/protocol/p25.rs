@@ -412,10 +412,14 @@ pub fn invoke_host_function(
     };
 
     // Convert ledger changes
+    // Include entries that:
+    // - Had their content modified (encoded_new_value.is_some())
+    // - Are involved in rent calculations (old_entry_size_bytes_for_rent > 0)
+    // - Had their TTL extended (ttl_change.is_some())
     let ledger_changes = result.ledger_changes
         .into_iter()
         .filter_map(|change| {
-            if change.encoded_new_value.is_some() || change.old_entry_size_bytes_for_rent > 0 {
+            if change.encoded_new_value.is_some() || change.old_entry_size_bytes_for_rent > 0 || change.ttl_change.is_some() {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change.encoded_new_value.and_then(|bytes| {
                     LedgerEntry::from_xdr(&bytes, Limits::none()).ok()

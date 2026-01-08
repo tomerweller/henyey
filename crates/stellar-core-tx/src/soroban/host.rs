@@ -958,12 +958,14 @@ fn execute_host_function_p24(
         .filter_map(|change| {
             // Include entries that:
             // 1. Have a new value (were created or modified), OR
-            // 2. Are NOT read-only and have no new value (were deleted)
-            // Skip read-only entries that weren't modified (just reads, not deletions).
+            // 2. Are NOT read-only and have no new value (were deleted), OR
+            // 3. Have a TTL change (read-only entries with TTL bump)
+            // Skip read-only entries that weren't modified and have no TTL change.
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
+            let has_ttl_change = change.ttl_change.is_some();
 
-            if is_modification || is_deletion {
+            if is_modification || is_deletion || has_ttl_change {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change.encoded_new_value.and_then(|bytes| {
                     LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
@@ -1257,12 +1259,14 @@ fn execute_host_function_p25(
         .filter_map(|change| {
             // Include entries that:
             // 1. Have a new value (were created or modified), OR
-            // 2. Are NOT read-only and have no new value (were deleted)
-            // Skip read-only entries that weren't modified (just reads, not deletions).
+            // 2. Are NOT read-only and have no new value (were deleted), OR
+            // 3. Have a TTL change (read-only entries with TTL bump)
+            // Skip read-only entries that weren't modified and have no TTL change.
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
+            let has_ttl_change = change.ttl_change.is_some();
 
-            if is_modification || is_deletion {
+            if is_modification || is_deletion || has_ttl_change {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change.encoded_new_value.and_then(|bytes| {
                     LedgerEntry::from_xdr(&bytes, Limits::none()).ok()

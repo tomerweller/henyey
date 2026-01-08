@@ -99,9 +99,8 @@ pub fn execute_change_trust(
             )?;
         }
 
-        state.delete_trustline_by_trustline_asset(source, &tl_asset);
-
-        // Decrease sub-entries
+        // Decrease sub-entries BEFORE deleting trustline.
+        // C++ stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
         if let Some(account) = state.get_account_mut(source) {
             if account.num_sub_entries >= multiplier as u32 {
                 account.num_sub_entries -= multiplier as u32;
@@ -111,6 +110,12 @@ pub fn execute_change_trust(
                 ));
             }
         }
+        // Flush ALL account changes before recording trustline deletion.
+        // C++ stellar-core records all pending account STATE/UPDATED pairs before
+        // trustline deletions, which may include accounts modified in earlier ops.
+        state.flush_all_accounts();
+
+        state.delete_trustline_by_trustline_asset(source, &tl_asset);
     } else if existing.is_some() {
         // Updating existing trustline
         let existing_balance = existing.map(|tl| tl.balance).unwrap_or(0);
