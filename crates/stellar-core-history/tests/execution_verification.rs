@@ -54,8 +54,8 @@ impl Default for VerificationConfig {
             date_partition: "2025-12-18".to_string(),  // AWS public blockchain CDP data
             archive_url: "https://history.stellar.org/prd/core-testnet/core_testnet_001/".to_string(),
             network_id: NetworkId::testnet(),
-            start_ledger: 310225,  // Start after checkpoint 310207
-            end_ledger: 312000,    // ~1775 ledgers to test across multiple checkpoints
+            start_ledger: 256065,  // Start after checkpoint 256063
+            end_ledger: 256150,    // Short range to investigate Soroban mismatches
         }
     }
 }
@@ -308,13 +308,15 @@ fn compare_tx_results(
 }
 
 /// Execute transactions and compare results against archived results
+/// Returns the id_pool after this ledger is processed (for use in next ledger)
 async fn verify_ledger_execution(
     ledger_meta: &LedgerCloseMeta,
     bucket_list: &mut BucketList,
     hot_archive: Option<&BucketList>,
     network_id: &NetworkId,
     summary: &mut VerificationSummary,
-) -> Result<(), Box<dyn std::error::Error>> {
+    previous_id_pool: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
     let header = cdp::extract_ledger_header(ledger_meta);
     let tx_metas = cdp::extract_transaction_metas(ledger_meta);
 
@@ -332,7 +334,11 @@ async fn verify_ledger_execution(
         .collect();
 
     // Create snapshot from bucket list (and hot archive if present)
-    let snapshot = LedgerSnapshot::empty(header.ledger_seq);
+    // Use the PREVIOUS ledger's id_pool for offer ID generation, since the header's
+    // id_pool reflects the state AFTER all transactions in this ledger were processed
+    let mut header_for_snapshot = header.clone();
+    header_for_snapshot.id_pool = previous_id_pool;
+    let snapshot = LedgerSnapshot::new(header_for_snapshot, Hash256::ZERO, HashMap::new());
     let bucket_list_clone = bucket_list.clone();
     let bucket_list_ref = Arc::new(RwLock::new(bucket_list_clone));
     let hot_archive_ref = hot_archive.map(|ha| Arc::new(RwLock::new(ha.clone())));
@@ -532,7 +538,8 @@ async fn verify_ledger_execution(
         all_tx_match: all_match,
     });
 
-    Ok(())
+    // Return the id_pool AFTER this ledger is processed (for next ledger)
+    Ok(header.id_pool)
 }
 
 /// Main verification test
@@ -645,6 +652,10 @@ async fn test_execution_verification_against_testnet() {
         println!("Hot archive bucket list restored. Hash: {}", &ha.hash().to_hex()[..16]);
     }
 
+    // Track id_pool across ledgers (starts from checkpoint and updates with each ledger)
+    // The id_pool in a ledger header reflects state AFTER that ledger's transactions
+    let mut current_id_pool = 0u64;  // Will be initialized from replay
+
     // Replay from checkpoint to start_ledger - 1 using metadata
     if config.start_ledger > checkpoint_ledger + 1 {
         println!("\nReplaying ledgers {} to {} to reach start...", checkpoint_ledger + 1, config.start_ledger - 1);
@@ -669,6 +680,9 @@ async fn test_execution_verification_against_testnet() {
                         )
                         .expect("Failed to add batch");
 
+                    // Track id_pool from each replayed ledger
+                    current_id_pool = header.id_pool;
+
                     if seq % 10 == 0 {
                         println!("  Replayed to ledger {}", seq);
                     }
@@ -677,6 +691,18 @@ async fn test_execution_verification_against_testnet() {
                     println!("  Failed to fetch ledger {}: {}", seq, e);
                     return;
                 }
+            }
+        }
+    } else {
+        // If starting right after checkpoint, get id_pool from checkpoint ledger
+        match cdp.get_ledger_close_meta(checkpoint_ledger).await {
+            Ok(meta) => {
+                let header = cdp::extract_ledger_header(&meta);
+                current_id_pool = header.id_pool;
+            }
+            Err(e) => {
+                println!("  Failed to fetch checkpoint ledger: {}", e);
+                return;
             }
         }
     }
@@ -690,8 +716,10 @@ async fn test_execution_verification_against_testnet() {
 
         match cdp.get_ledger_close_meta(seq).await {
             Ok(meta) => {
-                match verify_ledger_execution(&meta, &mut bucket_list, hot_archive_bucket_list.as_ref(), &config.network_id, &mut summary).await {
-                    Ok(()) => {
+                match verify_ledger_execution(&meta, &mut bucket_list, hot_archive_bucket_list.as_ref(), &config.network_id, &mut summary, current_id_pool).await {
+                    Ok(new_id_pool) => {
+                        // Update id_pool for next ledger
+                        current_id_pool = new_id_pool;
                         let result = summary.ledger_results.last().unwrap();
                         if result.all_tx_match {
                             println!("OK ({} txs, {} ops)", result.tx_count, result.op_count);
@@ -773,7 +801,7 @@ async fn test_verify_single_ledger() {
 #[ignore]
 async fn test_analyze_mismatch() {
     // The mismatch transactions: ledgers 310088 and 310138
-    let ledger_seq = 310227u32;  // Real mismatch to investigate
+    let ledger_seq = 256121u32;  // Soroban mismatch to investigate
     let network_id = NetworkId::testnet();
 
     let cdp = CdpDataLake::new(
