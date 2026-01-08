@@ -349,6 +349,14 @@ pub fn execute_operation_with_soroban(
         .map(|m| muxed_to_account_id(m))
         .unwrap_or_else(|| source_account_id.clone());
 
+    // Check that the operation's source account exists.
+    // This matches C++ stellar-core's OperationFrame::checkSourceAccount().
+    // If the source account doesn't exist (e.g., it was merged by a prior operation),
+    // return opNO_ACCOUNT.
+    if state.get_account(&op_source).is_none() {
+        return Ok(OperationExecutionResult::new(OperationResult::OpNoAccount));
+    }
+
     match &op.body {
         OperationBody::CreateAccount(op_data) => {
             Ok(OperationExecutionResult::new(

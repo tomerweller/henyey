@@ -95,13 +95,10 @@ struct LedgerVerificationResult {
     all_tx_match: bool,
 }
 
-/// Check if a mismatch is in operations AFTER the first failure.
-/// In C++ stellar-core, once an operation fails, subsequent operations may not
-/// be fully validated and their error codes are undefined. We only need to
-/// match the FIRST failing operation's result.
 /// Check if a mismatch is a Soroban execution difference.
 /// Soroban execution can fail in our test due to state management differences
 /// (e.g., TTL expiration, hot archive, contract instance caching).
+#[allow(dead_code)]
 fn is_soroban_execution_difference(mismatch: &TxMismatch) -> bool {
     // Check if operations include InvokeHostFunction
     mismatch.operations.iter().any(|op| op.contains("InvokeHostFunction"))
@@ -162,58 +159,8 @@ fn is_soroban_error_code_difference(mismatch: &TxMismatch) -> bool {
     expected_soroban_fail && actual_soroban_fail
 }
 
-fn is_subsequent_op_in_failed_tx(mismatch: &TxMismatch) -> bool {
-    // If both expected and actual are TxFailed, check if they agree on the first op result
-    // Also handle fee bump inner failed cases
-    let expected_failed = mismatch.expected_result.starts_with("TxFailed")
-        || mismatch.expected_result.contains("TxFeeBumpInnerFailed");
-    let actual_failed = mismatch.actual_result.starts_with("TxFailed")
-        || mismatch.actual_result.contains("TxFeeBumpInnerFailed");
-
-    if expected_failed && actual_failed {
-        // Extract first op result from both
-        // Format: TxFailed(VecM([OpInner(Payment(SrcNoTrust)), OpInner(Payment(NoTrust))]))
-        fn extract_first_op(s: &str) -> Option<String> {
-            let start = s.find("OpInner(")?;
-            // Find matching close paren by counting depth
-            let mut depth = 0;
-            let mut end = start;
-            for (i, c) in s[start..].chars().enumerate() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if end > start {
-                Some(s[start..end].to_string())
-            } else {
-                None
-            }
-        }
-
-        if let (Some(expected_first), Some(actual_first)) = (
-            extract_first_op(&mismatch.expected_result),
-            extract_first_op(&mismatch.actual_result),
-        ) {
-            // If first op matches, difference is in subsequent ops (undefined behavior)
-            if expected_first == actual_first {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 impl VerificationSummary {
     fn print_report(&self) {
-        let subsequent_op = self.mismatches.iter().filter(|m| is_subsequent_op_in_failed_tx(m)).count();
         let liquidity_pool = self.mismatches.iter().filter(|m| is_path_payment_liquidity_pool_difference(m)).count();
         let soroban_hash = self.mismatches.iter().filter(|m| is_soroban_return_value_difference(m)).count();
         let fee_bump_soroban = self.mismatches.iter().filter(|m| is_fee_bump_soroban_inner_fee_difference(m)).count();
@@ -228,7 +175,6 @@ impl VerificationSummary {
         println!(" Transactions verified: {:>6}", self.transactions_verified);
         println!(" Operations verified:   {:>6}", self.operations_verified);
         println!(" Total mismatches:      {:>6}", self.mismatches.len());
-        println!("   Tolerated (subsequent ops):   {:>3}", subsequent_op);
         println!("   Tolerated (liquidity pool):   {:>3}", liquidity_pool);
         println!("   Tolerated (soroban hash):     {:>3}", soroban_hash);
         println!("   Tolerated (fee bump soroban): {:>3}", fee_bump_soroban);
@@ -298,8 +244,7 @@ impl VerificationSummary {
 
 /// Check if a mismatch is a tolerated/known difference
 fn is_tolerated_mismatch(mismatch: &TxMismatch) -> bool {
-    is_subsequent_op_in_failed_tx(mismatch)
-        || is_path_payment_liquidity_pool_difference(mismatch)
+    is_path_payment_liquidity_pool_difference(mismatch)
         || is_soroban_return_value_difference(mismatch)
         || is_fee_bump_soroban_inner_fee_difference(mismatch)
         || is_soroban_error_code_difference(mismatch)
@@ -777,9 +722,9 @@ async fn test_execution_verification_against_testnet() {
         );
     }
 
-    let tolerated = summary.mismatches.len();
+    let tolerated = summary.mismatches.iter().filter(|m| is_tolerated_mismatch(m)).count();
     if tolerated > 0 {
-        println!("\n✓ Verification passed! ({} subsequent-op differences tolerated)", tolerated);
+        println!("\n✓ Verification passed! ({} tolerated differences)", tolerated);
     } else {
         println!("\n✓ Verification passed with 100% match!");
     }
