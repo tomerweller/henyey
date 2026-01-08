@@ -742,6 +742,59 @@ impl TransactionExecutor {
         Ok(())
     }
 
+    /// Load liquidity pools that could be used for path payment conversions.
+    ///
+    /// For each adjacent pair of assets in the conversion path, attempts to load the
+    /// corresponding liquidity pool if it exists.
+    fn load_path_payment_pools(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        send_asset: &stellar_xdr::curr::Asset,
+        dest_asset: &stellar_xdr::curr::Asset,
+        path: &[stellar_xdr::curr::Asset],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{LiquidityPoolParameters, LiquidityPoolConstantProductParameters, Limits};
+
+        // Build the full conversion path: send_asset -> path[0] -> ... -> dest_asset
+        let mut assets: Vec<&stellar_xdr::curr::Asset> = vec![send_asset];
+        assets.extend(path.iter());
+        assets.push(dest_asset);
+
+        // For each adjacent pair, try to load the liquidity pool
+        for window in assets.windows(2) {
+            let asset_a = window[0];
+            let asset_b = window[1];
+
+            if asset_a == asset_b {
+                continue; // Same asset, no swap needed
+            }
+
+            // Compute pool ID: assets must be sorted (a < b) to match pool key
+            let (sorted_a, sorted_b) = if asset_a < asset_b {
+                (asset_a.clone(), asset_b.clone())
+            } else {
+                (asset_b.clone(), asset_a.clone())
+            };
+
+            let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+                LiquidityPoolConstantProductParameters {
+                    asset_a: sorted_a,
+                    asset_b: sorted_b,
+                    fee: 30, // LIQUIDITY_POOL_FEE_V18 = 30
+                },
+            );
+
+            if let Ok(xdr) = params.to_xdr(Limits::none()) {
+                let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
+                // Attempt to load - it's OK if the pool doesn't exist
+                let _ = self.load_liquidity_pool(snapshot, &pool_id);
+            }
+        }
+
+        Ok(())
+    }
+
     fn load_offer_dependencies(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -2129,6 +2182,13 @@ impl TransactionExecutor {
                 }
                 self.load_asset_issuer(snapshot, &op_data.send_asset)?;
                 self.load_asset_issuer(snapshot, &op_data.dest_asset)?;
+                // Load liquidity pools that could be used for conversions
+                self.load_path_payment_pools(
+                    snapshot,
+                    &op_data.send_asset,
+                    &op_data.dest_asset,
+                    op_data.path.as_slice(),
+                )?;
             }
             OperationBody::PathPaymentStrictReceive(op_data) => {
                 let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
@@ -2141,6 +2201,13 @@ impl TransactionExecutor {
                 }
                 self.load_asset_issuer(snapshot, &op_data.send_asset)?;
                 self.load_asset_issuer(snapshot, &op_data.dest_asset)?;
+                // Load liquidity pools that could be used for conversions
+                self.load_path_payment_pools(
+                    snapshot,
+                    &op_data.send_asset,
+                    &op_data.dest_asset,
+                    op_data.path.as_slice(),
+                )?;
             }
             OperationBody::LiquidityPoolDeposit(op_data) => {
                 self.load_liquidity_pool_dependencies(
@@ -3414,14 +3481,25 @@ pub fn build_tx_result_pair(
         };
 
         // Calculate inner fee_charged using C++ formula:
-        // Protocol < 25: min(inner_declared_fee, base_fee * num_inner_ops)
         // Protocol >= 25: 0 (outer pays everything)
+        // Protocol < 25 and protocol >= 11:
+        //   - For Soroban: resourceFee + min(inclusionFee, baseFee * numOps)
+        //   - For classic: min(inner_fee, baseFee * numOps)
         let inner_fee_charged = if protocol_version >= 25 {
             0
         } else {
             let num_inner_ops = frame.operation_count() as i64;
             let adjusted_fee = base_fee * std::cmp::max(1, num_inner_ops);
-            std::cmp::min(frame.inner_fee() as i64, adjusted_fee)
+            if frame.is_soroban() {
+                // For Soroban transactions, include the declared resource fee
+                let resource_fee = frame.declared_soroban_resource_fee();
+                let inner_fee = frame.inner_fee() as i64;
+                let inclusion_fee = inner_fee - resource_fee;
+                resource_fee + std::cmp::min(inclusion_fee, adjusted_fee)
+            } else {
+                // For classic transactions
+                std::cmp::min(frame.inner_fee() as i64, adjusted_fee)
+            }
         };
 
         let inner_pair = InnerTransactionResultPair {

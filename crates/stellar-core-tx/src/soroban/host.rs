@@ -52,6 +52,18 @@ pub struct SorobanExecutionResult {
     pub rent_fee: i64,
 }
 
+/// Error from Soroban execution that includes consumed resources.
+/// This is needed to properly determine TRAPPED vs RESOURCE_LIMIT_EXCEEDED
+/// based on whether actual consumption exceeded specified limits.
+pub struct SorobanExecutionError {
+    /// The underlying host error.
+    pub host_error: HostErrorP25,
+    /// CPU instructions consumed before failure.
+    pub cpu_insns_consumed: u64,
+    /// Memory bytes consumed before failure.
+    pub mem_bytes_consumed: u64,
+}
+
 /// A single storage change from Soroban execution.
 pub struct StorageChange {
     /// The ledger key.
@@ -602,7 +614,8 @@ pub fn build_storage_map(
 /// # Returns
 ///
 /// Returns the execution result including return value, storage changes, and events.
-/// Returns an error if the host function fails or budget is exceeded.
+/// Returns an error if the host function fails or budget is exceeded, along with
+/// the consumed resources which are needed to distinguish TRAPPED from RESOURCE_LIMIT_EXCEEDED.
 pub fn execute_host_function(
     host_function: &HostFunction,
     auth_entries: &[SorobanAuthorizationEntry],
@@ -611,7 +624,7 @@ pub fn execute_host_function(
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
-) -> Result<SorobanExecutionResult, HostErrorP25> {
+) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     if context.protocol_version >= 25 {
         return execute_host_function_p25(
             host_function,
@@ -642,7 +655,14 @@ fn execute_host_function_p24(
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
-) -> Result<SorobanExecutionResult, HostErrorP25> {
+) -> Result<SorobanExecutionResult, SorobanExecutionError> {
+    // Helper to create error with zero consumed resources (for setup errors before budget exists)
+    let make_setup_error = |e: HostErrorP25| SorobanExecutionError {
+        host_error: e,
+        cpu_insns_consumed: 0,
+        mem_bytes_consumed: 0,
+    };
+
     // Create budget with network cost parameters
     // Use a larger budget for the e2e_invoke call which includes XDR parsing overhead
     // The transaction's instruction limit is for contract execution only, but e2e_invoke
@@ -653,17 +673,17 @@ fn execute_host_function_p24(
     let budget = if soroban_config.has_valid_cost_params() {
         let cpu_cost_params = convert_contract_cost_params_to_p24(&soroban_config.cpu_cost_params)
             .ok_or_else(|| {
-                HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Context,
                     soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ))
+                )))
             })?;
         let mem_cost_params = convert_contract_cost_params_to_p24(&soroban_config.mem_cost_params)
             .ok_or_else(|| {
-                HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Context,
                     soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ))
+                )))
             })?;
         Budget::try_from_configs(
             instruction_limit,
@@ -671,7 +691,7 @@ fn execute_host_function_p24(
             cpu_cost_params,
             mem_cost_params,
         )
-        .map_err(convert_host_error_p24_to_p25)?
+        .map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?
     } else {
         tracing::warn!(
             "Using default Soroban budget - cost parameters not loaded from network."
@@ -721,27 +741,27 @@ fn execute_host_function_p24(
     let encoded_host_fn = host_function
         .to_xdr(Limits::none())
         .map_err(|_e| {
-            HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+            make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                 soroban_env_host25::xdr::ScErrorType::Context,
                 soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ))
+            )))
         })?;
 
     let encoded_resources = soroban_data
         .resources
         .to_xdr(Limits::none())
         .map_err(|_e| {
-            HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+            make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                 soroban_env_host25::xdr::ScErrorType::Context,
                 soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ))
+            )))
         })?;
 
     let encoded_source = source.to_xdr(Limits::none()).map_err(|_e| {
-        HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+        make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
             soroban_env_host25::xdr::ScErrorType::Context,
             soroban_env_host25::xdr::ScErrorCode::InternalError,
-        ))
+        )))
     })?;
 
     // Encode auth entries
@@ -750,10 +770,10 @@ fn execute_host_function_p24(
         .map(|e| e.to_xdr(Limits::none()))
         .collect::<Result<_, _>>()
         .map_err(|_e| {
-            HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+            make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                 soroban_env_host25::xdr::ScErrorType::Context,
                 soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ))
+            )))
         })?;
 
     // Extract archived entry indices from soroban_data.ext for TTL restoration FIRST
@@ -780,15 +800,15 @@ fn execute_host_function_p24(
     let mut add_entry = |key: &LedgerKey,
                          entry: &soroban_env_host24::xdr::LedgerEntry,
                          live_until: Option<u32>|
-     -> Result<(), HostErrorP25> {
+     -> Result<(), SorobanExecutionError> {
         encoded_ledger_entries.push(
             entry
                 .to_xdr(soroban_env_host24::xdr::Limits::none())
                 .map_err(|_| {
-                    HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                    make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                         soroban_env_host25::xdr::ScErrorType::Context,
                         soroban_env_host25::xdr::ScErrorCode::InternalError,
-                    ))
+                    )))
                 })?,
         );
 
@@ -805,10 +825,10 @@ fn execute_host_function_p24(
             ttl_entry
                 .to_xdr(soroban_env_host24::xdr::Limits::none())
                 .map_err(|_| {
-                HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Context,
                     soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ))
+                )))
             })?
         } else if needs_ttl {
             // For archived entries being restored, provide expired TTL (0)
@@ -821,10 +841,10 @@ fn execute_host_function_p24(
             ttl_entry
                 .to_xdr(soroban_env_host24::xdr::Limits::none())
                 .map_err(|_| {
-                HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Context,
                     soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ))
+                )))
             })?
         } else {
             // Empty bytes for entries that don't need TTL (non-contract entries)
@@ -836,13 +856,13 @@ fn execute_host_function_p24(
 
     for key in soroban_data.resources.footprint.read_only.iter() {
         let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(|| {
-            HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+            make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                 soroban_env_host25::xdr::ScErrorType::Context,
                 soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ))
+            )))
         })?;
         if let Some((entry, live_until)) =
-            snapshot.get(&Rc::new(key_p24)).map_err(convert_host_error_p24_to_p25)?
+            snapshot.get(&Rc::new(key_p24)).map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?
         {
             add_entry(key, &entry, live_until)?;
         }
@@ -858,16 +878,16 @@ fn execute_host_function_p24(
 
     for (idx, key) in soroban_data.resources.footprint.read_write.iter().enumerate() {
         let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(|| {
-            HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+            make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                 soroban_env_host25::xdr::ScErrorType::Context,
                 soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ))
+            )))
         })?;
 
         // For archived entries being restored, use get_archived which doesn't check TTL
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         let entry_result = if is_being_restored {
-            let result = snapshot.get_archived(&Rc::new(key_p24)).map_err(convert_host_error_p24_to_p25)?;
+            let result = snapshot.get_archived(&Rc::new(key_p24)).map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?;
             if let Some((ref entry, live_until)) = result {
                 tracing::warn!(
                     idx = idx,
@@ -885,7 +905,7 @@ fn execute_host_function_p24(
             }
             result
         } else {
-            snapshot.get(&Rc::new(key_p24)).map_err(convert_host_error_p24_to_p25)?
+            snapshot.get(&Rc::new(key_p24)).map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?
         };
 
         if let Some((entry, live_until)) = entry_result {
@@ -920,13 +940,19 @@ fn execute_host_function_p24(
     ) {
         Ok(r) => r,
         Err(e) => {
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
             tracing::debug!(
-                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
-                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
                 diagnostic_events = diagnostic_events.len(),
                 "Soroban e2e_invoke failed"
             );
-            return Err(convert_host_error_p24_to_p25(e));
+            return Err(SorobanExecutionError {
+                host_error: convert_host_error_p24_to_p25(e),
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+            });
         }
     };
 
@@ -937,7 +963,13 @@ fn execute_host_function_p24(
             (val, bytes.len() as u32)
         }
         Err(ref e) => {
-            return Err(convert_host_error_p24_to_p25(e.clone()));
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
+            return Err(SorobanExecutionError {
+                host_error: convert_host_error_p24_to_p25(e.clone()),
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+            });
         }
     };
 
@@ -1011,12 +1043,19 @@ fn execute_host_function_p25(
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
-) -> Result<SorobanExecutionResult, HostErrorP25> {
+) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     use soroban_env_host25::{
         budget::Budget,
         e2e_invoke,
         fees::{compute_rent_fee, LedgerEntryRentChange},
         storage::SnapshotSource,
+    };
+
+    // Helper to create error with zero consumed resources (for setup errors before budget exists)
+    let make_setup_error = |e: HostErrorP25| SorobanExecutionError {
+        host_error: e,
+        cpu_insns_consumed: 0,
+        mem_bytes_consumed: 0,
     };
 
     let instruction_limit = soroban_config.tx_max_instructions * 2;
@@ -1028,7 +1067,8 @@ fn execute_host_function_p25(
             memory_limit,
             soroban_config.cpu_cost_params.clone(),
             soroban_config.mem_cost_params.clone(),
-        )?
+        )
+        .map_err(make_setup_error)?
     } else {
         tracing::warn!(
             "Using default Soroban budget - cost parameters not loaded from network."
@@ -1071,31 +1111,31 @@ fn execute_host_function_p25(
     };
 
     let encoded_host_fn = host_function.to_xdr(Limits::none())
-        .map_err(|_e| HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+        .map_err(|_e| make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
             soroban_env_host25::xdr::ScErrorType::Context,
             soroban_env_host25::xdr::ScErrorCode::InternalError,
-        )))?;
+        ))))?;
 
     let encoded_resources = soroban_data.resources.to_xdr(Limits::none())
-        .map_err(|_e| HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+        .map_err(|_e| make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
             soroban_env_host25::xdr::ScErrorType::Context,
             soroban_env_host25::xdr::ScErrorCode::InternalError,
-        )))?;
+        ))))?;
 
     let encoded_source = source.to_xdr(Limits::none())
-        .map_err(|_e| HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+        .map_err(|_e| make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
             soroban_env_host25::xdr::ScErrorType::Context,
             soroban_env_host25::xdr::ScErrorCode::InternalError,
-        )))?;
+        ))))?;
 
     let encoded_auth_entries: Vec<Vec<u8>> = auth_entries
         .iter()
         .map(|e| e.to_xdr(Limits::none()))
         .collect::<Result<_, _>>()
-        .map_err(|_| HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+        .map_err(|_| make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
             soroban_env_host25::xdr::ScErrorType::Context,
             soroban_env_host25::xdr::ScErrorCode::InternalError,
-        )))?;
+        ))))?;
 
     // Extract archived entry indices from soroban_data.ext for TTL restoration FIRST
     // These are indices into the read_write footprint entries that need their TTL restored
@@ -1114,12 +1154,12 @@ fn execute_host_function_p25(
     let mut encoded_ttl_entries = Vec::new();
 
     let mut add_entry =
-        |key: &LedgerKey, entry: &LedgerEntry, live_until: Option<u32>| -> Result<(), HostErrorP25> {
+        |key: &LedgerKey, entry: &LedgerEntry, live_until: Option<u32>| -> Result<(), SorobanExecutionError> {
         encoded_ledger_entries.push(entry.to_xdr(Limits::none())
-            .map_err(|_| HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+            .map_err(|_| make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                 soroban_env_host25::xdr::ScErrorType::Context,
                 soroban_env_host25::xdr::ScErrorCode::InternalError,
-            )))?);
+            ))))?);
 
         // For contract entries (ContractData, ContractCode), we always need TTL
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
@@ -1130,10 +1170,10 @@ fn execute_host_function_p25(
                 live_until_ledger_seq: lu,
             };
             ttl_entry.to_xdr(Limits::none())
-                .map_err(|_| HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                .map_err(|_| make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Context,
                     soroban_env_host25::xdr::ScErrorCode::InternalError,
-                )))?
+                ))))?
         } else if needs_ttl {
             // For archived entries being restored, provide expired TTL (0)
             // The host will extend this TTL as part of restoration
@@ -1143,10 +1183,10 @@ fn execute_host_function_p25(
                 live_until_ledger_seq: 0, // Expired/archived
             };
             ttl_entry.to_xdr(Limits::none())
-                .map_err(|_| HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                .map_err(|_| make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Context,
                     soroban_env_host25::xdr::ScErrorCode::InternalError,
-                )))?
+                ))))?
         } else {
             Vec::new()
         };
@@ -1155,7 +1195,7 @@ fn execute_host_function_p25(
     };
 
     for key in soroban_data.resources.footprint.read_only.iter() {
-        if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
+        if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone())).map_err(make_setup_error)? {
             add_entry(key, &entry, live_until)?;
         }
     }
@@ -1172,7 +1212,7 @@ fn execute_host_function_p25(
         // For archived entries being restored, use get_archived which doesn't check TTL
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         let entry_result = if is_being_restored {
-            let result = snapshot.get_archived(&Rc::new(key.clone()))?;
+            let result = snapshot.get_archived(&Rc::new(key.clone())).map_err(make_setup_error)?;
             if result.is_none() {
                 tracing::warn!(
                     idx = idx,
@@ -1188,7 +1228,7 @@ fn execute_host_function_p25(
             }
             result
         } else {
-            snapshot.get(&Rc::new(key.clone()))?
+            snapshot.get(&Rc::new(key.clone())).map_err(make_setup_error)?
         };
 
         if let Some((entry, live_until)) = entry_result {
@@ -1223,13 +1263,19 @@ fn execute_host_function_p25(
     ) {
         Ok(r) => r,
         Err(e) => {
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
             tracing::debug!(
-                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
-                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
                 diagnostic_events = diagnostic_events.len(),
                 "P25: Soroban e2e_invoke failed"
             );
-            return Err(e);
+            return Err(SorobanExecutionError {
+                host_error: e,
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+            });
         }
     };
 
@@ -1239,7 +1285,13 @@ fn execute_host_function_p25(
             (val, bytes.len() as u32)
         }
         Err(ref e) => {
-            return Err(e.clone());
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
+            return Err(SorobanExecutionError {
+                host_error: e.clone(),
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+            });
         }
     };
 

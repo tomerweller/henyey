@@ -104,7 +104,7 @@ pub use header::{
 };
 pub use manager::{LedgerCloseContext, LedgerManager, LedgerManagerConfig, LedgerManagerStats};
 pub use snapshot::{
-    LedgerSnapshot, SnapshotBuilder, SnapshotHandle, SnapshotManager,
+    EntriesLookupFn, LedgerSnapshot, SnapshotBuilder, SnapshotHandle, SnapshotManager,
 };
 
 /// Result type for ledger operations.

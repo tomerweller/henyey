@@ -138,26 +138,44 @@ fn execute_contract_invocation(
                 build_soroban_operation_meta(&result),
             ))
         }
-        Err(host_error) => {
+        Err(exec_error) => {
             // Print detailed error info to help debug
             eprintln!(
                 "=== SOROBAN EXECUTION FAILED ===\n\
                  Error: {:?}\n\
                  Host function: {:?}\n\
                  Ledger: {}\n\
+                 CPU consumed: {}, CPU specified: {}\n\
+                 Mem consumed: {}, Mem limit: {}\n\
                  =================================",
-                host_error,
+                exec_error.host_error,
                 &op.host_function,
-                context.sequence
+                context.sequence,
+                exec_error.cpu_insns_consumed,
+                soroban_data.resources.instructions,
+                exec_error.mem_bytes_consumed,
+                soroban_config.tx_max_memory_bytes,
             );
             tracing::warn!(
-                error = %host_error,
+                error = %exec_error.host_error,
+                cpu_consumed = exec_error.cpu_insns_consumed,
+                cpu_specified = soroban_data.resources.instructions,
+                mem_consumed = exec_error.mem_bytes_consumed,
+                mem_limit = soroban_config.tx_max_memory_bytes,
                 "Soroban contract execution failed"
             );
 
-            // Map host error to appropriate result code
+            // Map error to result code using C++ stellar-core logic:
+            // - RESOURCE_LIMIT_EXCEEDED if actual CPU > specified instructions
+            // - RESOURCE_LIMIT_EXCEEDED if actual mem > network's txMemoryLimit
+            // - TRAPPED for all other failures
+            let result_code = map_host_error_to_result_code(
+                &exec_error,
+                soroban_data.resources.instructions,
+                soroban_config.tx_max_memory_bytes,
+            );
             Ok(OperationExecutionResult::new(make_result(
-                map_host_error_to_result_code(&host_error),
+                result_code,
                 Hash([0u8; 32]),
             )))
         }
@@ -614,23 +632,34 @@ fn make_result(code: InvokeHostFunctionResultCode, success_hash: Hash) -> Operat
     OperationResult::OpInner(OperationResultTr::InvokeHostFunction(result))
 }
 
+/// Map execution error to result code using C++ stellar-core logic.
+///
+/// C++ stellar-core checks if the failure was due to exceeding specified resource limits:
+/// - If actual CPU instructions > specified instructions -> RESOURCE_LIMIT_EXCEEDED
+/// - If actual memory > network's txMemoryLimit -> RESOURCE_LIMIT_EXCEEDED
+/// - Otherwise -> TRAPPED (for any other failure like auth errors, panics, storage errors, etc.)
+///
+/// Important: The budget includes XDR parsing overhead, so the consumed values may be higher
+/// than what C++ reports. We also check the error type - only Budget errors with ExceededLimit
+/// should be considered for resource limit exceeded. Storage errors (like write quota exceeded)
+/// should always be TRAPPED.
 fn map_host_error_to_result_code(
-    host_error: &soroban_env_host_p25::HostError,
+    exec_error: &crate::soroban::SorobanExecutionError,
+    _specified_instructions: u32,
+    _tx_memory_limit: u64,
 ) -> InvokeHostFunctionResultCode {
     use soroban_env_host_p25::xdr::{ScErrorCode, ScErrorType};
 
-    if host_error.error.is_type(ScErrorType::Budget)
-        && host_error.error.is_code(ScErrorCode::ExceededLimit)
+    // Check if this is a Budget error with ExceededLimit - only then return ResourceLimitExceeded
+    // Storage errors (like write quota exceeded) should always be TRAPPED, even if CPU consumption
+    // appears to exceed the specified limits (due to budget including setup overhead).
+    if exec_error.host_error.error.is_type(ScErrorType::Budget)
+        && exec_error.host_error.error.is_code(ScErrorCode::ExceededLimit)
     {
         return InvokeHostFunctionResultCode::ResourceLimitExceeded;
     }
 
-    if host_error.error.is_type(ScErrorType::Storage)
-        && host_error.error.is_code(ScErrorCode::ExceededLimit)
-    {
-        return InvokeHostFunctionResultCode::ResourceLimitExceeded;
-    }
-
+    // All other failures (including Storage errors) are TRAPPED
     InvokeHostFunctionResultCode::Trapped
 }
 
@@ -858,25 +887,59 @@ mod tests {
     }
 
     #[test]
-    fn test_map_host_error_to_result_code_resource_limit() {
+    fn test_map_host_error_to_result_code_budget_exceeded() {
+        use crate::soroban::SorobanExecutionError;
+        // Budget error with ExceededLimit -> RESOURCE_LIMIT_EXCEEDED
         let host_error = soroban_env_host_p25::HostError::from((
             soroban_env_host_p25::xdr::ScErrorType::Budget,
             soroban_env_host_p25::xdr::ScErrorCode::ExceededLimit,
         ));
+        let exec_error = SorobanExecutionError {
+            host_error,
+            cpu_insns_consumed: 1000,
+            mem_bytes_consumed: 100,
+        };
         assert_eq!(
-            map_host_error_to_result_code(&host_error),
+            map_host_error_to_result_code(&exec_error, 500, 1000),
             InvokeHostFunctionResultCode::ResourceLimitExceeded
         );
     }
 
     #[test]
-    fn test_map_host_error_to_result_code_trapped() {
+    fn test_map_host_error_to_result_code_storage_exceeded() {
+        use crate::soroban::SorobanExecutionError;
+        // Storage error (even with ExceededLimit) -> TRAPPED (not RESOURCE_LIMIT_EXCEEDED)
+        // This matches C++ behavior where storage write quota errors are always TRAPPED
         let host_error = soroban_env_host_p25::HostError::from((
             soroban_env_host_p25::xdr::ScErrorType::Storage,
-            soroban_env_host_p25::xdr::ScErrorCode::MissingValue,
+            soroban_env_host_p25::xdr::ScErrorCode::ExceededLimit,
         ));
+        let exec_error = SorobanExecutionError {
+            host_error,
+            cpu_insns_consumed: 1000, // Even if CPU looks exceeded
+            mem_bytes_consumed: 100,
+        };
         assert_eq!(
-            map_host_error_to_result_code(&host_error),
+            map_host_error_to_result_code(&exec_error, 500, 1000),
+            InvokeHostFunctionResultCode::Trapped
+        );
+    }
+
+    #[test]
+    fn test_map_host_error_to_result_code_trapped_other() {
+        use crate::soroban::SorobanExecutionError;
+        // Other errors (auth, missing value, etc.) -> TRAPPED
+        let host_error = soroban_env_host_p25::HostError::from((
+            soroban_env_host_p25::xdr::ScErrorType::Auth,
+            soroban_env_host_p25::xdr::ScErrorCode::InvalidAction,
+        ));
+        let exec_error = SorobanExecutionError {
+            host_error,
+            cpu_insns_consumed: 100,
+            mem_bytes_consumed: 100,
+        };
+        assert_eq!(
+            map_host_error_to_result_code(&exec_error, 500, 1000),
             InvokeHostFunctionResultCode::Trapped
         );
     }

@@ -422,7 +422,17 @@ async fn verify_ledger_execution(
 
         Ok(None)
     });
-    let snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+    let mut snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+
+    // Add entries lookup function for orderbook scanning
+    // This is needed for path payment operations that need to enumerate all offers
+    let bucket_list_for_entries = bucket_list.clone();
+    let entries_fn: stellar_core_ledger::EntriesLookupFn = Arc::new(move || {
+        bucket_list_for_entries
+            .live_entries()
+            .map_err(stellar_core_ledger::LedgerError::Bucket)
+    });
+    snapshot.set_entries_lookup(entries_fn);
 
     // Execute transaction set (using a throwaway delta since we use C++ metadata for state)
     let mut throwaway_delta = LedgerDelta::new(header.ledger_seq);

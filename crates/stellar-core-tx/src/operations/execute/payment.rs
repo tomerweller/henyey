@@ -102,6 +102,16 @@ fn execute_native_payment(
 }
 
 /// Execute a credit asset payment.
+///
+/// The order of checks matches C++ stellar-core's PathPaymentStrictReceive implementation:
+/// 1. Check destination exists
+/// 2. Check issuer exists
+/// 3. Check destination trustline (NoTrust)
+/// 4. Check destination authorized (NotAuthorized)
+/// 5. Check destination has room (LineFull)
+/// 6. Check source trustline (SrcNoTrust)
+/// 7. Check source authorized (SrcNotAuthorized)
+/// 8. Check source balance (Underfunded)
 fn execute_credit_payment(
     source: &AccountId,
     dest: &AccountId,
@@ -115,36 +125,19 @@ fn execute_credit_payment(
         Asset::Native => return Ok(make_result(PaymentResultCode::Malformed)),
     };
 
+    // Check destination exists (unless issuer is destination)
+    if issuer != dest && state.get_account(dest).is_none() {
+        return Ok(make_result(PaymentResultCode::NoDestination));
+    }
+
     let issuer_account = match state.get_account(issuer) {
         Some(account) => account,
         None => return Ok(make_result(PaymentResultCode::NoIssuer)),
     };
 
-    // Check destination exists
-    if issuer != dest && state.get_account(dest).is_none() {
-        return Ok(make_result(PaymentResultCode::NoDestination));
-    }
-
-    // Check source trustline exists
     let auth_required = issuer_account.flags & AUTH_REQUIRED_FLAG != 0;
-    if issuer != source {
-        let source_trustline = match state.get_trustline(source, asset) {
-            Some(tl) => tl,
-            None => return Ok(make_result(PaymentResultCode::SrcNoTrust)),
-        };
 
-        if auth_required && !is_trustline_authorized(source_trustline.flags) {
-            return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
-        }
-
-        // Check source has sufficient balance
-        let available = source_trustline.balance - trustline_liabilities(source_trustline).selling;
-        if available < amount {
-            return Ok(make_result(PaymentResultCode::Underfunded));
-        }
-    }
-
-    // Check destination trustline exists
+    // Check destination trustline first (C++ updateDestBalance is called before updateSourceBalance)
     if issuer != dest {
         let dest_trustline = match state.get_trustline(dest, asset) {
             Some(tl) => tl,
@@ -163,20 +156,37 @@ fn execute_credit_payment(
         }
     }
 
+    // Check source trustline (C++ updateSourceBalance is called after updateDestBalance)
     if issuer != source {
-        // Update source trustline balance
-        let source_trustline_mut = state
-            .get_trustline_mut(source, asset)
-            .ok_or_else(|| TxError::Internal("source trustline disappeared".into()))?;
-        source_trustline_mut.balance -= amount;
+        let source_trustline = match state.get_trustline(source, asset) {
+            Some(tl) => tl,
+            None => return Ok(make_result(PaymentResultCode::SrcNoTrust)),
+        };
+
+        if auth_required && !is_trustline_authorized(source_trustline.flags) {
+            return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
+        }
+
+        // Check source has sufficient balance
+        let available = source_trustline.balance - trustline_liabilities(source_trustline).selling;
+        if available < amount {
+            return Ok(make_result(PaymentResultCode::Underfunded));
+        }
     }
 
+    // Apply the transfer - update destination first, then source (matches C++ order)
     if issuer != dest {
-        // Update destination trustline balance
         let dest_trustline_mut = state
             .get_trustline_mut(dest, asset)
             .ok_or_else(|| TxError::Internal("destination trustline disappeared".into()))?;
         dest_trustline_mut.balance += amount;
+    }
+
+    if issuer != source {
+        let source_trustline_mut = state
+            .get_trustline_mut(source, asset)
+            .ok_or_else(|| TxError::Internal("source trustline disappeared".into()))?;
+        source_trustline_mut.balance -= amount;
     }
 
     Ok(make_result(PaymentResultCode::Success))
