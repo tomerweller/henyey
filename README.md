@@ -71,8 +71,6 @@ Supporting crates: crypto, common, work, historywork, simulation
 - History archive replay and verification
 - BucketList state management
 
-See [`PARITY_GAPS.md`](PARITY_GAPS.md) for the detailed, module-by-module gap list.
-
 ## C++ Parity Summary
 
 Each crate has been analyzed against its C++ upstream counterpart. The table below summarizes implementation status and key gaps:
@@ -219,8 +217,7 @@ rs-stellar-core/
 │   ├── stellar-core-invariant/   # Ledger invariants
 │   ├── stellar-core-work/        # Work scheduler
 │   └── stellar-core-simulation/  # Test harness
-├── configs/                      # Example configurations
-└── PARITY_GAPS.md               # Parity tracking
+└── configs/                      # Example configurations
 ```
 
 ## Crate Overview
