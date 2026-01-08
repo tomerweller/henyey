@@ -44,6 +44,7 @@ use stellar_xdr::curr::{
     AccountEntry, DecoratedSignature, Preconditions, SignerKey, TransactionEnvelope,
 };
 
+use crate::fee_bump::{FeeBumpError, FeeBumpFrame, validate_fee_bump};
 use crate::frame::TransactionFrame;
 
 /// Ledger context for transaction validation and execution.
@@ -218,6 +219,13 @@ pub enum ValidationError {
     BadMinAccountSequenceLedgerGap,
     /// Required extra signers not present.
     ExtraSignersNotMet,
+    /// Fee bump outer fee is insufficient.
+    FeeBumpInsufficientFee {
+        outer_fee: i64,
+        required_min: i64,
+    },
+    /// Fee bump inner transaction has invalid structure.
+    FeeBumpInvalidInner(String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -249,6 +257,15 @@ impl std::fmt::Display for ValidationError {
                 write!(f, "min account sequence ledger gap not met")
             }
             Self::ExtraSignersNotMet => write!(f, "extra signers requirement not met"),
+            Self::FeeBumpInsufficientFee {
+                outer_fee,
+                required_min,
+            } => write!(
+                f,
+                "fee bump outer fee {} is less than required {}",
+                outer_fee, required_min
+            ),
+            Self::FeeBumpInvalidInner(msg) => write!(f, "fee bump invalid inner: {}", msg),
         }
     }
 }
@@ -507,6 +524,47 @@ fn is_archivable_soroban_key(key: &stellar_xdr::curr::LedgerKey) -> bool {
     }
 }
 
+/// Validate fee bump-specific rules.
+///
+/// This performs validation specific to fee bump transactions including:
+/// - Outer fee >= inner fee (with base fee multiplier)
+/// - Inner transaction structure
+/// - Inner signature format
+fn validate_fee_bump_rules(
+    frame: &TransactionFrame,
+    context: &LedgerContext,
+) -> std::result::Result<(), ValidationError> {
+    if !frame.is_fee_bump() {
+        return Ok(());
+    }
+
+    let mut fee_bump_frame = FeeBumpFrame::from_frame(frame.clone(), &context.network_id)
+        .map_err(|e| ValidationError::FeeBumpInvalidInner(e.to_string()))?;
+
+    validate_fee_bump(&mut fee_bump_frame, context).map_err(|e| match e {
+        FeeBumpError::InsufficientOuterFee {
+            outer_fee,
+            required_min,
+        } => ValidationError::FeeBumpInsufficientFee {
+            outer_fee,
+            required_min,
+        },
+        FeeBumpError::TooManyOperations(count) => {
+            ValidationError::FeeBumpInvalidInner(format!("too many operations: {}", count))
+        }
+        FeeBumpError::InvalidInnerTxType => {
+            ValidationError::FeeBumpInvalidInner("inner transaction must be V1".to_string())
+        }
+        FeeBumpError::InvalidInnerSignature => ValidationError::InvalidSignature,
+        FeeBumpError::NotFeeBump => {
+            ValidationError::FeeBumpInvalidInner("not a fee bump transaction".to_string())
+        }
+        FeeBumpError::HashError(msg) => {
+            ValidationError::FeeBumpInvalidInner(format!("hash error: {}", msg))
+        }
+    })
+}
+
 /// Perform all basic validations.
 ///
 /// This is a convenience function that runs all basic checks suitable for catchup.
@@ -534,6 +592,11 @@ pub fn validate_basic(
     }
 
     if let Err(e) = validate_soroban_resources(frame, context) {
+        errors.push(e);
+    }
+
+    // Fee bump specific validation
+    if let Err(e) = validate_fee_bump_rules(frame, context) {
         errors.push(e);
     }
 
@@ -588,6 +651,11 @@ pub fn validate_full(
     }
 
     if let Err(e) = validate_soroban_resources(frame, context) {
+        errors.push(e);
+    }
+
+    // Fee bump specific validation
+    if let Err(e) = validate_fee_bump_rules(frame, context) {
         errors.push(e);
     }
 

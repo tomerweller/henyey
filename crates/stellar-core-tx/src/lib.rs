@@ -83,6 +83,7 @@
 mod apply;
 mod error;
 mod events;
+pub mod fee_bump;
 mod frame;
 pub mod meta_builder;
 pub mod operations;
@@ -137,6 +138,13 @@ pub use state::{LedgerReader, LedgerStateManager};
 pub use meta_builder::{
     DiagnosticConfig, DiagnosticEventManager, ExecutionMetrics, OperationMetaBuilder,
     TransactionMetaBuilder,
+};
+
+// Re-export fee bump types
+pub use fee_bump::{
+    calculate_inner_fee_charged, extract_inner_hash_from_result, validate_fee_bump,
+    verify_inner_signatures, wrap_inner_result_in_fee_bump, FeeBumpError, FeeBumpFrame,
+    FeeBumpMutableTransactionResult,
 };
 
 /// Result type alias for transaction operations.
@@ -206,6 +214,8 @@ impl From<ValidationError> for ValidationResult {
             ValidationError::BadMinAccountSequenceAge => ValidationResult::BadMinSeqAgeOrGap,
             ValidationError::BadMinAccountSequenceLedgerGap => ValidationResult::BadMinSeqAgeOrGap,
             ValidationError::ExtraSignersNotMet => ValidationResult::BadAuthExtra,
+            ValidationError::FeeBumpInsufficientFee { .. } => ValidationResult::InsufficientFee,
+            ValidationError::FeeBumpInvalidInner(_) => ValidationResult::Invalid,
         }
     }
 }

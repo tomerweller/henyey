@@ -50,6 +50,28 @@ This section documents the parity between this Rust crate and the upstream C++ s
   - Sponsorship cleanup when removing sponsored signers
   - Protocol 7 bypass (matches C++ behavior)
 
+#### Fee Bump Transactions (Newly Implemented)
+- **FeeBumpFrame** (`fee_bump.rs`): Dedicated fee bump transaction wrapper
+  - Wraps inner V1 transaction with fee bump envelope
+  - Separate accessors for outer fee source and inner source
+  - Inner transaction hash computation and caching
+  - `fee_source_is_inner_source()` for same-account detection
+- **FeeBumpMutableTransactionResult** (`fee_bump.rs`): Result tracking for fee bumps
+  - Tracks both outer fee and inner fee separately
+  - Inner transaction hash stored in `InnerTransactionResultPair`
+  - Protocol-versioned fee refund logic (P24 vs P25+)
+  - Inner operation results management
+- **Fee bump validation** (`fee_bump.rs`, `validation.rs`): Complete fee bump validation
+  - Outer fee >= inner fee validation
+  - Outer fee >= base_fee * (op_count + 1) validation
+  - Inner signature format validation
+  - Integration with basic and full validation paths
+- **Helper functions** (`fee_bump.rs`):
+  - `calculate_inner_fee_charged()`: Protocol-versioned inner fee calculation
+  - `wrap_inner_result_in_fee_bump()`: Convert inner result to fee bump result
+  - `extract_inner_hash_from_result()`: Extract inner hash from result
+  - `verify_inner_signatures()`: Cryptographic inner signature verification
+
 #### Transaction Metadata Building (Newly Implemented)
 - **TransactionMetaBuilder** (`meta_builder.rs`): Full meta construction for live execution
   - Creates OperationMetaBuilder for each operation
@@ -152,12 +174,6 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - **ThreadParallelApplyLedgerState**: Thread-local ledger state for parallel apply
 - **TxEffects**: Per-transaction effect tracking for parallel merge
 
-#### Fee Bump Transactions
-- **FeeBumpTransactionFrame**: Separate frame class for fee bump handling
-  - C++: `FeeBumpTransactionFrame.cpp` - 600+ lines of fee bump-specific logic
-  - Rust: Handled within TransactionFrame, may miss edge cases
-- **Inner transaction result wrapping**: Proper inner result in outer result
-
 #### Database Integration (Not Applicable)
 - **TransactionSQL**: Transaction persistence to SQL database
   - C++: `TransactionSQL.cpp` - stores tx results in database
@@ -202,13 +218,15 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 6. **Event Reconciliation**: C++ uses `LumenEventReconciler` to ensure fee events are correctly attributed. Rust emits fee events directly without reconciliation, which may produce different event sequences in edge cases.
 
+7. **Fee Bump Handling**: Rust now has a dedicated `FeeBumpFrame` wrapper that provides fee bump-specific functionality matching C++ `FeeBumpTransactionFrame`. The implementation includes proper inner transaction hash tracking, protocol-versioned fee logic, and result wrapping.
+
 #### Priority Gaps for Full Parity
 
 **High Priority** (needed for validator mode):
 1. ~~SignatureChecker with weight accumulation and threshold checking~~ ✓ Implemented
 2. ~~TransactionMetaBuilder for generating metadata during execution~~ ✓ Implemented
 3. ~~MutableTransactionResult with RefundableFeeTracker~~ ✓ Implemented
-4. Complete fee bump transaction handling
+4. ~~Complete fee bump transaction handling~~ ✓ Implemented
 
 **Medium Priority** (needed for complete validation):
 1. ~~Unused signature checking~~ ✓ Implemented (via SignatureChecker)
@@ -220,3 +238,5 @@ This section documents the parity between this Rust crate and the upstream C++ s
 1. Parallel execution infrastructure
 2. SQL database integration
 3. TransactionBridge
+
+**All high-priority gaps for validator mode have been addressed.**
