@@ -254,8 +254,8 @@ pub struct App {
     /// Database connection.
     db: stellar_core_db::Database,
     /// Lock file handle to prevent multiple instances.
-    #[allow(dead_code)]
-    db_lock: Option<File>,
+    /// Stored to keep the lock alive for the lifetime of the App.
+    _db_lock: Option<File>,
 
     /// Node keypair.
     keypair: stellar_core_crypto::SecretKey,
@@ -773,7 +773,7 @@ impl App {
             config,
             state: RwLock::new(AppState::Initializing),
             db,
-            db_lock: Some(db_lock),
+            _db_lock: Some(db_lock),
             keypair,
             bucket_manager,
             ledger_manager,
