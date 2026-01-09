@@ -60,6 +60,9 @@ flate2.workspace = true
 # URL handling
 url.workspace = true
 
+# HTTP client
+reqwest.workspace = true
+
 # Temp files
 tempfile.workspace = true
 

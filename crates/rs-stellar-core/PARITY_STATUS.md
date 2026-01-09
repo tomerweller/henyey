@@ -23,6 +23,7 @@ This section documents the feature parity between this Rust implementation and t
 | `encode-xdr` / `encode-asset` | Implemented | XDR encoding (AccountId, MuxedAccount, Asset, Hash) |
 | `sign-transaction` | Implemented | Add signature to transaction envelope |
 | `sec-to-pub` | Implemented | Print public key from secret key (stdin) |
+| `http-command` | Implemented | Send HTTP command to running node |
 | `diag-bucket-stats` / `bucket-info` | Partial | Basic bucket info (not full per-account aggregation) |
 
 #### Offline Tools (Unique to Rust)
@@ -93,7 +94,6 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `dump-xdr` | Dump XDR file (with streaming support) | Low |
 | `dump-wasm` | Dump WASM blobs from ledger | Low |
 | `force-scp` | Force SCP flag (deprecated in C++) | Low |
-| `http-command` | Send command to local stellar-core HTTP port | Medium |
 | `merge-bucketlist` | Write diagnostic merged bucket list | Low |
 | `dump-archival-stats` | Print state archival statistics | Low |
 | `dump-ledger` | Dump current ledger state as JSON with filtering | Medium |

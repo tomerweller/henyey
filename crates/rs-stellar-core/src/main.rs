@@ -212,6 +212,22 @@ enum Commands {
     /// Print sample configuration
     SampleConfig,
 
+    /// Send a command to a running stellar-core node
+    ///
+    /// Makes an HTTP GET request to the local node's command interface.
+    /// Examples:
+    ///   http-command info
+    ///   http-command "peers?fullkeys=true"
+    ///   http-command "ll?level=DEBUG"
+    HttpCommand {
+        /// The command to send (e.g., "info", "peers", "ll?level=DEBUG")
+        command: String,
+
+        /// HTTP port of the running node (default: 11626)
+        #[arg(long, short, default_value = "11626")]
+        port: u16,
+    },
+
     /// Offline commands (no network required)
     #[command(subcommand)]
     Offline(OfflineCommands),
@@ -413,6 +429,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::CheckQuorumIntersection { path } => cmd_check_quorum_intersection(&path),
 
         Commands::SampleConfig => cmd_sample_config(),
+
+        Commands::HttpCommand { command, port } => cmd_http_command(&command, port).await,
 
         Commands::Offline(cmd) => cmd_offline(cmd, config).await,
     }
@@ -3730,6 +3748,65 @@ fn sec_to_pub() -> anyhow::Result<()> {
     println!("{}", encode_account_id(public_key.as_bytes()));
 
     Ok(())
+}
+
+/// Send an HTTP command to a running stellar-core node.
+///
+/// Makes an HTTP GET request to http://127.0.0.1:{port}/{command}
+/// and prints the response. Query parameters are URL-encoded.
+///
+/// Equivalent to C++ stellar-core http-command.
+async fn cmd_http_command(command: &str, port: u16) -> anyhow::Result<()> {
+    // Build the URL path, encoding special characters after the ?
+    let mut path = String::from("/");
+    let mut in_query = false;
+
+    for c in command.chars() {
+        if in_query {
+            // URL-encode non-alphanumeric characters in query string
+            if c.is_ascii_alphanumeric() || c == '&' || c == '=' {
+                path.push(c);
+            } else {
+                path.push_str(&format!("%{:02X}", c as u8));
+            }
+        } else {
+            path.push(c);
+            if c == '?' {
+                in_query = true;
+            }
+        }
+    }
+
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+
+    // Make the HTTP request
+    let client = reqwest::Client::new();
+    let response = client.get(&url).send().await;
+
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await?;
+
+            if status.is_success() {
+                println!("{}", body);
+                Ok(())
+            } else {
+                eprintln!("HTTP {}: {}", status.as_u16(), body);
+                anyhow::bail!("Request failed with status {}", status.as_u16());
+            }
+        }
+        Err(e) => {
+            if e.is_connect() {
+                anyhow::bail!(
+                    "Connection refused on port {}. Is stellar-core running?",
+                    port
+                );
+            } else {
+                anyhow::bail!("HTTP request failed: {}", e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
