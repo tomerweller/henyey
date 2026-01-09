@@ -89,10 +89,12 @@
 //! - [`surge_pricing`]: Lane configuration and priority queues
 //! - [`tx_queue`]: Transaction queue and set building
 //! - [`tx_queue_limiter`]: Resource-aware queue limiting with eviction
+//! - [`json_api`]: JSON structures for admin/diagnostic endpoints
 
 mod error;
 mod herder;
 mod herder_utils;
+pub mod json_api;
 mod ledger_close_data;
 mod pending;
 mod persistence;
