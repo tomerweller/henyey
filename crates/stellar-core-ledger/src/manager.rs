@@ -39,7 +39,9 @@ use crate::{
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellar_core_bucket::BucketList;
+use stellar_core_bucket::{
+    update_starting_eviction_iterator, BucketList, EvictionIterator, StateArchivalSettings,
+};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
 use stellar_core_invariant::{
@@ -51,11 +53,12 @@ use stellar_core_invariant::{
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
-    ConfigSettingScpTiming, GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt,
-    LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, Limits, TransactionEventStage,
-    TransactionMeta, TransactionPhase, TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
-    TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM, WriteXdr,
+    ConfigSettingScpTiming, EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet,
+    Hash, LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData,
+    LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
+    LedgerKeyConfigSetting, Limits, TransactionEventStage, TransactionMeta, TransactionPhase,
+    TransactionResultMetaV1, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+    UpgradeEntryMeta, VecM, WriteXdr,
 };
 use tracing::{debug, info};
 
@@ -86,6 +89,61 @@ fn prepend_fee_event(
         combined.extend(fee_events);
         combined.extend(existing_events);
         v4.events = combined.try_into().unwrap_or_default();
+    }
+}
+
+/// Protocol version that introduced persistent eviction/state archival.
+const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
+
+/// Load the EvictionIterator from the bucket list's ConfigSettingEntry.
+///
+/// The EvictionIterator tracks where the incremental eviction scan is positioned.
+/// Returns `None` if no EvictionIterator entry exists (pre-protocol 23).
+fn load_eviction_iterator_from_bucket_list(bucket_list: &BucketList) -> Option<EvictionIterator> {
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::EvictionIterator,
+    });
+
+    match bucket_list.get(&key) {
+        Ok(Some(entry)) => {
+            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(xdr_iter)) =
+                entry.data
+            {
+                Some(EvictionIterator {
+                    bucket_file_offset: xdr_iter.bucket_file_offset as u32,
+                    bucket_list_level: xdr_iter.bucket_list_level,
+                    is_curr_bucket: xdr_iter.is_curr_bucket,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Load StateArchivalSettings from the snapshot's ConfigSettingEntry.
+fn load_state_archival_settings_from_snapshot(
+    snapshot: &SnapshotHandle,
+) -> Option<StateArchivalSettings> {
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    });
+
+    match snapshot.get_entry(&key) {
+        Ok(Some(entry)) => {
+            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) =
+                entry.data
+            {
+                Some(StateArchivalSettings {
+                    eviction_scan_size: settings.eviction_scan_size as u64,
+                    starting_eviction_scan_level: settings.starting_eviction_scan_level,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1093,8 +1151,93 @@ impl<'a> LedgerCloseContext<'a> {
         let bucket_list_hash = {
             let mut bucket_list = self.manager.bucket_list.write();
             let init_entries = self.delta.init_entries();
-            let live_entries = self.delta.live_entries();
-            let dead_entries = self.delta.dead_entries();
+            let mut live_entries = self.delta.live_entries();
+            let mut dead_entries = self.delta.dead_entries();
+
+            // Run incremental eviction scan for Protocol 23+
+            // This must happen BEFORE applying transaction changes to match C++ stellar-core
+            let mut archived_entries: Vec<LedgerEntry> = Vec::new();
+
+            if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
+                if hot_archive_guard.is_some() {
+                    drop(hot_archive_guard); // Release read lock before write operations
+
+                    // Load eviction state
+                    let eviction_settings = load_state_archival_settings_from_snapshot(&self.snapshot)
+                        .unwrap_or_default();
+                    let eviction_iterator = load_eviction_iterator_from_bucket_list(&bucket_list);
+
+                    let mut iter = eviction_iterator.unwrap_or_else(|| {
+                        EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
+                    });
+
+                    // Update starting level if needed (matches C++ behavior)
+                    update_starting_eviction_iterator(
+                        &mut iter,
+                        eviction_settings.starting_eviction_scan_level,
+                        self.close_data.ledger_seq,
+                    );
+
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        start_level = iter.bucket_list_level,
+                        start_is_curr = iter.is_curr_bucket,
+                        start_offset = iter.bucket_file_offset,
+                        scan_size = eviction_settings.eviction_scan_size,
+                        "Starting eviction scan"
+                    );
+
+                    // Run eviction scan
+                    let eviction_start = std::time::Instant::now();
+                    let eviction_result = bucket_list
+                        .scan_for_eviction_incremental(
+                            iter,
+                            self.close_data.ledger_seq,
+                            &eviction_settings,
+                        )
+                        .map_err(|e| LedgerError::Bucket(e))?;
+                    let eviction_duration = eviction_start.elapsed();
+
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        bytes_scanned = eviction_result.bytes_scanned,
+                        archived_count = eviction_result.archived_entries.len(),
+                        evicted_count = eviction_result.evicted_keys.len(),
+                        end_level = eviction_result.end_iterator.bucket_list_level,
+                        end_is_curr = eviction_result.end_iterator.is_curr_bucket,
+                        duration_ms = eviction_duration.as_millis(),
+                        "Incremental eviction scan completed"
+                    );
+
+                    // Add evicted keys to dead entries
+                    dead_entries.extend(eviction_result.evicted_keys);
+                    archived_entries = eviction_result.archived_entries;
+
+                    // Add EvictionIterator update to live entries
+                    let eviction_iter_entry = LedgerEntry {
+                        last_modified_ledger_seq: self.close_data.ledger_seq,
+                        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
+                            XdrEvictionIterator {
+                                bucket_file_offset: eviction_result.end_iterator.bucket_file_offset
+                                    as u64,
+                                bucket_list_level: eviction_result.end_iterator.bucket_list_level,
+                                is_curr_bucket: eviction_result.end_iterator.is_curr_bucket,
+                            },
+                        )),
+                        ext: LedgerEntryExt::V0,
+                    };
+                    live_entries.push(eviction_iter_entry);
+
+                    tracing::debug!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        level = eviction_result.end_iterator.bucket_list_level,
+                        is_curr = eviction_result.end_iterator.is_curr_bucket,
+                        offset = eviction_result.end_iterator.bucket_file_offset,
+                        "Added EvictionIterator entry to live entries"
+                    );
+                }
+            }
 
             bucket_list.add_batch(
                 self.close_data.ledger_seq,
@@ -1107,10 +1250,21 @@ impl<'a> LedgerCloseContext<'a> {
 
             let live_hash = bucket_list.hash();
 
-            // For Protocol 23+, combine live and hot archive bucket list hashes
-            if protocol_version >= 23 {
-                let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
-                if let Some(ref hot_archive) = *hot_archive_guard {
+            // For Protocol 23+, update hot archive and combine bucket list hashes
+            if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
+                if let Some(ref mut hot_archive) = *hot_archive_guard {
+                    // Add archived entries to hot archive bucket list
+                    // Must call add_batch even with empty entries to maintain spill consistency
+                    hot_archive.add_batch(
+                        self.close_data.ledger_seq,
+                        protocol_version,
+                        BucketListType::HotArchive,
+                        archived_entries,
+                        vec![],
+                        vec![],
+                    )?;
+
                     use sha2::{Digest, Sha256};
                     let hot_hash = hot_archive.hash();
                     let mut hasher = Sha256::new();

@@ -945,11 +945,16 @@ impl BucketList {
         // Skip to the current offset (entry index)
         // Note: bucket_file_offset is used as entry index for in-memory buckets
         let start_index = iter.bucket_file_offset as usize;
+        let total_entries = bucket.len();
 
-        let entries: Vec<_> = bucket.iter().collect();
-        let total_entries = entries.len();
-
-        for (i, entry) in entries.iter().enumerate().skip(start_index) {
+        // Iterate directly instead of collecting all entries into memory
+        // This is critical for performance with disk-backed buckets
+        for (i, entry) in bucket.iter().enumerate() {
+            // Skip entries before start_index
+            if i < start_index {
+                continue;
+            }
+            let entry = &entry;
             // Estimate entry size (XDR serialized size)
             let entry_size = match entry {
                 BucketEntry::Live(e) | BucketEntry::Init(e) => {
