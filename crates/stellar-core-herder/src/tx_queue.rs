@@ -471,6 +471,105 @@ impl TransactionSet {
 
         format!("txs:{}, ops:{}, base_fee:{}", tx_count, op_count, base_fee)
     }
+
+    /// Convert to StoredTransactionSet XDR for persistence.
+    ///
+    /// Uses the generalized format (v1) if available, otherwise falls back to legacy (v0).
+    pub fn to_xdr_stored_set(&self) -> stellar_xdr::curr::StoredTransactionSet {
+        use stellar_xdr::curr::StoredTransactionSet;
+
+        if let Some(ref gen) = self.generalized_tx_set {
+            StoredTransactionSet::V1(gen.clone())
+        } else {
+            // Build legacy TransactionSet
+            let legacy = stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash(self.previous_ledger_hash.0),
+                txs: self.transactions.clone().try_into().unwrap_or_default(),
+            };
+            StoredTransactionSet::V0(legacy)
+        }
+    }
+
+    /// Create from StoredTransactionSet XDR.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error description if the transaction set cannot be decoded.
+    pub fn from_xdr_stored_set(
+        stored: &stellar_xdr::curr::StoredTransactionSet,
+    ) -> std::result::Result<Self, String> {
+        use stellar_xdr::curr::StoredTransactionSet;
+
+        match stored {
+            StoredTransactionSet::V0(legacy) => {
+                let previous_ledger_hash = Hash256::from_bytes(legacy.previous_ledger_hash.0);
+                let transactions: Vec<TransactionEnvelope> = legacy.txs.to_vec();
+
+                // Compute hash
+                let hash =
+                    Self::compute_non_generalized_hash(previous_ledger_hash, &transactions)
+                        .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
+
+                Ok(Self {
+                    hash,
+                    previous_ledger_hash,
+                    transactions,
+                    generalized_tx_set: None,
+                })
+            }
+            StoredTransactionSet::V1(gen) => {
+                let previous_ledger_hash = match gen {
+                    GeneralizedTransactionSet::V1(v1) => Hash256::from_bytes(v1.previous_ledger_hash.0),
+                };
+
+                // Extract transactions from phases
+                let transactions = extract_transactions_from_generalized(gen);
+
+                // Compute hash from generalized format
+                let hash = gen
+                    .to_xdr(Limits::none())
+                    .map(|bytes| Hash256::hash(&bytes))
+                    .map_err(|e| format!("Failed to encode generalized tx set: {}", e))?;
+
+                Ok(Self {
+                    hash,
+                    previous_ledger_hash,
+                    transactions,
+                    generalized_tx_set: Some(gen.clone()),
+                })
+            }
+        }
+    }
+}
+
+/// Extract all transactions from a GeneralizedTransactionSet.
+fn extract_transactions_from_generalized(gen: &GeneralizedTransactionSet) -> Vec<TransactionEnvelope> {
+    let GeneralizedTransactionSet::V1(v1) = gen;
+    let mut transactions = Vec::new();
+
+    for phase in v1.phases.iter() {
+        match phase {
+            stellar_xdr::curr::TransactionPhase::V0(components) => {
+                for component in components.iter() {
+                    match component {
+                        stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                            transactions.extend(comp.txs.iter().cloned());
+                        }
+                    }
+                }
+            }
+            stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                // V1 phase has execution_stages, which contains parallel stages
+                for stage in parallel.execution_stages.iter() {
+                    for cluster in stage.iter() {
+                        transactions.extend(cluster.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+
+    transactions
 }
 
 fn tx_operation_count(envelope: &TransactionEnvelope) -> i64 {

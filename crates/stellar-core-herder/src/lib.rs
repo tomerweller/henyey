@@ -79,6 +79,8 @@
 //!
 //! - [`error`]: Error types for Herder operations
 //! - [`herder`]: Main Herder implementation
+//! - [`herder_utils`]: Utility functions (value extraction, node ID formatting)
+//! - [`ledger_close_data`]: Ledger close data for consensus output
 //! - [`pending`]: Pending SCP envelope management
 //! - [`persistence`]: SCP state persistence for crash recovery
 //! - [`quorum_tracker`]: Quorum participation tracking
@@ -89,6 +91,8 @@
 
 mod error;
 mod herder;
+mod herder_utils;
+mod ledger_close_data;
 mod pending;
 mod persistence;
 mod quorum_tracker;
@@ -116,6 +120,12 @@ pub use persistence::{
     get_quorum_set_hash, get_tx_set_hashes, InMemoryScpPersistence, PersistedSlotState,
     RestoredScpState, ScpPersistenceManager, ScpStatePersistence,
 };
+
+// HerderUtils
+pub use herder_utils::{get_stellar_values, get_tx_set_hashes_from_envelope, to_short_string, to_short_strkey};
+
+// LedgerCloseData
+pub use ledger_close_data::{LedgerCloseData, LedgerCloseDataError, stellar_value_to_string};
 
 /// Result type for Herder operations.
 pub type Result<T> = std::result::Result<T, HerderError>;

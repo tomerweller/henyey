@@ -183,14 +183,16 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Cluster building**: Identifying dependent transaction clusters
 - [ ] **Resource conflict detection**: Ledger key overlap analysis
 
-#### HerderUtils (`HerderUtils.h/cpp`)
-- [ ] **getStellarValues()**: Extract StellarValue from SCP statements
-- [ ] **Hash computation utilities**: Various hash helpers
+#### HerderUtils (`HerderUtils.h/cpp`) - `herder_utils.rs`
+- [x] **getStellarValues()**: Extract StellarValue from SCP statements
+- [x] **getTxSetHashes()**: Extract tx set hashes from SCP envelopes
+- [x] **toShortString()**: Short node ID rendering (hex and strkey formats)
 
-#### LedgerCloseData
-- [ ] **LedgerCloseData class**: Complete ledger close information wrapper
-- [ ] **Expected hash tracking**: `mExpectedLedgerHash` for validation
-- [ ] **XDR serialization**: `toXDR()`, `toLedgerCloseData()`
+#### LedgerCloseData - `ledger_close_data.rs`
+- [x] **LedgerCloseData class**: Complete ledger close information wrapper
+- [x] **Expected hash tracking**: `mExpectedLedgerHash` for validation
+- [x] **XDR serialization**: `to_xdr()`, `from_xdr()`
+- [x] **stellarValueToString()**: Human-readable StellarValue formatting
 
 #### TxQueueLimiter (`TxQueueLimiter.h/cpp`)
 - [ ] **TxQueueLimiter class**: Resource-aware queue limiting
