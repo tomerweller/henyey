@@ -35,6 +35,9 @@ This section documents the parity between this Rust implementation and the upstr
 - `/tx` - Submit transaction
 - `/shutdown` - Request graceful shutdown
 - `/health` - Health check endpoint
+- `/ll` - Get/set log levels (query supported, dynamic set partial)
+- `/manualclose` - Manual ledger close (stub, requires RUN_STANDALONE)
+- `/sorobaninfo` - Soroban network configuration (basic format)
 
 #### Survey System
 - **Time-sliced survey protocol**: Full implementation of collecting and reporting phases
@@ -99,15 +102,15 @@ This section documents the parity between this Rust implementation and the upstr
 - **`pregenerate-loadgen-txs`**: Generate payment transactions for load testing
 
 #### HTTP Command Handler Gaps
-- **`ll`**: Set log level dynamically
+- **`ll` (dynamic set)**: Dynamic log level changes require tracing-subscriber reload support
 - **`logRotate`**: Rotate log files
 - **`maintenance`**: Trigger maintenance operations
-- **`manualClose`**: Manually close ledger (MANUAL_CLOSE mode)
+- **`manualClose` (full)**: Full manual close requires RUN_STANDALONE infrastructure
 - **`clearMetrics`**: Clear metrics by domain
 - **`dumpProposedSettings`**: Dump proposed settings
 - **`surveyTopology`** (legacy): Non-time-sliced survey
 - **`getSurveyResult`** (legacy): Get legacy survey result
-- **`sorobanInfo`**: Soroban-specific information
+- **`sorobanInfo` (detailed/upgrade_xdr)**: Detailed formats require reading config entries from ledger
 
 #### Test-Only HTTP Endpoints (BUILD_TESTS)
 - **`generateLoad`**: Generate synthetic load

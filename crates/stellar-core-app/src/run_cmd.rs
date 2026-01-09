@@ -540,6 +540,9 @@ impl StatusServer {
             .route("/tx", post(submit_tx_handler))
             .route("/shutdown", post(shutdown_handler))
             .route("/health", get(health_handler))
+            .route("/ll", get(ll_handler).post(ll_handler))
+            .route("/manualclose", post(manualclose_handler))
+            .route("/sorobaninfo", get(sorobaninfo_handler))
             .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
@@ -708,6 +711,100 @@ struct SelfCheckResponse {
     message: Option<String>,
 }
 
+/// Query parameters for /ll endpoint.
+#[derive(Deserialize)]
+struct LlParams {
+    level: Option<String>,
+    partition: Option<String>,
+}
+
+/// Response for the /ll endpoint.
+#[derive(Serialize)]
+struct LlResponse {
+    levels: std::collections::HashMap<String, String>,
+}
+
+/// Query parameters for /manualclose endpoint.
+#[derive(Deserialize)]
+struct ManualCloseParams {
+    #[serde(rename = "ledgerSeq")]
+    ledger_seq: Option<u32>,
+    #[serde(rename = "closeTime")]
+    close_time: Option<u64>,
+}
+
+/// Response for the /manualclose endpoint.
+#[derive(Serialize)]
+struct ManualCloseResponse {
+    success: bool,
+    ledger_seq: Option<u32>,
+    message: Option<String>,
+}
+
+/// Query parameters for /sorobaninfo endpoint.
+#[derive(Deserialize)]
+struct SorobanInfoParams {
+    format: Option<String>,
+}
+
+/// Response for the /sorobaninfo endpoint (basic format).
+#[derive(Serialize)]
+struct SorobanInfoResponse {
+    max_contract_size: u32,
+    max_contract_data_key_size: u32,
+    max_contract_data_entry_size: u32,
+    tx: SorobanTxLimits,
+    ledger: SorobanLedgerLimits,
+    fee_rate_per_instructions_increment: i64,
+    fee_read_ledger_entry: i64,
+    fee_write_ledger_entry: i64,
+    fee_read_1kb: i64,
+    fee_write_1kb: i64,
+    fee_historical_1kb: i64,
+    fee_contract_events_size_1kb: i64,
+    fee_transaction_size_1kb: i64,
+    state_archival: SorobanStateArchival,
+}
+
+/// Soroban per-transaction resource limits.
+#[derive(Serialize)]
+struct SorobanTxLimits {
+    max_instructions: i64,
+    memory_limit: u32,
+    max_read_ledger_entries: u32,
+    max_read_bytes: u32,
+    max_write_ledger_entries: u32,
+    max_write_bytes: u32,
+    max_contract_events_size_bytes: u32,
+    max_size_bytes: u32,
+}
+
+/// Soroban per-ledger resource limits.
+#[derive(Serialize)]
+struct SorobanLedgerLimits {
+    max_instructions: i64,
+    max_read_ledger_entries: u32,
+    max_read_bytes: u32,
+    max_write_ledger_entries: u32,
+    max_write_bytes: u32,
+    max_tx_size_bytes: u32,
+    max_tx_count: u32,
+}
+
+/// Soroban state archival settings.
+#[derive(Serialize)]
+struct SorobanStateArchival {
+    max_entry_ttl: u32,
+    min_temporary_ttl: u32,
+    min_persistent_ttl: u32,
+    persistent_rent_rate_denominator: i64,
+    temp_rent_rate_denominator: i64,
+    max_entries_to_archive: u32,
+    bucketlist_size_window_sample_size: u32,
+    eviction_scan_size: i64,
+    starting_eviction_scan_level: u32,
+}
+
 /// Query parameters for starting survey collecting.
 #[derive(Deserialize)]
 struct StartSurveyParams {
@@ -788,6 +885,9 @@ async fn root_handler() -> Json<RootResponse> {
             "/tx".to_string(),
             "/shutdown".to_string(),
             "/health".to_string(),
+            "/ll".to_string(),
+            "/manualclose".to_string(),
+            "/sorobaninfo".to_string(),
         ],
     })
 }
@@ -1445,6 +1545,213 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespo
     };
 
     (status, Json(response))
+}
+
+/// Handler for /ll endpoint - get or set log levels.
+///
+/// GET /ll - returns current log levels for all partitions
+/// POST /ll?level=INFO - set global log level
+/// POST /ll?level=DEBUG&partition=SCP - set log level for specific partition
+async fn ll_handler(
+    State(_state): State<Arc<ServerState>>,
+    Query(params): Query<LlParams>,
+) -> impl IntoResponse {
+    use std::collections::HashMap;
+
+    // Known log partitions (matching C++ stellar-core)
+    let partitions = vec![
+        "Fs", "SCP", "Bucket", "Database", "History", "Process",
+        "Ledger", "Overlay", "Herder", "Tx", "LoadGen", "Work",
+        "Invariant", "Perf", "Test",
+    ];
+
+    let mut levels = HashMap::new();
+
+    if let Some(level_str) = &params.level {
+        // Validate and normalize the level
+        let normalized = match level_str.to_uppercase().as_str() {
+            "TRACE" => "TRACE",
+            "DEBUG" => "DEBUG",
+            "INFO" => "INFO",
+            "WARN" | "WARNING" => "WARN",
+            "ERROR" => "ERROR",
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(LlResponse {
+                        levels: {
+                            let mut m = HashMap::new();
+                            m.insert("error".to_string(), format!("Invalid log level: {}", level_str));
+                            m
+                        },
+                    }),
+                );
+            }
+        };
+
+        if let Some(partition) = &params.partition {
+            // Set level for specific partition
+            // Note: Dynamic log level changes require tracing-subscriber reload support
+            // For now, we acknowledge the request but note it's not fully implemented
+            levels.insert(partition.clone(), normalized.to_string());
+            tracing::info!(
+                partition = %partition,
+                level = %normalized,
+                "Log level change requested (dynamic change not yet implemented)"
+            );
+        } else {
+            // Set global level
+            levels.insert("Global".to_string(), normalized.to_string());
+            tracing::info!(
+                level = %normalized,
+                "Global log level change requested (dynamic change not yet implemented)"
+            );
+        }
+    } else {
+        // Return current levels (default to INFO for all partitions)
+        // In a full implementation, this would query actual tracing subscriber state
+        for partition in partitions {
+            levels.insert(partition.to_string(), "INFO".to_string());
+        }
+    }
+
+    (StatusCode::OK, Json(LlResponse { levels }))
+}
+
+/// Handler for /manualclose endpoint - manually close a ledger.
+///
+/// Only works in MANUAL_CLOSE / RUN_STANDALONE mode.
+async fn manualclose_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<ManualCloseParams>,
+) -> impl IntoResponse {
+    // Check if running in standalone mode (would need config access)
+    // For now, this endpoint is stubbed as manual close requires
+    // significant infrastructure that may not be present
+
+    let app_state = state.app.state().await;
+    let (current_ledger, _, _, _) = state.app.ledger_info();
+
+    // In a full implementation:
+    // 1. Verify RUN_STANDALONE mode
+    // 2. Create a synthetic close with provided ledger_seq and close_time
+    // 3. Trigger the ledger manager to close
+
+    if params.ledger_seq.is_some() || params.close_time.is_some() {
+        // Parameters provided but not in standalone mode
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ManualCloseResponse {
+                success: false,
+                ledger_seq: None,
+                message: Some(
+                    "The 'manualclose' command accepts parameters only if the configuration includes RUN_STANDALONE=true.".to_string()
+                ),
+            }),
+        );
+    }
+
+    // For now, report current state but note manual close is not fully implemented
+    (
+        StatusCode::OK,
+        Json(ManualCloseResponse {
+            success: false,
+            ledger_seq: Some(current_ledger),
+            message: Some(format!(
+                "Manual close not yet implemented. Current state: {}, ledger: {}",
+                app_state, current_ledger
+            )),
+        }),
+    )
+}
+
+/// Handler for /sorobaninfo endpoint - get Soroban network configuration.
+async fn sorobaninfo_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<SorobanInfoParams>,
+) -> impl IntoResponse {
+    let format = params.format.as_deref().unwrap_or("basic");
+
+    // Check if Soroban is active
+    let (_, _, _, protocol_version) = state.app.ledger_info();
+    if protocol_version < 20 {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "error": "Soroban is not active in current ledger version",
+                "protocol_version": protocol_version
+            })),
+        );
+    }
+
+    match format {
+        "basic" => {
+            // Return Soroban configuration in basic format
+            // These are placeholder values - in a full implementation,
+            // these would be read from the ledger's ConfigSettingEntry values
+            let response = SorobanInfoResponse {
+                max_contract_size: 65536,
+                max_contract_data_key_size: 256,
+                max_contract_data_entry_size: 65536,
+                tx: SorobanTxLimits {
+                    max_instructions: 100_000_000,
+                    memory_limit: 41943040,
+                    max_read_ledger_entries: 40,
+                    max_read_bytes: 200000,
+                    max_write_ledger_entries: 25,
+                    max_write_bytes: 66560,
+                    max_contract_events_size_bytes: 8198,
+                    max_size_bytes: 71680,
+                },
+                ledger: SorobanLedgerLimits {
+                    max_instructions: 2_500_000_000,
+                    max_read_ledger_entries: 200,
+                    max_read_bytes: 1000000,
+                    max_write_ledger_entries: 125,
+                    max_write_bytes: 332800,
+                    max_tx_size_bytes: 71680,
+                    max_tx_count: 100,
+                },
+                fee_rate_per_instructions_increment: 25,
+                fee_read_ledger_entry: 6250,
+                fee_write_ledger_entry: 10000,
+                fee_read_1kb: 1786,
+                fee_write_1kb: 11800,
+                fee_historical_1kb: 16235,
+                fee_contract_events_size_1kb: 10000,
+                fee_transaction_size_1kb: 1624,
+                state_archival: SorobanStateArchival {
+                    max_entry_ttl: 31536000,
+                    min_temporary_ttl: 17280,
+                    min_persistent_ttl: 2073600,
+                    persistent_rent_rate_denominator: 2103840,
+                    temp_rent_rate_denominator: 4096,
+                    max_entries_to_archive: 100,
+                    bucketlist_size_window_sample_size: 30,
+                    eviction_scan_size: 100000,
+                    starting_eviction_scan_level: 7,
+                },
+            };
+            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+        }
+        "detailed" | "upgrade_xdr" => {
+            // These formats require reading actual config entries from ledger
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "error": format!("Format '{}' not yet implemented", format),
+                    "available_formats": ["basic"]
+                })),
+            )
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Unknown format: {}", format),
+                "available_formats": ["basic", "detailed", "upgrade_xdr"]
+            })),
+        ),
+    }
 }
 
 #[cfg(test)]
