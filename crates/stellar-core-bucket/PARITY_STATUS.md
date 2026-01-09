@@ -15,7 +15,7 @@ This section documents the implementation status relative to the C++ stellar-cor
 | Disk-Backed Storage | Partial | Simpler index than C++ |
 | BucketSnapshot/SnapshotManager | Complete | Thread-safe read snapshots with historical ledger support |
 | Advanced Indexing | Partial | Bloom filters implemented, no DiskIndex/InMemoryIndex |
-| Specialized Queries | Not Implemented | Pool share lookups, inflation winners |
+| Specialized Queries | Partial | Inflation winners, type scanning implemented; pool share lookups pending |
 | Metrics/Monitoring | Not Implemented | Medida integration |
 
 ### Implemented
@@ -114,11 +114,12 @@ This section documents the implementation status relative to the C++ stellar-cor
 
 #### Specialized Queries (SearchableBucketList.h)
 - **SearchableLiveBucketListSnapshot** specialized queries:
-  - `loadPoolShareTrustLinesByAccountAndAsset()` - Pool share lookups
-  - `loadInflationWinners()` - Inflation winner queries
-  - `scanForEviction()` - Background eviction scanning
-  - `scanForEntriesOfType()` - Type-filtered iteration
-- **SearchableHotArchiveBucketListSnapshot** - Hot archive snapshot queries
+  - `loadPoolShareTrustLinesByAccountAndAsset()` - Pool share lookups - **Not Implemented** (requires asset-to-poolID index)
+  - `loadInflationWinners()` - **Implemented** as `load_inflation_winners()` in `snapshot.rs`
+  - `scanForEviction()` - Background eviction scanning - Partial (basic eviction in eviction.rs)
+  - `scanForEntriesOfType()` - **Implemented** as `scan_for_entries_of_type()` in `snapshot.rs`
+- **SearchableHotArchiveBucketListSnapshot** - Hot archive snapshot queries - Basic structure exists
+- **InflationWinner** struct - **Implemented** in `snapshot.rs`
 
 #### Advanced Indexing (LiveBucketIndex.h, DiskIndex.h, InMemoryIndex.h)
 - **LiveBucketIndex** - Sophisticated index supporting:

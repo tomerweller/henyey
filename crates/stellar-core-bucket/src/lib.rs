@@ -179,7 +179,7 @@ pub use hot_archive::{
 pub use snapshot::{
     BucketLevelSnapshot, BucketListSnapshot, BucketSnapshot, BucketSnapshotManager,
     HotArchiveBucketLevelSnapshot, HotArchiveBucketListSnapshot, HotArchiveBucketSnapshot,
-    SearchableBucketListSnapshot, SearchableHotArchiveBucketListSnapshot,
+    InflationWinner, SearchableBucketListSnapshot, SearchableHotArchiveBucketListSnapshot,
 };
 
 // ============================================================================

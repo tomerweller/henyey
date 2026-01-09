@@ -42,9 +42,9 @@
 
 use crate::{Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel, HotArchiveBucketList};
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use stellar_xdr::curr::{LedgerEntry, LedgerHeader, LedgerKey};
+use stellar_xdr::curr::{AccountId, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerHeader, LedgerKey};
 
 /// A read-only snapshot of a single bucket.
 ///
@@ -400,6 +400,194 @@ impl SearchableBucketListSnapshot {
             .copied()
             .unwrap_or(self.snapshot.ledger_seq());
         (oldest, self.snapshot.ledger_seq())
+    }
+
+    /// Scans all entries of a specific type in the bucket list.
+    ///
+    /// This iterates through all buckets (from level 0 to level 10, curr then snap)
+    /// and invokes the callback for each entry matching the specified type.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry_type` - The ledger entry type to filter for
+    /// * `callback` - Function called for each matching entry. Return `false` to stop iteration.
+    ///
+    /// # Returns
+    ///
+    /// `true` if iteration completed, `false` if stopped early by callback.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// snapshot.scan_for_entries_of_type(LedgerEntryType::Account, |entry| {
+    ///     println!("Found account: {:?}", entry);
+    ///     true // continue iteration
+    /// });
+    /// ```
+    pub fn scan_for_entries_of_type<F>(&self, entry_type: LedgerEntryType, mut callback: F) -> bool
+    where
+        F: FnMut(&BucketEntry) -> bool,
+    {
+        // Track seen keys to avoid processing same key multiple times
+        // (older buckets may have outdated versions)
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+
+        for level in &self.snapshot.levels {
+            // Process curr bucket first, then snap
+            for bucket in [&level.curr, &level.snap] {
+                // Iterate through all entries in the bucket
+                for bucket_entry in bucket.raw_bucket().iter() {
+                    // Check if this entry matches the requested type
+                    if let Some(key) = bucket_entry.key() {
+                        // Skip if we've already seen a newer version of this key
+                        if seen_keys.contains(&key) {
+                            continue;
+                        }
+
+                        // Check entry type
+                        let matches_type = match &bucket_entry {
+                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                                ledger_entry_type(&e.data) == entry_type
+                            }
+                            BucketEntry::Dead(k) => ledger_key_type(k) == entry_type,
+                            BucketEntry::Metadata(_) => false,
+                        };
+
+                        if matches_type {
+                            seen_keys.insert(key);
+
+                            // Skip dead entries for callback
+                            if !bucket_entry.is_dead() && !callback(&bucket_entry) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Finds inflation winners from the bucket list.
+    ///
+    /// Scans all account entries to find those that have set an inflation destination,
+    /// then aggregates the votes (balances) for each destination.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_winners` - Maximum number of winners to return
+    /// * `min_balance` - Minimum vote count (sum of balances) to be considered a winner
+    ///
+    /// # Returns
+    ///
+    /// A vector of inflation winners sorted by vote count (descending).
+    ///
+    /// # Note
+    ///
+    /// This is a legacy query method. In modern Stellar (protocol 12+), inflation
+    /// has been deprecated. This method is provided for historical compatibility.
+    pub fn load_inflation_winners(
+        &self,
+        max_winners: usize,
+        min_balance: i64,
+    ) -> Vec<InflationWinner> {
+        use std::collections::HashMap;
+
+        // Track seen accounts to avoid double-counting across bucket levels
+        let mut seen_accounts: HashSet<AccountId> = HashSet::new();
+
+        // Map from inflation destination to total votes
+        let mut vote_counts: HashMap<AccountId, i64> = HashMap::new();
+
+        // Scan all account entries
+        for level in &self.snapshot.levels {
+            for bucket in [&level.curr, &level.snap] {
+                for bucket_entry in bucket.raw_bucket().iter() {
+                    match &bucket_entry {
+                        BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                            if let LedgerEntryData::Account(account) = &entry.data {
+                                // Skip if we've already seen this account
+                                if seen_accounts.contains(&account.account_id) {
+                                    continue;
+                                }
+                                seen_accounts.insert(account.account_id.clone());
+
+                                // Only count accounts with an inflation destination
+                                if let Some(dest) = &account.inflation_dest {
+                                    *vote_counts.entry(dest.clone()).or_insert(0) +=
+                                        account.balance;
+                                }
+                            }
+                        }
+                        BucketEntry::Dead(key) => {
+                            // Mark account as seen (it's deleted)
+                            if let LedgerKey::Account(k) = key {
+                                seen_accounts.insert(k.account_id.clone());
+                            }
+                        }
+                        BucketEntry::Metadata(_) => {}
+                    }
+                }
+            }
+        }
+
+        // Filter and sort winners
+        let mut winners: Vec<InflationWinner> = vote_counts
+            .into_iter()
+            .filter(|(_, votes)| *votes >= min_balance)
+            .map(|(account_id, votes)| InflationWinner { account_id, votes })
+            .collect();
+
+        // Sort by votes descending
+        winners.sort_by(|a, b| b.votes.cmp(&a.votes));
+
+        // Truncate to max_winners
+        winners.truncate(max_winners);
+
+        winners
+    }
+}
+
+/// An account that has received inflation votes.
+///
+/// Used by [`SearchableBucketListSnapshot::load_inflation_winners`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InflationWinner {
+    /// The account that is receiving votes (inflation destination).
+    pub account_id: AccountId,
+    /// Total votes (sum of balances of accounts voting for this destination).
+    pub votes: i64,
+}
+
+/// Returns the ledger entry type for a given entry data.
+fn ledger_entry_type(data: &LedgerEntryData) -> LedgerEntryType {
+    match data {
+        LedgerEntryData::Account(_) => LedgerEntryType::Account,
+        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
+        LedgerEntryData::Data(_) => LedgerEntryType::Data,
+        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
+    }
+}
+
+/// Returns the ledger entry type for a given ledger key.
+fn ledger_key_type(key: &LedgerKey) -> LedgerEntryType {
+    match key {
+        LedgerKey::Account(_) => LedgerEntryType::Account,
+        LedgerKey::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerKey::Offer(_) => LedgerEntryType::Offer,
+        LedgerKey::Data(_) => LedgerEntryType::Data,
+        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerKey::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerKey::Ttl(_) => LedgerEntryType::Ttl,
     }
 }
 
@@ -811,5 +999,186 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_scan_for_entries_of_type() {
+        let mut bucket_list = BucketList::new();
+        let header = make_test_header(1);
+
+        // Add some account entries
+        for i in 0..5u8 {
+            let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([i; 32])));
+            let entry = LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id,
+                    balance: i as i64 * 100,
+                    seq_num: SequenceNumber(1),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32::default(),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: vec![].try_into().unwrap(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            };
+            bucket_list
+                .add_batch(1 + i as u32, 25, BucketListType::Live, vec![entry], vec![], vec![])
+                .unwrap();
+        }
+
+        let snapshot = BucketListSnapshot::new(&bucket_list, header);
+        let searchable = SearchableBucketListSnapshot::new(snapshot, BTreeMap::new());
+
+        // Count account entries
+        let mut count = 0;
+        searchable.scan_for_entries_of_type(LedgerEntryType::Account, |_| {
+            count += 1;
+            true // continue
+        });
+        assert_eq!(count, 5);
+
+        // Test early termination
+        let mut count = 0;
+        let completed = searchable.scan_for_entries_of_type(LedgerEntryType::Account, |_| {
+            count += 1;
+            count < 3 // stop after 3
+        });
+        assert!(!completed);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_load_inflation_winners() {
+        let mut bucket_list = BucketList::new();
+        let header = make_test_header(10);
+
+        // Create inflation destination account
+        let dest_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xFF; 32])));
+
+        // Add accounts that vote for the destination
+        for i in 1..=3u8 {
+            let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([i; 32])));
+            let entry = LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id,
+                    balance: 1_000_000_000 * i as i64, // 1B, 2B, 3B stroops
+                    seq_num: SequenceNumber(1),
+                    num_sub_entries: 0,
+                    inflation_dest: Some(dest_account_id.clone()),
+                    flags: 0,
+                    home_domain: String32::default(),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: vec![].try_into().unwrap(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            };
+            bucket_list
+                .add_batch(i as u32, 25, BucketListType::Live, vec![entry], vec![], vec![])
+                .unwrap();
+        }
+
+        // Add an account without inflation destination
+        let no_dest_account = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0x10; 32])));
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: no_dest_account,
+                balance: 10_000_000_000, // 10B stroops
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None, // No destination
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list
+            .add_batch(4, 25, BucketListType::Live, vec![entry], vec![], vec![])
+            .unwrap();
+
+        let snapshot = BucketListSnapshot::new(&bucket_list, header);
+        let searchable = SearchableBucketListSnapshot::new(snapshot, BTreeMap::new());
+
+        // Load inflation winners
+        let winners = searchable.load_inflation_winners(10, 0);
+
+        // Should have one winner with total votes = 1B + 2B + 3B = 6B
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].account_id, dest_account_id);
+        assert_eq!(winners[0].votes, 6_000_000_000);
+    }
+
+    #[test]
+    fn test_inflation_winners_min_balance_filter() {
+        let mut bucket_list = BucketList::new();
+        let header = make_test_header(5);
+
+        let dest1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
+        let dest2 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xBB; 32])));
+
+        // Account 1 votes for dest1 with 100 stroops
+        let entry1 = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
+                balance: 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: Some(dest1.clone()),
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Account 2 votes for dest2 with 1000 stroops
+        let entry2 = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2; 32]))),
+                balance: 1000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: Some(dest2.clone()),
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        bucket_list
+            .add_batch(1, 25, BucketListType::Live, vec![entry1, entry2], vec![], vec![])
+            .unwrap();
+
+        let snapshot = BucketListSnapshot::new(&bucket_list, header);
+        let searchable = SearchableBucketListSnapshot::new(snapshot, BTreeMap::new());
+
+        // With min_balance=500, only dest2 should qualify
+        let winners = searchable.load_inflation_winners(10, 500);
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].account_id, dest2);
+        assert_eq!(winners[0].votes, 1000);
+
+        // With min_balance=0, both should qualify
+        let winners = searchable.load_inflation_winners(10, 0);
+        assert_eq!(winners.len(), 2);
+        // dest2 should be first (higher votes)
+        assert_eq!(winners[0].account_id, dest2);
+        assert_eq!(winners[1].account_id, dest1);
     }
 }
