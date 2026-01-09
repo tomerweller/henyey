@@ -46,3 +46,6 @@ source
 upstream/
 rust_out
 testnet.lock
+
+# Claude local files
+.claude/*.local.md
