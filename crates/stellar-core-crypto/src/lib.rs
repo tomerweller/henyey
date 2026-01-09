@@ -14,6 +14,7 @@
 //! - **StrKey encoding**: Stellar's base32 key format for account IDs, secret seeds, and more
 //! - **Short hashing**: SipHash-2-4 for deterministic ordering in bucket lists and ledger state
 //! - **Sealed boxes**: Curve25519-based encryption for survey payloads
+//! - **Curve25519 ECDH**: Key exchange for P2P overlay authentication via [`Curve25519Secret`] and [`Curve25519Public`]
 //! - **Secure random**: Cryptographically secure random number generation
 //!
 //! # Design Goals
@@ -46,6 +47,7 @@
 //! let hash = sha256(b"stellar");
 //! ```
 
+mod curve25519;
 mod error;
 mod hash;
 mod keys;
@@ -55,6 +57,7 @@ mod short_hash;
 mod signature;
 mod strkey;
 
+pub use curve25519::*;
 pub use error::CryptoError;
 pub use hash::*;
 pub use keys::*;

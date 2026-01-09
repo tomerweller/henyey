@@ -14,7 +14,7 @@ This document tracks the parity between the Rust `stellar-core-crypto` crate and
 | Short Hash (SipHash) | High |
 | Sealed Box Encryption | High |
 | Random Generation | High |
-| Curve25519 (P2P ECDH) | Low |
+| Curve25519 (P2P ECDH) | High |
 | Signature Cache | Not Implemented |
 | Key Utilities | Partial |
 | Hex Encoding | Partial |
@@ -116,6 +116,23 @@ This document tracks the parity between the Rust `stellar-core-crypto` crate and
 | N/A | `seal_to_curve25519_public_key()` | Implemented |
 | N/A | `open_from_curve25519_secret_key()` | Implemented |
 
+### Curve25519 P2P Key Exchange (Curve25519.h/cpp)
+
+| C++ Function | Rust Equivalent | Status |
+|--------------|-----------------|--------|
+| `curve25519RandomSecret()` | `Curve25519Secret::random()` | Implemented |
+| `curve25519DerivePublic()` | `Curve25519Secret::derive_public()` | Implemented |
+| `clearCurve25519Keys()` | `clear_curve25519_keys()` | Implemented |
+| `curve25519DeriveSharedKey()` | `Curve25519Secret::derive_shared_key()` | Implemented |
+| `Curve25519Public` XDR conversion | `From` trait impls | Implemented |
+| `Curve25519Secret` XDR conversion | `From` trait impls | Implemented |
+| N/A | `Curve25519Secret::diffie_hellman()` | Implemented |
+| N/A | `Curve25519Secret::from_bytes()` | Implemented |
+| N/A | `Curve25519Secret::to_bytes()` | Implemented |
+| N/A | `Curve25519Public::from_bytes()` | Implemented |
+| N/A | `Curve25519Public::to_bytes()` | Implemented |
+| N/A | `Curve25519Public::as_bytes()` | Implemented |
+
 ### Signature Utilities (signature.rs)
 
 | Feature | Rust Implementation | Status |
@@ -141,18 +158,6 @@ The C++ implementation includes a process-wide signature verification cache (`Ra
 | BLAKE2-based cache key computation | Not Implemented | Low |
 
 **Note**: This is a performance optimization, not a correctness issue. The Rust implementation performs signature verification on every call.
-
-### Curve25519 P2P Key Exchange (Curve25519.h/cpp)
-
-| C++ Function | Status | Priority |
-|--------------|--------|----------|
-| `curve25519RandomSecret()` | Not Implemented | Medium |
-| `curve25519DerivePublic()` | Not Implemented | Medium |
-| `clearCurve25519Keys()` | Not Implemented | Medium |
-| `curve25519DeriveSharedKey()` | Not Implemented | Medium |
-| `Curve25519Public` / `Curve25519Secret` XDR types | Not Implemented | Medium |
-
-**Note**: These functions are used for P2P overlay authentication (ephemeral ECDH handshake). The sealed box implementation covers survey encryption but not P2P handshake.
 
 ### SignerKey Utilities (SignerKey.h/cpp, SignerKeyUtils.h/cpp)
 
@@ -279,7 +284,6 @@ All high priority items are **implemented**:
 - Short hash (SipHash-2-4)
 
 ### Medium Priority (Needed for Full Network Participation)
-- Curve25519 P2P ECDH key exchange
 - SignerKey utilities for transaction validation
 - Contract address (C...) StrKey support
 - Signed payload (P...) StrKey support
@@ -303,5 +307,9 @@ The Rust implementation includes unit tests for:
 - StrKey encoding/decoding (all implemented types)
 - Short hash computation with seed management
 - Sealed box encryption/decryption
+- Curve25519 ECDH key agreement
+- Curve25519 shared key derivation with local_first ordering
+- Curve25519 XDR type conversions
+- Curve25519 key clearing/zeroization
 
 Tests are located in each module file under `#[cfg(test)]` sections.
