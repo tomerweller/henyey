@@ -90,6 +90,7 @@
 //! let hash = bucket_list.hash();
 //! ```
 
+mod bloom_filter;
 mod bucket;
 mod bucket_list;
 mod disk_bucket;
@@ -114,6 +115,12 @@ pub use bucket_list::{BucketLevel, BucketList, BucketListStats, BUCKET_LIST_LEVE
 // ============================================================================
 
 pub use disk_bucket::{DiskBucket, DiskBucketIter};
+
+// ============================================================================
+// Bloom filter for fast negative lookups
+// ============================================================================
+
+pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 
 // ============================================================================
 // Entry types and comparison

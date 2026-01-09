@@ -33,6 +33,10 @@ hex.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
 
+# Probabilistic filters for fast negative lookups
+xorf.workspace = true
+siphasher = "0.3"
+
 # Concurrency
 parking_lot.workspace = true
 

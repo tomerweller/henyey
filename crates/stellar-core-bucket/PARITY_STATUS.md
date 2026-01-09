@@ -14,7 +14,7 @@ This section documents the implementation status relative to the C++ stellar-cor
 | Eviction Scanning | Complete | Incremental scanning with iterator |
 | Disk-Backed Storage | Partial | Simpler index than C++ |
 | BucketSnapshot/SnapshotManager | Complete | Thread-safe read snapshots with historical ledger support |
-| Advanced Indexing | Not Implemented | DiskIndex, InMemoryIndex, Bloom filters |
+| Advanced Indexing | Partial | Bloom filters implemented, no DiskIndex/InMemoryIndex |
 | Specialized Queries | Not Implemented | Pool share lookups, inflation winners |
 | Metrics/Monitoring | Not Implemented | Medida integration |
 
@@ -132,10 +132,15 @@ This section documents the implementation status relative to the C++ stellar-cor
   - Memory-limited cache sizing
   - `maybeInitializeCache()` based on bucket list account size
   - Thread-safe access via shared mutex
-- **Bloom filter** - Fast negative lookups (`markBloomMiss()`, bloom meters)
-- **Asset-to-PoolID mapping** - `getPoolIDsByAsset()` for liquidity pool queries
-- **HotArchiveBucketIndex** - Index for hot archive buckets
-- The Rust `DiskBucket` uses a simpler 8-byte key hash to file offset index (no Bloom filter, no page index)
+- **Bloom filter** - Implemented as `BucketBloomFilter` in `bloom_filter.rs`:
+  - Uses `BinaryFuse16` (same algorithm as C++ via xorf crate)
+  - False positive rate ~1/65536 (~0.0015%)
+  - SipHash-2-4 key hashing for C++ compatibility
+  - `may_contain()` / `may_contain_hash()` for fast negative lookups
+  - Standalone module; not yet integrated with DiskBucket
+- **Asset-to-PoolID mapping** - `getPoolIDsByAsset()` for liquidity pool queries - Not Implemented
+- **HotArchiveBucketIndex** - Index for hot archive buckets - Not Implemented
+- The Rust `DiskBucket` uses a simpler 8-byte key hash to file offset index (no range index, no page index)
 
 #### Iterator Types (BucketInputIterator.h, BucketOutputIterator.h)
 - **BucketInputIterator** - File-based iterator with:
@@ -264,3 +269,4 @@ The Rust implementation correctly handles:
 | LedgerCmp.h | entry.rs (compare_keys) | Complete |
 | MergeKey.h/cpp | future_bucket.rs (MergeKey) | Complete |
 | BucketUtils.h/cpp | entry.rs, eviction.rs | Complete |
+| BinaryFuseFilter.h/cpp | bloom_filter.rs | Complete (via xorf crate) |

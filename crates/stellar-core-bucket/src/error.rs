@@ -62,4 +62,12 @@ pub enum BucketError {
     /// such as during eviction or state verification.
     #[error("database error: {0}")]
     Database(#[from] stellar_core_db::DbError),
+
+    /// Bloom filter construction or lookup failed.
+    ///
+    /// This can occur when:
+    /// - Not enough elements to build a filter (minimum 2)
+    /// - Too many hash collisions during construction
+    #[error("bloom filter error: {0}")]
+    BloomFilter(String),
 }
