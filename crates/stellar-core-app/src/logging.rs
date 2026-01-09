@@ -6,6 +6,7 @@
 //!   appropriate log levels, formats, and filters
 //! - **Progress tracking**: Utilities for reporting progress during long-running
 //!   operations like catchup
+//! - **Dynamic log level changes**: Runtime modification of log levels via the `/ll` endpoint
 //!
 //! # Log Formats
 //!
@@ -19,13 +20,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use stellar_core_app::logging::{LogConfig, init};
+//! use stellar_core_app::logging::{LogConfig, init_with_handle};
 //!
 //! // Initialize with default settings (INFO level, text format)
-//! init(&LogConfig::default()).expect("Failed to initialize logging");
+//! let handle = init_with_handle(&LogConfig::default()).expect("Failed to initialize logging");
 //!
-//! // Or use verbose debug configuration
-//! init(&LogConfig::verbose()).expect("Failed to initialize logging");
+//! // Later, dynamically change log levels
+//! handle.set_level("DEBUG").ok();
+//! handle.set_partition_level("stellar_core_scp", "TRACE").ok();
 //! ```
 //!
 //! # Progress Tracking
@@ -47,12 +49,14 @@
 //! tracker.complete();
 //! ```
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tracing::Level;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::reload::Handle;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 /// Log output format selection.
 ///
@@ -147,16 +151,178 @@ impl LogConfig {
     }
 }
 
+/// Known log partitions matching C++ stellar-core partition names.
+///
+/// These map to Rust module targets for filtering purposes.
+pub const LOG_PARTITIONS: &[(&str, &str)] = &[
+    ("Fs", "stellar_core"),           // Filesystem operations
+    ("SCP", "stellar_core_scp"),      // SCP consensus
+    ("Bucket", "stellar_core_bucket"), // Bucket list
+    ("Database", "stellar_core_db"),  // Database operations
+    ("History", "stellar_core_history"), // History archives
+    ("Process", "stellar_core_app"),  // Application process
+    ("Ledger", "stellar_core_ledger"), // Ledger operations
+    ("Overlay", "stellar_core_overlay"), // P2P overlay
+    ("Herder", "stellar_core_herder"), // Herder consensus coordination
+    ("Tx", "stellar_core_tx"),        // Transaction processing
+    ("LoadGen", "stellar_core_app::loadgen"), // Load generation
+    ("Work", "stellar_core_work"),    // Work scheduler
+    ("Invariant", "stellar_core_invariant"), // Invariants
+    ("Perf", "stellar_core_app::perf"), // Performance metrics
+];
+
+/// Handle for dynamically changing log levels at runtime.
+///
+/// This handle wraps a tracing-subscriber reload handle and provides
+/// a convenient API for modifying log levels from the `/ll` endpoint.
+#[derive(Clone)]
+pub struct LogLevelHandle {
+    handle: Arc<Handle<EnvFilter, Registry>>,
+    /// Current log levels by partition (partition name -> level string)
+    levels: Arc<RwLock<HashMap<String, String>>>,
+    /// Global log level
+    global_level: Arc<RwLock<String>>,
+}
+
+impl LogLevelHandle {
+    /// Create a new log level handle.
+    fn new(handle: Handle<EnvFilter, Registry>, initial_level: &str) -> Self {
+        let mut levels = HashMap::new();
+        for (partition, _) in LOG_PARTITIONS {
+            levels.insert(partition.to_string(), initial_level.to_string());
+        }
+        Self {
+            handle: Arc::new(handle),
+            levels: Arc::new(RwLock::new(levels)),
+            global_level: Arc::new(RwLock::new(initial_level.to_string())),
+        }
+    }
+
+    /// Set the global log level.
+    pub fn set_level(&self, level: &str) -> anyhow::Result<()> {
+        let level = normalize_level(level)?;
+        let filter = self.build_filter(&level, None)?;
+        self.handle.reload(filter)?;
+        *self.global_level.write().unwrap() = level.clone();
+        // Update all partition levels to the new global level
+        let mut levels = self.levels.write().unwrap();
+        for (partition, _) in LOG_PARTITIONS {
+            levels.insert(partition.to_string(), level.clone());
+        }
+        Ok(())
+    }
+
+    /// Set the log level for a specific partition.
+    pub fn set_partition_level(&self, partition: &str, level: &str) -> anyhow::Result<()> {
+        let level = normalize_level(level)?;
+        // Validate partition name
+        let target = partition_to_target(partition)
+            .ok_or_else(|| anyhow::anyhow!("Unknown partition: {}", partition))?;
+
+        // Update the stored level
+        {
+            let mut levels = self.levels.write().unwrap();
+            levels.insert(partition.to_string(), level.clone());
+        }
+
+        // Rebuild and apply filter
+        let filter = self.build_filter_with_partitions()?;
+        self.handle.reload(filter)?;
+
+        tracing::debug!(partition = %partition, target = %target, level = %level, "Updated partition log level");
+        Ok(())
+    }
+
+    /// Get the current log levels for all partitions.
+    pub fn get_levels(&self) -> HashMap<String, String> {
+        let levels = self.levels.read().unwrap();
+        let mut result = levels.clone();
+        result.insert("Global".to_string(), self.global_level.read().unwrap().clone());
+        result
+    }
+
+    /// Build an EnvFilter from the current level configuration.
+    fn build_filter(&self, global_level: &str, partition_override: Option<(&str, &str)>) -> anyhow::Result<EnvFilter> {
+        let mut filter = EnvFilter::new(global_level)
+            .add_directive("hyper=warn".parse()?)
+            .add_directive("reqwest=warn".parse()?)
+            .add_directive("h2=warn".parse()?);
+
+        if let Some((target, level)) = partition_override {
+            let directive = format!("{}={}", target, level);
+            filter = filter.add_directive(directive.parse()?);
+        }
+
+        Ok(filter)
+    }
+
+    /// Build an EnvFilter from all stored partition levels.
+    fn build_filter_with_partitions(&self) -> anyhow::Result<EnvFilter> {
+        let global = self.global_level.read().unwrap().clone();
+        let levels = self.levels.read().unwrap();
+
+        let mut filter = EnvFilter::new(&global)
+            .add_directive("hyper=warn".parse()?)
+            .add_directive("reqwest=warn".parse()?)
+            .add_directive("h2=warn".parse()?);
+
+        for (partition, level) in levels.iter() {
+            if level != &global {
+                if let Some(target) = partition_to_target(partition) {
+                    let directive = format!("{}={}", target, level);
+                    if let Ok(d) = directive.parse() {
+                        filter = filter.add_directive(d);
+                    }
+                }
+            }
+        }
+
+        Ok(filter)
+    }
+}
+
+/// Normalize a log level string to uppercase canonical form.
+fn normalize_level(level: &str) -> anyhow::Result<String> {
+    match level.to_uppercase().as_str() {
+        "TRACE" => Ok("trace".to_string()),
+        "DEBUG" => Ok("debug".to_string()),
+        "INFO" => Ok("info".to_string()),
+        "WARN" | "WARNING" => Ok("warn".to_string()),
+        "ERROR" => Ok("error".to_string()),
+        _ => Err(anyhow::anyhow!("Invalid log level: {}", level)),
+    }
+}
+
+/// Map a partition name to its Rust module target.
+fn partition_to_target(partition: &str) -> Option<&'static str> {
+    LOG_PARTITIONS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(partition))
+        .map(|(_, target)| *target)
+}
+
 /// Initialize the global logging subscriber.
 ///
 /// This should be called once at application startup.
+/// For dynamic log level changes, use [`init_with_handle`] instead.
 pub fn init(config: &LogConfig) -> anyhow::Result<()> {
+    let _ = init_with_handle(config)?;
+    Ok(())
+}
+
+/// Initialize the global logging subscriber and return a handle for dynamic level changes.
+///
+/// This should be called once at application startup. The returned handle can be
+/// used to modify log levels at runtime via the `/ll` HTTP endpoint.
+pub fn init_with_handle(config: &LogConfig) -> anyhow::Result<LogLevelHandle> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(config.level.as_str())
             .add_directive("hyper=warn".parse().unwrap())
             .add_directive("reqwest=warn".parse().unwrap())
             .add_directive("h2=warn".parse().unwrap())
     });
+
+    let initial_level = config.level.as_str().to_lowercase();
 
     match config.format {
         LogFormat::Text => {
@@ -167,10 +333,14 @@ pub fn init(config: &LogConfig) -> anyhow::Result<()> {
                 .with_file(config.with_source_location)
                 .with_line_number(config.with_source_location);
 
+            let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+
             tracing_subscriber::registry()
-                .with(env_filter)
+                .with(filter)
                 .with(fmt_layer)
                 .init();
+
+            Ok(LogLevelHandle::new(reload_handle, &initial_level))
         }
         LogFormat::Json => {
             let fmt_layer = tracing_subscriber::fmt::layer()
@@ -178,14 +348,16 @@ pub fn init(config: &LogConfig) -> anyhow::Result<()> {
                 .with_span_list(true)
                 .with_current_span(true);
 
+            let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+
             tracing_subscriber::registry()
-                .with(env_filter)
+                .with(filter)
                 .with(fmt_layer)
                 .init();
+
+            Ok(LogLevelHandle::new(reload_handle, &initial_level))
         }
     }
-
-    Ok(())
 }
 
 /// Progress tracker for long-running operations.
@@ -544,5 +716,42 @@ mod tests {
             format!("{}", CatchupPhase::DownloadingBuckets),
             "Downloading buckets"
         );
+    }
+
+    #[test]
+    fn test_normalize_level() {
+        assert_eq!(normalize_level("trace").unwrap(), "trace");
+        assert_eq!(normalize_level("TRACE").unwrap(), "trace");
+        assert_eq!(normalize_level("Debug").unwrap(), "debug");
+        assert_eq!(normalize_level("INFO").unwrap(), "info");
+        assert_eq!(normalize_level("warn").unwrap(), "warn");
+        assert_eq!(normalize_level("WARNING").unwrap(), "warn");
+        assert_eq!(normalize_level("error").unwrap(), "error");
+        assert!(normalize_level("invalid").is_err());
+    }
+
+    #[test]
+    fn test_partition_to_target() {
+        assert_eq!(partition_to_target("SCP"), Some("stellar_core_scp"));
+        assert_eq!(partition_to_target("scp"), Some("stellar_core_scp"));
+        assert_eq!(partition_to_target("Bucket"), Some("stellar_core_bucket"));
+        assert_eq!(partition_to_target("Overlay"), Some("stellar_core_overlay"));
+        assert_eq!(partition_to_target("Unknown"), None);
+    }
+
+    #[test]
+    fn test_log_partitions_complete() {
+        // Verify all expected partitions are defined
+        let expected = [
+            "Fs", "SCP", "Bucket", "Database", "History", "Process",
+            "Ledger", "Overlay", "Herder", "Tx", "LoadGen", "Work", "Invariant", "Perf",
+        ];
+        for partition in expected {
+            assert!(
+                partition_to_target(partition).is_some(),
+                "Missing partition: {}",
+                partition
+            );
+        }
     }
 }

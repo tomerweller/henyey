@@ -98,7 +98,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `/scp` | Implemented | SCP slot status summary |
 | `/metrics` | Implemented | Prometheus-format metrics |
 | `/tx` | Implemented | Submit transaction |
-| `/ll` | Partial | Query supported; dynamic set needs tracing-subscriber reload |
+| `/ll` | Implemented | Dynamic log level changes via tracing-subscriber reload layer |
 | `/selfCheck` | Implemented | Via `/self-check` |
 | `/upgrades` | Implemented | Current and proposed upgrades |
 | `/startSurveyCollecting` | Implemented | Via `/survey/start` |
@@ -233,9 +233,10 @@ This crate corresponds to the following C++ stellar-core components:
 | Aspect | C++ | Rust |
 |--------|-----|------|
 | Framework | Custom logging system | `tracing` ecosystem |
-| Log levels | Per partition | Global with filter directives |
+| Log levels | Per partition | Per partition via filter directives |
 | Format | Custom | Text or JSON via `tracing-subscriber` |
-| Dynamic changes | Fully supported | Limited (requires reload) |
+| Dynamic changes | Fully supported | Fully supported via `/ll` endpoint |
+| Partition mapping | Direct C++ modules | Maps C++ partitions to Rust crate targets |
 
 ### Metrics
 

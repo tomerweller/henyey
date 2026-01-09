@@ -472,6 +472,7 @@ impl NodeRunner {
 struct ServerState {
     app: Arc<App>,
     start_time: Instant,
+    log_handle: Option<crate::logging::LogLevelHandle>,
 }
 
 /// HTTP server for node status and control.
@@ -495,10 +496,12 @@ struct ServerState {
 /// - POST /survey/reporting/stop - stop survey reporting
 /// - POST /tx - submit transactions
 /// - POST /shutdown - request a graceful shutdown
+/// - GET/POST /ll - get or set log levels dynamically
 pub struct StatusServer {
     port: u16,
     app: Arc<App>,
     start_time: Instant,
+    log_handle: Option<crate::logging::LogLevelHandle>,
 }
 
 impl StatusServer {
@@ -508,6 +511,17 @@ impl StatusServer {
             port,
             app,
             start_time: Instant::now(),
+            log_handle: None,
+        }
+    }
+
+    /// Create a new status server with a log level handle for dynamic log changes.
+    pub fn with_log_handle(port: u16, app: Arc<App>, log_handle: crate::logging::LogLevelHandle) -> Self {
+        Self {
+            port,
+            app,
+            start_time: Instant::now(),
+            log_handle: Some(log_handle),
         }
     }
 
@@ -516,6 +530,7 @@ impl StatusServer {
         let state = Arc::new(ServerState {
             app: self.app,
             start_time: self.start_time,
+            log_handle: self.log_handle,
         });
 
         let mut shutdown_rx = state.app.subscribe_shutdown();
@@ -1560,68 +1575,69 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespo
 /// POST /ll?level=INFO - set global log level
 /// POST /ll?level=DEBUG&partition=SCP - set log level for specific partition
 async fn ll_handler(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Query(params): Query<LlParams>,
 ) -> impl IntoResponse {
     use std::collections::HashMap;
 
-    // Known log partitions (matching C++ stellar-core)
-    let partitions = vec![
-        "Fs", "SCP", "Bucket", "Database", "History", "Process",
-        "Ledger", "Overlay", "Herder", "Tx", "LoadGen", "Work",
-        "Invariant", "Perf", "Test",
-    ];
+    // If we don't have a log handle, return the stub response
+    let Some(log_handle) = &state.log_handle else {
+        // Fallback: return static levels when no handle is available
+        let mut levels = HashMap::new();
+        for (partition, _) in crate::logging::LOG_PARTITIONS {
+            levels.insert(partition.to_string(), "INFO".to_string());
+        }
+        levels.insert("Global".to_string(), "INFO".to_string());
 
-    let mut levels = HashMap::new();
-
-    if let Some(level_str) = &params.level {
-        // Validate and normalize the level
-        let normalized = match level_str.to_uppercase().as_str() {
-            "TRACE" => "TRACE",
-            "DEBUG" => "DEBUG",
-            "INFO" => "INFO",
-            "WARN" | "WARNING" => "WARN",
-            "ERROR" => "ERROR",
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(LlResponse {
-                        levels: {
-                            let mut m = HashMap::new();
-                            m.insert("error".to_string(), format!("Invalid log level: {}", level_str));
-                            m
-                        },
-                    }),
-                );
-            }
-        };
-
-        if let Some(partition) = &params.partition {
-            // Set level for specific partition
-            // Note: Dynamic log level changes require tracing-subscriber reload support
-            // For now, we acknowledge the request but note it's not fully implemented
-            levels.insert(partition.clone(), normalized.to_string());
-            tracing::info!(
-                partition = %partition,
-                level = %normalized,
-                "Log level change requested (dynamic change not yet implemented)"
-            );
-        } else {
-            // Set global level
-            levels.insert("Global".to_string(), normalized.to_string());
-            tracing::info!(
-                level = %normalized,
-                "Global log level change requested (dynamic change not yet implemented)"
+        if params.level.is_some() {
+            levels.insert(
+                "warning".to_string(),
+                "Log level handle not available. Logging initialized without dynamic support.".to_string(),
             );
         }
-    } else {
-        // Return current levels (default to INFO for all partitions)
-        // In a full implementation, this would query actual tracing subscriber state
-        for partition in partitions {
-            levels.insert(partition.to_string(), "INFO".to_string());
+
+        return (StatusCode::OK, Json(LlResponse { levels }));
+    };
+
+    if let Some(level_str) = &params.level {
+        // Setting a log level
+        if let Some(partition) = &params.partition {
+            // Set level for specific partition
+            match log_handle.set_partition_level(partition, level_str) {
+                Ok(()) => {
+                    tracing::info!(
+                        partition = %partition,
+                        level = %level_str,
+                        "Log level updated for partition"
+                    );
+                    let levels = log_handle.get_levels();
+                    return (StatusCode::OK, Json(LlResponse { levels }));
+                }
+                Err(e) => {
+                    let mut levels = HashMap::new();
+                    levels.insert("error".to_string(), e.to_string());
+                    return (StatusCode::BAD_REQUEST, Json(LlResponse { levels }));
+                }
+            }
+        } else {
+            // Set global level
+            match log_handle.set_level(level_str) {
+                Ok(()) => {
+                    tracing::info!(level = %level_str, "Global log level updated");
+                    let levels = log_handle.get_levels();
+                    return (StatusCode::OK, Json(LlResponse { levels }));
+                }
+                Err(e) => {
+                    let mut levels = HashMap::new();
+                    levels.insert("error".to_string(), e.to_string());
+                    return (StatusCode::BAD_REQUEST, Json(LlResponse { levels }));
+                }
+            }
         }
     }
 
+    // GET request: return current levels
+    let levels = log_handle.get_levels();
     (StatusCode::OK, Json(LlResponse { levels }))
 }
 
