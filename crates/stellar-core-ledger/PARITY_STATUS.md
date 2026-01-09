@@ -132,8 +132,8 @@ This section documents the implementation status compared to the C++ upstream in
 - [ ] **Transaction modes** (READ_ONLY_WITHOUT_SQL_TXN, READ_WRITE_WITH_SQL_TXN)
 
 #### Order Book Utilities (`LedgerTxn.h`)
-- [ ] **Offer sorting utilities** (`isBetterOffer`, `OfferDescriptor`) - Used for order book operations
-- [ ] **Asset pair hash utilities** (`AssetPairHash`, `AssetPair`)
+- [x] **Offer sorting utilities** (`isBetterOffer`, `OfferDescriptor`) - Implemented in `offer.rs`
+- [x] **Asset pair hash utilities** (`AssetPairHash`, `AssetPair`) - Implemented in `offer.rs`
 - [ ] **Inflation winners query** (`InflationWinner` struct)
 - [ ] **Best offer queries** for DEX matching
 

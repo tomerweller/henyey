@@ -89,6 +89,7 @@ mod error;
 pub mod execution;
 mod header;
 mod manager;
+pub mod offer;
 mod snapshot;
 mod soroban_state;
 
