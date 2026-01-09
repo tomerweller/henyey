@@ -387,7 +387,11 @@ impl CatchupManager {
                 .unwrap_or_else(|_| {
                     // Construct a minimal header from replay state if download fails
                     warn!("Could not download final header, using replay state");
-                    create_header_from_replay_state(&final_state, &bucket_list)
+                    create_header_from_replay_state(
+                        &final_state,
+                        &bucket_list,
+                        hot_archive_bucket_list.as_ref(),
+                    )
                 });
             (final_header, final_state.ledger_hash, ledgers_applied)
         };
@@ -555,12 +559,18 @@ impl CatchupManager {
                 )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
-            let final_header = data
-                .headers
-                .iter()
-                .find(|entry| entry.header.ledger_seq == target)
-                .map(|entry| entry.header.clone())
-                .unwrap_or(checkpoint_header);
+            let final_header = self
+                .download_checkpoint_header(target)
+                .await
+                .unwrap_or_else(|_| {
+                    // Construct a minimal header from replay state if download fails
+                    warn!("Could not download final header, using replay state");
+                    create_header_from_replay_state(
+                        &final_state,
+                        &bucket_list,
+                        hot_archive_bucket_list.as_ref(),
+                    )
+                });
             (final_header, final_state.ledger_hash, ledgers_applied)
         };
 
@@ -1769,9 +1779,23 @@ impl Default for CatchupManagerBuilder {
 fn create_header_from_replay_state(
     replay_state: &ReplayedLedgerState,
     bucket_list: &BucketList,
+    hot_archive_bucket_list: Option<&BucketList>,
 ) -> LedgerHeader {
     use stellar_xdr::curr::{
         Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+    };
+    use sha2::{Digest, Sha256};
+
+    let bucket_list_hash = if let Some(hot_archive) = hot_archive_bucket_list {
+        let mut hasher = Sha256::new();
+        hasher.update(bucket_list.hash().as_bytes());
+        hasher.update(hot_archive.hash().as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        Hash256::from_bytes(bytes)
+    } else {
+        bucket_list.hash()
     };
 
     LedgerHeader {
@@ -1784,7 +1808,7 @@ fn create_header_from_replay_state(
             ext: StellarValueExt::Basic,
         },
         tx_set_result_hash: Hash([0u8; 32]),
-        bucket_list_hash: Hash(bucket_list.hash().0),
+        bucket_list_hash: Hash(bucket_list_hash.0),
         ledger_seq: replay_state.sequence,
         total_coins: 0,
         fee_pool: 0,
