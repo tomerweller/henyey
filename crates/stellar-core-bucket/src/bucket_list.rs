@@ -59,16 +59,14 @@ use crate::eviction::{
     update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
 };
 use crate::merge::merge_buckets_with_options;
-use crate::{BucketError, Result};
+use crate::{
+    BucketError, Result,
+    FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+    FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
+};
 
 /// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
 pub const BUCKET_LIST_LEVELS: usize = 11;
-
-/// First protocol version supporting INITENTRY and METAENTRY (CAP-0020).
-const FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY: u32 = 11;
-
-/// First protocol version supporting persistent eviction (CAP-0046/Soroban).
-const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 
 /// A single level in the BucketList, containing `curr` and `snap` buckets.
 ///

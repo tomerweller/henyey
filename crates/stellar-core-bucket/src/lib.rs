@@ -164,6 +164,16 @@ pub use hot_archive::{
     HOT_ARCHIVE_BUCKET_LIST_LEVELS,
 };
 
+// ============================================================================
+// Protocol version constants
+// ============================================================================
+
+/// First protocol version supporting INITENTRY and METAENTRY (CAP-0020).
+pub const FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY: u32 = 11;
+
+/// First protocol version supporting persistent eviction (CAP-0046/Soroban).
+pub const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
+
 /// Result type for bucket operations.
 ///
 /// This is a convenience alias for `std::result::Result<T, BucketError>`.

@@ -45,10 +45,11 @@ use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
 
 use crate::bucket::Bucket;
 use crate::entry::{compare_keys, BucketEntry};
-use crate::{BucketError, Result};
-
-const FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY: u32 = 11;
-const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
+use crate::{
+    BucketError, Result,
+    FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+    FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
+};
 
 /// Merge two buckets into a new bucket.
 ///
