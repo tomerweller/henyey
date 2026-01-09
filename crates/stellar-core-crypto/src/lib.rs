@@ -54,6 +54,7 @@ mod keys;
 mod random;
 mod sealed_box;
 mod short_hash;
+mod signer_key;
 mod signature;
 mod strkey;
 
@@ -64,6 +65,7 @@ pub use keys::*;
 pub use random::*;
 pub use sealed_box::*;
 pub use short_hash::*;
+pub use signer_key::*;
 pub use signature::*;
 pub use strkey::*;
 

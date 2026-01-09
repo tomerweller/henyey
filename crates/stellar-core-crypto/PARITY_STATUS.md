@@ -16,6 +16,7 @@ This document tracks the parity between the Rust `stellar-core-crypto` crate and
 | Random Generation | High |
 | Curve25519 (P2P ECDH) | High |
 | Signature Cache | Not Implemented |
+| SignerKey Utilities | High |
 | Key Utilities | Partial |
 | Hex Encoding | Partial |
 
@@ -161,14 +162,17 @@ The C++ implementation includes a process-wide signature verification cache (`Ra
 
 ### SignerKey Utilities (SignerKey.h/cpp, SignerKeyUtils.h/cpp)
 
-| C++ Feature | Status | Priority |
-|-------------|--------|----------|
-| `KeyFunctions<SignerKey>` template | Not Implemented | Medium |
-| `SignerKeyUtils::preAuthTxKey()` | Not Implemented | Medium |
-| `SignerKeyUtils::hashXKey()` | Not Implemented | Medium |
-| `SignerKeyUtils::ed25519PayloadKey()` | Not Implemented | Medium |
-| Signed Payload StrKey (P...) | Not Implemented | Medium |
-| Contract StrKey (C...) | Not Implemented | Medium |
+| C++ Feature | Rust Equivalent | Status |
+|-------------|-----------------|--------|
+| `SignerKeyUtils::preAuthTxKey()` | `pre_auth_tx_key()` | Implemented |
+| `SignerKeyUtils::hashXKey()` | `hash_x_key()` | Implemented |
+| `SignerKeyUtils::ed25519PayloadKey()` | `ed25519_payload_key()` | Implemented |
+| N/A | `ed25519_key()` | Implemented |
+| N/A | `hash_x_key_from_hash()` | Implemented |
+| N/A | `get_ed25519_from_signer_key()` | Implemented |
+| `KeyFunctions<SignerKey>` template | Not Needed | Rust generics provide this |
+| Signed Payload StrKey (P...) | Not Implemented | Medium Priority |
+| Contract StrKey (C...) | Not Implemented | Medium Priority |
 
 ### Key Utilities (KeyUtils.h/cpp)
 
@@ -284,7 +288,6 @@ All high priority items are **implemented**:
 - Short hash (SipHash-2-4)
 
 ### Medium Priority (Needed for Full Network Participation)
-- SignerKey utilities for transaction validation
 - Contract address (C...) StrKey support
 - Signed payload (P...) StrKey support
 
@@ -311,5 +314,7 @@ The Rust implementation includes unit tests for:
 - Curve25519 shared key derivation with local_first ordering
 - Curve25519 XDR type conversions
 - Curve25519 key clearing/zeroization
+- SignerKey creation (pre_auth_tx_key, hash_x_key, ed25519_payload_key, ed25519_key)
+- SignerKey Ed25519 extraction
 
 Tests are located in each module file under `#[cfg(test)]` sections.
