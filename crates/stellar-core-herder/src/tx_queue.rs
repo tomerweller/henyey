@@ -1832,6 +1832,39 @@ impl TransactionQueue {
             .map(|entry| entry.2)
             .collect()
     }
+
+    /// Get statistics about the transaction queue.
+    pub fn stats(&self) -> TxQueueStats {
+        let by_hash = self.by_hash.read();
+        let seen = self.seen.read();
+
+        // Count accounts with pending transactions
+        let mut accounts: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for tx in by_hash.values() {
+            let account_id = account_id_from_envelope(&tx.envelope);
+            accounts.insert(account_key_from_account_id(&account_id));
+        }
+
+        TxQueueStats {
+            pending_count: by_hash.len(),
+            account_count: accounts.len(),
+            banned_count: self.banned_count(),
+            seen_count: seen.len(),
+        }
+    }
+}
+
+/// Statistics about the transaction queue.
+#[derive(Debug, Clone, Default)]
+pub struct TxQueueStats {
+    /// Number of pending transactions.
+    pub pending_count: usize,
+    /// Number of accounts with pending transactions.
+    pub account_count: usize,
+    /// Number of currently banned transactions.
+    pub banned_count: usize,
+    /// Number of seen (deduplicated) transaction hashes.
+    pub seen_count: usize,
 }
 
 fn extra_signers_satisfied(

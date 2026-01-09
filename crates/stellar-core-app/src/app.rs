@@ -56,6 +56,7 @@ use tokio::sync::mpsc;
 use stellar_core_bucket::BucketManager;
 use stellar_core_herder::{
     EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
+    drift_tracker::CloseTimeDriftTracker,
 };
 use stellar_core_history::{
     is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupOutput,
@@ -343,6 +344,9 @@ pub struct App {
     survey_reporting: RwLock<SurveyReportingState>,
     /// SCP timeout scheduling state.
     scp_timeouts: RwLock<ScpTimeoutState>,
+
+    /// Close time drift tracker for clock synchronization monitoring.
+    drift_tracker: std::sync::Mutex<CloseTimeDriftTracker>,
 
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
@@ -812,6 +816,7 @@ impl App {
             survey_throttle,
             survey_reporting: RwLock::new(SurveyReportingState::new()),
             scp_timeouts: RwLock::new(ScpTimeoutState::new()),
+            drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
             lost_sync_count: AtomicU64::new(0),
             ping_counter: AtomicU64::new(0),
             ping_inflight: RwLock::new(HashMap::new()),
@@ -2032,6 +2037,7 @@ impl App {
         let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
         let mut peer_maintenance_interval = tokio::time::interval(Duration::from_secs(10));
         let mut peer_refresh_interval = tokio::time::interval(Duration::from_secs(60));
+        let mut herder_cleanup_interval = tokio::time::interval(Duration::from_secs(30));
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
@@ -2164,6 +2170,11 @@ impl App {
                     }
                 }
 
+                // Herder cleanup - evict expired data
+                _ = herder_cleanup_interval.tick() => {
+                    self.herder.cleanup();
+                }
+
                 // Shutdown signal (lowest priority)
                 _ = shutdown_rx.recv() => {
                     tracing::info!("Shutdown signal received");
@@ -2178,13 +2189,29 @@ impl App {
                     let overlay = self.overlay.lock().await;
                     let peers = overlay.as_ref().map(|o| o.peer_count()).unwrap_or(0);
                     drop(overlay);
+
+                    // Check quorum status for the tracking slot
+                    let heard_from_quorum = self.herder.heard_from_quorum(tracking_slot);
+                    let is_v_blocking = self.herder.is_v_blocking(tracking_slot);
+
                     tracing::info!(
                         tracking_slot,
                         ledger,
                         latest_ext,
                         peers,
+                        heard_from_quorum,
+                        is_v_blocking,
                         "Heartbeat"
                     );
+
+                    // Warn if we haven't heard from quorum for a while
+                    if self.is_validator && !heard_from_quorum && peers > 0 {
+                        tracing::warn!(
+                            tracking_slot,
+                            is_v_blocking,
+                            "Have not heard from quorum - may be experiencing network partition"
+                        );
+                    }
 
                     // If externalization stalls, ask peers for fresh SCP state.
                     if peers > 0 && self.herder.state().can_receive_scp() {
@@ -2197,6 +2224,7 @@ impl App {
                             tracing::warn!(
                                 latest_ext,
                                 tracking_slot,
+                                heard_from_quorum,
                                 "SCP externalization stalled; requesting SCP state"
                             );
                             *self.last_scp_state_request_at.write().await = now;
@@ -3191,6 +3219,16 @@ impl App {
         if self.herder.is_tracking() {
             let next_slot = (current_slot + 1) as u32;
             tracing::debug!(next_slot, "Checking if we should trigger consensus");
+
+            // Record local close time for drift tracking before triggering consensus.
+            // This captures when we started the consensus round.
+            let local_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Ok(mut tracker) = self.drift_tracker.lock() {
+                tracker.record_local_close_time(next_slot, local_time);
+            }
 
             // In a full implementation, we would:
             // 1. Check if enough time has passed since last close
@@ -5987,19 +6025,51 @@ impl HerderCallback for App {
             tracing::warn!(error = %err, "Failed to persist ledger close data");
         }
 
-        let applied_hashes: Vec<stellar_core_common::Hash256> = tx_set
-            .transactions
-            .iter()
-            .filter_map(|tx| self.tx_hash(tx))
-            .collect();
+        // Separate successful and failed transactions for queue management.
+        // Results are in the same order as tx_set.transactions.
+        let mut applied_hashes = Vec::new();
+        let mut failed_hashes = Vec::new();
+        for (tx, result) in tx_set.transactions.iter().zip(results.iter()) {
+            if let Some(hash) = self.tx_hash(tx) {
+                if result.success {
+                    applied_hashes.push(hash);
+                } else {
+                    failed_hashes.push(hash);
+                }
+            }
+        }
+
         self.herder
             .ledger_closed(ledger_seq as u64, &applied_hashes);
+
+        // Ban failed transactions to prevent immediate resubmission.
+        if !failed_hashes.is_empty() {
+            tracing::debug!(
+                failed_count = failed_hashes.len(),
+                "Banning failed transactions"
+            );
+            self.herder.tx_queue().ban(&failed_hashes);
+        }
+
+        // Record externalized close time for drift tracking and log warning if clock drift is high.
+        if let Ok(mut tracker) = self.drift_tracker.lock() {
+            if let Some(warning) = tracker.record_externalized_close_time(ledger_seq, close_time) {
+                tracing::warn!("{}", warning);
+            }
+        }
+
         self.herder.tx_queue().update_validation_context(
             ledger_seq,
             result.header.scp_value.close_time.0,
             result.header.ledger_version,
             result.header.base_fee,
         );
+
+        // Shift the transaction ban queue - ages out old bans after each ledger close.
+        let unbanned = self.herder.tx_queue().shift();
+        if unbanned > 0 {
+            tracing::debug!(unbanned, "Shifted transaction ban queue");
+        }
 
         // Update current ledger tracking
         *self.current_ledger.write().await = ledger_seq;

@@ -51,12 +51,13 @@ use stellar_xdr::curr::{
 };
 
 use crate::error::HerderError;
-use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult};
+use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
 use crate::state::HerderState;
 use crate::tx_queue::{
     account_key_from_account_id, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
+    TxQueueStats,
 };
 use crate::Result;
 
@@ -1189,6 +1190,8 @@ impl Herder {
             pending_envelope_slots: self.pending_envelopes.slot_count(),
             cached_tx_sets: self.scp_driver.tx_set_cache_size(),
             is_validator: self.is_validator(),
+            pending_envelope_stats: self.pending_envelopes.stats(),
+            tx_queue_stats: self.tx_queue.stats(),
         }
     }
 }
@@ -1225,6 +1228,10 @@ pub struct HerderStats {
     pub cached_tx_sets: usize,
     /// Whether this node is a validator.
     pub is_validator: bool,
+    /// Detailed pending envelope statistics.
+    pub pending_envelope_stats: PendingStats,
+    /// Detailed transaction queue statistics.
+    pub tx_queue_stats: TxQueueStats,
 }
 
 fn node_id_from_public_key(pk: &PublicKey) -> NodeId {
