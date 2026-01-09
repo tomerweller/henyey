@@ -79,6 +79,8 @@ This document tracks the parity between the Rust `stellar-core-crypto` crate and
 | Pre-Auth TX (T...) | `encode/decode_pre_auth_tx()` | Implemented |
 | SHA256 Hash (X...) | `encode/decode_sha256_hash()` | Implemented |
 | Muxed Account (M...) | `encode/decode_muxed_account()` | Implemented |
+| Contract Address (C...) | `encode/decode_contract()` | Implemented |
+| Signed Payload (P...) | `encode/decode_signed_payload()` | Implemented |
 | CRC16-XModem | `crc16_xmodem()` (internal) | Implemented |
 | `getStrKeySize()` | Not exposed | Not Implemented |
 
@@ -171,8 +173,8 @@ The C++ implementation includes a process-wide signature verification cache (`Ra
 | N/A | `hash_x_key_from_hash()` | Implemented |
 | N/A | `get_ed25519_from_signer_key()` | Implemented |
 | `KeyFunctions<SignerKey>` template | Not Needed | Rust generics provide this |
-| Signed Payload StrKey (P...) | Not Implemented | Medium Priority |
-| Contract StrKey (C...) | Not Implemented | Medium Priority |
+| Signed Payload StrKey (P...) | `encode/decode_signed_payload()` | Implemented |
+| Contract StrKey (C...) | `encode/decode_contract()` | Implemented |
 
 ### Key Utilities (KeyUtils.h/cpp)
 
@@ -288,8 +290,9 @@ All high priority items are **implemented**:
 - Short hash (SipHash-2-4)
 
 ### Medium Priority (Needed for Full Network Participation)
-- Contract address (C...) StrKey support
-- Signed payload (P...) StrKey support
+All medium priority items are **implemented**:
+- Contract address (C...) StrKey support - `encode_contract()`, `decode_contract()`
+- Signed payload (P...) StrKey support - `encode_signed_payload()`, `decode_signed_payload()`
 
 ### Low Priority (Optimizations and Testing)
 - Signature verification cache
