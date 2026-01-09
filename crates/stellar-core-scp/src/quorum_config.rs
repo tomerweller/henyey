@@ -109,10 +109,11 @@ pub fn config_to_quorum_set(config: &QuorumSetConfig) -> Result<ScpQuorumSet, Qu
 
     // Calculate threshold from percentage
     let total = validators.len() + inner_sets.len();
+    let threshold_percent: u32 = config.threshold_percent.into();
     let threshold = if total == 0 {
         0
     } else {
-        ((config.threshold_percent as usize * total) / 100).max(1) as u32
+        ((threshold_percent as usize * total) / 100).max(1) as u32
     };
 
     // Validate threshold
@@ -190,10 +191,11 @@ fn parse_hex_node_id(key_str: &str) -> Result<NodeId, QuorumConfigError> {
 /// 2. Threshold is reasonable (not 0, not > 100%)
 /// 3. There are enough validators for safety
 pub fn validate_quorum_config(config: &QuorumSetConfig) -> Result<(), QuorumConfigError> {
-    // Check threshold is in range
-    if config.threshold_percent > 100 {
+    // Check threshold is in range (ThresholdPercent already validated during deserialization)
+    let threshold_value: u32 = config.threshold_percent.into();
+    if threshold_value > 100 {
         return Err(QuorumConfigError::InvalidThreshold {
-            threshold: config.threshold_percent,
+            threshold: threshold_value,
             validator_count: 100,
         });
     }
@@ -212,15 +214,15 @@ pub fn validate_quorum_config(config: &QuorumSetConfig) -> Result<(), QuorumConf
     }
 
     // Warn if threshold is too low
-    if config.threshold_percent < 51 {
+    if threshold_value < 51 {
         warn!(
             "Quorum threshold {}% is below 51% - this may compromise safety",
-            config.threshold_percent
+            threshold_value
         );
     }
 
     // Warn if threshold is 100% (no fault tolerance)
-    if config.threshold_percent == 100 && !config.validators.is_empty() {
+    if threshold_value == 100 && !config.validators.is_empty() {
         warn!(
             "Quorum threshold is 100% - no fault tolerance, any validator failure blocks consensus"
         );
@@ -278,7 +280,7 @@ pub mod known_validators {
 /// Create a testnet quorum set configuration.
 pub fn testnet_quorum_config() -> QuorumSetConfig {
     QuorumSetConfig {
-        threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT,
+        threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT.into(),
         validators: known_validators::TESTNET_VALIDATORS
             .iter()
             .map(|s| s.to_string())
@@ -293,7 +295,7 @@ pub fn testnet_quorum_config() -> QuorumSetConfig {
 /// based on validators you trust. This is just a starting point.
 pub fn mainnet_sdf_quorum_config() -> QuorumSetConfig {
     QuorumSetConfig {
-        threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT,
+        threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT.into(),
         validators: known_validators::MAINNET_SDF_VALIDATORS
             .iter()
             .map(|s| s.to_string())
@@ -330,7 +332,7 @@ mod tests {
     #[test]
     fn test_config_to_quorum_set() {
         let config = QuorumSetConfig {
-            threshold_percent: 67,
+            threshold_percent: 67.into(),
             validators: vec![
                 "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
                 "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
@@ -347,7 +349,7 @@ mod tests {
     #[test]
     fn test_validate_quorum_config() {
         let config = QuorumSetConfig {
-            threshold_percent: 67,
+            threshold_percent: 67.into(),
             validators: vec![
                 "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
                 "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
@@ -364,19 +366,15 @@ mod tests {
         // The testnet validator keys are strkey format, so this may fail
         // if stellar-strkey is not available - that's ok for testing structure
         assert!(!config.validators.is_empty());
-        assert_eq!(config.threshold_percent, 67);
+        assert_eq!(config.threshold_percent.value(), 67);
     }
 
     #[test]
-    fn test_invalid_threshold() {
-        let config = QuorumSetConfig {
-            threshold_percent: 150, // Invalid: > 100%
-            validators: vec![
-                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-            ],
-            inner_sets: Vec::new(),
-        };
-
-        assert!(validate_quorum_config(&config).is_err());
+    fn test_threshold_percent_clamped() {
+        // ThresholdPercent clamps values > 100 to 100
+        // This tests that the clamping works correctly
+        use stellar_core_common::config::ThresholdPercent;
+        let threshold: ThresholdPercent = 150.into();
+        assert_eq!(threshold.value(), 100);
     }
 }

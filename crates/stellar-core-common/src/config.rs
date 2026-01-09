@@ -32,8 +32,96 @@
 //! let testnet_config = Config::testnet();
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
+
+/// Log levels for filtering log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+/// Log output formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+/// A threshold percentage value constrained to 0-100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ThresholdPercent(u32);
+
+impl ThresholdPercent {
+    /// Create a new threshold percentage, clamping to 0-100.
+    pub fn new(value: u32) -> Self {
+        Self(value.min(100))
+    }
+
+    /// Get the percentage value.
+    pub fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for ThresholdPercent {
+    fn default() -> Self {
+        Self(67)
+    }
+}
+
+impl std::fmt::Display for ThresholdPercent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl PartialEq<u32> for ThresholdPercent {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<u32> for ThresholdPercent {
+    fn partial_cmp(&self, other: &u32) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
+impl From<u32> for ThresholdPercent {
+    fn from(value: u32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<ThresholdPercent> for u32 {
+    fn from(value: ThresholdPercent) -> Self {
+        value.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ThresholdPercent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        if value > 100 {
+            return Err(serde::de::Error::custom(
+                "threshold_percent must be between 0 and 100",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
 
 /// Main configuration for rs-stellar-core.
 ///
@@ -164,8 +252,8 @@ pub struct QuorumSetConfig {
     /// Threshold percentage (0-100) of validators/inner sets that must agree.
     ///
     /// For example, 67 means at least 67% must agree. Default: 67
-    #[serde(default = "default_threshold")]
-    pub threshold_percent: u32,
+    #[serde(default)]
+    pub threshold_percent: ThresholdPercent,
 
     /// Public keys of validators in this quorum set.
     ///
@@ -231,30 +319,19 @@ pub struct HistoryArchiveConfig {
 }
 
 /// Logging configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoggingConfig {
     /// Log level filter.
     ///
-    /// Valid values: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`
-    /// Default: `"info"`
-    #[serde(default = "default_log_level")]
-    pub level: String,
+    /// Default: `Info`
+    #[serde(default)]
+    pub level: LogLevel,
 
     /// Log output format.
     ///
-    /// Valid values: `"text"` (human-readable), `"json"` (structured)
-    /// Default: `"text"`
-    #[serde(default = "default_log_format")]
-    pub format: String,
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: default_log_level(),
-            format: default_log_format(),
-        }
-    }
+    /// Default: `Text`
+    #[serde(default)]
+    pub format: LogFormat,
 }
 
 fn default_peer_port() -> u16 {
@@ -271,18 +348,6 @@ fn default_max_peers() -> usize {
 
 fn default_target_peers() -> usize {
     8
-}
-
-fn default_threshold() -> u32 {
-    67
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_log_format() -> String {
-    "text".to_string()
 }
 
 impl Config {

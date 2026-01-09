@@ -139,6 +139,13 @@ impl Resource {
         self.values.len()
     }
 
+    /// Gets the value for a specific resource type, returning `None` if out of bounds.
+    ///
+    /// This is the safe variant that does not panic.
+    pub fn try_get_val(&self, ty: ResourceType) -> Option<i64> {
+        self.values.get(ty as usize).copied()
+    }
+
     /// Gets the value for a specific resource type.
     ///
     /// # Panics
@@ -146,6 +153,18 @@ impl Resource {
     /// Panics if the resource type index is out of bounds for this resource vector.
     pub fn get_val(&self, ty: ResourceType) -> i64 {
         self.values[ty as usize]
+    }
+
+    /// Sets the value for a specific resource type, returning `false` if out of bounds.
+    ///
+    /// This is the safe variant that does not panic.
+    pub fn try_set_val(&mut self, ty: ResourceType, val: i64) -> bool {
+        if let Some(slot) = self.values.get_mut(ty as usize) {
+            *slot = val;
+            true
+        } else {
+            false
+        }
     }
 
     /// Sets the value for a specific resource type.

@@ -116,20 +116,15 @@ fn change_type_order(change: &LedgerEntryChange) -> u8 {
 /// Changes are sorted by (key_bytes, change_type, change_hash) to ensure
 /// deterministic ordering regardless of the original order.
 fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::curr::Error> {
-    let mut entries: Vec<(Vec<u8>, u8, [u8; 32], LedgerEntryChange)> = changes
-        .0
-        .iter()
-        .cloned()
-        .map(|change| {
-            let key = change_key(&change);
-            let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-            let change_hash = Hash256::hash_xdr(&change)
-                .map(|hash| hash.0)
-                .unwrap_or([0u8; 32]);
-            let order = change_type_order(&change);
-            (key_bytes, order, change_hash, change)
-        })
-        .collect();
+    let mut entries: Vec<(Vec<u8>, u8, [u8; 32], LedgerEntryChange)> = Vec::with_capacity(changes.0.len());
+
+    for change in changes.0.iter().cloned() {
+        let key = change_key(&change);
+        let key_bytes = key.to_xdr(Limits::none())?;
+        let change_hash = Hash256::hash_xdr(&change)?.0;
+        let order = change_type_order(&change);
+        entries.push((key_bytes, order, change_hash, change));
+    }
 
     entries.sort_by(|a, b| {
         a.0.cmp(&b.0)
@@ -138,7 +133,7 @@ fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::cur
     });
 
     let sorted: Vec<LedgerEntryChange> = entries.into_iter().map(|(_, _, _, c)| c).collect();
-    changes.0 = sorted.try_into().unwrap_or_default();
+    changes.0 = sorted.try_into().map_err(|_| stellar_xdr::curr::Error::Invalid)?;
     Ok(())
 }
 
