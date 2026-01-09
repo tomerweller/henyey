@@ -767,27 +767,6 @@ impl CatchupManager {
         Ok(Vec::new())
     }
 
-    /// Download a single bucket.
-    #[allow(dead_code)]
-    async fn download_bucket(&self, hash: &Hash256) -> Result<Vec<u8>> {
-        for archive in &self.archives {
-            match archive.get_bucket(hash).await {
-                Ok(data) => return Ok(data),
-                Err(e) => {
-                    warn!(
-                        "Failed to download bucket {} from archive {}: {}",
-                        hash,
-                        archive.base_url(),
-                        e
-                    );
-                    continue;
-                }
-            }
-        }
-
-        Err(HistoryError::BucketNotFound(*hash))
-    }
-
     /// Apply downloaded buckets to build the initial bucket list state.
     /// Returns (live_bucket_list, hot_archive_bucket_list).
     ///

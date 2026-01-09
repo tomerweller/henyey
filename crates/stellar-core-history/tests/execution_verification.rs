@@ -107,15 +107,6 @@ struct LedgerVerificationResult {
     all_tx_match: bool,
 }
 
-/// Check if a mismatch is a Soroban execution difference.
-/// Soroban execution can fail in our test due to state management differences
-/// (e.g., TTL expiration, hot archive, contract instance caching).
-#[allow(dead_code)]
-fn is_soroban_execution_difference(mismatch: &TxMismatch) -> bool {
-    // Check if operations include InvokeHostFunction
-    mismatch.operations.iter().any(|op| op.contains("InvokeHostFunction"))
-}
-
 /// Check if a mismatch is due to path payment liquidity pool differences.
 /// Our path finding doesn't fully support liquidity pools yet, so TooFewOffers
 /// when C++ succeeds through a pool is a known limitation.
