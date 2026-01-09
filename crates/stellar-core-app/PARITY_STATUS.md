@@ -53,7 +53,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `dump-wasm` | Not Implemented | |
 | `encode-asset` | Not Implemented | |
 | `force-scp` | Not Implemented | Deprecated in C++ |
-| `gen-seed` | Not Implemented | |
+| `gen-seed` | Implemented | `new-keypair` command in rs-stellar-core |
 | `http-command` | Not Implemented | |
 | `self-check` (CLI) | Not Implemented | HTTP endpoint exists |
 | `merge-bucketlist` | Not Implemented | |
