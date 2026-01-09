@@ -34,15 +34,9 @@ clap.workspace = true
 
 # Async runtime
 tokio.workspace = true
-futures.workspace = true
-async-trait.workspace = true
-x25519-dalek.workspace = true
-rand.workspace = true
 
 # HTTP server
 axum.workspace = true
-tower.workspace = true
-tower-http.workspace = true
 
 # Configuration
 toml.workspace = true
@@ -64,7 +58,6 @@ flate2.workspace = true
 
 # URL handling
 url.workspace = true
-fs2.workspace = true
 
 # Temp files
 tempfile.workspace = true
