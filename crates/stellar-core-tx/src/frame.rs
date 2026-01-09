@@ -477,6 +477,27 @@ impl TransactionFrame {
             .unwrap_or(0)
     }
 
+    /// Return the inner transaction envelope size for fee bump, or full envelope size for regular tx.
+    /// This is used for Soroban resource fee computation, matching C++ behavior where
+    /// FeeBumpTransactionFrame::getResources() delegates to mInnerTx->getResources().
+    pub fn inner_tx_size_bytes(&self) -> u32 {
+        match &self.envelope {
+            TransactionEnvelope::TxFeeBump(fee_bump) => {
+                // Get the inner transaction envelope and compute its size
+                let inner_envelope = match &fee_bump.tx.inner_tx {
+                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                        TransactionEnvelope::Tx(inner.clone())
+                    }
+                };
+                inner_envelope
+                    .to_xdr(Limits::none())
+                    .map(|bytes| bytes.len() as u32)
+                    .unwrap_or(0)
+            }
+            _ => self.tx_size_bytes(),
+        }
+    }
+
     /// Build Soroban transaction resources for fee computation.
     pub fn soroban_transaction_resources(
         &self,
@@ -500,7 +521,9 @@ impl TransactionFrame {
             disk_read_bytes: data.resources.disk_read_bytes,
             write_bytes: data.resources.write_bytes,
             contract_events_size_bytes,
-            transaction_size_bytes: self.tx_size_bytes(),
+            // Use inner_tx_size_bytes to match C++ behavior: FeeBumpTransactionFrame::getResources()
+            // delegates to mInnerTx->getResources(), so the tx size is the inner tx envelope size.
+            transaction_size_bytes: self.inner_tx_size_bytes(),
         })
     }
 

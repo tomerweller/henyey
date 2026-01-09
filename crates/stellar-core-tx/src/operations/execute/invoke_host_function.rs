@@ -197,13 +197,38 @@ fn execute_upload_wasm(
     hasher.update(wasm.as_slice());
     let code_hash = Hash(hasher.finalize().into());
 
+    // The return value for UploadContractWasm is Bytes containing the code hash.
+    // This matches the soroban-env-host behavior.
+    let return_value = ScVal::Bytes(
+        stellar_xdr::curr::ScBytes::try_from(code_hash.0.to_vec())
+            .expect("32 bytes should fit in ScBytes"),
+    );
+
+    // Compute the success preimage hash (return value + empty events).
+    // This is what C++ stellar-core uses as the Success result hash.
+    let result_hash = compute_success_preimage_hash(&return_value, &[]);
+
+    // Compute the return value size for fee calculation.
+    // For UploadContractWasm, the return value is Bytes(code_hash).
+    let return_value_xdr_size = return_value
+        .to_xdr(Limits::none())
+        .map(|bytes| bytes.len() as u32)
+        .unwrap_or(0);
+
     // Check if this code already exists
     if state.get_contract_code(&code_hash).is_some() {
-        // Code already exists, just return success with the hash
-        return Ok(OperationExecutionResult::new(make_result(
-            InvokeHostFunctionResultCode::Success,
-            code_hash,
-        )));
+        // Code already exists, just return success with the preimage hash
+        // No rent fee since we're not creating any new entries
+        return Ok(OperationExecutionResult::with_soroban_meta(
+            make_result(InvokeHostFunctionResultCode::Success, result_hash),
+            SorobanOperationMeta {
+                events: Vec::new(),
+                diagnostic_events: Vec::new(),
+                return_value: Some(return_value),
+                event_size_bytes: return_value_xdr_size,
+                rent_fee: 0,
+            },
+        ));
     }
 
     // Create TTL for the code FIRST (matches C++ stellar-core ordering).
@@ -232,11 +257,20 @@ fn execute_upload_wasm(
     };
     state.create_contract_code(code_entry);
 
-    // Return success with the code hash
-    Ok(OperationExecutionResult::new(make_result(
-        InvokeHostFunctionResultCode::Success,
-        code_hash,
-    )))
+    // Return success with the preimage hash
+    // Note: rent_fee is 0 for UploadContractWasm because the rent is computed
+    // separately based on the footprint write entries. The code entry rent is
+    // handled by the ledger execution layer.
+    Ok(OperationExecutionResult::with_soroban_meta(
+        make_result(InvokeHostFunctionResultCode::Success, result_hash),
+        SorobanOperationMeta {
+            events: Vec::new(),
+            diagnostic_events: Vec::new(),
+            return_value: Some(return_value),
+            event_size_bytes: return_value_xdr_size,
+            rent_fee: 0,
+        },
+    ))
 }
 
 /// Extract cost inputs from WASM bytecode.

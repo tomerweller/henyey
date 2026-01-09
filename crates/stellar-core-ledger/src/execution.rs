@@ -377,6 +377,8 @@ pub struct TransactionExecutionResult {
     pub success: bool,
     /// Fee charged (always charged even on failure).
     pub fee_charged: i64,
+    /// Fee refund (for Soroban transactions, protocol < 25 applies this to inner fee too).
+    pub fee_refund: i64,
     /// Operation results.
     pub operation_results: Vec<OperationResult>,
     /// Error message if failed.
@@ -1172,6 +1174,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Invalid transaction structure".into()),
                 failure: Some(failure),
@@ -1186,6 +1189,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Source account not found".into()),
                 failure: Some(ExecutionFailure::NoAccount),
@@ -1199,6 +1203,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Source account not found".into()),
                 failure: Some(ExecutionFailure::NoAccount),
@@ -1215,6 +1220,7 @@ impl TransactionExecutor {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
+                    fee_refund: 0,
                     operation_results: vec![],
                     error: Some("Source account not found".into()),
                     failure: Some(ExecutionFailure::NoAccount),
@@ -1231,6 +1237,7 @@ impl TransactionExecutor {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
+                    fee_refund: 0,
                     operation_results: vec![],
                     error: Some("Source account not found".into()),
                     failure: Some(ExecutionFailure::NoAccount),
@@ -1251,6 +1258,7 @@ impl TransactionExecutor {
                     return Ok(TransactionExecutionResult {
                         success: false,
                         fee_charged: 0,
+                        fee_refund: 0,
                         operation_results: vec![],
                         error: Some("Source account not found".into()),
                         failure: Some(ExecutionFailure::NoAccount),
@@ -1269,6 +1277,7 @@ impl TransactionExecutor {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
+                    fee_refund: 0,
                     operation_results: vec![],
                     error: Some("Insufficient fee".into()),
                     failure: Some(ExecutionFailure::InsufficientFee),
@@ -1281,6 +1290,7 @@ impl TransactionExecutor {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
+                    fee_refund: 0,
                     operation_results: vec![],
                     error: Some("Insufficient fee".into()),
                     failure: Some(ExecutionFailure::InsufficientFee),
@@ -1293,6 +1303,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Insufficient fee".into()),
                 failure: Some(ExecutionFailure::InsufficientFee),
@@ -1315,6 +1326,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Time bounds invalid".into()),
                 failure: Some(match e {
@@ -1332,6 +1344,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Ledger bounds invalid".into()),
                 failure: Some(match e {
@@ -1358,6 +1371,7 @@ impl TransactionExecutor {
                     return Ok(TransactionExecutionResult {
                         success: false,
                         fee_charged: 0,
+                        fee_refund: 0,
                         operation_results: vec![],
                         error: Some("Minimum sequence number not met".into()),
                         failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
@@ -1376,12 +1390,13 @@ impl TransactionExecutor {
                         return Ok(TransactionExecutionResult {
                             success: false,
                             fee_charged: 0,
+                            fee_refund: 0,
                             operation_results: vec![],
                             error: Some("Minimum sequence age unavailable".into()),
                             failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
                             tx_meta: None,
                             fee_changes: None,
-                post_fee_changes: None,
+                            post_fee_changes: None,
                         });
                     }
                 };
@@ -1391,6 +1406,7 @@ impl TransactionExecutor {
                     return Ok(TransactionExecutionResult {
                         success: false,
                         fee_charged: 0,
+                        fee_refund: 0,
                         operation_results: vec![],
                         error: Some("Minimum sequence age not met".into()),
                         failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
@@ -1407,6 +1423,7 @@ impl TransactionExecutor {
                     return Ok(TransactionExecutionResult {
                         success: false,
                         fee_charged: 0,
+                        fee_refund: 0,
                         operation_results: vec![],
                         error: Some("Minimum sequence ledger gap not met".into()),
                         failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
@@ -1425,6 +1442,7 @@ impl TransactionExecutor {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
+                    fee_refund: 0,
                     operation_results: vec![],
                     error: Some("Bad sequence: equals starting sequence".into()),
                     failure: Some(ExecutionFailure::BadSequence),
@@ -1438,6 +1456,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Bad sequence: sequence overflow".into()),
                 failure: Some(ExecutionFailure::BadSequence),
@@ -1450,6 +1469,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some(format!(
                     "Bad sequence: expected {}, got {}",
@@ -1468,6 +1488,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Invalid signature".into()),
                 failure: Some(ExecutionFailure::InvalidSignature),
@@ -1490,6 +1511,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Invalid signature".into()),
                 failure: Some(ExecutionFailure::InvalidSignature),
@@ -1511,6 +1533,7 @@ impl TransactionExecutor {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
+                    fee_refund: 0,
                     operation_results: vec![],
                     error: Some("Invalid inner signature".into()),
                     failure: Some(ExecutionFailure::InvalidSignature),
@@ -1533,6 +1556,7 @@ impl TransactionExecutor {
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
+                fee_refund: 0,
                 operation_results: vec![],
                 error: Some("Invalid signature".into()),
                 failure: Some(ExecutionFailure::InvalidSignature),
@@ -1558,6 +1582,7 @@ impl TransactionExecutor {
                     return Ok(TransactionExecutionResult {
                         success: false,
                         fee_charged: 0,
+                        fee_refund: 0,
                         operation_results: vec![],
                         error: Some("Missing extra signer".into()),
                         failure: Some(ExecutionFailure::BadAuthExtra),
@@ -1600,7 +1625,7 @@ impl TransactionExecutor {
             self.classic_events,
         );
         let mut refundable_fee_tracker = if frame.is_soroban() {
-            let (non_refundable_fee, _) =
+            let (non_refundable_fee, initial_refundable_fee) =
                 compute_soroban_resource_fee(&frame, self.protocol_version, &self.soroban_config, 0)
                     .unwrap_or((0, 0));
             let declared_fee = frame.declared_soroban_resource_fee();
@@ -2052,6 +2077,7 @@ impl TransactionExecutor {
         Ok(TransactionExecutionResult {
             success: all_success,
             fee_charged: fee.saturating_sub(fee_refund),
+            fee_refund,
             operation_results,
             error: if all_success {
                 None
@@ -3483,7 +3509,8 @@ pub fn build_tx_result_pair(
         // Calculate inner fee_charged using C++ formula:
         // Protocol >= 25: 0 (outer pays everything)
         // Protocol < 25 and protocol >= 11:
-        //   - For Soroban: resourceFee + min(inclusionFee, baseFee * numOps)
+        //   - For Soroban: resourceFee + min(inclusionFee, baseFee * numOps) - refund
+        //     (C++ had a bug where refund was applied to inner fee; this was fixed in p25)
         //   - For classic: min(inner_fee, baseFee * numOps)
         let inner_fee_charged = if protocol_version >= 25 {
             0
@@ -3495,7 +3522,11 @@ pub fn build_tx_result_pair(
                 let resource_fee = frame.declared_soroban_resource_fee();
                 let inner_fee = frame.inner_fee() as i64;
                 let inclusion_fee = inner_fee - resource_fee;
-                resource_fee + std::cmp::min(inclusion_fee, adjusted_fee)
+                let computed_fee = resource_fee + std::cmp::min(inclusion_fee, adjusted_fee);
+                // Prior to protocol 25, C++ incorrectly applied the refund to the inner
+                // feeCharged field for fee bump transactions. We replicate this behavior
+                // for compatibility.
+                computed_fee.saturating_sub(exec.fee_refund)
             } else {
                 // For classic transactions
                 std::cmp::min(frame.inner_fee() as i64, adjusted_fee)

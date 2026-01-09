@@ -49,13 +49,25 @@ struct VerificationConfig {
 
 impl Default for VerificationConfig {
     fn default() -> Self {
+        // Support environment variable overrides for ledger range
+        let start_ledger = std::env::var("TESTNET_LEDGER_START")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256779);
+        let end_ledger = std::env::var("TESTNET_LEDGER_END")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256779);
+        let date_partition = std::env::var("TESTNET_DATE_PARTITION")
+            .unwrap_or_else(|_| "2025-12-18".to_string());
+
         Self {
             cdp_base_url: "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet".to_string(),
-            date_partition: "2025-12-18".to_string(),  // AWS public blockchain CDP data
+            date_partition,  // AWS public blockchain CDP data
             archive_url: "https://history.stellar.org/prd/core-testnet/core_testnet_001/".to_string(),
             network_id: NetworkId::testnet(),
-            start_ledger: 256065,  // Start after checkpoint 256063
-            end_ledger: 256150,    // Short range to investigate Soroban mismatches
+            start_ledger,
+            end_ledger,
         }
     }
 }
@@ -799,7 +811,7 @@ async fn test_verify_single_ledger() {
 #[ignore]
 async fn test_analyze_mismatch() {
     // The mismatch transactions: ledgers 310088 and 310138
-    let ledger_seq = 256121u32;  // Soroban mismatch to investigate
+    let ledger_seq = 256779u32;  // Fee bump Soroban mismatch to investigate
     let network_id = NetworkId::testnet();
 
     let cdp = CdpDataLake::new(
