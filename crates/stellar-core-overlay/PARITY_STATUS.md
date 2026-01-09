@@ -130,9 +130,9 @@ The following features from the C++ overlay are implemented in Rust:
 - Known peer tracking and discovery
 - Basic ban list (in-memory)
 
-### Not Yet Implemented (Gaps)
+### Cross-Crate Integration Points
 
-All major components have been implemented. The following items are minor gaps or intentional architectural differences:
+All major overlay components have been implemented. The following items require integration with other crates (SCP consensus, transaction queue) and are intentionally forwarded to subscribers:
 
 #### Message Handlers
 
@@ -152,7 +152,7 @@ The following message types are received but not fully processed:
 | `TimeSlicedSurvey*` | **Implemented** - SurveyManager handles survey lifecycle and data collection |
 | `DontHave` | **Implemented** - Routes to ItemFetcher for retry |
 
-#### Detailed Feature Gaps
+#### Feature Implementation Status
 
 1. **Pull-Mode Transaction Flooding**
    - C++: TxAdverts batches outgoing transaction hashes
@@ -210,7 +210,7 @@ The following message types are received but not fully processed:
 
 6. **Metrics**
    - C++: Medida library with timers/meters/counters
-   - Rust: Basic atomic counters (full metrics TBD)
+   - Rust: Full OverlayMetrics with atomic counters, timers, and comprehensive tracking (implemented)
 
 #### Key Algorithm Parity
 
