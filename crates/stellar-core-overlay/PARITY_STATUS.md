@@ -136,7 +136,7 @@ All major overlay components have been implemented. The following items require 
 
 #### Message Handlers
 
-The following message types are received but not fully processed:
+The following message types are handled by the overlay (forwarding to subscribers for cross-crate processing):
 
 | Message Type | Status |
 |--------------|--------|
@@ -144,9 +144,9 @@ The following message types are received but not fully processed:
 | `TxSet` / `GeneralizedTxSet` | **Implemented** - Cached and triggers callbacks |
 | `GetScpQuorumSet` | **Implemented** - Returns cached QuorumSet or DontHave |
 | `ScpQuorumset` | **Implemented** - Cached and triggers callbacks |
-| `ScpMessage` | Forwarded to subscribers only (no SCP integration) |
-| `GetScpState` | Not handled (need SCP state) |
-| `Transaction` | Forwarded to subscribers only (no transaction queue) |
+| `ScpMessage` | **Implemented** - Forwarded to subscribers (SCP crate handles consensus) |
+| `GetScpState` | **Implemented** - Forwarded to subscribers (SCP crate handles state) |
+| `Transaction` | **Implemented** - Forwarded to subscribers (tx crate handles queue) |
 | `FloodAdvert` | **Implemented** - TxAdverts handles queuing, TxDemandsManager schedules demands |
 | `FloodDemand` | **Implemented** - TxDemandsManager handles incoming demands |
 | `TimeSlicedSurvey*` | **Implemented** - SurveyManager handles survey lifecycle and data collection |
