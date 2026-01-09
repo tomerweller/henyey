@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use stellar_xdr::curr::{NodeId, ScpEnvelope, ScpQuorumSet, Value};
+use stellar_xdr::curr::{NodeId, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value};
 
 use crate::driver::SCPDriver;
 use crate::slot::Slot;
@@ -138,6 +138,35 @@ impl<D: SCPDriver> SCP<D> {
         self.local_quorum_set = quorum_set;
     }
 
+    /// Get a reference to the SCP driver.
+    ///
+    /// This provides access to the application driver for callbacks
+    /// and application-specific logic.
+    pub fn driver(&self) -> &Arc<D> {
+        &self.driver
+    }
+
+    /// Check if SCP has no active slots.
+    ///
+    /// Returns true if there are no slots being tracked, indicating
+    /// that SCP is in an idle state with no active consensus.
+    pub fn empty(&self) -> bool {
+        self.slots.read().is_empty()
+    }
+
+    /// Get the highest known slot index.
+    ///
+    /// Returns the highest slot index that SCP is tracking, regardless
+    /// of whether it has been externalized. This differs from
+    /// [`highest_externalized_slot`](Self::highest_externalized_slot) which
+    /// only considers externalized slots.
+    ///
+    /// # Returns
+    /// The highest slot index, or None if no slots exist.
+    pub fn get_highest_known_slot(&self) -> Option<u64> {
+        self.slots.read().keys().copied().max()
+    }
+
     /// Process an incoming SCP envelope.
     ///
     /// This is the main entry point for processing SCP messages
@@ -196,12 +225,7 @@ impl<D: SCPDriver> SCP<D> {
     ///
     /// # Returns
     /// True if nomination was started successfully.
-    pub fn nominate(
-        &self,
-        slot_index: u64,
-        value: Value,
-        prev_value: &Value,
-    ) -> bool {
+    pub fn nominate(&self, slot_index: u64, value: Value, prev_value: &Value) -> bool {
         if !self.is_validator {
             return false;
         }
@@ -223,12 +247,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Nominate with timeout flag.
     ///
     /// Called when the nomination timer expires without reaching consensus.
-    pub fn nominate_timeout(
-        &self,
-        slot_index: u64,
-        value: Value,
-        prev_value: &Value,
-    ) -> bool {
+    pub fn nominate_timeout(&self, slot_index: u64, value: Value, prev_value: &Value) -> bool {
         if !self.is_validator {
             return false;
         }
@@ -248,7 +267,7 @@ impl<D: SCPDriver> SCP<D> {
     /// typically when the ballot protocol has taken over.
     pub fn stop_nomination(&self, slot_index: u64) {
         if let Some(slot) = self.slots.write().get_mut(&slot_index) {
-            slot.stop_nomination();
+            slot.stop_nomination(&self.driver);
         }
     }
 
@@ -262,6 +281,20 @@ impl<D: SCPDriver> SCP<D> {
         } else {
             false
         }
+    }
+
+    /// Handle ballot protocol timer expiration.
+    ///
+    /// This is an alias for [`bump_ballot`](Self::bump_ballot) that matches
+    /// the C++ `ballotProtocolTimerExpired()` naming convention.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot whose timer expired
+    ///
+    /// # Returns
+    /// True if the ballot was bumped, false otherwise.
+    pub fn ballot_protocol_timer_expired(&self, slot_index: u64) -> bool {
+        self.bump_ballot(slot_index)
     }
 
     /// Get the externalized value for a slot.
@@ -363,6 +396,153 @@ impl<D: SCPDriver> SCP<D> {
         self.driver.compute_timeout(round, false)
     }
 
+    /// Check if we've heard from a v-blocking set for a slot.
+    ///
+    /// A v-blocking set is a set of nodes that can block any quorum.
+    /// If we've heard from a v-blocking set, it means we have significant
+    /// network participation.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to check
+    ///
+    /// # Returns
+    /// True if we've heard from a v-blocking set.
+    pub fn got_v_blocking(&self, slot_index: u64) -> bool {
+        let slots = self.slots.read();
+        let Some(slot) = slots.get(&slot_index) else {
+            return false;
+        };
+
+        let nodes = slot.get_nodes_heard_from();
+        crate::quorum::is_blocking_set(&self.local_quorum_set, &nodes)
+    }
+
+    /// Get the cumulative statement count across all slots.
+    ///
+    /// This is used for monitoring the total number of SCP statements
+    /// processed by this node.
+    ///
+    /// # Returns
+    /// The total number of statements recorded across all slots.
+    pub fn get_cumulative_statement_count(&self) -> usize {
+        self.slots
+            .read()
+            .values()
+            .map(|slot| slot.get_statement_count())
+            .sum()
+    }
+
+    /// Get the latest messages that would be sent for a slot.
+    ///
+    /// Returns the latest envelopes for the slot that would be
+    /// broadcast to peers.
+    pub fn get_latest_messages_send(&self, slot_index: u64) -> Vec<ScpEnvelope> {
+        let slots = self.slots.read();
+        let Some(slot) = slots.get(&slot_index) else {
+            return Vec::new();
+        };
+
+        slot.get_latest_messages_send()
+    }
+
+    /// Process slots in ascending order starting from a given slot.
+    ///
+    /// # Arguments
+    /// * `from_slot` - The slot to start from
+    /// * `f` - Callback function for each slot, receives (slot_index, slot). Return false to stop.
+    ///
+    /// # Returns
+    /// True if iteration completed, false if stopped early by callback.
+    pub fn process_slots_ascending_from<F>(&self, from_slot: u64, mut f: F) -> bool
+    where
+        F: FnMut(u64) -> bool,
+    {
+        let slots = self.slots.read();
+        let mut indices: Vec<_> = slots.keys().copied().filter(|s| *s >= from_slot).collect();
+        indices.sort_unstable();
+
+        for slot_index in indices {
+            if !f(slot_index) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Process slots in descending order starting from a given slot.
+    ///
+    /// # Arguments
+    /// * `from_slot` - The slot to start from (inclusive upper bound)
+    /// * `f` - Callback function for each slot, receives slot_index. Return false to stop.
+    ///
+    /// # Returns
+    /// True if iteration completed, false if stopped early by callback.
+    pub fn process_slots_descending_from<F>(&self, from_slot: u64, mut f: F) -> bool
+    where
+        F: FnMut(u64) -> bool,
+    {
+        let slots = self.slots.read();
+        let mut indices: Vec<_> = slots.keys().copied().filter(|s| *s <= from_slot).collect();
+        indices.sort_unstable();
+        indices.reverse();
+
+        for slot_index in indices {
+            if !f(slot_index) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Get the latest message from a specific node across all slots.
+    ///
+    /// This returns the latest message (by slot index) from a given node.
+    ///
+    /// # Arguments
+    /// * `node_id` - The node to get messages from
+    ///
+    /// # Returns
+    /// The latest envelope from the node, if any.
+    pub fn get_latest_message(&self, node_id: &NodeId) -> Option<ScpEnvelope> {
+        let slots = self.slots.read();
+        let mut latest: Option<(u64, ScpEnvelope)> = None;
+
+        for (&slot_index, slot) in slots.iter() {
+            if let Some(env) = slot.get_latest_envelope(node_id) {
+                if latest
+                    .as_ref()
+                    .map(|(idx, _)| slot_index > *idx)
+                    .unwrap_or(true)
+                {
+                    latest = Some((slot_index, env.clone()));
+                }
+            }
+        }
+
+        latest.map(|(_, env)| env)
+    }
+
+    /// Get the externalizing state for a slot.
+    ///
+    /// Returns envelopes that contribute to the externalized state
+    /// of a slot, if it has been externalized.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to get state for
+    ///
+    /// # Returns
+    /// A vector of envelopes contributing to externalization.
+    pub fn get_externalizing_state(&self, slot_index: u64) -> Vec<ScpEnvelope> {
+        let slots = self.slots.read();
+        let Some(slot) = slots.get(&slot_index) else {
+            return Vec::new();
+        };
+
+        slot.get_externalizing_state()
+    }
+
     /// Cleanup old slots, keeping only the most recent ones.
     fn cleanup_old_slots(&self, slots: &mut HashMap<u64, Slot>) {
         if slots.len() <= self.max_slots {
@@ -392,6 +572,122 @@ impl<D: SCPDriver> SCP<D> {
         })
     }
 
+    /// Restore state from a saved envelope (for crash recovery).
+    ///
+    /// This method is used to restore SCP state from a previously saved envelope
+    /// when restarting after a crash. It creates the slot if needed and restores
+    /// the state from the envelope.
+    ///
+    /// # Arguments
+    /// * `envelope` - The envelope to restore state from
+    ///
+    /// # Returns
+    /// True if state was successfully restored, false if the envelope is invalid.
+    pub fn set_state_from_envelope(&self, envelope: &ScpEnvelope) -> bool {
+        let slot_index = envelope.statement.slot_index;
+        let mut slots = self.slots.write();
+
+        let slot = slots.entry(slot_index).or_insert_with(|| {
+            Slot::new(
+                slot_index,
+                self.local_node_id.clone(),
+                self.local_quorum_set.clone(),
+                self.is_validator,
+            )
+        });
+
+        slot.set_state_from_envelope(envelope)
+    }
+
+    /// Abandon the current ballot for a slot.
+    ///
+    /// This is used when we need to give up on the current ballot,
+    /// for example when we detect that consensus cannot be reached.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to abandon
+    /// * `counter` - The counter for the new ballot (0 to auto-increment)
+    ///
+    /// # Returns
+    /// True if the ballot was abandoned successfully.
+    pub fn abandon_ballot(&self, slot_index: u64, counter: u32) -> bool {
+        if let Some(slot) = self.slots.write().get_mut(&slot_index) {
+            slot.abandon_ballot(counter)
+        } else {
+            false
+        }
+    }
+
+    /// Bump the ballot for a slot to a specific counter value.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to bump
+    /// * `value` - The value for the ballot
+    /// * `counter` - The specific counter to bump to
+    ///
+    /// # Returns
+    /// True if the ballot was bumped, false if the operation failed.
+    pub fn bump_state(&self, slot_index: u64, value: Value, counter: u32) -> bool {
+        if let Some(slot) = self.slots.write().get_mut(&slot_index) {
+            slot.bump_state(&self.driver, value, counter)
+        } else {
+            false
+        }
+    }
+
+    /// Get nodes that are missing from consensus for a slot.
+    ///
+    /// Returns the set of nodes in our quorum set that we haven't
+    /// heard from for the given slot. This is useful for diagnosing
+    /// why consensus might be stuck.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to check
+    ///
+    /// # Returns
+    /// Set of node IDs that haven't sent messages for this slot.
+    pub fn get_missing_nodes(&self, slot_index: u64) -> std::collections::HashSet<NodeId> {
+        let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
+        let slots = self.slots.read();
+
+        if let Some(slot) = slots.get(&slot_index) {
+            let heard_from: std::collections::HashSet<NodeId> =
+                slot.ballot().latest_envelopes().keys().cloned().collect();
+
+            all_nodes.difference(&heard_from).cloned().collect()
+        } else {
+            all_nodes
+        }
+    }
+
+    /// Check if a statement is newer than what we have for that node.
+    ///
+    /// This compares the given statement against the latest statement
+    /// we have from the same node, returning true if the new statement
+    /// represents progress.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to check
+    /// * `statement` - The statement to compare
+    ///
+    /// # Returns
+    /// True if the statement is newer than our current state for that node.
+    pub fn is_newer_statement(&self, slot_index: u64, statement: &ScpStatement) -> bool {
+        let slots = self.slots.read();
+        if let Some(slot) = slots.get(&slot_index) {
+            match &statement.pledges {
+                ScpStatementPledges::Nominate(_) => slot
+                    .nomination()
+                    .is_newer_statement(&statement.node_id, statement),
+                _ => slot
+                    .ballot()
+                    .is_newer_statement(&statement.node_id, statement),
+            }
+        } else {
+            true // No slot means any statement is "newer"
+        }
+    }
+
     /// Get SCP envelopes for recent slots.
     ///
     /// Returns envelopes for slots starting from `from_slot` up to the current slot.
@@ -416,6 +712,94 @@ impl<D: SCPDriver> SCP<D> {
         }
 
         envelopes
+    }
+
+    /// Get JSON-serializable information for a slot.
+    ///
+    /// Returns slot info that can be serialized to JSON for debugging
+    /// and monitoring, matching C++ `getJsonInfo()`.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to get info for
+    ///
+    /// # Returns
+    /// SlotInfo if the slot exists, None otherwise.
+    pub fn get_info(&self, slot_index: u64) -> Option<crate::SlotInfo> {
+        let slots = self.slots.read();
+        slots.get(&slot_index).map(|slot| slot.get_info())
+    }
+
+    /// Get JSON-serializable quorum information for a slot.
+    ///
+    /// Returns quorum info that can be serialized to JSON for debugging
+    /// and monitoring, matching C++ `getJsonQuorumInfo()`.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to get quorum info for
+    ///
+    /// # Returns
+    /// QuorumInfo if the slot exists, None otherwise.
+    pub fn get_quorum_info(&self, slot_index: u64) -> Option<crate::QuorumInfo> {
+        let slots = self.slots.read();
+        slots.get(&slot_index).map(|slot| slot.get_quorum_info())
+    }
+
+    /// Get JSON-serializable quorum information for a specific node in a slot.
+    ///
+    /// This returns information about a specific node's state in the consensus
+    /// process, matching C++ `getJsonQuorumInfo(NodeID const& id, ...)`.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to query
+    /// * `node_id` - The node to get info for
+    ///
+    /// # Returns
+    /// NodeInfo if the slot exists and we have information about the node,
+    /// None otherwise.
+    pub fn get_quorum_info_for_node(
+        &self,
+        slot_index: u64,
+        node_id: &NodeId,
+    ) -> Option<crate::NodeInfo> {
+        let slots = self.slots.read();
+        let slot = slots.get(&slot_index)?;
+
+        // Check nomination protocol first
+        let nom_state = slot.nomination().get_node_state(node_id);
+        if nom_state != crate::QuorumInfoNodeState::Missing {
+            return Some(crate::NodeInfo {
+                state: format!("{:?}", nom_state),
+                ballot_counter: None,
+            });
+        }
+
+        // Check ballot protocol
+        let ballot_state = slot.ballot().get_node_state(node_id);
+        let ballot_counter = slot
+            .ballot()
+            .latest_envelopes()
+            .get(node_id)
+            .and_then(|env| match &env.statement.pledges {
+                stellar_xdr::curr::ScpStatementPledges::Prepare(p) => Some(p.ballot.counter),
+                stellar_xdr::curr::ScpStatementPledges::Confirm(c) => Some(c.ballot.counter),
+                stellar_xdr::curr::ScpStatementPledges::Externalize(e) => Some(e.commit.counter),
+                _ => None,
+            });
+
+        Some(crate::NodeInfo {
+            state: format!("{:?}", ballot_state),
+            ballot_counter,
+        })
+    }
+
+    /// Get JSON-serializable information for all active slots.
+    ///
+    /// Returns a vector of SlotInfo for all slots currently tracked.
+    pub fn get_all_slot_info(&self) -> Vec<crate::SlotInfo> {
+        let slots = self.slots.read();
+        let mut infos: Vec<_> = slots.values().map(|slot| slot.get_info()).collect();
+        infos.sort_by_key(|info| info.slot_index);
+        infos
     }
 }
 
@@ -470,8 +854,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
     use stellar_xdr::curr::{
-        PublicKey, ScpBallot, ScpNomination, ScpStatement, ScpStatementPrepare,
-        ScpStatementPledges, Uint256,
+        PublicKey, ScpBallot, ScpNomination, ScpStatement, ScpStatementPledges,
+        ScpStatementPrepare, Uint256,
     };
 
     /// Mock driver for testing.
@@ -497,19 +881,11 @@ mod tests {
             ValidationLevel::FullyValidated
         }
 
-        fn combine_candidates(
-            &self,
-            _slot_index: u64,
-            candidates: &[Value],
-        ) -> Option<Value> {
+        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
             candidates.first().cloned()
         }
 
-        fn extract_valid_value(
-            &self,
-            _slot_index: u64,
-            value: &Value,
-        ) -> Option<Value> {
+        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
             Some(value.clone())
         }
 
@@ -586,19 +962,11 @@ mod tests {
             ValidationLevel::MaybeValid
         }
 
-        fn combine_candidates(
-            &self,
-            _slot_index: u64,
-            candidates: &[Value],
-        ) -> Option<Value> {
+        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
             candidates.first().cloned()
         }
 
-        fn extract_valid_value(
-            &self,
-            _slot_index: u64,
-            value: &Value,
-        ) -> Option<Value> {
+        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
             Some(value.clone())
         }
 
@@ -726,12 +1094,7 @@ mod tests {
     #[test]
     fn test_scp_new() {
         let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(
-            make_node_id(1),
-            true,
-            make_quorum_set(),
-            driver,
-        );
+        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
 
         assert!(scp.is_validator());
         assert_eq!(scp.slot_count(), 0);
@@ -740,12 +1103,7 @@ mod tests {
     #[test]
     fn test_force_externalize() {
         let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(
-            make_node_id(1),
-            true,
-            make_quorum_set(),
-            driver,
-        );
+        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
 
         let value: Value = vec![1, 2, 3].try_into().unwrap();
         scp.force_externalize(42, value.clone());
@@ -822,18 +1180,8 @@ mod tests {
         let driver = Arc::new(MockDriver::new());
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
-        let env_slot2 = make_nomination_envelope(
-            node_b.clone(),
-            2,
-            &quorum_set,
-            make_value(&[2]),
-        );
-        let env_slot1 = make_nomination_envelope(
-            node_a.clone(),
-            1,
-            &quorum_set,
-            make_value(&[1]),
-        );
+        let env_slot2 = make_nomination_envelope(node_b.clone(), 2, &quorum_set, make_value(&[2]));
+        let env_slot1 = make_nomination_envelope(node_a.clone(), 1, &quorum_set, make_value(&[1]));
         scp.receive_envelope(env_slot2);
         scp.receive_envelope(env_slot1);
 
@@ -845,12 +1193,7 @@ mod tests {
     #[test]
     fn test_purge_slots() {
         let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(
-            make_node_id(1),
-            true,
-            make_quorum_set(),
-            driver,
-        );
+        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
 
         // Create some slots
         for i in 1..=10 {
@@ -866,5 +1209,138 @@ mod tests {
         assert_eq!(scp.slot_count(), 5);
         assert!(scp.get_externalized_value(5).is_none());
         assert!(scp.get_externalized_value(6).is_some());
+    }
+
+    // ==================== Tests for new parity features ====================
+
+    #[test]
+    fn test_got_v_blocking() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node_a.clone(), node_b.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let driver = Arc::new(MaybeValidDriver::new(quorum_set.clone()));
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // No slot created yet
+        assert!(!scp.got_v_blocking(1));
+
+        // Force externalize to create a slot
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        scp.force_externalize(1, value);
+
+        // No envelopes yet, so no v-blocking
+        // (Note: got_v_blocking checks ballot envelopes, not nomination)
+        assert!(!scp.got_v_blocking(1));
+    }
+
+    #[test]
+    fn test_get_cumulative_statement_count() {
+        let node_a = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let driver = Arc::new(MockDriver::new());
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // No slots, count should be 0
+        assert_eq!(scp.get_cumulative_statement_count(), 0);
+
+        // Force externalize to create slots
+        for i in 1..=3 {
+            let value: Value = vec![i as u8].try_into().unwrap();
+            scp.force_externalize(i, value);
+        }
+
+        // Slots exist but might have no statements (depends on implementation)
+        let _count = scp.get_cumulative_statement_count(); // Just verify it doesn't panic
+    }
+
+    #[test]
+    fn test_get_missing_nodes() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node_a.clone(), node_b.clone(), node_c.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let driver = Arc::new(MaybeValidDriver::new(quorum_set.clone()));
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // No slot yet - all nodes should be missing
+        let missing = scp.get_missing_nodes(1);
+        assert!(missing.contains(&node_a));
+        assert!(missing.contains(&node_b));
+        assert!(missing.contains(&node_c));
+    }
+
+    #[test]
+    fn test_is_newer_statement() {
+        let node_a = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let driver = Arc::new(MockDriver::new());
+        let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
+
+        // Create a nomination statement
+        let nom = ScpNomination {
+            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+            votes: vec![make_value(&[1])].try_into().unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let statement = ScpStatement {
+            node_id: node_a.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Nominate(nom),
+        };
+
+        // No slot exists yet, any statement is "newer"
+        assert!(scp.is_newer_statement(1, &statement));
+    }
+
+    #[test]
+    fn test_empty() {
+        let driver = Arc::new(MockDriver::new());
+        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
+
+        // New SCP should be empty
+        assert!(scp.empty());
+
+        // After force_externalize, should not be empty
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        scp.force_externalize(1, value);
+        assert!(!scp.empty());
+    }
+
+    #[test]
+    fn test_get_highest_known_slot() {
+        let driver = Arc::new(MockDriver::new());
+        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
+
+        // No slots initially
+        assert_eq!(scp.get_highest_known_slot(), None);
+
+        // Add some slots
+        for i in [5, 2, 8, 3] {
+            let value: Value = vec![i as u8].try_into().unwrap();
+            scp.force_externalize(i, value);
+        }
+
+        // Should return the highest slot
+        assert_eq!(scp.get_highest_known_slot(), Some(8));
+    }
+
+    #[test]
+    fn test_driver_access() {
+        let driver = Arc::new(MockDriver::new());
+        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver.clone());
+
+        // Should be able to access the driver
+        let retrieved = scp.driver();
+        assert!(Arc::ptr_eq(&driver, retrieved));
     }
 }

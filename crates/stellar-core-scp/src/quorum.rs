@@ -49,6 +49,24 @@ use std::collections::HashSet;
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
+/// Maximum allowed nesting level for quorum sets.
+///
+/// This constant defines the maximum depth of nested inner sets allowed
+/// in a quorum set. This limit prevents excessive recursion during
+/// quorum set validation and ensures bounded memory usage.
+///
+/// The value matches the C++ stellar-core implementation.
+pub const MAXIMUM_QUORUM_NESTING_LEVEL: u32 = 4;
+
+/// Maximum allowed number of nodes in a quorum set.
+///
+/// This constant defines the maximum total number of unique nodes
+/// (validators) that can be referenced in a quorum set, including
+/// all nested inner sets.
+///
+/// The value matches the C++ stellar-core implementation.
+pub const MAXIMUM_QUORUM_NODES: usize = 1000;
+
 /// Check if a set of nodes satisfies a quorum slice.
 ///
 /// A quorum slice is satisfied if at least `threshold` of its members
@@ -112,11 +130,7 @@ where
 ///
 /// # Returns
 /// True if the nodes form a quorum.
-pub fn is_quorum<F>(
-    quorum_set: &ScpQuorumSet,
-    nodes: &HashSet<NodeId>,
-    get_quorum_set: F,
-) -> bool
+pub fn is_quorum<F>(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>, get_quorum_set: F) -> bool
 where
     F: Fn(&NodeId) -> Option<ScpQuorumSet>,
 {
@@ -152,17 +166,11 @@ where
 ///
 /// # Returns
 /// True if the nodes form a blocking set.
-pub fn is_blocking_set(
-    quorum_set: &ScpQuorumSet,
-    nodes: &HashSet<NodeId>,
-) -> bool {
+pub fn is_blocking_set(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
     is_blocking_set_helper(quorum_set, nodes)
 }
 
-fn is_blocking_set_helper(
-    quorum_set: &ScpQuorumSet,
-    nodes: &HashSet<NodeId>,
-) -> bool {
+fn is_blocking_set_helper(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
     let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
     let threshold = quorum_set.threshold as usize;
 
@@ -197,24 +205,15 @@ fn is_blocking_set_helper(
 ///
 /// A set B is v-blocking for node v if B intersects all of v's quorum slices.
 /// This is equivalent to is_blocking_set for the node's quorum set.
-pub fn is_v_blocking(
-    quorum_set: &ScpQuorumSet,
-    nodes: &HashSet<NodeId>,
-) -> bool {
+pub fn is_v_blocking(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
     is_blocking_set(quorum_set, nodes)
 }
-
-const MAXIMUM_QUORUM_NESTING_LEVEL: u32 = 4;
-const MAXIMUM_QUORUM_NODES: usize = 1000;
 
 /// Check if a quorum set is sane.
 ///
 /// This validates structural constraints, duplicate nodes, and optionally
 /// enforces a safety threshold (> 50%).
-pub fn is_quorum_set_sane(
-    quorum_set: &ScpQuorumSet,
-    extra_checks: bool,
-) -> Result<(), String> {
+pub fn is_quorum_set_sane(quorum_set: &ScpQuorumSet, extra_checks: bool) -> Result<(), String> {
     let mut checker = QuorumSetSanityChecker {
         extra_checks,
         known_nodes: HashSet::new(),
@@ -280,10 +279,9 @@ pub fn find_closest_v_blocking(
     nodes: &HashSet<NodeId>,
     excluded: Option<&NodeId>,
 ) -> Vec<NodeId> {
-    let mut left_till_block = 1i64
-        + quorum_set.validators.len() as i64
-        + quorum_set.inner_sets.len() as i64
-        - quorum_set.threshold as i64;
+    let mut left_till_block =
+        1i64 + quorum_set.validators.len() as i64 + quorum_set.inner_sets.len() as i64
+            - quorum_set.threshold as i64;
 
     if left_till_block <= 0 {
         return Vec::new();
@@ -484,6 +482,59 @@ pub fn simple_quorum_set(threshold: u32, validators: Vec<NodeId>) -> ScpQuorumSe
         threshold,
         validators: validators.try_into().unwrap_or_default(),
         inner_sets: Vec::new().try_into().unwrap_or_default(),
+    }
+}
+
+/// Create a singleton quorum set containing just one node.
+///
+/// A singleton quorum set has threshold 1 and contains only the given node.
+/// This is useful when a node needs to represent itself in quorum calculations.
+pub fn singleton_quorum_set(node_id: NodeId) -> ScpQuorumSet {
+    simple_quorum_set(1, vec![node_id])
+}
+
+/// Cache for singleton quorum sets to avoid repeated allocations.
+///
+/// This struct provides efficient caching of singleton quorum sets,
+/// matching the C++ `getSingletonQSet()` optimization.
+#[derive(Debug, Default)]
+pub struct SingletonQuorumSetCache {
+    cache: std::sync::RwLock<std::collections::HashMap<NodeId, ScpQuorumSet>>,
+}
+
+impl SingletonQuorumSetCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self {
+            cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Get or create a singleton quorum set for the given node.
+    ///
+    /// If the quorum set is already cached, returns a clone.
+    /// Otherwise, creates a new one and caches it.
+    pub fn get_or_create(&self, node_id: &NodeId) -> ScpQuorumSet {
+        // Try read first
+        if let Ok(cache) = self.cache.read() {
+            if let Some(qs) = cache.get(node_id) {
+                return qs.clone();
+            }
+        }
+
+        // Need to create and cache
+        let qs = singleton_quorum_set(node_id.clone());
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(node_id.clone(), qs.clone());
+        }
+        qs
+    }
+
+    /// Clear the cache.
+    pub fn clear(&self) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.clear();
+        }
     }
 }
 
@@ -828,7 +879,10 @@ mod tests {
         let node2 = make_node_id(2);
         let node3 = make_node_id(3);
 
-        let qs = make_simple_quorum_set(3, &[node0.clone(), node1.clone(), node2.clone(), node3.clone()]);
+        let qs = make_simple_quorum_set(
+            3,
+            &[node0.clone(), node1.clone(), node2.clone(), node3.clone()],
+        );
 
         let mut nodes = HashSet::new();
         nodes.insert(node0.clone());
@@ -934,5 +988,280 @@ mod tests {
         assert_eq!(without_excluded.len(), 1);
         assert_eq!(with_excluded.len(), 1);
         assert!(!with_excluded.contains(&node1));
+    }
+
+    // ==================== Tests for new parity features ====================
+
+    #[test]
+    fn test_singleton_quorum_set() {
+        let node = make_node_id(42);
+        let qs = singleton_quorum_set(node.clone());
+
+        assert_eq!(qs.threshold, 1);
+        assert_eq!(qs.validators.len(), 1);
+        assert_eq!(&qs.validators[0], &node);
+        assert!(qs.inner_sets.is_empty());
+    }
+
+    #[test]
+    fn test_singleton_quorum_set_cache() {
+        let cache = SingletonQuorumSetCache::new();
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        // First access creates the quorum set
+        let qs1a = cache.get_or_create(&node1);
+        assert_eq!(qs1a.threshold, 1);
+        assert_eq!(qs1a.validators.len(), 1);
+        assert_eq!(&qs1a.validators[0], &node1);
+
+        // Second access returns cached version
+        let qs1b = cache.get_or_create(&node1);
+        assert_eq!(qs1a.threshold, qs1b.threshold);
+        assert_eq!(qs1a.validators.len(), qs1b.validators.len());
+
+        // Different node gets different quorum set
+        let qs2 = cache.get_or_create(&node2);
+        assert_eq!(&qs2.validators[0], &node2);
+
+        // Clear removes all cached entries
+        cache.clear();
+
+        // After clear, still creates correctly
+        let qs1c = cache.get_or_create(&node1);
+        assert_eq!(&qs1c.validators[0], &node1);
+    }
+
+    #[test]
+    fn test_singleton_quorum_set_cache_thread_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(SingletonQuorumSetCache::new());
+        let mut handles = vec![];
+
+        // Spawn multiple threads accessing the cache concurrently
+        for i in 0..10 {
+            let cache_clone = Arc::clone(&cache);
+            handles.push(thread::spawn(move || {
+                let node = make_node_id(i);
+                for _ in 0..100 {
+                    let qs = cache_clone.get_or_create(&node);
+                    assert_eq!(qs.threshold, 1);
+                    assert_eq!(qs.validators.len(), 1);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    // ==================== Additional C++ parity tests ====================
+
+    #[test]
+    fn test_is_quorum_with_nested_sets() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        // Create a quorum set with an inner set:
+        // threshold=2, validators=[node0, node1], inner_sets=[{threshold=1, validators=[node2, node3]}]
+        let inner = make_simple_quorum_set(1, &[node2.clone(), node3.clone()]);
+        let qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node0.clone(), node1.clone()].try_into().unwrap(),
+            inner_sets: vec![inner].try_into().unwrap(),
+        };
+
+        let get_qs = |_: &NodeId| -> Option<ScpQuorumSet> { None };
+
+        // node0 + node1 = 2 validators, satisfies threshold
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+        assert!(is_quorum_slice(&qs, &nodes, &get_qs));
+
+        // node0 + inner set satisfied = 2, satisfies threshold
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node2.clone()); // inner set is satisfied (1-of-2)
+        assert!(is_quorum_slice(&qs, &nodes, &get_qs));
+
+        // Only inner set satisfied = 1, doesn't satisfy threshold
+        let mut nodes = HashSet::new();
+        nodes.insert(node2.clone());
+        nodes.insert(node3.clone());
+        assert!(!is_quorum_slice(&qs, &nodes, &get_qs));
+    }
+
+    #[test]
+    fn test_is_quorum_full() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        // All nodes have the same 2-of-3 quorum set
+        let qs = make_simple_quorum_set(2, &[node0.clone(), node1.clone(), node2.clone()]);
+
+        let get_qs = |_: &NodeId| -> Option<ScpQuorumSet> { Some(qs.clone()) };
+
+        // 2 nodes form a quorum (each has their slice satisfied by the set)
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+        assert!(is_quorum(&qs, &nodes, &get_qs));
+
+        // 1 node does not form a quorum
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        assert!(!is_quorum(&qs, &nodes, &get_qs));
+
+        // All 3 nodes form a quorum
+        let mut nodes = HashSet::new();
+        nodes.insert(node0);
+        nodes.insert(node1);
+        nodes.insert(node2);
+        assert!(is_quorum(&qs, &nodes, &get_qs));
+    }
+
+    #[test]
+    fn test_is_quorum_asymmetric() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        // node0 trusts node1 and node2 (2-of-2)
+        let qs0 = make_simple_quorum_set(2, &[node1.clone(), node2.clone()]);
+        // node1 trusts node0 and node2 (2-of-2)
+        let qs1 = make_simple_quorum_set(2, &[node0.clone(), node2.clone()]);
+        // node2 trusts node0 and node1 (2-of-2)
+        let qs2 = make_simple_quorum_set(2, &[node0.clone(), node1.clone()]);
+
+        let get_qs = |n: &NodeId| -> Option<ScpQuorumSet> {
+            if n == &node0 {
+                Some(qs0.clone())
+            } else if n == &node1 {
+                Some(qs1.clone())
+            } else if n == &node2 {
+                Some(qs2.clone())
+            } else {
+                None
+            }
+        };
+
+        // {node0, node1, node2} forms a quorum
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+        nodes.insert(node2.clone());
+        assert!(is_quorum(&qs0, &nodes, &get_qs));
+
+        // {node0, node1} doesn't form a quorum (node0's slice requires node2)
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+        assert!(!is_quorum(&qs0, &nodes, &get_qs));
+    }
+
+    #[test]
+    fn test_blocking_set_with_nested() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        // threshold=3, validators=[node0, node1], inner_sets=[{threshold=1, [node2, node3]}]
+        // Total members = 3, need 3 to pass, so blocking threshold = 3-3+1 = 1
+        let inner = make_simple_quorum_set(1, &[node2.clone(), node3.clone()]);
+        let qs = ScpQuorumSet {
+            threshold: 3,
+            validators: vec![node0.clone(), node1.clone()].try_into().unwrap(),
+            inner_sets: vec![inner].try_into().unwrap(),
+        };
+
+        // Any single validator blocks
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        assert!(is_blocking_set(&qs, &nodes));
+
+        // If inner set is blocked, it blocks the outer
+        let mut nodes = HashSet::new();
+        nodes.insert(node2.clone());
+        nodes.insert(node3.clone());
+        assert!(is_blocking_set(&qs, &nodes));
+    }
+
+    #[test]
+    fn test_hash_quorum_set_deterministic() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+
+        let qs1 = make_simple_quorum_set(1, &[node0.clone(), node1.clone()]);
+        let qs2 = make_simple_quorum_set(1, &[node0.clone(), node1.clone()]);
+
+        // Same quorum sets should have same hash
+        assert_eq!(hash_quorum_set(&qs1), hash_quorum_set(&qs2));
+
+        // Different threshold should have different hash
+        let qs3 = make_simple_quorum_set(2, &[node0.clone(), node1.clone()]);
+        assert_ne!(hash_quorum_set(&qs1), hash_quorum_set(&qs3));
+    }
+
+    #[test]
+    fn test_get_all_nodes_with_nested() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        let inner = make_simple_quorum_set(1, &[node2.clone(), node3.clone()]);
+        let qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node0.clone(), node1.clone()].try_into().unwrap(),
+            inner_sets: vec![inner].try_into().unwrap(),
+        };
+
+        let all_nodes = get_all_nodes(&qs);
+        assert_eq!(all_nodes.len(), 4);
+        assert!(all_nodes.contains(&node0));
+        assert!(all_nodes.contains(&node1));
+        assert!(all_nodes.contains(&node2));
+        assert!(all_nodes.contains(&node3));
+    }
+
+    #[test]
+    fn test_normalize_preserves_semantics() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        // Create an unnormalized quorum set (unsorted)
+        let mut qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node2.clone(), node0.clone(), node1.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let _hash_before = hash_quorum_set(&qs);
+        normalize_quorum_set(&mut qs);
+        let _hash_after = hash_quorum_set(&qs);
+
+        // Hash may change due to ordering, but semantics preserved
+        // Validators should now be sorted
+        let validators: Vec<_> = qs.validators.iter().cloned().collect();
+        assert_eq!(validators[0], node0);
+        assert_eq!(validators[1], node1);
+        assert_eq!(validators[2], node2);
+
+        // But both should function the same way
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+        assert!(is_quorum_slice(&qs, &nodes, &|_: &NodeId| None));
     }
 }

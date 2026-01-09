@@ -34,8 +34,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use stellar_xdr::curr::{
-    Limits, NodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement,
-    ScpStatementPledges, Value, WriteXdr,
+    Limits, NodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges,
+    Value, WriteXdr,
 };
 
 use crate::driver::{SCPDriver, ValidationLevel};
@@ -175,6 +175,76 @@ impl NominationProtocol {
         self.latest_composite.as_ref()
     }
 
+    /// Get the last envelope constructed by this node.
+    pub fn get_last_envelope(&self) -> Option<&ScpEnvelope> {
+        self.last_envelope.as_ref()
+    }
+
+    /// Get the last envelope actually sent (emitted) to the network.
+    ///
+    /// This returns the most recent nomination envelope that was actually
+    /// broadcast to the network, which may differ from `get_last_envelope()`
+    /// when the slot is not fully validated.
+    pub fn get_last_message_send(&self) -> Option<&ScpEnvelope> {
+        self.last_envelope_emit.as_ref()
+    }
+
+    /// Get the current round leaders.
+    pub fn get_round_leaders(&self) -> &HashSet<NodeId> {
+        &self.round_leaders
+    }
+
+    /// Get the latest nomination envelope from a specific node.
+    pub fn get_latest_nomination(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
+        self.latest_nominations.get(node_id)
+    }
+
+    /// Get the timer expiration count.
+    pub fn timer_exp_count(&self) -> u32 {
+        self.timer_exp_count
+    }
+
+    /// Get the state of a node in the nomination protocol.
+    ///
+    /// Returns the QuorumInfoNodeState for a given node based on their
+    /// latest nomination envelope, or Missing if we haven't heard from them.
+    pub fn get_node_state(&self, node_id: &NodeId) -> crate::QuorumInfoNodeState {
+        if self.latest_nominations.contains_key(node_id) {
+            crate::QuorumInfoNodeState::Nominating
+        } else {
+            crate::QuorumInfoNodeState::Missing
+        }
+    }
+
+    /// Get a summary string of the nomination state for debugging.
+    pub fn get_state_string(&self) -> String {
+        format!(
+            "round={} started={} stopped={} votes={} accepted={} candidates={} leaders={}",
+            self.round,
+            self.started,
+            self.stopped,
+            self.votes.len(),
+            self.accepted.len(),
+            self.candidates.len(),
+            self.round_leaders.len()
+        )
+    }
+
+    /// Get JSON-serializable nomination information.
+    ///
+    /// Returns a NominationInfo struct that can be serialized to JSON
+    /// for debugging and monitoring purposes.
+    pub fn get_info(&self) -> crate::NominationInfo {
+        crate::NominationInfo {
+            running: self.started && !self.stopped,
+            round: self.round,
+            votes: self.votes.iter().map(crate::value_to_str).collect(),
+            accepted: self.accepted.iter().map(crate::value_to_str).collect(),
+            candidates: self.candidates.iter().map(crate::value_to_str).collect(),
+            node_count: self.latest_nominations.len(),
+        }
+    }
+
     /// Process the latest nomination envelopes with a callback.
     pub fn process_current_state<F>(
         &self,
@@ -312,7 +382,7 @@ impl NominationProtocol {
             _ => return EnvelopeState::Invalid,
         };
 
-        if !self.is_newer_statement(node_id, nomination) {
+        if !self.is_newer_nomination_internal(node_id, nomination) {
             return EnvelopeState::Invalid;
         }
 
@@ -345,9 +415,7 @@ impl NominationProtocol {
                             }
                         }
                         ValidationLevel::MaybeValid => {
-                            if let Some(extracted) =
-                                driver.extract_valid_value(slot_index, value)
-                            {
+                            if let Some(extracted) = driver.extract_valid_value(slot_index, value) {
                                 if Self::insert_unique(&mut self.votes, extracted) {
                                     modified = true;
                                 }
@@ -439,6 +507,8 @@ impl NominationProtocol {
         // Combine all candidates
         if let Some(composite) = driver.combine_candidates(slot_index, &self.candidates) {
             if self.latest_composite.as_ref() != Some(&composite) {
+                // Notify driver of the updated candidate value
+                driver.updated_candidate_value(slot_index, &composite);
                 self.latest_composite = Some(composite);
             }
         }
@@ -468,9 +538,7 @@ impl NominationProtocol {
 
         let mut envelope = ScpEnvelope {
             statement: statement.clone(),
-            signature: stellar_xdr::curr::Signature(
-                Vec::new().try_into().unwrap_or_default(),
-            ),
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         driver.sign_envelope(&mut envelope);
@@ -507,7 +575,7 @@ impl NominationProtocol {
             ScpStatementPledges::Nominate(nom) => nom,
             _ => return false,
         };
-        if !self.is_newer_statement(local_node_id, nomination) {
+        if !self.is_newer_nomination_internal(local_node_id, nomination) {
             return false;
         }
         // Safe to insert: we only store nominations here.
@@ -517,13 +585,18 @@ impl NominationProtocol {
         true
     }
 
-    fn is_newer_statement(&self, node_id: &NodeId, nomination: &ScpNomination) -> bool {
+    pub fn is_newer_statement(&self, node_id: &NodeId, statement: &ScpStatement) -> bool {
+        let ScpStatementPledges::Nominate(nomination) = &statement.pledges else {
+            return false;
+        };
+        self.is_newer_nomination_internal(node_id, nomination)
+    }
+
+    fn is_newer_nomination_internal(&self, node_id: &NodeId, nomination: &ScpNomination) -> bool {
         match self.latest_nominations.get(node_id) {
             None => true,
             Some(existing) => {
-                if let ScpStatementPledges::Nominate(existing_nom) =
-                    &existing.statement.pledges
-                {
+                if let ScpStatementPledges::Nominate(existing_nom) = &existing.statement.pledges {
                     self.is_newer_nomination(existing_nom, nomination)
                 } else {
                     true
@@ -647,9 +720,7 @@ impl NominationProtocol {
                 let hash = self.hash_value(driver, slot_index, &candidate);
                 match best {
                     None => *best = Some((hash, candidate)),
-                    Some((best_hash, _)) if hash >= *best_hash => {
-                        *best = Some((hash, candidate))
-                    }
+                    Some((best_hash, _)) if hash >= *best_hash => *best = Some((hash, candidate)),
                     _ => {}
                 }
             }
@@ -792,12 +863,7 @@ impl NominationProtocol {
         res as u64
     }
 
-    fn for_each_quorum_node<F>(
-        &self,
-        quorum_set: &ScpQuorumSet,
-        local_node_id: &NodeId,
-        f: &mut F,
-    )
+    fn for_each_quorum_node<F>(&self, quorum_set: &ScpQuorumSet, local_node_id: &NodeId, f: &mut F)
     where
         F: FnMut(&NodeId),
     {
@@ -811,11 +877,7 @@ impl NominationProtocol {
         }
     }
 
-    fn count_quorum_nodes(
-        &self,
-        quorum_set: &ScpQuorumSet,
-        local_node_id: &NodeId,
-    ) -> usize {
+    fn count_quorum_nodes(&self, quorum_set: &ScpQuorumSet, local_node_id: &NodeId) -> usize {
         let mut count = quorum_set
             .validators
             .iter()
@@ -827,6 +889,43 @@ impl NominationProtocol {
         count
     }
 
+    /// Restore state from a saved envelope (for crash recovery).
+    ///
+    /// This method is used to restore the nomination protocol state from a previously
+    /// saved envelope when restarting after a crash. It sets up the internal state
+    /// to match what it would have been after processing that envelope.
+    ///
+    /// # Arguments
+    /// * `envelope` - The envelope to restore state from
+    ///
+    /// # Returns
+    /// True if state was successfully restored, false if the envelope is invalid
+    /// for state restoration.
+    pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
+        let nomination = match &envelope.statement.pledges {
+            ScpStatementPledges::Nominate(nom) => nom,
+            _ => return false,
+        };
+
+        // Restore votes and accepted values
+        self.votes = nomination.votes.iter().cloned().collect();
+        self.accepted = nomination.accepted.iter().cloned().collect();
+
+        // Mark as started
+        self.started = true;
+
+        // Store the envelope
+        self.latest_nominations
+            .insert(envelope.statement.node_id.clone(), envelope.clone());
+        self.last_envelope = Some(envelope.clone());
+
+        true
+    }
+
+    /// Get the candidates (confirmed values ready for ballot protocol).
+    pub fn candidates(&self) -> &[Value] {
+        &self.candidates
+    }
 }
 
 impl Default for NominationProtocol {
@@ -839,8 +938,8 @@ impl Default for NominationProtocol {
 mod tests {
     use super::*;
     use crate::driver::ValidationLevel;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use stellar_xdr::curr::{PublicKey, ScpBallot, Uint256};
 
@@ -912,19 +1011,11 @@ mod tests {
             ValidationLevel::FullyValidated
         }
 
-        fn combine_candidates(
-            &self,
-            _slot_index: u64,
-            candidates: &[Value],
-        ) -> Option<Value> {
+        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
             candidates.first().cloned()
         }
 
-        fn extract_valid_value(
-            &self,
-            _slot_index: u64,
-            value: &Value,
-        ) -> Option<Value> {
+        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
             Some(value.clone())
         }
 
@@ -1026,13 +1117,7 @@ mod tests {
 
         let v1 = make_value(&[1]);
         let v2 = make_value(&[2]);
-        let env = make_nomination_envelope(
-            make_node_id(2),
-            7,
-            &quorum_set,
-            vec![v2, v1],
-            vec![],
-        );
+        let env = make_nomination_envelope(make_node_id(2), 7, &quorum_set, vec![v2, v1], vec![]);
         let state = nom.process_envelope(&env, &node, &quorum_set, &driver, 7);
         assert_eq!(state, EnvelopeState::Invalid);
     }
@@ -1045,17 +1130,15 @@ mod tests {
         let mut nom = NominationProtocol::new();
 
         let v1 = make_value(&[1]);
-        let env = make_nomination_envelope(
-            make_node_id(2),
-            8,
-            &quorum_set,
-            vec![v1.clone()],
-            vec![],
-        );
+        let env =
+            make_nomination_envelope(make_node_id(2), 8, &quorum_set, vec![v1.clone()], vec![]);
         let first = nom.process_envelope(&env, &node, &quorum_set, &driver, 8);
         let second = nom.process_envelope(&env, &node, &quorum_set, &driver, 8);
 
-        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert!(matches!(
+            first,
+            EnvelopeState::Valid | EnvelopeState::ValidNew
+        ));
         assert_eq!(second, EnvelopeState::Invalid);
     }
 
@@ -1124,20 +1207,10 @@ mod tests {
 
         let value_local = make_value(&[1]);
         let value_remote = make_value(&[2]);
-        let env_local = make_nomination_envelope(
-            local.clone(),
-            11,
-            &quorum_set,
-            vec![value_local],
-            vec![],
-        );
-        let env_remote = make_nomination_envelope(
-            remote.clone(),
-            11,
-            &quorum_set,
-            vec![value_remote],
-            vec![],
-        );
+        let env_local =
+            make_nomination_envelope(local.clone(), 11, &quorum_set, vec![value_local], vec![]);
+        let env_remote =
+            make_nomination_envelope(remote.clone(), 11, &quorum_set, vec![value_remote], vec![]);
 
         nom.process_envelope(&env_local, &local, &quorum_set, &driver, 11);
         nom.process_envelope(&env_remote, &local, &quorum_set, &driver, 11);
@@ -1165,13 +1238,8 @@ mod tests {
         let mut nom = NominationProtocol::new();
 
         let value_local = make_value(&[3]);
-        let env_local = make_nomination_envelope(
-            local.clone(),
-            12,
-            &quorum_set,
-            vec![value_local],
-            vec![],
-        );
+        let env_local =
+            make_nomination_envelope(local.clone(), 12, &quorum_set, vec![value_local], vec![]);
 
         nom.process_envelope(&env_local, &local, &quorum_set, &driver, 12);
 
@@ -1247,13 +1315,8 @@ mod tests {
         let mut nom = NominationProtocol::new();
 
         let value = make_value(&[9]);
-        let env_old = make_nomination_envelope(
-            remote.clone(),
-            14,
-            &quorum_set,
-            vec![value.clone()],
-            vec![],
-        );
+        let env_old =
+            make_nomination_envelope(remote.clone(), 14, &quorum_set, vec![value.clone()], vec![]);
         let env_new = make_nomination_envelope(
             remote.clone(),
             14,
@@ -1298,18 +1361,16 @@ mod tests {
             vec![value_a.clone(), value_b.clone()],
             vec![],
         );
-        let env_new = make_nomination_envelope(
-            remote.clone(),
-            15,
-            &quorum_set,
-            vec![value_a],
-            vec![],
-        );
+        let env_new =
+            make_nomination_envelope(remote.clone(), 15, &quorum_set, vec![value_a], vec![]);
 
         let first = nom.process_envelope(&env_old, &local, &quorum_set, &driver, 15);
         let second = nom.process_envelope(&env_new, &local, &quorum_set, &driver, 15);
 
-        assert!(matches!(first, EnvelopeState::Valid | EnvelopeState::ValidNew));
+        assert!(matches!(
+            first,
+            EnvelopeState::Valid | EnvelopeState::ValidNew
+        ));
         assert_eq!(second, EnvelopeState::Invalid);
     }
 
@@ -1352,5 +1413,109 @@ mod tests {
 
         assert!(!ok);
         assert_eq!(seen.len(), 1);
+    }
+
+    // ==================== Tests for new parity features ====================
+
+    #[test]
+    fn test_set_state_from_envelope_nomination() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let mut nom = NominationProtocol::new();
+
+        let votes = vec![make_value(&[1, 2, 3]), make_value(&[4, 5, 6])];
+        let accepted = vec![make_value(&[7, 8, 9])];
+
+        let envelope = make_nomination_envelope(
+            node.clone(),
+            1,
+            &quorum_set,
+            votes.clone(),
+            accepted.clone(),
+        );
+
+        assert!(!nom.is_started());
+        assert!(nom.set_state_from_envelope(&envelope));
+        assert!(nom.is_started());
+
+        // Verify votes were restored
+        for vote in &votes {
+            assert!(nom.votes().contains(vote));
+        }
+
+        // Verify accepted values were restored
+        for acc in &accepted {
+            assert!(nom.accepted().contains(acc));
+        }
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_rejects_ballot_pledges() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let mut nom = NominationProtocol::new();
+
+        // Create a prepare envelope (ballot protocol, not nomination)
+        let prep = stellar_xdr::curr::ScpStatementPrepare {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            ballot: stellar_xdr::curr::ScpBallot {
+                counter: 1,
+                value: make_value(&[1]),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(prep),
+        };
+        let envelope = stellar_xdr::curr::ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        assert!(!nom.set_state_from_envelope(&envelope));
+        assert!(!nom.is_started());
+    }
+
+    #[test]
+    fn test_candidates_accessor() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        // Initially no candidates
+        assert!(nom.candidates().is_empty());
+
+        // After nomination starts and values are confirmed, candidates should appear
+        let value = make_value(&[1, 2, 3]);
+        nom.nominate(
+            &node,
+            &quorum_set,
+            &driver,
+            1,
+            value.clone(),
+            &make_value(&[0]),
+            false,
+        );
+
+        // Create envelope from another node that accepts the value
+        let other = make_node_id(2);
+        let env = make_nomination_envelope(
+            other.clone(),
+            1,
+            &quorum_set,
+            vec![value.clone()],
+            vec![value.clone()],
+        );
+        nom.process_envelope(&env, &node, &quorum_set, &driver, 1);
+
+        // Candidates may or may not be populated depending on quorum
+        // This test mainly verifies the accessor works
+        let _ = nom.candidates();
     }
 }

@@ -73,8 +73,15 @@ impl std::fmt::Display for QuorumConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidPublicKey(key) => write!(f, "invalid public key: {}", key),
-            Self::InvalidThreshold { threshold, validator_count } => {
-                write!(f, "threshold {} > validator count {}", threshold, validator_count)
+            Self::InvalidThreshold {
+                threshold,
+                validator_count,
+            } => {
+                write!(
+                    f,
+                    "threshold {} > validator count {}",
+                    threshold, validator_count
+                )
             }
             Self::InvalidStructure(msg) => write!(f, "invalid quorum set: {}", msg),
             Self::NoQuorumIntersection => write!(f, "quorum sets do not have intersection"),
@@ -214,7 +221,9 @@ pub fn validate_quorum_config(config: &QuorumSetConfig) -> Result<(), QuorumConf
 
     // Warn if threshold is 100% (no fault tolerance)
     if config.threshold_percent == 100 && !config.validators.is_empty() {
-        warn!("Quorum threshold is 100% - no fault tolerance, any validator failure blocks consensus");
+        warn!(
+            "Quorum threshold is 100% - no fault tolerance, any validator failure blocks consensus"
+        );
     }
 
     Ok(())
@@ -298,9 +307,7 @@ pub fn node_id_to_strkey(node_id: &NodeId) -> String {
     use stellar_strkey::ed25519::PublicKey as StrKeyPublicKey;
 
     match &node_id.0 {
-        PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => {
-            StrKeyPublicKey(*bytes).to_string()
-        }
+        PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => StrKeyPublicKey(*bytes).to_string(),
     }
 }
 

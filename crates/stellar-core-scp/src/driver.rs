@@ -42,6 +42,25 @@ use std::time::Duration;
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, Value};
 
+/// Type of SCP timer.
+///
+/// SCP uses timers to trigger timeouts during both nomination and
+/// ballot protocol phases. This enum identifies the timer type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SCPTimerType {
+    /// Timer for the nomination protocol phase.
+    ///
+    /// Nomination timers trigger round advancement when no progress
+    /// is made within the timeout period.
+    Nomination,
+
+    /// Timer for the ballot protocol phase.
+    ///
+    /// Ballot timers trigger ballot bumping (increasing counter) when
+    /// the current ballot round times out without externalization.
+    Ballot,
+}
+
 /// Validation level for SCP values.
 ///
 /// During consensus, values must be validated to ensure nodes agree
@@ -103,12 +122,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Returns
     /// The validation level for this value.
-    fn validate_value(
-        &self,
-        slot_index: u64,
-        value: &Value,
-        nomination: bool,
-    ) -> ValidationLevel;
+    fn validate_value(&self, slot_index: u64, value: &Value, nomination: bool) -> ValidationLevel;
 
     /// Combine multiple nominated values into one.
     ///
@@ -122,11 +136,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Returns
     /// The combined value, or None if combination is not possible.
-    fn combine_candidates(
-        &self,
-        slot_index: u64,
-        candidates: &[Value],
-    ) -> Option<Value>;
+    fn combine_candidates(&self, slot_index: u64, candidates: &[Value]) -> Option<Value>;
 
     /// Extract a valid value from a potentially invalid composite.
     ///
@@ -139,11 +149,7 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// # Returns
     /// The extracted valid value, or None if no valid value can be extracted.
-    fn extract_valid_value(
-        &self,
-        slot_index: u64,
-        value: &Value,
-    ) -> Option<Value>;
+    fn extract_valid_value(&self, slot_index: u64, value: &Value) -> Option<Value>;
 
     /// Emit an envelope to peers.
     ///
@@ -197,6 +203,18 @@ pub trait SCPDriver: Send + Sync {
     /// Called when we heard from a quorum for the current ballot.
     fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {}
 
+    /// Called when the ballot protocol is started for a slot.
+    ///
+    /// This is called when we transition from nomination to the ballot protocol,
+    /// indicating that we have candidate values and are beginning voting.
+    fn started_ballot_protocol(&self, _slot_index: u64, _value: &Value) {}
+
+    /// Called when the composite candidate value is updated during nomination.
+    ///
+    /// This is called during nomination when the composite candidate changes,
+    /// allowing the driver to track nomination progress.
+    fn updated_candidate_value(&self, _slot_index: u64, _value: &Value) {}
+
     /// Compute hash for node priority in nomination.
     ///
     /// This is used to deterministically order nodes during nomination
@@ -243,5 +261,101 @@ pub trait SCPDriver: Send + Sync {
     fn hash_quorum_set(&self, quorum_set: &ScpQuorumSet) -> Hash256 {
         // Default implementation using XDR serialization
         Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO)
+    }
+
+    /// Get the weight of a node in quorum calculations.
+    ///
+    /// This is used for weighted voting in quorum sets. The default
+    /// implementation returns equal weight (1.0) for all nodes.
+    ///
+    /// # Arguments
+    /// * `node_id` - The node to get weight for
+    /// * `quorum_set` - The quorum set context
+    ///
+    /// # Returns
+    /// Weight as a fraction between 0.0 and 1.0.
+    fn get_node_weight(&self, _node_id: &NodeId, _quorum_set: &ScpQuorumSet) -> f64 {
+        // Default: all nodes have equal weight
+        1.0
+    }
+
+    /// Get a debug string representation of a value.
+    ///
+    /// Used for logging and debugging. The default implementation
+    /// returns a hex-encoded prefix of the value.
+    fn get_value_string(&self, value: &Value) -> String {
+        let bytes = value.as_slice();
+        hex::encode(&bytes[..8.min(bytes.len())])
+    }
+
+    /// Compute a generic hash of arbitrary data.
+    ///
+    /// This is used for various internal hashing needs.
+    /// The default implementation uses SHA-256.
+    fn get_hash_of(&self, data: &[u8]) -> Hash256 {
+        Hash256::hash(data)
+    }
+
+    /// Request the application to set up a timer.
+    ///
+    /// This callback is invoked when SCP needs a timer to be started.
+    /// When the timer fires, the application should call the appropriate
+    /// SCP method to handle the timeout (e.g., `nominate_timeout` or
+    /// `bump_ballot_on_timeout`).
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot this timer is for
+    /// * `timer_type` - Whether this is a nomination or ballot timer
+    /// * `timeout` - The duration after which the timer should fire
+    ///
+    /// # Default Implementation
+    /// The default implementation does nothing. Applications that want
+    /// timer-based timeout handling should override this method.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn setup_timer(&self, slot_index: u64, timer_type: SCPTimerType, timeout: Duration) {
+    ///     let slot = slot_index;
+    ///     let timer = timer_type;
+    ///     tokio::spawn(async move {
+    ///         tokio::time::sleep(timeout).await;
+    ///         // Call SCP timeout handler
+    ///         match timer {
+    ///             SCPTimerType::Nomination => scp.nominate_timeout(slot, ...),
+    ///             SCPTimerType::Ballot => scp.bump_ballot_on_timeout(slot),
+    ///         }
+    ///     });
+    /// }
+    /// ```
+    fn setup_timer(&self, _slot_index: u64, _timer_type: SCPTimerType, _timeout: Duration) {
+        // Default: do nothing, timers managed externally
+    }
+
+    /// Request the application to cancel a previously set timer.
+    ///
+    /// This callback is invoked when a timer is no longer needed,
+    /// typically because the slot has made progress or been externalized.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot whose timer should be cancelled
+    /// * `timer_type` - Whether this is a nomination or ballot timer
+    ///
+    /// # Default Implementation
+    /// The default implementation does nothing.
+    fn stop_timer(&self, _slot_index: u64, _timer_type: SCPTimerType) {
+        // Default: do nothing, timers managed externally
+    }
+
+    /// Called when a timer expires.
+    ///
+    /// This is an informational callback to notify the driver that
+    /// a timeout occurred. The actual timeout handling is performed
+    /// by SCP internally.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot that timed out
+    /// * `timer_type` - Whether this was a nomination or ballot timer
+    fn timer_expired(&self, _slot_index: u64, _timer_type: SCPTimerType) {
+        // Default: do nothing
     }
 }
