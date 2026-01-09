@@ -16,10 +16,6 @@ stellar-core-tx.workspace = true
 stellar-core-invariant.workspace = true
 soroban-env-host-p25.workspace = true
 
-# Async runtime
-tokio.workspace = true
-async-trait.workspace = true
-
 # Serialization
 serde.workspace = true
 
@@ -30,7 +26,6 @@ tracing.workspace = true
 # Utilities
 parking_lot.workspace = true
 sha2.workspace = true
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [dev-dependencies]
 tempfile.workspace = true
