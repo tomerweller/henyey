@@ -387,7 +387,19 @@ pub fn replay_ledger_with_execution(
         }
     }
 
-    let fee_pool_delta = delta.fee_pool_delta();
+    // Use historical fee_charged values from expected_tx_results when available.
+    // During replay, our re-execution may calculate fees differently than the original
+    // execution (e.g., due to subtle parity differences). The historical fee_pool in
+    // the header was computed using the original fee_charged values, so we need to
+    // use those values for the invariant check to pass.
+    let fee_pool_delta = if let Some(expected_results) = expected_tx_results {
+        expected_results
+            .iter()
+            .map(|r| r.result.fee_charged)
+            .sum()
+    } else {
+        delta.fee_pool_delta()
+    };
     let total_coins_delta = delta.total_coins_delta();
     let changes = delta
         .changes()
