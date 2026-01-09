@@ -951,18 +951,6 @@ mod tests {
         let inmemory_xdr = inmemory.to_xdr_bytes().unwrap();
 
         // These should be identical
-        if inmemory_xdr != disk_xdr {
-            // Find first difference
-            for (i, (a, b)) in inmemory_xdr.iter().zip(disk_xdr.iter()).enumerate() {
-                if a != b {
-                    eprintln!("First difference at byte {}: in-memory={:#04x}, disk={:#04x}", i, a, b);
-                    break;
-                }
-            }
-            if inmemory_xdr.len() != disk_xdr.len() {
-                eprintln!("Length difference: in-memory={}, disk={}", inmemory_xdr.len(), disk_xdr.len());
-            }
-        }
         assert_eq!(inmemory_xdr, disk_xdr, "In-memory XDR differs from disk XDR");
         assert_eq!(inmemory.hash(), original_hash);
     }

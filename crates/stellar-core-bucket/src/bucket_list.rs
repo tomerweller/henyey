@@ -579,12 +579,6 @@ impl BucketList {
         // Don't normalize INIT entries at level 0 - they stay as INIT
         let keep_dead_0 = Self::keep_tombstone_entries(0);
 
-        // Debug: trace level 0 curr before prepare
-        if ledger_seq == 310231 {
-            eprintln!("[BUCKET_LIST] Before prepare: level 0 curr hash={}, len={}",
-                self.levels[0].curr.hash(), self.levels[0].curr.len());
-        }
-
         self.levels[0].prepare_with_normalization(
             ledger_seq,
             protocol_version,
@@ -593,18 +587,7 @@ impl BucketList {
             false, // don't normalize at level 0
         )?;
 
-        // Debug: trace level 0 after prepare
-        if ledger_seq == 310231 {
-            eprintln!("[BUCKET_LIST] After prepare: level 0 has pending merge");
-        }
-
         self.levels[0].commit();
-
-        // Debug: trace level 0 after commit
-        if ledger_seq == 310231 {
-            eprintln!("[BUCKET_LIST] After commit: level 0 curr hash={}, len={}",
-                self.levels[0].curr.hash(), self.levels[0].curr.len());
-        }
 
         // Step 3: Resolve any ready futures (commit all pending merges)
         // In C++ stellar-core, this is done by resolveAnyReadyFutures()
