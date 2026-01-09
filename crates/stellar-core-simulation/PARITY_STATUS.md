@@ -17,6 +17,23 @@ This section documents the parity between this Rust crate and the upstream C++ `
 | Graceful shutdown | `shutdown()` | Destructor + `stopAllNodes()` | Both support clean termination |
 | Port allocation | `allocate_port()` | Via `Config` | Rust uses ephemeral ports; C++ uses config-based |
 
+#### VirtualClock (`virtual_clock.rs`)
+- [x] `VirtualClock` - Clock abstraction with virtual/real time modes
+- [x] `ClockMode::VirtualTime` / `ClockMode::RealTime` - Operating modes
+- [x] `now()` / `now_nanos()` - Time queries (virtual or real)
+- [x] `system_now()` - System time with virtual time support
+- [x] `set_virtual_time()` - Set virtual time to specific point
+- [x] `advance_by()` - Advance virtual time by duration
+- [x] `sleep_for()` - Sleep (real) or advance (virtual) time
+- [x] `schedule_at()` / `schedule_after()` - Time-based event scheduling
+- [x] `EventHandle` - Cancel scheduled events
+- [x] `crank()` / `crank_with_options()` - Event loop advancement
+- [x] `crank_until()` - Crank until predicate is satisfied
+- [x] `crank_for_at_least()` - Crank for minimum duration
+- [x] `crank_for_at_most()` - Crank for maximum duration or until idle
+- [x] `ClockStats` - Statistics tracking (events scheduled/triggered/cancelled, crank cycles)
+- [x] `SharedVirtualClock` - Thread-safe Arc<VirtualClock> wrapper
+
 ### Not Yet Implemented (Gaps)
 
 #### Simulation Class (`Simulation.h/.cpp`)
@@ -24,14 +41,12 @@ This section documents the parity between this Rust crate and the upstream C++ `
 | Feature | C++ API | Description | Priority |
 |---------|---------|-------------|----------|
 | **Connection Modes** | `Mode::OVER_TCP`, `Mode::OVER_LOOPBACK` | C++ supports both real TCP and in-process loopback connections | Medium |
-| **Virtual Clock Control** | `setCurrentVirtualTime()` | Synchronize all node clocks to a specific time point | High |
+| **Multi-Node Clock Sync** | `setCurrentVirtualTime()` across all nodes | Synchronize all node clocks to a specific time point | Medium |
 | **Node Management** | `addNode()`, `removeNode()`, `getNode()` | Dynamic node add/remove during simulation | Medium |
 | **Pending Connections** | `addPendingConnection()` | Queue connections before starting simulation | Low |
 | **Loopback Connections** | `getLoopbackConnection()` | Access to loopback peer connections for testing | Low |
 | **Start/Stop Control** | `startAllNodes()`, `stopAllNodes()` | Explicit lifecycle control for all nodes | Medium |
-| **Crank Mechanisms** | `crankNode()`, `crankAllNodes()` | Manual event loop advancement for deterministic testing | High |
-| **Timed Cranking** | `crankForAtMost()`, `crankForAtLeast()` | Run simulation for specific durations | High |
-| **Conditional Cranking** | `crankUntil(predicate)` | Run until a condition is met | High |
+| **Crank Mechanisms** | `crankNode()`, `crankAllNodes()` | Manual event loop advancement for nodes | Medium |
 | **Consensus Verification** | `haveAllExternalized()` | Check if all nodes externalized a ledger | High |
 | **Metrics Summary** | `metricsSummary()` | Aggregate metrics across nodes | Low |
 | **Connection Control** | `addConnection()`, `dropConnection()` | Dynamic connection manipulation | Medium |
@@ -110,7 +125,7 @@ This section documents the parity between this Rust crate and the upstream C++ `
 
 #### Architectural Differences
 
-1. **Async vs VirtualClock**: The Rust implementation uses Tokio's async runtime, while C++ uses a VirtualClock abstraction for deterministic time control. This is a fundamental architectural difference that affects how "cranking" would be implemented.
+1. **Async vs VirtualClock**: The Rust implementation uses Tokio's async runtime alongside a `VirtualClock` abstraction that provides deterministic time control similar to C++. The Rust `VirtualClock` supports both virtual time (for fast deterministic tests) and real time modes, with crank-based event loop advancement (`crank()`, `crank_until()`, `crank_for_at_least()`, `crank_for_at_most()`).
 
 2. **Application Integration**: The C++ `Simulation` class manages full `Application` instances with ledger, herder, overlay, and all other subsystems. The Rust `OverlaySimulation` currently only manages `OverlayManager` instances, meaning it cannot test consensus, ledger application, or transaction processing.
 
@@ -122,7 +137,7 @@ This section documents the parity between this Rust crate and the upstream C++ `
 
 #### Migration Path Recommendations
 
-1. **Phase 1 - Virtual Time**: Implement a `VirtualClock` equivalent in Rust to enable deterministic testing with crank-based event loop control.
+1. **Phase 1 - Virtual Time**: ✅ Implemented! The `VirtualClock` provides deterministic time control with crank-based event loop advancement.
 
 2. **Phase 2 - Topologies**: Extract topology creation into a separate module supporting arbitrary connection patterns.
 

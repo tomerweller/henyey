@@ -10,6 +10,19 @@
 //! [`OverlayManager`] instances representing individual nodes in a simulated
 //! network. Nodes are connected in a star topology with node 0 as the hub.
 //!
+//! # Virtual Clock
+//!
+//! For deterministic timing control, use the [`VirtualClock`] abstraction which
+//! supports two modes:
+//!
+//! - **Virtual Time**: Time advances instantly under program control, enabling
+//!   tests to run at maximum speed without wall-clock dependencies.
+//! - **Real Time**: Time advances according to the actual wall clock.
+//!
+//! The virtual clock provides crank-based event loop advancement similar to
+//! the C++ `VirtualClock` in stellar-core, enabling deterministic testing of
+//! time-dependent behavior.
+//!
 //! # Deterministic Testing
 //!
 //! For reproducible test scenarios, use [`OverlaySimulation::start_with_seed`]
@@ -34,7 +47,19 @@
 //! # Example
 //!
 //! ```ignore
-//! use stellar_core_simulation::OverlaySimulation;
+//! use stellar_core_simulation::{OverlaySimulation, VirtualClock};
+//! use std::time::Duration;
+//!
+//! // Create a virtual clock for deterministic time control
+//! let clock = VirtualClock::virtual_time();
+//!
+//! // Schedule an event
+//! clock.schedule_after(Duration::from_secs(5), || {
+//!     println!("Event fired!");
+//! });
+//!
+//! // Advance time and process events
+//! clock.crank_for_at_least(Duration::from_secs(5));
 //!
 //! #[tokio::test]
 //! async fn test_message_broadcast() {
@@ -63,6 +88,18 @@ use stellar_xdr::curr::{
     Signature, StellarMessage, Uint256,
 };
 use tokio::time::{sleep, Duration};
+
+// =============================================================================
+// Modules
+// =============================================================================
+
+pub mod virtual_clock;
+
+// Re-export main types
+pub use virtual_clock::{
+    shared_clock, shared_virtual_clock, ClockMode, ClockStats, EventHandle, EventId,
+    SharedVirtualClock, VirtualClock,
+};
 
 // =============================================================================
 // Constants
