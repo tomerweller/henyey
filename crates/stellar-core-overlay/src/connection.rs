@@ -150,10 +150,27 @@ impl Connection {
 
         trace!("Sending message to {}", self.remote_addr);
 
-        self.framed.send(message).await.map_err(|e| {
-            self.closed = true;
-            e
-        })
+        // Add timeout to prevent blocking indefinitely on TCP backpressure
+        const SEND_TIMEOUT_SECS: u64 = 10;
+        match timeout(
+            Duration::from_secs(SEND_TIMEOUT_SECS),
+            self.framed.send(message),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.closed = true;
+                Err(e)
+            }
+            Err(_) => {
+                self.closed = true;
+                Err(OverlayError::ConnectionTimeout(format!(
+                    "send timeout after {}s to {}",
+                    SEND_TIMEOUT_SECS, self.remote_addr
+                )))
+            }
+        }
     }
 
     /// Receives the next message from the peer.
