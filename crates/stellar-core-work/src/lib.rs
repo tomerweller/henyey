@@ -186,6 +186,39 @@ pub enum WorkState {
     Cancelled,
 }
 
+impl WorkState {
+    /// Returns `true` if this is a terminal state.
+    ///
+    /// Terminal states are those where no further progress will be made:
+    /// [`Success`](Self::Success), [`Failed`](Self::Failed),
+    /// [`Blocked`](Self::Blocked), and [`Cancelled`](Self::Cancelled).
+    ///
+    /// Non-terminal states are [`Pending`](Self::Pending) and
+    /// [`Running`](Self::Running).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Failed | Self::Blocked | Self::Cancelled
+        )
+    }
+
+    /// Returns `true` if this is a successful terminal state.
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    /// Returns `true` if this is a failure state.
+    ///
+    /// This includes [`Failed`](Self::Failed), [`Blocked`](Self::Blocked),
+    /// and [`Cancelled`](Self::Cancelled).
+    #[must_use]
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::Failed | Self::Blocked | Self::Cancelled)
+    }
+}
+
 /// Execution context provided to a work item during execution.
 ///
 /// The context provides the work item with its identity, the current attempt
@@ -651,6 +684,7 @@ impl WorkScheduler {
     ///
     /// Does not panic. Invalid dependency IDs will cause the work item to be
     /// blocked when its dependencies are checked.
+    #[must_use]
     pub fn add_work(
         &mut self,
         work: Box<dyn Work + Send>,
@@ -692,6 +726,7 @@ impl WorkScheduler {
     /// Returns the current state of a work item, if it exists.
     ///
     /// Returns `None` if no work item with the given ID has been registered.
+    #[must_use]
     pub fn state(&self, id: WorkId) -> Option<WorkState> {
         self.states.get(&id).copied()
     }
