@@ -1523,14 +1523,18 @@ impl CatchupManager {
         let mut last_result: Option<LedgerReplayResult> = None;
         let mut last_header: Option<LedgerHeader> = None;
 
-        // Initialize eviction iterator for incremental eviction scan
-        // Start at the configured starting level (default: level 6)
+        // Load eviction iterator from checkpoint state instead of starting fresh.
+        // The EvictionIterator ConfigSettingEntry tracks where the eviction scan was
+        // at the checkpoint, and we must continue from there for correct bucket list hash.
         let mut eviction_iterator: Option<EvictionIterator> = if self.replay_config.run_eviction {
-            Some(EvictionIterator::new(
-                self.replay_config
-                    .eviction_settings
-                    .starting_eviction_scan_level,
-            ))
+            load_eviction_iterator_from_bucket_list(bucket_list).or_else(|| {
+                info!("No EvictionIterator found in checkpoint, starting fresh");
+                Some(EvictionIterator::new(
+                    self.replay_config
+                        .eviction_settings
+                        .starting_eviction_scan_level,
+                ))
+            })
         } else {
             None
         };
@@ -1828,6 +1832,54 @@ fn create_header_from_replay_state(
         max_tx_set_size: 1000,
         skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
         ext: LedgerHeaderExt::V0,
+    }
+}
+
+/// Load the EvictionIterator from the bucket list's ConfigSettingEntry.
+///
+/// The EvictionIterator tracks where the incremental eviction scan was at a given
+/// checkpoint. When replaying ledgers, we must load this iterator and continue from
+/// that position to produce the correct bucket list hash.
+///
+/// Returns `Some(EvictionIterator)` if found in the bucket list, or `None` if no
+/// EvictionIterator entry exists (e.g., for pre-protocol 23 checkpoints).
+fn load_eviction_iterator_from_bucket_list(
+    bucket_list: &BucketList,
+) -> Option<stellar_core_bucket::EvictionIterator> {
+    use stellar_xdr::curr::{ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting};
+
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::EvictionIterator,
+    });
+
+    match bucket_list.get(&key) {
+        Ok(Some(entry)) => {
+            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(xdr_iter)) = entry.data {
+                let iter = stellar_core_bucket::EvictionIterator {
+                    bucket_file_offset: xdr_iter.bucket_file_offset as u32,
+                    bucket_list_level: xdr_iter.bucket_list_level,
+                    is_curr_bucket: xdr_iter.is_curr_bucket,
+                };
+                info!(
+                    level = iter.bucket_list_level,
+                    is_curr = iter.is_curr_bucket,
+                    offset = iter.bucket_file_offset,
+                    "Loaded EvictionIterator from checkpoint"
+                );
+                Some(iter)
+            } else {
+                warn!("EvictionIterator entry has unexpected type");
+                None
+            }
+        }
+        Ok(None) => {
+            debug!("No EvictionIterator ConfigSettingEntry in bucket list");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to query EvictionIterator from bucket list");
+            None
+        }
     }
 }
 
