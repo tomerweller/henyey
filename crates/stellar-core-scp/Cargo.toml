@@ -12,20 +12,12 @@ stellar-strkey.workspace = true
 stellar-core-common.workspace = true
 stellar-core-crypto.workspace = true
 
-# Async runtime
-tokio.workspace = true
-async-trait.workspace = true
-
 # Serialization
 serde.workspace = true
 
 # Error handling
 thiserror.workspace = true
 tracing.workspace = true
-
-# Data structures
-indexmap.workspace = true
-im.workspace = true
 
 # Utilities
 parking_lot.workspace = true
