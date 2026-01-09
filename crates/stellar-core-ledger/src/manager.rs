@@ -420,11 +420,15 @@ impl LedgerManager {
     /// * `bucket_list` - The live bucket list
     /// * `hot_archive_bucket_list` - The hot archive bucket list (protocol 23+)
     /// * `header` - The ledger header to initialize with
+    /// * `header_hash` - The pre-computed hash of the header from the history archive.
+    ///   This is the authoritative hash that the network used. If `None`, the hash
+    ///   will be computed from the header (not recommended for catchup scenarios).
     pub fn initialize_from_buckets(
         &self,
         bucket_list: BucketList,
         hot_archive_bucket_list: Option<BucketList>,
         header: LedgerHeader,
+        header_hash: Option<Hash256>,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
@@ -486,8 +490,25 @@ impl LedgerManager {
             });
         }
 
-        // Compute header hash
-        let header_hash = compute_header_hash(&header)?;
+        // Use the provided header hash if available, otherwise compute it.
+        // The provided hash should come from the history archive and is authoritative.
+        let header_hash = match header_hash {
+            Some(hash) => {
+                tracing::debug!(
+                    ledger_seq = header.ledger_seq,
+                    provided_hash = %hash.to_hex(),
+                    "Using pre-computed header hash from history archive"
+                );
+                hash
+            }
+            None => {
+                tracing::debug!(
+                    ledger_seq = header.ledger_seq,
+                    "Computing header hash (no pre-computed hash provided)"
+                );
+                compute_header_hash(&header)?
+            }
+        };
 
         // Update state
         *self.bucket_list.write() = bucket_list;
@@ -501,6 +522,7 @@ impl LedgerManager {
 
         info!(
             ledger_seq = state.header.ledger_seq,
+            header_hash = %state.header_hash.to_hex(),
             "Ledger initialized from buckets"
         );
 
@@ -516,9 +538,10 @@ impl LedgerManager {
         bucket_list: BucketList,
         hot_archive_bucket_list: Option<BucketList>,
         header: LedgerHeader,
+        header_hash: Option<Hash256>,
     ) -> Result<()> {
         self.reset_for_catchup();
-        self.initialize_from_buckets(bucket_list, hot_archive_bucket_list, header)
+        self.initialize_from_buckets(bucket_list, hot_archive_bucket_list, header, header_hash)
     }
 
     /// Initialize the ledger from bucket list state, skipping hash verification.

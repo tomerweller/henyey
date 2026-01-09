@@ -301,12 +301,34 @@ impl HistoryArchive {
         &self,
         seq: u32,
     ) -> Result<stellar_xdr::curr::LedgerHeader, HistoryError> {
+        let (header, _hash) = self.get_ledger_header_with_hash(seq).await?;
+        Ok(header)
+    }
+
+    /// Download a single ledger header with its pre-computed hash by sequence.
+    ///
+    /// This downloads the checkpoint containing the ledger and extracts
+    /// the specific header along with its hash from the archive.
+    /// The hash is the one recorded in the history archive, which is the
+    /// authoritative hash used by the network.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - The ledger sequence number
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (header, hash) for the specified sequence.
+    pub async fn get_ledger_header_with_hash(
+        &self,
+        seq: u32,
+    ) -> Result<(stellar_xdr::curr::LedgerHeader, Hash256), HistoryError> {
         let headers = self.get_ledger_headers(seq).await?;
 
         // Find the header with the matching sequence
         for entry in headers {
             if entry.header.ledger_seq == seq {
-                return Ok(entry.header);
+                return Ok((entry.header, Hash256::from(entry.hash.0)));
             }
         }
 

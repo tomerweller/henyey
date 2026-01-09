@@ -426,6 +426,13 @@ pub struct CatchupOutput {
     ///
     /// This header has been verified to match the downloaded state.
     pub header: stellar_xdr::curr::LedgerHeader,
+
+    /// The pre-computed hash of the ledger header.
+    ///
+    /// This is the authoritative hash from the history archive, which should be
+    /// used instead of re-computing the hash from the header. Using the archive's
+    /// hash ensures consistency with what the network actually recorded.
+    pub header_hash: stellar_core_common::Hash256,
 }
 
 impl CatchupOutput {

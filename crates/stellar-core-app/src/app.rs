@@ -1700,12 +1700,14 @@ impl App {
 
         // Initialize ledger manager with catchup results.
         // This validates that the bucket list hash matches the ledger header.
+        // Pass the pre-computed header hash from the history archive - this is authoritative.
         if self.ledger_manager.is_initialized() {
             self.ledger_manager
                 .reinitialize_from_buckets(
                     output.bucket_list,
                     output.hot_archive_bucket_list,
                     output.header,
+                    Some(output.header_hash),
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to reinitialize ledger manager: {}", e))?;
         } else {
@@ -1714,6 +1716,7 @@ impl App {
                     output.bucket_list,
                     output.hot_archive_bucket_list,
                     output.header,
+                    Some(output.header_hash),
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
         }

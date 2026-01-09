@@ -362,12 +362,12 @@ impl CatchupManager {
 
         let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
             // Catching up to exactly a checkpoint - download and use the checkpoint header
+            // Use the archive's pre-computed hash - it's the authoritative hash the network used
             info!(
                 "Catching up to checkpoint {} (no ledgers to replay)",
                 checkpoint_seq
             );
-            let checkpoint_header = self.download_checkpoint_header(checkpoint_seq).await?;
-            let header_hash = verify::compute_header_hash(&checkpoint_header)?;
+            let (checkpoint_header, header_hash) = self.download_checkpoint_header(checkpoint_seq).await?;
             (checkpoint_header, header_hash, 0)
         } else {
             // Replay ledgers to reach target
@@ -380,20 +380,22 @@ impl CatchupManager {
                 )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
-            // Get the final header from replay
-            let final_header = self
-                .download_checkpoint_header(target)
-                .await
-                .unwrap_or_else(|_| {
+            // Get the final header from replay - use archive's hash if available
+            let (final_header, final_hash) = match self.download_checkpoint_header(target).await {
+                Ok((header, hash)) => (header, hash),
+                Err(_) => {
                     // Construct a minimal header from replay state if download fails
                     warn!("Could not download final header, using replay state");
-                    create_header_from_replay_state(
+                    let header = create_header_from_replay_state(
                         &final_state,
                         &bucket_list,
                         hot_archive_bucket_list.as_ref(),
-                    )
-                });
-            (final_header, final_state.ledger_hash, ledgers_applied)
+                    );
+                    // Fall back to the replay-computed hash
+                    (header, final_state.ledger_hash)
+                }
+            };
+            (final_header, final_hash, ledgers_applied)
         };
 
         // Verify the final state matches expected bucket list hash
@@ -428,6 +430,7 @@ impl CatchupManager {
             bucket_list,
             hot_archive_bucket_list,
             header: final_header,
+            header_hash: final_hash,
         })
     }
 
@@ -525,7 +528,7 @@ impl CatchupManager {
                 verify::verify_tx_result_set(header, &xdr)?;
             }
         }
-        let checkpoint_header = checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
+        let (checkpoint_header, checkpoint_hash) = checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
         let ledger_data = if target == checkpoint_seq {
             Vec::new()
         } else {
@@ -547,8 +550,8 @@ impl CatchupManager {
         self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
 
         let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
-            let header_hash = verify::compute_header_hash(&checkpoint_header)?;
-            (checkpoint_header, header_hash, 0)
+            // Use the archive's pre-computed hash - it's the authoritative hash the network used
+            (checkpoint_header, checkpoint_hash, 0)
         } else {
             let final_state = self
                 .replay_ledgers(
@@ -559,19 +562,22 @@ impl CatchupManager {
                 )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
-            let final_header = self
-                .download_checkpoint_header(target)
-                .await
-                .unwrap_or_else(|_| {
+            // Get the final header from replay - use archive's hash if available
+            let (final_header, final_hash) = match self.download_checkpoint_header(target).await {
+                Ok((header, hash)) => (header, hash),
+                Err(_) => {
                     // Construct a minimal header from replay state if download fails
                     warn!("Could not download final header, using replay state");
-                    create_header_from_replay_state(
+                    let header = create_header_from_replay_state(
                         &final_state,
                         &bucket_list,
                         hot_archive_bucket_list.as_ref(),
-                    )
-                });
-            (final_header, final_state.ledger_hash, ledgers_applied)
+                    );
+                    // Fall back to the replay-computed hash
+                    (header, final_state.ledger_hash)
+                }
+            };
+            (final_header, final_hash, ledgers_applied)
         };
 
         if let Err(e) =
@@ -597,6 +603,7 @@ impl CatchupManager {
             bucket_list,
             hot_archive_bucket_list,
             header: final_header,
+            header_hash: final_hash,
         })
     }
 
@@ -1461,18 +1468,22 @@ impl CatchupManager {
         Ok(())
     }
 
-    /// Download the header for a specific ledger.
-    async fn download_checkpoint_header(&self, ledger_seq: u32) -> Result<LedgerHeader> {
+    /// Download the header for a specific ledger with its pre-computed hash.
+    ///
+    /// Returns the header and its hash as recorded in the history archive.
+    /// The hash from the archive is authoritative - it's what the network used.
+    async fn download_checkpoint_header(&self, ledger_seq: u32) -> Result<(LedgerHeader, Hash256)> {
         for archive in &self.archives {
-            match archive.get_ledger_header(ledger_seq).await {
-                Ok(header) => {
+            match archive.get_ledger_header_with_hash(ledger_seq).await {
+                Ok((header, hash)) => {
                     debug!(
-                        "Downloaded header for ledger {}: bucket_list_hash={}, ledger_seq={}",
+                        "Downloaded header for ledger {}: bucket_list_hash={}, ledger_seq={}, hash={}",
                         ledger_seq,
                         hex::encode(header.bucket_list_hash.0),
-                        header.ledger_seq
+                        header.ledger_seq,
+                        hash.to_hex()
                     );
-                    return Ok(header);
+                    return Ok((header, hash));
                 }
                 Err(e) => {
                     warn!(
@@ -1626,19 +1637,17 @@ impl CatchupManager {
 fn checkpoint_header_from_headers(
     checkpoint_seq: u32,
     headers: &[LedgerHeaderHistoryEntry],
-) -> Result<LedgerHeader> {
-    let mut header_map = HashMap::new();
+) -> Result<(LedgerHeader, Hash256)> {
     for entry in headers {
-        header_map.insert(entry.header.ledger_seq, entry.header.clone());
+        if entry.header.ledger_seq == checkpoint_seq {
+            return Ok((entry.header.clone(), Hash256::from(entry.hash.0)));
+        }
     }
 
-    let checkpoint_header = header_map.get(&checkpoint_seq).ok_or_else(|| {
-        HistoryError::CatchupFailed(format!(
-            "checkpoint header {} not found in headers",
-            checkpoint_seq
-        ))
-    })?;
-    Ok(checkpoint_header.clone())
+    Err(HistoryError::CatchupFailed(format!(
+        "checkpoint header {} not found in headers",
+        checkpoint_seq
+    )))
 }
 
 /// Data downloaded for a single ledger.
