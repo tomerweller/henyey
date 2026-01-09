@@ -3217,45 +3217,130 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
     }
 }
 
-/// Converts Stellar keys between formats.
+/// Converts Stellar IDs between formats (equivalent to C++ convert-id).
 ///
-/// Handles the following formats:
-/// - `G...` - Public key (strkey) -> displays hex
-/// - `S...` - Secret seed (strkey) -> displays public key (not raw secret)
-/// - 64 hex chars - Hex public key -> displays strkey
+/// Handles the following input formats:
+/// - `G...` - Public key (account ID) -> displays strKey and hex
+/// - `S...` - Secret seed -> displays seed strKey and derived public key
+/// - `T...` - Pre-auth transaction hash -> displays type and hex
+/// - `X...` - SHA256 hash -> displays type and hex
+/// - `M...` - Muxed account -> displays type, account ID, and memo ID
+/// - `C...` - Contract address -> displays type and hex
+/// - `P...` - Signed payload -> displays type and hex
+/// - 64 hex chars - 32-byte hex -> displays all possible interpretations
 fn convert_key(key: &str) -> anyhow::Result<()> {
+    use stellar_core_crypto::{
+        decode_pre_auth_tx, decode_sha256_hash, decode_muxed_account,
+        decode_contract, decode_signed_payload,
+        encode_account_id, encode_pre_auth_tx, encode_sha256_hash,
+        encode_muxed_account, encode_contract,
+    };
+
     let key = key.trim();
 
+    // Try public key (G...)
     if key.starts_with('G') {
-        // Public key (account ID)
         let pk = stellar_core_crypto::PublicKey::from_strkey(key)?;
-        println!("Type: Account ID (Public Key)");
-        println!("StrKey: {}", pk.to_strkey());
-        println!("Hex: {}", hex::encode(pk.as_bytes()));
-    } else if key.starts_with('S') {
-        // Secret seed
-        let sk = stellar_core_crypto::SecretKey::from_strkey(key)?;
-        let pk = sk.public_key();
-        println!("Type: Secret Seed");
-        println!("Public Key: {}", pk.to_strkey());
-        println!("WARNING: Secret key detected, not displaying raw bytes");
-    } else if key.len() == 64 {
-        // Might be hex
-        let bytes = hex::decode(key)?;
-        if bytes.len() == 32 {
-            if let Ok(pk) = stellar_core_crypto::PublicKey::from_bytes(bytes.as_slice().try_into()?) {
-                println!("Type: Public Key (from hex)");
-                println!("StrKey: {}", pk.to_strkey());
-            } else {
-                println!("Type: 32-byte hash");
-                println!("Hex: {}", key);
-            }
-        }
-    } else {
-        anyhow::bail!("Unknown key format: {}", key);
+        println!("PublicKey:");
+        println!("  strKey: {}", pk.to_strkey());
+        println!("  hex: {}", hex::encode(pk.as_bytes()));
+        return Ok(());
     }
 
-    Ok(())
+    // Try secret seed (S...)
+    if key.starts_with('S') {
+        let sk = stellar_core_crypto::SecretKey::from_strkey(key)?;
+        let pk = sk.public_key();
+        println!("Seed:");
+        println!("  strKey: {}", sk.to_strkey());
+        println!("PublicKey:");
+        println!("  strKey: {}", pk.to_strkey());
+        println!("  hex: {}", hex::encode(pk.as_bytes()));
+        return Ok(());
+    }
+
+    // Try pre-auth transaction hash (T...)
+    if key.starts_with('T') {
+        let hash = decode_pre_auth_tx(key)?;
+        println!("StrKey:");
+        println!("  type: STRKEY_PRE_AUTH_TX");
+        println!("  hex: {}", hex::encode(&hash));
+        return Ok(());
+    }
+
+    // Try SHA256 hash (X...)
+    if key.starts_with('X') {
+        let hash = decode_sha256_hash(key)?;
+        println!("StrKey:");
+        println!("  type: STRKEY_HASH_X");
+        println!("  hex: {}", hex::encode(&hash));
+        return Ok(());
+    }
+
+    // Try muxed account (M...)
+    if key.starts_with('M') {
+        let (account_id, memo_id) = decode_muxed_account(key)?;
+        println!("StrKey:");
+        println!("  type: STRKEY_MUXED_ACCOUNT_ED25519");
+        println!("  accountId: {}", encode_account_id(&account_id));
+        println!("  memoId: {}", memo_id);
+        println!("  hex: {}", hex::encode(&account_id));
+        return Ok(());
+    }
+
+    // Try contract address (C...)
+    if key.starts_with('C') {
+        let hash = decode_contract(key)?;
+        println!("StrKey:");
+        println!("  type: STRKEY_CONTRACT");
+        println!("  hex: {}", hex::encode(&hash));
+        return Ok(());
+    }
+
+    // Try signed payload (P...)
+    if key.starts_with('P') {
+        let (signer, payload) = decode_signed_payload(key)?;
+        println!("StrKey:");
+        println!("  type: STRKEY_SIGNED_PAYLOAD_ED25519");
+        println!("  signer: {}", hex::encode(&signer));
+        println!("  payload: {}", hex::encode(&payload));
+        return Ok(());
+    }
+
+    // Try 64-character hex string (32 bytes)
+    if key.len() == 64 {
+        if let Ok(bytes) = hex::decode(key) {
+            if bytes.len() == 32 {
+                let data: [u8; 32] = bytes.try_into().unwrap();
+
+                // Show all possible interpretations
+                println!("Interpreted as PublicKey:");
+                println!("  strKey: {}", encode_account_id(&data));
+                println!("  hex: {}", key);
+
+                // Show as seed -> public key derivation
+                let sk = stellar_core_crypto::SecretKey::from_seed(&data);
+                let pk = sk.public_key();
+                println!();
+                println!("Interpreted as Seed:");
+                println!("  strKey: {}", sk.to_strkey());
+                println!("PublicKey:");
+                println!("  strKey: {}", pk.to_strkey());
+                println!("  hex: {}", hex::encode(pk.as_bytes()));
+
+                println!();
+                println!("Other interpretations:");
+                println!("  STRKEY_PRE_AUTH_TX: {}", encode_pre_auth_tx(&data));
+                println!("  STRKEY_HASH_X: {}", encode_sha256_hash(&data));
+                println!("  STRKEY_MUXED_ACCOUNT: {}", encode_muxed_account(&data, 0));
+                println!("  STRKEY_CONTRACT: {}", encode_contract(&data));
+
+                return Ok(());
+            }
+        }
+    }
+
+    anyhow::bail!("Unknown key format: {}. Expected G.../S.../T.../X.../M.../C.../P... strkey or 64-character hex", key);
 }
 
 /// Decodes XDR from base64 and prints it in debug format.

@@ -46,7 +46,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `version` | Implemented | Via `--version` flag |
 | `help` | Implemented | Via `--help` flag |
 | `verify-checkpoints` | Not Implemented | |
-| `convert-id` | Not Implemented | |
+| `convert-id` | Implemented | `offline convert-key` in rs-stellar-core |
 | `diag-bucket-stats` | Not Implemented | |
 | `dump-ledger` | Not Implemented | |
 | `dump-xdr` | Not Implemented | |
