@@ -71,7 +71,7 @@ fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
         LedgerEntryData::ContractData(data) => LedgerKey::ContractData(LedgerKeyContractData {
             contract: data.contract.clone(),
             key: data.key.clone(),
-            durability: data.durability.clone(),
+            durability: data.durability,
         }),
         LedgerEntryData::ContractCode(code) => LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: code.hash.clone(),
