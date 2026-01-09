@@ -483,7 +483,7 @@ pub fn build_tx_hash_map_with_network(
                 stellar_xdr::curr::TransactionEnvelope::Tx(_) => EnvelopeType::Tx,
                 stellar_xdr::curr::TransactionEnvelope::TxFeeBump(_) => EnvelopeType::TxFeeBump,
             };
-            hasher.update(&(envelope_type as i32).to_be_bytes());
+            hasher.update((envelope_type as i32).to_be_bytes());
 
             // Add the transaction body (not the full envelope)
             match env {

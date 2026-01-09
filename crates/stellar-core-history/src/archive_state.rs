@@ -260,7 +260,7 @@ impl HistoryArchiveState {
     pub fn has_hot_archive_buckets(&self) -> bool {
         self.hot_archive_buckets
             .as_ref()
-            .map_or(false, |v| !v.is_empty())
+            .is_some_and(|v| !v.is_empty())
     }
 
     /// Get the number of hot archive bucket levels.
