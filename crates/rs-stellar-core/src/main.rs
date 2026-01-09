@@ -2666,6 +2666,11 @@ async fn cmd_debug_bucket_entry(
                 println!("  Balance: {}", acc.balance);
                 println!("  Sequence: {}", acc.seq_num.0);
                 println!("  Last modified: {}", entry.last_modified_ledger_seq);
+                println!("  Thresholds: {:?}", acc.thresholds.0);
+                println!("  Num signers: {}", acc.signers.len());
+                for (i, signer) in acc.signers.iter().enumerate() {
+                    println!("    Signer {}: weight={}", i, signer.weight);
+                }
             }
         }
         None => {
@@ -2690,6 +2695,11 @@ async fn cmd_debug_bucket_entry(
                         println!("    Balance: {}", acc.balance);
                         println!("    Sequence: {}", acc.seq_num.0);
                         println!("    Last modified: {}", e.last_modified_ledger_seq);
+                        println!("    Thresholds: {:?}", acc.thresholds.0);
+                        println!("    Num signers: {}", acc.signers.len());
+                        for (i, signer) in acc.signers.iter().enumerate() {
+                            println!("      Signer {}: weight={}", i, signer.weight);
+                        }
                     }
                 }
                 BucketEntry::Dead(_) => {

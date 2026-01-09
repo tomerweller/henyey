@@ -712,7 +712,15 @@ impl TransactionExecutor {
         });
 
         if let Some(entry) = snapshot.get_entry(&key)? {
-            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: found in bucket list");
+            // Log signer info for debugging
+            if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
+                tracing::trace!(
+                    account = ?account_id,
+                    num_signers = acct.signers.len(),
+                    thresholds = ?acct.thresholds.0,
+                    "load_account: found in bucket list"
+                );
+            }
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -1656,6 +1664,7 @@ impl TransactionExecutor {
             &fee_source_account,
             outer_threshold,
         ) {
+            tracing::warn!("Signature check failed: fee_source outer check");
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
@@ -1678,6 +1687,7 @@ impl TransactionExecutor {
                 &source_account,
                 inner_threshold,
             ) {
+                tracing::warn!("Signature check failed: fee_bump inner check");
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
@@ -1692,7 +1702,10 @@ impl TransactionExecutor {
             }
         }
 
-        let required_weight = threshold_medium(&source_account);
+        // Transaction envelope uses LOW threshold for signature check.
+        // Each operation will additionally check its own threshold (low/medium/high).
+        // This matches C++ stellar-core's checkAllTransactionSignatures behavior.
+        let required_weight = threshold_low(&source_account);
         if !frame.is_fee_bump()
             && !has_sufficient_signer_weight(
                 &outer_hash,
@@ -1701,6 +1714,14 @@ impl TransactionExecutor {
                 required_weight,
             )
         {
+            tracing::warn!(
+                required_weight = required_weight,
+                is_fee_bump = frame.is_fee_bump(),
+                master_weight = source_account.thresholds.0[0],
+                num_signers = source_account.signers.len(),
+                thresholds = ?source_account.thresholds.0,
+                "Signature check failed: source outer check"
+            );
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
@@ -3917,8 +3938,18 @@ fn has_sufficient_signer_weight(
     // Master key signer.
     if let Ok(pk) = stellar_core_crypto::PublicKey::try_from(&account.account_id.0) {
         let master_weight = account.thresholds.0[0] as u32;
+        tracing::trace!(
+            master_weight = master_weight,
+            required_weight = required_weight,
+            num_signatures = signatures.len(),
+            num_signers = account.signers.len(),
+            thresholds = ?account.thresholds.0,
+            "Checking signature weight"
+        );
         if master_weight > 0 {
-            if has_ed25519_signature(tx_hash, signatures, &pk) {
+            let has_sig = has_ed25519_signature(tx_hash, signatures, &pk);
+            tracing::trace!(has_master_sig = has_sig, "Master key signature check");
+            if has_sig {
                 let id = signer_key_id(&SignerKey::Ed25519(stellar_xdr::curr::Uint256(
                     *pk.as_bytes(),
                 )));
