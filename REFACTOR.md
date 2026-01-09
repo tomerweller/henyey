@@ -74,7 +74,7 @@ Top-level application layer orchestrating subsystems.
 
 | Location | Issue | Suggested Fix |
 |----------|-------|---------------|
-| `app.rs:1497` | `unwrap()` on `pop_front()` | Use `if let Some(peer_id) = reporting.queue.pop_front()` |
+| ~~`app.rs:1497`~~ | ~~`unwrap()` on `pop_front()`~~ | ✅ Fixed: Use `if let Some(peer_id)` pattern |
 | `app.rs:2636` | `unwrap()` on `next_back()` | Use match expression or combine empty check with retrieval |
 | `app.rs:2736` | `.expect("tx set present")` | Use match or `if let Some(tx_set)` with proper error handling |
 | `run_cmd.rs:329,335` | Signal handlers use `.expect()` | Return proper error from `wait_for_shutdown_signal()` |
@@ -85,14 +85,14 @@ Top-level application layer orchestrating subsystems.
 |----------|-------|---------------|
 | `app.rs`, `run_cmd.rs` | Peer address parsing duplicated | Extract shared utility function |
 | Throughout | `stellar_xdr::curr::Limits::none()` repeated dozens of times | Define constant or helper function |
-| `run_cmd.rs:1128-1139` | `node_id_to_strkey` and `peer_id_to_strkey` nearly identical | Unify into single function |
+| ~~`run_cmd.rs:1128-1139`~~ | ~~`node_id_to_strkey` and `peer_id_to_strkey` nearly identical~~ | ✅ Fixed: Unified into single function |
 
 ### Performance Issues
 
 | Location | Issue | Suggested Fix |
 |----------|-------|---------------|
 | `app.rs` | Over 89 `.clone()` calls, many in hot paths | Review and use references or Arc where possible |
-| `app.rs:593` | `samples.remove(0)` is O(n) for Vec | Use `VecDeque` instead |
+| ~~`app.rs:593`~~ | ~~`samples.remove(0)` is O(n) for Vec~~ | ✅ Fixed: Changed to `VecDeque` |
 
 ### API Design Issues
 
@@ -142,7 +142,7 @@ Bucket storage and merging.
 
 | Location | Issue | Suggested Fix |
 |----------|-------|---------------|
-| `bucket_list.rs:68-71`, `merge.rs:50-51` | Protocol constants duplicated | Define in single location and re-export |
+| ~~`bucket_list.rs:68-71`, `merge.rs:50-51`~~ | ~~Protocol constants duplicated~~ | ✅ Fixed: Centralized in `lib.rs` and re-exported |
 
 ---
 
