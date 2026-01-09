@@ -236,7 +236,9 @@ impl FloodGate {
 
         let before_count = self.seen.len();
         self.seen.retain(|_, entry| !entry.is_expired(ttl));
-        let removed = before_count - self.seen.len();
+        // Use saturating_sub to avoid panic if entries were added by another thread
+        // between the two len() calls
+        let removed = before_count.saturating_sub(self.seen.len());
 
         if removed > 0 {
             debug!("FloodGate cleanup: removed {} expired entries", removed);

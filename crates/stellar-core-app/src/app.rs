@@ -3141,7 +3141,12 @@ impl App {
 
         let gap = first_buffered.saturating_sub(current_ledger);
         if gap >= CHECKPOINT_FREQUENCY {
-            let target = first_buffered.saturating_sub(1);
+            // Cap catchup target at the latest checkpoint to avoid replaying individual
+            // ledgers past a checkpoint. Replaying without TransactionMeta can produce
+            // different bucket list state due to transaction re-execution parity issues.
+            // By stopping at a checkpoint, we restore state directly from the archive.
+            let target = latest_checkpoint_before_or_at(first_buffered.saturating_sub(1))
+                .unwrap_or(0);
             return if target == 0 { None } else { Some(target) };
         }
 
@@ -3189,12 +3194,10 @@ impl App {
                 return Some(alt_target);
             }
 
-            // Last resort: target just before first_buffered to bridge the gap
-            let bridge_target = first_buffered.saturating_sub(1);
-            if bridge_target > current_ledger {
-                return Some(bridge_target);
-            }
-
+            // We cannot target non-checkpoint ledgers because replaying individual ledgers
+            // past a checkpoint causes bucket list hash mismatches due to transaction
+            // re-execution parity differences with C++ stellar-core.
+            // Return None to wait for more buffered ledgers or the next checkpoint.
             return None;
         }
 
@@ -6261,9 +6264,11 @@ mod tests {
     #[test]
     fn test_buffered_catchup_target_large_gap() {
         let current = 100;
-        let first_buffered = current + CHECKPOINT_FREQUENCY + 5;
+        let first_buffered = current + CHECKPOINT_FREQUENCY + 5; // 169
         let target = App::buffered_catchup_target(current, first_buffered, first_buffered);
-        assert_eq!(target, Some(first_buffered - 1));
+        // Target should be capped at the latest checkpoint (127) to avoid replaying
+        // individual ledgers which can cause bucket list hash mismatches.
+        assert_eq!(target, Some(127));
     }
 
     #[test]
