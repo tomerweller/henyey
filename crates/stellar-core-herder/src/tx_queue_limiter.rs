@@ -95,9 +95,6 @@ fn compute_better_fee(
 /// }
 /// ```
 pub struct TxQueueLimiter {
-    /// Pool ledger multiplier (how many ledgers worth of txs to buffer)
-    #[allow(dead_code)]
-    pool_ledger_multiplier: u32,
     /// Maximum ledger resources (scaled by multiplier)
     max_resources: Resource,
     /// Whether this limiter is for Soroban transactions
@@ -143,7 +140,6 @@ impl TxQueueLimiter {
         };
 
         Self {
-            pool_ledger_multiplier: multiplier,
             max_resources,
             is_soroban,
             max_dex_operations,

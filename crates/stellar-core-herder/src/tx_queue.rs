@@ -275,14 +275,6 @@ pub(crate) fn fee_rate_cmp(a_fee: u64, a_ops: u32, b_fee: u64, b_ops: u32) -> Or
     left.cmp(&right)
 }
 
-#[allow(dead_code)]
-fn tx_size_bytes(envelope: &TransactionEnvelope) -> u32 {
-    envelope
-        .to_xdr(Limits::none())
-        .map(|bytes| bytes.len() as u32)
-        .unwrap_or(0)
-}
-
 fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> bool {
     match fee_rate_cmp(new_tx.total_fee, new_tx.op_count, old_tx.total_fee, old_tx.op_count) {
         Ordering::Greater => true,
@@ -1333,7 +1325,7 @@ impl TransactionQueue {
         (tx_set, gen_tx_set)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn select_transactions(&self, max_ops: usize) -> SelectedTxs {
         self.select_transactions_with_starting_seq(max_ops, None)
     }

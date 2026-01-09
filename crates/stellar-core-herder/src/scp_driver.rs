@@ -129,7 +129,6 @@ pub struct PendingTxSet {
 
 /// Pending quorum set request.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PendingQuorumSet {
     /// The hash of the quorum set.
     pub hash: Hash256,

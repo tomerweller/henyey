@@ -82,7 +82,6 @@ pub(crate) trait SurgePricingLaneConfig {
     fn lane_limits(&self) -> &[Resource];
 
     /// Update the generic lane's resource limit (used during dynamic adjustments).
-    #[allow(dead_code)]
     fn update_generic_lane_limit(&mut self, limit: Resource);
 
     /// Calculate the resources consumed by a transaction.
@@ -268,7 +267,6 @@ impl Ord for QueueEntry {
 }
 
 /// Result of visiting a transaction during priority queue iteration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisitTxResult {
     /// Transaction was skipped (e.g., sequence gap).
@@ -309,7 +307,6 @@ pub(crate) struct SurgePricingPriorityQueue {
     seed: u64,
 }
 
-#[allow(dead_code)]
 impl SurgePricingPriorityQueue {
     pub(crate) fn new(
         lane_config: Box<dyn SurgePricingLaneConfig>,
