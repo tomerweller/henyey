@@ -53,9 +53,6 @@ const VERSION_PRE_AUTH_TX: u8 = 19 << 3;
 const VERSION_SHA256_HASH: u8 = 23 << 3;
 /// Version byte for muxed accounts (produces 'M' prefix).
 const VERSION_MUXED_ACCOUNT: u8 = 12 << 3;
-/// Version byte for signed payloads (produces 'P' prefix).
-#[allow(dead_code)]
-const VERSION_SIGNED_PAYLOAD: u8 = 15 << 3;
 
 /// Encodes an Ed25519 public key as a Stellar account ID (G...).
 ///

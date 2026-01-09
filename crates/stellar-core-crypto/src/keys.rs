@@ -105,12 +105,6 @@ impl PublicKey {
     pub fn to_curve25519_bytes(&self) -> [u8; 32] {
         self.0.to_montgomery().to_bytes()
     }
-
-    /// Returns a reference to the inner verifying key.
-    #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> &VerifyingKey {
-        &self.0
-    }
 }
 
 impl fmt::Debug for PublicKey {
