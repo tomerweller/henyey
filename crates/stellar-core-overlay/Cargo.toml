@@ -17,9 +17,6 @@ tokio-util.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 
-# Networking
-socket2.workspace = true
-
 # Crypto for X25519 key exchange and HMAC
 x25519-dalek.workspace = true
 hmac.workspace = true
