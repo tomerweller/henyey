@@ -243,11 +243,9 @@ impl VerificationSummary {
 }
 
 /// Check if a mismatch is a tolerated/known difference
-fn is_tolerated_mismatch(mismatch: &TxMismatch) -> bool {
-    is_path_payment_liquidity_pool_difference(mismatch)
-        || is_soroban_return_value_difference(mismatch)
-        || is_fee_bump_soroban_inner_fee_difference(mismatch)
-        || is_soroban_error_code_difference(mismatch)
+/// Currently NO mismatches are tolerated - all must be fixed
+fn is_tolerated_mismatch(_mismatch: &TxMismatch) -> bool {
+    false
 }
 
 /// Extract operation names from a transaction envelope
