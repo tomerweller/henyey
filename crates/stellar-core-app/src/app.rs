@@ -6317,13 +6317,13 @@ mod tests {
         let target = App::compute_catchup_target_for_timeout(150, 100, 70);
         assert_eq!(target, Some(127));
 
-        // Test case 4: current_ledger past all checkpoint targets, use bridge target
+        // Test case 4: current_ledger past all checkpoint targets, return None
         // first_buffered=100, last_buffered=110, current=95
         // first_buffered checkpoint start=64, target=63 (but 63 < 95)
         // last_buffered checkpoint start=64, alt_target=63 (but 63 < 95)
-        // bridge_target = 100 - 1 = 99 > 95, so return 99
+        // Cannot target non-checkpoint ledgers, so return None
         let target = App::compute_catchup_target_for_timeout(110, 100, 95);
-        assert_eq!(target, Some(99));
+        assert!(target.is_none());
 
         // Test case 5: current_ledger already at or past first_buffered, return None
         // This happens when we've caught up but buffered ledgers haven't been processed
@@ -6332,8 +6332,8 @@ mod tests {
 
         // Test case 6: very early ledger (first checkpoint)
         // first_buffered=50 is in checkpoint starting at 0
-        // Target would be 0 - 1 with saturating_sub = 0, which is <= current_ledger=10
-        // Fall through to bridge_target = 50 - 1 = 49 > 10
+        // Since checkpoint_start is 0, target = first_buffered - 1 = 49
+        // 49 > current_ledger (10), so return Some(49)
         let target = App::compute_catchup_target_for_timeout(60, 50, 10);
         assert_eq!(target, Some(49));
 
