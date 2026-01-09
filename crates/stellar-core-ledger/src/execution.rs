@@ -958,11 +958,9 @@ impl TransactionExecutor {
         for change in changes.iter() {
             match change {
                 LedgerEntryChange::Created(entry) | LedgerEntryChange::Updated(entry) | LedgerEntryChange::Restored(entry) => {
-                    // Use no-tracking method to avoid delta pollution
                     self.state.apply_entry_no_tracking(entry);
                 }
                 LedgerEntryChange::Removed(key) => {
-                    // Use no-tracking method to avoid delta pollution
                     self.state.delete_entry_no_tracking(key);
                 }
                 LedgerEntryChange::State(_) => {
@@ -970,6 +968,10 @@ impl TransactionExecutor {
                 }
             }
         }
+        // Clear snapshots to prevent stale snapshot state from affecting subsequent transactions.
+        // Without this, a transaction that creates an entry might see an old snapshot from a
+        // previous transaction's execution, causing incorrect STATE/CREATED tracking.
+        self.state.commit();
     }
 
     /// Apply a fee refund to an account WITHOUT delta tracking.
@@ -1692,11 +1694,11 @@ impl TransactionExecutor {
 
         if self.protocol_version >= 10 {
             // For fee bump transactions in two-phase mode, C++ stellar-core's
-            // FeeBumpTransactionFrame::apply() emits a STATE/UPDATED pair for the fee source
-            // BEFORE the inner transaction's sequence bump. This captures the fee source state
-            // as modified by removeOneTimeSignerKeyFromFeeSource() (even if nothing changed).
-            // We capture this BEFORE the sequence bump to match C++ stellar-core ordering.
-            let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() && fee_source_id != inner_source_id {
+            // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
+            // which loads the fee source account, generating a STATE/UPDATED pair even if
+            // the fee source equals the inner source. This happens BEFORE the inner transaction's
+            // sequence bump. We capture this to match C++ stellar-core ordering.
+            let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
                 let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                     account_id: fee_source_id.clone(),
                 });

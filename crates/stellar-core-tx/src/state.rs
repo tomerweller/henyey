@@ -1,6 +1,6 @@
 //! Ledger state management for transaction execution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
@@ -178,6 +178,24 @@ pub struct LedgerStateManager {
     entry_sponsorship_snapshots: HashMap<LedgerKey, Option<AccountId>>,
     /// Snapshot of last modified ledger sequence for rollback.
     entry_last_modified_snapshots: HashMap<LedgerKey, Option<u32>>,
+    /// Track accounts created in this transaction (for rollback).
+    created_accounts: HashSet<[u8; 32]>,
+    /// Track trustlines created in this transaction (for rollback).
+    created_trustlines: HashSet<([u8; 32], AssetKey)>,
+    /// Track offers created in this transaction (for rollback).
+    created_offers: HashSet<([u8; 32], i64)>,
+    /// Track data entries created in this transaction (for rollback).
+    created_data: HashSet<([u8; 32], String)>,
+    /// Track contract data entries created in this transaction (for rollback).
+    created_contract_data: HashSet<ContractDataKey>,
+    /// Track contract code entries created in this transaction (for rollback).
+    created_contract_code: HashSet<[u8; 32]>,
+    /// Track TTL entries created in this transaction (for rollback).
+    created_ttl: HashSet<[u8; 32]>,
+    /// Track claimable balances created in this transaction (for rollback).
+    created_claimable_balances: HashSet<[u8; 32]>,
+    /// Track liquidity pools created in this transaction (for rollback).
+    created_liquidity_pools: HashSet<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +252,15 @@ impl LedgerStateManager {
             liquidity_pool_snapshots: HashMap::new(),
             entry_sponsorship_snapshots: HashMap::new(),
             entry_last_modified_snapshots: HashMap::new(),
+            created_accounts: HashSet::new(),
+            created_trustlines: HashSet::new(),
+            created_offers: HashSet::new(),
+            created_data: HashSet::new(),
+            created_contract_data: HashSet::new(),
+            created_contract_code: HashSet::new(),
+            created_ttl: HashSet::new(),
+            created_claimable_balances: HashSet::new(),
+            created_liquidity_pools: HashSet::new(),
         }
     }
 
@@ -985,8 +1012,10 @@ impl LedgerStateManager {
     pub fn get_account_mut(&mut self, account_id: &AccountId) -> Option<&mut AccountEntry> {
         let key = account_id_to_bytes(account_id);
         if self.accounts.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
-            // A None snapshot means the entry was just created and we need to capture its current state
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_accounts set.
             if !self.account_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.accounts.get(&key).cloned();
                 self.account_snapshots.insert(key, snapshot);
@@ -1026,6 +1055,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.accounts.insert(key, entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_accounts.insert(key);
 
         // Track modification
         if !self.modified_accounts.contains(&key) {
@@ -1255,7 +1287,10 @@ impl LedgerStateManager {
         let key = (account_key, asset_key.clone());
 
         if self.trustlines.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_trustlines set.
             if !self.trustline_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.trustlines.get(&key).cloned();
                 self.trustline_snapshots.insert(key.clone(), snapshot);
@@ -1287,7 +1322,10 @@ impl LedgerStateManager {
         let key = (account_key, asset_key.clone());
 
         if self.trustlines.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_trustlines set.
             if !self.trustline_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.trustlines.get(&key).cloned();
                 self.trustline_snapshots.insert(key.clone(), snapshot);
@@ -1331,6 +1369,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.trustlines.insert(key.clone(), entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_trustlines.insert(key.clone());
 
         // Track modification
         if !self.modified_trustlines.contains(&key) {
@@ -1458,7 +1499,10 @@ impl LedgerStateManager {
         let key = (seller_key, offer_id);
 
         if self.offers.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_offers set.
             if !self.offer_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.offers.get(&key).cloned();
                 self.offer_snapshots.insert(key, snapshot);
@@ -1501,6 +1545,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.offers.insert(key, entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_offers.insert(key);
 
         // Track modification
         if !self.modified_offers.contains(&key) {
@@ -1616,7 +1663,10 @@ impl LedgerStateManager {
         let key = (account_key, name.to_string());
 
         if self.data_entries.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_data set.
             if !self.data_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.data_entries.get(&key).cloned();
                 self.data_snapshots.insert(key.clone(), snapshot);
@@ -1662,6 +1712,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.data_entries.insert(key.clone(), entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_data.insert(key.clone());
 
         // Track modification
         if !self.modified_data.contains(&key) {
@@ -1762,7 +1815,10 @@ impl LedgerStateManager {
         let lookup_key = ContractDataKey::new(contract.clone(), key.clone(), durability);
 
         if self.contract_data.contains_key(&lookup_key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_contract_data set.
             if !self.contract_data_snapshots.get(&lookup_key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.contract_data.get(&lookup_key).cloned();
                 self.contract_data_snapshots.insert(lookup_key.clone(), snapshot);
@@ -1810,6 +1866,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.contract_data.insert(key.clone(), entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_contract_data.insert(key.clone());
 
         // Track modification
         if !self.modified_contract_data.contains(&key) {
@@ -1905,7 +1964,10 @@ impl LedgerStateManager {
         let key = hash.0;
 
         if self.contract_code.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_contract_code set.
             if !self.contract_code_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.contract_code.get(&key).cloned();
                 self.contract_code_snapshots.insert(key, snapshot);
@@ -1943,6 +2005,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.contract_code.insert(key, entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_contract_code.insert(key);
 
         // Track modification
         if !self.modified_contract_code.contains(&key) {
@@ -2028,7 +2093,10 @@ impl LedgerStateManager {
         let key = key_hash.0;
 
         if self.ttl_entries.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_ttl set.
             if !self.ttl_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.ttl_entries.get(&key).cloned();
                 self.ttl_snapshots.insert(key, snapshot);
@@ -2068,6 +2136,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.ttl_entries.insert(key, entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_ttl.insert(key);
 
         // Track modification
         if !self.modified_ttl.contains(&key) {
@@ -2230,6 +2301,9 @@ impl LedgerStateManager {
         // Insert into state
         self.claimable_balances.insert(key, entry);
 
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_claimable_balances.insert(key);
+
         // Track modification
         if !self.modified_claimable_balances.contains(&key) {
             self.modified_claimable_balances.push(key);
@@ -2317,7 +2391,10 @@ impl LedgerStateManager {
     pub fn get_liquidity_pool_mut(&mut self, pool_id: &PoolId) -> Option<&mut LiquidityPoolEntry> {
         let key = pool_id_to_bytes(pool_id);
         if self.liquidity_pools.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries)
+            // Save snapshot if not already saved or if it's None (for newly created entries).
+            // For newly created entries, we update the snapshot to the current value so
+            // subsequent operations can track changes with STATE/UPDATED pairs.
+            // Rollback correctness is ensured by the created_liquidity_pools set.
             if !self.liquidity_pool_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.liquidity_pools.get(&key).cloned();
                 self.liquidity_pool_snapshots.insert(key, snapshot);
@@ -2357,6 +2434,9 @@ impl LedgerStateManager {
 
         // Insert into state
         self.liquidity_pools.insert(key, entry);
+
+        // Track that this entry was created in this transaction (for rollback)
+        self.created_liquidity_pools.insert(key);
 
         // Track modification
         if !self.modified_liquidity_pools.contains(&key) {
@@ -2614,113 +2694,98 @@ impl LedgerStateManager {
     ///
     /// This restores all entries to their original state and clears the delta.
     pub fn rollback(&mut self) {
-        // Restore account snapshots
+        // Restore account snapshots. Entries created in this transaction are removed,
+        // others are restored from their snapshot.
         for (key, snapshot) in self.account_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.accounts.insert(key, entry);
-                }
-                None => {
-                    self.accounts.remove(&key);
-                }
+            if self.created_accounts.contains(&key) {
+                // Entry was created in this transaction - remove it
+                self.accounts.remove(&key);
+            } else if let Some(entry) = snapshot {
+                // Entry existed before - restore it
+                self.accounts.insert(key, entry);
             }
         }
+        self.created_accounts.clear();
 
         // Restore trustline snapshots
         for (key, snapshot) in self.trustline_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.trustlines.insert(key, entry);
-                }
-                None => {
-                    self.trustlines.remove(&key);
-                }
+            if self.created_trustlines.contains(&key) {
+                self.trustlines.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.trustlines.insert(key, entry);
             }
         }
+        self.created_trustlines.clear();
 
         // Restore offer snapshots
         for (key, snapshot) in self.offer_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.offers.insert(key, entry);
-                }
-                None => {
-                    self.offers.remove(&key);
-                }
+            if self.created_offers.contains(&key) {
+                self.offers.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.offers.insert(key, entry);
             }
         }
+        self.created_offers.clear();
 
         // Restore data entry snapshots
         for (key, snapshot) in self.data_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.data_entries.insert(key, entry);
-                }
-                None => {
-                    self.data_entries.remove(&key);
-                }
+            if self.created_data.contains(&key) {
+                self.data_entries.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.data_entries.insert(key, entry);
             }
         }
+        self.created_data.clear();
 
         // Restore contract data snapshots
         for (key, snapshot) in self.contract_data_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.contract_data.insert(key, entry);
-                }
-                None => {
-                    self.contract_data.remove(&key);
-                }
+            if self.created_contract_data.contains(&key) {
+                self.contract_data.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.contract_data.insert(key, entry);
             }
         }
+        self.created_contract_data.clear();
 
         // Restore contract code snapshots
         for (key, snapshot) in self.contract_code_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.contract_code.insert(key, entry);
-                }
-                None => {
-                    self.contract_code.remove(&key);
-                }
+            if self.created_contract_code.contains(&key) {
+                self.contract_code.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.contract_code.insert(key, entry);
             }
         }
+        self.created_contract_code.clear();
 
         // Restore TTL entry snapshots
         for (key, snapshot) in self.ttl_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.ttl_entries.insert(key, entry);
-                }
-                None => {
-                    self.ttl_entries.remove(&key);
-                }
+            if self.created_ttl.contains(&key) {
+                self.ttl_entries.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.ttl_entries.insert(key, entry);
             }
         }
+        self.created_ttl.clear();
 
         // Restore claimable balance snapshots
         for (key, snapshot) in self.claimable_balance_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.claimable_balances.insert(key, entry);
-                }
-                None => {
-                    self.claimable_balances.remove(&key);
-                }
+            if self.created_claimable_balances.contains(&key) {
+                self.claimable_balances.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.claimable_balances.insert(key, entry);
             }
         }
+        self.created_claimable_balances.clear();
 
         // Restore liquidity pool snapshots
         for (key, snapshot) in self.liquidity_pool_snapshots.drain() {
-            match snapshot {
-                Some(entry) => {
-                    self.liquidity_pools.insert(key, entry);
-                }
-                None => {
-                    self.liquidity_pools.remove(&key);
-                }
+            if self.created_liquidity_pools.contains(&key) {
+                self.liquidity_pools.remove(&key);
+            } else if let Some(entry) = snapshot {
+                self.liquidity_pools.insert(key, entry);
             }
         }
+        self.created_liquidity_pools.clear();
 
         // Restore entry sponsorship snapshots
         for (key, snapshot) in self.entry_sponsorship_snapshots.drain() {
@@ -2786,6 +2851,17 @@ impl LedgerStateManager {
         self.modified_ttl.clear();
         self.modified_claimable_balances.clear();
         self.modified_liquidity_pools.clear();
+
+        // Clear created entry tracking
+        self.created_accounts.clear();
+        self.created_trustlines.clear();
+        self.created_offers.clear();
+        self.created_data.clear();
+        self.created_contract_data.clear();
+        self.created_contract_code.clear();
+        self.created_ttl.clear();
+        self.created_claimable_balances.clear();
+        self.created_liquidity_pools.clear();
     }
 
     /// Flush all pending account changes to the delta, excluding a specific account.
@@ -2850,7 +2926,8 @@ impl LedgerStateManager {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.accounts.get(&key).cloned() {
                         // For single-operation transactions, only record if entry actually changed.
-                        // For multi-operation transactions, record for every access.
+                        // For multi-operation transactions, record for every access (even if no change)
+                        // because C++ stellar-core records per-operation entries for multi-op txs.
                         let should_record = self.multi_op_mode || &entry != snapshot_entry;
                         if should_record {
                             let pre_state = self.account_to_ledger_entry(snapshot_entry);
@@ -2875,29 +2952,38 @@ impl LedgerStateManager {
     /// This is needed for operations that mutate entries through `get_*_mut`,
     /// which do not call `record_update` directly.
     ///
-    /// After flushing, snapshots are updated to the current value so that
-    /// subsequent operations within the same transaction will use the correct
-    /// STATE value (matching C++ stellar-core behavior).
+    /// For per-operation STATE values, we use op_entry_snapshots (captured at access time)
+    /// rather than transaction-level snapshots. This allows correct per-op change recording
+    /// while preserving transaction-level snapshots for rollback.
     pub fn flush_modified_entries(&mut self) {
         let modified_accounts = std::mem::take(&mut self.modified_accounts);
         for key in modified_accounts {
             if let Some(snapshot) = self.account_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.accounts.get(&key).cloned() {
-                        // For single-operation transactions, only record if entry actually changed.
-                        // For multi-operation transactions, record for every access (even if no change)
-                        // because C++ stellar-core records per-operation entries for multi-op txs.
-                        let should_record = self.multi_op_mode || &entry != snapshot_entry;
+                        // Build ledger key for op_snapshot lookup
+                        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+                            account_id: entry.account_id.clone(),
+                        });
+                        // Record update if:
+                        // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all loadAccount calls
+                        // 2. Entry actually changed - always record real value changes
+                        // Note: We use accessed_in_op for both single-op and multi-op transactions because
+                        // C++ stellar-core records per-operation changes only for entries actually accessed.
+                        let accessed_in_op = self.op_snapshots_active && self.op_entry_snapshots.contains_key(&ledger_key);
+                        let should_record = accessed_in_op || &entry != snapshot_entry;
                         if should_record {
-                            let pre_state = self.account_to_ledger_entry(snapshot_entry);
-                            let ledger_key = LedgerKey::Account(LedgerKeyAccount {
-                                account_id: entry.account_id.clone(),
-                            });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.account_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.account_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.account_snapshots.insert(key, Some(entry));
+                            // DO NOT update account_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -2909,20 +2995,28 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.trustline_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.trustlines.get(&key).cloned() {
-                        // For single-operation transactions, only record if entry actually changed.
-                        // For multi-operation transactions, record for every access.
-                        let should_record = self.multi_op_mode || &entry != snapshot_entry;
+                        // Build ledger key for op_snapshot lookup
+                        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                            account_id: entry.account_id.clone(),
+                            asset: entry.asset.clone(),
+                        });
+                        // Record update if:
+                        // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                        // 2. Entry actually changed - always record real value changes
+                        let accessed_in_op = self.op_snapshots_active && self.op_entry_snapshots.contains_key(&ledger_key);
+                        let should_record = accessed_in_op || &entry != snapshot_entry;
                         if should_record {
-                            let pre_state = self.trustline_to_ledger_entry(snapshot_entry);
-                            let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-                                account_id: entry.account_id.clone(),
-                                asset: entry.asset.clone(),
-                            });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.trustline_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.trustline_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.trustline_snapshots.insert(key, Some(entry));
+                            // DO NOT update trustline_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -2936,17 +3030,21 @@ impl LedgerStateManager {
                     if let Some(entry) = self.offers.get(&key).cloned() {
                         // Only record update if entry actually changed from snapshot
                         if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
-                            let pre_state = self.offer_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
                                 seller_id: entry.seller_id.clone(),
                                 offer_id: entry.offer_id,
                             });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.offer_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.offer_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.offer_snapshots.insert(key, Some(entry));
+                            // DO NOT update offer_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -2958,19 +3056,28 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.data_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.data_entries.get(&key).cloned() {
-                        // Only record update if entry actually changed from snapshot
-                        if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
-                            let pre_state = self.data_to_ledger_entry(snapshot_entry);
-                            let ledger_key = LedgerKey::Data(LedgerKeyData {
-                                account_id: entry.account_id.clone(),
-                                data_name: entry.data_name.clone(),
-                            });
+                        // Build ledger key for op_snapshot lookup
+                        let ledger_key = LedgerKey::Data(LedgerKeyData {
+                            account_id: entry.account_id.clone(),
+                            data_name: entry.data_name.clone(),
+                        });
+                        // Record update if:
+                        // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                        // 2. Entry actually changed - always record real value changes
+                        let accessed_in_op = self.op_snapshots_active && self.op_entry_snapshots.contains_key(&ledger_key);
+                        let should_record = accessed_in_op || &entry != snapshot_entry;
+                        if should_record {
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.data_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.data_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.data_snapshots.insert(key, Some(entry));
+                            // DO NOT update data_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -2984,18 +3091,22 @@ impl LedgerStateManager {
                     if let Some(entry) = self.contract_data.get(&key).cloned() {
                         // Only record update if entry actually changed from snapshot
                         if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
-                            let pre_state = self.contract_data_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
                                 contract: entry.contract.clone(),
                                 key: entry.key.clone(),
                                 durability: entry.durability.clone(),
                             });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.contract_data_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.contract_data_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.contract_data_snapshots.insert(key, Some(entry));
+                            // DO NOT update contract_data_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -3009,16 +3120,20 @@ impl LedgerStateManager {
                     if let Some(entry) = self.contract_code.get(&key).cloned() {
                         // Only record update if entry actually changed from snapshot
                         if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
-                            let pre_state = self.contract_code_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
                                 hash: entry.hash.clone(),
                             });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.contract_code_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.contract_code_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.contract_code_snapshots.insert(key, Some(entry));
+                            // DO NOT update contract_code_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -3032,16 +3147,20 @@ impl LedgerStateManager {
                     if let Some(entry) = self.ttl_entries.get(&key).cloned() {
                         // Only record update if entry actually changed from snapshot
                         if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
-                            let pre_state = self.ttl_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                                 key_hash: entry.key_hash.clone(),
                             });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.ttl_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.ttl_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.ttl_snapshots.insert(key, Some(entry));
+                            // DO NOT update ttl_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -3055,17 +3174,21 @@ impl LedgerStateManager {
                     if let Some(entry) = self.claimable_balances.get(&key).cloned() {
                         // Only record update if entry actually changed from snapshot
                         if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
-                            let pre_state = self.claimable_balance_to_ledger_entry(snapshot_entry);
                             let ledger_key =
                                 LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
                                     balance_id: entry.balance_id.clone(),
                                 });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.claimable_balance_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.claimable_balance_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.claimable_balance_snapshots.insert(key, Some(entry));
+                            // DO NOT update claimable_balance_snapshots - preserve for rollback
                         }
                     }
                 }
@@ -3079,16 +3202,20 @@ impl LedgerStateManager {
                     if let Some(entry) = self.liquidity_pools.get(&key).cloned() {
                         // Only record update if entry actually changed from snapshot
                         if &entry != snapshot_entry {
-                            // Get pre-state from snapshot BEFORE updating last_modified
-                            let pre_state = self.liquidity_pool_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
                                 liquidity_pool_id: entry.liquidity_pool_id.clone(),
                             });
+                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
+                            // Otherwise fall back to transaction-level snapshot
+                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.liquidity_pool_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.liquidity_pool_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);
-                            // Update snapshot to current value for subsequent operations
-                            self.liquidity_pool_snapshots.insert(key, Some(entry));
+                            // DO NOT update liquidity_pool_snapshots - preserve for rollback
                         }
                     }
                 }

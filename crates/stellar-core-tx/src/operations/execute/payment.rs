@@ -43,6 +43,13 @@ pub fn execute_payment(
         return Ok(make_result(PaymentResultCode::Malformed));
     }
 
+    // C++ stellar-core optimization: if sending native XLM to self, mark as instant success
+    // without accessing any ledger entries. This matches behavior from protocol v3+.
+    // (Before v3, this applied to all asset types, but we only support v23+)
+    if *source == dest && matches!(op.asset, Asset::Native) {
+        return Ok(make_result(PaymentResultCode::Success));
+    }
+
     match &op.asset {
         Asset::Native => execute_native_payment(source, &dest, op.amount, state, context),
         Asset::CreditAlphanum4(_) | Asset::CreditAlphanum12(_) => {

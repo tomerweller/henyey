@@ -1945,7 +1945,17 @@ async fn cmd_verify_execution(
                 Hash256::from(header_entry.hash.0),
                 std::collections::HashMap::new(),
             );
-            let snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+            let mut snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+
+            // Add entries_fn to enable orderbook loading for path payments
+            let bucket_list_for_entries: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
+            let entries_fn: Arc<dyn Fn() -> stellar_core_ledger::Result<Vec<stellar_xdr::curr::LedgerEntry>> + Send + Sync> =
+                Arc::new(move || {
+                    bucket_list_for_entries.read().unwrap().live_entries().map_err(|e| {
+                        LedgerError::Internal(format!("Failed to get live entries: {}", e))
+                    })
+                });
+            snapshot_handle.set_entries_lookup(entries_fn);
 
             // Load Soroban config from ledger state
             let soroban_config = load_soroban_config(&snapshot_handle);
@@ -2128,18 +2138,26 @@ async fn cmd_verify_execution(
                     _ => false,
                 };
 
-                // Always sync state with CDP to ensure subsequent transactions see correct state.
+                // Sync state with CDP to ensure subsequent transactions see correct state.
                 // This is critical because even when both succeed, our state changes may differ
                 // from CDP's (e.g., fee calculations, refunds, or execution differences).
                 // Without syncing, these differences accumulate and cause subsequent failures.
-                let cdp_changes = extract_changes_from_meta(&tx_info.meta);
+                //
+                // IMPORTANT: Only sync when the transaction succeeded. For failed transactions,
+                // the CDP metadata contains changes from successful operations within the failed
+                // transaction (for audit purposes), but these changes are rolled back and NOT
+                // persisted to ledger state. Syncing them would incorrectly apply state changes
+                // that C++ stellar-core rolled back.
+                if cdp_succeeded {
+                    let cdp_changes = extract_changes_from_meta(&tx_info.meta);
 
-                let cdp_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
-                    cdp_changes.try_into().unwrap_or_default();
-                executor.apply_ledger_entry_changes(&cdp_changes_vec);
+                    let cdp_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
+                        cdp_changes.try_into().unwrap_or_default();
+                    executor.apply_ledger_entry_changes(&cdp_changes_vec);
 
-                if !tx_info.post_fee_meta.is_empty() {
-                    executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
+                    if !tx_info.post_fee_meta.is_empty() {
+                        executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
+                    }
                 }
 
                 if in_test_range {
@@ -2171,6 +2189,8 @@ async fn cmd_verify_execution(
                             }
 
                             // Deep comparison of transaction meta if both are available
+                            // For fee bump transactions with separate fee source, fee changes are
+                            // already in the CDP meta, so we don't need to prepend them
                             let (meta_matches, meta_diffs) = match &result.tx_meta {
                                 Some(our_meta) => {
                                     compare_transaction_meta(our_meta, &tx_info.meta, None, show_diff)
