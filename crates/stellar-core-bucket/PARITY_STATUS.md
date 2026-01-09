@@ -230,11 +230,10 @@ The Rust implementation correctly handles:
 
 ### Future Work Priority
 
-1. **High Priority**: BucketSnapshotManager for concurrent access patterns (required for parallel transaction validation)
-2. **Medium Priority**: Advanced indexing (Bloom filters, caches) for query performance
-3. **Medium Priority**: SearchableBucketListSnapshot for specialized queries (pool shares, inflation winners)
-4. **Lower Priority**: Metrics integration (observability)
-5. **Lower Priority**: In-memory level 0 optimizations
+1. **Medium Priority**: Advanced indexing (Bloom filters, caches) for query performance
+2. **Medium Priority**: SearchableBucketListSnapshot specialized queries (pool shares, inflation winners)
+3. **Lower Priority**: Metrics integration (observability)
+4. **Lower Priority**: In-memory level 0 optimizations
 
 ### C++ to Rust File Mapping
 
@@ -254,10 +253,10 @@ The Rust implementation correctly handles:
 | HotArchiveBucketIndex.h/cpp | hot_archive.rs | Simplified |
 | DiskIndex.h/cpp | disk_bucket.rs | Simplified |
 | InMemoryIndex.h/cpp | bucket.rs (key_index) | Partial |
-| BucketSnapshot.h/cpp | - | Not implemented |
-| BucketSnapshotManager.h/cpp | - | Not implemented |
-| SearchableBucketList.h/cpp | - | Not implemented |
-| BucketListSnapshotBase.h/cpp | - | Not implemented |
+| BucketSnapshot.h/cpp | snapshot.rs | Complete |
+| BucketSnapshotManager.h/cpp | snapshot.rs | Complete |
+| SearchableBucketList.h/cpp | snapshot.rs | Partial (no specialized queries) |
+| BucketListSnapshotBase.h/cpp | snapshot.rs | Complete |
 | BucketApplicator.h/cpp | - | Not implemented |
 | BucketMergeMap.h/cpp | - | Not implemented |
 | BucketMergeAdapter.h | - | Not needed (Rust generics) |
