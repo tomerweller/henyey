@@ -1369,6 +1369,74 @@ fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Downloads buckets in parallel from a history archive.
+///
+/// This function downloads multiple buckets concurrently (up to 16 at a time),
+/// significantly speeding up initial state restoration compared to sequential downloads.
+///
+/// # Arguments
+///
+/// * `archive` - The history archive to download from
+/// * `bucket_manager` - The bucket manager to import buckets into
+/// * `hashes` - The bucket hashes to download
+///
+/// # Returns
+///
+/// Returns `Ok(())` if all buckets were downloaded successfully, or an error
+/// if any download failed.
+async fn download_buckets_parallel(
+    archive: &stellar_core_history::HistoryArchive,
+    bucket_manager: &stellar_core_bucket::BucketManager,
+    hashes: Vec<&stellar_core_common::Hash256>,
+) -> anyhow::Result<()> {
+    use futures::stream::{self, StreamExt};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+
+    // Filter out already-cached buckets
+    let to_download: Vec<_> = hashes
+        .into_iter()
+        .filter(|hash| bucket_manager.load_bucket(hash).is_err())
+        .collect();
+
+    if to_download.is_empty() {
+        return Ok(());
+    }
+
+    let total = to_download.len();
+    let downloaded = AtomicU32::new(0);
+
+    println!("Downloading {} buckets with {} parallel connections...", total, MAX_CONCURRENT_DOWNLOADS);
+
+    let results: Vec<anyhow::Result<()>> = stream::iter(to_download.into_iter())
+        .map(|hash| {
+            let downloaded = &downloaded;
+            async move {
+                let bucket_data = archive.get_bucket(hash).await
+                    .map_err(|e| anyhow::anyhow!("Failed to download bucket {}: {}", hash.to_hex(), e))?;
+                bucket_manager.import_bucket(&bucket_data)
+                    .map_err(|e| anyhow::anyhow!("Failed to import bucket {}: {}", hash.to_hex(), e))?;
+
+                let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
+                if count % 5 == 0 || count == total as u32 {
+                    println!("  Downloaded {}/{} buckets", count, total);
+                }
+                Ok(())
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+        .collect()
+        .await;
+
+    // Check for any failures
+    for result in results {
+        result?;
+    }
+
+    Ok(())
+}
+
 /// Replays bucket list changes from CDP metadata to validate our implementation.
 ///
 /// This test takes the exact ledger entry changes from CDP (what C++ stellar-core produced)
@@ -1495,12 +1563,7 @@ async fn cmd_replay_bucket_list(
         .collect();
 
     println!("Downloading {} buckets...", all_hashes.len());
-    for hash in all_hashes {
-        if bucket_manager.load_bucket(hash).is_err() {
-            let bucket_data = archive.get_bucket(hash).await?;
-            bucket_manager.import_bucket(&bucket_data)?;
-        }
-    }
+    download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
 
     // Restore bucket lists
     let mut bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
@@ -1802,12 +1865,7 @@ async fn cmd_verify_execution(
         .collect();
 
     println!("Downloading {} buckets...", all_hashes.len());
-    for hash in all_hashes {
-        if bucket_manager.load_bucket(hash).is_err() {
-            let bucket_data = archive.get_bucket(hash).await?;
-            bucket_manager.import_bucket(&bucket_data)?;
-        }
-    }
+    download_buckets_parallel(&archive, bucket_manager.as_ref(), all_hashes).await?;
 
     // Restore live bucket list for state lookups
     let bucket_list = Arc::new(RwLock::new(
@@ -2423,12 +2481,7 @@ async fn cmd_debug_bucket_entry(
         .collect();
 
     println!("Downloading {} buckets...", all_hashes.len());
-    for hash in all_hashes {
-        if bucket_manager.load_bucket(hash).is_err() {
-            let bucket_data = archive.get_bucket(hash).await?;
-            bucket_manager.import_bucket(&bucket_data)?;
-        }
-    }
+    download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
 
     // Restore bucket list
     let bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {

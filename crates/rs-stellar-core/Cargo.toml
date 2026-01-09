@@ -34,6 +34,7 @@ clap.workspace = true
 
 # Async runtime
 tokio.workspace = true
+futures.workspace = true
 
 # HTTP server
 axum.workspace = true
