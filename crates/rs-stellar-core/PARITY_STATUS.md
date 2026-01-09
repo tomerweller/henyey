@@ -62,6 +62,7 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `/survey/topology` | Implemented | Survey topology request |
 | `/survey/reporting/stop` | Implemented | Stop survey reporting |
 | `/getsurveyresult` | Implemented | Get survey results |
+| `/ll` | Implemented | Dynamic log level changes via tracing-subscriber reload layer |
 
 #### Core Subsystems
 
@@ -119,7 +120,6 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | Endpoint | C++ Description | Priority |
 |----------|-----------------|----------|
 | `/clearmetrics` | Clear metrics | Low |
-| `/ll` | Set log level dynamically | Medium |
 | `/logrotate` | Rotate log files | Low |
 | `/manualclose` | Manual ledger close (testing) | Medium |
 | `/maintenance` | Run maintenance | Low |
