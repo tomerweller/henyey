@@ -17,6 +17,8 @@ The following clippy warnings and issues have been addressed:
 - **stellar-core-overlay**: Removed useless format!
 - **stellar-core-scp**: Use is_empty(), simplified boolean, removed useless format!
 - **stellar-core-ledger**: Removed clone on Copy type (NetworkId)
+- **stellar-core-history**: Use is_some_and, remove unnecessary borrow
+- **stellar-core-historywork**: Derive Default instead of manual impl
 
 ---
 
