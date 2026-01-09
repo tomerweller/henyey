@@ -112,7 +112,7 @@ pub fn sha256_multi(chunks: &[&[u8]]) -> Hash256 {
 pub fn sub_sha256(seed: &[u8], counter: u64) -> Hash256 {
     let mut hasher = Sha256::new();
     hasher.update(seed);
-    hasher.update(&counter.to_le_bytes());
+    hasher.update(counter.to_le_bytes());
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&result);
