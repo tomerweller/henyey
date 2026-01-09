@@ -637,9 +637,9 @@ impl FlowControl {
         let send_more = match msg {
             StellarMessage::SendMoreExtended(sm) => sm,
             _ => {
-                return Err(OverlayError::InvalidMessage(format!(
-                    "unexpected message type, expected SEND_MORE_EXTENDED"
-                )));
+                return Err(OverlayError::InvalidMessage(
+                    "unexpected message type, expected SEND_MORE_EXTENDED".to_string(),
+                ));
             }
         };
 
