@@ -499,6 +499,9 @@ fn apply_soroban_storage_change(
         // Only emit TTL changes when the TTL is actually being modified.
         // C++ stellar-core does not emit TTL updates when only the data is modified.
         if let Some(live_until) = change.live_until {
+            if live_until == 0 {
+                return;
+            }
             let key_hash = compute_key_hash(&change.key);
             let existing_ttl = state.get_ttl(&key_hash);
             let ttl_changed = existing_ttl
@@ -518,6 +521,9 @@ fn apply_soroban_storage_change(
             }
         }
     } else if let Some(live_until) = change.live_until {
+        if live_until == 0 {
+            return;
+        }
         // TTL-only change: the data entry wasn't modified, but its TTL was bumped.
         // This happens when a contract reads an entry and its TTL gets auto-extended.
         let key_hash = compute_key_hash(&change.key);

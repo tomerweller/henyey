@@ -3036,6 +3036,20 @@ fn build_entry_changes_with_hot_archive(
             .unwrap_or_default()
     }
 
+    fn push_created_or_restored(
+        changes: &mut Vec<LedgerEntryChange>,
+        entry: &LedgerEntry,
+        hot_archive_restored_keys: &HashSet<LedgerKey>,
+    ) {
+        if let Ok(key) = crate::delta::entry_to_key(entry) {
+            if hot_archive_restored_keys.contains(&key) {
+                changes.push(LedgerEntryChange::Restored(entry.clone()));
+                return;
+            }
+        }
+        changes.push(LedgerEntryChange::Created(entry.clone()));
+    }
+
     let mut changes: Vec<LedgerEntryChange> = Vec::new();
 
     // Build final values for each updated key (used for Soroban deduplication)
@@ -3156,7 +3170,7 @@ fn build_entry_changes_with_hot_archive(
                         let key_bytes = entry_key_bytes(entry);
                         if !created_keys.contains(&key_bytes) {
                             created_keys.insert(key_bytes);
-                            changes.push(LedgerEntryChange::Created(entry.clone()));
+                            push_created_or_restored(&mut changes, entry, hot_archive_restored_keys);
                         }
                     }
                 }
@@ -3165,7 +3179,7 @@ fn build_entry_changes_with_hot_archive(
                     let key_bytes = entry_key_bytes(entry);
                     if !created_keys.contains(&key_bytes) {
                         created_keys.insert(key_bytes);
-                        changes.push(LedgerEntryChange::Created(entry.clone()));
+                        push_created_or_restored(&mut changes, entry, hot_archive_restored_keys);
                     }
                 }
                 ChangeGroup::SingleUpdate { idx } => {
@@ -3235,7 +3249,7 @@ fn build_entry_changes_with_hot_archive(
                         // Only emit create once per key
                         if !created_keys.contains(&key_bytes) {
                             created_keys.insert(key_bytes);
-                            changes.push(LedgerEntryChange::Created(entry.clone()));
+                            push_created_or_restored(&mut changes, entry, hot_archive_restored_keys);
                         }
                     }
                 }
@@ -3357,7 +3371,7 @@ fn build_entry_changes_with_hot_archive(
         }
 
         for entry in created {
-            changes.push(LedgerEntryChange::Created(entry.clone()));
+            push_created_or_restored(&mut changes, entry, hot_archive_restored_keys);
         }
     }
 

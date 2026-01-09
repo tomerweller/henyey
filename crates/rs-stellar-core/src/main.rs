@@ -2087,9 +2087,9 @@ async fn cmd_verify_execution(
                 phase1_fee_mismatches += phase1_mismatches as u32;
             }
 
-            // Track accounts that receive Soroban refunds so we can update the bucket list
-            // Note: Soroban refunds are already included in CDP's tx_changes_after,
-            // so we don't need to track or apply them separately.
+            // Post-transaction fee processing (e.g., Soroban refunds) is recorded
+            // separately in CDP's post_tx_apply_fee_processing and must be applied
+            // after each transaction to keep state aligned.
 
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
@@ -2134,13 +2134,13 @@ async fn cmd_verify_execution(
                 // Without syncing, these differences accumulate and cause subsequent failures.
                 let cdp_changes = extract_changes_from_meta(&tx_info.meta);
 
-                let cdp_changes_vec: stellar_xdr::curr::LedgerEntryChanges = cdp_changes
-                    .try_into()
-                    .unwrap_or_default();
+                let cdp_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
+                    cdp_changes.try_into().unwrap_or_default();
                 executor.apply_ledger_entry_changes(&cdp_changes_vec);
 
-                // Note: Soroban refunds are already included in CDP's tx_changes_after,
-                // so no separate refund application is needed.
+                if !tx_info.post_fee_meta.is_empty() {
+                    executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
+                }
 
                 if in_test_range {
                     transactions_verified += 1;
@@ -2687,7 +2687,10 @@ fn augment_soroban_ttl_metadata(
     let mut existing_ttl_hashes: std::collections::HashSet<stellar_xdr::curr::Hash> = std::collections::HashSet::new();
     for change in existing_changes.iter() {
         match change {
-            LedgerEntryChange::State(entry) | LedgerEntryChange::Updated(entry) | LedgerEntryChange::Created(entry) => {
+            LedgerEntryChange::State(entry)
+            | LedgerEntryChange::Updated(entry)
+            | LedgerEntryChange::Created(entry)
+            | LedgerEntryChange::Restored(entry) => {
                 if let LedgerEntryData::Ttl(ttl) = &entry.data {
                     existing_ttl_hashes.insert(ttl.key_hash.clone());
                 }

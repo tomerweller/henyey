@@ -339,6 +339,11 @@ pub struct TransactionProcessingInfo {
     /// These changes are applied before the transaction body and include
     /// fee deduction from the source account.
     pub fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+
+    /// Post-transaction fee processing changes.
+    ///
+    /// These changes are applied after the transaction body, such as Soroban refunds.
+    pub post_fee_meta: stellar_xdr::curr::LedgerEntryChanges,
 }
 
 /// Extract complete transaction processing info in apply order.
@@ -380,6 +385,7 @@ pub fn extract_transaction_processing(
                         result: tp.result.clone(),
                         meta: tp.tx_apply_processing.clone(),
                         fee_meta: tp.fee_processing.clone(),
+                        post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
                     })
                 })
                 .collect();
@@ -410,6 +416,7 @@ pub fn extract_transaction_processing(
                         result: tp.result.clone(),
                         meta: tp.tx_apply_processing.clone(),
                         fee_meta: tp.fee_processing.clone(),
+                        post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
                     })
                 })
                 .collect();
@@ -438,6 +445,7 @@ pub fn extract_transaction_processing(
                         result: tp.result.clone(),
                         meta: tp.tx_apply_processing.clone(),
                         fee_meta: tp.fee_processing.clone(),
+                        post_fee_meta: tp.post_tx_apply_fee_processing.clone(),
                     })
                 })
                 .collect();
