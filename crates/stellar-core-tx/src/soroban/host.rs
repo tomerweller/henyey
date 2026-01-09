@@ -13,7 +13,7 @@ use soroban_env_host24::{
     budget::Budget,
     e2e_invoke::{self},
     fees::{compute_rent_fee, LedgerEntryRentChange},
-    storage::{AccessType, EntryWithLiveUntil, Footprint, FootprintMap, SnapshotSource, StorageMap},
+    storage::{EntryWithLiveUntil, SnapshotSource},
     HostError as HostErrorP24, LedgerInfo as LedgerInfoP24,
 };
 use soroban_env_host24::xdr::{ReadXdr as ReadXdrP24, WriteXdr as WriteXdrP24};
@@ -23,7 +23,7 @@ use soroban_env_host25::HostError as HostErrorP25;
 // Both soroban-env-host v25 and our code use stellar-xdr v25, so we can use types directly
 use stellar_xdr::curr::{
     AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerFootprint, LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry,
+    LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry,
     SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
 };
 
@@ -507,93 +507,6 @@ fn convert_contract_cost_params_to_p24(
         soroban_env_host24::xdr::Limits::none(),
     )
     .ok()
-}
-
-/// Build a Soroban storage footprint from transaction resources.
-#[allow(dead_code)]
-pub fn build_footprint(
-    budget: &Budget,
-    ledger_footprint: &LedgerFootprint,
-) -> Result<Footprint, HostErrorP24> {
-    let mut footprint_map = FootprintMap::new();
-
-    // Add read-only entries
-    for key in ledger_footprint.read_only.iter() {
-        let key = convert_ledger_key_to_p24(key).ok_or_else(|| {
-            HostErrorP24::from(soroban_env_host24::Error::from_type_and_code(
-                soroban_env_host24::xdr::ScErrorType::Context,
-                soroban_env_host24::xdr::ScErrorCode::InternalError,
-            ))
-        })?;
-        footprint_map = footprint_map.insert(Rc::new(key), AccessType::ReadOnly, budget)?;
-    }
-
-    // Add read-write entries
-    for key in ledger_footprint.read_write.iter() {
-        let key = convert_ledger_key_to_p24(key).ok_or_else(|| {
-            HostErrorP24::from(soroban_env_host24::Error::from_type_and_code(
-                soroban_env_host24::xdr::ScErrorType::Context,
-                soroban_env_host24::xdr::ScErrorCode::InternalError,
-            ))
-        })?;
-        footprint_map = footprint_map.insert(Rc::new(key), AccessType::ReadWrite, budget)?;
-    }
-
-    Ok(Footprint(footprint_map))
-}
-
-/// Build a storage map from the ledger state using the footprint.
-#[allow(dead_code)]
-pub fn build_storage_map(
-    budget: &Budget,
-    footprint: &Footprint,
-    snapshot: &impl SnapshotSource,
-) -> Result<StorageMap, HostErrorP24> {
-    let mut storage_map = StorageMap::new();
-    let mut found_count = 0;
-    let mut missing_count = 0;
-
-    for (key, access_type) in footprint.0.iter(budget)? {
-        let entry = snapshot.get(key)?;
-        let key_type = match key.as_ref() {
-            soroban_env_host24::xdr::LedgerKey::Account(_) => "Account",
-            soroban_env_host24::xdr::LedgerKey::Trustline(_) => "Trustline",
-            soroban_env_host24::xdr::LedgerKey::ContractData(_) => "ContractData",
-            soroban_env_host24::xdr::LedgerKey::ContractCode(_) => "ContractCode",
-            soroban_env_host24::xdr::LedgerKey::Ttl(_) => "Ttl",
-            _ => "Other",
-        };
-
-        if let Some((ref e, ref ttl)) = entry {
-            found_count += 1;
-            let has_ext = !matches!(e.ext, soroban_env_host24::xdr::LedgerEntryExt::V0);
-            tracing::trace!(
-                key_type,
-                access = ?access_type,
-                last_modified = e.last_modified_ledger_seq,
-                has_ext,
-                live_until = ?ttl,
-                "Soroban footprint entry found"
-            );
-        } else {
-            missing_count += 1;
-            tracing::warn!(
-                key_type,
-                access = ?access_type,
-                "Soroban footprint entry MISSING from storage"
-            );
-        }
-        storage_map = storage_map.insert(key.clone(), entry, budget)?;
-    }
-
-    tracing::debug!(
-        found_count,
-        missing_count,
-        total = found_count + missing_count,
-        "Soroban storage map built from footprint"
-    );
-
-    Ok(storage_map)
 }
 
 /// Execute a Soroban host function using soroban-env-host's e2e_invoke API.

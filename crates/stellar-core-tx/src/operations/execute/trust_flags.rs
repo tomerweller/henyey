@@ -18,8 +18,6 @@ use crate::Result;
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
     TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
-#[allow(dead_code)]
-const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
 const AUTH_REQUIRED_FLAG: u32 = 0x1;
 
 /// Execute an AllowTrust operation (deprecated).

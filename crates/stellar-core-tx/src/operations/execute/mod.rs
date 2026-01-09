@@ -602,12 +602,6 @@ pub fn execute_operation_with_soroban(
     }
 }
 
-/// Create an OperationResult for unsupported operations.
-#[allow(dead_code)]
-fn make_not_supported_result() -> OperationResult {
-    OperationResult::OpNotSupported
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

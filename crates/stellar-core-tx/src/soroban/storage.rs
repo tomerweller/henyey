@@ -216,7 +216,7 @@ impl SorobanStorage {
 
 /// Footprint tracking for Soroban transactions.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
+#[cfg(test)]
 pub struct Footprint {
     /// Keys that are read-only.
     pub read_only: Vec<LedgerKey>,
@@ -224,7 +224,7 @@ pub struct Footprint {
     pub read_write: Vec<LedgerKey>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Footprint {
     /// Create a new footprint.
     pub fn new() -> Self {

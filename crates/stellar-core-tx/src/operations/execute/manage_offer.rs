@@ -4,7 +4,6 @@
 //! and CreatePassiveSellOffer operations for the Stellar DEX.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
@@ -303,12 +302,6 @@ fn execute_manage_offer(
                 None,
             ));
         }
-        ConvertResult::CrossedTooMany => {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::Malformed,
-                None,
-            ));
-        }
     };
 
     if wheat_received > 0 {
@@ -537,7 +530,7 @@ fn validate_offer(
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 const AUTH_REQUIRED_FLAG: u32 = 0x1;
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
@@ -557,138 +550,6 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
         Asset::CreditAlphanum4(a) => Some(&a.issuer),
         Asset::CreditAlphanum12(a) => Some(&a.issuer),
     }
-}
-
-
-/// Create a new offer.
-#[allow(dead_code)]
-fn create_offer(
-    source: &AccountId,
-    selling: &Asset,
-    buying: &Asset,
-    amount: i64,
-    price: &Price,
-    state: &mut LedgerStateManager,
-    context: &LedgerContext,
-) -> Result<OperationResult> {
-    let sponsor = state.active_sponsor_for(source);
-    if let Some(sponsor) = &sponsor {
-        let sponsor_account = state
-            .get_account(sponsor)
-            .ok_or(TxError::SourceAccountNotFound)?;
-        let min_balance = state.minimum_balance_for_account_with_deltas(
-            sponsor_account,
-            context.protocol_version,
-            0,
-            1,
-            0,
-        )?;
-        if sponsor_account.balance < min_balance {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::LowReserve,
-                None,
-            ));
-        }
-    } else if let Some(account) = state.get_account(source) {
-        let min_balance =
-            state.minimum_balance_for_account(account, context.protocol_version, 1)?;
-        if account.balance < min_balance {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::LowReserve,
-                None,
-            ));
-        }
-    } else {
-        return Ok(make_sell_offer_result(
-            ManageSellOfferResultCode::Underfunded,
-            None,
-        ));
-    }
-
-    // Generate a new offer ID (in production this should be deterministic based on ledger state)
-    let offer_id = generate_offer_id(state);
-
-    let offer = OfferEntry {
-        seller_id: source.clone(),
-        offer_id,
-        selling: selling.clone(),
-        buying: buying.clone(),
-        amount,
-        price: price.clone(),
-        flags: 0,
-        ext: OfferEntryExt::V0,
-    };
-
-    state.create_offer(offer);
-
-    // Increment the source account's sub-entries
-    if let Some(account) = state.get_account_mut(source) {
-        account.num_sub_entries += 1;
-    }
-    if let Some(sponsor) = sponsor {
-        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-            seller_id: source.clone(),
-            offer_id,
-        });
-        state.apply_entry_sponsorship_with_sponsor(ledger_key, &sponsor, Some(source), 1)?;
-    }
-
-    let success = ManageOfferSuccessResult {
-        offers_claimed: vec![].try_into().unwrap(),
-        offer: ManageOfferSuccessResultOffer::Created(create_offer_entry(
-            source, offer_id, selling, buying, amount, price,
-        )),
-    };
-
-    Ok(make_sell_offer_result(
-        ManageSellOfferResultCode::Success,
-        Some(success),
-    ))
-}
-
-/// Update an existing offer.
-#[allow(dead_code)]
-fn update_offer(
-    source: &AccountId,
-    offer_id: i64,
-    selling: &Asset,
-    buying: &Asset,
-    amount: i64,
-    price: &Price,
-    state: &mut LedgerStateManager,
-) -> Result<OperationResult> {
-    // Check offer exists and belongs to source
-    if state.get_offer(source, offer_id).is_none() {
-        return Ok(make_sell_offer_result(
-            ManageSellOfferResultCode::NotFound,
-            None,
-        ));
-    }
-
-    let offer = OfferEntry {
-        seller_id: source.clone(),
-        offer_id,
-        selling: selling.clone(),
-        buying: buying.clone(),
-        amount,
-        price: price.clone(),
-        flags: 0,
-        ext: OfferEntryExt::V0,
-    };
-
-    state.update_offer(offer);
-
-    let success = ManageOfferSuccessResult {
-        offers_claimed: vec![].try_into().unwrap(),
-        offer: ManageOfferSuccessResultOffer::Updated(create_offer_entry(
-            source, offer_id, selling, buying, amount, price,
-        )),
-    };
-
-    Ok(make_sell_offer_result(
-        ManageSellOfferResultCode::Success,
-        Some(success),
-    ))
 }
 
 /// Delete an existing offer.
@@ -946,20 +807,16 @@ fn apply_balance_delta(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum ConvertResult {
     Ok,
     Partial,
     FilterStopBadPrice,
     FilterStopCrossSelf,
-    CrossedTooMany,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum OfferFilterResult {
     Keep,
-    Skip,
     StopBadPrice,
     StopCrossSelf,
 }
@@ -987,14 +844,10 @@ fn convert_with_offers(
     let mut max_sheep_send = max_sheep_send;
     let mut max_wheat_receive = max_wheat_receive;
     let mut need_more = max_sheep_send > 0 && max_wheat_receive > 0;
-    let mut ignored = HashSet::new();
 
     while need_more {
         let offer = state.best_offer_filtered(selling, buying, |offer| {
-            if offer.seller_id == *source && offer.offer_id == updating_offer_id {
-                return false;
-            }
-            !ignored.contains(&(offer.seller_id.clone(), offer.offer_id))
+            offer.seller_id != *source || offer.offer_id != updating_offer_id
         });
 
         let Some(offer) = offer else {
@@ -1003,10 +856,6 @@ fn convert_with_offers(
 
         match offer_filter(source, &offer, passive, max_wheat_price) {
             OfferFilterResult::Keep => {}
-            OfferFilterResult::Skip => {
-                ignored.insert((offer.seller_id, offer.offer_id));
-                continue;
-            }
             OfferFilterResult::StopBadPrice => return Ok(ConvertResult::FilterStopBadPrice),
             OfferFilterResult::StopCrossSelf => return Ok(ConvertResult::FilterStopCrossSelf),
         }

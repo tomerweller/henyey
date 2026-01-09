@@ -376,14 +376,13 @@ impl TransactionValidator {
 /// use the operation execution functions directly.
 pub struct TransactionExecutor {
     /// Execution context (ledger sequence, close time, etc.).
-    #[allow(dead_code)]
-    context: ApplyContext,
+    _context: ApplyContext,
 }
 
 impl TransactionExecutor {
     /// Create a new executor with the given context.
     pub fn new(context: ApplyContext) -> Self {
-        Self { context }
+        Self { _context: context }
     }
 
     /// Execute a transaction and return the result.

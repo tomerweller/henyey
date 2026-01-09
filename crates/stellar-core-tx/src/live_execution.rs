@@ -88,9 +88,6 @@ const FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY: u32 = 10;
 /// Protocol version where refund timing changed to post-tx-set.
 const PROTOCOL_VERSION_23: u32 = 23;
 
-/// Protocol version that affects fee bump inner fee tracking.
-#[allow(dead_code)]
-const PROTOCOL_VERSION_25: u32 = 25;
 
 // ============================================================================
 // Live Execution Context
