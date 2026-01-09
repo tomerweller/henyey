@@ -3273,7 +3273,7 @@ fn convert_key(key: &str) -> anyhow::Result<()> {
         let hash = decode_sha256_hash(key)?;
         println!("StrKey:");
         println!("  type: STRKEY_HASH_X");
-        println!("  hex: {}", hex::encode(&hash));
+        println!("  hex: {}", hex::encode(hash));
         return Ok(());
     }
 
@@ -3284,7 +3284,7 @@ fn convert_key(key: &str) -> anyhow::Result<()> {
         println!("  type: STRKEY_MUXED_ACCOUNT_ED25519");
         println!("  accountId: {}", encode_account_id(&account_id));
         println!("  memoId: {}", memo_id);
-        println!("  hex: {}", hex::encode(&account_id));
+        println!("  hex: {}", hex::encode(account_id));
         return Ok(());
     }
 
@@ -3293,7 +3293,7 @@ fn convert_key(key: &str) -> anyhow::Result<()> {
         let hash = decode_contract(key)?;
         println!("StrKey:");
         println!("  type: STRKEY_CONTRACT");
-        println!("  hex: {}", hex::encode(&hash));
+        println!("  hex: {}", hex::encode(hash));
         return Ok(());
     }
 
@@ -3302,8 +3302,8 @@ fn convert_key(key: &str) -> anyhow::Result<()> {
         let (signer, payload) = decode_signed_payload(key)?;
         println!("StrKey:");
         println!("  type: STRKEY_SIGNED_PAYLOAD_ED25519");
-        println!("  signer: {}", hex::encode(&signer));
-        println!("  payload: {}", hex::encode(&payload));
+        println!("  signer: {}", hex::encode(signer));
+        println!("  payload: {}", hex::encode(payload));
         return Ok(());
     }
 

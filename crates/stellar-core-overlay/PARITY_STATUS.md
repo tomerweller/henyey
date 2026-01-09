@@ -228,7 +228,7 @@ This document tracks feature parity between this Rust crate and the C++ upstream
 
 5. **Curve25519 Survey Response Encryption** - Full encryption for privacy
    - C++: Encrypts survey responses with peer's Curve25519 key
-   - Rust: Responses collected but encryption not fully implemented
+   - Rust: **Implemented** in `stellar-core-app/src/app.rs` using `stellar_core_crypto::seal_to_curve25519_public_key` for encryption and `open_from_curve25519_secret_key` for decryption
 
 ### Testing Status
 
@@ -260,5 +260,4 @@ This document tracks feature parity between this Rust crate and the C++ upstream
 1. **Integration Tests**: End-to-end tests with multiple nodes on real network
 2. **LoopbackPeer**: For fast in-process testing without network
 3. **VirtualClock Support**: For deterministic testing with simulated time
-4. **Survey Encryption**: Full Curve25519 encryption for survey responses
-5. **Protocol Fuzzing**: Fuzz testing for message parsing robustness
+4. **Protocol Fuzzing**: Fuzz testing for message parsing robustness
