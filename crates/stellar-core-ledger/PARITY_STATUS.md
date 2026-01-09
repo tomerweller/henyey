@@ -97,6 +97,21 @@ This section documents the implementation status compared to the C++ upstream in
 - [x] Available to send/receive
 - [x] Sub-entry affordability check
 
+#### In-Memory Soroban State (`soroban_state.rs` -> `InMemorySorobanState.h/.cpp`)
+- [x] `InMemorySorobanState` - In-memory cache for contract data and code
+- [x] `ContractDataMapEntry` - Contract data with co-located TTL
+- [x] `ContractCodeMapEntry` - Contract code with TTL and size tracking
+- [x] `TtlData` - TTL data structure for co-location
+- [x] TTL co-location with entries (avoids redundant key storage)
+- [x] Pending TTL handling for out-of-order initialization
+- [x] Contract data state size tracking (XDR size)
+- [x] Contract code state size tracking (in-memory module size)
+- [x] Entry get/create/update/delete operations
+- [x] TTL entry synthesis from co-located data
+- [x] `update_state()` for ledger close batch updates
+- [x] `SharedSorobanState` thread-safe wrapper with RwLock
+- [x] Protocol-aware code size computation
+
 ### Not Yet Implemented (Gaps)
 
 #### LedgerTxn System (`LedgerTxn.h`, `LedgerTxnImpl.h`, `LedgerTxnEntry.h`)
@@ -106,12 +121,6 @@ This section documents the implementation status compared to the C++ upstream in
 - [ ] **Asset pair hash utilities** (`AssetPairHash`, `AssetPair`)
 - [ ] **Inflation winners query** (`InflationWinner` struct)
 - [ ] **Restored entries tracking** (`RestoredEntries` struct) - Tracks entries restored from hot archive vs live bucket list
-
-#### In-Memory Soroban State (`InMemorySorobanState.h/.cpp`)
-- [ ] **In-memory contract data cache** - C++ maintains an in-memory map of live Soroban state for fast access
-- [ ] **Contract code size tracking** - Tracks size in memory for each contract code entry
-- [ ] **TTL data co-location** - TTL stored directly with contract data to avoid extra lookups
-- [ ] **Memory-efficient contract data map** - Uses polymorphic entries to avoid key duplication
 
 #### Shared Module Cache (`SharedModuleCacheCompiler.h/.cpp`)
 - [ ] **Compiled module cache** - C++ pre-compiles WASM modules for faster Soroban execution

@@ -118,4 +118,22 @@ pub enum LedgerError {
     /// indicate a logic error in the implementation.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Invalid entry type or state.
+    ///
+    /// Indicates an entry has an unexpected type or is in an invalid state
+    /// for the requested operation.
+    #[error("invalid entry: {0}")]
+    InvalidEntry(String),
+
+    /// Invalid ledger sequence for state update.
+    ///
+    /// Ledger sequences must progress by exactly one for state updates.
+    #[error("invalid ledger sequence: expected {expected}, got {actual}")]
+    InvalidLedgerSequence {
+        /// The expected ledger sequence.
+        expected: u32,
+        /// The actual ledger sequence received.
+        actual: u32,
+    },
 }

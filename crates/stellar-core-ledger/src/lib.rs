@@ -90,6 +90,7 @@ pub mod execution;
 mod header;
 mod manager;
 mod snapshot;
+mod soroban_state;
 
 // Re-export main types
 pub use close::{
@@ -105,6 +106,10 @@ pub use header::{
 pub use manager::{LedgerCloseContext, LedgerManager, LedgerManagerConfig, LedgerManagerStats};
 pub use snapshot::{
     EntriesLookupFn, LedgerSnapshot, SnapshotBuilder, SnapshotHandle, SnapshotManager,
+};
+pub use soroban_state::{
+    ContractCodeMapEntry, ContractDataMapEntry, InMemorySorobanState, SharedSorobanState,
+    SorobanStateStats, TtlData,
 };
 
 /// Result type for ledger operations.
