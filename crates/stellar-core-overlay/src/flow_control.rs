@@ -824,48 +824,11 @@ pub fn is_flood_message(msg: &StellarMessage) -> bool {
     )
 }
 
-/// Get the number of messages from a SEND_MORE_EXTENDED.
-#[allow(dead_code)]
-pub fn get_num_messages(msg: &StellarMessage) -> u32 {
-    match msg {
-        StellarMessage::SendMoreExtended(sm) => sm.num_messages,
-        _ => 0,
-    }
-}
-
 /// Get message body size in bytes.
 pub fn msg_body_size(msg: &StellarMessage) -> u64 {
     msg.to_xdr(stellar_xdr::curr::Limits::none())
         .map(|bytes| bytes.len() as u64)
         .unwrap_or(0)
-}
-
-/// Get the message type for logging.
-#[allow(dead_code)]
-pub fn message_type_name(msg: &StellarMessage) -> &'static str {
-    match msg {
-        StellarMessage::ErrorMsg(_) => "ERROR",
-        StellarMessage::Hello(_) => "HELLO",
-        StellarMessage::Auth(_) => "AUTH",
-        StellarMessage::DontHave(_) => "DONT_HAVE",
-        StellarMessage::Peers(_) => "PEERS",
-        StellarMessage::GetTxSet(_) => "GET_TX_SET",
-        StellarMessage::TxSet(_) => "TX_SET",
-        StellarMessage::GeneralizedTxSet(_) => "GENERALIZED_TX_SET",
-        StellarMessage::Transaction(_) => "TRANSACTION",
-        StellarMessage::GetScpQuorumset(_) => "GET_SCP_QUORUMSET",
-        StellarMessage::ScpQuorumset(_) => "SCP_QUORUMSET",
-        StellarMessage::ScpMessage(_) => "SCP_MESSAGE",
-        StellarMessage::GetScpState(_) => "GET_SCP_STATE",
-        StellarMessage::SendMore(_) => "SEND_MORE",
-        StellarMessage::SendMoreExtended(_) => "SEND_MORE_EXTENDED",
-        StellarMessage::FloodAdvert(_) => "FLOOD_ADVERT",
-        StellarMessage::FloodDemand(_) => "FLOOD_DEMAND",
-        StellarMessage::TimeSlicedSurveyRequest(_) => "TIME_SLICED_SURVEY_REQUEST",
-        StellarMessage::TimeSlicedSurveyResponse(_) => "TIME_SLICED_SURVEY_RESPONSE",
-        StellarMessage::TimeSlicedSurveyStartCollecting(_) => "TIME_SLICED_SURVEY_START_COLLECTING",
-        StellarMessage::TimeSlicedSurveyStopCollecting(_) => "TIME_SLICED_SURVEY_STOP_COLLECTING",
-    }
 }
 
 /// Compare two messages for equality (by XDR serialization).

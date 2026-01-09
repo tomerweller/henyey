@@ -196,9 +196,6 @@ pub struct Peer {
     auth: AuthContext,
     /// Statistics.
     stats: Arc<PeerStats>,
-    /// Channel for sending messages (used by split peer).
-    #[allow(dead_code)]
-    send_tx: Option<mpsc::Sender<StellarMessage>>,
 }
 
 impl Peer {
@@ -230,7 +227,6 @@ impl Peer {
             connection,
             auth,
             stats: Arc::new(PeerStats::default()),
-            send_tx: None,
         };
 
         // Perform handshake
@@ -264,7 +260,6 @@ impl Peer {
             connection,
             auth,
             stats: Arc::new(PeerStats::default()),
-            send_tx: None,
         };
 
         // Perform handshake
