@@ -114,7 +114,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Node ID resolution**: `resolveNodeID()` - Config-based node lookup
 - [ ] **Upgrade scheduling**: `setUpgrades()`, `getUpgradesJson()` - Scheduled upgrade management
 - [ ] **SCP state synchronization**: `forceSCPStateIntoSyncWithLastClosedLedger()`
-- [ ] **Flow control**: `getFlowControlExtraBuffer()`, `getMaxTxSize()`, `getMaxClassicTxSize()`
+- [x] **Flow control**: `getFlowControlExtraBuffer()`, `getMaxTxSize()`, `getMaxClassicTxSize()` - see `flow_control.rs`
 - [ ] **Last checkpoint sending**: `SEND_LATEST_CHECKPOINT_DELAY` timing
 
 #### SCP Driver (`HerderSCPDriver`)

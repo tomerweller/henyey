@@ -92,6 +92,7 @@
 //! - [`json_api`]: JSON structures for admin/diagnostic endpoints
 
 mod error;
+pub mod flow_control;
 mod herder;
 mod herder_utils;
 pub mod json_api;
