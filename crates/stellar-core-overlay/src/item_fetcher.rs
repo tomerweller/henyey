@@ -17,12 +17,12 @@
 //! 4. If we exhaust all peers, we restart with exponential backoff
 //! 5. When the item is received, all waiting envelopes are re-processed
 
-use crate::{PeerId, Result};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use crate::PeerId;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{Hash, ScpEnvelope, WriteXdr};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 /// Type of item being fetched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -541,7 +541,7 @@ pub struct ItemFetcherStats {
 ///
 /// Uses the same approach as C++: BLAKE2 of the StellarMessage wrapping the envelope.
 fn compute_envelope_hash(env: &ScpEnvelope) -> Hash {
-    use blake2::{Blake2b512, Digest};
+    use blake2::Digest;
 
     // Create a StellarMessage::ScpMessage wrapping the envelope
     let msg = stellar_xdr::curr::StellarMessage::ScpMessage(env.clone());

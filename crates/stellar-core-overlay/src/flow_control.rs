@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
-use stellar_xdr::curr::{MessageType, StellarMessage, WriteXdr};
+use stellar_xdr::curr::{StellarMessage, WriteXdr};
 use tracing::{debug, trace, warn};
 
 /// Configuration for flow control.
@@ -135,8 +135,8 @@ struct ReadingCapacity {
 struct FlowControlMessageCapacity {
     /// Current local reading capacity.
     capacity: ReadingCapacity,
-    /// Capacity limits.
-    capacity_limits: ReadingCapacity,
+    /// Capacity limits (stored for debugging/future use).
+    _capacity_limits: ReadingCapacity,
     /// Outbound capacity (what the peer allows us to send).
     outbound_capacity: u64,
 }
@@ -149,7 +149,7 @@ impl FlowControlMessageCapacity {
         };
         Self {
             capacity: capacity_limits,
-            capacity_limits,
+            _capacity_limits: capacity_limits,
             outbound_capacity: 0,
         }
     }
@@ -825,6 +825,7 @@ pub fn is_flood_message(msg: &StellarMessage) -> bool {
 }
 
 /// Get the number of messages from a SEND_MORE_EXTENDED.
+#[allow(dead_code)]
 pub fn get_num_messages(msg: &StellarMessage) -> u32 {
     match msg {
         StellarMessage::SendMoreExtended(sm) => sm.num_messages,
@@ -840,6 +841,7 @@ pub fn msg_body_size(msg: &StellarMessage) -> u64 {
 }
 
 /// Get the message type for logging.
+#[allow(dead_code)]
 pub fn message_type_name(msg: &StellarMessage) -> &'static str {
     match msg {
         StellarMessage::ErrorMsg(_) => "ERROR",

@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace};
 
 /// Maximum number of failures before a peer is considered unreliable.
 pub const MAX_FAILURES: u32 = 10;

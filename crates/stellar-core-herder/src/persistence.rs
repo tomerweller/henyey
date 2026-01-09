@@ -31,8 +31,8 @@
 
 use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet,
-    ScpStatementPledges, StellarValue, TransactionSet, Value, WriteXdr,
+    Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet,
+    ScpStatementPledges, StellarValue, Value, WriteXdr,
 };
 use tracing::{debug, info, warn};
 

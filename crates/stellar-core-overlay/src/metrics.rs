@@ -22,8 +22,6 @@
 //!
 //! All metrics use atomic operations and are safe to access from multiple threads.
 
-use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 

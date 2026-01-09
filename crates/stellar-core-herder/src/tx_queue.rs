@@ -43,7 +43,7 @@ use stellar_core_common::{
 use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet,
-    Limits, Operation, OperationType, Preconditions, SignerKey, TransactionEnvelope,
+    Limits, OperationType, Preconditions, SignerKey, TransactionEnvelope,
     TransactionPhase, TxSetComponent,
 };
 use stellar_xdr::curr::WriteXdr;
@@ -694,7 +694,7 @@ pub struct TransactionQueue {
     /// The front is the oldest, the back is the newest.
     banned_transactions: RwLock<std::collections::VecDeque<HashSet<Hash256>>>,
     /// Depth of the ban deque (number of ledgers transactions stay banned).
-    ban_depth: u32,
+    _ban_depth: u32,
 }
 
 /// Default ban depth (number of ledgers transactions stay banned).
@@ -726,7 +726,7 @@ impl TransactionQueue {
             soroban_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
             global_evicted_inclusion_fee: RwLock::new((0, 0)),
             banned_transactions: RwLock::new(banned),
-            ban_depth,
+            _ban_depth: ban_depth,
         }
     }
 

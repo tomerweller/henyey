@@ -23,12 +23,12 @@
 //! 5. When transaction received, records pull latency
 //! 6. Old demand records are cleaned up after MAX_RETENTION
 
-use crate::{PeerId, Result};
+use crate::PeerId;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::{FloodDemand, Hash, StellarMessage, TransactionEnvelope};
-use tracing::{debug, trace, warn};
+use stellar_xdr::curr::{FloodDemand, Hash, TransactionEnvelope};
+use tracing::{debug, trace};
 
 /// Maximum number of retry attempts before giving up on a transaction.
 pub const MAX_RETRY_COUNT: u32 = 15;

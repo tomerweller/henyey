@@ -31,11 +31,11 @@
 //! - Responses are encrypted with Curve25519
 //! - Rate limiting prevents survey flooding
 
-use crate::{PeerId, Result};
+use crate::PeerId;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum phase duration for collecting (default: 30 minutes).
 const MAX_COLLECTING_PHASE_DURATION: Duration = Duration::from_secs(30 * 60);
@@ -245,8 +245,8 @@ impl Default for SurveyConfig {
 struct SurveyState {
     /// Survey nonce (unique identifier).
     nonce: u32,
-    /// Surveyor node ID.
-    surveyor: PeerId,
+    /// Surveyor node ID (stored for future use).
+    _surveyor: PeerId,
     /// Current phase.
     phase: SurveyPhase,
     /// When collecting started.
@@ -451,7 +451,7 @@ impl SurveyManager {
 
         *state = Some(SurveyState {
             nonce,
-            surveyor,
+            _surveyor: surveyor,
             phase: SurveyPhase::Collecting,
             collect_start_time: Instant::now(),
             collect_end_time: None,
@@ -673,7 +673,7 @@ impl SurveyManager {
 
     /// Add a peer to the backlog of peers to survey.
     pub fn add_peer_to_backlog(&self, peer_id: PeerId) -> bool {
-        let mut surveyed = self.surveyed_peers.write();
+        let surveyed = self.surveyed_peers.write();
         if surveyed.contains(&peer_id) {
             return false;
         }

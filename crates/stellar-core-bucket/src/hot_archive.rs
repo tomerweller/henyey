@@ -28,7 +28,7 @@
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use stellar_xdr::curr::{
-    BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry, HotArchiveBucketEntryType,
+    BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry,
     LedgerEntry, LedgerKey, Limits, WriteXdr,
 };
 
@@ -171,8 +171,8 @@ pub struct HotArchiveBucketLevel {
     pub snap: HotArchiveBucket,
     /// Staged merge result.
     next: Option<HotArchiveBucket>,
-    /// Level number.
-    level: usize,
+    /// Level number (stored for debugging).
+    _level: usize,
 }
 
 impl HotArchiveBucketLevel {
@@ -182,7 +182,7 @@ impl HotArchiveBucketLevel {
             curr: HotArchiveBucket::empty(),
             snap: HotArchiveBucket::empty(),
             next: None,
-            level,
+            _level: level,
         }
     }
 

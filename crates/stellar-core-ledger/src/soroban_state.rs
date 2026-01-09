@@ -267,6 +267,7 @@ impl InMemorySorobanState {
     }
 
     /// Extract the key hash for any supported key type.
+    #[allow(dead_code)]
     fn get_key_hash(key: &LedgerKey) -> Option<[u8; 32]> {
         match key {
             LedgerKey::ContractData(cd) => Some(Self::contract_data_key_hash(cd)),
@@ -590,7 +591,7 @@ impl InMemorySorobanState {
     pub fn process_ttl_entry(&mut self, entry: &LedgerEntry) -> Result<()> {
         let (key_hash, ttl_data) = match &entry.data {
             LedgerEntryData::Ttl(ttl) => {
-                let key = LedgerKeyTtl {
+                let _key = LedgerKeyTtl {
                     key_hash: ttl.key_hash.clone(),
                 };
                 (

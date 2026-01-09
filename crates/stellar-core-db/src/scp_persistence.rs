@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use stellar_xdr::curr::Hash;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::queries::ScpStatePersistenceQueries;
 use crate::pool::Database;

@@ -21,7 +21,7 @@
 
 use crate::{
     item_fetcher::{ItemFetcher, ItemType, PendingRequest},
-    PeerId, Result,
+    PeerId,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ use stellar_xdr::curr::{
     DontHave, GeneralizedTransactionSet, Hash, MessageType, ScpEnvelope, ScpQuorumSet,
     StellarMessage, TransactionSet,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 /// Callback for when a TxSet is received.
 pub type TxSetCallback = Box<dyn Fn(Hash, TxSetData) + Send + Sync>;

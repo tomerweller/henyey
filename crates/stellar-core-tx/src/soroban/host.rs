@@ -888,7 +888,7 @@ fn execute_host_function_p24(
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         let entry_result = if is_being_restored {
             let result = snapshot.get_archived(&Rc::new(key_p24)).map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?;
-            if let Some((ref entry, live_until)) = result {
+            if let Some((ref _entry, live_until)) = result {
                 tracing::warn!(
                     idx = idx,
                     key_type = ?std::mem::discriminant(key),

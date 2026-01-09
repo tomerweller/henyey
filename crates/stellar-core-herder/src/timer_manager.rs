@@ -45,7 +45,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, info, warn, trace};
+use tracing::{debug, info, trace};
 
 use stellar_core_scp::SlotIndex;
 
@@ -192,8 +192,8 @@ struct ActiveTimer {
     timer_type: TimerType,
     slot: SlotIndex,
     expires_at: Instant,
-    /// Unique ID to detect if timer was rescheduled
-    generation: u64,
+    /// Unique ID to detect if timer was rescheduled (stored for future use)
+    _generation: u64,
 }
 
 /// The timer manager that runs as a background task.
@@ -280,7 +280,7 @@ impl<C: TimerCallback> TimerManager<C> {
             timer_type,
             slot,
             expires_at,
-            generation: self.generation,
+            _generation: self.generation,
         };
 
         debug!(

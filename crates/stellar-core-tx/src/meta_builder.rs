@@ -32,7 +32,7 @@ use stellar_core_common::NetworkId;
 use stellar_xdr::curr::{
     ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
     ExtensionPoint, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, Memo, OperationMeta,
-    OperationMetaV2, ScError, ScErrorCode, ScMap, ScMapEntry, ScString, ScSymbol, ScVal,
+    OperationMetaV2, ScError, ScMap, ScMapEntry, ScString, ScSymbol, ScVal,
     SorobanTransactionMeta, SorobanTransactionMetaExt, SorobanTransactionMetaExtV1,
     SorobanTransactionMetaV2, StringM, TransactionMeta, TransactionMetaV2, TransactionMetaV3,
     TransactionMetaV4,

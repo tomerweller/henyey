@@ -19,7 +19,7 @@
 
 use crate::{OverlayError, PeerId, Result};
 use parking_lot::RwLock;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;

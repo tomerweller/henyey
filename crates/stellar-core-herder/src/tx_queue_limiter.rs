@@ -354,9 +354,8 @@ impl TxQueueLimiter {
         let min_inclusion_fee = min_fee_to_beat_lane.max(min_fee_to_beat_generic);
 
         if min_inclusion_fee > 0 {
-            // Need to report full fee (inclusion + resource fee for Soroban)
-            let full_fee = min_inclusion_fee + (new_tx.total_fee as i64 - new_tx.total_fee as i64);
-            return (false, full_fee);
+            // Need to report full fee (inclusion fee for eviction threshold)
+            return (false, min_inclusion_fee);
         }
 
         // Calculate old tx discount for replace-by-fee

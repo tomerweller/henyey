@@ -75,7 +75,7 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info, warn};
 
-use crate::delta::{key_to_bytes, LedgerDelta};
+use crate::delta::LedgerDelta;
 use crate::snapshot::SnapshotHandle;
 use crate::{LedgerError, Result};
 
@@ -901,6 +901,7 @@ impl TransactionExecutor {
     /// the C++ behavior, we delete archived entries from state before executing the operation.
     /// This way, when the Soroban host re-adds these entries, they will be recorded as CREATED
     /// rather than UPDATED in the transaction meta.
+    #[allow(dead_code)]
     fn clear_archived_entries_from_state(&mut self, soroban_data: &SorobanTransactionData) {
         // Get archived entry indices from SorobanTransactionDataExt::V1
         let archived_indices: HashSet<usize> =
@@ -1627,7 +1628,7 @@ impl TransactionExecutor {
             self.classic_events,
         );
         let mut refundable_fee_tracker = if frame.is_soroban() {
-            let (non_refundable_fee, initial_refundable_fee) =
+            let (non_refundable_fee, _initial_refundable_fee) =
                 compute_soroban_resource_fee(&frame, self.protocol_version, &self.soroban_config, 0)
                     .unwrap_or((0, 0));
             let declared_fee = frame.declared_soroban_resource_fee();
@@ -2048,7 +2049,7 @@ impl TransactionExecutor {
             self.state.commit();
         }
 
-        let mut post_fee_changes = empty_entry_changes();
+        let post_fee_changes = empty_entry_changes();
         let mut fee_refund = 0i64;
         if let Some(tracker) = refundable_fee_tracker {
             let refund = tracker.refund_amount();

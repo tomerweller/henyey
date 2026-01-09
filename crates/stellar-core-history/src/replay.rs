@@ -47,7 +47,7 @@
 
 use crate::{verify, HistoryError, Result};
 use sha2::{Digest, Sha256};
-use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
+use stellar_core_bucket::{update_starting_eviction_iterator, EvictionIterator, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_invariant::LedgerEntryChange;
 use stellar_core_ledger::{
@@ -55,10 +55,28 @@ use stellar_core_ledger::{
     LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle, TransactionSetVariant,
 };
 use stellar_xdr::curr::{
-    BucketListType, ConfigSettingEntry, EvictionIterator as XdrEvictionIterator, LedgerEntry,
-    LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, TransactionEnvelope, TransactionMeta,
-    TransactionResultPair, TransactionResultSet, WriteXdr,
+    BucketListType, ConfigSettingEntry, ConfigSettingId, EvictionIterator as XdrEvictionIterator,
+    LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting,
+    TransactionEnvelope, TransactionMeta, TransactionResultPair, TransactionResultSet, WriteXdr,
 };
+
+fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchivalSettings> {
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    });
+    match snapshot.get_entry(&key) {
+        Ok(Some(entry)) => match entry.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
+                Some(StateArchivalSettings {
+                    eviction_scan_size: settings.eviction_scan_size as u64,
+                    starting_eviction_scan_level: settings.starting_eviction_scan_level,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// The result of replaying a single ledger.
 ///
@@ -332,6 +350,8 @@ pub fn replay_ledger_with_execution(
     let transactions = tx_set.transactions_with_base_fee();
     // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
     let soroban_config = load_soroban_config(&snapshot);
+    let eviction_settings =
+        load_state_archival_settings(&snapshot).unwrap_or(config.eviction_settings);
     // Use transaction set hash as base PRNG seed for Soroban execution
     let soroban_base_prng_seed = tx_set.hash();
     let op_invariants = if config.verify_invariants {
@@ -433,26 +453,32 @@ pub fn replay_ledger_with_execution(
         && header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
         && hot_archive_bucket_list.is_some()
     {
-        if let Some(iter) = eviction_iterator {
-            let eviction_result = bucket_list
-                .scan_for_eviction_incremental(iter, header.ledger_seq, &config.eviction_settings)
-                .map_err(HistoryError::Bucket)?;
+        let mut iter = updated_eviction_iterator.unwrap_or_else(|| {
+            EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
+        });
+        update_starting_eviction_iterator(
+            &mut iter,
+            eviction_settings.starting_eviction_scan_level,
+            header.ledger_seq,
+        );
+        let eviction_result = bucket_list
+            .scan_for_eviction_incremental(iter, header.ledger_seq, &eviction_settings)
+            .map_err(HistoryError::Bucket)?;
 
-            tracing::info!(
-                ledger_seq = header.ledger_seq,
-                bytes_scanned = eviction_result.bytes_scanned,
-                archived_count = eviction_result.archived_entries.len(),
-                evicted_count = eviction_result.evicted_keys.len(),
-                end_level = eviction_result.end_iterator.bucket_list_level,
-                end_is_curr = eviction_result.end_iterator.is_curr_bucket,
-                "Incremental eviction scan results"
-            );
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            bytes_scanned = eviction_result.bytes_scanned,
+            archived_count = eviction_result.archived_entries.len(),
+            evicted_count = eviction_result.evicted_keys.len(),
+            end_level = eviction_result.end_iterator.bucket_list_level,
+            end_is_curr = eviction_result.end_iterator.is_curr_bucket,
+            "Incremental eviction scan results"
+        );
 
-            evicted_keys = eviction_result.evicted_keys;
-            archived_entries = eviction_result.archived_entries;
-            updated_eviction_iterator = Some(eviction_result.end_iterator);
-            eviction_actually_ran = true;
-        }
+        evicted_keys = eviction_result.evicted_keys;
+        archived_entries = eviction_result.archived_entries;
+        updated_eviction_iterator = Some(eviction_result.end_iterator);
+        eviction_actually_ran = true;
     }
 
     // Combine transaction dead entries with evicted entries

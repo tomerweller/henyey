@@ -481,7 +481,7 @@ pub fn process_post_apply(
     frame: &TransactionFrame,
     ctx: &mut LiveExecutionContext,
     tx_result: &mut MutableTransactionResult,
-    meta_builder: Option<&mut TransactionMetaBuilder>,
+    _meta_builder: Option<&mut TransactionMetaBuilder>,
 ) -> Result<i64> {
     // In protocol 23+, refunds are handled in process_post_tx_set_apply
     if ctx.protocol_version() >= PROTOCOL_VERSION_23 {
@@ -509,7 +509,7 @@ pub fn process_post_apply_fee_bump(
     fee_bump: &FeeBumpFrame,
     ctx: &mut LiveExecutionContext,
     tx_result: &mut MutableTransactionResult,
-    meta_builder: Option<&mut TransactionMetaBuilder>,
+    _meta_builder: Option<&mut TransactionMetaBuilder>,
 ) -> Result<i64> {
     // In protocol 23+, refunds are handled in process_post_tx_set_apply
     if ctx.protocol_version() >= PROTOCOL_VERSION_23 {
@@ -797,7 +797,7 @@ pub fn remove_one_time_signers(
 pub fn apply_transaction(
     frame: &TransactionFrame,
     ctx: &mut LiveExecutionContext,
-    skip_signature_validation: bool,
+    _skip_signature_validation: bool,
 ) -> Result<MutableTransactionResult> {
     // Phase 1: Fee and sequence number
     let fee_result = process_fee_seq_num(frame, ctx, None)?;
@@ -809,7 +809,7 @@ pub fn apply_transaction(
     let mut tx_result = fee_result.tx_result;
 
     // Phase 2: Process sequence number (protocol 10+)
-    if let Err(e) = process_seq_num(frame, ctx) {
+    if let Err(_e) = process_seq_num(frame, ctx) {
         tx_result.set_error(TransactionResultCode::TxNoAccount);
         return Ok(tx_result);
     }

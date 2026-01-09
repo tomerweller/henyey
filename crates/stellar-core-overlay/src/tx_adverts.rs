@@ -16,13 +16,11 @@
 //! 3. When we receive a FloodAdvert, we call `queue_incoming_advert` to process it
 //! 4. We pop adverts from the incoming queue to demand transactions
 
-use crate::{PeerId, Result};
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{FloodAdvert, Hash, StellarMessage};
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// Default size of the advert history cache.
 const ADVERT_CACHE_SIZE: usize = 50000;
@@ -336,6 +334,7 @@ pub struct TxAdvertsStats {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn make_hash(id: u8) -> Hash {
         Hash([id; 32])

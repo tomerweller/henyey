@@ -323,11 +323,11 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
     // However, we don't have the transaction hash here in the signer verification
     // This matches C++ behavior where the payload is part of the signer key
 
-    let Ok(public_key) = PublicKey::from_bytes(&payload_signer.ed25519.0) else {
+    let Ok(_public_key) = PublicKey::from_bytes(&payload_signer.ed25519.0) else {
         return false;
     };
 
-    let Ok(signature) = Signature::try_from(&sig.signature) else {
+    let Ok(_signature) = Signature::try_from(&sig.signature) else {
         return false;
     };
 

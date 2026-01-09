@@ -37,10 +37,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 use stellar_xdr::curr::{Hash, TransactionEnvelope};
 
@@ -156,7 +155,7 @@ pub trait TxBroadcastCallback: Send + Sync + 'static {
 /// Pending transaction for broadcast.
 #[derive(Debug, Clone)]
 struct PendingTx {
-    envelope: TransactionEnvelope,
+    _envelope: TransactionEnvelope,
     broadcast_count: u32,
     last_broadcast: Option<Instant>,
 }
@@ -344,7 +343,7 @@ impl<C: TxBroadcastCallback> TxBroadcastManager<C> {
         self.pending.insert(
             tx_hash,
             PendingTx {
-                envelope,
+                _envelope: envelope,
                 broadcast_count: 0,
                 last_broadcast: None,
             },
@@ -387,6 +386,7 @@ pub struct TxBroadcastStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::time::timeout;
 
