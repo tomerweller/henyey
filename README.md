@@ -58,7 +58,7 @@ This Rust implementation aims to mirror stellar-core v25.x behavior for educatio
 │   (validation)  │
 └─────────────────┘
 
-Supporting crates: crypto, common, work, historywork, simulation
+Supporting crates: crypto, common, work, historywork
 ```
 
 ## Status
@@ -188,8 +188,7 @@ rs-stellar-core/
 │   ├── stellar-core-crypto/      # Cryptographic primitives
 │   ├── stellar-core-common/      # Shared types
 │   ├── stellar-core-invariant/   # Ledger invariants
-│   ├── stellar-core-work/        # Work scheduler
-│   └── stellar-core-simulation/  # Test harness
+│   └── stellar-core-work/        # Work scheduler
 └── configs/                      # Example configurations
 ```
 
@@ -234,7 +233,6 @@ rs-stellar-core/
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`stellar-core-work`](crates/stellar-core-work/README.md) | Generic DAG-based work scheduler | [~90%](crates/stellar-core-work/PARITY_STATUS.md) |
-| [`stellar-core-simulation`](crates/stellar-core-simulation/README.md) | Deterministic test harness for overlay/SCP testing | [~75%](crates/stellar-core-simulation/PARITY_STATUS.md) |
 
 ## Design Constraints
 

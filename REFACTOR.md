@@ -19,9 +19,8 @@ This document contains code analysis findings for all crates in the rs-stellar-c
 11. [stellar-core-ledger](#stellar-core-ledger)
 12. [stellar-core-overlay](#stellar-core-overlay)
 13. [stellar-core-scp](#stellar-core-scp)
-14. [stellar-core-simulation](#stellar-core-simulation)
-15. [stellar-core-tx](#stellar-core-tx)
-16. [stellar-core-work](#stellar-core-work)
+14. [stellar-core-tx](#stellar-core-tx)
+15. [stellar-core-work](#stellar-core-work)
 
 ---
 
@@ -555,43 +554,6 @@ Stellar Consensus Protocol implementation.
 
 ---
 
-## stellar-core-simulation
-
-Testing harness for multi-node simulation.
-
-### Race Conditions
-
-| Location | Issue | Suggested Fix |
-|----------|-------|---------------|
-| `lib.rs:342-352` | Port allocation TOCTOU race | Pass listener directly or use SO_REUSEADDR |
-
-### Silent Error Handling
-
-| Location | Issue | Suggested Fix |
-|----------|-------|---------------|
-| `lib.rs:221-225` | Connection errors silently ignored | Log or track connection results |
-| `lib.rs:253-262` | `broadcast_scp` succeeds with no hub | Return error when no hub available |
-
-### Architecture Issues
-
-| Location | Issue | Suggested Fix |
-|----------|-------|---------------|
-| `lib.rs` | `VirtualClock` not integrated with `OverlaySimulation` | Add `clock` field and methods to advance virtual time |
-
-### Validation
-
-| Location | Issue | Suggested Fix |
-|----------|-------|---------------|
-| `lib.rs:170-173,197-231` | No validation for `node_count` parameter | Require at least 2 nodes |
-
-### API Design
-
-| Location | Issue | Suggested Fix |
-|----------|-------|---------------|
-| `virtual_clock.rs:544-574` | `crank_until` returns `Result<(), ()>` | Return `bool` or custom error type |
-
----
-
 ## stellar-core-tx
 
 Transaction processing.
@@ -696,12 +658,12 @@ Async work scheduler.
 | Category | Total Issues |
 |----------|--------------|
 | Potential Panics | 35 |
-| Silent Error Handling | 28 |
+| Silent Error Handling | 26 |
 | Code Duplication | 25 |
 | Missing Tests | 22 |
 | Performance Issues | 20 |
-| API Design Issues | 18 |
+| API Design Issues | 17 |
 | Unused/Dead Code | 15 |
 | Security Concerns | 6 |
 | Documentation Gaps | 12 |
-| **Total** | **181** |
+| **Total** | **178** |

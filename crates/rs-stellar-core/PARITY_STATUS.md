@@ -75,7 +75,6 @@ This section documents the feature parity between this Rust implementation and t
 | Transactions | `stellar-core-tx` | Implemented | All classic operations, Soroban support |
 | Invariants | `stellar-core-invariant` | Implemented | Ledger invariant checking |
 | Work | `stellar-core-work` | Implemented | Async work scheduling |
-| Simulation | `stellar-core-simulation` | Implemented | Network simulation |
 | Application | `stellar-core-app` | Implemented | App orchestration, config |
 
 ### Not Yet Implemented (Gaps)
@@ -164,7 +163,7 @@ This section documents the feature parity between this Rust implementation and t
 
 2. **Full XDR Support**: The `decode-xdr` command supports a subset of XDR types; C++ supports more types.
 
-3. **Network Simulation**: The simulation crate exists but may have different capabilities than the C++ version.
+3. **Network Simulation**: Simulation framework is out of scope for this implementation.
 
 4. **Fuzzing**: Rust would use `cargo-fuzz` or similar tools rather than the C++ fuzzing infrastructure.
 

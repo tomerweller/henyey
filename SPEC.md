@@ -151,7 +151,19 @@ archives = [
 - Metrics parity is intentionally out of scope.
 - Not production-hardened; use for education and research only.
 
-## 9. References
+## 9. Out of Scope
+
+The following components are explicitly out of scope for this implementation:
+
+### 9.1 Simulation Framework
+
+A deterministic multi-node simulation framework (`stellar-core-simulation`) is not included. The C++ stellar-core provides simulation capabilities for testing overlay and consensus behavior in controlled environments. This Rust implementation focuses on production-like execution paths rather than simulation infrastructure.
+
+### 9.2 Transaction Metadata Baseline Testing
+
+Transaction metadata baseline tests that compare XDR hashes against reference values are not included. These tests verify byte-for-byte parity of transaction metadata output with C++ stellar-core. While useful for strict parity verification, they are not essential for functional correctness and add significant maintenance overhead.
+
+## 10. References
 
 - stellar-core (upstream): https://github.com/stellar/stellar-core
 - CAPs: https://github.com/stellar/stellar-protocol/tree/master/core
