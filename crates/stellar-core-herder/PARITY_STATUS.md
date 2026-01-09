@@ -137,7 +137,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Arbitrage damping**: `mArbitrageFloodDamping`, `allowTxBroadcast()` for path payment loops
 - [ ] **Separate queues**: `ClassicTransactionQueue`, `SorobanTransactionQueue` as distinct types
 - [ ] **Queue rebuild**: `resetAndRebuild()` for config upgrades
-- [ ] **Filtered operations**: `mFilteredTypes`, `isFiltered()` for operation type filtering
+- [x] **Filtered operations**: `mFilteredTypes`, `isFiltered()` for operation type filtering - see `tx_queue.rs`
 - [ ] **Footprint key filtering**: `mKeysToFilter`, `mTxsFilteredDueToFootprintKeys`
 - [ ] **Pending depth configuration**: `mPendingDepth` for per-account limits
 - [ ] **Pool ledger multiplier**: Queue sizing based on ledger multiplier

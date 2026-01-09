@@ -742,6 +742,9 @@ impl Herder {
             TxQueueResult::Banned => {
                 debug!("Banned transaction rejected");
             }
+            TxQueueResult::Filtered => {
+                debug!("Transaction rejected due to filtered operation type");
+            }
         }
 
         result

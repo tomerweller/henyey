@@ -43,7 +43,8 @@ use stellar_core_common::{
 use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet,
-    Limits, Preconditions, SignerKey, TransactionEnvelope, TransactionPhase, TxSetComponent,
+    Limits, Operation, OperationType, Preconditions, SignerKey, TransactionEnvelope,
+    TransactionPhase, TxSetComponent,
 };
 use stellar_xdr::curr::WriteXdr;
 
@@ -70,6 +71,8 @@ pub enum TxQueueResult {
     Invalid,
     /// Transaction is banned.
     Banned,
+    /// Transaction contains a filtered operation type.
+    Filtered,
 }
 
 const MAX_TX_SET_ALLOWANCE_BYTES: u32 = 10 * 1024 * 1024;
@@ -110,6 +113,12 @@ pub struct TxQueueConfig {
     pub max_queue_ops: Option<u32>,
     /// Optional classic tx byte allowance for queue admission.
     pub max_queue_classic_bytes: Option<u32>,
+    /// Operation types to filter out (transactions containing these will be rejected).
+    ///
+    /// This allows nodes to exclude transactions with specific operation types
+    /// from their mempool. This is configured via
+    /// `EXCLUDE_TRANSACTIONS_CONTAINING_OPERATION_TYPE` in C++.
+    pub filtered_operation_types: HashSet<OperationType>,
 }
 
 impl Default for TxQueueConfig {
@@ -130,6 +139,7 @@ impl Default for TxQueueConfig {
             max_queue_soroban_resources: None,
             max_queue_ops: None,
             max_queue_classic_bytes: None,
+            filtered_operation_types: HashSet::new(),
         }
     }
 }
@@ -860,6 +870,11 @@ impl TransactionQueue {
         // Check if banned
         if self.is_banned(&queued.hash) {
             return TxQueueResult::Banned;
+        }
+
+        // Check if filtered by operation type
+        if self.is_filtered(&queued.envelope) {
+            return TxQueueResult::Filtered;
         }
 
         // Check fee
@@ -1721,6 +1736,40 @@ impl TransactionQueue {
     pub fn is_banned(&self, hash: &Hash256) -> bool {
         let banned = self.banned_transactions.read();
         banned.iter().any(|set| set.contains(hash))
+    }
+
+    /// Check if a transaction contains any filtered operation types.
+    ///
+    /// Returns `true` if the transaction contains at least one operation
+    /// whose type is in the `filtered_operation_types` set.
+    ///
+    /// # Arguments
+    ///
+    /// * `envelope` - The transaction envelope to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the transaction should be filtered out.
+    pub fn is_filtered(&self, envelope: &TransactionEnvelope) -> bool {
+        // Skip check if no types are filtered
+        if self.config.filtered_operation_types.is_empty() {
+            return false;
+        }
+
+        let ops = match envelope {
+            TransactionEnvelope::TxV0(env) => &env.tx.operations,
+            TransactionEnvelope::Tx(env) => &env.tx.operations,
+            TransactionEnvelope::TxFeeBump(env) => {
+                match &env.tx.inner_tx {
+                    FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
+                }
+            }
+        };
+
+        ops.iter().any(|op| {
+            let op_type = op.body.discriminant();
+            self.config.filtered_operation_types.contains(&op_type)
+        })
     }
 
     /// Shift the ban queue after a ledger close.
@@ -3780,5 +3829,163 @@ mod tests {
         }
 
         assert_eq!(queue.try_add(signed), TxQueueResult::Added);
+    }
+
+    #[test]
+    fn test_is_filtered_empty_config() {
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            filtered_operation_types: HashSet::new(), // No filters
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Create a transaction with CreateAccount operation
+        let envelope = make_test_envelope(1000, 1);
+
+        // Should NOT be filtered when no types are configured
+        assert!(!queue.is_filtered(&envelope));
+    }
+
+    #[test]
+    fn test_is_filtered_matching_type() {
+        let mut filtered = HashSet::new();
+        filtered.insert(OperationType::CreateAccount);
+
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            filtered_operation_types: filtered,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Create a transaction with CreateAccount operation
+        let envelope = make_test_envelope(1000, 1);
+
+        // Should be filtered
+        assert!(queue.is_filtered(&envelope));
+    }
+
+    #[test]
+    fn test_is_filtered_non_matching_type() {
+        let mut filtered = HashSet::new();
+        filtered.insert(OperationType::Payment); // Filter payments, not CreateAccount
+
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            filtered_operation_types: filtered,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Create a transaction with CreateAccount operation
+        let envelope = make_test_envelope(1000, 1);
+
+        // Should NOT be filtered (we filter Payment, not CreateAccount)
+        assert!(!queue.is_filtered(&envelope));
+    }
+
+    #[test]
+    fn test_try_add_filtered_transaction() {
+        let mut filtered = HashSet::new();
+        filtered.insert(OperationType::CreateAccount);
+
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            filtered_operation_types: filtered,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Create a transaction with CreateAccount operation
+        let envelope = make_test_envelope(1000, 1);
+
+        // Should return Filtered result
+        assert_eq!(queue.try_add(envelope), TxQueueResult::Filtered);
+    }
+
+    #[test]
+    fn test_is_filtered_soroban_type() {
+        let mut filtered = HashSet::new();
+        filtered.insert(OperationType::InvokeHostFunction);
+
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            filtered_operation_types: filtered,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Create a Soroban transaction
+        let envelope = make_soroban_envelope(1000);
+
+        // Should be filtered
+        assert!(queue.is_filtered(&envelope));
+    }
+
+    #[test]
+    fn test_is_filtered_multiple_ops_one_filtered() {
+        let mut filtered = HashSet::new();
+        // Filter ManageSellOffer operations
+        filtered.insert(OperationType::ManageSellOffer);
+
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: false,
+            filtered_operation_types: filtered,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Create a transaction with multiple operations - CreateAccount and ManageSellOffer
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations = vec![
+            Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                    starting_balance: 1000000000,
+                }),
+            },
+            Operation {
+                source_account: None,
+                body: OperationBody::ManageSellOffer(ManageSellOfferOp {
+                    selling: Asset::Native,
+                    buying: Asset::CreditAlphanum4(AlphaNum4 {
+                        asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                        issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+                    }),
+                    amount: 1000,
+                    price: Price { n: 1, d: 1 },
+                    offer_id: 0,
+                }),
+            },
+        ];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 1000,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }].try_into().unwrap(),
+        });
+
+        // Should be filtered because one operation is ManageSellOffer
+        assert!(queue.is_filtered(&envelope));
     }
 }
