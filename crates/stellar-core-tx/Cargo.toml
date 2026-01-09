@@ -16,10 +16,6 @@ stellar-core-db.workspace = true
 soroban-env-host-p24.workspace = true
 soroban-env-host-p25.workspace = true
 
-# Async runtime
-tokio.workspace = true
-async-trait.workspace = true
-
 # Serialization
 serde.workspace = true
 
@@ -28,7 +24,6 @@ thiserror.workspace = true
 tracing.workspace = true
 
 # Utilities
-bytes.workspace = true
 sha2.workspace = true
 
 # WASM parsing for cost input extraction
