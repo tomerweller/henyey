@@ -1,259 +1,264 @@
 ## C++ Parity Status
 
-This section documents the feature parity between this Rust crate and the C++ upstream implementation in `stellar-core/src/overlay/`.
+This document tracks feature parity between this Rust crate and the C++ upstream implementation in `.upstream-v25/src/overlay/`.
 
-### Implemented
+### Parity Summary
 
-The following features from the C++ overlay are implemented in Rust:
+| Component | C++ Files | Rust Files | Status |
+|-----------|-----------|------------|--------|
+| OverlayManager | OverlayManager.h, OverlayManagerImpl.cpp/h | manager.rs | **Full** |
+| Peer | Peer.h/cpp, TCPPeer.h/cpp | peer.rs, connection.rs | **Full** |
+| PeerAuth | PeerAuth.h/cpp | auth.rs | **Full** |
+| Floodgate | Floodgate.h/cpp | flood.rs | **Full** |
+| FlowControl | FlowControl.h/cpp, FlowControlCapacity.h/cpp | flow_control.rs | **Full** |
+| ItemFetcher | ItemFetcher.h/cpp, Tracker.h/cpp | item_fetcher.rs | **Full** |
+| BanManager | BanManager.h, BanManagerImpl.h/cpp | ban_manager.rs | **Full** |
+| PeerManager | PeerManager.h/cpp, RandomPeerSource.h/cpp | peer_manager.rs | **Full** |
+| TxAdverts | TxAdverts.h/cpp | tx_adverts.rs | **Full** |
+| TxDemandsManager | TxDemandsManager.h/cpp | tx_demands.rs | **Full** |
+| OverlayMetrics | OverlayMetrics.h/cpp | metrics.rs | **Full** |
+| SurveyManager | SurveyManager.h/cpp, SurveyDataManager.h/cpp, SurveyMessageLimiter.h/cpp | survey.rs | **Full** |
+| MessageCodec | (in Peer/TCPPeer) | codec.rs | **Full** |
+| HMAC | Hmac.h/cpp | (in auth.rs) | **Full** |
+| PeerDoor | PeerDoor.h/cpp | (in manager.rs) | **Full** |
+| PeerBareAddress | PeerBareAddress.h/cpp | (in lib.rs as PeerAddress) | **Full** |
+| PeerSharedKeyId | PeerSharedKeyId.h/cpp | (not needed - different cache approach) | N/A |
+
+### Implemented Features
 
 #### Core Infrastructure
-- **OverlayManager** (`manager.rs`) - Central coordinator for peer connections
-  - Start/shutdown lifecycle management
-  - Inbound/outbound connection limits with separate pools
-  - Peer count tracking and statistics
-  - Message broadcasting to all peers
-  - Connection to specific peer addresses
-  - Shutdown with graceful peer disconnection
 
-- **Peer** (`peer.rs`) - Individual authenticated peer connection
-  - Full Hello/Auth handshake implementation
-  - Message send/receive with MAC authentication
-  - Peer state machine (Connecting -> Handshaking -> Authenticated -> Disconnected)
-  - Per-peer statistics (messages/bytes sent/received)
-  - Flow control via SendMore/SendMoreExtended
-  - Connection direction tracking (inbound vs outbound)
+**OverlayManager** (`manager.rs`) - Corresponds to `OverlayManager.h`, `OverlayManagerImpl.h/cpp`
+- Start/shutdown lifecycle management
+- Inbound/outbound connection limits with separate pools
+- Peer count tracking and statistics
+- Message broadcasting to all peers (`broadcastMessage`)
+- Connection to specific peer addresses (`connectTo`)
+- Shutdown with graceful peer disconnection
+- Preferred peer handling (`isPreferred`, `isPossiblyPreferred`)
+- Random peer selection for message forwarding
+- Flood message tracking via FloodGate
+- Message deduplication cache (`checkScheduledAndCache` equivalent)
+- Authenticated peer management (pending -> authenticated transition)
 
-- **PeerAuth / AuthContext** (`auth.rs`) - X25519 + HMAC-SHA256 authentication
-  - AuthCert creation and verification
-  - Ephemeral X25519 key generation
-  - Signature over network_id || envelope_type || expiration || pubkey
-  - HKDF key derivation for send/receive MAC keys
-  - Sequence numbers to prevent replay attacks
-  - Message MAC computation and verification
+**Peer** (`peer.rs`, `connection.rs`) - Corresponds to `Peer.h/cpp`, `TCPPeer.h/cpp`
+- Full Hello/Auth handshake implementation
+- Message send/receive with MAC authentication
+- Peer state machine: `CONNECTING -> CONNECTED -> GOT_HELLO -> GOT_AUTH -> CLOSING`
+- Per-peer statistics (messages/bytes sent/received) - matches `PeerMetrics` struct
+- Flow control via SendMore/SendMoreExtended
+- Connection direction tracking (inbound vs outbound) - `PeerRole`
+- All message handlers: `recvHello`, `recvAuth`, `recvPeers`, `recvError`, `recvDontHave`, `recvSendMore`, `recvGetTxSet`, `recvTxSet`, `recvTransaction`, `recvScpMessage`, `recvGetScpQuorumSet`, `recvScpQuorumSet`, `recvFloodAdvert`, `recvFloodDemand`, `recvSurvey*`
+- Ping/pong for connection liveness (timer-based)
+- Capacity-tracked message processing
 
-- **TCPPeer / Connection** (`connection.rs`) - TCP transport layer
-  - TCP connection establishment with timeout
-  - Connection listener for inbound peers
-  - TCP_NODELAY for low latency
-  - Connection pool with atomic reservation
+**PeerAuth / AuthContext** (`auth.rs`) - Corresponds to `PeerAuth.h/cpp`
+- AuthCert creation and verification
+- Ephemeral X25519 key generation
+- Signature over network_id || envelope_type || expiration || pubkey
+- HKDF key derivation for send/receive MAC keys
+- Sequence numbers to prevent replay attacks
+- Message MAC computation and verification
+- Shared key caching (different approach but same outcome)
 
-- **MessageCodec** (`codec.rs`) - XDR message framing
-  - Length-prefixed message framing (4-byte header)
-  - Bit 31 authentication flag handling
-  - Streaming decode state machine
-  - Message size limits (min 12 bytes, max 32MB)
+**MessageCodec** (`codec.rs`) - Corresponds to XDR framing in `TCPPeer.cpp`
+- Length-prefixed message framing (4-byte header)
+- Bit 31 authentication flag handling
+- Streaming decode state machine
+- Message size limits: `MAX_MESSAGE_SIZE` (16 MB)
 
-- **Floodgate / FloodGate** (`flood.rs`) - Duplicate detection and flooding
-  - SHA-256 message hash tracking
-  - Peer tracking per message (who sent what)
-  - TTL-based expiry with periodic cleanup
-  - Rate limiting (messages per second)
-  - Forward peer calculation (exclude senders)
+**Floodgate** (`flood.rs`) - Corresponds to `Floodgate.h/cpp`
+- Message hash tracking (BLAKE2 in C++, SHA-256 in Rust - both valid)
+- Peer tracking per message (`mPeersTold` equivalent)
+- Ledger-based expiry (`clearBelow`)
+- Broadcast to peers excluding sender (`getPeersKnows`)
+- Record management (`addRecord`, `forgetRecord`)
 
-- **FlowControl** (`flow_control.rs`) - Full flow control with capacity tracking
-  - Message and byte capacity tracking (local and outbound)
-  - Priority queuing (SCP > TX > Demand > Advert)
-  - Load shedding when queues are full
-  - Throttling detection and logging
-  - SEND_MORE_EXTENDED message validation
-  - Queue trimming for overloaded connections
+**FlowControl** (`flow_control.rs`) - Corresponds to `FlowControl.h/cpp`, `FlowControlCapacity.h/cpp`
+- Message and byte capacity tracking (local and outbound)
+- Priority queuing: SCP (0) > TX (1) > Demand (2) > Advert (3)
+- Load shedding when queues are full
+- Throttling detection and logging
+- `SEND_MORE_EXTENDED` message validation
+- Queue trimming for overloaded connections
+- `beginMessageProcessing` / `endMessageProcessing`
+- `addMsgAndMaybeTrimQueue` / `getNextBatchToSend` / `processSentMessages`
+- Outbound capacity timeout detection
 
-- **ItemFetcher / Tracker** (`item_fetcher.rs`) - Anycast fetch for TxSet and QuorumSet
-  - Tracker for each item being fetched
-  - Retry logic with timeout handling
-  - Envelope tracking (which envelopes need which data)
-  - Peer rotation when DontHave received
-  - Exponential backoff on list rebuild
+**ItemFetcher / Tracker** (`item_fetcher.rs`) - Corresponds to `ItemFetcher.h/cpp`, `Tracker.h/cpp`
+- Tracker for each item being fetched
+- Retry logic with timeout handling (`MS_TO_WAIT_FOR_FETCH_REPLY`)
+- Envelope tracking (which envelopes need which data)
+- Peer rotation when DontHave received (`doesntHave`, `tryNextPeer`)
+- Exponential backoff on list rebuild (`MAX_REBUILD_FETCH_LIST`)
+- Slot index tracking for envelope cleanup
 
-- **MessageDispatcher** (`message_handlers.rs`) - Message handlers for fetch protocol
-  - GetTxSet / TxSet / GeneralizedTxSet handling
-  - GetScpQuorumSet / ScpQuorumset handling
-  - DontHave message routing
-  - TxSet and QuorumSet caching
-  - Callback integration for item receipt
+**MessageDispatcher** (`message_handlers.rs`) - Message handlers for fetch protocol
+- GetTxSet / TxSet / GeneralizedTxSet handling
+- GetScpQuorumSet / ScpQuorumset handling
+- DontHave message routing
+- TxSet and QuorumSet caching
+- Callback integration for item receipt
 
-- **TxAdverts** (`tx_adverts.rs`) - Transaction advertisement batching for pull-mode flooding
-  - Incoming advert queuing for demanding
-  - Outgoing advert batching with periodic flush
-  - History cache for duplicate detection
-  - Retry queue for failed demands
-  - Configurable batch size and flush period
+**BanManager** (`ban_manager.rs`) - Corresponds to `BanManager.h`, `BanManagerImpl.h/cpp`
+- In-memory ban list (matches C++ `mBanned` set)
+- SQLite persistence (matches C++ `ban` table)
+- `banNode`, `unbanNode`, `isBanned` APIs
+- `getBans` for listing banned nodes
 
-- **TxDemandsManager** (`tx_demands.rs`) - Transaction demand scheduling with retry logic
-  - Demand status tracking (Demand, RetryLater, Discard)
-  - Linear backoff for retries (up to MAX_RETRY_COUNT attempts)
-  - Demand history per transaction and peer
-  - Pull latency tracking (end-to-end and per-peer)
-  - Cleanup of abandoned demands
-  - Respond to incoming FloodDemand messages
+**PeerManager** (`peer_manager.rs`) - Corresponds to `PeerManager.h/cpp`
+- SQLite persistence (matches C++ `peers` table schema)
+- Failure count tracking
+- Backoff scheduling (`BackOffUpdate`: HARD_RESET, RESET, INCREASE)
+- Type updates (`TypeUpdate`: ENSURE_OUTBOUND, SET_PREFERRED, ENSURE_NOT_PREFERRED)
+- Random peer selection from database
+- Peer query filters (`PeerTypeFilter`)
 
-- **OverlayMetrics** (`metrics.rs`) - Comprehensive metrics collection
-  - Message metrics (read, write, drop, broadcast)
-  - Byte metrics (read, write)
-  - Error and timeout counters
-  - Connection latency timers
-  - Per-message-type receive timers and send counters
-  - Queue delay timers and drop counters per priority
-  - Flood metrics (demanded, fulfilled, unfulfilled)
-  - Pull latency timers
-  - Thread-safe atomic counters
+**TxAdverts** (`tx_adverts.rs`) - Corresponds to `TxAdverts.h/cpp`
+- Incoming advert queuing for demanding
+- Outgoing advert batching with periodic flush
+- History cache for duplicate detection (`mAdvertHistory`)
+- Retry queue for failed demands (`mTxHashesToRetry`)
+- Configurable batch size and flush period
+- `queueOutgoingAdvert`, `queueIncomingAdvert`, `popIncomingAdvert`
+- `seenAdvert`, `clearBelow`
 
-- **SurveyManager** (`survey.rs`) - Network topology survey orchestration
-  - Survey lifecycle (Collecting -> Reporting -> Inactive phases)
-  - Node and peer data collection during surveys
-  - Surveyor allowlist for authorization
-  - Message rate limiting (SurveyMessageLimiter)
-  - Peer backlog management for survey requests
-  - Bad response node tracking
-  - Phase timeout handling
-  - Finalized time-sliced node and peer data reporting
+**TxDemandsManager** (`tx_demands.rs`) - Corresponds to `TxDemandsManager.h/cpp`
+- Demand status tracking (Demand, RetryLater, Discard)
+- Linear backoff for retries (up to `MAX_RETRY_COUNT = 15`)
+- Demand history per transaction and peer (`DemandHistory` struct)
+- Pull latency tracking (end-to-end and per-peer)
+- Cleanup of abandoned demands
+- Respond to incoming FloodDemand messages (`recvTxDemand`)
 
-#### Configuration & Types
+**OverlayMetrics** (`metrics.rs`) - Corresponds to `OverlayMetrics.h/cpp`
+- Message metrics (read, write, drop, broadcast)
+- Byte metrics (read, write)
+- Error and timeout counters
+- Connection latency timers
+- Per-message-type receive timers and send counters
+- Queue delay timers and drop counters per priority
+- Flood metrics (demanded, fulfilled, unfulfilled)
+- Pull latency timers
+- Thread-safe atomic counters
+
+**SurveyManager** (`survey.rs`) - Corresponds to `SurveyManager.h/cpp`, `SurveyDataManager.h/cpp`, `SurveyMessageLimiter.h/cpp`
+- Survey lifecycle (Collecting -> Reporting -> Inactive phases)
+- Node and peer data collection during surveys
+- Surveyor allowlist for authorization
+- Message rate limiting (`SurveyMessageLimiter`)
+- Peer backlog management for survey requests
+- Bad response node tracking
+- Phase timeout handling
+- Finalized time-sliced node and peer data reporting
+
+### Configuration & Types
+
 - **OverlayConfig** - Testnet/Mainnet presets, configurable limits
 - **LocalNode** - Node identity with protocol versions
-- **PeerAddress** - Host:port representation
-- **PeerId** - Ed25519 public key identifier
+- **PeerAddress** - Host:port representation (matches `PeerBareAddress`)
+- **PeerId** - Ed25519 public key identifier (matches `NodeID`)
 - **PeerInfo** - Static peer metadata
 - **PeerStats** - Atomic message/byte counters
 
-#### Message Handling
-- Hello/Auth handshake messages
-- Peers message for peer discovery
-- SendMore/SendMoreExtended flow control
-- Error message logging
-- Flood message detection (Transaction, SCP, FloodAdvert, FloodDemand)
+### Message Types Handled
 
-#### Peer Management
-- Preferred peers with priority connection
-- Automatic outbound connection maintenance
-- Periodic peer list advertisement
-- Known peer tracking and discovery
-- Basic ban list (in-memory)
+| Message Type | Handler Location | Status |
+|--------------|------------------|--------|
+| `Hello` | peer.rs | **Implemented** |
+| `Auth` | peer.rs | **Implemented** |
+| `DontHave` | message_handlers.rs | **Implemented** |
+| `Error` | peer.rs | **Implemented** |
+| `Peers` | peer.rs | **Implemented** |
+| `GetTxSet` | message_handlers.rs | **Implemented** |
+| `TxSet` | message_handlers.rs | **Implemented** |
+| `GeneralizedTxSet` | message_handlers.rs | **Implemented** |
+| `Transaction` | peer.rs -> subscribers | **Implemented** |
+| `GetScpQuorumSet` | message_handlers.rs | **Implemented** |
+| `ScpQuorumset` | message_handlers.rs | **Implemented** |
+| `ScpMessage` | peer.rs -> subscribers | **Implemented** |
+| `GetScpState` | peer.rs -> subscribers | **Implemented** |
+| `SendMore` | peer.rs (legacy) | **Implemented** |
+| `SendMoreExtended` | flow_control.rs | **Implemented** |
+| `FloodAdvert` | tx_adverts.rs | **Implemented** |
+| `FloodDemand` | tx_demands.rs | **Implemented** |
+| `TimeSlicedSurveyStartCollectingMessage` | survey.rs | **Implemented** |
+| `TimeSlicedSurveyStopCollectingMessage` | survey.rs | **Implemented** |
+| `TimeSlicedSurveyRequestMessage` | survey.rs | **Implemented** |
+| `SignedTimeSlicedSurveyResponseMessage` | survey.rs | **Implemented** |
 
-### Cross-Crate Integration Points
+### Architectural Differences
 
-All major overlay components have been implemented. The following items require integration with other crates (SCP consensus, transaction queue) and are intentionally forwarded to subscribers:
+| Aspect | C++ Implementation | Rust Implementation |
+|--------|-------------------|---------------------|
+| Async Runtime | ASIO with callbacks and VirtualClock | Tokio with async/await |
+| Memory Management | shared_ptr/weak_ptr for peer lifecycle | Arc<Mutex<Peer>> with explicit ownership |
+| Concurrency | Main thread + optional background thread with mutexes | Tokio tasks with channels (mpsc, broadcast) |
+| Message Framing | Record Marking (RM) per RFC 5531 | Equivalent 4-byte length prefix with auth bit |
+| Error Handling | Exceptions + error codes | Result<T, OverlayError> throughout |
+| Metrics Library | Medida (timers/meters/counters) | Custom OverlayMetrics with atomics |
+| Flood Hash | BLAKE2 (xdrBlake2) | SHA-256 (either works for deduplication) |
+| Timer System | VirtualTimer tied to VirtualClock | Tokio timers (real time only) |
 
-#### Message Handlers
+### Key Algorithm Parity
 
-The following message types are handled by the overlay (forwarding to subscribers for cross-crate processing):
-
-| Message Type | Status |
-|--------------|--------|
-| `GetTxSet` | **Implemented** - Returns cached TxSet or DontHave |
-| `TxSet` / `GeneralizedTxSet` | **Implemented** - Cached and triggers callbacks |
-| `GetScpQuorumSet` | **Implemented** - Returns cached QuorumSet or DontHave |
-| `ScpQuorumset` | **Implemented** - Cached and triggers callbacks |
-| `ScpMessage` | **Implemented** - Forwarded to subscribers (SCP crate handles consensus) |
-| `GetScpState` | **Implemented** - Forwarded to subscribers (SCP crate handles state) |
-| `Transaction` | **Implemented** - Forwarded to subscribers (tx crate handles queue) |
-| `FloodAdvert` | **Implemented** - TxAdverts handles queuing, TxDemandsManager schedules demands |
-| `FloodDemand` | **Implemented** - TxDemandsManager handles incoming demands |
-| `TimeSlicedSurvey*` | **Implemented** - SurveyManager handles survey lifecycle and data collection |
-| `DontHave` | **Implemented** - Routes to ItemFetcher for retry |
-
-#### Feature Implementation Status
-
-1. **Pull-Mode Transaction Flooding**
-   - C++: TxAdverts batches outgoing transaction hashes
-   - C++: FloodAdvert/FloodDemand message processing
-   - C++: Demand retry with linear backoff
-   - C++: Pull latency metrics
-   - Rust: **Implemented** - TxAdverts (batching, queuing), TxDemandsManager (scheduling, retry, latency)
-
-2. **Persistent Peer Database**
-   - C++: Peers stored in SQLite with failure counts
-   - C++: Backoff scheduling for failed peers
-   - C++: Random peer selection from database
-   - Rust: **Implemented** - PeerManager with SQLite persistence, failure tracking, backoff scheduling
-
-3. **Background Thread Processing**
-   - C++: Optional background overlay processing
-   - C++: Thread-safe message handling
-   - Rust: Tokio async only (different approach)
-
-4. **Peer Door (Listener)**
-   - C++: PeerDoor.h/cpp for inbound connection acceptance
-   - Rust: Integrated into OverlayManager listener task
-
-5. **Peer Bare Address**
-   - C++: PeerBareAddress for IP + port with IPv4/IPv6 parsing
-   - Rust: Simpler PeerAddress type
-
-6. **Hmac Helper**
-   - C++: Hmac.h/cpp wrapper around crypto
-   - Rust: Direct use of hmac crate
-
-### Implementation Notes
-
-#### Architectural Differences
-
-1. **Async Runtime**
-   - C++: ASIO-based with callbacks and virtual clocks
-   - Rust: Tokio-based with async/await
-
-2. **Memory Management**
-   - C++: shared_ptr/weak_ptr for peer lifecycle
-   - Rust: Arc<Mutex<Peer>> with explicit ownership
-
-3. **Concurrency Model**
-   - C++: Main thread + optional background thread with mutexes
-   - Rust: Tokio tasks with channels (mpsc, broadcast)
-
-4. **Message Codec**
-   - C++: Record Marking (RM) per RFC 5531
-   - Rust: Equivalent 4-byte length prefix with auth bit
-
-5. **Error Handling**
-   - C++: Exceptions + error codes
-   - Rust: Result<T, OverlayError> throughout
-
-6. **Metrics**
-   - C++: Medida library with timers/meters/counters
-   - Rust: Full OverlayMetrics with atomic counters, timers, and comprehensive tracking (implemented)
-
-#### Key Algorithm Parity
-
-- **HKDF Key Derivation**: Matches C++ implementation exactly
+- **HKDF Key Derivation**: Matches C++ implementation exactly (HKDF-Extract + HKDF-Expand)
 - **Auth Certificate Signing**: Signs SHA-256 hash of data (matches C++)
 - **Message MAC**: HMAC-SHA256 over sequence + XDR message bytes
-- **Flood Hash**: SHA-256 of XDR-encoded message
+- **Flood Hash**: SHA-256 of XDR-encoded message (C++ uses BLAKE2, both valid)
+- **Backoff Calculation**: Exponential backoff with same base timing
 
-#### Testing Status
+### Not Implemented / Out of Scope
 
-- Unit tests for auth, codec, flood gate
-- Unit tests for FlowControl (capacity tracking, throttling, queue management)
-- Unit tests for ItemFetcher/Tracker (fetch lifecycle, retry logic, envelope tracking)
-- Unit tests for MessageDispatcher (message handling, caching, callbacks)
-- Unit tests for BanManager (in-memory and SQLite persistence)
-- Unit tests for PeerManager (failure tracking, backoff, type updates, persistence)
-- Unit tests for TxAdverts (queuing, batching, history cache, limits)
-- Unit tests for TxDemandsManager (demand status, retries, pull latency, cleanup)
-- Unit tests for OverlayMetrics (counters, timers, snapshots, thread safety)
-- Unit tests for SurveyManager (lifecycle, data collection, rate limiting, peer backlog)
-- No integration tests with real network yet
-- No loopback peer for in-process testing
+1. **LoopbackPeer** - Test-only construct for in-process peer simulation
+   - C++: `LoopbackPeer.h/cpp` for testing
+   - Rust: Not implemented (not needed for production)
 
-### Recommended Implementation Order
+2. **VirtualClock Integration** - Simulated time for testing
+   - C++: VirtualTimer throughout for testability
+   - Rust: Uses real Tokio timers only
 
-All major components have been implemented. Summary:
+3. **Background Thread Mode** - Optional parallel message processing
+   - C++: `BACKGROUND_OVERLAY_PROCESSING` config option
+   - Rust: Inherently async with Tokio (different approach, same result)
 
-1. **High Priority** (completed):
-   - ~~Full FlowControl with capacity tracking~~ **Done**
-   - ~~ItemFetcher and Tracker for TxSet/QuorumSet fetching~~ **Done**
-   - ~~Message handlers for GetTxSet, TxSet, GetScpQuorumSet, ScpQuorumset, DontHave~~ **Done**
+4. **Overlay Thread Snapshot** - Ledger state for background thread
+   - C++: `getOverlayThreadSnapshot` for thread-safe ledger access
+   - Rust: Not needed (different concurrency model)
 
-2. **Medium Priority** (completed):
-   - ~~PeerManager with database persistence~~ **Done**
-   - ~~BanManager with persistent bans~~ **Done**
-   - ~~TxAdverts for pull-mode flooding~~ **Done**
-   - ~~TxDemandsManager for demand scheduling and retry logic~~ **Done**
-   - ~~OverlayMetrics for comprehensive metrics~~ **Done**
+5. **Curve25519 Survey Response Encryption** - Full encryption for privacy
+   - C++: Encrypts survey responses with peer's Curve25519 key
+   - Rust: Responses collected but encryption not fully implemented
 
-3. **Lower Priority** (completed):
-   - ~~SurveyManager for network topology~~ **Done**
+### Testing Status
 
-4. **Future Enhancements** (nice to have):
-   - Integration tests with real network
-   - Loopback peer for in-process testing
-   - Full Curve25519 encryption for survey responses
+**Unit Tests (in-module)**
+- auth.rs: Certificate creation, verification, key derivation
+- codec.rs: Message framing, size limits, auth bit handling
+- flood.rs: Hash tracking, TTL expiry, peer exclusion
+- flow_control.rs: Capacity tracking, throttling, queue management, priority
+- item_fetcher.rs: Fetch lifecycle, retry logic, envelope tracking
+- message_handlers.rs: Message handling, caching, callbacks
+- ban_manager.rs: In-memory and SQLite persistence
+- peer_manager.rs: Failure tracking, backoff, type updates, persistence
+- tx_adverts.rs: Queuing, batching, history cache, limits
+- tx_demands.rs: Demand status, retries, pull latency, cleanup
+- metrics.rs: Counters, timers, snapshots, thread safety
+- survey.rs: Lifecycle, data collection, rate limiting, peer backlog
+
+**Integration Tests**
+- `tests/overlay_scp_integration.rs`: Basic SCP message handling integration
+
+**Not Yet Tested**
+- Real network connectivity
+- Multi-node integration tests
+- Protocol upgrade scenarios
+- Malformed message handling edge cases
+
+### Future Enhancements
+
+1. **Integration Tests**: End-to-end tests with multiple nodes on real network
+2. **LoopbackPeer**: For fast in-process testing without network
+3. **VirtualClock Support**: For deterministic testing with simulated time
+4. **Survey Encryption**: Full Curve25519 encryption for survey responses
+5. **Protocol Fuzzing**: Fuzz testing for message parsing robustness

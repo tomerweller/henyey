@@ -1,122 +1,186 @@
-## C++ Parity Status
+# Parity Status: stellar-core-historywork
 
-This section documents the parity between this Rust crate and the upstream C++
-stellar-core `src/historywork/` directory.
+This document tracks the parity between this Rust crate and the upstream C++
+stellar-core `src/historywork/` directory (v25.x).
 
-### Implemented
+## Summary
 
-The following C++ work items have Rust equivalents:
+| Category | Status |
+|----------|--------|
+| Core Download Workflow | Implemented (simplified) |
+| Core Publish Workflow | Implemented (simplified) |
+| Verification | Implemented inline (no background threads) |
+| Batch Operations | Partial |
+| Hot Archive Buckets | Not implemented |
+| Metrics | Not implemented |
 
-| C++ Class | Rust Equivalent | Notes |
-|-----------|-----------------|-------|
-| `GetHistoryArchiveStateWork` | `GetHistoryArchiveStateWork` | Full parity |
-| `DownloadBucketsWork` | `DownloadBucketsWork` | Simplified - downloads to memory instead of files |
-| `Progress` (fmtProgress) | `HistoryWorkProgress` | Simpler stage-based progress instead of checkpoint-range formatting |
+## Implemented Work Items
 
-**Publish Work Items:**
+### Download Work Items
 
-| C++ Class | Rust Equivalent | Notes |
-|-----------|-----------------|-------|
-| `PutHistoryArchiveStateWork` | `PublishHistoryArchiveStateWork` | Uses `ArchiveWriter` trait instead of commands |
-| (bucket publishing in PutSnapshotFilesWork) | `PublishBucketsWork` | Dedicated work item |
-| (header publishing in PutSnapshotFilesWork) | `PublishLedgerHeadersWork` | Dedicated work item |
-| (tx publishing in PutSnapshotFilesWork) | `PublishTransactionsWork` | Dedicated work item |
-| (results publishing in PutSnapshotFilesWork) | `PublishResultsWork` | Dedicated work item |
-| (SCP publishing in PutSnapshotFilesWork) | `PublishScpHistoryWork` | Dedicated work item |
+| C++ Class | Rust Equivalent | Parity Notes |
+|-----------|-----------------|--------------|
+| `GetHistoryArchiveStateWork` | `GetHistoryArchiveStateWork` | Full parity. Fetches HAS JSON from archive. |
+| `DownloadBucketsWork` | `DownloadBucketsWork` | Simplified. Downloads to memory instead of disk. No bucket indexing. Uses parallel async downloads (16 concurrent) matching C++ `MAX_CONCURRENT_SUBPROCESSES`. |
+| (via BatchDownloadWork) | `DownloadLedgerHeadersWork` | Rust-specific. Downloads and verifies header chain in one step. |
+| (via BatchDownloadWork) | `DownloadTransactionsWork` | Rust-specific. Downloads and verifies tx sets against headers. |
+| (via BatchDownloadWork) | `DownloadTxResultsWork` | Rust-specific. Downloads and verifies tx results. |
+| (via BatchDownloadWork) | `DownloadScpHistoryWork` | Rust-specific. Downloads SCP consensus messages. |
 
-**Download Work Items (Rust-specific, no direct C++ equivalent):**
+In C++, ledger headers, transactions, results, and SCP are downloaded via the generic
+`BatchDownloadWork` + `GetAndUnzipRemoteFileWork` pipeline. In Rust, each category has
+a dedicated work item that uses async HTTP via `stellar-core-history`.
 
-| Rust Work Item | Description |
-|----------------|-------------|
-| `DownloadLedgerHeadersWork` | Downloads and verifies ledger headers |
-| `DownloadTransactionsWork` | Downloads and verifies transaction sets |
-| `DownloadTxResultsWork` | Downloads and verifies transaction results |
-| `DownloadScpHistoryWork` | Downloads SCP consensus history |
+### Publish Work Items
 
-Note: In C++, these download operations are handled through `BatchDownloadWork`
-and `GetAndUnzipRemoteFileWork` with file-based workflows. The Rust implementation
-uses a simpler in-memory approach via `stellar-core-history` archive methods.
+| C++ Class | Rust Equivalent | Parity Notes |
+|-----------|-----------------|--------------|
+| `PutHistoryArchiveStateWork` | `PublishHistoryArchiveStateWork` | Simplified. Uses `ArchiveWriter` trait instead of shell commands. Does not publish to `.well-known/` path. |
+| (part of PutSnapshotFilesWork) | `PublishBucketsWork` | Dedicated work item. Gzips and writes each bucket. |
+| (part of PutSnapshotFilesWork) | `PublishLedgerHeadersWork` | Dedicated work item. Serializes headers to XDR, gzips, writes. |
+| (part of PutSnapshotFilesWork) | `PublishTransactionsWork` | Dedicated work item. Serializes tx entries, gzips, writes. |
+| (part of PutSnapshotFilesWork) | `PublishResultsWork` | Dedicated work item. Serializes result entries, gzips, writes. |
+| (part of PutSnapshotFilesWork) | `PublishScpHistoryWork` | Dedicated work item. Serializes SCP entries, gzips, writes. |
 
-### Not Yet Implemented (Gaps)
+### Builder and State
 
-The following C++ work items do not have Rust equivalents:
+| C++ Concept | Rust Equivalent | Notes |
+|-------------|-----------------|-------|
+| Implicit work dependencies | `HistoryWorkBuilder` | Explicit builder pattern with `register()` and `register_publish()` |
+| Per-work state | `SharedHistoryState` | Single shared state container (`Arc<Mutex<...>>`) |
+| Progress formatting | `HistoryWorkProgress` | Simpler stage enum + message instead of `fmtProgress()` |
 
-#### Low-Level File Operations
+### Verification
 
-| C++ Class | Purpose | Priority |
-|-----------|---------|----------|
-| `RunCommandWork` | Base class for spawning shell commands (curl, gzip, etc.) | Low - Rust uses native libraries |
-| `GetRemoteFileWork` | Downloads files via shell commands | Low - Rust uses async HTTP |
-| `GetAndUnzipRemoteFileWork` | Downloads and gunzips files | Low - Rust uses flate2 in-memory |
-| `GunzipFileWork` | Decompresses .gz files via shell | Low - Rust uses flate2 |
-| `GzipFileWork` | Compresses files to .gz via shell | Low - Rust uses flate2 |
-| `PutRemoteFileWork` | Uploads files via shell commands | Low - `ArchiveWriter` trait handles this |
-| `MakeRemoteDirWork` | Creates remote directories via shell | Low - handled by `ArchiveWriter` |
+| C++ Class | Rust Approach | Notes |
+|-----------|---------------|-------|
+| `VerifyBucketWork` | Inline in `DownloadBucketsWork` | C++ verifies and indexes in background thread. Rust verifies hash inline after download. |
+| `VerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | C++ runs in background thread. Rust verifies against headers inline. |
+| Header chain verification | Inline in `DownloadLedgerHeadersWork` | Uses `stellar_core_history::verify::verify_header_chain()` |
 
-#### Batch and Range Operations
+## Not Implemented
 
-| C++ Class | Purpose | Priority |
-|-----------|---------|----------|
-| `BatchDownloadWork` | Downloads multiple checkpoint files in a range | Medium - needed for multi-checkpoint catchup |
-| `DownloadVerifyTxResultsWork` | Batch downloads and verifies tx results for a checkpoint range | Medium |
+### Low-Level File/Shell Operations
 
-#### Verification Work Items
+These are not needed as Rust uses native libraries instead of shell commands.
 
-| C++ Class | Purpose | Priority |
-|-----------|---------|----------|
-| `VerifyBucketWork` | Verifies bucket hash and builds index in background thread | Medium - Rust verifies inline |
-| `VerifyTxResultsWork` | Verifies transaction results against ledger headers | Medium - Rust verifies inline |
-| `CheckSingleLedgerHeaderWork` | Offline self-check: verifies LCL against archive | Low |
+| C++ Class | Purpose | Rust Alternative |
+|-----------|---------|------------------|
+| `RunCommandWork` | Base class for shell commands | Not needed |
+| `GetRemoteFileWork` | HTTP downloads via curl/wget | `reqwest` in `stellar-core-history` |
+| `GetAndUnzipRemoteFileWork` | Download + gunzip via shell | Async HTTP + `flate2` |
+| `GunzipFileWork` | Decompress via shell | `flate2` crate |
+| `GzipFileWork` | Compress via shell | `flate2` crate |
+| `PutRemoteFileWork` | Upload via shell commands | `ArchiveWriter` trait |
+| `MakeRemoteDirWork` | Create remote dirs via shell | `ArchiveWriter` handles this |
 
-#### Snapshot and Publishing Pipeline
-
-| C++ Class | Purpose | Priority |
-|-----------|---------|----------|
-| `WriteSnapshotWork` | Writes ledger snapshot to local files | Medium |
-| `ResolveSnapshotWork` | Resolves bucket references in a snapshot | Medium |
-| `PutFilesWork` | Orchestrates uploading multiple files to an archive | Medium |
-| `PutSnapshotFilesWork` | Full snapshot publish pipeline (gzip + upload) | Medium |
-| `PublishWork` | Top-level publish sequence orchestration | Medium |
-
-#### Advanced Features
+### Batch and Range Operations
 
 | C++ Class | Purpose | Priority |
 |-----------|---------|----------|
-| `WriteVerifiedCheckpointHashesWork` | Batch verifies ledger chain and writes checkpoint hashes to JSON | Low - used for offline verification |
-| `FetchRecentQsetsWork` | Fetches recent quorum sets from archives for bootstrap | Low |
+| `BatchDownloadWork` | Download multiple checkpoint files in a range | Medium - currently only single-checkpoint |
+| `DownloadVerifyTxResultsWork` | Batch download + verify tx results | Medium - combined with above |
 
-#### Hot Archive Buckets
+The Rust implementation currently handles single checkpoints. Multi-checkpoint range
+operations (needed for catchup across many checkpoints) are not yet implemented.
+
+### Advanced Verification and Tools
+
+| C++ Class | Purpose | Priority |
+|-----------|---------|----------|
+| `WriteVerifiedCheckpointHashesWork` | Offline verification: downloads full chain and writes verified hashes to JSON | Low |
+| `CheckSingleLedgerHeaderWork` | Self-check: verifies local LCL against archive | Low |
+
+### Snapshot and Publishing Pipeline
+
+| C++ Class | Purpose | Priority |
+|-----------|---------|----------|
+| `WriteSnapshotWork` | Write current state snapshot to disk | Medium |
+| `ResolveSnapshotWork` | Resolve bucket references in snapshot | Medium |
+| `PutFilesWork` | Upload multiple files to archive | Medium - `ArchiveWriter` is simpler |
+| `PutSnapshotFilesWork` | Full snapshot publish (gzip + upload) | Medium |
+| `PublishWork` | Top-level orchestration of publish | Medium |
+
+The Rust publish workflow is simpler: individual work items handle gzip and write.
+C++ has a more complex pipeline with differential uploads (only new files).
+
+### Bootstrap and QSet Operations
+
+| C++ Class | Purpose | Priority |
+|-----------|---------|----------|
+| `FetchRecentQsetsWork` | Download recent SCP history to extract quorum sets for bootstrap | Low |
+
+### Hot Archive Buckets (Protocol 25)
 
 | C++ Feature | Purpose | Priority |
 |-------------|---------|----------|
-| `HotArchiveBucket` support in `DownloadBucketsWork` | Downloads both live and hot archive buckets | Medium - needed for full Protocol 25 support |
+| `HotArchiveBucket` support in `DownloadBucketsWork` | Download both live and hot archive buckets | High for full P25 support |
 
-### Implementation Differences
+The C++ `DownloadBucketsWork` handles both `LiveBucket` and `HotArchiveBucket` types.
+The Rust implementation only downloads live buckets currently.
 
-| Aspect | C++ Approach | Rust Approach |
-|--------|--------------|---------------|
-| **File Downloads** | Shell commands (`curl`, `wget`) via `RunCommandWork` | Native async HTTP via `reqwest` in `stellar-core-history` |
-| **Compression** | Shell commands (`gzip`, `gunzip`) | In-memory via `flate2` crate |
-| **Bucket Storage** | Files on disk with indexing | In-memory `HashMap<Hash256, Vec<u8>>` |
+## Architecture Differences
+
+| Aspect | C++ Implementation | Rust Implementation |
+|--------|-------------------|---------------------|
+| **File Downloads** | Shell commands (`curl`, `wget`) via `RunCommandWork` | Native async HTTP via `reqwest` |
+| **Compression** | Shell commands (`gzip`, `gunzip`) | In-memory via `flate2` |
+| **Bucket Storage** | Files on disk with indexing (`BucketManager.adoptFileAsBucket()`) | In-memory `HashMap<Hash256, Vec<u8>>` |
 | **Work Orchestration** | `BasicWork`/`Work`/`BatchWork` hierarchy with state machine | `Work` trait with `WorkScheduler` DAG |
-| **Progress Reporting** | `fmtProgress` with checkpoint range math | `HistoryWorkStage` enum with message |
-| **Metrics** | `medida` metrics (meters, counters) | Not yet implemented |
+| **Background Work** | `postOnBackgroundThread` for CPU-intensive tasks | All async, no dedicated background threads |
+| **Progress Reporting** | `fmtProgress()` with checkpoint-range math | `HistoryWorkStage` enum + message |
 | **Error Handling** | Exception-based with `onFailureRaise` callbacks | `Result`-based with `WorkOutcome::Failed` |
 | **Archive Selection** | Random archive selection on retry | Single archive per work builder |
-| **Publish Target** | Shell-command based (`put` commands) | `ArchiveWriter` trait for abstraction |
+| **Retry Logic** | Built into `BasicWork` base class | Configured per-work via `WorkScheduler` |
 
-### Metrics Not Yet Implemented
+## Metrics Not Implemented
 
 The C++ implementation includes extensive metrics via `medida`:
 
 - `history.download.success` / `history.download.failure`
 - `history.verify.success` / `history.verify.failure`
 - `history.publish.success` / `history.publish.failure`
+- `history.check.success` / `history.check.failure`
+- `history.ledger-check.success` / `history.ledger-check.failure`
 - Bytes/second meters for downloads
 - Per-archive failure tracking
 
-### Testing Gaps
+## Testing Status
 
-| C++ Test | Status |
-|----------|--------|
-| `HistoryWorkTests.cpp` | Rust has integration tests but not unit tests for individual work items |
+| Test Category | C++ | Rust | Notes |
+|---------------|-----|------|-------|
+| Integration tests | `HistoryWorkTests.cpp` | `tests/history_work.rs` | Rust has end-to-end test with mock HTTP server |
+| Unit tests | Various in `test/` | `tests/checkpoint_data.rs` | Basic state tests |
+| Acceptance tests | `[acceptance]` tagged | None | C++ has tagged slow tests |
+| Catchup simulation | `CatchupSimulation` | None | C++ has elaborate simulation framework |
+
+## Known Behavioral Differences
+
+1. **Well-Known Path**: C++ `PutHistoryArchiveStateWork` publishes HAS to both the
+   checkpoint path AND `.well-known/stellar-history.json`. Rust only publishes to
+   the checkpoint path.
+
+2. **Bucket Indexing**: C++ builds a bucket index during verification for fast
+   lookups. Rust keeps raw bucket data in memory without indexing.
+
+3. **Disk Usage**: C++ downloads to temp files and cleans up. Rust keeps everything
+   in memory, which may limit catchup size on memory-constrained systems.
+
+4. **Archive Failover**: C++ randomly selects archives and fails over on error.
+   Rust uses a single archive per builder with retry at the work level.
+
+5. **Empty Result Handling**: Rust publish work items fail if data is empty.
+   C++ may handle this differently depending on the work type.
+
+## Recommendations for Future Work
+
+1. **High Priority**: Add `HotArchiveBucket` support for full Protocol 25 parity.
+
+2. **Medium Priority**: Implement `BatchDownloadWork` equivalent for multi-checkpoint
+   catchup operations.
+
+3. **Medium Priority**: Add `.well-known/` path publishing to `PublishHistoryArchiveStateWork`.
+
+4. **Low Priority**: Add metrics collection for monitoring and debugging.
+
+5. **Low Priority**: Consider disk-based bucket storage for large catchup operations.

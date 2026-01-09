@@ -1,164 +1,302 @@
-## C++ Parity Status
+# C++ Parity Status
 
-This section documents the parity between this Rust crate and the upstream C++ stellar-core
-database implementation in `.upstream-v25/src/database/` and related modules.
+This document tracks the parity between this Rust crate (`stellar-core-db`) and the upstream
+C++ stellar-core database implementation.
 
-### Implemented
+## Upstream References
 
-The following features from C++ stellar-core are implemented in this Rust crate:
+The C++ implementation is spread across multiple files:
+- **Core Database**: `.upstream-v25/src/database/Database.{h,cpp}` - connection management, prepared statements, metrics
+- **Database Utilities**: `.upstream-v25/src/database/DatabaseUtils.{h,cpp}` - helper functions for bulk operations
+- **Persistent State**: `.upstream-v25/src/main/PersistentState.{h,cpp}` - key-value state storage
+- **Ledger Headers**: `.upstream-v25/src/ledger/LedgerHeaderUtils.{h,cpp}` - ledger header SQL operations
+- **Peer Manager**: `.upstream-v25/src/overlay/PeerManager.{h,cpp}` - peer table operations
+- **Ban Manager**: `.upstream-v25/src/overlay/BanManager.h`, `BanManagerImpl.cpp` - ban list operations
+- **Herder Persistence**: `.upstream-v25/src/herder/HerderPersistence*.{h,cpp}` - SCP history storage
+- **History Manager**: `.upstream-v25/src/history/HistoryManager*.{h,cpp}` - history publishing queue
+- **Transaction SQL**: `.upstream-v25/src/transactions/TransactionSQL.{h,cpp}` - transaction history
 
-**Core Database Infrastructure**
-- [x] Database connection management (`Database` class -> `Database` struct)
-- [x] Connection pooling (SOCI pool -> r2d2 pool)
-- [x] Transaction support (SOCI transactions -> rusqlite transactions)
-- [x] Schema versioning and migrations (`getDBSchemaVersion`, `upgradeToCurrentSchema`)
-- [x] In-memory database for testing
+## Parity Summary
 
-**SQLite Configuration**
-- [x] WAL journal mode
-- [x] Cache size configuration
-- [x] Busy timeout handling
-- [x] Foreign keys enabled
+| Category | Rust Status | Notes |
+|----------|-------------|-------|
+| Core Infrastructure | Implemented | Different library (rusqlite vs SOCI) |
+| State Management | Implemented | Full parity |
+| Ledger Headers | Implemented | Full parity |
+| SCP History | Implemented | Full parity |
+| Peer Management | Implemented | Full parity |
+| Ban Management | Implemented | Full parity |
+| Transaction History | Implemented | Full parity |
+| Publish Queue | Implemented | Full parity |
+| Bucket List Snapshots | Implemented | Full parity |
+| Account Management | Implemented | Basic operations only |
+| PostgreSQL Support | Not Implemented | Intentional - SQLite only |
+| Query Metrics | Not Implemented | Intentional |
+| Data Cleanup | Not Implemented | Gap |
+| History Streaming | Not Implemented | Gap |
+| Ledger Entry SQL | Not Implemented | Architectural difference |
 
-**State Management (storestate table)**
-- [x] Get/set/delete state values (`PersistentState` -> `StateQueries`)
-- [x] Network passphrase storage
-- [x] Last closed ledger tracking
-- [x] Schema version tracking
+## Implemented Features
 
-**Ledger Headers (ledgerheaders table)**
-- [x] Store ledger headers (`storeInDatabase` -> `store_ledger_header`)
-- [x] Load by sequence number (`loadBySequence` -> `load_ledger_header`)
-- [x] Get maximum ledger sequence (`loadMaxLedgerSeq` -> `get_latest_ledger_seq`)
-- [x] Get ledger hash by sequence (`get_ledger_hash`)
+### Core Database Infrastructure
 
-**SCP State (scphistory, scpquorums tables)**
-- [x] Store SCP envelopes per ledger (`HerderPersistence` -> `ScpQueries`)
-- [x] Load SCP envelopes per ledger
-- [x] Store quorum sets by hash
-- [x] Load quorum sets by hash
+| C++ Feature | Rust Equivalent | Status |
+|-------------|-----------------|--------|
+| `Database` class | `Database` struct | Done |
+| `soci::session` | `rusqlite::Connection` | Done |
+| `soci::connection_pool` | `r2d2::Pool` | Done |
+| `soci::transaction` | `rusqlite::Transaction` | Done |
+| `getDBSchemaVersion()` | `get_schema_version()` | Done |
+| `upgradeToCurrentSchema()` | `run_migrations()` | Done |
+| `initialize()` | `initialize_schema()` | Done |
+| In-memory database | `Database::open_in_memory()` | Done |
 
-**Peer Management (peers table)**
-- [x] Store peer records (`PeerManager::store` -> `store_peer`)
-- [x] Load peer records (`loadAllPeers` -> `load_peers`)
-- [x] Random peer selection with filters (`load_random_peers*`)
-- [x] Failure-based peer cleanup (`remove_peers_with_failures`)
+### SQLite Configuration
 
-**Ban Management (ban table)**
-- [x] Ban node (`BanManager::banNode` -> `ban_node`)
-- [x] Unban node (`BanManager::unbanNode` -> `unban_node`)
-- [x] Check if banned (`BanManager::isBanned` -> `is_banned`)
-- [x] List bans (`BanManager::getBans` -> `load_bans`)
+| C++ Pragma | Rust Pragma | Status |
+|------------|-------------|--------|
+| `journal_mode = WAL` | `journal_mode = WAL` | Done |
+| `wal_autocheckpoint=10000` | Not set | Different default |
+| `busy_timeout = 10000` | Not set | Different default |
+| `cache_size=-20000` | `cache_size = -64000` | Done (larger) |
+| `mmap_size=104857600` | Not set | Not implemented |
+| `synchronous = NORMAL` | `synchronous = NORMAL` | Done |
+| `foreign_keys` | `foreign_keys = ON` | Done |
+| N/A | `temp_store = MEMORY` | Rust addition |
 
-**Transaction History (txhistory, txsets, txresults tables)**
-- [x] Store individual transactions (`store_transaction`)
-- [x] Load transactions by ID (`load_transaction`)
-- [x] Store transaction history entries per ledger (`store_tx_history_entry`)
-- [x] Load transaction history entries (`load_tx_history_entry`)
-- [x] Store transaction result entries (`store_tx_result_entry`)
-- [x] Load transaction result entries (`load_tx_result_entry`)
+### State Management (storestate table)
 
-**Publish Queue (publishqueue table)**
-- [x] Enqueue checkpoint for publishing (`enqueue_publish`)
-- [x] Remove from queue after publishing (`remove_publish`)
-- [x] Load pending checkpoints (`load_publish_queue`)
+| C++ Method | Rust Method | Status |
+|------------|-------------|--------|
+| `PersistentState::getState()` | `StateQueries::get_state()` | Done |
+| `PersistentState::setState()` | `StateQueries::set_state()` | Done |
+| Network passphrase storage | `get/set_network_passphrase()` | Done |
+| Last closed ledger | `get/set_last_closed_ledger()` | Done |
+| Schema version tracking | `get/set_schema_version()` | Done |
+| SCP slot state (slotstate table) | `ScpStatePersistenceQueries` | Done |
+| TX set storage | `save/load_tx_set_data()` | Done |
 
-**Bucket List Snapshots (bucketlist table)**
-- [x] Store bucket list levels at checkpoints (`store_bucket_list`)
-- [x] Load bucket list levels (`load_bucket_list`)
+### Ledger Headers (ledgerheaders table)
 
-**Account Management (accounts table)**
-- [x] Load account by ID (`load_account`)
-- [x] Store account (`store_account`)
-- [x] Delete account (`delete_account`)
+| C++ Method | Rust Method | Status |
+|------------|-------------|--------|
+| `storeInDatabase()` | `store_ledger_header()` | Done |
+| `loadBySequence()` | `load_ledger_header()` | Done |
+| `loadMaxLedgerSeq()` | `get_latest_ledger_seq()` | Done |
+| Get hash by sequence | `get_ledger_hash()` | Done |
 
-### Not Yet Implemented (Gaps)
+### SCP History (scphistory, scpquorums tables)
 
-The following C++ features are not yet implemented in this Rust crate:
+| C++ Method | Rust Method | Status |
+|------------|-------------|--------|
+| `HerderPersistence::saveSCPHistory()` | `store_scp_history()` | Done |
+| `HerderPersistence::getSCPHistory()` | `load_scp_history()` | Done |
+| Store quorum set by hash | `store_scp_quorum_set()` | Done |
+| Load quorum set by hash | `load_scp_quorum_set()` | Done |
 
-**Database Backend Support**
-- [ ] PostgreSQL support (C++ supports both SQLite and PostgreSQL via SOCI)
-- [ ] `DatabaseTypeSpecificOperation` pattern for backend-specific code
-- [ ] Database connection string parsing (`removePasswordFromConnectionString`)
-- [ ] Read-only transaction mode (`setCurrentTransactionReadOnly`)
-- [ ] Simple collation clause for PostgreSQL (`getSimpleCollationClause`)
+### Peer Management (peers table)
 
-**Performance Instrumentation**
-- [ ] Query timers (`getInsertTimer`, `getSelectTimer`, `getDeleteTimer`, `getUpdateTimer`, `getUpsertTimer`)
-- [ ] Query meter for counting operations
-- [ ] Prepared statement caching with metrics (`mStatementsSize` counter)
+| C++ Method | Rust Method | Status |
+|------------|-------------|--------|
+| `PeerManager::store()` | `store_peer()` | Done |
+| `PeerManager::load()` | `load_peer()` | Done |
+| `PeerManager::loadAllPeers()` | `load_peers()` | Done |
+| `PeerManager::loadRandomPeers()` | `load_random_peers()` | Done |
+| Random peers by type | `load_random_peers_by_type_max_failures()` | Done |
+| Random outbound peers | `load_random_peers_any_outbound()` | Done |
+| `removePeersWithManyFailures()` | `remove_peers_with_failures()` | Done |
 
-**Prepared Statement Management**
-- [ ] Per-session prepared statement cache (`getPreparedStatement`)
-- [ ] Cache cleanup (`clearPreparedStatementCache`)
-- [ ] `StatementContext` RAII wrapper for statement lifecycle
+### Ban Management (ban table)
 
-**Data Cleanup Operations**
-- [ ] `deleteOldEntries` for ledger headers (prune old data)
-- [ ] `deleteOldEntries` for SCP history
-- [ ] `deleteOldEntries` for transaction history
-- [ ] Bulk delete utilities (`DatabaseUtils::deleteOldEntriesHelper`)
+| C++ Method | Rust Method | Status |
+|------------|-------------|--------|
+| `BanManager::banNode()` | `ban_node()` | Done |
+| `BanManager::unbanNode()` | `unban_node()` | Done |
+| `BanManager::isBanned()` | `is_banned()` | Done |
+| `BanManager::getBans()` | `load_bans()` | Done |
 
-**History Streaming**
-- [ ] `copyToStream` for ledger headers (export to history archives)
-- [ ] `copyToStream` for transactions
-- [ ] `copyToStream` for SCP history
+### Transaction History (txhistory, txsets, txresults tables)
 
-**Additional Ledger Entry Types (LedgerTxn SQL)**
-- [ ] Trust lines (trustlines table) - schema exists but no query impl
-- [ ] Offers (offers table) - schema exists but no query impl
-- [ ] Account data entries (accountdata table) - schema exists but no query impl
-- [ ] Claimable balances (claimablebalance table) - schema exists but no query impl
-- [ ] Liquidity pools (liquiditypool table) - schema exists but no query impl
+| C++ Method | Rust Method | Status |
+|------------|-------------|--------|
+| Store individual transaction | `store_transaction()` | Done |
+| Load transaction by ID | `load_transaction()` | Done |
+| Store TX history entry | `store_tx_history_entry()` | Done |
+| Load TX history entry | `load_tx_history_entry()` | Done |
+| Store TX result entry | `store_tx_result_entry()` | Done |
+| Load TX result entry | `load_tx_result_entry()` | Done |
 
-**Soroban/Smart Contract Storage**
-- [ ] Contract data (contractdata table) - schema exists but no query impl
-- [ ] Contract code (contractcode table) - schema exists but no query impl
-- [ ] TTL entries (ttl table) - schema exists but no query impl
+### Publish Queue (publishqueue table)
 
-**Transaction Fee History**
-- [ ] txfeehistory table operations - schema exists but no query impl
+| C++ Method | Rust Method | Status |
+|------------|-------------|--------|
+| Enqueue checkpoint | `enqueue_publish()` | Done |
+| Remove from queue | `remove_publish()` | Done |
+| Load pending queue | `load_publish_queue()` | Done |
 
-**Upgrade History**
-- [ ] upgradehistory table operations - schema exists but no query impl
+### Bucket List Snapshots (bucketlist table)
 
-**Quorum Info**
-- [ ] quoruminfo table (node -> qsethash mapping, used in C++ but not in Rust schema)
+| C++ Feature | Rust Method | Status |
+|-------------|-------------|--------|
+| Store bucket list levels | `store_bucket_list()` | Done |
+| Load bucket list levels | `load_bucket_list()` | Done |
 
-**Slot State**
-- [ ] slotstate table (used for SCP state persistence in C++, not in Rust schema)
+### Account Management (accounts table)
 
-**Schema Migration Details**
-- [ ] Migration from version 22 (drop txfeehistory)
-- [ ] Migration from version 23 (drop SQL-based publish, upgrade history)
-- [ ] Migration from version 24 (drop pubsub, migrate to slotstate)
-- [ ] Migration from version 25 (remove dbbackend entry)
+| C++ Feature | Rust Method | Status |
+|-------------|-------------|--------|
+| Load account by ID | `load_account()` | Done |
+| Store account | `store_account()` | Done |
+| Delete account | `delete_account()` | Done |
 
-### Implementation Notes
+## Not Implemented (Gaps)
 
-**Architecture Differences**
+### Database Backend Support
 
-1. **Database Library**: The C++ implementation uses SOCI (a C++ database access library), while Rust uses rusqlite with r2d2 for connection pooling. This is a fundamental difference that affects API design.
+| C++ Feature | Status | Notes |
+|-------------|--------|-------|
+| PostgreSQL backend | Not Implemented | Intentional - SQLite only by design |
+| `DatabaseTypeSpecificOperation` pattern | N/A | Not needed for SQLite-only |
+| Connection string parsing | N/A | Simplified configuration |
+| Read-only transaction mode | Not Implemented | Could be added if needed |
+| PostgreSQL collation clause | N/A | Not needed for SQLite |
 
-2. **Query Pattern**: C++ uses prepared statement caching with a shared cache per session name. Rust uses rusqlite's built-in statement handling without explicit caching.
+### Performance Instrumentation
 
-3. **Multi-Database Support**: C++ supports both SQLite and PostgreSQL through SOCI's backend abstraction. The Rust implementation currently only supports SQLite.
+| C++ Feature | Status | Notes |
+|-------------|--------|-------|
+| `getInsertTimer()` | Not Implemented | Metrics at higher layer |
+| `getSelectTimer()` | Not Implemented | Metrics at higher layer |
+| `getDeleteTimer()` | Not Implemented | Metrics at higher layer |
+| `getUpdateTimer()` | Not Implemented | Metrics at higher layer |
+| `getUpsertTimer()` | Not Implemented | Metrics at higher layer |
+| Query meter | Not Implemented | Metrics at higher layer |
+| `mStatementsSize` counter | Not Implemented | Not tracking statement cache size |
 
-4. **XDR Encoding**: C++ stores XDR data as base64-encoded text in many tables. Rust stores XDR data as raw binary blobs (BLOB type), which is more efficient.
+### Prepared Statement Management
 
-5. **Schema Design**: The Rust schema is largely compatible with C++ but stores some fields differently:
-   - C++ uses base64-encoded text for XDR data; Rust uses raw blobs
-   - C++ uses CHARACTER(64) for hashes; Rust uses TEXT
-   - Both use the same table names and primary keys
+| C++ Feature | Status | Notes |
+|-------------|--------|-------|
+| `getPreparedStatement()` | Not Implemented | rusqlite handles internally |
+| `clearPreparedStatementCache()` | Not Implemented | Not needed |
+| `StatementContext` RAII wrapper | Not Implemented | Rust ownership handles this |
+| Per-session statement caching | Not Implemented | Single pool, no sessions |
 
-6. **Connection Pooling**: C++ creates a connection pool on-demand when `getPool()` is called. Rust creates the pool at database open time with a fixed size.
+### Data Cleanup Operations
 
-7. **Session Naming**: C++ uses named sessions for tracking prepared statement caches. Rust doesn't use this pattern.
+| C++ Feature | Status | Notes |
+|-------------|--------|-------|
+| `LedgerHeaderUtils::deleteOldEntries()` | **Gap** | Prune old ledger headers |
+| `HerderPersistence::deleteOldEntries()` | **Gap** | Prune old SCP history |
+| `DatabaseUtils::deleteOldEntriesHelper()` | **Gap** | Generic pruning helper |
 
-**Intentional Omissions**
+### History Streaming
 
-- **PostgreSQL**: The Rust implementation is SQLite-only by design, focusing on single-node deployments and testing scenarios.
+| C++ Feature | Status | Notes |
+|-------------|--------|-------|
+| `LedgerHeaderUtils::copyToStream()` | **Gap** | Export headers to history archives |
+| Transaction `copyToStream()` | **Gap** | Export transactions to archives |
+| SCP history streaming | **Gap** | Export SCP data to archives |
 
-- **Query Metrics**: The Rust crate doesn't include metrics infrastructure. Metrics would be added at a higher layer if needed.
+### Additional Ledger Entry Types
 
-- **Ledger Entry SQL**: The C++ `LedgerTxn*SQL` files implement complex ledger entry storage used during ledger application. The Rust implementation stores ledger entries in the bucket list (via stellar-core-ledger), not in SQL tables, following a different architecture.
+Schema exists but no query implementations:
+
+| Table | C++ Location | Status |
+|-------|--------------|--------|
+| trustlines | `LedgerTxnTrustLineSQL.cpp` | Schema only |
+| offers | `LedgerTxnOfferSQL.cpp` | Schema only |
+| accountdata | `LedgerTxnDataSQL.cpp` | Schema only |
+| claimablebalance | `LedgerTxnClaimableBalanceSQL.cpp` | Schema only |
+| liquiditypool | `LedgerTxnLiquidityPoolSQL.cpp` | Schema only |
+| contractdata | `LedgerTxnContractDataSQL.cpp` | Schema only |
+| contractcode | `LedgerTxnContractCodeSQL.cpp` | Schema only |
+| ttl | `LedgerTxnTTLSQL.cpp` | Schema only |
+
+### Other Tables
+
+| Table | C++ Feature | Status |
+|-------|-------------|--------|
+| txfeehistory | Transaction fee changes | Schema only |
+| upgradehistory | Protocol upgrade history | Schema only |
+
+## Architectural Differences
+
+### Database Library
+
+- **C++**: Uses SOCI with SQLite3 and optional PostgreSQL backends
+- **Rust**: Uses rusqlite with r2d2 connection pooling
+
+This is a fundamental difference that affects:
+- Error handling (SOCI exceptions vs Rust Results)
+- Statement preparation (explicit cache vs implicit)
+- Type conversions (SOCI type traits vs rusqlite ToSql/FromSql)
+
+### XDR Encoding
+
+- **C++**: Stores XDR data as base64-encoded TEXT in most tables
+- **Rust**: Stores XDR data as raw BLOB (binary), which is more efficient
+
+This is intentional and does not affect parity of behavior, only storage format.
+
+### Connection Pooling
+
+- **C++**: Creates pool on-demand when `getPool()` is called, pool size based on hardware concurrency
+- **Rust**: Creates pool at open time with fixed size (10 for file, 1 for in-memory)
+
+### Session Management
+
+- **C++**: Uses named sessions for prepared statement cache isolation
+- **Rust**: No session names, simpler connection model
+
+### Ledger Entry Storage
+
+- **C++**: `LedgerTxn*SQL` files store all ledger entries in SQL tables during ledger close
+- **Rust**: Ledger entries are stored in the bucket list only (via stellar-core-ledger crate)
+
+This is a significant architectural difference. The Rust implementation uses the bucket list
+as the primary state storage, matching the canonical Stellar state representation. SQL tables
+for ledger entries exist in the schema for compatibility but are not actively used.
+
+## Migration Compatibility
+
+The Rust migration system uses a different versioning scheme than C++:
+
+| C++ Version | Rust Version | Description |
+|-------------|--------------|-------------|
+| MIN_SCHEMA_VERSION = 21 | N/A | C++ minimum supported |
+| SCHEMA_VERSION = 25 | CURRENT_VERSION = 5 | Current version |
+
+The Rust crate starts fresh with its own version numbering since it:
+1. Uses different storage formats (BLOB vs base64 TEXT)
+2. Has different table structures in some cases
+3. Does not need to support legacy C++ databases
+
+## Recommendations for Future Work
+
+### Priority 1: Data Cleanup Operations
+
+Implement `deleteOldEntries` equivalents for:
+- Ledger headers
+- SCP history
+- Transaction history
+
+These are important for long-running nodes to manage database size.
+
+### Priority 2: History Streaming
+
+Implement `copyToStream` equivalents for history archive publishing.
+Currently history publishing works but could be optimized.
+
+### Priority 3: Additional SQLite Pragmas
+
+Consider adding:
+- `mmap_size` for memory-mapped I/O performance
+- `wal_autocheckpoint` for WAL size management
+- `busy_timeout` for concurrent access handling
+
+### Not Recommended
+
+- **PostgreSQL support**: The Rust implementation is designed for SQLite-only deployments
+- **Query metrics in database layer**: Should be implemented at a higher level if needed
+- **Prepared statement caching**: rusqlite handles this efficiently

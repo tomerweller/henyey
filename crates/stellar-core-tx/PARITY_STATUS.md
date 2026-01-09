@@ -1,256 +1,307 @@
-## C++ Parity Status
+# C++ Parity Status
 
-This section documents the parity between this Rust crate and the upstream C++ stellar-core implementation in `.upstream-v25/src/transactions/`.
+This document provides a detailed comparison between the Rust `stellar-core-tx` crate and the upstream C++ stellar-core v25 implementation in `.upstream-v25/src/transactions/`.
 
-### Implemented
+## Summary
 
-#### Transaction Frame & Envelope Handling
-- **TransactionFrame** (`frame.rs`): Full envelope handling for V0, V1, and FeeBump transactions
-- **Hash computation**: Network-bound transaction hash with signature payload
-- **Resource extraction**: Surge pricing resource calculation for both classic and Soroban
-- **Soroban detection**: Proper identification of Soroban vs classic transactions
-- **Fee calculations**: Total fee, inclusion fee, Soroban resource fee separation
+| Category | Status | Notes |
+|----------|--------|-------|
+| Transaction Frame | Full | V0, V1, FeeBump envelopes |
+| Transaction Validation | Full | All preconditions |
+| Signature Checking | Full | Weight accumulation, threshold levels |
+| Fee Bump Transactions | Full | Dedicated wrapper, fee logic |
+| Transaction Application | Full | Live execution + catchup modes |
+| Classic Operations (24) | Full | All operations implemented |
+| Soroban Operations (3) | Full | Via e2e_invoke API |
+| Event Emission | Full | SAC events, lumen reconciliation |
+| Metadata Building | Full | V2/V3/V4 TransactionMeta |
+| Parallel Execution | N/A | Not needed for current use case |
 
-#### Transaction Validation
-- **Structure validation**: Operation count, fee checks, Soroban single-op requirement
-- **Time bounds validation**: Min/max time checks against ledger close time
-- **Ledger bounds validation**: Min/max ledger sequence checks
-- **Fee validation**: Minimum fee per operation
-- **Sequence validation**: Sequence number matching with account
-- **Signature validation**: Ed25519 signature verification with hint matching
-- **Extra signers**: V2 precondition extra signer validation (Ed25519, PreAuthTx, HashX, SignedPayload)
-- **Min sequence preconditions**: V2 min_seq_num, min_seq_age, min_seq_ledger_gap
-- **Soroban resource validation**: Archived entry indices, footprint validation
+## Implemented Components
 
-#### Transaction Processing (Newly Implemented)
-- **SignatureChecker** (`signature_checker.rs`): Full signer weight checking
-  - Weight accumulation across multiple signers
-  - Threshold level checking (LOW/MEDIUM/HIGH)
-  - Ordered processing: PRE_AUTH_TX → HASH_X → ED25519 → ED25519_SIGNED_PAYLOAD
-  - Weight cap at u8::MAX for protocol 10+
-  - Tracks which signatures have been used
-  - `check_all_signatures_used()` for unused signature detection
-- **ThresholdLevel** (`operations/mod.rs`): Operation-specific threshold requirements
-  - LOW: AllowTrust, SetTrustLineFlags, BumpSequence, ClaimClaimableBalance, Inflation, ExtendFootprintTtl, RestoreFootprint
-  - MEDIUM: Most operations (Payment, CreateAccount, ChangeTrust, etc.)
-  - HIGH: AccountMerge, SetOptions (when modifying thresholds/signers)
-- **MutableTransactionResult** (`result.rs`): Mutable result wrapper for execution
-  - Result code mutation during apply
-  - Refundable fee tracker integration
-  - `set_error()` resets refundable fees
-  - `finalize_fee_refund()` for final fee calculation
-- **RefundableFeeTracker** (`result.rs`): Detailed Soroban fee tracking
-  - Tracks max_refundable_fee, consumed_events_size, consumed_rent_fee
-  - `consume_rent_fee()` and `update_consumed_refundable_fee()`
-  - `get_fee_refund()` returns max - consumed
-  - `reset_consumed_fee()` for error cases (full refund)
-- **One-time signer removal** (`state.rs`): Pre-auth TX signer cleanup
-  - `remove_one_time_signers_from_all_sources()` for transaction cleanup
-  - `remove_account_signer()` for individual signer removal
-  - Sponsorship cleanup when removing sponsored signers
-  - Protocol 7 bypass (matches C++ behavior)
+### TransactionFrame (`frame.rs`)
 
-#### Fee Bump Transactions (Newly Implemented)
-- **FeeBumpFrame** (`fee_bump.rs`): Dedicated fee bump transaction wrapper
-  - Wraps inner V1 transaction with fee bump envelope
-  - Separate accessors for outer fee source and inner source
-  - Inner transaction hash computation and caching
-  - `fee_source_is_inner_source()` for same-account detection
-- **FeeBumpMutableTransactionResult** (`fee_bump.rs`): Result tracking for fee bumps
-  - Tracks both outer fee and inner fee separately
-  - Inner transaction hash stored in `InnerTransactionResultPair`
-  - Protocol-versioned fee refund logic (P24 vs P25+)
-  - Inner operation results management
-- **Fee bump validation** (`fee_bump.rs`, `validation.rs`): Complete fee bump validation
-  - Outer fee >= inner fee validation
-  - Outer fee >= base_fee * (op_count + 1) validation
-  - Inner signature format validation
-  - Integration with basic and full validation paths
-- **Helper functions** (`fee_bump.rs`):
-  - `calculate_inner_fee_charged()`: Protocol-versioned inner fee calculation
-  - `wrap_inner_result_in_fee_bump()`: Convert inner result to fee bump result
-  - `extract_inner_hash_from_result()`: Extract inner hash from result
-  - `verify_inner_signatures()`: Cryptographic inner signature verification
+Corresponds to: `TransactionFrame.h/cpp`, `TransactionFrameBase.h/cpp`
 
-#### Transaction Metadata Building (Newly Implemented)
-- **TransactionMetaBuilder** (`meta_builder.rs`): Full meta construction for live execution
-  - Creates OperationMetaBuilder for each operation
-  - Manages transaction-level and operation-level events
-  - Supports V2, V3, and V4 TransactionMeta XDR formats
-  - `push_tx_changes_before()` and `push_tx_changes_after()` for tx-level changes
-  - `set_non_refundable_resource_fee()` and `set_refundable_fee_tracker()` for Soroban
-  - One-time `finalize(success)` produces final TransactionMeta XDR
-- **OperationMetaBuilder** (`meta_builder.rs`): Per-operation metadata
-  - Records ledger changes: `record_create()`, `record_update()`, `record_delete()`, `record_restore()`
-  - Manages OpEventManager for operation-level contract events
-  - Soroban return value tracking via `set_soroban_return_value()`
-  - `finalize_v2()` for V2/V3 meta, `finalize_v4()` for V4 meta with per-op events
-- **DiagnosticEventManager** (`meta_builder.rs`): Diagnostic event collection
-  - `create_for_apply()` for Soroban transaction apply phase
-  - `create_for_validation()` for transaction submission validation
-  - `push_error()` for validation/execution errors (ScError, message, args)
-  - `push_metrics()` for execution metrics (CPU, memory, I/O)
-  - `push_event()` and `push_events()` for Soroban host diagnostic events
-  - Disabled mode is complete no-op for performance
-- **DiagnosticConfig**: Configuration for diagnostic event collection
-  - `enable_soroban_diagnostic_events` for apply phase
-  - `enable_diagnostics_for_tx_submission` for validation phase
-- **ExecutionMetrics**: Struct for execution metrics diagnostic events
-  - cpu_insn, mem_byte, ledger_read_byte, ledger_write_byte
-  - emit_event, emit_event_byte, invoke_time_nsecs
+| C++ Function | Rust Implementation | Status |
+|-------------|---------------------|--------|
+| `getFullHash()` | `hash()` | Full |
+| `getContentsHash()` | `signature_payload()` | Full |
+| `getEnvelope()` | `envelope()` | Full |
+| `getSeqNum()` | `sequence_number()` | Full |
+| `getSourceID()` | `source_account_id()` | Full |
+| `getFeeSourceID()` | `fee_source_account()` | Full |
+| `getNumOperations()` | `operation_count()` | Full |
+| `getFullFee()` | `total_fee()` | Full |
+| `getInclusionFee()` | `inclusion_fee()` | Full |
+| `declaredSorobanResourceFee()` | `declared_soroban_resource_fee()` | Full |
+| `getResources()` | `resources()` | Full |
+| `isSoroban()` | `is_soroban()` | Full |
+| `hasDexOperations()` | `has_dex_operations()` | Full |
+| `sorobanResources()` | `soroban_data()` | Full |
+| `isRestoreFootprintTx()` | Internal check | Full |
+| `getRefundableFee()` | `refundable_fee()` | Full |
+| `getMemo()` | `memo()` | Full |
+| `getTimeBounds()` | `preconditions()` | Full |
+| `getLedgerBounds()` | `preconditions()` | Full |
+| V0 to V1 conversion | `v0_to_v1_transaction()` | Full |
 
-#### Transaction Application (Catchup Mode)
-- **LedgerDelta**: State change accumulation with proper ordering
-- **Change ordering preservation**: ChangeRef tracking for metadata construction
-- **Pre-state tracking**: STATE entries for UPDATED/REMOVED metadata
-- **TransactionMeta parsing**: V0, V1, V2, V3, V4 meta format support
-- **Fee charging**: Fee accumulation and refund tracking
+### Validation (`validation.rs`)
 
-#### Classic Operations (All 24 Operations)
-| Operation | Status | Notes |
-|-----------|--------|-------|
-| CreateAccount | Implemented | Full reserve checking |
-| Payment | Implemented | Native and credit assets |
-| PathPaymentStrictReceive | Implemented | Path finding with offers |
-| PathPaymentStrictSend | Implemented | Path finding with offers |
-| ManageSellOffer | Implemented | Create/update/delete offers |
-| ManageBuyOffer | Implemented | Create/update/delete offers |
-| CreatePassiveSellOffer | Implemented | Non-crossing offers |
-| SetOptions | Implemented | Thresholds, signers, flags |
-| ChangeTrust | Implemented | Credit and pool shares |
-| AllowTrust | Implemented | Authorization flags (deprecated) |
-| AccountMerge | Implemented | Balance transfer and deletion |
-| Inflation | Implemented | Returns NotTime (deprecated since P12) |
-| ManageData | Implemented | 64-byte data entries |
-| BumpSequence | Implemented | Sequence number advancement |
-| CreateClaimableBalance | Implemented | Predicate validation |
-| ClaimClaimableBalance | Implemented | Predicate evaluation |
-| BeginSponsoringFutureReserves | Implemented | Sponsorship stack |
-| EndSponsoringFutureReserves | Implemented | Sponsorship stack |
-| RevokeSponsorship | Implemented | Entry and signer revocation |
-| Clawback | Implemented | Trustline clawback |
-| ClawbackClaimableBalance | Implemented | Balance clawback |
-| SetTrustLineFlags | Implemented | Authorization flags |
-| LiquidityPoolDeposit | Implemented | AMM deposits |
-| LiquidityPoolWithdraw | Implemented | AMM withdrawals |
+Corresponds to: `TransactionFrame::checkValid*()`, `TransactionFrame::commonValid()`
 
-#### Soroban Operations
-| Operation | Status | Notes |
-|-----------|--------|-------|
-| InvokeHostFunction | Implemented | Via e2e_invoke API |
-| ExtendFootprintTtl | Implemented | TTL extension with rent fee |
-| RestoreFootprint | Implemented | Archived entry restoration |
+| C++ Function | Rust Implementation | Status |
+|-------------|---------------------|--------|
+| `checkValid()` | `validate_full()` | Full |
+| `commonValid()` | `validate_basic()` | Full |
+| Structure validation | `validate_structure()` | Full |
+| Fee validation | `validate_fee()` | Full |
+| Time bounds | `validate_time_bounds()` | Full |
+| Ledger bounds | `validate_ledger_bounds()` | Full |
+| Sequence validation | `validate_sequence()` | Full |
+| Min seq num | `validate_min_seq_num()` | Full |
+| Extra signers | `validate_extra_signers()` | Full |
+| Signature verification | `validate_signatures()` | Full |
+| Soroban resources | `validate_soroban_resources()` | Full |
+| Fee bump rules | `validate_fee_bump_rules()` | Full |
 
-#### Soroban Integration
-- **Protocol-versioned hosts**: P24 and P25 soroban-env-host support
-- **e2e_invoke API**: Using same high-level API as C++ stellar-core
-- **Storage snapshot**: TTL-aware entry access (expired = archived)
-- **Budget tracking**: CPU and memory consumption
-- **Event collection**: Contract events and diagnostic events
-- **Rent fee calculation**: Protocol-versioned rent fee computation
-- **Archived entry restoration**: V1 ext archived_soroban_entries support
-- **PRNG seed**: Configurable seed for deterministic execution
+### SignatureChecker (`signature_checker.rs`)
 
-#### Event Emission (SAC Events)
-- **Protocol 23+ events**: Native classic event emission
-- **Event types**: transfer, mint, burn, clawback, set_authorized, fee
-- **Backfill support**: Pre-P23 event backfilling
-- **Muxed account handling**: Proper address extraction
-- **Memo encoding**: Classic memo to ScVal conversion
+Corresponds to: `SignatureChecker.h/cpp`
 
-#### State Management
-- **LedgerStateManager**: In-memory state with HashMap-based storage
-- **Entry types**: Account, Trustline, Offer, Data, ContractData, ContractCode, TTL, ClaimableBalance, LiquidityPool
-- **Snapshots**: Per-operation snapshots for rollback
-- **Sponsorship stack**: Active sponsorship context tracking
-- **Minimum balance**: Reserve calculations with sponsorship
+| C++ Function | Rust Implementation | Status |
+|-------------|---------------------|--------|
+| Constructor | `SignatureChecker::new()` | Full |
+| `checkSignature()` | `check_signature()` | Full |
+| `checkAllSignaturesUsed()` | `check_all_signatures_used()` | Full |
+| PRE_AUTH_TX verification | Inline in `check_signature()` | Full |
+| HASH_X verification | `verify_hash_x()` | Full |
+| ED25519 verification | `verify_ed25519()` | Full |
+| ED25519_SIGNED_PAYLOAD | `verify_ed25519_signed_payload()` | Full |
+| Weight capping (P10+) | `cap_weight()` | Full |
+| Protocol 7 bypass | Inline check | Full |
+| Signer collection | `collect_signers_for_account()` | Full |
 
-### Not Yet Implemented (Gaps)
+### MutableTransactionResult (`result.rs`)
 
-#### Parallel Execution (Not Applicable)
-- **ParallelApplyStage**: Parallel transaction application infrastructure
-  - C++: `ParallelApplyStage.cpp`, `ParallelApplyUtils.cpp`
-  - Rust: Not needed - sequential execution for catchup mode
-- **ThreadParallelApplyLedgerState**: Thread-local ledger state for parallel apply
-- **TxEffects**: Per-transaction effect tracking for parallel merge
+Corresponds to: `MutableTransactionResult.h/cpp`
 
-#### Database Integration (Not Applicable)
-- **TransactionSQL**: Transaction persistence to SQL database
-  - C++: `TransactionSQL.cpp` - stores tx results in database
-  - Rust: Not needed - bucket list only
-- **TransactionBridge**: Bridge between transaction frames and database
+| C++ Class/Function | Rust Implementation | Status |
+|-------------------|---------------------|--------|
+| `MutableTransactionResultBase` | `MutableTransactionResult` | Full |
+| `RefundableFeeTracker` | `RefundableFeeTracker` | Full |
+| `initializeRefundableFeeTracker()` | `initialize_refundable_fee_tracker()` | Full |
+| `getRefundableFeeTracker()` | `refundable_fee_tracker()` | Full |
+| `setError()` | `set_error()` | Full |
+| `getResultCode()` | `result_code()` | Full |
+| `isSuccess()` | `is_success()` | Full |
+| `getFeeCharged()` | `fee_charged()` | Full |
+| `finalizeFeeRefund()` | `finalize_fee_refund()` | Full |
+| `getOpResultAt()` | `op_result_at()` | Full |
+| `consumeRefundableSorobanResources()` | `consume_rent_fee()` etc. | Full |
+| `getFeeRefund()` | `get_fee_refund()` | Full |
+| `resetConsumedFee()` | `reset_consumed_fee()` | Full |
 
-#### Event Management (Implemented)
-- **EventManager hierarchy**: Full C++ EventManager/OpEventManager/TxEventManager structure
-  - C++: `EventManager.cpp` - 500+ lines with LumenEventReconciler
-  - Rust: Full implementation in `events.rs` with `OpEventManager`, `TxEventManager`, and `EventManagerHierarchy`
-  - Features: finalization guards, insert-at-beginning for mint events, disabled mode for performance
-- **LumenEventReconciler**: XLM balance reconciliation for event emission
-  - C++: `LumenEventReconciler.cpp` - reconciles XLM movements for fee events
-  - Rust: Full implementation in `lumen_reconciler.rs` with `LumenEventReconciler` and `ReconcilerConfig`
-  - Features: pre-protocol 8 balance tracking, account delta calculation, mint event insertion
+### FeeBumpTransactionFrame (`fee_bump.rs`)
 
-#### Signature Utilities
-- **SignatureUtils**: Signature verification helpers
-  - C++: `SignatureUtils.cpp` - hint computation, verification helpers
-  - Rust: Basic signature functions in stellar-core-crypto
+Corresponds to: `FeeBumpTransactionFrame.h/cpp`
 
-#### Live Execution Mode (Implemented)
-- **processFeeSeqNum** (`live_execution.rs`): Fee charging and sequence number processing
-  - C++: `TransactionFrame::processFeeSeqNum()` in `TransactionFrame.cpp`
-  - Rust: Full implementation with `process_fee_seq_num()` and `process_fee_seq_num_fee_bump()`
-  - Features: Fee charging, balance capping, sequence update (pre-P10), refundable fee tracker init
-- **processPostApply** (`live_execution.rs`): Post-apply processing
-  - C++: `TransactionFrame::processPostApply()` for pre-P23 Soroban refunds
-  - Rust: Full implementation with `process_post_apply()` and fee bump variant
-  - Features: Protocol-versioned refund timing, account balance updates
-- **processPostTxSetApply** (`live_execution.rs`): Per-transaction-set post processing
-  - C++: `TransactionFrame::processPostTxSetApply()` for P23+ Soroban refunds
-  - Rust: Full implementation with `process_post_tx_set_apply()` and fee bump variant
-  - Features: Deferred refund application, fee event emission
-- **refundSorobanFee** (`live_execution.rs`): Core refund logic
-  - C++: `TransactionFrame::refundSorobanFee()`
-  - Rust: Full implementation with merged account handling and overflow protection
-- **LiveExecutionContext** (`live_execution.rs`): Execution context
-  - Provides ledger context, fee pool tracking, and state management
-  - Supports both stateful and stateless operation modes
+| C++ Function | Rust Implementation | Status |
+|-------------|---------------------|--------|
+| Constructor | `FeeBumpFrame::from_frame()` | Full |
+| `getFeeSourceID()` | `fee_source()` | Full |
+| Inner source access | `inner_source()` | Full |
+| Inner tx hash | `inner_hash()` | Full |
+| `feeSourceIsInnersource()` | `fee_source_is_inner_source()` | Full |
+| Fee bump validation | `validate_fee_bump()` | Full |
+| Inner signature verification | `verify_inner_signatures()` | Full |
+| `FeeBumpMutableTransactionResult` | `FeeBumpMutableTransactionResult` | Full |
+| Inner fee calculation | `calculate_inner_fee_charged()` | Full |
+| Result wrapping | `wrap_inner_result_in_fee_bump()` | Full |
 
-### Implementation Notes
+### Live Execution (`live_execution.rs`)
 
-#### Architectural Differences
+Corresponds to: `TransactionFrame::processFeeSeqNum()`, `processPostApply()`, etc.
 
-1. **Dual Mode Support**: The Rust crate now supports both live execution and catchup/replay modes as first-class citizens. Live execution mode provides full validation and result building matching C++ stellar-core, while catchup mode trusts archived results for fast synchronization.
+| C++ Function | Rust Implementation | Status |
+|-------------|---------------------|--------|
+| `processFeeSeqNum()` | `process_fee_seq_num()` | Full |
+| (FeeBump variant) | `process_fee_seq_num_fee_bump()` | Full |
+| `processSeqNum()` | `process_seq_num()` | Full |
+| `processPostApply()` | `process_post_apply()` | Full |
+| (FeeBump variant) | `process_post_apply_fee_bump()` | Full |
+| `processPostTxSetApply()` | `process_post_tx_set_apply()` | Full |
+| (FeeBump variant) | `process_post_tx_set_apply_fee_bump()` | Full |
+| `refundSorobanFee()` | `refund_soroban_fee()` | Full |
+| `removeOneTimeSignerKeyFromAllSourceAccounts()` | `remove_one_time_signers()` | Full |
+| Protocol version checks | Protocol constants | Full |
 
-2. **State Layer**: Rust uses an in-memory `LedgerStateManager` while C++ uses `AbstractLedgerTxn` with SQL backing. This is intentional as Rust targets bucket list state.
+### TransactionMetaBuilder (`meta_builder.rs`)
 
-3. **Protocol Versioning**: Rust uses separate `soroban-env-host-p24` and `soroban-env-host-p25` crates, while C++ uses version-aware code paths within a single codebase.
+Corresponds to: `TransactionMeta.h/cpp`
 
-4. **Signature Checking**: The Rust `SignatureChecker` now matches C++ behavior with stateful tracking of which signatures have been used across the transaction, weight accumulation, and threshold checking.
+| C++ Class/Function | Rust Implementation | Status |
+|-------------------|---------------------|--------|
+| `TransactionMetaBuilder` | `TransactionMetaBuilder` | Full |
+| `OperationMetaBuilder` | `OperationMetaBuilder` | Full |
+| `pushTxChangesBefore()` | `push_tx_changes_before()` | Full |
+| `pushTxChangesAfter()` | `push_tx_changes_after()` | Full |
+| `setNonRefundableResourceFee()` | `set_non_refundable_resource_fee()` | Full |
+| `setRefundableFeeTracker()` | `set_refundable_fee_tracker()` | Full |
+| `DiagnosticEventManager` | `DiagnosticEventManager` | Full |
+| V2/V3/V4 meta formats | `finalize()` | Full |
+| Change recording | `record_create/update/delete/restore()` | Full |
 
-5. **Meta Building**: Rust now has `TransactionMetaBuilder` for live execution mode, matching C++ behavior. The catchup mode still parses metadata from archives.
+### Event Emission (`events.rs`, `lumen_reconciler.rs`)
 
-6. **Event Reconciliation**: Rust now has a full `LumenEventReconciler` implementation matching C++ behavior for pre-protocol 8 XLM balance tracking, ensuring fee events are correctly attributed with proper mint event insertion at the beginning of event lists.
+Corresponds to: `EventManager.h/cpp`, `LumenEventReconciler.h/cpp`
 
-7. **Fee Bump Handling**: Rust now has a dedicated `FeeBumpFrame` wrapper that provides fee bump-specific functionality matching C++ `FeeBumpTransactionFrame`. The implementation includes proper inner transaction hash tracking, protocol-versioned fee logic, and result wrapping.
+| C++ Class/Function | Rust Implementation | Status |
+|-------------------|---------------------|--------|
+| `OpEventManager` | `OpEventManager` | Full |
+| `TxEventManager` | `TxEventManager` | Full |
+| Event hierarchy | `EventManagerHierarchy` | Full |
+| Transfer events | `event_for_transfer()` | Full |
+| Mint events | `event_for_mint()` | Full |
+| Burn events | `event_for_burn()` | Full |
+| Clawback events | `event_for_clawback()` | Full |
+| Authorization events | `event_for_set_authorized()` | Full |
+| Fee events | `refund_fee()` | Full |
+| `LumenEventReconciler` | `LumenEventReconciler` | Full |
+| `insertAtBeginning` support | Mint event insertion | Full |
+| Muxed account handling | `make_muxed_account_address()` | Full |
+| Contract ID computation | `contract_id_from_asset()` | Full |
 
-#### Priority Gaps for Full Parity
+### Classic Operations
 
-**High Priority** (needed for validator mode):
-1. ~~SignatureChecker with weight accumulation and threshold checking~~ ✓ Implemented
-2. ~~TransactionMetaBuilder for generating metadata during execution~~ ✓ Implemented
-3. ~~MutableTransactionResult with RefundableFeeTracker~~ ✓ Implemented
-4. ~~Complete fee bump transaction handling~~ ✓ Implemented
-5. ~~Live execution mode (processFeeSeqNum, processPostApply, processPostTxSetApply)~~ ✓ Implemented
+All 24 classic operations are fully implemented in `src/operations/execute/`:
 
-**Medium Priority** (needed for complete validation):
-1. ~~Unused signature checking~~ ✓ Implemented (via SignatureChecker)
-2. ~~One-time signer removal~~ ✓ Implemented
-3. ~~DiagnosticEventManager integration~~ ✓ Implemented
-4. ~~LumenEventReconciler for event consistency~~ ✓ Implemented
+| Operation | C++ File | Rust File | Status |
+|-----------|----------|-----------|--------|
+| CreateAccount | `CreateAccountOpFrame.cpp` | `create_account.rs` | Full |
+| Payment | `PaymentOpFrame.cpp` | `payment.rs` | Full |
+| PathPaymentStrictReceive | `PathPaymentStrictReceiveOpFrame.cpp` | `path_payment.rs` | Full |
+| PathPaymentStrictSend | `PathPaymentStrictSendOpFrame.cpp` | `path_payment.rs` | Full |
+| ManageSellOffer | `ManageSellOfferOpFrame.cpp` | `manage_offer.rs` | Full |
+| ManageBuyOffer | `ManageBuyOfferOpFrame.cpp` | `manage_offer.rs` | Full |
+| CreatePassiveSellOffer | `CreatePassiveSellOfferOpFrame.cpp` | `manage_offer.rs` | Full |
+| SetOptions | `SetOptionsOpFrame.cpp` | `set_options.rs` | Full |
+| ChangeTrust | `ChangeTrustOpFrame.cpp` | `change_trust.rs` | Full |
+| AllowTrust | `AllowTrustOpFrame.cpp` | `trust_flags.rs` | Full |
+| AccountMerge | `MergeOpFrame.cpp` | `account_merge.rs` | Full |
+| Inflation | `InflationOpFrame.cpp` | `inflation.rs` | Full (deprecated) |
+| ManageData | `ManageDataOpFrame.cpp` | `manage_data.rs` | Full |
+| BumpSequence | `BumpSequenceOpFrame.cpp` | `bump_sequence.rs` | Full |
+| CreateClaimableBalance | `CreateClaimableBalanceOpFrame.cpp` | `claimable_balance.rs` | Full |
+| ClaimClaimableBalance | `ClaimClaimableBalanceOpFrame.cpp` | `claimable_balance.rs` | Full |
+| BeginSponsoringFutureReserves | `BeginSponsoringFutureReservesOpFrame.cpp` | `sponsorship.rs` | Full |
+| EndSponsoringFutureReserves | `EndSponsoringFutureReservesOpFrame.cpp` | `sponsorship.rs` | Full |
+| RevokeSponsorship | `RevokeSponsorshipOpFrame.cpp` | `sponsorship.rs` | Full |
+| Clawback | `ClawbackOpFrame.cpp` | `clawback.rs` | Full |
+| ClawbackClaimableBalance | `ClawbackClaimableBalanceOpFrame.cpp` | `clawback.rs` | Full |
+| SetTrustLineFlags | `SetTrustLineFlagsOpFrame.cpp` | `trust_flags.rs` | Full |
+| LiquidityPoolDeposit | `LiquidityPoolDepositOpFrame.cpp` | `liquidity_pool.rs` | Full |
+| LiquidityPoolWithdraw | `LiquidityPoolWithdrawOpFrame.cpp` | `liquidity_pool.rs` | Full |
 
-**Low Priority** (not needed for current use cases):
-1. Parallel execution infrastructure
-2. SQL database integration
-3. TransactionBridge
+### Soroban Operations
 
-**All high-priority and medium-priority gaps have been addressed.**
+| Operation | C++ File | Rust File | Status |
+|-----------|----------|-----------|--------|
+| InvokeHostFunction | `InvokeHostFunctionOpFrame.cpp` | `invoke_host_function.rs` | Full |
+| ExtendFootprintTtl | `ExtendFootprintTTLOpFrame.cpp` | `extend_footprint_ttl.rs` | Full |
+| RestoreFootprint | `RestoreFootprintOpFrame.cpp` | `restore_footprint.rs` | Full |
+
+### ThresholdLevel (`operations/mod.rs`)
+
+Corresponds to: `OperationFrame.h` enum `ThresholdLevel`
+
+| C++ | Rust | Notes |
+|-----|------|-------|
+| `ThresholdLevel::LOW` | `ThresholdLevel::Low` | Same operations |
+| `ThresholdLevel::MEDIUM` | `ThresholdLevel::Medium` | Same operations |
+| `ThresholdLevel::HIGH` | `ThresholdLevel::High` | Same operations |
+| `getThresholdLevel()` | `get_threshold_level()` | Full parity |
+| Threshold index lookup | `ThresholdLevel::index()` | Full |
+
+### Soroban Integration (`soroban/`)
+
+| Component | Implementation | Status |
+|-----------|----------------|--------|
+| Protocol-versioned hosts | `soroban-env-host-p24`, `soroban-env-host-p25` | Full |
+| `e2e_invoke` API | Used for InvokeHostFunction | Full |
+| Storage snapshot | TTL-aware entry access | Full |
+| Budget tracking | CPU/memory consumption | Full |
+| Event collection | Contract + diagnostic events | Full |
+| Rent fee calculation | Protocol-versioned | Full |
+| Archived entry restoration | V1 ext support | Full |
+| PRNG seed | Configurable seed | Full |
+
+## Not Implemented (By Design)
+
+### Parallel Execution Infrastructure
+
+Corresponds to: `ParallelApplyStage.cpp`, `ParallelApplyUtils.cpp`
+
+These components provide parallel transaction application for live validator mode. They are not implemented in Rust because:
+- The primary use case is sequential catchup/replay
+- Parallel execution adds significant complexity
+- Sequential execution is sufficient for current requirements
+
+| C++ Component | Status | Reason |
+|--------------|--------|--------|
+| `ParallelApplyStage` | Not needed | Sequential execution only |
+| `ThreadParallelApplyLedgerState` | Not needed | Sequential execution only |
+| `TxEffects` | Not needed | Sequential execution only |
+| `parallelApply()` | Not needed | Sequential execution only |
+
+### Database Integration
+
+Corresponds to: `TransactionSQL.cpp`, `TransactionBridge.cpp`
+
+Database persistence is not implemented because:
+- Rust targets bucket list state only
+- Transaction results are not persisted to SQL
+- Historical data comes from archives
+
+| C++ Component | Status | Reason |
+|--------------|--------|--------|
+| `TransactionSQL` | Not needed | Bucket list only |
+| `TransactionBridge` | Not needed | Bucket list only |
+
+## Architectural Differences
+
+### 1. Dual Mode Support
+The Rust crate supports both live execution and catchup/replay modes as first-class citizens:
+- **Live execution**: Full validation, fee charging, result building
+- **Catchup mode**: Trusts archived results, fast synchronization
+
+### 2. State Layer
+- **C++**: Uses `AbstractLedgerTxn` with SQL backing
+- **Rust**: Uses in-memory `LedgerStateManager` targeting bucket list
+
+### 3. Protocol Versioning
+- **C++**: Version-aware code paths within single codebase
+- **Rust**: Separate `soroban-env-host-p24` and `soroban-env-host-p25` crates
+
+### 4. Error Handling
+- **C++**: Mutable result objects with error codes
+- **Rust**: Result types with structured errors + mutable result for apply phase
+
+## Test Coverage
+
+The Rust implementation includes comprehensive unit tests:
+- Frame creation and property access
+- Hash computation across networks
+- Validation error handling
+- Signature checking with all signer types
+- Operation execution for all 27 operations
+- Fee processing and refunds
+- Protocol version-specific behavior
+
+## Verification Approach
+
+Parity is verified through:
+1. Comparison against upstream test vectors
+2. Review of C++ implementation behavior
+3. Integration testing with mainnet/testnet archive data
+4. Protocol-specific behavior testing (P10, P23, etc.)

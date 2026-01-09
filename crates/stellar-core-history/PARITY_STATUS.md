@@ -1,139 +1,335 @@
 ## C++ Parity Status
 
-This section documents the parity between this Rust crate and its C++ upstream counterpart in `stellar-core/src/history/`.
+This document tracks the parity between this Rust crate (`stellar-core-history`) and the C++ `stellar-core/src/history/` module. The upstream reference is `.upstream-v25/src/history/`.
 
-### Implemented
+### Module Mapping
 
-#### Core Archive Access
-- [x] `HistoryArchive` - HTTP client for fetching archive data (corresponds to parts of C++ `HistoryArchive`)
-- [x] `HistoryManager` - Multi-archive access with failover (similar to C++ `HistoryArchiveManager::selectRandomReadableHistoryArchive`)
-- [x] `HistoryArchiveState` - HAS file parsing/serialization with full JSON support
-- [x] Hot archive bucket support (protocol 23+ `hotArchiveBuckets`)
-- [x] Network passphrase field in HAS (version 2 format)
+| Rust Module | C++ File(s) | Status |
+|-------------|-------------|--------|
+| `lib.rs` | `HistoryManager.h` | Partial |
+| `archive.rs` | `HistoryArchive.h/cpp` | Partial |
+| `archive_state.rs` | `HistoryArchive.h` (HistoryArchiveState) | Complete |
+| `catchup.rs` | `historywork/*.cpp` (CatchupWork, etc.) | Partial |
+| `checkpoint.rs` | `HistoryManager.h` (static methods) | Complete |
+| `download.rs` | `historywork/GetRemoteFileWork.cpp` | Complete |
+| `paths.rs` | `HistoryArchive.h` (path helpers) | Complete |
+| `publish.rs` | `historywork/PublishWork.cpp`, `StateSnapshot.cpp` | Partial |
+| `publish_queue.rs` | `HistoryManagerImpl.cpp` (publish queue) | Partial |
+| `replay.rs` | `ledger/LedgerManagerImpl.cpp` (closeLedger) | Complete |
+| `verify.rs` | Various verification in catchup works | Complete |
+| `cdp.rs` | N/A (Rust-only, SEP-0054) | N/A |
+| `error.rs` | C++ exceptions | Complete |
 
-#### Path Generation
-- [x] Checkpoint path computation (`checkpoint_path`, `bucket_path`)
-- [x] Checkpoint frequency (64 ledgers)
-- [x] Checkpoint ledger calculations (`checkpoint_ledger`, `is_checkpoint_ledger`, `checkpoint_containing`)
-- [x] HAS path generation (`.well-known/stellar-history.json` and per-checkpoint paths)
+---
 
-#### Download Infrastructure
+### Implemented Features
+
+#### Core Archive Access (`archive.rs`, `lib.rs`)
+
+- [x] **HistoryArchive** - HTTP client for fetching archive data
+  - `get_root_has()` - Fetch `.well-known/stellar-history.json`
+  - `get_checkpoint_has()` - Fetch checkpoint-specific HAS files
+  - `get_ledger_headers()` - Download ledger header XDR files
+  - `get_transactions()` - Download transaction history XDR files
+  - `get_results()` - Download transaction result XDR files
+  - `get_scp_history()` - Download SCP history entries
+  - `get_bucket()` - Download bucket files by hash
+- [x] **HistoryManager** - Multi-archive access with failover
+  - Sequential archive iteration until one succeeds
+  - Similar to C++ `HistoryArchiveManager::selectRandomReadableHistoryArchive`
+- [x] **CatchupMode** enum - Minimal, Complete, Recent modes
+
+#### History Archive State (`archive_state.rs`)
+
+- [x] **HistoryArchiveState** - Full JSON parsing/serialization
+  - Version 1 and 2 format support
+  - Network passphrase field (version 2)
+  - `currentBuckets` array with curr/snap/next structure
+  - `hotArchiveBuckets` for protocol 23+ state archival
+- [x] **HASBucketLevel** - Per-level bucket hash tracking
+  - `curr` and `snap` bucket hashes
+  - `next` merge state tracking (parsed but not resolved)
+- [x] `all_bucket_hashes()` / `unique_bucket_hashes()` - Bucket enumeration
+- [x] `bucket_hashes_at_level()` / `hot_archive_bucket_hashes_at_level()`
+
+#### Path Generation (`paths.rs`, `checkpoint.rs`)
+
+- [x] **Checkpoint frequency** - 64 ledgers (matches `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING=false`)
+- [x] `checkpoint_ledger()` / `checkpoint_containing()` - Checkpoint calculation
+- [x] `is_checkpoint_ledger()` - Checkpoint boundary detection
+- [x] `latest_checkpoint_before_or_at()` - Find catchup starting point
+- [x] `checkpoint_path()` - Generate `{category}/AA/BB/CC/{category}-AABBCCDD.xdr.gz` paths
+- [x] `bucket_path()` - Generate `bucket/AA/BB/CC/bucket-{hash}.xdr.gz` paths
+- [x] `root_has_path()` - `.well-known/stellar-history.json`
+- [x] `has_path()` - Per-checkpoint HAS file paths
+
+#### Download Infrastructure (`download.rs`)
+
 - [x] HTTP download with configurable retries and timeouts
 - [x] Gzip decompression for archive files
 - [x] XDR stream parsing (record-marked format per RFC 5531)
-- [x] Bucket file download by hash
+- [x] `DownloadConfig` - Timeout, retry, and chunk size configuration
 
-#### Catchup
-- [x] `CatchupManager` - Full catchup orchestration
-- [x] Bucket download and application to BucketList
-- [x] Ledger header/transaction/result download
-- [x] Header chain verification
-- [x] Transaction set hash verification
-- [x] Transaction result set hash verification
-- [x] Bucket list hash verification at checkpoints
-- [x] Pre-downloaded checkpoint data support (`catchup_to_ledger_with_checkpoint_data`)
-- [x] Progress tracking with status callbacks (`CatchupProgress`, `CatchupStatus`)
-- [x] Disk-backed bucket storage for memory efficiency
+#### Catchup (`catchup.rs`)
 
-#### Replay
-- [x] Transaction re-execution replay (`replay_ledger_with_execution`)
-- [x] TransactionMeta-based replay (`replay_ledger`)
-- [x] Eviction iterator tracking (protocol 23+)
-- [x] Hot archive bucket list updates during eviction
-- [x] Invariant verification during replay
-- [x] Combined bucket list hash computation (live + hot archive)
+- [x] **CatchupManager** - Full catchup orchestration
+  - 7-step process: HAS download, bucket download, bucket apply, ledger download, verify, replay, complete
+  - Progress tracking with `CatchupProgress` and `CatchupStatus`
+- [x] **Bucket download and application**
+  - Parallel bucket downloads (16 concurrent, matches C++ `MAX_CONCURRENT_SUBPROCESSES`)
+  - Disk-backed bucket storage for memory efficiency
+  - Bucket hash verification before use
+- [x] **Ledger data download**
+  - Headers, transactions, and results per checkpoint
+  - SCP history entry download and persistence
+- [x] **Pre-downloaded checkpoint data support**
+  - `catchup_to_ledger_with_checkpoint_data()` for testing/alternative sources
+- [x] **Verification during catchup**
+  - Header chain verification
+  - Transaction set hash verification (classic and generalized)
+  - Transaction result set hash verification
+  - Bucket list hash verification at checkpoints
 
-#### Publishing
-- [x] `PublishManager` - Checkpoint publishing to local directory
-- [x] Ledger header, transaction, and result file writing
-- [x] Bucket file publishing
-- [x] HAS file generation
-- [x] Directory structure creation following archive layout
+#### Replay (`replay.rs`)
+
+- [x] **Transaction re-execution replay** (`replay_ledger_with_execution`)
+  - Re-executes transactions against bucket list state
+  - Produces init/live/dead entry batches for bucket list updates
+  - Works with traditional archives (no TransactionMeta needed)
+- [x] **TransactionMeta-based replay** (`replay_ledger`)
+  - Applies exact entry changes from archives
+  - Requires CDP or LedgerCloseMeta sources
+- [x] **Eviction iterator tracking** (protocol 23+)
+  - Loads `EvictionIterator` ConfigSettingEntry from checkpoint
+  - Incremental eviction scan during replay
+  - Updates iterator position per-ledger
+- [x] **Hot archive bucket list updates**
+  - Archived persistent entries moved to hot archive during eviction
+  - Combined bucket list hash: `SHA256(live_hash || hot_archive_hash)`
+- [x] **Invariant verification during replay**
+  - Conservation of lumens, valid entry structure, sequence progression
+- [x] **ReplayConfig** - Verification and event emission options
+
+#### Publishing (`publish.rs`)
+
+- [x] **PublishManager** - Checkpoint publishing to local directory
+  - `publish_checkpoint()` - Write all checkpoint files
+  - `is_published()` / `latest_published_checkpoint()` - Publication tracking
+- [x] **File writing**
+  - Ledger headers, transactions, results (gzipped XDR)
+  - Bucket files from bucket list entries
+  - HAS file generation (JSON)
+- [x] **Directory structure creation** following archive layout
+- [x] **Verification before publishing**
+  - Header chain verification
+  - Transaction set and result hash verification
 
 #### Publish Queue (`publish_queue.rs`)
-- [x] `PublishQueue` - Persistent queue backed by SQLite database
-- [x] `enqueue()` / `dequeue()` - Queue management with HAS state persistence
-- [x] `len()` / `is_empty()` - Queue size tracking
-- [x] `min_ledger()` / `max_ledger()` - Ledger range queries
-- [x] `get_state()` - Retrieve queued HistoryArchiveState
-- [x] `get_all()` - Load all queued checkpoints
-- [x] `get_referenced_bucket_hashes()` - Bucket retention tracking
-- [x] `stats()` / `log_status()` - Queue statistics and logging
 
-#### Verification
-- [x] Header chain verification
-- [x] Bucket hash verification
-- [x] Transaction set hash verification (classic and generalized)
-- [x] Transaction result set hash verification
-- [x] HAS structure validation
-- [x] SCP history entry verification
+- [x] **PublishQueue** - Persistent queue backed by SQLite
+  - `enqueue()` / `dequeue()` - Queue management with HAS state persistence
+  - `len()` / `is_empty()` - Queue size tracking
+  - `min_ledger()` / `max_ledger()` - Ledger range queries
+  - `get_state()` - Retrieve queued HistoryArchiveState
+  - `get_all()` - Load all queued checkpoints
+  - `get_referenced_bucket_hashes()` - Bucket retention tracking
+  - `stats()` / `log_status()` - Queue statistics and logging
+- [x] **Database schema** - `publishqueue` table matching C++ format
 
-#### CDP Integration
-- [x] `CdpDataLake` - SEP-0054 compliant data lake client
-- [x] LedgerCloseMeta fetching and parsing
-- [x] Transaction metadata extraction
-- [x] Evicted keys extraction (V2 format)
-- [x] Upgrade metadata extraction
+#### Verification (`verify.rs`)
+
+- [x] **Header chain verification** (`verify_header_chain`)
+- [x] **Bucket hash verification** (`verify_bucket_hash`)
+- [x] **Transaction set hash verification** (`verify_tx_set`, `compute_tx_set_hash`)
+  - Classic format: `SHA256(previous_ledger_hash || tx1_xdr || tx2_xdr || ...)`
+  - Generalized format: `SHA256(full_tx_set_xdr)`
+- [x] **Transaction result set verification** (`verify_tx_result_set`)
+- [x] **Ledger hash verification** (`verify_ledger_hash`)
+- [x] **HAS structure validation** (`verify_has_structure`, `verify_has_checkpoint`)
+- [x] **SCP history entry verification** (`verify_scp_history_entries`)
+
+#### CDP Integration (`cdp.rs`) - Rust Extension
+
+- [x] **CdpDataLake** - SEP-0054 compliant data lake client
+  - Partition and batch file path calculation
+  - Zstd decompression for LedgerCloseMetaBatch files
+- [x] `extract_ledger_header()` - Header extraction from LedgerCloseMeta
+- [x] `extract_transaction_envelopes()` - Transaction envelope extraction
+- [x] `extract_transaction_metas()` - TransactionMeta extraction
+- [x] `extract_transaction_results()` - Transaction result extraction
+- [x] `extract_evicted_keys()` - V2 evicted keys extraction
+- [x] `extract_upgrade_metas()` - Protocol upgrade metadata extraction
+- [x] `extract_transaction_processing()` - Combined envelope/result/meta extraction
+
+---
 
 ### Not Yet Implemented (Gaps)
 
-#### HistoryManager / Publishing Queue
-- [ ] **Publish queue migration** - `dropSQLBasedPublish()` for migrating old SQL-based queue format
-- [ ] **Publication success/failure tracking** - Metrics for `getPublishSuccessCount()`, `getPublishFailureCount()`
-- [ ] **Publication callback** - `historyPublished()` callback mechanism for successful/failed publication
+#### CheckpointBuilder (`CheckpointBuilder.h/cpp`)
 
-#### CheckpointBuilder
-- [ ] **ACID transactional checkpoint building** - C++ `CheckpointBuilder` provides crash-safe checkpoint construction with dirty files and atomic rename. Rust writes directly without crash recovery.
-- [ ] **Incremental transaction appending** - C++ appends transactions/results ledger-by-ledger during close. Rust requires all data upfront.
-- [ ] **Checkpoint restoration** - `restoreCheckpoint(lcl)` to recover publish state after crash based on LCL
-- [ ] **Dirty file cleanup** - `cleanup(lcl)` to remove uncommitted publish data
+- [ ] **ACID transactional checkpoint building**
+  - C++ writes to temporary `.dirty` files first, then atomically renames on commit
+  - Provides crash-safe checkpoint construction with automatic recovery
+  - Rust writes directly without crash recovery logic
+- [ ] **Incremental transaction appending**
+  - C++ `appendTransactionSet()` appends transactions ledger-by-ledger during close
+  - Rust requires all checkpoint data upfront for `publish_checkpoint()`
+- [ ] **Checkpoint restoration** (`restoreCheckpoint(lcl)`)
+  - Recovery of publish state after crash based on last committed ledger
+- [ ] **Dirty file cleanup** (`cleanup(lcl)`)
+  - Remove uncommitted publish data on startup
 
-#### HistoryArchive Operations
-- [ ] **Archive initialization** - `initializeHistoryArchive()` to create `.well-known/stellar-history.json` in new archive
-- [ ] **Remote put/mkdir commands** - C++ supports configurable shell commands for remote upload (`putFileCmd`, `mkdirCmd`). Rust only writes to local filesystem.
-- [ ] **Get/put/mkdir command templating** - Config-based command templates with `{0}` and `{1}` placeholders for files
+#### HistoryManager Publishing Integration
 
-#### Archive Manager
-- [ ] **Writable archive detection** - `publishEnabled()`, `getWritableHistoryArchives()` based on configured get/put commands
-- [ ] **Archive configuration validation** - `checkSensibleConfig()` for validating archive setup
-- [ ] **History archive reporting work** - `getHistoryArchiveReportWork()` to check last-published checkpoint on each archive
-- [ ] **Ledger header verification work** - `getCheckLedgerHeaderWork()` to verify header against archives
+- [ ] **Publish queue migration** (`dropSQLBasedPublish()`)
+  - One-time migration from old SQL-based format to file-based format
+  - Populates checkpoint files from DB history during upgrade
+- [ ] **Publication success/failure tracking**
+  - `getPublishSuccessCount()`, `getPublishFailureCount()` metrics
+  - Medida-based instrumentation in C++
+- [ ] **Publication callback** (`historyPublished()`)
+  - Callback mechanism for successful/failed publication
+  - Dequeues from publish queue after all archives succeed
+- [ ] **Wait for checkpoint publish** (`waitForCheckpointPublish()`)
+  - Blocking wait for publication completion (utility scenarios)
 
-#### StateSnapshot
-- [ ] **SCP message writing** - `writeSCPMessages()` for including SCP history in snapshots
-- [ ] **Differing HAS file computation** - `differingHASFiles()` to compute what files need uploading vs existing archive state
+#### HistoryArchive Remote Operations
+
+- [ ] **Archive initialization** (`initializeHistoryArchive()`)
+  - Create `.well-known/stellar-history.json` in new archive
+  - Currently Rust only reads from archives
+- [ ] **Remote put/mkdir commands**
+  - C++ supports configurable shell commands for remote upload (`putFileCmd`, `mkdirCmd`)
+  - Templates with `{0}` (local) and `{1}` (remote) placeholders
+  - Rust only writes to local filesystem
+- [ ] **Get command templating** (`getFileCmd`)
+  - C++ can use shell commands for fetch, not just HTTP
+
+#### HistoryArchiveManager
+
+- [ ] **Writable archive detection** (`publishEnabled()`, `getWritableHistoryArchives()`)
+  - Based on presence of both `get` and `put` commands in config
+- [ ] **Archive configuration validation** (`checkSensibleConfig()`)
+  - Verify archive URLs are accessible, commands are valid
+- [ ] **History archive report work** (`getHistoryArchiveReportWork()`)
+  - Check last-published checkpoint on each configured archive
+- [ ] **Ledger header verification work** (`getCheckLedgerHeaderWork()`)
+  - Verify a ledger header against archives
 
 #### FutureBucket Support
-- [ ] **In-progress merge tracking** - HAS `next` field with `state` and `output` for async bucket merges. Rust parses but ignores merge state.
-- [ ] **Future resolution** - `resolveAllFutures()`, `resolveAnyReadyFutures()` for completing pending bucket merges
 
-#### Ledger/Transaction History Utilities
-- [ ] **Gap handling in history streams** - `getHistoryEntryForLedger()` template for iterating history entries with gaps
+- [ ] **In-progress merge resolution**
+  - HAS `next` field with `state != 0` indicates ongoing bucket merge
+  - C++ `resolveAllFutures()`, `resolveAnyReadyFutures()` for completing merges
+  - Rust parses `next` field but ignores merge state
+- [ ] **Bucket merge persistence**
+  - C++ can save/restore in-progress merges across restarts
+
+#### StateSnapshot (`StateSnapshot.h/cpp`)
+
+- [ ] **SCP message writing** (`writeSCPMessages()`)
+  - Include SCP history in published snapshots
+- [ ] **Differing HAS file computation** (`differingHASFiles()`)
+  - Compute what files need uploading vs existing archive state
+  - Optimization for incremental publishing
 
 #### Testing Support
-- [ ] **Publication enable/disable** - `setPublicationEnabled(bool)` for testing
-- [ ] **Throw-on-append testing** - `mThrowOnAppend` for crash testing
 
-### Implementation Notes
+- [ ] **Publication enable/disable** (`setPublicationEnabled(bool)`)
+  - Testing interface to pause/resume publication
+- [ ] **Throw-on-append testing** (`mThrowOnAppend`)
+  - Crash testing for checkpoint builder
+- [ ] **Accelerated checkpoint frequency**
+  - `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING` sets frequency to 8
 
-#### Architectural Differences
+---
 
-1. **Async Model**: The Rust implementation uses `async/await` with Tokio, while C++ uses a Work-based state machine pattern. The Rust approach is more idiomatic for async Rust code but doesn't map 1:1 to C++ Work classes.
+### Architectural Differences
 
-2. **Database Integration**: C++ integrates deeply with its SQL database for persistent state (publish queue, archive state). The Rust implementation is more standalone, using the `stellar-core-db` crate only for ledger history storage.
+#### Async Model
 
-3. **Remote Publishing**: C++ supports configurable shell commands for remote archive access (S3, GCS, etc.). Rust currently only writes to local filesystem; remote upload would need to be handled externally or via a separate upload utility.
+The Rust implementation uses `async/await` with Tokio, while C++ uses a Work-based state machine pattern (WorkScheduler, BasicWork subclasses). The Rust approach is more idiomatic but doesn't map 1:1 to C++ Work classes like `GetRemoteFileWork`, `ApplyBucketsWork`, etc.
 
-4. **Crash Safety**: C++ `CheckpointBuilder` implements careful ACID-like semantics with dirty files and atomic renames. Rust's `PublishManager` writes files directly without explicit crash recovery logic.
+#### Database Integration
 
-5. **Metrics**: C++ uses the Medida library for publish success/failure metrics. Rust doesn't yet have equivalent instrumentation.
+C++ integrates deeply with its SQL database for persistent state:
+- Publish queue in DB (migrated to files in recent versions)
+- Transaction/result history from DB during catchup
+- LCL tracking for crash recovery
 
-#### Design Decisions
+Rust uses `stellar-core-db` more standalone, with dedicated queries for:
+- Storing ledger headers and transaction history
+- Bucket list snapshots
+- SCP history entries
 
-1. **CDP Integration**: The Rust crate includes first-class CDP/SEP-0054 support, which is not part of the C++ history module. This provides access to `LedgerCloseMeta` for detailed transaction metadata.
+#### Remote Publishing
 
-2. **Disk-Backed Buckets**: During catchup, the Rust implementation saves buckets to disk and uses memory-mapped access, avoiding loading all bucket entries into memory. This is similar to C++ but implemented differently.
+C++ supports configurable shell commands for remote archive access:
+```toml
+[HISTORY.archive_name]
+get = "curl -sf {0} -o {1}"
+put = "aws s3 cp {1} s3://bucket{0} --region us-east-1"
+mkdir = "aws s3 mb s3://bucket{0}"
+```
 
-3. **Re-execution Focus**: The Rust crate emphasizes transaction re-execution during replay rather than TransactionMeta application. This works with traditional archives but may produce different intermediate results than C++ stellar-core.
+Rust currently only writes to local filesystem. Remote upload would need external tooling or a separate upload utility.
 
-4. **Invariant Integration**: The Rust crate integrates with `stellar-core-invariant` for runtime verification during replay, providing checks like conservation of lumens and valid ledger entry structure.
+#### Crash Safety
+
+C++ `CheckpointBuilder` implements ACID-like semantics:
+1. Write to `.dirty` temp files with fsync
+2. Atomic rename to final names after commit
+3. `cleanup(lcl)` on startup to recover valid state
+4. File-based publish queue with `durableRename`
+
+Rust's `PublishManager` writes files directly without explicit crash recovery. The publish queue uses SQLite transactions for atomicity.
+
+#### Metrics and Instrumentation
+
+C++ uses Medida for publish success/failure metrics and timing:
+- `history.publish.success` / `history.publish.failure` meters
+- `history.publish.time` timer
+- StatusManager for publish status messages
+
+Rust uses `tracing` for structured logging but lacks equivalent metrics.
+
+---
+
+### Design Decisions (Rust Extensions)
+
+#### CDP Integration (SEP-0054)
+
+The Rust crate includes first-class CDP support not present in C++:
+- `CdpDataLake` for accessing LedgerCloseMeta from cloud storage
+- Full `TransactionMeta` extraction for exact replay
+- Evicted keys and upgrade metadata extraction
+
+This provides richer data than traditional archives for indexers and replay.
+
+#### Disk-Backed Buckets
+
+During catchup, Rust saves buckets to disk and uses file-backed storage with compact key-to-offset indexes. This is similar in spirit to C++'s bucket management but implemented differently:
+- Buckets cached as `{hash}.bucket` files
+- Memory-mapped access for large buckets
+- Reduces memory from O(entries) to O(unique_keys) for indexes
+
+#### Re-execution Focus
+
+Rust emphasizes transaction re-execution during replay rather than TransactionMeta application:
+- Works with traditional archives lacking TransactionMeta
+- May produce different intermediate results than C++
+- Final state verification at checkpoints ensures correctness
+
+For exact verification, CDP data with `LedgerCloseMeta` can be used.
+
+#### Invariant Integration
+
+The Rust crate integrates with `stellar-core-invariant` for runtime verification:
+- Conservation of lumens
+- Valid ledger entry structure
+- Sequence number progression
+- Close time non-decreasing
+- Liabilities match offers
+- Order book not crossed
+
+These run during replay when `verify_invariants` is enabled.
