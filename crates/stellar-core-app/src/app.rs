@@ -531,8 +531,8 @@ struct ScpLatencyTracker {
     first_seen: HashMap<u64, Instant>,
     self_sent: HashMap<u64, Instant>,
     self_to_other_recorded: HashSet<u64>,
-    first_to_self_samples_ms: Vec<u64>,
-    self_to_other_samples_ms: Vec<u64>,
+    first_to_self_samples_ms: VecDeque<u64>,
+    self_to_other_samples_ms: VecDeque<u64>,
 }
 
 #[derive(Debug)]
@@ -599,10 +599,10 @@ impl ScpLatencyTracker {
         None
     }
 
-    fn push_sample(samples: &mut Vec<u64>, value: u64) {
-        samples.push(value);
+    fn push_sample(samples: &mut VecDeque<u64>, value: u64) {
+        samples.push_back(value);
         if samples.len() > Self::MAX_SAMPLES {
-            let _ = samples.remove(0);
+            samples.pop_front();
         }
     }
 
@@ -1507,8 +1507,10 @@ impl App {
 
         {
             let mut reporting = self.survey_reporting.write().await;
-            while requests_sent < MAX_REQUEST_LIMIT_PER_LEDGER && !reporting.queue.is_empty() {
-                let peer_id = reporting.queue.pop_front().unwrap();
+            while requests_sent < MAX_REQUEST_LIMIT_PER_LEDGER {
+                let Some(peer_id) = reporting.queue.pop_front() else {
+                    break;
+                };
                 if !reporting.peers.remove(&peer_id) {
                     continue;
                 }
@@ -2681,7 +2683,7 @@ impl App {
             return;
         }
 
-        let last_buffered = *buffer.keys().next_back().unwrap();
+        let last_buffered = *buffer.keys().next_back().expect("checked non-empty above");
         let trim_before = if Self::is_first_ledger_in_checkpoint(last_buffered) {
             if last_buffered == 0 {
                 return;

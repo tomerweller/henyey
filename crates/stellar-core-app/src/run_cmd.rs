@@ -1237,9 +1237,7 @@ fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<String> {
 }
 
 fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
-    CryptoPublicKey::from_bytes(peer_id.as_bytes())
-        .ok()
-        .map(|pk| pk.to_strkey())
+    node_id_to_strkey(&stellar_xdr::curr::NodeId(peer_id.0))
 }
 
 fn map_upgrade_item(upgrade: LedgerUpgrade) -> Option<UpgradeItem> {
