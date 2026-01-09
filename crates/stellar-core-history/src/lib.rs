@@ -111,6 +111,7 @@ pub mod verify;
 // Publishing and external data sources
 pub mod cdp;
 pub mod publish;
+pub mod publish_queue;
 
 // Error handling
 pub mod error;
@@ -131,6 +132,7 @@ pub use checkpoint::{
 pub use download::DownloadConfig;
 pub use error::HistoryError;
 pub use paths::{bucket_path, checkpoint_ledger, checkpoint_path};
+pub use publish_queue::{PublishQueue, PublishQueueStats};
 pub use replay::{LedgerReplayResult, ReplayConfig, ReplayedLedgerState};
 pub use verify::{compute_header_hash, verify_bucket_hash, verify_header_chain};
 

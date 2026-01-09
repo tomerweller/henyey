@@ -50,6 +50,16 @@ This section documents the parity between this Rust crate and its C++ upstream c
 - [x] HAS file generation
 - [x] Directory structure creation following archive layout
 
+#### Publish Queue (`publish_queue.rs`)
+- [x] `PublishQueue` - Persistent queue backed by SQLite database
+- [x] `enqueue()` / `dequeue()` - Queue management with HAS state persistence
+- [x] `len()` / `is_empty()` - Queue size tracking
+- [x] `min_ledger()` / `max_ledger()` - Ledger range queries
+- [x] `get_state()` - Retrieve queued HistoryArchiveState
+- [x] `get_all()` - Load all queued checkpoints
+- [x] `get_referenced_bucket_hashes()` - Bucket retention tracking
+- [x] `stats()` / `log_status()` - Queue statistics and logging
+
 #### Verification
 - [x] Header chain verification
 - [x] Bucket hash verification
@@ -68,9 +78,7 @@ This section documents the parity between this Rust crate and its C++ upstream c
 ### Not Yet Implemented (Gaps)
 
 #### HistoryManager / Publishing Queue
-- [ ] **Persistent publish queue** - C++ uses SQL database to persist checkpoints queued for publication (`publishQueueLength`, `getMinLedgerQueuedToPublish`, `getMaxLedgerQueuedToPublish`). Rust only supports immediate local directory publishing.
 - [ ] **Publish queue migration** - `dropSQLBasedPublish()` for migrating old SQL-based queue format
-- [ ] **Missing bucket recovery** - `getMissingBucketsReferencedByPublishQueue()` to identify buckets needed from archives before publishing can resume
 - [ ] **Publication success/failure tracking** - Metrics for `getPublishSuccessCount()`, `getPublishFailureCount()`
 - [ ] **Publication callback** - `historyPublished()` callback mechanism for successful/failed publication
 

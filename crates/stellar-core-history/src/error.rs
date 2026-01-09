@@ -121,4 +121,8 @@ pub enum HistoryError {
     /// Bucket error from stellar-core-bucket crate.
     #[error("bucket error: {0}")]
     Bucket(#[from] stellar_core_bucket::BucketError),
+
+    /// Database error from stellar-core-db crate.
+    #[error("database error: {0}")]
+    Database(#[from] stellar_core_db::DbError),
 }
