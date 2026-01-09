@@ -44,12 +44,6 @@ impl SimulationDriver {
         }
     }
 
-    #[allow(dead_code)]
-    fn with_validation_level(mut self, level: ValidationLevel) -> Self {
-        self.validation_level = level;
-        self
-    }
-
     fn register_quorum_set(&self, node_id: NodeId, qset: ScpQuorumSet) {
         self.quorum_sets.write().unwrap().insert(node_id, qset);
     }
@@ -312,21 +306,6 @@ impl Simulation {
 
     fn get_driver(&self, node_id: &NodeId) -> &Arc<SimulationDriver> {
         self.drivers.get(node_id).unwrap()
-    }
-
-    /// Broadcast all emitted envelopes from one node to all other nodes.
-    #[allow(dead_code)]
-    fn broadcast_from(&self, source: &NodeId) {
-        let envelopes = self.get_driver(source).get_emitted_envelopes();
-        self.get_driver(source).clear_emitted();
-
-        for envelope in envelopes {
-            for (node_id, scp) in &self.nodes {
-                if node_id != source {
-                    scp.receive_envelope(envelope.clone());
-                }
-            }
-        }
     }
 
     /// Broadcast all pending envelopes from all nodes until no more are generated.
