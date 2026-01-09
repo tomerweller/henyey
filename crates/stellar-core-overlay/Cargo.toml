@@ -24,6 +24,7 @@ socket2.workspace = true
 x25519-dalek.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+blake2.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -38,6 +39,10 @@ dashmap.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 hex.workspace = true
+stellar-strkey.workspace = true
+
+# Database
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -73,21 +73,53 @@
 //! ```
 
 mod auth;
+mod ban_manager;
 mod codec;
 mod connection;
 mod error;
 mod flood;
+mod flow_control;
+mod item_fetcher;
 mod manager;
+mod message_handlers;
+mod metrics;
 mod peer;
+mod peer_manager;
+mod survey;
+mod tx_adverts;
+mod tx_demands;
 
 // Re-export public types
 pub use auth::{AuthCert, AuthContext, AuthState};
+pub use ban_manager::BanManager;
 pub use codec::{helpers as message_helpers, MessageCodec, MessageFrame};
 pub use connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
 pub use error::OverlayError;
 pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
+pub use flow_control::{
+    is_flood_message, FlowControl, FlowControlConfig, FlowControlStats, MessagePriority,
+    QueuedOutboundMessage, SendMoreCapacity,
+};
+pub use item_fetcher::{
+    ItemFetcher, ItemFetcherConfig, ItemFetcherStats, ItemType, NextPeerResult, PendingRequest,
+    Tracker,
+};
 pub use manager::{OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
+pub use message_handlers::{MessageDispatcher, MessageDispatcherStats, TxSetData};
+pub use metrics::{Counter, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot};
 pub use peer::{Peer, PeerInfo, PeerSender, PeerState, PeerStats, PeerStatsSnapshot};
+pub use peer_manager::{
+    BackOffUpdate, PeerManager, PeerQuery, PeerRecord, PeerTypeFilter, StoredPeerType, TypeUpdate,
+};
+pub use survey::{
+    CollectingNodeData, CollectingPeerData, SurveyConfig, SurveyManager, SurveyManagerStats,
+    SurveyPhase, TimeSlicedNodeData, TimeSlicedPeerData, SURVEY_THROTTLE_TIMEOUT_MULT,
+};
+pub use tx_adverts::{TxAdverts, TxAdvertsConfig, TxAdvertsStats, TX_ADVERT_VECTOR_MAX_SIZE};
+pub use tx_demands::{
+    CleanupResult, DemandStatus, PeerDemandResult, TxDemandsConfig, TxDemandsManager,
+    TxDemandsStats, TxKnownStatus, TxPullLatency, MAX_RETRY_COUNT, TX_DEMAND_VECTOR_MAX_SIZE,
+};
 
 use tokio::sync::mpsc;
 
@@ -289,6 +321,54 @@ impl PeerAddress {
     pub fn to_socket_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    /// Returns true if this address is a private/local network address.
+    ///
+    /// Private addresses include:
+    /// - 10.0.0.0/8 (10.x.x.x)
+    /// - 172.16.0.0/12 (172.16-31.x.x)
+    /// - 192.168.0.0/16 (192.168.x.x)
+    /// - 127.0.0.0/8 (localhost)
+    /// - ::1 (IPv6 localhost)
+    ///
+    /// These addresses should not be shared with other peers as they
+    /// are not routable on the public internet.
+    pub fn is_private(&self) -> bool {
+        use std::net::IpAddr;
+
+        // Try to parse as IP address
+        if let Ok(ip) = self.host.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(ipv4) => {
+                    let octets = ipv4.octets();
+                    // 10.0.0.0/8
+                    if octets[0] == 10 {
+                        return true;
+                    }
+                    // 172.16.0.0/12
+                    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                        return true;
+                    }
+                    // 192.168.0.0/16
+                    if octets[0] == 192 && octets[1] == 168 {
+                        return true;
+                    }
+                    // 127.0.0.0/8 (loopback)
+                    if octets[0] == 127 {
+                        return true;
+                    }
+                    false
+                }
+                IpAddr::V6(ipv6) => {
+                    // ::1 (loopback)
+                    ipv6.is_loopback()
+                }
+            }
+        } else {
+            // Hostname - check for localhost
+            self.host == "localhost"
+        }
+    }
 }
 
 impl std::fmt::Display for PeerAddress {
@@ -335,6 +415,26 @@ impl PeerId {
     /// Returns the full hex-encoded representation of the public key.
     pub fn to_hex(&self) -> String {
         hex::encode(self.as_bytes())
+    }
+
+    /// Returns the Stellar strkey-encoded representation of the public key.
+    ///
+    /// The strkey format is the standard way to represent Stellar public keys
+    /// as human-readable strings starting with 'G'.
+    pub fn to_strkey(&self) -> String {
+        stellar_strkey::ed25519::PublicKey(*self.as_bytes()).to_string()
+    }
+
+    /// Creates a `PeerId` from a Stellar strkey-encoded public key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is not a valid Stellar public key strkey.
+    pub fn from_strkey(strkey: &str) -> Result<Self> {
+        let pk: stellar_strkey::ed25519::PublicKey = strkey
+            .parse()
+            .map_err(|e| OverlayError::InvalidPeerAddress(format!("Invalid strkey: {}", e)))?;
+        Ok(Self::from_bytes(pk.0))
     }
 }
 

@@ -50,6 +50,64 @@ The following features from the C++ overlay are implemented in Rust:
   - Rate limiting (messages per second)
   - Forward peer calculation (exclude senders)
 
+- **FlowControl** (`flow_control.rs`) - Full flow control with capacity tracking
+  - Message and byte capacity tracking (local and outbound)
+  - Priority queuing (SCP > TX > Demand > Advert)
+  - Load shedding when queues are full
+  - Throttling detection and logging
+  - SEND_MORE_EXTENDED message validation
+  - Queue trimming for overloaded connections
+
+- **ItemFetcher / Tracker** (`item_fetcher.rs`) - Anycast fetch for TxSet and QuorumSet
+  - Tracker for each item being fetched
+  - Retry logic with timeout handling
+  - Envelope tracking (which envelopes need which data)
+  - Peer rotation when DontHave received
+  - Exponential backoff on list rebuild
+
+- **MessageDispatcher** (`message_handlers.rs`) - Message handlers for fetch protocol
+  - GetTxSet / TxSet / GeneralizedTxSet handling
+  - GetScpQuorumSet / ScpQuorumset handling
+  - DontHave message routing
+  - TxSet and QuorumSet caching
+  - Callback integration for item receipt
+
+- **TxAdverts** (`tx_adverts.rs`) - Transaction advertisement batching for pull-mode flooding
+  - Incoming advert queuing for demanding
+  - Outgoing advert batching with periodic flush
+  - History cache for duplicate detection
+  - Retry queue for failed demands
+  - Configurable batch size and flush period
+
+- **TxDemandsManager** (`tx_demands.rs`) - Transaction demand scheduling with retry logic
+  - Demand status tracking (Demand, RetryLater, Discard)
+  - Linear backoff for retries (up to MAX_RETRY_COUNT attempts)
+  - Demand history per transaction and peer
+  - Pull latency tracking (end-to-end and per-peer)
+  - Cleanup of abandoned demands
+  - Respond to incoming FloodDemand messages
+
+- **OverlayMetrics** (`metrics.rs`) - Comprehensive metrics collection
+  - Message metrics (read, write, drop, broadcast)
+  - Byte metrics (read, write)
+  - Error and timeout counters
+  - Connection latency timers
+  - Per-message-type receive timers and send counters
+  - Queue delay timers and drop counters per priority
+  - Flood metrics (demanded, fulfilled, unfulfilled)
+  - Pull latency timers
+  - Thread-safe atomic counters
+
+- **SurveyManager** (`survey.rs`) - Network topology survey orchestration
+  - Survey lifecycle (Collecting -> Reporting -> Inactive phases)
+  - Node and peer data collection during surveys
+  - Surveyor allowlist for authorization
+  - Message rate limiting (SurveyMessageLimiter)
+  - Peer backlog management for survey requests
+  - Bad response node tracking
+  - Phase timeout handling
+  - Finalized time-sliced node and peer data reporting
+
 #### Configuration & Types
 - **OverlayConfig** - Testnet/Mainnet presets, configurable limits
 - **LocalNode** - Node identity with protocol versions
@@ -74,20 +132,7 @@ The following features from the C++ overlay are implemented in Rust:
 
 ### Not Yet Implemented (Gaps)
 
-The following C++ components are not yet implemented:
-
-#### Major Features
-
-| C++ Component | Files | Description | Priority |
-|--------------|-------|-------------|----------|
-| **FlowControl** | `FlowControl.h/cpp`, `FlowControlCapacity.h/cpp` | Full flow control with capacity tracking, outbound queuing, load shedding, message prioritization (SCP > TX > Demand > Advert) | High |
-| **ItemFetcher** | `ItemFetcher.h/cpp`, `Tracker.h/cpp` | Anycast fetch for TxSet and QuorumSet with retry logic, timeout handling, and envelope tracking | High |
-| **BanManager** | `BanManager.h/cpp`, `BanManagerImpl.h/cpp` | Persistent ban list in database, ban duration, unban functionality | Medium |
-| **PeerManager** | `PeerManager.h/cpp` | Persistent peer storage in database, failure tracking, next-attempt scheduling, backoff | Medium |
-| **SurveyManager** | `SurveyManager.h/cpp`, `SurveyDataManager.h/cpp`, `SurveyMessageLimiter.h/cpp` | Network topology surveys, time-sliced surveys, survey data collection and reporting | Medium |
-| **TxAdverts** | `TxAdverts.h/cpp` | Transaction advertisement batching, outgoing advert queue, advert history cache | Medium |
-| **TxDemandsManager** | `TxDemandsManager.h/cpp` | Transaction demand scheduling, retry with linear backoff, demand timeout handling | Medium |
-| **OverlayMetrics** | `OverlayMetrics.h/cpp` | Comprehensive metrics collection via medida (timers, meters, counters, histograms) | Low |
+All major components have been implemented. The following items are minor gaps or intentional architectural differences:
 
 #### Message Handlers
 
@@ -95,60 +140,47 @@ The following message types are received but not fully processed:
 
 | Message Type | Status |
 |--------------|--------|
-| `GetTxSet` | Not handled (need TxSet storage) |
-| `TxSet` / `GeneralizedTxSet` | Not handled (need ItemFetcher) |
-| `GetScpQuorumSet` | Not handled (need QuorumSet storage) |
-| `ScpQuorumset` | Not handled (need ItemFetcher) |
+| `GetTxSet` | **Implemented** - Returns cached TxSet or DontHave |
+| `TxSet` / `GeneralizedTxSet` | **Implemented** - Cached and triggers callbacks |
+| `GetScpQuorumSet` | **Implemented** - Returns cached QuorumSet or DontHave |
+| `ScpQuorumset` | **Implemented** - Cached and triggers callbacks |
 | `ScpMessage` | Forwarded to subscribers only (no SCP integration) |
 | `GetScpState` | Not handled (need SCP state) |
 | `Transaction` | Forwarded to subscribers only (no transaction queue) |
-| `FloodAdvert` | Not handled (need TxAdverts) |
-| `FloodDemand` | Not handled (need TxDemandsManager) |
-| `TimeSlicedSurvey*` | Not handled (need SurveyManager) |
-| `DontHave` | Not handled (need ItemFetcher) |
+| `FloodAdvert` | **Implemented** - TxAdverts handles queuing, TxDemandsManager schedules demands |
+| `FloodDemand` | **Implemented** - TxDemandsManager handles incoming demands |
+| `TimeSlicedSurvey*` | **Implemented** - SurveyManager handles survey lifecycle and data collection |
+| `DontHave` | **Implemented** - Routes to ItemFetcher for retry |
 
 #### Detailed Feature Gaps
 
-1. **Flow Control (Full Implementation)**
-   - C++: Tracks local/remote capacity separately for messages and bytes
-   - C++: Priority queuing (SCP > TX > Demand > Advert)
-   - C++: Load shedding when queues are full
-   - C++: Throttling detection and logging
-   - Rust: Basic SendMoreExtended sending only
-
-2. **Pull-Mode Transaction Flooding**
+1. **Pull-Mode Transaction Flooding**
    - C++: TxAdverts batches outgoing transaction hashes
    - C++: FloodAdvert/FloodDemand message processing
-   - C++: Demand retry with exponential backoff
+   - C++: Demand retry with linear backoff
    - C++: Pull latency metrics
-   - Rust: Not implemented
+   - Rust: **Implemented** - TxAdverts (batching, queuing), TxDemandsManager (scheduling, retry, latency)
 
-3. **Persistent Peer Database**
+2. **Persistent Peer Database**
    - C++: Peers stored in SQLite with failure counts
    - C++: Backoff scheduling for failed peers
    - C++: Random peer selection from database
-   - Rust: In-memory only
+   - Rust: **Implemented** - PeerManager with SQLite persistence, failure tracking, backoff scheduling
 
-4. **Quorum Set and Transaction Set Fetching**
-   - C++: ItemFetcher tracks which envelopes need which data
-   - C++: Tracker manages retry across multiple peers
-   - C++: DontHave message triggers next peer attempt
-   - Rust: Not implemented
-
-5. **Background Thread Processing**
+3. **Background Thread Processing**
    - C++: Optional background overlay processing
    - C++: Thread-safe message handling
    - Rust: Tokio async only (different approach)
 
-6. **Peer Door (Listener)**
+4. **Peer Door (Listener)**
    - C++: PeerDoor.h/cpp for inbound connection acceptance
    - Rust: Integrated into OverlayManager listener task
 
-7. **Peer Bare Address**
+5. **Peer Bare Address**
    - C++: PeerBareAddress for IP + port with IPv4/IPv6 parsing
    - Rust: Simpler PeerAddress type
 
-8. **Hmac Helper**
+6. **Hmac Helper**
    - C++: Hmac.h/cpp wrapper around crypto
    - Rust: Direct use of hmac crate
 
@@ -190,22 +222,38 @@ The following message types are received but not fully processed:
 #### Testing Status
 
 - Unit tests for auth, codec, flood gate
+- Unit tests for FlowControl (capacity tracking, throttling, queue management)
+- Unit tests for ItemFetcher/Tracker (fetch lifecycle, retry logic, envelope tracking)
+- Unit tests for MessageDispatcher (message handling, caching, callbacks)
+- Unit tests for BanManager (in-memory and SQLite persistence)
+- Unit tests for PeerManager (failure tracking, backoff, type updates, persistence)
+- Unit tests for TxAdverts (queuing, batching, history cache, limits)
+- Unit tests for TxDemandsManager (demand status, retries, pull latency, cleanup)
+- Unit tests for OverlayMetrics (counters, timers, snapshots, thread safety)
+- Unit tests for SurveyManager (lifecycle, data collection, rate limiting, peer backlog)
 - No integration tests with real network yet
 - No loopback peer for in-process testing
 
 ### Recommended Implementation Order
 
-1. **High Priority** (needed for basic functionality):
-   - Full FlowControl with capacity tracking
-   - ItemFetcher and Tracker for TxSet/QuorumSet fetching
-   - Message handlers for GetTxSet, DontHave
+All major components have been implemented. Summary:
 
-2. **Medium Priority** (needed for production):
-   - PeerManager with database persistence
-   - BanManager with persistent bans
-   - TxAdverts and TxDemandsManager for pull-mode flooding
+1. **High Priority** (completed):
+   - ~~Full FlowControl with capacity tracking~~ **Done**
+   - ~~ItemFetcher and Tracker for TxSet/QuorumSet fetching~~ **Done**
+   - ~~Message handlers for GetTxSet, TxSet, GetScpQuorumSet, ScpQuorumset, DontHave~~ **Done**
 
-3. **Lower Priority** (nice to have):
-   - SurveyManager for network topology
-   - Full OverlayMetrics integration
-   - Background thread processing option
+2. **Medium Priority** (completed):
+   - ~~PeerManager with database persistence~~ **Done**
+   - ~~BanManager with persistent bans~~ **Done**
+   - ~~TxAdverts for pull-mode flooding~~ **Done**
+   - ~~TxDemandsManager for demand scheduling and retry logic~~ **Done**
+   - ~~OverlayMetrics for comprehensive metrics~~ **Done**
+
+3. **Lower Priority** (completed):
+   - ~~SurveyManager for network topology~~ **Done**
+
+4. **Future Enhancements** (nice to have):
+   - Integration tests with real network
+   - Loopback peer for in-process testing
+   - Full Curve25519 encryption for survey responses

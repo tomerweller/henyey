@@ -97,6 +97,18 @@ pub enum OverlayError {
     #[error("overlay is shutting down")]
     ShuttingDown,
 
+    // ===== Address Errors =====
+
+    /// Invalid peer address format.
+    #[error("invalid peer address: {0}")]
+    InvalidPeerAddress(String),
+
+    // ===== Database Errors =====
+
+    /// Database operation failed.
+    #[error("database error: {0}")]
+    DatabaseError(String),
+
     // ===== Wrapped Errors =====
 
     /// XDR serialization/deserialization error.

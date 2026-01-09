@@ -65,6 +65,7 @@ stellar-core-simulation = { path = "crates/stellar-core-simulation" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
+blake2 = "0.10"
 hmac = "0.12"
 crypto_box = { version = "0.9", features = ["seal"] }
 
