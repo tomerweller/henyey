@@ -945,8 +945,8 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     }
 
     println!();
-    let first_checkpoint = *checkpoints_to_publish.first().unwrap();
-    let last_checkpoint = *checkpoints_to_publish.last().unwrap();
+    let first_checkpoint = *checkpoints_to_publish.first().expect("checked non-empty above");
+    let last_checkpoint = *checkpoints_to_publish.last().expect("checked non-empty above");
     println!(
         "Publishing checkpoints {} to {}...",
         first_checkpoint, last_checkpoint
@@ -1187,7 +1187,7 @@ fn build_scp_history_entries(
         }
 
         let mut qset_hashes = qset_hashes.into_iter().collect::<Vec<_>>();
-        qset_hashes.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        qset_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         let mut qsets = Vec::new();
         for hash in qset_hashes {

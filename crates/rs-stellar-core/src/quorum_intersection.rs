@@ -131,6 +131,12 @@ fn is_quorum_for_set(nodes: &HashSet<NodeId>, qmap: &HashMap<NodeId, ScpQuorumSe
     is_quorum(local_qset, nodes, |node_id| qmap.get(node_id).cloned())
 }
 
+/// Maximum number of nodes supported for quorum intersection analysis.
+///
+/// The algorithm is O(2^n * n^2), so we cap at 20 nodes to prevent
+/// runaway computation (2^20 ≈ 1 million subsets).
+const MAX_QUORUM_INTERSECTION_NODES: usize = 20;
+
 /// Checks if the network enjoys quorum intersection.
 ///
 /// Enumerates all possible node subsets, identifies which ones form valid
@@ -146,10 +152,21 @@ fn is_quorum_for_set(nodes: &HashSet<NodeId>, qmap: &HashMap<NodeId, ScpQuorumSe
 /// # Returns
 ///
 /// `true` if all quorum pairs intersect, `false` otherwise.
+///
+/// # Panics
+///
+/// Panics if the network has more than [`MAX_QUORUM_INTERSECTION_NODES`] nodes.
 fn network_enjoys_quorum_intersection(qmap: &HashMap<NodeId, ScpQuorumSet>) -> bool {
     let nodes: Vec<NodeId> = qmap.keys().cloned().collect();
     if nodes.is_empty() {
         return false;
+    }
+    if nodes.len() > MAX_QUORUM_INTERSECTION_NODES {
+        panic!(
+            "Quorum intersection analysis only supports up to {} nodes, got {}",
+            MAX_QUORUM_INTERSECTION_NODES,
+            nodes.len()
+        );
     }
 
     // Enumerate all possible quorums by checking every subset
