@@ -253,3 +253,15 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - Metrics collection and reporting
 - ~~JSON API for admin endpoints~~ - DONE: `json_api.rs`
 - Upgrade scheduling with time-based triggers (partially done in `upgrades.rs`)
+
+#### App Integration Status
+
+The following herder features are now integrated with the main application:
+
+- **Periodic cleanup**: 30s interval cleanup of expired pending envelopes, transactions, and old tx sets
+- **Quorum loss detection**: `heard_from_quorum()` and `is_v_blocking()` checks in heartbeat
+- **Close time drift tracking**: `CloseTimeDriftTracker` records local/network times and warns on drift
+- **Transaction banning**: Failed transactions banned; ban queue shifts on ledger close
+- **Pending envelope statistics**: `PendingStats` exposed via `HerderStats`
+- **Transaction queue introspection**: `TxQueueStats` provides queue state visibility
+- **Sync recovery manager**: Background task monitors for consensus stuck (35s timeout) and triggers recovery
