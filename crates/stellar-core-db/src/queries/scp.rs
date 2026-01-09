@@ -264,7 +264,7 @@ impl ScpStatePersistenceQueries for Connection {
     fn save_tx_set_data(&self, hash: &Hash, data: &[u8]) -> Result<(), DbError> {
         // Use a txsets-style table but store by hash
         // For simplicity, we'll use the storestate table with a "txset:" prefix
-        let key = format!("txset:{}", hex::encode(&hash.0));
+        let key = format!("txset:{}", hex::encode(hash.0));
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
         self.execute(
             "INSERT OR REPLACE INTO storestate (statename, state) VALUES (?1, ?2)",
@@ -274,7 +274,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_tx_set_data(&self, hash: &Hash) -> Result<Option<Vec<u8>>, DbError> {
-        let key = format!("txset:{}", hex::encode(&hash.0));
+        let key = format!("txset:{}", hex::encode(hash.0));
         let result: Option<String> = self
             .query_row(
                 "SELECT state FROM storestate WHERE statename = ?1",
@@ -328,7 +328,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn has_tx_set_data(&self, hash: &Hash) -> Result<bool, DbError> {
-        let key = format!("txset:{}", hex::encode(&hash.0));
+        let key = format!("txset:{}", hex::encode(hash.0));
         let count: i32 = self.query_row(
             "SELECT COUNT(*) FROM storestate WHERE statename = ?1",
             params![key],
