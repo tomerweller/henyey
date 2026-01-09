@@ -91,6 +91,7 @@
 //! - [`tx_queue_limiter`]: Resource-aware queue limiting with eviction
 //! - [`json_api`]: JSON structures for admin/diagnostic endpoints
 
+pub mod drift_tracker;
 mod error;
 pub mod flow_control;
 mod herder;

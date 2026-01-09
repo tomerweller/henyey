@@ -107,7 +107,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Persistence**: `persistUpgrades()` / `restoreUpgrades()` - Upgrade parameters persistence
 - [ ] **Out-of-sync recovery**: `outOfSyncRecovery()`, `herderOutOfSync()`, `lostSync()` - Timeout-based recovery
 - [ ] **Dead node detection**: `startCheckForDeadNodesInterval()`, missing node tracking
-- [ ] **Drift tracking**: `mDriftCTSlidingWindow` - Close time drift monitoring
+- [x] **Drift tracking**: `mDriftCTSlidingWindow` - Close time drift monitoring - see `drift_tracker.rs`
 - [ ] **Metrics**: Full medida-style metrics (counters, timers, histograms)
 - [ ] **Timer management**: `mTrackingTimer`, `mOutOfSyncTimer`, `mTriggerTimer` with VirtualClock
 - [x] **JSON API**: `getJsonInfo()`, `getJsonQuorumInfo()`, `getJsonTransitiveQuorumInfo()` - see `json_api.rs`
