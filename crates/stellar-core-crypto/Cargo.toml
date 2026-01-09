@@ -19,8 +19,14 @@ x25519-dalek.workspace = true
 # SHA-256 - pure Rust (RustCrypto)
 sha2.workspace = true
 
+# BLAKE2 - pure Rust (RustCrypto)
+blake2.workspace = true
+
 # HMAC for message authentication
 hmac.workspace = true
+
+# HKDF for key derivation
+hkdf = "0.12"
 
 # Sealed box encryption for surveys (X25519 + XSalsa20-Poly1305)
 crypto_box.workspace = true

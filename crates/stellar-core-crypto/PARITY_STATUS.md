@@ -21,8 +21,20 @@ This section documents the parity between this Rust crate and the upstream C++ `
 
 #### SHA-256 Hashing (SHA.h/cpp)
 - [x] `sha256()` - single-shot hashing
-- [x] `SHA256` class - streaming/incremental hashing
+- [x] `SHA256` class - streaming/incremental hashing (`Sha256Hasher`)
 - [x] `reset()`, `add()`, `finish()` methods
+- [x] `subSha256()` - sub-seeding for per-transaction PRNGs (`sub_sha256`)
+- [x] `hmacSha256()` - HMAC-SHA256 (`hmac_sha256`)
+- [x] `hmacSha256Verify()` - timing-safe HMAC verification (`hmac_sha256_verify`)
+- [x] `hkdfExtract()` - HKDF extract step (`hkdf_extract`)
+- [x] `hkdfExpand()` - HKDF expand step (`hkdf_expand`)
+- [x] `xdrSha256()` - hash XDR-encoded values (`xdr_sha256`)
+
+#### BLAKE2 Hashing (BLAKE2.h/cpp)
+- [x] `blake2()` - single-shot BLAKE2b-256 hashing
+- [x] `BLAKE2` class - streaming/incremental BLAKE2b (`Blake2Hasher`)
+- [x] `reset()`, `add()`, `finish()` methods
+- [x] `xdrBlake2()` - hash XDR-encoded values with BLAKE2 (`xdr_blake2`)
 
 #### StrKey Encoding (StrKey.h/cpp)
 - [x] `toStrKey()` - encode with version byte and CRC16
@@ -70,18 +82,8 @@ This section documents the parity between this Rust crate and the upstream C++ `
 - [ ] Signature verification result caching (RandomEvictionCache)
 - [ ] BLAKE2-based cache key computation for signature cache
 
-#### BLAKE2 Hashing (BLAKE2.h/cpp)
-- [ ] `blake2()` - single-shot BLAKE2b hashing
-- [ ] `BLAKE2` class - streaming/incremental BLAKE2b
-- [ ] `xdrBlake2()` - hash XDR-encoded values with BLAKE2
-
 #### SHA-256 Extensions (SHA.h/cpp)
-- [ ] `subSha256()` - sub-seeding for per-transaction PRNGs
-- [ ] `hmacSha256()` - HMAC-SHA256
-- [ ] `hmacSha256Verify()` - timing-safe HMAC verification
-- [ ] `hkdfExtract()` - HKDF extract step
-- [ ] `hkdfExpand()` - HKDF expand step
-- [ ] `xdrSha256()` - hash XDR-encoded values without allocation (XDRSHA256 helper)
+- [ ] Zero-allocation XDR hashing via CRTP `XDRHasher<T>` pattern (Rust allocates XDR bytes first)
 
 #### Curve25519 / Key Exchange (Curve25519.h/cpp)
 - [ ] `curve25519RandomSecret()` - generate random Curve25519 secret
@@ -154,9 +156,9 @@ This section documents the parity between this Rust crate and the upstream C++ `
 #### Priority Gaps for Core Functionality
 
 **High Priority** (needed for core consensus/ledger):
-- BLAKE2 hashing (used in signature cache keys)
-- HMAC-SHA256 and HKDF (used in various protocols)
-- `xdrSha256()` for zero-allocation XDR hashing
+- ~~BLAKE2 hashing (used in signature cache keys)~~ ✓ Implemented (`blake2`, `Blake2Hasher`, `xdr_blake2`)
+- ~~HMAC-SHA256 and HKDF (used in various protocols)~~ ✓ Implemented (`hmac_sha256`, `hmac_sha256_verify`, `hkdf_extract`, `hkdf_expand`)
+- ~~`xdrSha256()` for XDR hashing~~ ✓ Implemented (`xdr_sha256`, `xdr_blake2`)
 
 **Medium Priority** (needed for full network participation):
 - Curve25519 ECDH for P2P overlay
@@ -168,3 +170,4 @@ This section documents the parity between this Rust crate and the upstream C++ `
 - Benchmarking utilities
 - Pseudo-random test key generation
 - Logging utilities
+- Zero-allocation XDR hashing (CRTP XDRHasher pattern)
