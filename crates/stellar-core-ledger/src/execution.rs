@@ -977,7 +977,7 @@ impl TransactionExecutor {
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
     ) -> Result<(LedgerEntryChanges, i64)> {
-        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
+        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
 
@@ -1126,7 +1126,7 @@ impl TransactionExecutor {
         deduct_fee: bool,
         fee_source_pre_state: Option<LedgerEntry>,
     ) -> Result<TransactionExecutionResult> {
-        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id.clone());
+        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
 
@@ -1284,7 +1284,7 @@ impl TransactionExecutor {
             base_fee,
             self.base_reserve,
             self.protocol_version,
-            self.network_id.clone(),
+            self.network_id,
         );
 
         if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
@@ -1586,7 +1586,7 @@ impl TransactionExecutor {
         let mut tx_event_manager = TxEventManager::new(
             true,
             self.protocol_version,
-            self.network_id.clone(),
+            self.network_id,
             self.classic_events,
         );
         let mut refundable_fee_tracker = if frame.is_soroban() {
@@ -1756,7 +1756,7 @@ impl TransactionExecutor {
                 base_fee,
                 self.base_reserve,
                 self.protocol_version,
-                self.network_id.clone(),
+                self.network_id,
                 prng_seed,
             )
         } else {
@@ -1766,7 +1766,7 @@ impl TransactionExecutor {
                 base_fee,
                 self.base_reserve,
                 self.protocol_version,
-                self.network_id.clone(),
+                self.network_id,
             )
         };
 
@@ -1855,7 +1855,7 @@ impl TransactionExecutor {
                     true,
                     op_type.is_soroban(),
                     self.protocol_version,
-                    self.network_id.clone(),
+                    self.network_id,
                     frame.memo().clone(),
                     self.classic_events,
                 );
