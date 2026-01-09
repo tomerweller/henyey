@@ -21,6 +21,8 @@ This section documents the feature parity between this Rust implementation and t
 | `convert-id` / `convert-key` | Implemented | Key format conversion (strkey/hex) |
 | `decode-xdr` / `print-xdr` | Implemented | XDR decoding (LedgerHeader, TransactionEnvelope, TransactionResult) |
 | `encode-xdr` / `encode-asset` | Implemented | XDR encoding (AccountId, MuxedAccount, Asset, Hash) |
+| `sign-transaction` | Implemented | Add signature to transaction envelope |
+| `sec-to-pub` | Implemented | Print public key from secret key (stdin) |
 | `diag-bucket-stats` / `bucket-info` | Partial | Basic bucket info (not full per-account aggregation) |
 
 #### Offline Tools (Unique to Rust)
@@ -96,8 +98,6 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `dump-ledger` | Dump current ledger state as JSON with filtering | Medium |
 | `new-hist` | Initialize history archives (create structure) | Low |
 | `report-last-history-checkpoint` | Report last checkpoint info | Low |
-| `sec-to-pub` | Print public key from secret key (stdin) | Low |
-| `sign-transaction` | Add signature to transaction envelope | Medium |
 | `get-settings-upgrade-txs` | Get settings upgrade transactions | Low |
 | `print-publish-queue` | Print scheduled checkpoints | Low |
 | `self-check` (offline mode) | Full DB vs bucket list consistency check | Medium |

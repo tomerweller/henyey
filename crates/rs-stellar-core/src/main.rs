@@ -348,6 +348,29 @@ enum OfflineCommands {
         #[arg(long)]
         account: String,
     },
+
+    /// Add a signature to a transaction envelope
+    ///
+    /// Reads a transaction envelope (base64), prompts for a secret key,
+    /// and outputs the signed envelope.
+    SignTransaction {
+        /// Network passphrase for signing (required)
+        #[arg(long)]
+        netid: String,
+
+        /// Input transaction envelope in base64 (or "-" for stdin)
+        #[arg(default_value = "-")]
+        input: String,
+
+        /// Output as base64 (default: true)
+        #[arg(long, default_value = "true")]
+        base64: bool,
+    },
+
+    /// Print the public key corresponding to a secret key
+    ///
+    /// Reads a secret key seed (S...) from stdin and prints the public key.
+    SecToPub,
 }
 
 #[tokio::main]
@@ -3214,6 +3237,12 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
         } => {
             cmd_debug_bucket_entry(config, checkpoint, &account).await
         }
+        OfflineCommands::SignTransaction { netid, input, base64 } => {
+            sign_transaction(&netid, &input, base64)
+        }
+        OfflineCommands::SecToPub => {
+            sec_to_pub()
+        }
     }
 }
 
@@ -3537,14 +3566,170 @@ fn bucket_info(path: &PathBuf) -> anyhow::Result<()> {
 ///
 /// Loads the quorum set definitions and verifies that the network enjoys
 /// quorum intersection (all quorums share at least one node).
-fn cmd_check_quorum_intersection(path: &PathBuf) -> anyhow::Result<()> {
-    let enjoys = quorum_intersection::check_quorum_intersection_from_json(path.as_path())?;
+fn cmd_check_quorum_intersection(path: &std::path::Path) -> anyhow::Result<()> {
+    let enjoys = quorum_intersection::check_quorum_intersection_from_json(path)?;
     if enjoys {
         println!("network enjoys quorum intersection");
         Ok(())
     } else {
         anyhow::bail!("quorum sets do not have intersection");
     }
+}
+
+/// Sign a transaction envelope with a secret key.
+///
+/// Reads a transaction envelope (base64 or from file), prompts for a secret key,
+/// signs the transaction, and outputs the signed envelope.
+///
+/// Equivalent to C++ stellar-core sign-transaction command.
+fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Result<()> {
+    use stellar_xdr::curr::{
+        DecoratedSignature, ReadXdr, SignatureHint, TransactionEnvelope,
+        TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+    };
+    use stellar_core_crypto::{sha256, SecretKey};
+
+    // Read the transaction envelope
+    let envelope_bytes = if input == "-" {
+        // Read from stdin
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let trimmed = line.trim();
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)?
+    } else {
+        // Treat input as base64 string
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, input)?
+    };
+
+    let mut tx_env = TransactionEnvelope::from_xdr(envelope_bytes, stellar_xdr::curr::Limits::none())?;
+
+    // Prompt for secret key
+    eprint!("Secret key seed [network id: '{}']: ", netid);
+    let mut secret_line = String::new();
+    std::io::stdin().read_line(&mut secret_line)?;
+    let secret_str = secret_line.trim();
+
+    let secret_key = SecretKey::from_strkey(secret_str)
+        .map_err(|e| anyhow::anyhow!("Invalid secret key: {:?}", e))?;
+
+    // Compute the network ID hash
+    let network_id_hash = sha256(netid.as_bytes());
+
+    // Create the signature payload
+    let payload = match &tx_env {
+        TransactionEnvelope::TxV0(v0) => {
+            // Convert V0 to V1 for signing (same signature semantics)
+            let tx = stellar_xdr::curr::Transaction {
+                source_account: stellar_xdr::curr::MuxedAccount::Ed25519(v0.tx.source_account_ed25519.clone()),
+                fee: v0.tx.fee,
+                seq_num: v0.tx.seq_num.clone(),
+                cond: stellar_xdr::curr::Preconditions::Time(v0.tx.time_bounds.clone().unwrap_or(
+                    stellar_xdr::curr::TimeBounds { min_time: 0.into(), max_time: 0.into() }
+                )),
+                memo: v0.tx.memo.clone(),
+                operations: v0.tx.operations.clone(),
+                ext: stellar_xdr::curr::TransactionExt::V0,
+            };
+            TransactionSignaturePayload {
+                network_id: stellar_xdr::curr::Hash(network_id_hash.0),
+                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx),
+            }
+        }
+        TransactionEnvelope::Tx(v1) => {
+            TransactionSignaturePayload {
+                network_id: stellar_xdr::curr::Hash(network_id_hash.0),
+                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
+            }
+        }
+        TransactionEnvelope::TxFeeBump(fee_bump) => {
+            TransactionSignaturePayload {
+                network_id: stellar_xdr::curr::Hash(network_id_hash.0),
+                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fee_bump.tx.clone()),
+            }
+        }
+    };
+
+    // Serialize and hash the payload
+    let payload_bytes = payload.to_xdr(stellar_xdr::curr::Limits::none())?;
+    let payload_hash = sha256(&payload_bytes);
+
+    // Sign the hash
+    let signature = secret_key.sign(&payload_hash.0);
+
+    // Create the decorated signature
+    let public_key = secret_key.public_key();
+    let hint_bytes = public_key.as_bytes();
+    let hint = SignatureHint([
+        hint_bytes[28],
+        hint_bytes[29],
+        hint_bytes[30],
+        hint_bytes[31],
+    ]);
+    let decorated_sig = DecoratedSignature {
+        hint,
+        signature: stellar_xdr::curr::Signature(signature.as_bytes().to_vec().try_into()?),
+    };
+
+    // Add the signature to the envelope
+    // VecM doesn't support direct mutation, so we convert to Vec, modify, and convert back
+    match &mut tx_env {
+        TransactionEnvelope::TxV0(v0) => {
+            let mut sigs: Vec<_> = v0.signatures.to_vec();
+            if sigs.len() >= 20 {
+                anyhow::bail!("Envelope already contains maximum number of signatures");
+            }
+            sigs.push(decorated_sig);
+            v0.signatures = sigs.try_into()?;
+        }
+        TransactionEnvelope::Tx(v1) => {
+            let mut sigs: Vec<_> = v1.signatures.to_vec();
+            if sigs.len() >= 20 {
+                anyhow::bail!("Envelope already contains maximum number of signatures");
+            }
+            sigs.push(decorated_sig);
+            v1.signatures = sigs.try_into()?;
+        }
+        TransactionEnvelope::TxFeeBump(fee_bump) => {
+            let mut sigs: Vec<_> = fee_bump.signatures.to_vec();
+            if sigs.len() >= 20 {
+                anyhow::bail!("Envelope already contains maximum number of signatures");
+            }
+            sigs.push(decorated_sig);
+            fee_bump.signatures = sigs.try_into()?;
+        }
+    }
+
+    // Output the signed envelope
+    let out_bytes = tx_env.to_xdr(stellar_xdr::curr::Limits::none())?;
+    if output_base64 {
+        println!("{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &out_bytes));
+    } else {
+        use std::io::Write;
+        std::io::stdout().write_all(&out_bytes)?;
+    }
+
+    Ok(())
+}
+
+/// Convert a secret key to its corresponding public key.
+///
+/// Reads a secret key seed (S...) from stdin and prints the public key.
+/// Equivalent to C++ stellar-core sec-to-pub command.
+fn sec_to_pub() -> anyhow::Result<()> {
+    use stellar_core_crypto::{SecretKey, encode_account_id};
+
+    eprint!("Secret key seed: ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let secret_str = line.trim();
+
+    let secret_key = SecretKey::from_strkey(secret_str)
+        .map_err(|e| anyhow::anyhow!("Invalid secret key: {:?}", e))?;
+
+    let public_key = secret_key.public_key();
+    println!("{}", encode_account_id(public_key.as_bytes()));
+
+    Ok(())
 }
 
 #[cfg(test)]

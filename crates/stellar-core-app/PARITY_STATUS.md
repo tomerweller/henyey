@@ -64,8 +64,8 @@ This crate corresponds to the following C++ stellar-core components:
 | `print-xdr` | Not Implemented | |
 | `publish` | Not Implemented | |
 | `report-last-history-checkpoint` | Not Implemented | |
-| `sec-to-pub` | Not Implemented | |
-| `sign-transaction` | Not Implemented | |
+| `sec-to-pub` | Implemented | Via `offline sec-to-pub` in rs-stellar-core |
+| `sign-transaction` | Implemented | Via `offline sign-transaction` in rs-stellar-core |
 | `upgrade-db` | Not Implemented | |
 | `get-settings-upgrade-txs` | Not Implemented | |
 | `check-quorum-intersection` | Not Implemented | |
