@@ -240,21 +240,12 @@ pub enum HistoryWorkStage {
 ///     println!("Stage: {:?}, Status: {}", stage, progress.message);
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HistoryWorkProgress {
     /// The current work stage, if any work is in progress.
     pub stage: Option<HistoryWorkStage>,
     /// Human-readable status message describing the current operation.
     pub message: String,
-}
-
-impl Default for HistoryWorkProgress {
-    fn default() -> Self {
-        Self {
-            stage: None,
-            message: String::new(),
-        }
-    }
 }
 
 /// Updates the progress indicator in shared state.
