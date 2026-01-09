@@ -11,6 +11,7 @@
 //!
 //! - [`config`] - Configuration types for node setup (network, database, history archives)
 //! - [`error`] - Common error types and the [`Result`] type alias
+//! - [`math`] - 128-bit arithmetic and overflow-safe math operations
 //! - [`meta`] - Ledger metadata normalization for deterministic hashing
 //! - [`network`] - Network identity derived from network passphrases
 //! - [`protocol`] - Protocol version constants and feature gating utilities
@@ -43,6 +44,7 @@
 
 pub mod config;
 pub mod error;
+pub mod math;
 pub mod meta;
 pub mod network;
 pub mod protocol;

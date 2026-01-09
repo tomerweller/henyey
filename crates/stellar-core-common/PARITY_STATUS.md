@@ -12,6 +12,7 @@ This document details the parity between `stellar-core-common` and the C++ upstr
 | Hash/Types | Partial | Core Hash256 done; many type utilities missing |
 | Network Identity | Full | Passphrase-based derivation matches C++ |
 | Time Utilities | Partial | Basic conversions done; VirtualClock not implemented |
+| Math Utilities | Full | bigDivide, saturating ops, sqrt implemented |
 | Configuration | Rust-native | Uses TOML/serde instead of C++ custom parsing |
 | Error Handling | Rust-native | Uses Result/Error instead of exceptions |
 
@@ -186,20 +187,24 @@ Uses Rust's `Result<T, E>` pattern instead of C++ exceptions:
 
 ### Math and Numeric Utilities (`Math.h/.cpp`, `numeric.h/.cpp`)
 
-**Priority: High (needed for transaction processing)**
+**Status: Mostly Implemented** (in `math.rs`)
 
-- `bigDivideOrThrow()` - 128-bit division with rounding (ROUND_DOWN, ROUND_UP)
-- `bigDivide()` - non-throwing version returning success/failure
-- `bigDivideUnsigned()` - unsigned variant
-- `bigSquareRoot()` - square root with 128-bit precision
-- `saturatingMultiply()` - overflow-safe multiplication
-- `saturatingAdd()` - overflow-safe addition
-- `isRepresentableAsInt64()` - double-to-int64 conversion check
-- `doubleToClampedUint32()` - clamped conversion
-- `Rounding` enum (ROUND_DOWN, ROUND_UP)
-- Random utilities: `rand_fraction()`, `rand_flip()`, `rand_uniform()`, `rand_element()`
-- Clustering: `k_means()`, `closest_cluster()`
-- `exponentialBackoff()` - backoff calculation
+| C++ Feature | Rust Equivalent | Status |
+|-------------|-----------------|--------|
+| `bigDivideOrThrow()` | `big_divide_or_throw()` | Implemented |
+| `bigDivide()` | `big_divide()` | Implemented |
+| `bigDivideUnsigned()` | `big_divide_unsigned()` | Implemented |
+| `bigSquareRoot()` | `big_square_root()` | Implemented |
+| `saturatingMultiply()` | `saturating_multiply()` | Implemented |
+| `saturatingAdd()` | `saturating_add()` | Implemented |
+| `isRepresentableAsInt64()` | `is_representable_as_i64()` | Implemented |
+| `doubleToClampedUint32()` | `double_to_clamped_u32()` | Implemented |
+| `Rounding` enum | `Rounding` enum | Implemented |
+| `bigMultiply()` | `big_multiply()` / `big_multiply_unsigned()` | Implemented |
+| `bigDivide128()` | `big_divide_128()` / `big_divide_unsigned_128()` | Implemented |
+| Random utilities | Not implemented | Not needed (use `rand` crate) |
+| Clustering (`k_means`) | Not implemented | Low priority |
+| `exponentialBackoff()` | Not implemented | Low priority |
 
 ### Filesystem Utilities (`Fs.h/.cpp`)
 
@@ -283,12 +288,11 @@ Uses Rust's `Result<T, E>` pattern instead of C++ exceptions:
 
 Features likely needed for full parity (in rough priority order):
 
-1. **Math utilities** (`bigDivide`, `saturatingMultiply`) - Critical for transaction processing
-2. **Type utilities** (`isAssetValid`, `addBalance`, asset conversions) - Needed for ledger operations
-3. **Resource scaling** (`multiplyByDouble`, `bigDivideOrThrow` for Resource) - Needed for surge pricing
-4. **XDR streaming** - Needed for history archive access
-5. **RandomEvictionCache** - Needed for performance optimization
-6. **VirtualClock/Scheduler** - Needed for testing infrastructure
+1. **Type utilities** (`isAssetValid`, `addBalance`, asset conversions) - Needed for ledger operations
+2. **Resource scaling** (`multiplyByDouble`, `bigDivideOrThrow` for Resource) - Needed for surge pricing
+3. **XDR streaming** - Needed for history archive access
+4. **RandomEvictionCache** - Needed for performance optimization
+5. **VirtualClock/Scheduler** - Needed for testing infrastructure
 
 ## Verification
 
