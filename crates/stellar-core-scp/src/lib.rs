@@ -346,7 +346,7 @@ pub use stellar_core_common::Hash256;
 pub fn node_id_to_short_string(node_id: &NodeId) -> String {
     match &node_id.0 {
         stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
-            format!("{}", hex::encode(&bytes[..4]))
+            hex::encode(&bytes[..4])
         }
     }
 }

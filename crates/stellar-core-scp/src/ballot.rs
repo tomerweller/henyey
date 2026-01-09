@@ -688,8 +688,8 @@ impl BallotProtocol {
                 if let (Some(prepared_prime), Some(prepared)) =
                     (&prep.prepared_prime, &prep.prepared)
                 {
-                    if !(ballot_compare(prepared_prime, prepared) == std::cmp::Ordering::Less
-                        && !ballot_compatible(prepared_prime, prepared))
+                    if ballot_compare(prepared_prime, prepared) != std::cmp::Ordering::Less
+                        || ballot_compatible(prepared_prime, prepared)
                     {
                         return false;
                     }
@@ -1689,10 +1689,9 @@ impl BallotProtocol {
             }
         }
         is_blocking_set(local_quorum_set, &nodes)
-            && self
+            && !self
                 .statement_quorum_set_map(local_node_id, local_quorum_set, driver)
-                .len()
-                > 0
+                .is_empty()
     }
 
     fn statement_quorum_set_map<D: SCPDriver>(
