@@ -50,6 +50,7 @@
 mod curve25519;
 mod error;
 mod hash;
+pub mod hex;
 mod keys;
 mod random;
 mod sealed_box;

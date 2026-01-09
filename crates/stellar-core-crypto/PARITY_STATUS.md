@@ -18,7 +18,7 @@ This document tracks the parity between the Rust `stellar-core-crypto` crate and
 | Signature Cache | Not Implemented |
 | SignerKey Utilities | High |
 | Key Utilities | Partial |
-| Hex Encoding | Partial |
+| Hex Encoding | Full |
 
 ## Implemented Features
 
@@ -189,14 +189,17 @@ The C++ implementation includes a process-wide signature verification cache (`Ra
 
 ### Hex Encoding (Hex.h/cpp)
 
-| C++ Function | Rust Status | Priority |
-|--------------|-------------|----------|
-| `binToHex()` | `Hash256::to_hex()` (partial) | Low |
-| `hexAbbrev()` | Not Implemented | Low |
-| `hexToBin()` | Not Implemented | Low |
-| `hexToBin256()` | Not Implemented | Low |
+**Status: Implemented** (in `hex.rs`)
 
-**Note**: Hex encoding is available via the `hex` crate dependency and `Hash256::to_hex()`.
+| C++ Function | Rust Equivalent | Status |
+|--------------|-----------------|--------|
+| `binToHex()` | `hex::bin_to_hex()` | Implemented |
+| `hexAbbrev()` | `hex::hex_abbrev()` | Implemented |
+| `hexToBin()` | `hex::hex_to_bin()` | Implemented |
+| `hexToBin256()` | `hex::hex_to_bin_256()` | Implemented |
+| N/A | `hex::hex_to_hash256()` | Implemented (convenience) |
+
+**Note**: All functions use the `hex` crate internally and match C++ behavior.
 
 ### XDRHasher CRTP Pattern (XDRHasher.h)
 
@@ -300,7 +303,6 @@ All medium priority items are **implemented**:
 - Benchmarking utilities
 - Pseudo-random test key generation
 - Logging utilities
-- Hex encoding utilities beyond `Hash256::to_hex()`
 
 ## Test Coverage
 
@@ -319,5 +321,6 @@ The Rust implementation includes unit tests for:
 - Curve25519 key clearing/zeroization
 - SignerKey creation (pre_auth_tx_key, hash_x_key, ed25519_payload_key, ed25519_key)
 - SignerKey Ed25519 extraction
+- Hex encoding/decoding (bin_to_hex, hex_abbrev, hex_to_bin, hex_to_bin_256)
 
 Tests are located in each module file under `#[cfg(test)]` sections.
