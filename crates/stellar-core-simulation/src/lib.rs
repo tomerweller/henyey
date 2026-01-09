@@ -93,10 +93,14 @@ use tokio::time::{sleep, Duration};
 // Modules
 // =============================================================================
 
+pub mod load_generator;
 pub mod tx_generator;
 pub mod virtual_clock;
 
 // Re-export main types
+pub use load_generator::{
+    GeneratedLoadConfig, LoadGenMetrics, LoadGenMode, LoadGenerator, LoadProgress, STEP_MSECS,
+};
 pub use tx_generator::{
     TestAccount, TxGenerator, TxGeneratorConfig, DEFAULT_BASE_FEE, DEFAULT_MIN_BALANCE,
     ROOT_ACCOUNT_ID,

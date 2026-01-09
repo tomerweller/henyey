@@ -51,6 +51,22 @@ This section documents the parity between this Rust crate and the upstream C++ `
 - [x] `signature_hint()` - Last 4 bytes of public key for decorated signatures
 - [x] Transaction signing and envelope creation
 
+#### LoadGenerator (`load_generator.rs`)
+- [x] `LoadGenMode` enum - PAY, SOROBAN_UPLOAD, SOROBAN_INVOKE, etc.
+- [x] `GeneratedLoadConfig` - Configuration with accounts, txs, rate, spikes
+- [x] `GeneratedLoadConfig::with_*()` - Builder pattern for configuration
+- [x] `LoadGenMetrics` - Metrics tracking (attempts, submissions, rates)
+- [x] `LoadGenerator` - Main load generator with account pool management
+- [x] `LoadGenerator::start()` / `stop()` - Load run lifecycle
+- [x] `LoadGenerator::generate_step()` - Step-based transaction generation (PAY mode)
+- [x] Account pool management (available/in-use tracking)
+- [x] Spike scheduling for traffic bursts
+- [x] `LoadProgress` - Progress reporting with ETA calculation
+- [ ] Soroban modes (SOROBAN_UPLOAD, SOROBAN_INVOKE, etc.) - Not yet implemented
+- [ ] Integration with Herder for actual transaction submission
+- [ ] Account sync verification (`checkAccountSynced`)
+- [ ] PAY_PREGENERATED mode (load from XDR file)
+
 ### Not Yet Implemented (Gaps)
 
 #### Simulation Class (`Simulation.h/.cpp`)
@@ -88,19 +104,18 @@ This section documents the parity between this Rust crate and the upstream C++ `
 | **Custom-A** | `customA()` | 7-node network for resilience testing | Low |
 | **Asymmetric** | `asymmetric()` | Core topology with extra nodes on one validator | Low |
 
-#### LoadGenerator (`LoadGenerator.h/.cpp`)
+#### LoadGenerator - Remaining Gaps (`LoadGenerator.h/.cpp`)
 
 | Feature | C++ API | Description | Priority |
 |---------|---------|-------------|----------|
-| **Load Generation Modes** | `LoadGenMode` enum | PAY, SOROBAN_UPLOAD, SOROBAN_INVOKE, etc. | High |
-| **Config-based Load** | `GeneratedLoadConfig` | Configure tx rates, spikes, accounts | High |
-| **Generate Load** | `generateLoad()` | Step-based load generation | High |
-| **Transaction Metrics** | `TxMetrics` | Track tx attempts, rejections, bytes | Medium |
-| **Account Management** | `getNextAvailableAccount()` | Prevent source account collisions | Medium |
 | **Soroban Load** | Various Soroban transaction creators | Upload, invoke, upgrade transactions | High |
 | **Mixed Load** | `createMixedClassicSorobanTransaction()` | Blend classic and Soroban transactions | Medium |
 | **Pre-generated TX Support** | `PAY_PREGENERATED` mode | Load transactions from XDR file | Low |
 | **Success Rate Tracking** | `checkMinimumSorobanSuccess()` | Verify Soroban success thresholds | Medium |
+| **Herder Integration** | `submitTx()`, `execute()` | Submit transactions via Herder | High |
+| **Account Sync Verification** | `checkAccountSynced()` | Verify all accounts synced to ledger | Medium |
+
+Note: Core LoadGenerator with PAY mode, metrics tracking, account pool management, and spike scheduling are now implemented in `load_generator.rs`.
 
 #### TxGenerator - Remaining Gaps (`TxGenerator.h/.cpp`)
 
