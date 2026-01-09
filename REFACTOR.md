@@ -2,6 +2,22 @@
 
 This document contains code analysis findings for all crates in the rs-stellar-core workspace. Each section identifies issues and suggests potential fixes without implementing them.
 
+## Recently Completed Fixes
+
+The following clippy warnings and issues have been addressed:
+
+- **stellar-core-app**: VecDeque for O(1) pop_front, unified strkey functions, fixed survey queue panic
+- **stellar-core-bucket**: Centralized protocol constants
+- **stellar-core-common**: Fixed clone_on_copy warning
+- **stellar-core-crypto**: Fixed needless borrow in sub_sha256
+- **stellar-core-db**: Fixed needless borrows in hex::encode calls
+- **stellar-core-herder**: Removed clone on Copy type (PublicKey)
+- **stellar-core-invariant**: Simplified boolean expressions, use map instead of and_then
+- **stellar-core-tx**: Removed clone on Copy type (ContractDataDurability), use is_err()
+- **stellar-core-overlay**: Removed useless format!
+- **stellar-core-scp**: Use is_empty(), simplified boolean, removed useless format!
+- **stellar-core-ledger**: Removed clone on Copy type (NetworkId)
+
 ---
 
 ## Table of Contents
