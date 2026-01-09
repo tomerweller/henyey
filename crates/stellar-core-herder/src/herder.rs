@@ -232,7 +232,7 @@ impl Herder {
         let max_time_drift = (max_slots as u64).saturating_add(2)
             .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
-            node_id: config.node_public_key.clone(),
+            node_id: config.node_public_key,
             max_tx_set_cache: 100,
             max_time_drift,
             local_quorum_set: config.local_quorum_set.clone(),
@@ -279,7 +279,7 @@ impl Herder {
         let max_time_drift = (max_slots as u64).saturating_add(2)
             .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
-            node_id: config.node_public_key.clone(),
+            node_id: config.node_public_key,
             max_tx_set_cache: 100,
             max_time_drift,
             local_quorum_set: config.local_quorum_set.clone(),
