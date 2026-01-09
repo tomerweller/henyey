@@ -1711,6 +1711,22 @@ impl App {
 
         tracing::info!(target_ledger = target_ledger, "Target ledger determined");
 
+        // Check if we're already at or past the target
+        let current = self.get_current_ledger().await.unwrap_or(0);
+        if target_ledger <= current {
+            tracing::info!(
+                current_ledger = current,
+                target_ledger,
+                "Already at or past target; skipping catchup"
+            );
+            return Ok(CatchupResult {
+                ledger_seq: current,
+                ledger_hash: Hash256::default(),
+                buckets_applied: 0,
+                ledgers_replayed: 0,
+            });
+        }
+
         // Run catchup work
         let output = self.run_catchup_work(target_ledger, progress.clone()).await?;
 
@@ -2771,6 +2787,7 @@ impl App {
                 Ok(seq) => seq,
                 Err(_) => return,
             };
+
             let next_seq = current_ledger.saturating_add(1);
 
             let close_info = {
@@ -2997,14 +3014,28 @@ impl App {
         // Determine catchup target
         let target = Self::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
         let target = match target {
-            Some(t) => t,
+            Some(t) => Some(t),
             None => {
                 // Fallback: use timeout-based target if buffered_catchup_target returns None
                 // but we've decided to catchup due to timeout
-                match Self::compute_catchup_target_for_timeout(last_buffered, first_buffered, current_ledger) {
-                    Some(t) => t,
-                    None => return,
-                }
+                Self::compute_catchup_target_for_timeout(last_buffered, first_buffered, current_ledger)
+            }
+        };
+
+        // If we still don't have a target, catch up to the latest checkpoint from archive.
+        // This handles the case where we're stuck with a gap we can't bridge via buffered messages.
+        let use_current_target = target.is_none();
+        let target = match target {
+            Some(t) => t,
+            None => {
+                tracing::info!(
+                    current_ledger,
+                    first_buffered,
+                    last_buffered,
+                    "No buffered catchup target; catching up to latest checkpoint from archive"
+                );
+                // We'll use CatchupTarget::Current below
+                0
             }
         };
 
@@ -3022,20 +3053,28 @@ impl App {
             return;
         }
 
-        if target == 0 || target <= current_ledger {
+        // Skip the target validation if we're using CatchupTarget::Current
+        if !use_current_target && (target == 0 || target <= current_ledger) {
             self.catchup_in_progress.store(false, Ordering::SeqCst);
             return;
         }
+
 
         tracing::info!(
             current_ledger,
             target,
             first_buffered,
             last_buffered,
+            use_current_target,
             "Starting buffered catchup"
         );
 
-        let catchup_result = self.catchup(CatchupTarget::Ledger(target)).await;
+        let catchup_target = if use_current_target {
+            CatchupTarget::Current
+        } else {
+            CatchupTarget::Ledger(target)
+        };
+        let catchup_result = self.catchup(catchup_target).await;
         self.catchup_in_progress.store(false, Ordering::SeqCst);
 
         match catchup_result {
