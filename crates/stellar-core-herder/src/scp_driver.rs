@@ -130,10 +130,6 @@ pub struct PendingTxSet {
 /// Pending quorum set request.
 #[derive(Debug, Clone)]
 pub struct PendingQuorumSet {
-    /// The hash of the quorum set.
-    pub hash: Hash256,
-    /// When we first requested this quorum set.
-    pub requested_at: std::time::Instant,
     /// Number of times we've requested this.
     pub request_count: u32,
 }
@@ -308,8 +304,6 @@ impl ScpDriver {
         self.pending_quorum_sets.insert(
             hash,
             PendingQuorumSet {
-                hash,
-                requested_at: std::time::Instant::now(),
                 request_count: 1,
             },
         );

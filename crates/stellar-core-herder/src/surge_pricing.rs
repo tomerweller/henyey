@@ -81,9 +81,6 @@ pub(crate) trait SurgePricingLaneConfig {
     /// Get the resource limits for each lane.
     fn lane_limits(&self) -> &[Resource];
 
-    /// Update the generic lane's resource limit (used during dynamic adjustments).
-    fn update_generic_lane_limit(&mut self, limit: Resource);
-
     /// Calculate the resources consumed by a transaction.
     fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource;
 }
@@ -124,10 +121,6 @@ impl SurgePricingLaneConfig for DexLimitingLaneConfig {
         &self.lane_limits
     }
 
-    fn update_generic_lane_limit(&mut self, limit: Resource) {
-        self.lane_limits[GENERIC_LANE] = limit;
-    }
-
     fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
         frame.resources(self.use_byte_limit, ledger_version)
     }
@@ -162,10 +155,6 @@ impl SurgePricingLaneConfig for SorobanGenericLaneConfig {
         &self.lane_limits
     }
 
-    fn update_generic_lane_limit(&mut self, limit: Resource) {
-        self.lane_limits[GENERIC_LANE] = limit;
-    }
-
     fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
         frame.resources(false, ledger_version)
     }
@@ -194,10 +183,6 @@ impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
 
     fn lane_limits(&self) -> &[Resource] {
         &self.lane_limits
-    }
-
-    fn update_generic_lane_limit(&mut self, limit: Resource) {
-        self.lane_limits[GENERIC_LANE] = limit;
     }
 
     fn tx_resources(&self, frame: &TransactionFrame, _ledger_version: u32) -> Resource {
@@ -349,7 +334,8 @@ impl SurgePricingPriorityQueue {
         self.lane_current_count[lane].clone()
     }
 
-    pub(crate) fn count_txs_resources(
+    #[cfg(test)]
+    fn count_txs_resources(
         &self,
         txs: &[QueuedTransaction],
         network_id: &stellar_core_common::NetworkId,
@@ -384,13 +370,6 @@ impl SurgePricingPriorityQueue {
             let resources = self.lane_config.tx_resources(&frame, ledger_version);
             self.lane_current_count[lane] += resources;
         }
-    }
-
-    pub(crate) fn lane_for_tx(
-        &self,
-        frame: &TransactionFrame,
-    ) -> usize {
-        self.lane_config.get_lane(frame)
     }
 
     pub(crate) fn tx_resources(
@@ -515,7 +494,8 @@ impl SurgePricingPriorityQueue {
         }
     }
 
-    pub(crate) fn get_most_top_txs_within_limits(
+    #[cfg(test)]
+    fn get_most_top_txs_within_limits(
         mut self,
         txs: Vec<QueuedTransaction>,
         network_id: &stellar_core_common::NetworkId,
