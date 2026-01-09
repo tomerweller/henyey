@@ -68,6 +68,8 @@ pub enum TxQueueResult {
     FeeTooLow,
     /// Transaction is invalid.
     Invalid,
+    /// Transaction is banned.
+    Banned,
 }
 
 const MAX_TX_SET_ALLOWANCE_BYTES: u32 = 10 * 1024 * 1024;
@@ -677,13 +679,34 @@ pub struct TransactionQueue {
     soroban_lane_evicted_inclusion_fee: RwLock<Vec<(u64, u32)>>,
     /// Eviction threshold for global queue limits.
     global_evicted_inclusion_fee: RwLock<(u64, u32)>,
+    /// Banned transaction hashes, organized as a deque of sets.
+    /// Each set represents one ledger's worth of banned transactions.
+    /// The front is the oldest, the back is the newest.
+    banned_transactions: RwLock<std::collections::VecDeque<HashSet<Hash256>>>,
+    /// Depth of the ban deque (number of ledgers transactions stay banned).
+    ban_depth: u32,
 }
+
+/// Default ban depth (number of ledgers transactions stay banned).
+const DEFAULT_BAN_DEPTH: u32 = 10;
 
 impl TransactionQueue {
     /// Create a new transaction queue.
     pub fn new(config: TxQueueConfig) -> Self {
+        Self::with_ban_depth(config, DEFAULT_BAN_DEPTH)
+    }
+
+    /// Create a new transaction queue with custom ban depth.
+    pub fn with_ban_depth(config: TxQueueConfig, ban_depth: u32) -> Self {
         let mut ctx = ValidationContext::default();
         ctx.base_fee = config.min_fee_per_op;
+
+        // Initialize the banned transactions deque with ban_depth empty sets
+        let mut banned = std::collections::VecDeque::with_capacity(ban_depth as usize);
+        for _ in 0..ban_depth {
+            banned.push_back(HashSet::new());
+        }
+
         Self {
             config,
             by_hash: RwLock::new(HashMap::new()),
@@ -692,6 +715,8 @@ impl TransactionQueue {
             classic_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
             soroban_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
             global_evicted_inclusion_fee: RwLock::new((0, 0)),
+            banned_transactions: RwLock::new(banned),
+            ban_depth,
         }
     }
 
@@ -830,6 +855,11 @@ impl TransactionQueue {
         // Check if already seen
         if self.seen.read().contains(&queued.hash) {
             return TxQueueResult::Duplicate;
+        }
+
+        // Check if banned
+        if self.is_banned(&queued.hash) {
+            return TxQueueResult::Banned;
         }
 
         // Check fee
@@ -1650,6 +1680,85 @@ impl TransactionQueue {
         self.seen.write().clear();
     }
 
+    /// Ban a list of transactions by hash.
+    ///
+    /// Banned transactions cannot be added to the queue again for `ban_depth`
+    /// ledgers. This should be called when transactions become invalid or
+    /// are evicted due to age.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx_hashes` - Hashes of transactions to ban
+    pub fn ban(&self, tx_hashes: &[Hash256]) {
+        if tx_hashes.is_empty() {
+            return;
+        }
+
+        let mut banned = self.banned_transactions.write();
+        // Add to the newest (back) set
+        if let Some(newest) = banned.back_mut() {
+            for hash in tx_hashes {
+                newest.insert(*hash);
+            }
+        }
+
+        // Also remove from the queue if present
+        let mut by_hash = self.by_hash.write();
+        for hash in tx_hashes {
+            by_hash.remove(hash);
+        }
+    }
+
+    /// Check if a transaction is banned.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - Hash of the transaction to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the transaction is currently banned.
+    pub fn is_banned(&self, hash: &Hash256) -> bool {
+        let banned = self.banned_transactions.read();
+        banned.iter().any(|set| set.contains(hash))
+    }
+
+    /// Shift the ban queue after a ledger close.
+    ///
+    /// This should be called after each ledger close. It removes the oldest
+    /// set of banned transactions (unbanning them) and adds a new empty set
+    /// for the next ledger.
+    ///
+    /// # Returns
+    ///
+    /// The number of transactions that were unbanned.
+    pub fn shift(&self) -> usize {
+        let mut banned = self.banned_transactions.write();
+
+        // Remove the oldest set (front) to unban those transactions
+        let unbanned = banned.pop_front().map(|s| s.len()).unwrap_or(0);
+
+        // Add a new empty set at the back for the next ledger
+        banned.push_back(HashSet::new());
+
+        unbanned
+    }
+
+    /// Get the total number of currently banned transactions.
+    pub fn banned_count(&self) -> usize {
+        let banned = self.banned_transactions.read();
+        banned.iter().map(|s| s.len()).sum()
+    }
+
+    /// Get the number of banned transactions at each depth level.
+    ///
+    /// Index 0 is the oldest (about to be unbanned), index ban_depth-1 is newest.
+    #[cfg(test)]
+    pub fn banned_count_by_depth(&self) -> Vec<usize> {
+        let banned = self.banned_transactions.read();
+        banned.iter().map(|s| s.len()).collect()
+    }
+
     pub fn pending_accounts(&self) -> Vec<AccountId> {
         let by_hash = self.by_hash.read();
         let mut accounts: HashSet<Vec<u8>> = HashSet::new();
@@ -2029,6 +2138,108 @@ mod tests {
         let result = queue.try_add(tx);
         assert_eq!(result, TxQueueResult::Duplicate);
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_ban_mechanism() {
+        let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 3);
+
+        // Create two transactions
+        let tx1 = make_test_envelope(200, 1);
+        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+        let hash2 = Hash256::hash_xdr(&tx2).unwrap();
+
+        // Add tx1 to the queue
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // Ban tx1 (which is in queue) and tx2 (which is not)
+        queue.ban(&[hash1, hash2]);
+        assert!(queue.is_banned(&hash1));
+        assert!(queue.is_banned(&hash2));
+        assert_eq!(queue.len(), 0); // tx1 should be removed from queue
+        assert_eq!(queue.banned_count(), 2);
+
+        // Try to add tx2 - should fail as banned (not in seen set)
+        assert_eq!(queue.try_add(tx2.clone()), TxQueueResult::Banned);
+
+        // tx1 would return Duplicate because it was seen (added before ban)
+        // This is correct behavior - seen takes precedence
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Duplicate);
+
+        // Verify ban depth tracking
+        let counts = queue.banned_count_by_depth();
+        assert_eq!(counts.len(), 3);
+        assert_eq!(counts[2], 2); // Newest set has both bans
+        assert_eq!(counts[0], 0);
+        assert_eq!(counts[1], 0);
+    }
+
+    #[test]
+    fn test_ban_shift_unban() {
+        let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 3);
+
+        let tx = make_test_envelope(200, 1);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+        queue.ban(&[hash]);
+        assert!(queue.is_banned(&hash));
+
+        // After 3 shifts, the ban should be removed
+        queue.shift(); // ledger 1
+        assert!(queue.is_banned(&hash));
+        queue.shift(); // ledger 2
+        assert!(queue.is_banned(&hash));
+        let unbanned = queue.shift(); // ledger 3 - oldest set removed
+        assert_eq!(unbanned, 1);
+        assert!(!queue.is_banned(&hash)); // Now unbanned
+
+        // Should be able to add again
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+    }
+
+    #[test]
+    fn test_multiple_bans_across_ledgers() {
+        let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 3);
+
+        // Ban tx1 in ledger 1
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+        queue.ban(&[hash1]);
+
+        queue.shift(); // ledger 2
+
+        // Ban tx2 in ledger 2
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+        let hash2 = Hash256::hash_xdr(&tx2).unwrap();
+        queue.ban(&[hash2]);
+
+        queue.shift(); // ledger 3
+
+        // Ban tx3 in ledger 3
+        let mut tx3 = make_test_envelope(200, 1);
+        set_source(&mut tx3, 3);
+        let hash3 = Hash256::hash_xdr(&tx3).unwrap();
+        queue.ban(&[hash3]);
+
+        // All should be banned
+        assert!(queue.is_banned(&hash1));
+        assert!(queue.is_banned(&hash2));
+        assert!(queue.is_banned(&hash3));
+
+        // After shift, tx1 should be unbanned
+        queue.shift(); // ledger 4
+        assert!(!queue.is_banned(&hash1));
+        assert!(queue.is_banned(&hash2));
+        assert!(queue.is_banned(&hash3));
+
+        // After another shift, tx2 should be unbanned
+        queue.shift(); // ledger 5
+        assert!(!queue.is_banned(&hash2));
+        assert!(queue.is_banned(&hash3));
     }
 
     #[test]

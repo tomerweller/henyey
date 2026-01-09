@@ -131,7 +131,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 #### Transaction Queue
 - [ ] **Account state tracking**: `AccountState` with `mTotalFees`, `mAge`, per-account transaction lists
 - [ ] **Transaction aging**: `shift()` - Age increment per ledger, auto-ban on max age
-- [ ] **Ban mechanism**: `ban()`, `isBanned()` with `mBannedTransactions` deque
+- [x] **Ban mechanism**: `ban()`, `is_banned()`, `shift()` with deque-based ban tracking - see `tx_queue.rs`
 - [ ] **Rebroadcast**: `rebroadcast()`, `broadcast()` with flood timing
 - [ ] **Flood control**: `broadcastSome()`, `getMaxResourcesToFloodThisPeriod()`
 - [ ] **Arbitrage damping**: `mArbitrageFloodDamping`, `allowTxBroadcast()` for path payment loops

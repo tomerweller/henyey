@@ -739,6 +739,9 @@ impl Herder {
             TxQueueResult::Invalid => {
                 debug!("Invalid transaction rejected");
             }
+            TxQueueResult::Banned => {
+                debug!("Banned transaction rejected");
+            }
         }
 
         result
