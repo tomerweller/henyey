@@ -6379,4 +6379,202 @@ mod tests {
             }
         }
     }
+
+    // ============================================================
+    // Herder Integration Tests
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_herder_stats_includes_pending_envelope_stats() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        let stats = app.herder_stats();
+
+        // Verify pending_envelope_stats is accessible
+        assert_eq!(stats.pending_envelope_stats.received, 0);
+        assert_eq!(stats.pending_envelope_stats.added, 0);
+        assert_eq!(stats.pending_envelope_stats.duplicates, 0);
+    }
+
+    #[tokio::test]
+    async fn test_herder_stats_includes_tx_queue_stats() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        let stats = app.herder_stats();
+
+        // Verify tx_queue_stats is accessible
+        assert_eq!(stats.tx_queue_stats.pending_count, 0);
+        assert_eq!(stats.tx_queue_stats.account_count, 0);
+        assert_eq!(stats.tx_queue_stats.banned_count, 0);
+        assert_eq!(stats.tx_queue_stats.seen_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_drift_tracker_initialized() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Verify drift tracker is accessible (will lock successfully)
+        let result = app.drift_tracker.lock();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sync_recovery_handle_initially_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Sync recovery handle is None until start_sync_recovery is called
+        assert!(app.sync_recovery_handle.read().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_recovery_heartbeat_no_panic_when_not_started() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Should not panic when handle is None
+        app.sync_recovery_heartbeat();
+    }
+
+    #[tokio::test]
+    async fn test_set_applying_ledger_updates_flag() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Initially false
+        assert!(!app.is_applying_ledger.load(Ordering::Relaxed));
+
+        // Set to true
+        app.set_applying_ledger(true);
+        assert!(app.is_applying_ledger.load(Ordering::Relaxed));
+
+        // Set back to false
+        app.set_applying_ledger(false);
+        assert!(!app.is_applying_ledger.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_sync_recovery_callback_is_applying_ledger() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Test the SyncRecoveryCallback implementation
+        assert!(!SyncRecoveryCallback::is_applying_ledger(&app));
+
+        app.is_applying_ledger.store(true, Ordering::Relaxed);
+        assert!(SyncRecoveryCallback::is_applying_ledger(&app));
+    }
+
+    #[tokio::test]
+    async fn test_sync_recovery_callback_is_tracking() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Herder starts in booting state, not tracking
+        assert!(!SyncRecoveryCallback::is_tracking(&app));
+    }
+
+    #[tokio::test]
+    async fn test_herder_cleanup_method_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Verify cleanup method is callable
+        app.herder.cleanup();
+    }
+
+    #[tokio::test]
+    async fn test_herder_quorum_tracking_methods() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Verify quorum tracking methods are callable
+        let slot = app.herder.tracking_slot();
+        let _heard = app.herder.heard_from_quorum(slot);
+        let _blocking = app.herder.is_v_blocking(slot);
+    }
+
+    #[tokio::test]
+    async fn test_herder_set_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Initially in Booting state
+        assert_eq!(app.herder.state(), stellar_core_herder::HerderState::Booting);
+
+        // Can set to Syncing
+        app.herder.set_state(stellar_core_herder::HerderState::Syncing);
+        assert_eq!(app.herder.state(), stellar_core_herder::HerderState::Syncing);
+    }
+
+    #[tokio::test]
+    async fn test_tx_queue_ban_shift() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Shift with empty ban queue should return 0
+        let unbanned = app.herder.tx_queue().shift();
+        assert_eq!(unbanned, 0);
+    }
 }
