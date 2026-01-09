@@ -71,7 +71,7 @@ pub fn execute_extend_footprint_ttl(
 
     // Extend TTL for all entries in the read-only footprint
     for key in footprint.read_only.iter() {
-        if let Err(_) = extend_entry_ttl(key, target_ttl, state) {
+        if extend_entry_ttl(key, target_ttl, state).is_err() {
             // Entry not found or cannot extend - this is a resource issue
             return Ok(make_result(ExtendFootprintTtlResultCode::ResourceLimitExceeded));
         }
@@ -79,7 +79,7 @@ pub fn execute_extend_footprint_ttl(
 
     // Extend TTL for all entries in the read-write footprint
     for key in footprint.read_write.iter() {
-        if let Err(_) = extend_entry_ttl(key, target_ttl, state) {
+        if extend_entry_ttl(key, target_ttl, state).is_err() {
             return Ok(make_result(ExtendFootprintTtlResultCode::ResourceLimitExceeded));
         }
     }

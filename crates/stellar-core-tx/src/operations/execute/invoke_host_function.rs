@@ -457,7 +457,7 @@ fn apply_soroban_storage_change(
         // Handle contract data and code entries.
         match &entry.data {
             stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                if state.get_contract_data(&cd.contract, &cd.key, cd.durability.clone()).is_some() {
+                if state.get_contract_data(&cd.contract, &cd.key, cd.durability).is_some() {
                     state.update_contract_data(cd.clone());
                 } else {
                     state.create_contract_data(cd.clone());
@@ -547,7 +547,7 @@ fn apply_soroban_storage_change(
         // Deletion case: new_entry is None and live_until is None
         match &change.key {
             LedgerKey::ContractData(key) => {
-                state.delete_contract_data(&key.contract, &key.key, key.durability.clone());
+                state.delete_contract_data(&key.contract, &key.key, key.durability);
                 let key_hash = compute_key_hash(&change.key);
                 state.delete_ttl(&key_hash);
             }
@@ -618,7 +618,7 @@ fn is_archived_contract_entry(
     match key {
         LedgerKey::ContractData(cd) => {
             if state
-                .get_contract_data(&cd.contract, &cd.key, cd.durability.clone())
+                .get_contract_data(&cd.contract, &cd.key, cd.durability)
                 .is_none()
             {
                 return false;

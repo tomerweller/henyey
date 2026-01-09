@@ -494,7 +494,7 @@ pub fn entry_to_key(entry: &LedgerEntry) -> LedgerKey {
         LedgerEntryData::ContractData(c) => LedgerKey::ContractData(LedgerKeyContractData {
             contract: c.contract.clone(),
             key: c.key.clone(),
-            durability: c.durability.clone(),
+            durability: c.durability,
         }),
         LedgerEntryData::ContractCode(c) => LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: c.hash.clone(),
