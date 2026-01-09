@@ -893,7 +893,7 @@ impl Invariant for LedgerEntryIsValid {
                             details: "liquidity pool asset_b is invalid".to_string(),
                         });
                     }
-                    if !(cp.params.asset_a < cp.params.asset_b) {
+                    if cp.params.asset_a >= cp.params.asset_b {
                         return Err(InvariantError::Violated {
                             name: self.name().to_string(),
                             details: "liquidity pool assets out of order".to_string(),
@@ -1953,11 +1953,11 @@ fn verify_events_delta(
                 },
                 (None, None) => return None,
             };
-            let prev_reserve_a = previous_body.and_then(|body| match body {
-                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => Some(cp.reserve_a),
+            let prev_reserve_a = previous_body.map(|body| match body {
+                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => cp.reserve_a,
             }).unwrap_or(0);
-            let prev_reserve_b = previous_body.and_then(|body| match body {
-                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => Some(cp.reserve_b),
+            let prev_reserve_b = previous_body.map(|body| match body {
+                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => cp.reserve_b,
             }).unwrap_or(0);
             let entry_a_diff = reserve_a - prev_reserve_a;
             let entry_b_diff = reserve_b - prev_reserve_b;
@@ -2710,7 +2710,7 @@ fn check_trustline_authorization(change: &LedgerEntryChange) -> Result<(), Invar
             LedgerEntryData::Trustline(previous) => Some(trustline_liabilities(previous)),
             _ => None,
         })
-        .unwrap_or_else(|| stellar_xdr::curr::Liabilities { buying: 0, selling: 0 });
+        .unwrap_or(stellar_xdr::curr::Liabilities { buying: 0, selling: 0 });
 
     if is_trustline_authorized_to_maintain_liabilities(trust) {
         if current_liabilities.buying > previous_liabilities.buying
