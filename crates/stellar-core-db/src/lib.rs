@@ -63,11 +63,13 @@ pub mod migrations;
 pub mod pool;
 pub mod queries;
 pub mod schema;
+pub mod scp_persistence;
 
 pub use error::DbError;
 pub use migrations::{run_migrations, verify_schema, needs_migration, CURRENT_VERSION};
 pub use pool::{Database, PooledConnection};
 pub use queries::*;
+pub use scp_persistence::SqliteScpPersistence;
 
 use std::path::Path;
 use tracing::info;

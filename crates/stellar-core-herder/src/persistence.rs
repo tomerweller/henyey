@@ -38,6 +38,9 @@ use tracing::{debug, info, warn};
 
 use crate::{HerderError, Result};
 
+// Re-export Database for users who want to construct SqliteScpPersistence
+pub use stellar_core_db::Database;
+
 /// Persisted SCP state for a single slot.
 ///
 /// This structure captures all the data needed to restore SCP state for a slot:
@@ -501,7 +504,7 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::*;
 
-    fn make_test_envelope(slot: u64) -> ScpEnvelope {
+    pub(crate) fn make_test_envelope(slot: u64) -> ScpEnvelope {
         ScpEnvelope {
             statement: ScpStatement {
                 node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
@@ -667,5 +670,178 @@ mod tests {
         let hash = get_quorum_set_hash(&envelope);
         assert!(hash.is_some());
         assert_eq!(hash.unwrap(), Hash([0u8; 32]));
+    }
+}
+
+// ============================================================================
+// SQLite Implementation
+// ============================================================================
+
+/// SQLite-backed implementation of SCP state persistence.
+///
+/// This implementation stores SCP state in the SQLite database for crash recovery.
+/// It implements the `ScpStatePersistence` trait, enabling the herder to persist
+/// and restore SCP state across restarts.
+///
+/// # Example
+///
+/// ```ignore
+/// use stellar_core_herder::persistence::{SqliteScpPersistence, ScpPersistenceManager, Database};
+///
+/// let db = Database::open("stellar.db")?;
+/// let persistence = SqliteScpPersistence::new(db);
+/// let manager = ScpPersistenceManager::new(Box::new(persistence));
+///
+/// // Persist SCP state
+/// manager.persist_scp_state(slot, &envelopes, &tx_sets, &quorum_sets)?;
+///
+/// // Restore on startup
+/// let restored = manager.restore_scp_state()?;
+/// ```
+pub struct SqliteScpPersistence {
+    inner: stellar_core_db::SqliteScpPersistence,
+}
+
+impl SqliteScpPersistence {
+    /// Create a new SQLite SCP persistence instance.
+    pub fn new(db: stellar_core_db::Database) -> Self {
+        Self {
+            inner: stellar_core_db::SqliteScpPersistence::new(db),
+        }
+    }
+}
+
+impl ScpStatePersistence for SqliteScpPersistence {
+    fn save_scp_state(&self, slot: u64, state: &PersistedSlotState) -> Result<()> {
+        let json = state.to_json()?;
+        self.inner
+            .save_scp_state(slot, &json)
+            .map_err(|e| HerderError::Internal(e))
+    }
+
+    fn load_scp_state(&self, slot: u64) -> Result<Option<PersistedSlotState>> {
+        let json = self
+            .inner
+            .load_scp_state(slot)
+            .map_err(|e| HerderError::Internal(e))?;
+        match json {
+            Some(j) => Ok(Some(PersistedSlotState::from_json(&j)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_all_scp_states(&self) -> Result<Vec<(u64, PersistedSlotState)>> {
+        let states = self
+            .inner
+            .load_all_scp_states()
+            .map_err(|e| HerderError::Internal(e))?;
+        let mut result = Vec::new();
+        for (slot, json) in states {
+            match PersistedSlotState::from_json(&json) {
+                Ok(state) => result.push((slot, state)),
+                Err(e) => {
+                    warn!("Failed to parse persisted state for slot {}: {}", slot, e);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn delete_scp_state_below(&self, slot: u64) -> Result<()> {
+        self.inner
+            .delete_scp_state_below(slot)
+            .map_err(|e| HerderError::Internal(e))
+    }
+
+    fn save_tx_set(&self, hash: &Hash, tx_set: &[u8]) -> Result<()> {
+        self.inner
+            .save_tx_set(hash, tx_set)
+            .map_err(|e| HerderError::Internal(e))
+    }
+
+    fn load_tx_set(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
+        self.inner
+            .load_tx_set(hash)
+            .map_err(|e| HerderError::Internal(e))
+    }
+
+    fn load_all_tx_sets(&self) -> Result<Vec<(Hash, Vec<u8>)>> {
+        self.inner
+            .load_all_tx_sets()
+            .map_err(|e| HerderError::Internal(e))
+    }
+
+    fn has_tx_set(&self, hash: &Hash) -> Result<bool> {
+        self.inner
+            .has_tx_set(hash)
+            .map_err(|e| HerderError::Internal(e))
+    }
+
+    fn delete_tx_sets_below(&self, slot: u64) -> Result<()> {
+        self.inner
+            .delete_tx_sets_below(slot)
+            .map_err(|e| HerderError::Internal(e))
+    }
+}
+
+#[cfg(test)]
+mod sqlite_tests {
+    use super::*;
+    use super::tests::make_test_envelope;
+
+    #[test]
+    fn test_sqlite_persistence_roundtrip() {
+        let db = stellar_core_db::Database::open_in_memory().unwrap();
+        let persistence = SqliteScpPersistence::new(db);
+
+        let mut state = PersistedSlotState::new();
+        let envelope = make_test_envelope(100);
+        state.add_envelope(&envelope).unwrap();
+
+        // Save
+        persistence.save_scp_state(100, &state).unwrap();
+
+        // Load
+        let loaded = persistence.load_scp_state(100).unwrap();
+        assert!(loaded.is_some());
+        let loaded_state = loaded.unwrap();
+        assert_eq!(loaded_state.envelopes.len(), 1);
+
+        // Load all
+        let all = persistence.load_all_scp_states().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, 100);
+
+        // Delete below
+        persistence.delete_scp_state_below(50).unwrap();
+        let remaining = persistence.load_all_scp_states().unwrap();
+        assert_eq!(remaining.len(), 1);
+
+        persistence.delete_scp_state_below(101).unwrap();
+        let remaining = persistence.load_all_scp_states().unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_sqlite_tx_set_persistence() {
+        let db = stellar_core_db::Database::open_in_memory().unwrap();
+        let persistence = SqliteScpPersistence::new(db);
+
+        let hash = Hash([1u8; 32]);
+        let data = vec![1, 2, 3, 4];
+
+        // Save
+        persistence.save_tx_set(&hash, &data).unwrap();
+
+        // Has
+        assert!(persistence.has_tx_set(&hash).unwrap());
+
+        // Load
+        let loaded = persistence.load_tx_set(&hash).unwrap();
+        assert_eq!(loaded, Some(data.clone()));
+
+        // Load all
+        let all = persistence.load_all_tx_sets().unwrap();
+        assert_eq!(all.len(), 1);
     }
 }

@@ -10,6 +10,7 @@ rust-version.workspace = true
 stellar-xdr.workspace = true
 stellar-core-common.workspace = true
 stellar-core-crypto.workspace = true
+stellar-core-db.workspace = true
 stellar-core-scp.workspace = true
 stellar-core-overlay.workspace = true
 stellar-core-ledger.workspace = true

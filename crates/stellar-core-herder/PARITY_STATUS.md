@@ -27,6 +27,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [x] `PersistedSlotState` - Serializable SCP state for a slot
 - [x] `ScpStatePersistence` trait - Storage backend abstraction
 - [x] `InMemoryScpPersistence` - In-memory storage for testing
+- [x] `SqliteScpPersistence` - SQLite storage for production (crash recovery)
 - [x] `ScpPersistenceManager` - Persistence coordinator
 - [x] `persist_scp_state()` - Save SCP state with envelopes, tx sets, quorum sets
 - [x] `restore_scp_state()` - Load persisted state for recovery
@@ -105,11 +106,11 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 #### Core Herder
 - [ ] **Persistence**: `persistUpgrades()` / `restoreUpgrades()` - Upgrade parameters persistence
-- [ ] **Out-of-sync recovery**: `outOfSyncRecovery()`, `herderOutOfSync()`, `lostSync()` - Timeout-based recovery
+- [x] **Out-of-sync recovery**: `outOfSyncRecovery()`, `herderOutOfSync()`, `lostSync()` - see `sync_recovery.rs`
 - [ ] **Dead node detection**: `startCheckForDeadNodesInterval()`, missing node tracking
 - [x] **Drift tracking**: `mDriftCTSlidingWindow` - Close time drift monitoring - see `drift_tracker.rs`
 - [ ] **Metrics**: Full medida-style metrics (counters, timers, histograms)
-- [ ] **Timer management**: `mTrackingTimer`, `mOutOfSyncTimer`, `mTriggerTimer` with VirtualClock
+- [x] **Timer management**: `mTrackingTimer`, `mOutOfSyncTimer` - see `timer_manager.rs`, `sync_recovery.rs`
 - [x] **JSON API**: `getJsonInfo()`, `getJsonQuorumInfo()`, `getJsonTransitiveQuorumInfo()` - see `json_api.rs`
 - [ ] **Node ID resolution**: `resolveNodeID()` - Config-based node lookup
 - [ ] **Upgrade scheduling**: `setUpgrades()`, `getUpgradesJson()` - Scheduled upgrade management
@@ -118,7 +119,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Last checkpoint sending**: `SEND_LATEST_CHECKPOINT_DELAY` timing
 
 #### SCP Driver (`HerderSCPDriver`)
-- [ ] **Timer management**: `setupTimer()`, `stopTimer()` with VirtualTimer integration
+- [x] **Timer management**: `setupTimer()`, `stopTimer()` - see `timer_manager.rs`
 - [ ] **SCP execution metrics**: `recordSCPExecutionMetrics()`, `recordSCPEvent()`, `recordSCPExternalizeEvent()`
 - [ ] **Externalize lag tracking**: `getExternalizeLag()`, `mQSetLag` per-node timers
 - [ ] **Missing node reporting**: `getMaybeDeadNodes()`, `mMissingNodes`, `mDeadNodes`
@@ -132,8 +133,8 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Account state tracking**: `AccountState` with `mTotalFees`, `mAge`, per-account transaction lists
 - [ ] **Transaction aging**: `shift()` - Age increment per ledger, auto-ban on max age
 - [x] **Ban mechanism**: `ban()`, `is_banned()`, `shift()` with deque-based ban tracking - see `tx_queue.rs`
-- [ ] **Rebroadcast**: `rebroadcast()`, `broadcast()` with flood timing
-- [ ] **Flood control**: `broadcastSome()`, `getMaxResourcesToFloodThisPeriod()`
+- [x] **Rebroadcast**: `rebroadcast()`, `broadcast()` with flood timing - see `tx_broadcast.rs`
+- [x] **Flood control**: `broadcastSome()`, `getMaxResourcesToFloodThisPeriod()` - see `tx_broadcast.rs`
 - [ ] **Arbitrage damping**: `mArbitrageFloodDamping`, `allowTxBroadcast()` for path payment loops
 - [ ] **Separate queues**: `ClassicTransactionQueue`, `SorobanTransactionQueue` as distinct types
 - [ ] **Queue rebuild**: `resetAndRebuild()` for config upgrades
@@ -210,11 +211,11 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 1. **Concurrency Model**
    - **C++**: Single-threaded with VirtualClock timers
-   - **Rust**: Thread-safe with `RwLock`, `DashMap`; async-ready but timers not integrated
+   - **Rust**: Thread-safe with `RwLock`, `DashMap`; async-ready with tokio integration
 
 2. **Timer Management**
    - **C++**: VirtualTimer with Application's VirtualClock
-   - **Rust**: Currently missing; timeout durations calculated but not scheduled
+   - **Rust**: `TimerManager` with tokio - see `timer_manager.rs`; `SyncRecoveryManager` for tracking timeouts - see `sync_recovery.rs`
 
 3. **Metrics**
    - **C++**: medida library with counters, meters, timers, histograms
@@ -222,7 +223,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 4. **Database Persistence**
    - **C++**: Direct SQL database access for SCP state
-   - **Rust**: `ScpStatePersistence` trait with `InMemoryScpPersistence` for testing; SQLite backend via `stellar-core-db` pending
+   - **Rust**: `ScpStatePersistence` trait with `InMemoryScpPersistence` for testing and `SqliteScpPersistence` for production
 
 5. **Transaction Queue Architecture**
    - **C++**: Separate `ClassicTransactionQueue` and `SorobanTransactionQueue` classes
@@ -246,9 +247,9 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 #### Missing Integration Points
 
-- Timer/scheduler integration with async runtime
-- Database persistence layer
+- ~~Timer/scheduler integration with async runtime~~ - DONE: `timer_manager.rs`, `sync_recovery.rs`
+- ~~Database persistence layer~~ - DONE: `SqliteScpPersistence` in `persistence.rs`
 - Overlay network `ItemFetcher` equivalent
 - Metrics collection and reporting
-- JSON API for admin endpoints
-- Upgrade scheduling with time-based triggers
+- ~~JSON API for admin endpoints~~ - DONE: `json_api.rs`
+- Upgrade scheduling with time-based triggers (partially done in `upgrades.rs`)

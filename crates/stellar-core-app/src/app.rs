@@ -2434,6 +2434,12 @@ impl App {
                     stellar_core_herder::TxQueueResult::Invalid => {
                         tracing::debug!("Invalid transaction rejected");
                     }
+                    stellar_core_herder::TxQueueResult::Banned => {
+                        tracing::debug!("Transaction from banned source rejected");
+                    }
+                    stellar_core_herder::TxQueueResult::Filtered => {
+                        tracing::debug!("Transaction filtered by operation type");
+                    }
                 }
             }
 

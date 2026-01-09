@@ -49,5 +49,5 @@ pub use history::HistoryQueries;
 pub use ledger::LedgerQueries;
 pub use peers::{PeerQueries, PeerRecord};
 pub use publish_queue::PublishQueueQueries;
-pub use scp::ScpQueries;
+pub use scp::{ScpQueries, ScpStatePersistenceQueries};
 pub use state::StateQueries;

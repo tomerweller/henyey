@@ -1502,6 +1502,12 @@ async fn submit_tx_handler(
         stellar_core_herder::TxQueueResult::Invalid => {
             (false, Some("Transaction invalid".to_string()))
         }
+        stellar_core_herder::TxQueueResult::Banned => {
+            (false, Some("Transaction from banned source".to_string()))
+        }
+        stellar_core_herder::TxQueueResult::Filtered => {
+            (false, Some("Transaction filtered by operation type".to_string()))
+        }
     };
 
     (

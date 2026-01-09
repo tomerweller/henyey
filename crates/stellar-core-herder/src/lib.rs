@@ -104,6 +104,9 @@ mod quorum_tracker;
 mod scp_driver;
 mod state;
 mod surge_pricing;
+pub mod sync_recovery;
+pub mod timer_manager;
+pub mod tx_broadcast;
 mod tx_queue;
 mod tx_queue_limiter;
 pub mod upgrades;
@@ -124,8 +127,8 @@ pub use tx_queue::{
 
 // Persistence
 pub use persistence::{
-    get_quorum_set_hash, get_tx_set_hashes, InMemoryScpPersistence, PersistedSlotState,
-    RestoredScpState, ScpPersistenceManager, ScpStatePersistence,
+    get_quorum_set_hash, get_tx_set_hashes, Database, InMemoryScpPersistence, PersistedSlotState,
+    RestoredScpState, ScpPersistenceManager, ScpStatePersistence, SqliteScpPersistence,
 };
 
 // HerderUtils
@@ -137,6 +140,22 @@ pub use ledger_close_data::{LedgerCloseData, LedgerCloseDataError, stellar_value
 // TxQueueLimiter and surge pricing
 pub use surge_pricing::VisitTxResult;
 pub use tx_queue_limiter::TxQueueLimiter;
+
+// Timer management
+pub use timer_manager::{TimerCallback, TimerCommand, TimerManager, TimerManagerHandle, TimerManagerWithStats, TimerStats, TimerType};
+
+// Sync recovery
+pub use sync_recovery::{
+    SyncRecoveryCallback, SyncRecoveryCommand, SyncRecoveryHandle, SyncRecoveryManager,
+    SyncRecoveryStats, SyncRecoveryStatsTracker, CONSENSUS_STUCK_TIMEOUT,
+    LEDGER_VALIDITY_BRACKET, OUT_OF_SYNC_RECOVERY_INTERVAL,
+};
+
+// Transaction broadcast
+pub use tx_broadcast::{
+    BroadcastCommand, TxBroadcastCallback, TxBroadcastHandle, TxBroadcastManager,
+    TxBroadcastStats, DEFAULT_FLOOD_PERIOD_MS,
+};
 
 /// Result type for Herder operations.
 pub type Result<T> = std::result::Result<T, HerderError>;

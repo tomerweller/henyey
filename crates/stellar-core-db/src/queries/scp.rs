@@ -4,19 +4,22 @@
 //!
 //! - SCP envelopes: The signed consensus messages exchanged by validators
 //! - Quorum sets: The trust configurations that define consensus requirements
+//! - Slot state persistence: Crash recovery for ongoing consensus
 //!
 //! SCP history is used for:
 //! - Catchup verification (proving ledger agreement)
 //! - Debugging consensus issues
 //! - History archive publishing
+//! - Crash recovery (resuming consensus after restart)
 
 use rusqlite::{params, Connection, OptionalExtension};
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{
-    Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpQuorumSet, Uint256, WriteXdr,
+    Hash, Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpQuorumSet, Uint256, WriteXdr,
 };
 
 use super::super::error::DbError;
+use super::super::schema::state_keys;
 
 /// Query trait for SCP consensus state operations.
 ///
@@ -145,5 +148,290 @@ impl ScpQueries for Connection {
 fn node_id_hex(node_id: &NodeId) -> String {
     match &node_id.0 {
         PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => hex::encode(bytes),
+    }
+}
+
+/// Extended query trait for SCP state persistence (crash recovery).
+///
+/// These methods support the herder's SCP state persistence for crash recovery.
+pub trait ScpStatePersistenceQueries {
+    /// Save SCP state for a slot as JSON.
+    fn save_scp_slot_state(&self, slot: u64, state_json: &str) -> Result<(), DbError>;
+
+    /// Load SCP state for a slot.
+    fn load_scp_slot_state(&self, slot: u64) -> Result<Option<String>, DbError>;
+
+    /// Load all SCP slot states.
+    fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError>;
+
+    /// Delete SCP state for slots below the given threshold.
+    fn delete_scp_slot_states_below(&self, slot: u64) -> Result<(), DbError>;
+
+    /// Save a transaction set by hash.
+    fn save_tx_set_data(&self, hash: &Hash, data: &[u8]) -> Result<(), DbError>;
+
+    /// Load a transaction set by hash.
+    fn load_tx_set_data(&self, hash: &Hash) -> Result<Option<Vec<u8>>, DbError>;
+
+    /// Load all transaction sets.
+    fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError>;
+
+    /// Check if a transaction set exists.
+    fn has_tx_set_data(&self, hash: &Hash) -> Result<bool, DbError>;
+
+    /// Delete old transaction set data.
+    /// Note: This is a no-op in the simple implementation since tx sets
+    /// aren't directly linked to slots. Use a separate cleanup mechanism.
+    fn delete_old_tx_set_data(&self, slot: u64) -> Result<(), DbError>;
+}
+
+impl ScpStatePersistenceQueries for Connection {
+    fn save_scp_slot_state(&self, slot: u64, state_json: &str) -> Result<(), DbError> {
+        // Use storestate table with a slot-specific key
+        let key = format!("{}:{}", state_keys::SCP_STATE, slot);
+        self.execute(
+            "INSERT OR REPLACE INTO storestate (statename, state) VALUES (?1, ?2)",
+            params![key, state_json],
+        )?;
+        Ok(())
+    }
+
+    fn load_scp_slot_state(&self, slot: u64) -> Result<Option<String>, DbError> {
+        let key = format!("{}:{}", state_keys::SCP_STATE, slot);
+        let result = self
+            .query_row(
+                "SELECT state FROM storestate WHERE statename = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError> {
+        let prefix = format!("{}:", state_keys::SCP_STATE);
+        let mut stmt = self.prepare(
+            "SELECT statename, state FROM storestate WHERE statename LIKE ?1 ORDER BY statename",
+        )?;
+        let pattern = format!("{}%", prefix);
+        let rows = stmt.query_map(params![pattern], |row| {
+            let key: String = row.get(0)?;
+            let state: String = row.get(1)?;
+            Ok((key, state))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let (key, state) = row?;
+            // Parse slot from key (format: "scpstate:123")
+            if let Some(slot_str) = key.strip_prefix(&prefix) {
+                if let Ok(slot) = slot_str.parse::<u64>() {
+                    results.push((slot, state));
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn delete_scp_slot_states_below(&self, slot: u64) -> Result<(), DbError> {
+        let prefix = format!("{}:", state_keys::SCP_STATE);
+        // We need to get all keys and filter by slot number
+        let mut stmt = self.prepare("SELECT statename FROM storestate WHERE statename LIKE ?1")?;
+        let pattern = format!("{}%", prefix);
+        let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
+
+        let mut keys_to_delete = Vec::new();
+        for row in rows {
+            let key = row?;
+            if let Some(slot_str) = key.strip_prefix(&prefix) {
+                if let Ok(key_slot) = slot_str.parse::<u64>() {
+                    if key_slot < slot {
+                        keys_to_delete.push(key);
+                    }
+                }
+            }
+        }
+
+        for key in keys_to_delete {
+            self.execute(
+                "DELETE FROM storestate WHERE statename = ?1",
+                params![key],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn save_tx_set_data(&self, hash: &Hash, data: &[u8]) -> Result<(), DbError> {
+        // Use a txsets-style table but store by hash
+        // For simplicity, we'll use the storestate table with a "txset:" prefix
+        let key = format!("txset:{}", hex::encode(&hash.0));
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+        self.execute(
+            "INSERT OR REPLACE INTO storestate (statename, state) VALUES (?1, ?2)",
+            params![key, encoded],
+        )?;
+        Ok(())
+    }
+
+    fn load_tx_set_data(&self, hash: &Hash) -> Result<Option<Vec<u8>>, DbError> {
+        let key = format!("txset:{}", hex::encode(&hash.0));
+        let result: Option<String> = self
+            .query_row(
+                "SELECT state FROM storestate WHERE statename = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match result {
+            Some(encoded) => {
+                let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
+                    .map_err(|e| DbError::Integrity(format!("Invalid base64 tx set data: {}", e)))?;
+                Ok(Some(data))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {
+        let prefix = "txset:";
+        let mut stmt = self.prepare(
+            "SELECT statename, state FROM storestate WHERE statename LIKE ?1",
+        )?;
+        let pattern = format!("{}%", prefix);
+        let rows = stmt.query_map(params![pattern], |row| {
+            let key: String = row.get(0)?;
+            let state: String = row.get(1)?;
+            Ok((key, state))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let (key, encoded) = row?;
+            if let Some(hash_hex) = key.strip_prefix(prefix) {
+                if let Ok(hash_bytes) = hex::decode(hash_hex) {
+                    if hash_bytes.len() == 32 {
+                        let mut hash_arr = [0u8; 32];
+                        hash_arr.copy_from_slice(&hash_bytes);
+                        let hash = Hash(hash_arr);
+
+                        if let Ok(data) = base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &encoded,
+                        ) {
+                            results.push((hash, data));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn has_tx_set_data(&self, hash: &Hash) -> Result<bool, DbError> {
+        let key = format!("txset:{}", hex::encode(&hash.0));
+        let count: i32 = self.query_row(
+            "SELECT COUNT(*) FROM storestate WHERE statename = ?1",
+            params![key],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn delete_old_tx_set_data(&self, _slot: u64) -> Result<(), DbError> {
+        // In a more sophisticated implementation, we would track which slots
+        // reference which tx sets. For now, this is a no-op.
+        // TX sets will be cleaned up when they're no longer referenced by any
+        // persisted slot state.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE storestate (statename TEXT PRIMARY KEY, state TEXT NOT NULL);
+            CREATE TABLE scphistory (nodeid TEXT, ledgerseq INTEGER, envelope BLOB);
+            CREATE TABLE scpquorums (qsethash TEXT PRIMARY KEY, lastledgerseq INTEGER, qset BLOB);
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_scp_slot_state_roundtrip() {
+        let conn = setup_db();
+        let state_json = r#"{"version":1,"envelopes":[],"quorum_sets":[]}"#;
+
+        // Save
+        conn.save_scp_slot_state(100, state_json).unwrap();
+
+        // Load
+        let loaded = conn.load_scp_slot_state(100).unwrap();
+        assert_eq!(loaded, Some(state_json.to_string()));
+
+        // Load non-existent
+        let not_found = conn.load_scp_slot_state(999).unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_load_all_scp_slot_states() {
+        let conn = setup_db();
+
+        conn.save_scp_slot_state(100, "state100").unwrap();
+        conn.save_scp_slot_state(101, "state101").unwrap();
+        conn.save_scp_slot_state(102, "state102").unwrap();
+
+        let all = conn.load_all_scp_slot_states().unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Should be ordered by slot
+        assert_eq!(all[0].0, 100);
+        assert_eq!(all[1].0, 101);
+        assert_eq!(all[2].0, 102);
+    }
+
+    #[test]
+    fn test_delete_scp_slot_states_below() {
+        let conn = setup_db();
+
+        conn.save_scp_slot_state(100, "state100").unwrap();
+        conn.save_scp_slot_state(101, "state101").unwrap();
+        conn.save_scp_slot_state(102, "state102").unwrap();
+
+        // Delete slots < 102
+        conn.delete_scp_slot_states_below(102).unwrap();
+
+        let remaining = conn.load_all_scp_slot_states().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 102);
+    }
+
+    #[test]
+    fn test_tx_set_data_roundtrip() {
+        let conn = setup_db();
+        let hash = Hash([1u8; 32]);
+        let data = vec![1, 2, 3, 4, 5];
+
+        // Save
+        conn.save_tx_set_data(&hash, &data).unwrap();
+
+        // Has
+        assert!(conn.has_tx_set_data(&hash).unwrap());
+        assert!(!conn.has_tx_set_data(&Hash([2u8; 32])).unwrap());
+
+        // Load
+        let loaded = conn.load_tx_set_data(&hash).unwrap();
+        assert_eq!(loaded, Some(data));
+
+        // Load all
+        let all = conn.load_all_tx_set_data().unwrap();
+        assert_eq!(all.len(), 1);
     }
 }
