@@ -31,10 +31,12 @@
 
 ## Testing Guidelines
 
-- Use Rust’s built-in test framework (`#[test]`).
+- Use Rust's built-in test framework (`#[test]`).
 - Unit tests go in the same module; integration tests go in `crates/<crate>/tests/`.
 - Name tests by behavior, e.g., `test_execute_transaction_min_seq_num_precondition`.
 - Run focused tests when possible to speed iteration, then run `cargo test --all` before submitting.
+- No fuzz testing is required for this project.
+- No baseline transaction meta testing is required.
 
 ## Commit & Pull Request Guidelines
 
