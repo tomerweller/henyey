@@ -32,7 +32,7 @@ Main binary crate providing CLI interface.
 
 | Location | Issue | Suggested Fix |
 |----------|-------|---------------|
-| `main.rs:948-949` | Unchecked `unwrap()` on `checkpoints_to_publish.first()/last()` | Use `.expect()` with descriptive message |
+| ~~`main.rs:948-949`~~ | ~~Unchecked `unwrap()` on `checkpoints_to_publish.first()/last()`~~ | ✅ Fixed: Use `.expect()` with descriptive message |
 | `main.rs:1826,1828,1927,1934,2281` | `unwrap()` on RwLock operations | Use `.expect("lock should not be poisoned")` |
 | `main.rs:1980` | `executor.as_mut().unwrap()` without guard | Use `.expect("executor was just initialized")` |
 | `main.rs:2360` | `account_bytes.try_into().unwrap()` | Combine validation and conversion |
@@ -49,8 +49,8 @@ Main binary crate providing CLI interface.
 
 | Location | Issue | Suggested Fix |
 |----------|-------|---------------|
-| `quorum_intersection.rs:158` | Exponential algorithm without guard | Add check that fails if `nodes.len() > 20` |
-| `main.rs:1189-1190` | Inefficient hash sorting via hex strings | Use `sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()))` |
+| ~~`quorum_intersection.rs:158`~~ | ~~Exponential algorithm without guard~~ | ✅ Fixed: Added MAX_QUORUM_INTERSECTION_NODES guard (20 nodes) |
+| ~~`main.rs:1189-1190`~~ | ~~Inefficient hash sorting via hex strings~~ | ✅ Fixed: Use direct byte comparison |
 
 ### Security Concerns
 
