@@ -1,0 +1,815 @@
+//! Thread-safe bucket list snapshots for concurrent access.
+//!
+//! This module provides the infrastructure for taking consistent point-in-time
+//! snapshots of the bucket list that can be safely accessed from multiple threads.
+//!
+//! # Architecture
+//!
+//! The snapshot system has three main components:
+//!
+//! - [`BucketSnapshot`]: A read-only wrapper around a single bucket
+//! - [`BucketListSnapshot`]: A complete snapshot of the bucket list at a ledger
+//! - [`BucketSnapshotManager`]: Manages current and historical snapshots
+//!
+//! # Thread Safety
+//!
+//! The [`BucketSnapshotManager`] uses a read-write lock to allow:
+//! - Multiple concurrent readers (via `RwLock::read()`)
+//! - Exclusive write access when updating snapshots (via `RwLock::write()`)
+//!
+//! This enables parallel transaction validation while the main thread continues
+//! to update the canonical bucket list.
+//!
+//! # Usage
+//!
+//! ```ignore
+//! use stellar_core_bucket::snapshot::BucketSnapshotManager;
+//!
+//! // Create snapshot manager with initial snapshot
+//! let manager = BucketSnapshotManager::new(initial_snapshot, hot_archive_snapshot, 5);
+//!
+//! // Get a searchable snapshot for queries (can be called from any thread)
+//! let snapshot = manager.copy_searchable_live_snapshot();
+//!
+//! // Query the snapshot
+//! if let Some(entry) = snapshot.load(&key) {
+//!     // Use the entry
+//! }
+//!
+//! // Update snapshot when ledger closes (main thread only)
+//! manager.update_current_snapshot(new_live_snapshot, new_hot_archive_snapshot);
+//! ```
+
+use crate::{Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel, HotArchiveBucketList};
+use parking_lot::RwLock;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use stellar_xdr::curr::{LedgerEntry, LedgerHeader, LedgerKey};
+
+/// A read-only snapshot of a single bucket.
+///
+/// This wrapper provides thread-safe access to bucket contents without
+/// allowing modifications. The underlying bucket data is shared via `Arc`
+/// for efficient cloning across threads.
+#[derive(Clone)]
+pub struct BucketSnapshot {
+    bucket: Arc<Bucket>,
+}
+
+impl BucketSnapshot {
+    /// Creates a new snapshot from an Arc-wrapped bucket.
+    pub fn new(bucket: Arc<Bucket>) -> Self {
+        Self { bucket }
+    }
+
+    /// Creates a snapshot from a cloned bucket.
+    ///
+    /// This wraps the bucket in an Arc for efficient sharing.
+    pub fn from_bucket(bucket: Bucket) -> Self {
+        Self {
+            bucket: Arc::new(bucket),
+        }
+    }
+
+    /// Creates a snapshot from a bucket reference by cloning.
+    pub fn from_ref(bucket: &Bucket) -> Self {
+        Self {
+            bucket: Arc::new(bucket.clone()),
+        }
+    }
+
+    /// Returns true if the bucket is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bucket.is_empty()
+    }
+
+    /// Returns the number of entries in the bucket.
+    pub fn len(&self) -> usize {
+        self.bucket.len()
+    }
+
+    /// Returns the bucket's content hash.
+    pub fn hash(&self) -> stellar_core_common::Hash256 {
+        self.bucket.hash()
+    }
+
+    /// Gets an entry by key from this bucket.
+    ///
+    /// Returns the entry if found, or `None` if not present or on error.
+    pub fn get(&self, key: &LedgerKey) -> Option<BucketEntry> {
+        self.bucket.get(key).ok().flatten()
+    }
+
+    /// Returns a reference to the underlying bucket.
+    pub fn raw_bucket(&self) -> &Bucket {
+        &self.bucket
+    }
+
+    /// Loads entries for the given keys.
+    ///
+    /// For each key found, the entry is added to `result` and the key is removed
+    /// from `keys`. This allows efficient multi-key lookups across multiple buckets.
+    pub fn load_keys(&self, keys: &mut Vec<LedgerKey>, result: &mut Vec<LedgerEntry>) {
+        keys.retain(|key| {
+            if let Some(entry) = self.bucket.get(key).ok().flatten() {
+                match entry {
+                    BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                        result.push(e);
+                        false // Remove from keys
+                    }
+                    BucketEntry::Dead(_) => {
+                        false // Key is dead, remove from search but don't add to result
+                    }
+                    BucketEntry::Metadata(_) => {
+                        true // Keep searching
+                    }
+                }
+            } else {
+                true // Keep in keys, continue searching
+            }
+        });
+    }
+}
+
+/// A read-only snapshot of a single hot archive bucket.
+#[derive(Clone)]
+pub struct HotArchiveBucketSnapshot {
+    bucket: Arc<HotArchiveBucket>,
+}
+
+impl HotArchiveBucketSnapshot {
+    /// Creates a new snapshot from an Arc-wrapped hot archive bucket.
+    pub fn new(bucket: Arc<HotArchiveBucket>) -> Self {
+        Self { bucket }
+    }
+
+    /// Creates a snapshot from an owned bucket.
+    pub fn from_bucket(bucket: HotArchiveBucket) -> Self {
+        Self {
+            bucket: Arc::new(bucket),
+        }
+    }
+
+    /// Creates a snapshot from a bucket reference by cloning.
+    pub fn from_ref(bucket: &HotArchiveBucket) -> Self {
+        Self {
+            bucket: Arc::new(bucket.clone()),
+        }
+    }
+
+    /// Returns true if the bucket is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bucket.is_empty()
+    }
+
+    /// Returns the number of entries in the bucket.
+    pub fn len(&self) -> usize {
+        self.bucket.len()
+    }
+
+    /// Returns the bucket's content hash.
+    pub fn hash(&self) -> stellar_core_common::Hash256 {
+        self.bucket.hash()
+    }
+
+    /// Returns a reference to the underlying bucket.
+    pub fn raw_bucket(&self) -> &HotArchiveBucket {
+        &self.bucket
+    }
+}
+
+/// Snapshot of a single bucket list level.
+#[derive(Clone)]
+pub struct BucketLevelSnapshot {
+    /// Current bucket snapshot
+    pub curr: BucketSnapshot,
+    /// Snapshot bucket snapshot
+    pub snap: BucketSnapshot,
+}
+
+impl BucketLevelSnapshot {
+    /// Creates a new level snapshot from a bucket level.
+    pub fn from_level(level: &BucketLevel) -> Self {
+        Self {
+            curr: BucketSnapshot::from_ref(&level.curr),
+            snap: BucketSnapshot::from_ref(&level.snap),
+        }
+    }
+}
+
+/// Snapshot of a single hot archive bucket list level.
+#[derive(Clone)]
+pub struct HotArchiveBucketLevelSnapshot {
+    /// Current bucket snapshot
+    pub curr: HotArchiveBucketSnapshot,
+    /// Snapshot bucket snapshot
+    pub snap: HotArchiveBucketSnapshot,
+}
+
+impl HotArchiveBucketLevelSnapshot {
+    /// Creates a new level snapshot from a hot archive bucket level.
+    pub fn from_level(level: &HotArchiveBucketLevel) -> Self {
+        Self {
+            curr: HotArchiveBucketSnapshot::from_ref(&level.curr),
+            snap: HotArchiveBucketSnapshot::from_ref(&level.snap),
+        }
+    }
+}
+
+/// A complete snapshot of the live bucket list at a specific ledger.
+///
+/// This captures the state of all 11 levels at the time the snapshot was taken,
+/// along with the ledger header that corresponds to this state.
+#[derive(Clone)]
+pub struct BucketListSnapshot {
+    levels: Vec<BucketLevelSnapshot>,
+    header: LedgerHeader,
+}
+
+impl BucketListSnapshot {
+    /// Creates a new snapshot from a bucket list and header.
+    pub fn new(bucket_list: &BucketList, header: LedgerHeader) -> Self {
+        let levels = bucket_list
+            .levels()
+            .iter()
+            .map(BucketLevelSnapshot::from_level)
+            .collect();
+        Self { levels, header }
+    }
+
+    /// Returns the ledger sequence number for this snapshot.
+    pub fn ledger_seq(&self) -> u32 {
+        self.header.ledger_seq
+    }
+
+    /// Returns the ledger header for this snapshot.
+    pub fn ledger_header(&self) -> &LedgerHeader {
+        &self.header
+    }
+
+    /// Returns the level snapshots.
+    pub fn levels(&self) -> &[BucketLevelSnapshot] {
+        &self.levels
+    }
+
+    /// Looks up an entry by key in this snapshot.
+    ///
+    /// Searches from level 0 (most recent) to level 10 (oldest), returning
+    /// the first live entry found or `None` if the key is dead or not present.
+    pub fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        for level in &self.levels {
+            // Check curr first, then snap
+            for bucket in [&level.curr, &level.snap] {
+                if let Some(entry) = bucket.get(key) {
+                    match entry {
+                        BucketEntry::Live(e) | BucketEntry::Init(e) => return Some(e),
+                        BucketEntry::Dead(_) => return None,
+                        BucketEntry::Metadata(_) => continue,
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Loads multiple entries by their keys.
+    ///
+    /// Returns a vector of found entries. Keys that are not found or are dead
+    /// are not included in the result.
+    pub fn load_keys(&self, keys: &[LedgerKey]) -> Vec<LedgerEntry> {
+        let mut remaining_keys: Vec<LedgerKey> = keys.to_vec();
+        let mut result = Vec::new();
+
+        for level in &self.levels {
+            if remaining_keys.is_empty() {
+                break;
+            }
+            level.curr.load_keys(&mut remaining_keys, &mut result);
+            if remaining_keys.is_empty() {
+                break;
+            }
+            level.snap.load_keys(&mut remaining_keys, &mut result);
+        }
+
+        result
+    }
+}
+
+/// A complete snapshot of the hot archive bucket list at a specific ledger.
+#[derive(Clone)]
+pub struct HotArchiveBucketListSnapshot {
+    levels: Vec<HotArchiveBucketLevelSnapshot>,
+    header: LedgerHeader,
+}
+
+impl HotArchiveBucketListSnapshot {
+    /// Creates a new snapshot from a hot archive bucket list and header.
+    pub fn new(bucket_list: &HotArchiveBucketList, header: LedgerHeader) -> Self {
+        let levels = bucket_list
+            .levels()
+            .iter()
+            .map(HotArchiveBucketLevelSnapshot::from_level)
+            .collect();
+        Self { levels, header }
+    }
+
+    /// Returns the ledger sequence number for this snapshot.
+    pub fn ledger_seq(&self) -> u32 {
+        self.header.ledger_seq
+    }
+
+    /// Returns the ledger header for this snapshot.
+    pub fn ledger_header(&self) -> &LedgerHeader {
+        &self.header
+    }
+
+    /// Returns the level snapshots.
+    pub fn levels(&self) -> &[HotArchiveBucketLevelSnapshot] {
+        &self.levels
+    }
+}
+
+/// A searchable wrapper around a bucket list snapshot.
+///
+/// This provides a higher-level interface for querying the snapshot,
+/// with support for historical ledger lookups.
+pub struct SearchableBucketListSnapshot {
+    snapshot: BucketListSnapshot,
+    historical_snapshots: BTreeMap<u32, BucketListSnapshot>,
+}
+
+impl SearchableBucketListSnapshot {
+    /// Creates a new searchable snapshot.
+    pub fn new(
+        snapshot: BucketListSnapshot,
+        historical_snapshots: BTreeMap<u32, BucketListSnapshot>,
+    ) -> Self {
+        Self {
+            snapshot,
+            historical_snapshots,
+        }
+    }
+
+    /// Returns the current ledger sequence number.
+    pub fn ledger_seq(&self) -> u32 {
+        self.snapshot.ledger_seq()
+    }
+
+    /// Returns the current ledger header.
+    pub fn ledger_header(&self) -> &LedgerHeader {
+        self.snapshot.ledger_header()
+    }
+
+    /// Loads a single entry by key from the current snapshot.
+    pub fn load(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        self.snapshot.get(key)
+    }
+
+    /// Loads multiple entries by their keys from the current snapshot.
+    pub fn load_keys(&self, keys: &[LedgerKey]) -> Vec<LedgerEntry> {
+        self.snapshot.load_keys(keys)
+    }
+
+    /// Loads entries from a specific historical ledger.
+    ///
+    /// Returns `None` if the requested ledger is not available in the
+    /// historical snapshots.
+    pub fn load_keys_from_ledger(
+        &self,
+        keys: &[LedgerKey],
+        ledger_seq: u32,
+    ) -> Option<Vec<LedgerEntry>> {
+        if ledger_seq == self.snapshot.ledger_seq() {
+            return Some(self.snapshot.load_keys(keys));
+        }
+
+        self.historical_snapshots
+            .get(&ledger_seq)
+            .map(|snap| snap.load_keys(keys))
+    }
+
+    /// Returns the range of available ledger sequences.
+    ///
+    /// Returns `(oldest, newest)` where `oldest` is the oldest historical
+    /// ledger available and `newest` is the current ledger.
+    pub fn available_ledger_range(&self) -> (u32, u32) {
+        let oldest = self
+            .historical_snapshots
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(self.snapshot.ledger_seq());
+        (oldest, self.snapshot.ledger_seq())
+    }
+}
+
+/// A searchable wrapper around a hot archive bucket list snapshot.
+pub struct SearchableHotArchiveBucketListSnapshot {
+    snapshot: HotArchiveBucketListSnapshot,
+    historical_snapshots: BTreeMap<u32, HotArchiveBucketListSnapshot>,
+}
+
+impl SearchableHotArchiveBucketListSnapshot {
+    /// Creates a new searchable hot archive snapshot.
+    pub fn new(
+        snapshot: HotArchiveBucketListSnapshot,
+        historical_snapshots: BTreeMap<u32, HotArchiveBucketListSnapshot>,
+    ) -> Self {
+        Self {
+            snapshot,
+            historical_snapshots,
+        }
+    }
+
+    /// Returns the current ledger sequence number.
+    pub fn ledger_seq(&self) -> u32 {
+        self.snapshot.ledger_seq()
+    }
+
+    /// Returns the current ledger header.
+    pub fn ledger_header(&self) -> &LedgerHeader {
+        self.snapshot.ledger_header()
+    }
+}
+
+/// Manages bucket list snapshots for thread-safe concurrent access.
+///
+/// This is the main entry point for obtaining snapshots of the bucket list.
+/// It maintains:
+///
+/// - The current canonical snapshot (updated by the main thread)
+/// - A configurable number of historical snapshots for point-in-time queries
+///
+/// # Thread Safety
+///
+/// - `copy_searchable_*` methods acquire a read lock
+/// - `update_current_snapshot` acquires a write lock
+///
+/// Multiple threads can call `copy_searchable_*` concurrently, but
+/// `update_current_snapshot` blocks all readers until complete.
+pub struct BucketSnapshotManager {
+    /// Current live bucket list snapshot
+    current_live: RwLock<Option<BucketListSnapshot>>,
+    /// Current hot archive bucket list snapshot
+    current_hot_archive: RwLock<Option<HotArchiveBucketListSnapshot>>,
+    /// Historical live snapshots (ledger_seq -> snapshot)
+    live_historical: RwLock<BTreeMap<u32, BucketListSnapshot>>,
+    /// Historical hot archive snapshots (ledger_seq -> snapshot)
+    hot_archive_historical: RwLock<BTreeMap<u32, HotArchiveBucketListSnapshot>>,
+    /// Maximum number of historical snapshots to retain
+    num_historical_snapshots: u32,
+}
+
+impl BucketSnapshotManager {
+    /// Creates a new snapshot manager with initial snapshots.
+    ///
+    /// # Arguments
+    ///
+    /// * `live_snapshot` - Initial live bucket list snapshot
+    /// * `hot_archive_snapshot` - Initial hot archive bucket list snapshot
+    /// * `num_historical_snapshots` - Number of historical snapshots to retain
+    pub fn new(
+        live_snapshot: BucketListSnapshot,
+        hot_archive_snapshot: HotArchiveBucketListSnapshot,
+        num_historical_snapshots: u32,
+    ) -> Self {
+        Self {
+            current_live: RwLock::new(Some(live_snapshot)),
+            current_hot_archive: RwLock::new(Some(hot_archive_snapshot)),
+            live_historical: RwLock::new(BTreeMap::new()),
+            hot_archive_historical: RwLock::new(BTreeMap::new()),
+            num_historical_snapshots,
+        }
+    }
+
+    /// Creates an empty snapshot manager.
+    ///
+    /// Use `update_current_snapshot` to set the initial snapshots.
+    pub fn empty(num_historical_snapshots: u32) -> Self {
+        Self {
+            current_live: RwLock::new(None),
+            current_hot_archive: RwLock::new(None),
+            live_historical: RwLock::new(BTreeMap::new()),
+            hot_archive_historical: RwLock::new(BTreeMap::new()),
+            num_historical_snapshots,
+        }
+    }
+
+    /// Returns a copy of the current searchable live bucket list snapshot.
+    ///
+    /// This method acquires a read lock and is safe to call from any thread.
+    pub fn copy_searchable_live_snapshot(&self) -> Option<SearchableBucketListSnapshot> {
+        let snapshot = self.current_live.read().clone()?;
+        let historical = self.live_historical.read().clone();
+        Some(SearchableBucketListSnapshot::new(snapshot, historical))
+    }
+
+    /// Returns a copy of the current searchable hot archive snapshot.
+    ///
+    /// This method acquires a read lock and is safe to call from any thread.
+    pub fn copy_searchable_hot_archive_snapshot(
+        &self,
+    ) -> Option<SearchableHotArchiveBucketListSnapshot> {
+        let snapshot = self.current_hot_archive.read().clone()?;
+        let historical = self.hot_archive_historical.read().clone();
+        Some(SearchableHotArchiveBucketListSnapshot::new(
+            snapshot, historical,
+        ))
+    }
+
+    /// Copies both live and hot archive snapshots atomically.
+    ///
+    /// This ensures both snapshots correspond to the same ledger state,
+    /// which is important when querying both snapshot types together.
+    pub fn copy_live_and_hot_archive_snapshots(
+        &self,
+    ) -> Option<(
+        SearchableBucketListSnapshot,
+        SearchableHotArchiveBucketListSnapshot,
+    )> {
+        // Acquire both locks to ensure consistency
+        let live = self.current_live.read().clone()?;
+        let hot_archive = self.current_hot_archive.read().clone()?;
+        let live_historical = self.live_historical.read().clone();
+        let hot_archive_historical = self.hot_archive_historical.read().clone();
+
+        Some((
+            SearchableBucketListSnapshot::new(live, live_historical),
+            SearchableHotArchiveBucketListSnapshot::new(hot_archive, hot_archive_historical),
+        ))
+    }
+
+    /// Updates a snapshot if a newer one is available.
+    ///
+    /// Returns `true` if the snapshot was updated, `false` otherwise.
+    pub fn maybe_update_live_snapshot(
+        &self,
+        snapshot: &mut Option<SearchableBucketListSnapshot>,
+    ) -> bool {
+        let current = self.current_live.read();
+        let needs_update = match (&*current, snapshot.as_ref()) {
+            (Some(curr), Some(snap)) => curr.ledger_seq() > snap.ledger_seq(),
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if needs_update {
+            drop(current);
+            *snapshot = self.copy_searchable_live_snapshot();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Updates the current snapshots.
+    ///
+    /// This method should only be called from the main thread after a ledger
+    /// closes. It acquires write locks on both snapshot stores.
+    ///
+    /// The previous current snapshot is moved to historical storage (if
+    /// historical snapshots are enabled).
+    pub fn update_current_snapshot(
+        &self,
+        live_snapshot: BucketListSnapshot,
+        hot_archive_snapshot: HotArchiveBucketListSnapshot,
+    ) {
+        // Update live snapshot
+        {
+            let mut current = self.current_live.write();
+            let mut historical = self.live_historical.write();
+
+            if self.num_historical_snapshots > 0 {
+                if let Some(prev) = current.take() {
+                    let ledger_seq = prev.ledger_seq();
+
+                    // Remove oldest if at capacity
+                    if historical.len() >= self.num_historical_snapshots as usize {
+                        if let Some(&oldest) = historical.keys().next() {
+                            historical.remove(&oldest);
+                        }
+                    }
+
+                    historical.insert(ledger_seq, prev);
+                }
+            }
+
+            *current = Some(live_snapshot);
+        }
+
+        // Update hot archive snapshot
+        {
+            let mut current = self.current_hot_archive.write();
+            let mut historical = self.hot_archive_historical.write();
+
+            if self.num_historical_snapshots > 0 {
+                if let Some(prev) = current.take() {
+                    let ledger_seq = prev.ledger_seq();
+
+                    // Remove oldest if at capacity
+                    if historical.len() >= self.num_historical_snapshots as usize {
+                        if let Some(&oldest) = historical.keys().next() {
+                            historical.remove(&oldest);
+                        }
+                    }
+
+                    historical.insert(ledger_seq, prev);
+                }
+            }
+
+            *current = Some(hot_archive_snapshot);
+        }
+    }
+
+    /// Returns the current ledger sequence, if a snapshot exists.
+    pub fn current_ledger_seq(&self) -> Option<u32> {
+        self.current_live.read().as_ref().map(|s| s.ledger_seq())
+    }
+
+    /// Returns the number of historical snapshots currently stored.
+    pub fn historical_snapshot_count(&self) -> usize {
+        self.live_historical.read().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::*;
+
+    fn make_test_header(ledger_seq: u32) -> LedgerHeader {
+        LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0; 32]),
+                close_time: TimePoint(0),
+                upgrades: vec![].try_into().unwrap(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0; 32]),
+            bucket_list_hash: Hash([0; 32]),
+            ledger_seq,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5000000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0; 32]),
+                Hash([0; 32]),
+                Hash([0; 32]),
+                Hash([0; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_bucket_snapshot_manager_creation() {
+        let bucket_list = BucketList::new();
+        let hot_archive = HotArchiveBucketList::new();
+        let header = make_test_header(1);
+
+        let live_snapshot = BucketListSnapshot::new(&bucket_list, header.clone());
+        let hot_archive_snapshot = HotArchiveBucketListSnapshot::new(&hot_archive, header);
+
+        let manager = BucketSnapshotManager::new(live_snapshot, hot_archive_snapshot, 5);
+
+        assert_eq!(manager.current_ledger_seq(), Some(1));
+        assert_eq!(manager.historical_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_update_maintains_history() {
+        let bucket_list = BucketList::new();
+        let hot_archive = HotArchiveBucketList::new();
+
+        let manager = BucketSnapshotManager::new(
+            BucketListSnapshot::new(&bucket_list, make_test_header(1)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(1)),
+            3,
+        );
+
+        // Update to ledger 2
+        manager.update_current_snapshot(
+            BucketListSnapshot::new(&bucket_list, make_test_header(2)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(2)),
+        );
+        assert_eq!(manager.current_ledger_seq(), Some(2));
+        assert_eq!(manager.historical_snapshot_count(), 1);
+
+        // Update to ledger 3
+        manager.update_current_snapshot(
+            BucketListSnapshot::new(&bucket_list, make_test_header(3)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(3)),
+        );
+        assert_eq!(manager.current_ledger_seq(), Some(3));
+        assert_eq!(manager.historical_snapshot_count(), 2);
+
+        // Update to ledger 4
+        manager.update_current_snapshot(
+            BucketListSnapshot::new(&bucket_list, make_test_header(4)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(4)),
+        );
+        assert_eq!(manager.current_ledger_seq(), Some(4));
+        assert_eq!(manager.historical_snapshot_count(), 3);
+
+        // Update to ledger 5 - should evict oldest (ledger 1)
+        manager.update_current_snapshot(
+            BucketListSnapshot::new(&bucket_list, make_test_header(5)),
+            HotArchiveBucketListSnapshot::new(&hot_archive, make_test_header(5)),
+        );
+        assert_eq!(manager.current_ledger_seq(), Some(5));
+        assert_eq!(manager.historical_snapshot_count(), 3);
+
+        // Verify historical snapshots contain ledgers 2, 3, 4
+        let snapshot = manager.copy_searchable_live_snapshot().unwrap();
+        let (oldest, newest) = snapshot.available_ledger_range();
+        assert_eq!(oldest, 2);
+        assert_eq!(newest, 5);
+    }
+
+    #[test]
+    fn test_searchable_snapshot_load() {
+        let mut bucket_list = BucketList::new();
+        let header = make_test_header(1);
+
+        // Add some entries
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32])));
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 1000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        bucket_list
+            .add_batch(1, 25, BucketListType::Live, vec![entry], vec![], vec![])
+            .unwrap();
+
+        let snapshot = BucketListSnapshot::new(&bucket_list, header);
+        let searchable = SearchableBucketListSnapshot::new(snapshot, BTreeMap::new());
+
+        // Query the entry
+        let key = LedgerKey::Account(LedgerKeyAccount { account_id });
+        let result = searchable.load(&key);
+        assert!(result.is_some());
+
+        if let Some(LedgerEntry {
+            data: LedgerEntryData::Account(acc),
+            ..
+        }) = result
+        {
+            assert_eq!(acc.balance, 1000);
+        } else {
+            panic!("Expected account entry");
+        }
+    }
+
+    #[test]
+    fn test_concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let bucket_list = BucketList::new();
+        let hot_archive = HotArchiveBucketList::new();
+        let header = make_test_header(1);
+
+        let manager = Arc::new(BucketSnapshotManager::new(
+            BucketListSnapshot::new(&bucket_list, header.clone()),
+            HotArchiveBucketListSnapshot::new(&hot_archive, header),
+            5,
+        ));
+
+        // Spawn multiple reader threads
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        let snapshot = manager.copy_searchable_live_snapshot();
+                        assert!(snapshot.is_some());
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+}

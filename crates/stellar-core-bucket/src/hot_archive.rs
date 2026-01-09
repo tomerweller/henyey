@@ -277,6 +277,11 @@ impl HotArchiveBucketList {
         self.ledger_seq
     }
 
+    /// Get a reference to all levels.
+    pub fn levels(&self) -> &[HotArchiveBucketLevel] {
+        &self.levels
+    }
+
     /// Get a reference to a level.
     pub fn level(&self, idx: usize) -> Option<&HotArchiveBucketLevel> {
         self.levels.get(idx)

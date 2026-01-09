@@ -13,7 +13,7 @@ This section documents the implementation status relative to the C++ stellar-cor
 | Hot Archive Bucket List | Complete | Protocol 23+ Soroban state archival |
 | Eviction Scanning | Complete | Incremental scanning with iterator |
 | Disk-Backed Storage | Partial | Simpler index than C++ |
-| BucketSnapshot/SnapshotManager | Not Implemented | Thread-safe read snapshots |
+| BucketSnapshot/SnapshotManager | Complete | Thread-safe read snapshots with historical ledger support |
 | Advanced Indexing | Not Implemented | DiskIndex, InMemoryIndex, Bloom filters |
 | Specialized Queries | Not Implemented | Pool share lookups, inflation winners |
 | Metrics/Monitoring | Not Implemented | Medida integration |
@@ -87,20 +87,35 @@ This section documents the implementation status relative to the C++ stellar-cor
   - Live + Archived in snap = Annihilate (entry was restored)
   - Tombstones (Live markers) dropped at level 10
 
+#### Bucket Snapshots (`snapshot.rs`)
+- **BucketSnapshot** / **HotArchiveBucketSnapshot** - Read-only bucket snapshots using Arc for thread-safe sharing:
+  - `get()` - Key lookup
+  - `load_keys()` - Batched key lookups
+  - `is_empty()` / `len()` / `hash()` - Bucket metadata
+- **BucketListSnapshot** / **HotArchiveBucketListSnapshot** - Complete bucket list snapshots at a ledger:
+  - Captures all 11 levels with associated ledger header
+  - `get()` - Searches all levels from newest to oldest
+  - `load_keys()` - Batched key lookups across all levels
+  - `ledger_seq()` / `ledger_header()` - Ledger metadata
+- **BucketSnapshotManager** - Thread-safe snapshot management with:
+  - RwLock for concurrent read access
+  - Historical snapshots for querying past ledger states (configurable count)
+  - `update_current_snapshot()` - Main thread updates
+  - `copy_searchable_live_snapshot()` / `copy_searchable_hot_archive_snapshot()` - Background thread access
+  - `copy_live_and_hot_archive_snapshots()` - Atomic copy of both for consistent state
+  - `maybe_update_live_snapshot()` - Refresh-if-newer semantics
+- **SearchableBucketListSnapshot** / **SearchableHotArchiveBucketListSnapshot** - Searchable wrappers with:
+  - `load()` - Single key lookup
+  - `load_keys()` - Batched key lookups
+  - `load_keys_from_ledger()` - Historical ledger queries
+  - `available_ledger_range()` - Query range of available historical snapshots
+
 ### Not Yet Implemented (Gaps)
 
-#### Bucket Snapshots (BucketSnapshot.h, BucketSnapshotManager.h, SearchableBucketList.h)
-- **BucketSnapshotBase** / **LiveBucketSnapshot** / **HotArchiveBucketSnapshot** - Read-only bucket snapshots for concurrent access with lazy file stream initialization
-- **BucketSnapshotManager** - Thread-safe snapshot management with:
-  - Shared mutex for concurrent read access (`mSnapshotMutex`)
-  - Historical snapshots for querying past ledger states
-  - `updateCurrentSnapshot()` for main thread updates
-  - `copySearchableLiveBucketListSnapshot()` / `copySearchableHotArchiveBucketListSnapshot()` for background threads
-  - `maybeCopy*` interface for refresh-if-newer semantics
-- **SearchableLiveBucketListSnapshot** - Searchable snapshot with specialized queries:
+#### Specialized Queries (SearchableBucketList.h)
+- **SearchableLiveBucketListSnapshot** specialized queries:
   - `loadPoolShareTrustLinesByAccountAndAsset()` - Pool share lookups
   - `loadInflationWinners()` - Inflation winner queries
-  - `loadKeys()` - Batched key lookups with labels
   - `scanForEviction()` - Background eviction scanning
   - `scanForEntriesOfType()` - Type-filtered iteration
 - **SearchableHotArchiveBucketListSnapshot** - Hot archive snapshot queries

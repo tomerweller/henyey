@@ -100,6 +100,7 @@ mod future_bucket;
 mod hot_archive;
 mod manager;
 mod merge;
+pub mod snapshot;
 
 // ============================================================================
 // Core bucket types
@@ -162,6 +163,16 @@ pub use hot_archive::{
     is_hot_archive_tombstone, merge_hot_archive_buckets, HotArchiveBucket, HotArchiveBucketLevel,
     HotArchiveBucketList, HotArchiveBucketListStats, FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE,
     HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+};
+
+// ============================================================================
+// Snapshots (thread-safe concurrent access)
+// ============================================================================
+
+pub use snapshot::{
+    BucketLevelSnapshot, BucketListSnapshot, BucketSnapshot, BucketSnapshotManager,
+    HotArchiveBucketLevelSnapshot, HotArchiveBucketListSnapshot, HotArchiveBucketSnapshot,
+    SearchableBucketListSnapshot, SearchableHotArchiveBucketListSnapshot,
 };
 
 // ============================================================================
