@@ -63,4 +63,7 @@ url.workspace = true
 # Temp files
 tempfile.workspace = true
 
+# Directories
+dirs = "5"
+
 [dev-dependencies]

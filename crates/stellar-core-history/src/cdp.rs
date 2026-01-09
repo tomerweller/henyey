@@ -275,6 +275,259 @@ impl CdpDataLake {
     }
 }
 
+/// CDP data lake client with disk caching and parallel prefetching.
+///
+/// This wrapper around `CdpDataLake` adds:
+/// - Disk-based caching of downloaded ledger metadata
+/// - Parallel prefetching of upcoming ledgers
+/// - Significant performance improvement for sequential access patterns
+///
+/// # Cache Structure
+///
+/// Cached files are stored as:
+/// ```text
+/// {cache_dir}/cdp/{network}/{date}/{ledger_seq}.xdr.zst
+/// ```
+///
+/// # Prefetching
+///
+/// When fetching a ledger, this client can prefetch the next N ledgers
+/// in parallel, reducing latency for sequential access patterns like
+/// catchup and verification.
+#[derive(Debug)]
+pub struct CachedCdpDataLake {
+    /// Inner CDP client for network requests.
+    inner: CdpDataLake,
+    /// Cache directory for storing downloaded metadata.
+    cache_dir: std::path::PathBuf,
+    /// Network identifier for cache organization (e.g., "testnet", "mainnet").
+    #[allow(dead_code)]
+    network: String,
+    /// Number of ledgers to prefetch ahead.
+    prefetch_count: usize,
+}
+
+impl CachedCdpDataLake {
+    /// Create a new cached CDP data lake client.
+    ///
+    /// # Arguments
+    /// * `base_url` - Base URL for the CDP data lake
+    /// * `date_partition` - Date partition (e.g., "2025-12-18")
+    /// * `cache_dir` - Directory for caching downloaded metadata
+    /// * `network` - Network identifier for cache organization
+    pub fn new(
+        base_url: &str,
+        date_partition: &str,
+        cache_dir: impl AsRef<std::path::Path>,
+        network: &str,
+    ) -> std::io::Result<Self> {
+        let cache_path = cache_dir
+            .as_ref()
+            .join("cdp")
+            .join(network)
+            .join(date_partition);
+        std::fs::create_dir_all(&cache_path)?;
+
+        Ok(Self {
+            inner: CdpDataLake::new(base_url, date_partition),
+            cache_dir: cache_path,
+            network: network.to_string(),
+            prefetch_count: 16, // Default prefetch count
+        })
+    }
+
+    /// Set the number of ledgers to prefetch.
+    pub fn with_prefetch_count(mut self, count: usize) -> Self {
+        self.prefetch_count = count;
+        self
+    }
+
+    /// Get the cache file path for a ledger.
+    fn cache_path(&self, ledger_seq: u32) -> std::path::PathBuf {
+        self.cache_dir.join(format!("{}.xdr.zst", ledger_seq))
+    }
+
+    /// Check if a ledger is cached.
+    pub fn is_cached(&self, ledger_seq: u32) -> bool {
+        self.cache_path(ledger_seq).exists()
+    }
+
+    /// Get count of cached ledgers in a range.
+    pub fn cached_count(&self, start: u32, end: u32) -> usize {
+        (start..=end).filter(|seq| self.is_cached(*seq)).count()
+    }
+
+    /// Fetch a ledger, using cache if available.
+    pub async fn get_ledger_close_meta(&self, ledger_seq: u32) -> Result<LedgerCloseMeta> {
+        let cache_path = self.cache_path(ledger_seq);
+
+        // Check cache first
+        if cache_path.exists() {
+            tracing::debug!(ledger_seq, "Loading LedgerCloseMeta from cache");
+            let compressed = std::fs::read(&cache_path)?;
+            return self.inner.decompress_and_parse(&compressed, ledger_seq);
+        }
+
+        // Fetch from network and cache
+        self.fetch_and_cache(ledger_seq).await
+    }
+
+    /// Fetch a ledger from network and cache it.
+    async fn fetch_and_cache(&self, ledger_seq: u32) -> Result<LedgerCloseMeta> {
+        let url = self.inner.url_for_ledger(ledger_seq);
+        tracing::debug!(ledger_seq, url = %url, "Fetching LedgerCloseMeta from CDP");
+
+        let response = self.inner.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HistoryError::DownloadFailed(format!("CDP fetch failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(HistoryError::HttpStatus {
+                url,
+                status: response.status().as_u16(),
+            });
+        }
+
+        let compressed_data: bytes::Bytes = response
+            .bytes()
+            .await
+            .map_err(|e| HistoryError::DownloadFailed(format!("CDP read failed: {}", e)))?;
+
+        // Cache the compressed data
+        let cache_path = self.cache_path(ledger_seq);
+        if let Err(e) = std::fs::write(&cache_path, &compressed_data) {
+            tracing::warn!(ledger_seq, error = %e, "Failed to cache CDP data");
+        }
+
+        self.inner.decompress_and_parse(&compressed_data, ledger_seq)
+    }
+
+    /// Prefetch multiple ledgers in parallel.
+    ///
+    /// Downloads and caches ledgers that aren't already cached.
+    /// Returns the number of ledgers successfully prefetched.
+    pub async fn prefetch(&self, start: u32, end: u32) -> usize {
+        use futures::stream::{self, StreamExt};
+
+        let to_fetch: Vec<u32> = (start..=end)
+            .filter(|seq| !self.is_cached(*seq))
+            .collect();
+
+        if to_fetch.is_empty() {
+            return 0;
+        }
+
+        let results: Vec<Result<()>> = stream::iter(to_fetch.iter())
+            .map(|&seq| async move {
+                self.fetch_and_cache(seq).await?;
+                Ok(())
+            })
+            .buffer_unordered(self.prefetch_count)
+            .collect()
+            .await;
+
+        results.iter().filter(|r| r.is_ok()).count()
+    }
+
+    /// Fetch multiple ledgers with prefetching.
+    ///
+    /// This method efficiently fetches a range of ledgers by:
+    /// 1. Using cached data when available
+    /// 2. Prefetching uncached ledgers in parallel
+    /// 3. Returning results in order
+    pub async fn get_ledger_close_metas_prefetch(
+        &self,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<LedgerCloseMeta>> {
+        use futures::stream::{self, StreamExt};
+
+        // Prefetch all uncached ledgers in parallel first
+        let uncached: Vec<u32> = (start..=end)
+            .filter(|seq| !self.is_cached(*seq))
+            .collect();
+
+        if !uncached.is_empty() {
+            let total = uncached.len();
+            tracing::info!(
+                "Prefetching {} ledgers ({} already cached)",
+                total,
+                (end - start + 1) as usize - total
+            );
+
+            let downloaded = std::sync::atomic::AtomicU32::new(0);
+            let _: Vec<Result<()>> = stream::iter(uncached.into_iter())
+                .map(|seq| {
+                    let downloaded = &downloaded;
+                    async move {
+                        self.fetch_and_cache(seq).await?;
+                        let count = downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if count % 10 == 0 || count == total as u32 {
+                            tracing::info!("  Prefetched {}/{} ledgers", count, total);
+                        }
+                        Ok(())
+                    }
+                })
+                .buffer_unordered(self.prefetch_count)
+                .collect()
+                .await;
+        }
+
+        // Now read all from cache (which should all be populated)
+        let mut metas = Vec::with_capacity((end - start + 1) as usize);
+        for seq in start..=end {
+            let meta = self.get_ledger_close_meta(seq).await?;
+            metas.push(meta);
+        }
+
+        Ok(metas)
+    }
+
+    /// Get cache statistics.
+    pub fn cache_stats(&self) -> CacheStats {
+        let entries = std::fs::read_dir(&self.cache_dir)
+            .map(|entries| entries.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+
+        let size_bytes = std::fs::read_dir(&self.cache_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        CacheStats {
+            entries,
+            size_bytes,
+            cache_dir: self.cache_dir.clone(),
+        }
+    }
+}
+
+/// Statistics about the CDP cache.
+#[derive(Debug)]
+pub struct CacheStats {
+    /// Number of cached ledger entries.
+    pub entries: usize,
+    /// Total size of cached data in bytes.
+    pub size_bytes: u64,
+    /// Cache directory path.
+    pub cache_dir: std::path::PathBuf,
+}
+
+impl CdpDataLake {
+    /// Helper to decompress and parse cached data.
+    fn decompress_and_parse(&self, compressed: &[u8], ledger_seq: u32) -> Result<LedgerCloseMeta> {
+        let decompressed = self.decompress_zstd(compressed)?;
+        self.parse_ledger_close_meta_batch(&decompressed, ledger_seq)
+    }
+}
+
 /// Extract transaction metadata from a `LedgerCloseMeta`.
 ///
 /// Returns the `TransactionMeta` for each transaction in execution order.

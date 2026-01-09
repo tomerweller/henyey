@@ -328,6 +328,14 @@ enum OfflineCommands {
         /// CDP date partition (default: 2025-12-18)
         #[arg(long, default_value = "2025-12-18")]
         cdp_date: String,
+
+        /// Cache directory for buckets and CDP metadata (default: ~/.cache/rs-stellar-core)
+        #[arg(long)]
+        cache_dir: Option<std::path::PathBuf>,
+
+        /// Disable caching (use temp directories)
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Debug: inspect an account in the bucket list at a checkpoint
@@ -1384,15 +1392,18 @@ fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
 ///
 /// Returns `Ok(())` if all buckets were downloaded successfully, or an error
 /// if any download failed.
+/// Returns (cached_count, downloaded_count)
 async fn download_buckets_parallel(
     archive: &stellar_core_history::HistoryArchive,
     bucket_manager: &stellar_core_bucket::BucketManager,
     hashes: Vec<&stellar_core_common::Hash256>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(usize, usize)> {
     use futures::stream::{self, StreamExt};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+
+    let total_count = hashes.len();
 
     // Filter out already-cached buckets
     let to_download: Vec<_> = hashes
@@ -1400,14 +1411,16 @@ async fn download_buckets_parallel(
         .filter(|hash| bucket_manager.load_bucket(hash).is_err())
         .collect();
 
+    let cached_count = total_count - to_download.len();
+
     if to_download.is_empty() {
-        return Ok(());
+        return Ok((cached_count, 0));
     }
 
-    let total = to_download.len();
+    let download_count = to_download.len();
     let downloaded = AtomicU32::new(0);
 
-    println!("Downloading {} buckets with {} parallel connections...", total, MAX_CONCURRENT_DOWNLOADS);
+    println!("  {} cached, {} to download...", cached_count, download_count);
 
     let results: Vec<anyhow::Result<()>> = stream::iter(to_download.into_iter())
         .map(|hash| {
@@ -1419,8 +1432,8 @@ async fn download_buckets_parallel(
                     .map_err(|e| anyhow::anyhow!("Failed to import bucket {}: {}", hash.to_hex(), e))?;
 
                 let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
-                if count % 5 == 0 || count == total as u32 {
-                    println!("  Downloaded {}/{} buckets", count, total);
+                if count % 5 == 0 || count == download_count as u32 {
+                    println!("  Downloaded {}/{} buckets", count, download_count);
                 }
                 Ok(())
             }
@@ -1434,7 +1447,7 @@ async fn download_buckets_parallel(
         result?;
     }
 
-    Ok(())
+    Ok((cached_count, download_count))
 }
 
 /// Replays bucket list changes from CDP metadata to validate our implementation.
@@ -1562,8 +1575,11 @@ async fn cmd_replay_bucket_list(
         .filter(|h| !h.is_zero())
         .collect();
 
-    println!("Downloading {} buckets...", all_hashes.len());
-    download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+    print!("Buckets ({} required):", all_hashes.len());
+    let (cached, downloaded) = download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+    if downloaded == 0 {
+        println!(" {} cached", cached);
+    }
 
     // Restore bucket lists
     let mut bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
@@ -1762,6 +1778,8 @@ async fn cmd_replay_bucket_list(
 /// * `show_diff` - Show detailed diff of mismatched entries
 /// * `cdp_url` - CDP data lake URL
 /// * `cdp_date` - CDP date partition
+/// * `cache_dir` - Optional cache directory for buckets and CDP metadata
+/// * `no_cache` - Disable caching (use temp directories)
 async fn cmd_verify_execution(
     config: AppConfig,
     from: Option<u32>,
@@ -1770,12 +1788,14 @@ async fn cmd_verify_execution(
     show_diff: bool,
     cdp_url: &str,
     cdp_date: &str,
+    cache_dir: Option<std::path::PathBuf>,
+    no_cache: bool,
 ) -> anyhow::Result<()> {
     use std::sync::{Arc, RwLock};
     use stellar_core_bucket::{BucketList, BucketManager};
     use stellar_core_common::{Hash256, NetworkId};
     use stellar_core_history::{HistoryArchive, checkpoint};
-    use stellar_core_history::cdp::{CdpDataLake, extract_ledger_header, extract_upgrade_metas};
+    use stellar_core_history::cdp::{CachedCdpDataLake, extract_ledger_header, extract_upgrade_metas};
     use stellar_core_history::replay::extract_ledger_changes;
     use stellar_core_ledger::{LedgerSnapshot, SnapshotHandle, LedgerError};
     use stellar_core_ledger::execution::{TransactionExecutor, load_soroban_config};
@@ -1787,11 +1807,20 @@ async fn cmd_verify_execution(
     println!("Re-executes transactions and compares results against CDP metadata.");
     println!();
 
-    // Determine network ID
-    let network_id = if config.network.passphrase.contains("Test") {
-        NetworkId::testnet()
+    // Determine network ID and network name
+    let (network_id, network_name) = if config.network.passphrase.contains("Test") {
+        (NetworkId::testnet(), "testnet")
     } else {
-        NetworkId::mainnet()
+        (NetworkId::mainnet(), "mainnet")
+    };
+
+    // Determine cache directory
+    let cache_base = if no_cache {
+        None
+    } else {
+        cache_dir.or_else(|| {
+            dirs::cache_dir().map(|p| p.join("rs-stellar-core"))
+        })
     };
 
     // Create archive client
@@ -1803,6 +1832,11 @@ async fn cmd_verify_execution(
 
     println!("Archive: {}", config.history.archives[0].url);
     println!("CDP: {} ({})", cdp_url, cdp_date);
+    if let Some(ref cache) = cache_base {
+        println!("Cache: {}", cache.display());
+    } else {
+        println!("Cache: disabled (using temp directories)");
+    }
 
     // Get current ledger and calculate range
     let root_has = archive.get_root_has().await?;
@@ -1829,12 +1863,43 @@ async fn cmd_verify_execution(
     println!("Initial state: checkpoint {}", init_checkpoint);
     println!();
 
-    // Create CDP client
-    let cdp = CdpDataLake::new(cdp_url, cdp_date);
+    // Create CDP client with caching
+    let cdp = if let Some(ref cache) = cache_base {
+        CachedCdpDataLake::new(cdp_url, cdp_date, cache, network_name)?
+    } else {
+        let temp = tempfile::tempdir()?;
+        CachedCdpDataLake::new(cdp_url, cdp_date, temp.path(), network_name)?
+    };
 
-    // Setup bucket manager and restore initial state
-    let bucket_dir = tempfile::tempdir()?;
-    let bucket_manager = Arc::new(BucketManager::new(bucket_dir.path().to_path_buf())?);
+    // Prefetch CDP metadata for the ledger range
+    let prefetch_start = init_checkpoint + 1;
+    let prefetch_end = end_ledger;
+    let cached = cdp.cached_count(prefetch_start, prefetch_end);
+    let total = (prefetch_end - prefetch_start + 1) as usize;
+    if cached < total {
+        println!("Prefetching CDP metadata: {} cached, {} to download", cached, total - cached);
+        cdp.prefetch(prefetch_start, prefetch_end).await;
+        println!();
+    } else {
+        println!("CDP metadata: {} ledgers cached", cached);
+        println!();
+    }
+
+    // Setup bucket manager with persistent or temp directory
+    // We need to keep the temp directory alive for the duration of the function
+    let _bucket_dir_holder: Box<dyn std::any::Any>;
+    let bucket_path = if let Some(ref cache) = cache_base {
+        let path = cache.join("buckets").join(network_name);
+        std::fs::create_dir_all(&path)?;
+        _bucket_dir_holder = Box::new(());
+        path
+    } else {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().to_path_buf();
+        _bucket_dir_holder = Box::new(temp);
+        path
+    };
+    let bucket_manager = Arc::new(BucketManager::new(bucket_path.clone())?);
 
     println!("Downloading initial state at checkpoint {}...", init_checkpoint);
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
@@ -1864,8 +1929,11 @@ async fn cmd_verify_execution(
         .filter(|h| !h.is_zero())
         .collect();
 
-    println!("Downloading {} buckets...", all_hashes.len());
-    download_buckets_parallel(&archive, bucket_manager.as_ref(), all_hashes).await?;
+    print!("Buckets ({} required):", all_hashes.len());
+    let (cached, downloaded) = download_buckets_parallel(&archive, bucket_manager.as_ref(), all_hashes).await?;
+    if downloaded == 0 {
+        println!(" {} cached", cached);
+    }
 
     // Restore live bucket list for state lookups
     let bucket_list = Arc::new(RwLock::new(
@@ -2480,8 +2548,11 @@ async fn cmd_debug_bucket_entry(
         .filter(|h: &&Hash256| !h.is_zero())
         .collect();
 
-    println!("Downloading {} buckets...", all_hashes.len());
-    download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+    print!("Buckets ({} required):", all_hashes.len());
+    let (cached, downloaded) = download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+    if downloaded == 0 {
+        println!(" {} cached", cached);
+    }
 
     // Restore bucket list
     let bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
@@ -3132,8 +3203,10 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
             show_diff,
             cdp_url,
             cdp_date,
+            cache_dir,
+            no_cache,
         } => {
-            cmd_verify_execution(config, from, to, stop_on_error, show_diff, &cdp_url, &cdp_date).await
+            cmd_verify_execution(config, from, to, stop_on_error, show_diff, &cdp_url, &cdp_date, cache_dir, no_cache).await
         }
         OfflineCommands::DebugBucketEntry {
             checkpoint,

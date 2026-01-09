@@ -123,7 +123,8 @@ pub use catchup::{
     CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData, LedgerData,
 };
 pub use cdp::{
-    extract_ledger_header, extract_transaction_envelopes, extract_transaction_metas, CdpDataLake,
+    extract_ledger_header, extract_transaction_envelopes, extract_transaction_metas,
+    CachedCdpDataLake, CacheStats, CdpDataLake,
 };
 pub use checkpoint::{
     checkpoint_containing, is_checkpoint_ledger, latest_checkpoint_before_or_at,
