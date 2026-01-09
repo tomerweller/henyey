@@ -1544,6 +1544,512 @@ pub async fn get_progress(state: &SharedHistoryState) -> HistoryWorkProgress {
     guard.progress.clone()
 }
 
+// ============================================================================
+// Batch Download Support
+// ============================================================================
+
+/// File type for batch download operations.
+///
+/// This enum identifies the type of history archive file being downloaded,
+/// used to construct the correct archive paths and manage downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoryFileType {
+    /// Ledger header files (ledger-*.xdr.gz)
+    Ledger,
+    /// Transaction set files (transactions-*.xdr.gz)
+    Transactions,
+    /// Transaction result files (results-*.xdr.gz)
+    Results,
+    /// SCP consensus history files (scp-*.xdr.gz)
+    Scp,
+}
+
+impl HistoryFileType {
+    /// Returns the string representation used in archive paths.
+    pub fn type_string(&self) -> &'static str {
+        match self {
+            HistoryFileType::Ledger => "ledger",
+            HistoryFileType::Transactions => "transactions",
+            HistoryFileType::Results => "results",
+            HistoryFileType::Scp => "scp",
+        }
+    }
+}
+
+impl std::fmt::Display for HistoryFileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.type_string())
+    }
+}
+
+/// A range of checkpoints for batch download operations.
+///
+/// Represents a contiguous range of checkpoints from `first` (inclusive)
+/// to `last` (inclusive). The range always spans complete checkpoints,
+/// where each checkpoint covers 64 ledgers.
+///
+/// # Example
+///
+/// ```rust
+/// use stellar_core_historywork::CheckpointRange;
+///
+/// // Range covering checkpoints 64, 128, 192, 256
+/// let range = CheckpointRange::new(64, 256);
+/// assert_eq!(range.count(), 4);
+///
+/// let checkpoints: Vec<_> = range.iter().collect();
+/// assert_eq!(checkpoints, vec![64, 128, 192, 256]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointRange {
+    /// First checkpoint in the range (inclusive).
+    pub first: u32,
+    /// Last checkpoint in the range (inclusive).
+    pub last: u32,
+}
+
+/// The frequency of checkpoints in ledger sequences.
+pub const CHECKPOINT_FREQUENCY: u32 = 64;
+
+impl CheckpointRange {
+    /// Creates a new checkpoint range.
+    ///
+    /// Both `first` and `last` should be valid checkpoint ledger sequences
+    /// (multiples of 64, or 63 for the genesis checkpoint).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `first > last`.
+    pub fn new(first: u32, last: u32) -> Self {
+        assert!(first <= last, "first checkpoint must be <= last");
+        Self { first, last }
+    }
+
+    /// Returns the number of checkpoints in this range.
+    pub fn count(&self) -> usize {
+        let first_idx = self.first / CHECKPOINT_FREQUENCY;
+        let last_idx = self.last / CHECKPOINT_FREQUENCY;
+        (last_idx - first_idx + 1) as usize
+    }
+
+    /// Returns an iterator over all checkpoint ledger sequences in this range.
+    pub fn iter(&self) -> impl Iterator<Item = u32> {
+        let first = self.first;
+        let last = self.last;
+        (0..).map(move |i| first + i * CHECKPOINT_FREQUENCY)
+            .take_while(move |&cp| cp <= last)
+    }
+
+    /// Returns the ledger range covered by this checkpoint range.
+    ///
+    /// The first ledger is `first - 63` (the start of the first checkpoint)
+    /// and the last ledger is `last` (the end of the last checkpoint).
+    pub fn ledger_range(&self) -> (u32, u32) {
+        let first_ledger = if self.first <= CHECKPOINT_FREQUENCY {
+            1
+        } else {
+            self.first - CHECKPOINT_FREQUENCY + 1
+        };
+        (first_ledger, self.last)
+    }
+}
+
+/// Shared state container for batch download operations.
+///
+/// Similar to [`HistoryWorkState`] but designed for multi-checkpoint
+/// downloads where data accumulates across many checkpoints.
+///
+/// # Thread Safety
+///
+/// This type is wrapped in [`SharedBatchDownloadState`] for safe sharing
+/// between concurrent download tasks.
+#[derive(Debug, Default)]
+pub struct BatchDownloadState {
+    /// Downloaded ledger headers, keyed by checkpoint ledger sequence.
+    pub headers: HashMap<u32, Vec<LedgerHeaderHistoryEntry>>,
+    /// Downloaded transactions, keyed by checkpoint ledger sequence.
+    pub transactions: HashMap<u32, Vec<TransactionHistoryEntry>>,
+    /// Downloaded transaction results, keyed by checkpoint ledger sequence.
+    pub tx_results: HashMap<u32, Vec<TransactionHistoryResultEntry>>,
+    /// Downloaded SCP history, keyed by checkpoint ledger sequence.
+    pub scp_history: HashMap<u32, Vec<ScpHistoryEntry>>,
+    /// Download progress tracking.
+    pub progress: BatchDownloadProgress,
+}
+
+/// Thread-safe handle to shared batch download state.
+pub type SharedBatchDownloadState = Arc<Mutex<BatchDownloadState>>;
+
+/// Progress tracking for batch download operations.
+#[derive(Debug, Clone, Default)]
+pub struct BatchDownloadProgress {
+    /// File type being downloaded.
+    pub file_type: Option<HistoryFileType>,
+    /// Total checkpoints to download.
+    pub total: usize,
+    /// Checkpoints downloaded so far.
+    pub completed: usize,
+    /// Current checkpoint being downloaded.
+    pub current: Option<u32>,
+}
+
+impl BatchDownloadProgress {
+    /// Returns a human-readable progress message.
+    pub fn message(&self) -> String {
+        if let Some(file_type) = &self.file_type {
+            format!(
+                "downloading {} files: {}/{} checkpoints",
+                file_type, self.completed, self.total
+            )
+        } else {
+            "batch download not started".to_string()
+        }
+    }
+}
+
+/// Work item to download files of a specific type for a checkpoint range.
+///
+/// This is the Rust equivalent of the C++ `BatchDownloadWork` class. It downloads
+/// history archive files (ledger headers, transactions, results, or SCP history)
+/// for a contiguous range of checkpoints, with parallel downloads for efficiency.
+///
+/// # Parallelism
+///
+/// Downloads are performed concurrently with up to 16 parallel requests per
+/// batch, matching the C++ `MAX_CONCURRENT_SUBPROCESSES` limit.
+///
+/// # Dependencies
+///
+/// - For ledger headers: None (can be downloaded first)
+/// - For transactions: Requires headers to be downloaded first for verification
+/// - For results: Requires headers and transactions for verification
+/// - For SCP: Requires headers for context
+///
+/// # Output
+///
+/// On success, populates the corresponding field in [`BatchDownloadState`]
+/// with downloaded data keyed by checkpoint sequence.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use stellar_core_historywork::{BatchDownloadWork, CheckpointRange, HistoryFileType};
+///
+/// // Download ledger headers for checkpoints 64-256
+/// let range = CheckpointRange::new(64, 256);
+/// let work = BatchDownloadWork::new(
+///     archive.clone(),
+///     range,
+///     HistoryFileType::Ledger,
+///     state.clone(),
+/// );
+/// ```
+pub struct BatchDownloadWork {
+    archive: Arc<HistoryArchive>,
+    range: CheckpointRange,
+    file_type: HistoryFileType,
+    state: SharedBatchDownloadState,
+}
+
+impl BatchDownloadWork {
+    /// Creates a new batch download work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to download from
+    /// * `range` - The checkpoint range to download
+    /// * `file_type` - The type of files to download
+    /// * `state` - Shared state where downloaded data will be stored
+    pub fn new(
+        archive: Arc<HistoryArchive>,
+        range: CheckpointRange,
+        file_type: HistoryFileType,
+        state: SharedBatchDownloadState,
+    ) -> Self {
+        Self {
+            archive,
+            range,
+            file_type,
+            state,
+        }
+    }
+
+    /// Returns a formatted status string showing download progress.
+    pub fn get_status(&self) -> String {
+        format!(
+            "batch-download-{}-{:08x}-{:08x}",
+            self.file_type, self.range.first, self.range.last
+        )
+    }
+}
+
+#[async_trait]
+impl Work for BatchDownloadWork {
+    fn name(&self) -> &str {
+        "batch-download"
+    }
+
+    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+        use futures::stream::{self, StreamExt};
+
+        let checkpoints: Vec<u32> = self.range.iter().collect();
+        let total = checkpoints.len();
+
+        // Update progress
+        {
+            let mut guard = self.state.lock().await;
+            guard.progress = BatchDownloadProgress {
+                file_type: Some(self.file_type),
+                total,
+                completed: 0,
+                current: checkpoints.first().copied(),
+            };
+        }
+
+        let archive = self.archive.clone();
+        let file_type = self.file_type;
+        let state = self.state.clone();
+
+        // Download all checkpoints in parallel (16 concurrent)
+        let results: Vec<Result<(u32, DownloadedCheckpointData), String>> = stream::iter(checkpoints)
+            .map(|checkpoint| {
+                let archive = archive.clone();
+                let state = state.clone();
+                async move {
+                    let result = download_checkpoint_file(&archive, checkpoint, file_type).await;
+
+                    // Update progress
+                    {
+                        let mut guard = state.lock().await;
+                        guard.progress.completed += 1;
+                        guard.progress.current = Some(checkpoint);
+                    }
+
+                    result.map(|data| (checkpoint, data))
+                }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+
+        // Process results and store in state
+        let mut guard = self.state.lock().await;
+        for result in results {
+            match result {
+                Ok((checkpoint, data)) => {
+                    match data {
+                        DownloadedCheckpointData::Headers(headers) => {
+                            guard.headers.insert(checkpoint, headers);
+                        }
+                        DownloadedCheckpointData::Transactions(txs) => {
+                            guard.transactions.insert(checkpoint, txs);
+                        }
+                        DownloadedCheckpointData::Results(results) => {
+                            guard.tx_results.insert(checkpoint, results);
+                        }
+                        DownloadedCheckpointData::Scp(scp) => {
+                            guard.scp_history.insert(checkpoint, scp);
+                        }
+                    }
+                }
+                Err(err) => {
+                    return WorkOutcome::Failed(err);
+                }
+            }
+        }
+
+        tracing::info!(
+            "Downloaded {} {} files for checkpoint range {:08x}-{:08x}",
+            total,
+            file_type,
+            self.range.first,
+            self.range.last
+        );
+
+        WorkOutcome::Success
+    }
+}
+
+/// Downloaded data for a single checkpoint.
+enum DownloadedCheckpointData {
+    Headers(Vec<LedgerHeaderHistoryEntry>),
+    Transactions(Vec<TransactionHistoryEntry>),
+    Results(Vec<TransactionHistoryResultEntry>),
+    Scp(Vec<ScpHistoryEntry>),
+}
+
+/// Downloads a specific file type for a single checkpoint.
+async fn download_checkpoint_file(
+    archive: &HistoryArchive,
+    checkpoint: u32,
+    file_type: HistoryFileType,
+) -> Result<DownloadedCheckpointData, String> {
+    match file_type {
+        HistoryFileType::Ledger => {
+            archive
+                .get_ledger_headers(checkpoint)
+                .await
+                .map(DownloadedCheckpointData::Headers)
+                .map_err(|e| format!("failed to download headers for {}: {}", checkpoint, e))
+        }
+        HistoryFileType::Transactions => {
+            archive
+                .get_transactions(checkpoint)
+                .await
+                .map(DownloadedCheckpointData::Transactions)
+                .map_err(|e| format!("failed to download transactions for {}: {}", checkpoint, e))
+        }
+        HistoryFileType::Results => {
+            archive
+                .get_results(checkpoint)
+                .await
+                .map(DownloadedCheckpointData::Results)
+                .map_err(|e| format!("failed to download results for {}: {}", checkpoint, e))
+        }
+        HistoryFileType::Scp => {
+            archive
+                .get_scp_history(checkpoint)
+                .await
+                .map(DownloadedCheckpointData::Scp)
+                .map_err(|e| format!("failed to download SCP for {}: {}", checkpoint, e))
+        }
+    }
+}
+
+/// Builder for registering batch download work items with a scheduler.
+///
+/// This builder creates work items for downloading history archive data
+/// across a range of checkpoints, suitable for multi-checkpoint catchup
+/// operations.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use stellar_core_historywork::{BatchDownloadWorkBuilder, CheckpointRange};
+///
+/// let range = CheckpointRange::new(64, 512);
+/// let builder = BatchDownloadWorkBuilder::new(archive, range);
+///
+/// let state = builder.state();
+/// let ids = builder.register(&mut scheduler);
+///
+/// scheduler.run_to_completion().await?;
+///
+/// // Access downloaded data from state
+/// let guard = state.lock().await;
+/// let all_headers = &guard.headers;
+/// ```
+pub struct BatchDownloadWorkBuilder {
+    archive: Arc<HistoryArchive>,
+    range: CheckpointRange,
+    state: SharedBatchDownloadState,
+}
+
+/// IDs for registered batch download work items.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchDownloadWorkIds {
+    /// ID of the ledger headers batch download work item.
+    pub headers: WorkId,
+    /// ID of the transactions batch download work item.
+    pub transactions: WorkId,
+    /// ID of the transaction results batch download work item.
+    pub results: WorkId,
+    /// ID of the SCP history batch download work item.
+    pub scp: WorkId,
+}
+
+impl BatchDownloadWorkBuilder {
+    /// Creates a new batch download work builder.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to download from
+    /// * `range` - The checkpoint range to download
+    pub fn new(archive: Arc<HistoryArchive>, range: CheckpointRange) -> Self {
+        Self {
+            archive,
+            range,
+            state: Default::default(),
+        }
+    }
+
+    /// Returns a clone of the shared state for accessing downloaded data.
+    pub fn state(&self) -> SharedBatchDownloadState {
+        self.state.clone()
+    }
+
+    /// Registers all batch download work items with the scheduler.
+    ///
+    /// Creates four work items for downloading headers, transactions, results,
+    /// and SCP history, with proper dependency ordering:
+    /// - Headers download first (no dependencies)
+    /// - Transactions depend on headers (for verification)
+    /// - Results depend on headers and transactions (for verification)
+    /// - SCP depends on headers (for context)
+    ///
+    /// Each work item is configured with 3 retry attempts.
+    ///
+    /// # Returns
+    ///
+    /// [`BatchDownloadWorkIds`] containing the scheduler IDs for all registered work.
+    pub fn register(&self, scheduler: &mut WorkScheduler) -> BatchDownloadWorkIds {
+        let headers_id = scheduler.add_work(
+            Box::new(BatchDownloadWork::new(
+                self.archive.clone(),
+                self.range,
+                HistoryFileType::Ledger,
+                self.state.clone(),
+            )),
+            vec![],
+            3,
+        );
+
+        let transactions_id = scheduler.add_work(
+            Box::new(BatchDownloadWork::new(
+                self.archive.clone(),
+                self.range,
+                HistoryFileType::Transactions,
+                self.state.clone(),
+            )),
+            vec![headers_id],
+            3,
+        );
+
+        let results_id = scheduler.add_work(
+            Box::new(BatchDownloadWork::new(
+                self.archive.clone(),
+                self.range,
+                HistoryFileType::Results,
+                self.state.clone(),
+            )),
+            vec![headers_id, transactions_id],
+            3,
+        );
+
+        let scp_id = scheduler.add_work(
+            Box::new(BatchDownloadWork::new(
+                self.archive.clone(),
+                self.range,
+                HistoryFileType::Scp,
+                self.state.clone(),
+            )),
+            vec![headers_id],
+            3,
+        );
+
+        BatchDownloadWorkIds {
+            headers: headers_id,
+            transactions: transactions_id,
+            results: results_id,
+            scp: scp_id,
+        }
+    }
+}
+
+// ============================================================================
+// Helper functions for accessing shared state
+// ============================================================================
+
 /// Builds a complete [`CheckpointData`] snapshot from shared state.
 ///
 /// This is the primary way to extract downloaded data for use in catchup
@@ -1577,4 +2083,66 @@ pub async fn build_checkpoint_data(state: &SharedHistoryState) -> Result<Checkpo
         tx_results: guard.tx_results.clone(),
         scp_history: guard.scp_history.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_checkpoint_range_count() {
+        // Single checkpoint
+        let range = CheckpointRange::new(64, 64);
+        assert_eq!(range.count(), 1);
+
+        // Two checkpoints
+        let range = CheckpointRange::new(64, 128);
+        assert_eq!(range.count(), 2);
+
+        // Multiple checkpoints
+        let range = CheckpointRange::new(64, 256);
+        assert_eq!(range.count(), 4);
+    }
+
+    #[test]
+    fn test_checkpoint_range_iter() {
+        let range = CheckpointRange::new(64, 256);
+        let checkpoints: Vec<_> = range.iter().collect();
+        assert_eq!(checkpoints, vec![64, 128, 192, 256]);
+    }
+
+    #[test]
+    fn test_checkpoint_range_ledger_range() {
+        let range = CheckpointRange::new(64, 128);
+        let (first, last) = range.ledger_range();
+        assert_eq!(first, 1); // 64 - 63 = 1
+        assert_eq!(last, 128);
+
+        let range = CheckpointRange::new(192, 256);
+        let (first, last) = range.ledger_range();
+        assert_eq!(first, 129); // 192 - 64 + 1 = 129
+        assert_eq!(last, 256);
+    }
+
+    #[test]
+    fn test_history_file_type_display() {
+        assert_eq!(HistoryFileType::Ledger.type_string(), "ledger");
+        assert_eq!(HistoryFileType::Transactions.type_string(), "transactions");
+        assert_eq!(HistoryFileType::Results.type_string(), "results");
+        assert_eq!(HistoryFileType::Scp.type_string(), "scp");
+    }
+
+    #[test]
+    fn test_batch_download_progress_message() {
+        let progress = BatchDownloadProgress {
+            file_type: Some(HistoryFileType::Ledger),
+            total: 10,
+            completed: 5,
+            current: Some(320),
+        };
+        assert_eq!(progress.message(), "downloading ledger files: 5/10 checkpoints");
+
+        let empty = BatchDownloadProgress::default();
+        assert_eq!(empty.message(), "batch download not started");
+    }
 }

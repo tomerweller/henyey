@@ -10,7 +10,7 @@ stellar-core `src/historywork/` directory (v25.x).
 | Core Download Workflow | Implemented (simplified) |
 | Core Publish Workflow | Implemented (simplified) |
 | Verification | Implemented inline (no background threads) |
-| Batch Operations | Partial |
+| Batch Operations | Complete |
 | Hot Archive Buckets | Not implemented |
 | Metrics | Not implemented |
 
@@ -76,13 +76,17 @@ These are not needed as Rust uses native libraries instead of shell commands.
 
 ### Batch and Range Operations
 
-| C++ Class | Purpose | Priority |
-|-----------|---------|----------|
-| `BatchDownloadWork` | Download multiple checkpoint files in a range | Medium - currently only single-checkpoint |
-| `DownloadVerifyTxResultsWork` | Batch download + verify tx results | Medium - combined with above |
+| C++ Class | Rust Equivalent | Parity Notes |
+|-----------|-----------------|--------------|
+| `BatchDownloadWork` | `BatchDownloadWork` | Full parity. Downloads files for a `CheckpointRange` with 16 concurrent downloads. |
+| `CheckpointRange` | `CheckpointRange` | Full parity. Supports iteration, count, and ledger range calculation. |
+| `FileType` | `HistoryFileType` | Full parity. Ledger, Transactions, Results, Scp variants. |
+| `BatchDownloadWorkBuilder` | `BatchDownloadWorkBuilder` | Rust-specific. Creates all four batch download work items with proper dependencies. |
+| `BatchDownloadState` | `BatchDownloadState` | Rust-specific. Shared state for multi-checkpoint downloads keyed by checkpoint sequence. |
+| `DownloadVerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | Verification integrated into download work. |
 
-The Rust implementation currently handles single checkpoints. Multi-checkpoint range
-operations (needed for catchup across many checkpoints) are not yet implemented.
+The Rust implementation supports full multi-checkpoint range operations for catchup.
+Downloads are parallelized with up to 16 concurrent requests per batch.
 
 ### Advanced Verification and Tools
 
@@ -176,11 +180,8 @@ The C++ implementation includes extensive metrics via `medida`:
 
 1. **High Priority**: Add `HotArchiveBucket` support for full Protocol 25 parity.
 
-2. **Medium Priority**: Implement `BatchDownloadWork` equivalent for multi-checkpoint
-   catchup operations.
+2. **Medium Priority**: Add `.well-known/` path publishing to `PublishHistoryArchiveStateWork`.
 
-3. **Medium Priority**: Add `.well-known/` path publishing to `PublishHistoryArchiveStateWork`.
+3. **Low Priority**: Add metrics collection for monitoring and debugging.
 
-4. **Low Priority**: Add metrics collection for monitoring and debugging.
-
-5. **Low Priority**: Consider disk-based bucket storage for large catchup operations.
+4. **Low Priority**: Consider disk-based bucket storage for large catchup operations.
