@@ -57,14 +57,21 @@ This section documents the implementation status relative to the C++ stellar-cor
   - `make_live()` for restarting deserialized merges
   - `to_snapshot()` / `from_snapshot()` for HistoryArchiveState persistence
 
-### Not Yet Implemented (Gaps)
+#### Hot Archive Bucket List (Implemented)
+- **HotArchiveBucket** (`hot_archive.rs`) - Bucket for archived persistent Soroban entries:
+  - Stores `HotArchiveBucketEntry` (Metaentry, Archived, Live variants)
+  - `fresh()` for creating from archived entries and restored keys
+  - Key-based lookup and iteration
+- **HotArchiveBucketList** (`hot_archive.rs`) - Dedicated 11-level bucket list for hot archive:
+  - Same spill mechanics as live bucket list
+  - `add_batch()` for archiving entries and marking restorations
+  - `get()` / `contains()` for looking up archived entries
+- **Hot archive merge semantics**:
+  - Archived + Live in snap = Keep Archived
+  - Live + Archived in snap = Annihilate (entry was restored)
+  - Tombstones (Live markers) dropped at level 10
 
-#### Hot Archive Bucket List
-- **HotArchiveBucket** - Separate bucket type for archived persistent Soroban entries
-- **HotArchiveBucketList** - Dedicated bucket list for hot archive
-- **HotArchiveBucketEntry** - XDR entry type with ARCHIVED/DELETED variants
-- **HotArchiveBucketIndex** - Index for hot archive buckets
-- The Rust implementation tracks archived entries in `EvictionResult` but doesn't maintain a separate hot archive bucket list
+### Not Yet Implemented (Gaps)
 
 #### Bucket Snapshots
 - **BucketSnapshot** / **BucketSnapshotBase** - Read-only bucket snapshots for concurrent access
@@ -147,7 +154,7 @@ The Rust implementation correctly handles:
 #### Future Work Priority
 
 1. ~~**High Priority**: FutureBucket for async merging (performance critical)~~ ✓ Implemented
-2. **High Priority**: HotArchiveBucketList for Soroban state archival completeness
+2. ~~**High Priority**: HotArchiveBucketList for Soroban state archival completeness~~ ✓ Implemented
 3. **Medium Priority**: BucketSnapshotManager for concurrent access patterns
 4. **Medium Priority**: Advanced indexing (Bloom filters, caches) for query performance
 5. **Lower Priority**: Metrics integration (observability)

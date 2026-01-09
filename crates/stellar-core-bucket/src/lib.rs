@@ -97,6 +97,7 @@ mod entry;
 mod error;
 mod eviction;
 mod future_bucket;
+mod hot_archive;
 mod manager;
 mod merge;
 
@@ -152,6 +153,16 @@ pub use merge::{merge_buckets, merge_buckets_with_options, merge_multiple, Merge
 // ============================================================================
 
 pub use future_bucket::{FutureBucket, FutureBucketSnapshot, FutureBucketState, MergeKey};
+
+// ============================================================================
+// Hot archive bucket list (Soroban state archival)
+// ============================================================================
+
+pub use hot_archive::{
+    is_hot_archive_tombstone, merge_hot_archive_buckets, HotArchiveBucket, HotArchiveBucketLevel,
+    HotArchiveBucketList, HotArchiveBucketListStats, FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE,
+    HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+};
 
 /// Result type for bucket operations.
 ///
