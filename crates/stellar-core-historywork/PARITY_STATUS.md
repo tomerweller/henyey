@@ -35,7 +35,7 @@ a dedicated work item that uses async HTTP via `stellar-core-history`.
 
 | C++ Class | Rust Equivalent | Parity Notes |
 |-----------|-----------------|--------------|
-| `PutHistoryArchiveStateWork` | `PublishHistoryArchiveStateWork` | Simplified. Uses `ArchiveWriter` trait instead of shell commands. Does not publish to `.well-known/` path. |
+| `PutHistoryArchiveStateWork` | `PublishHistoryArchiveStateWork` | Full parity. Publishes to both checkpoint path and `.well-known/stellar-history.json` (RFC 5785). |
 | (part of PutSnapshotFilesWork) | `PublishBucketsWork` | Dedicated work item. Gzips and writes each bucket. |
 | (part of PutSnapshotFilesWork) | `PublishLedgerHeadersWork` | Dedicated work item. Serializes headers to XDR, gzips, writes. |
 | (part of PutSnapshotFilesWork) | `PublishTransactionsWork` | Dedicated work item. Serializes tx entries, gzips, writes. |
@@ -160,28 +160,22 @@ The C++ implementation includes extensive metrics via `medida`:
 
 ## Known Behavioral Differences
 
-1. **Well-Known Path**: C++ `PutHistoryArchiveStateWork` publishes HAS to both the
-   checkpoint path AND `.well-known/stellar-history.json`. Rust only publishes to
-   the checkpoint path.
-
-2. **Bucket Indexing**: C++ builds a bucket index during verification for fast
+1. **Bucket Indexing**: C++ builds a bucket index during verification for fast
    lookups. Rust keeps raw bucket data in memory without indexing.
 
-3. **Disk Usage**: C++ downloads to temp files and cleans up. Rust keeps everything
+2. **Disk Usage**: C++ downloads to temp files and cleans up. Rust keeps everything
    in memory, which may limit catchup size on memory-constrained systems.
 
-4. **Archive Failover**: C++ randomly selects archives and fails over on error.
+3. **Archive Failover**: C++ randomly selects archives and fails over on error.
    Rust uses a single archive per builder with retry at the work level.
 
-5. **Empty Result Handling**: Rust publish work items fail if data is empty.
+4. **Empty Result Handling**: Rust publish work items fail if data is empty.
    C++ may handle this differently depending on the work type.
 
 ## Recommendations for Future Work
 
 1. **High Priority**: Add `HotArchiveBucket` support for full Protocol 25 parity.
 
-2. **Medium Priority**: Add `.well-known/` path publishing to `PublishHistoryArchiveStateWork`.
+2. **Low Priority**: Add metrics collection for monitoring and debugging.
 
-3. **Low Priority**: Add metrics collection for monitoring and debugging.
-
-4. **Low Priority**: Consider disk-based bucket storage for large catchup operations.
+3. **Low Priority**: Consider disk-based bucket storage for large catchup operations.

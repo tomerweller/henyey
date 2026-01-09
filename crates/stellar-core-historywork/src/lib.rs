@@ -803,11 +803,29 @@ fn serialize_entries<T: WriteXdr>(entries: &[T]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// The well-known directory path for stellar history (RFC 5785).
+pub const WELL_KNOWN_DIR: &str = ".well-known";
+
+/// The well-known file name for stellar history.
+pub const WELL_KNOWN_STELLAR_HISTORY: &str = "stellar-history.json";
+
+/// Returns the well-known path for stellar history (``.well-known/stellar-history.json``).
+///
+/// This is the RFC 5785 compliant location for the current history archive state.
+/// Clients can discover the latest checkpoint by fetching this file.
+pub fn well_known_stellar_history_path() -> String {
+    format!("{}/{}", WELL_KNOWN_DIR, WELL_KNOWN_STELLAR_HISTORY)
+}
+
 /// Work item to publish the History Archive State (HAS) to an archive.
 ///
-/// Serializes the HAS to JSON format and writes it to the standard history
-/// archive path. The HAS is the entry point for catchup operations and must
-/// be published last to ensure all referenced data is available.
+/// Serializes the HAS to JSON format and writes it to both:
+/// 1. The standard checkpoint path (e.g., `history/00/00/00/history-0000003f.json`)
+/// 2. The well-known path (`.well-known/stellar-history.json`) per RFC 5785
+///
+/// The HAS is the entry point for catchup operations. The checkpoint path provides
+/// historical access while the well-known path allows clients to discover the
+/// current archive state.
 ///
 /// # Dependencies
 ///
@@ -851,16 +869,30 @@ impl Work for PublishHistoryArchiveStateWork {
             return WorkOutcome::Failed("HAS not available".to_string());
         };
 
-        match has.to_json() {
-            Ok(json) => {
-                let path = checkpoint_path("history", self.checkpoint, "json");
-                if let Err(err) = self.writer.put_bytes(&path, json.as_bytes()).await {
-                    return WorkOutcome::Failed(format!("failed to publish HAS: {}", err));
-                }
-                WorkOutcome::Success
-            }
-            Err(err) => WorkOutcome::Failed(format!("failed to serialize HAS: {}", err)),
+        let json = match has.to_json() {
+            Ok(json) => json,
+            Err(err) => return WorkOutcome::Failed(format!("failed to serialize HAS: {}", err)),
+        };
+
+        // Publish to the checkpoint-specific path
+        let checkpoint_path = checkpoint_path("history", self.checkpoint, "json");
+        if let Err(err) = self.writer.put_bytes(&checkpoint_path, json.as_bytes()).await {
+            return WorkOutcome::Failed(format!("failed to publish HAS to checkpoint path: {}", err));
         }
+
+        // Also publish to the well-known path (RFC 5785)
+        let well_known_path = well_known_stellar_history_path();
+        if let Err(err) = self.writer.put_bytes(&well_known_path, json.as_bytes()).await {
+            return WorkOutcome::Failed(format!("failed to publish HAS to well-known path: {}", err));
+        }
+
+        tracing::info!(
+            "Published HAS to {} and {}",
+            checkpoint_path,
+            well_known_path
+        );
+
+        WorkOutcome::Success
     }
 }
 
@@ -2144,5 +2176,11 @@ mod tests {
 
         let empty = BatchDownloadProgress::default();
         assert_eq!(empty.message(), "batch download not started");
+    }
+
+    #[test]
+    fn test_well_known_stellar_history_path() {
+        let path = well_known_stellar_history_path();
+        assert_eq!(path, ".well-known/stellar-history.json");
     }
 }
