@@ -34,6 +34,23 @@ This section documents the parity between this Rust crate and the upstream C++ `
 - [x] `ClockStats` - Statistics tracking (events scheduled/triggered/cancelled, crank cycles)
 - [x] `SharedVirtualClock` - Thread-safe Arc<VirtualClock> wrapper
 
+#### TxGenerator (`tx_generator.rs`)
+- [x] `TxGeneratorConfig` - Configuration (network passphrase, base_fee, max_fee_rate)
+- [x] `TxGeneratorConfig::testnet()` / `::mainnet()` - Network presets
+- [x] `TestAccount` - Account with sequence number tracking
+- [x] `TestAccount::from_name()` - Deterministic name-based account creation
+- [x] `TestAccount::next_sequence_number()` - Sequence increment for transactions
+- [x] `TxGenerator` - Main transaction generator with account caching
+- [x] `TxGenerator::find_account()` / `find_account_mut()` - Account lookup/creation
+- [x] `TxGenerator::payment_transaction()` - Generate payment TXs (1 stroop)
+- [x] `TxGenerator::create_account_transaction()` - Generate create account TXs
+- [x] `TxGenerator::generate_fee()` - Fee generation with optional randomization
+- [x] `derive_seed_from_name()` - Deterministic seed from account name (SHA-256)
+- [x] `compute_network_id()` - Network ID hash computation
+- [x] `compute_transaction_hash()` - Transaction hash for signing
+- [x] `signature_hint()` - Last 4 bytes of public key for decorated signatures
+- [x] Transaction signing and envelope creation
+
 ### Not Yet Implemented (Gaps)
 
 #### Simulation Class (`Simulation.h/.cpp`)
@@ -85,11 +102,10 @@ This section documents the parity between this Rust crate and the upstream C++ `
 | **Pre-generated TX Support** | `PAY_PREGENERATED` mode | Load transactions from XDR file | Low |
 | **Success Rate Tracking** | `checkMinimumSorobanSuccess()` | Verify Soroban success thresholds | Medium |
 
-#### TxGenerator (`TxGenerator.h/.cpp`)
+#### TxGenerator - Remaining Gaps (`TxGenerator.h/.cpp`)
 
 | Feature | C++ API | Description | Priority |
 |---------|---------|-------------|----------|
-| **Payment Transactions** | `paymentTransaction()` | Generate classic payment TXs | High |
 | **Upload Wasm** | `createUploadWasmTransaction()` | Deploy Wasm blobs | High |
 | **Create Contract** | `createContractTransaction()` | Deploy contract instances | High |
 | **Invoke Contract** | `invokeSorobanLoadTransaction()` | Execute contract calls | High |
@@ -97,8 +113,8 @@ This section documents the parity between this Rust crate and the upstream C++ `
 | **Batch Transfers** | `invokeBatchTransfer()` | Multi-destination transfers | Medium |
 | **Random Wasm** | `sorobanRandomWasmTransaction()` | Generate random Wasm for testing | Low |
 | **Config Upgrades** | `invokeSorobanCreateUpgradeTransaction()` | Network config upgrade TXs | Medium |
-| **Account Caching** | `mAccounts` map | Efficient account lookups | Medium |
-| **Fee Generation** | `generateFee()` | Random fee generation within limits | Low |
+
+Note: Core payment transactions, create account transactions, account caching, and fee generation are now implemented in `tx_generator.rs`.
 
 #### ApplyLoad (`ApplyLoad.h/.cpp`)
 
@@ -143,7 +159,7 @@ This section documents the parity between this Rust crate and the upstream C++ `
 
 3. **Phase 3 - Application Integration**: Once `stellar-core-herder` and `stellar-core-ledger` are implemented, integrate them into simulation.
 
-4. **Phase 4 - Load Generation**: Build transaction generators once the transaction processing pipeline exists.
+4. **Phase 4 - Load Generation**: ✅ Partially implemented! Core `TxGenerator` with payment and create account transactions. Remaining: Soroban contract transactions (upload, create, invoke).
 
 #### Current Rust-Specific Advantages
 

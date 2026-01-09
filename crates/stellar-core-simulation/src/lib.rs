@@ -93,9 +93,14 @@ use tokio::time::{sleep, Duration};
 // Modules
 // =============================================================================
 
+pub mod tx_generator;
 pub mod virtual_clock;
 
 // Re-export main types
+pub use tx_generator::{
+    TestAccount, TxGenerator, TxGeneratorConfig, DEFAULT_BASE_FEE, DEFAULT_MIN_BALANCE,
+    ROOT_ACCOUNT_ID,
+};
 pub use virtual_clock::{
     shared_clock, shared_virtual_clock, ClockMode, ClockStats, EventHandle, EventId,
     SharedVirtualClock, VirtualClock,
