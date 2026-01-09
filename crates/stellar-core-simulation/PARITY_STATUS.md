@@ -67,6 +67,17 @@ This section documents the parity between this Rust crate and the upstream C++ `
 - [ ] Account sync verification (`checkAccountSynced`)
 - [ ] PAY_PREGENERATED mode (load from XDR file)
 
+#### Consensus Verification (`consensus.rs`)
+- [x] `ConsensusCheckResult` enum - AllExternalized, NotYetExternalized, SpreadTooWide
+- [x] `have_all_externalized()` - Check if all nodes reached target ledger
+- [x] `have_all_externalized_default()` - With default max_spread=5
+- [x] `ConsensusTracker` - Stateful tracking of consensus progress
+- [x] `ConsensusTracker::update()` - Update with new ledger sequences
+- [x] `ConsensusTracker::update_with_validators()` - Filter by validator status
+- [x] Spread validation (max - min > max_spread check)
+- [x] Minimum/maximum ledger tracking
+- [x] Check count and progress metrics
+
 ### Not Yet Implemented (Gaps)
 
 #### Simulation Class (`Simulation.h/.cpp`)
@@ -80,7 +91,6 @@ This section documents the parity between this Rust crate and the upstream C++ `
 | **Loopback Connections** | `getLoopbackConnection()` | Access to loopback peer connections for testing | Low |
 | **Start/Stop Control** | `startAllNodes()`, `stopAllNodes()` | Explicit lifecycle control for all nodes | Medium |
 | **Crank Mechanisms** | `crankNode()`, `crankAllNodes()` | Manual event loop advancement for nodes | Medium |
-| **Consensus Verification** | `haveAllExternalized()` | Check if all nodes externalized a ledger | High |
 | **Metrics Summary** | `metricsSummary()` | Aggregate metrics across nodes | Low |
 | **Connection Control** | `addConnection()`, `dropConnection()` | Dynamic connection manipulation | Medium |
 | **Config Generation** | `newConfig()`, `ConfigGen` | Custom config generators per node | Medium |
@@ -88,6 +98,8 @@ This section documents the parity between this Rust crate and the upstream C++ `
 | **Overlay Tick Control** | `stopOverlayTick()` | Prevent automatic peer reconnection | Low |
 | **Soroban Upgrade Support** | `isSetUpForSorobanUpgrade()`, `markReadyForSorobanUpgrade()` | Track Soroban upgrade readiness | Low |
 | **Application Integration** | `ApplicationLoopbackOverlay` | Full application lifecycle management | High |
+
+Note: **Consensus Verification** (`haveAllExternalized()`) is now implemented in `consensus.rs`.
 
 #### Topologies (`Topologies.h/.cpp`)
 

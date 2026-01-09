@@ -93,11 +93,16 @@ use tokio::time::{sleep, Duration};
 // Modules
 // =============================================================================
 
+pub mod consensus;
 pub mod load_generator;
 pub mod tx_generator;
 pub mod virtual_clock;
 
 // Re-export main types
+pub use consensus::{
+    have_all_externalized, have_all_externalized_default, ConsensusCheckResult, ConsensusTracker,
+    DEFAULT_MAX_SPREAD,
+};
 pub use load_generator::{
     GeneratedLoadConfig, LoadGenMetrics, LoadGenMode, LoadGenerator, LoadProgress, STEP_MSECS,
 };
