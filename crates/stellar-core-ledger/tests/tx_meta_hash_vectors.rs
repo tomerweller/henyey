@@ -2,9 +2,9 @@ use stellar_core_common::normalize_transaction_meta;
 use stellar_core_crypto::{seed, xdr_compute_hash};
 use stellar_core_ledger::entry_to_key;
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, ExtensionPoint, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
-    LedgerEntryData, LedgerEntryExt, OperationMetaV2, PublicKey, String32, Thresholds,
-    TransactionMeta, TransactionMetaV4, Uint256, VecM,
+    AccountEntry, AccountEntryExt, ExtensionPoint, LedgerEntry, LedgerEntryChange,
+    LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, OperationMetaV2, PublicKey, String32,
+    Thresholds, TransactionMeta, TransactionMetaV4, Uint256, VecM,
 };
 
 fn account_entry(id_byte: u8, balance: i64) -> LedgerEntry {
@@ -86,7 +86,9 @@ fn tx_meta_hash_vectors() {
     let meta_one = tx_meta_with_changes(tx_changes_before, op_changes);
     let meta_two = tx_meta_with_changes(
         ledger_entry_changes(vec![LedgerEntryChange::Created(entry_b)]),
-        vec![ledger_entry_changes(vec![LedgerEntryChange::Created(entry_a)])],
+        vec![ledger_entry_changes(vec![LedgerEntryChange::Created(
+            entry_a,
+        )])],
     );
 
     let got = vec![tx_meta_hash(&meta_one), tx_meta_hash(&meta_two)];
@@ -118,8 +120,13 @@ fn dump_tx_meta_hash_vectors() {
     let meta_one = tx_meta_with_changes(tx_changes_before, op_changes);
     let meta_two = tx_meta_with_changes(
         ledger_entry_changes(vec![LedgerEntryChange::Created(entry_b)]),
-        vec![ledger_entry_changes(vec![LedgerEntryChange::Created(entry_a)])],
+        vec![ledger_entry_changes(vec![LedgerEntryChange::Created(
+            entry_a,
+        )])],
     );
 
-    println!("{:?}", vec![tx_meta_hash(&meta_one), tx_meta_hash(&meta_two)]);
+    println!(
+        "{:?}",
+        vec![tx_meta_hash(&meta_one), tx_meta_hash(&meta_two)]
+    );
 }

@@ -266,31 +266,14 @@ impl InMemorySorobanState {
         key.key_hash.0
     }
 
-    /// Extract the key hash for any supported key type.
-    #[allow(dead_code)]
-    fn get_key_hash(key: &LedgerKey) -> Option<[u8; 32]> {
-        match key {
-            LedgerKey::ContractData(cd) => Some(Self::contract_data_key_hash(cd)),
-            LedgerKey::ContractCode(cc) => Some(Self::contract_code_key_hash(cc)),
-            LedgerKey::Ttl(ttl) => Some(Self::ttl_key_to_map_key(ttl)),
-            _ => None,
-        }
-    }
-
     /// Get a contract data entry by key.
-    pub fn get_contract_data(
-        &self,
-        key: &LedgerKeyContractData,
-    ) -> Option<&ContractDataMapEntry> {
+    pub fn get_contract_data(&self, key: &LedgerKeyContractData) -> Option<&ContractDataMapEntry> {
         let key_hash = Self::contract_data_key_hash(key);
         self.contract_data_entries.get(&key_hash)
     }
 
     /// Get a contract code entry by key.
-    pub fn get_contract_code(
-        &self,
-        key: &LedgerKeyContractCode,
-    ) -> Option<&ContractCodeMapEntry> {
+    pub fn get_contract_code(&self, key: &LedgerKeyContractCode) -> Option<&ContractCodeMapEntry> {
         let key_hash = Self::contract_code_key_hash(key);
         self.contract_code_entries.get(&key_hash)
     }
@@ -314,18 +297,18 @@ impl InMemorySorobanState {
     /// Get TTL data for a key.
     pub fn get_ttl(&self, key: &LedgerKey) -> Option<TtlData> {
         match key {
-            LedgerKey::ContractData(cd) => {
-                self.get_contract_data(cd).map(|e| e.ttl_data)
-            }
-            LedgerKey::ContractCode(cc) => {
-                self.get_contract_code(cc).map(|e| e.ttl_data)
-            }
+            LedgerKey::ContractData(cd) => self.get_contract_data(cd).map(|e| e.ttl_data),
+            LedgerKey::ContractCode(cc) => self.get_contract_code(cc).map(|e| e.ttl_data),
             LedgerKey::Ttl(ttl) => {
                 let key_hash = ttl.key_hash.0;
                 self.contract_data_entries
                     .get(&key_hash)
                     .map(|e| e.ttl_data)
-                    .or_else(|| self.contract_code_entries.get(&key_hash).map(|e| e.ttl_data))
+                    .or_else(|| {
+                        self.contract_code_entries
+                            .get(&key_hash)
+                            .map(|e| e.ttl_data)
+                    })
             }
             _ => None,
         }
@@ -340,7 +323,11 @@ impl InMemorySorobanState {
             .contract_data_entries
             .get(&key_hash)
             .map(|e| e.ttl_data)
-            .or_else(|| self.contract_code_entries.get(&key_hash).map(|e| e.ttl_data))?;
+            .or_else(|| {
+                self.contract_code_entries
+                    .get(&key_hash)
+                    .map(|e| e.ttl_data)
+            })?;
 
         // Synthesize the TTL entry
         let entry = LedgerEntry {
@@ -374,13 +361,19 @@ impl InMemorySorobanState {
                 key: cd.key.clone(),
                 durability: cd.durability.clone(),
             },
-            _ => return Err(LedgerError::InvalidEntry("not a contract data entry".into())),
+            _ => {
+                return Err(LedgerError::InvalidEntry(
+                    "not a contract data entry".into(),
+                ))
+            }
         };
 
         let key_hash = Self::contract_data_key_hash(&key);
 
         if self.contract_data_entries.contains_key(&key_hash) {
-            return Err(LedgerError::InvalidEntry("contract data already exists".into()));
+            return Err(LedgerError::InvalidEntry(
+                "contract data already exists".into(),
+            ));
         }
 
         // Check for pending TTL
@@ -412,14 +405,19 @@ impl InMemorySorobanState {
                 key: cd.key.clone(),
                 durability: cd.durability.clone(),
             },
-            _ => return Err(LedgerError::InvalidEntry("not a contract data entry".into())),
+            _ => {
+                return Err(LedgerError::InvalidEntry(
+                    "not a contract data entry".into(),
+                ))
+            }
         };
 
         let key_hash = Self::contract_data_key_hash(&key);
 
-        let old_entry = self.contract_data_entries.remove(&key_hash).ok_or_else(|| {
-            LedgerError::InvalidEntry("contract data does not exist".into())
-        })?;
+        let old_entry = self
+            .contract_data_entries
+            .remove(&key_hash)
+            .ok_or_else(|| LedgerError::InvalidEntry("contract data does not exist".into()))?;
 
         // Update size tracking
         let old_size = old_entry.xdr_size();
@@ -444,9 +442,10 @@ impl InMemorySorobanState {
     pub fn delete_contract_data(&mut self, key: &LedgerKeyContractData) -> Result<()> {
         let key_hash = Self::contract_data_key_hash(key);
 
-        let old_entry = self.contract_data_entries.remove(&key_hash).ok_or_else(|| {
-            LedgerError::InvalidEntry("contract data does not exist".into())
-        })?;
+        let old_entry = self
+            .contract_data_entries
+            .remove(&key_hash)
+            .ok_or_else(|| LedgerError::InvalidEntry("contract data does not exist".into()))?;
 
         self.contract_data_state_size -= old_entry.xdr_size() as i64;
 
@@ -473,13 +472,19 @@ impl InMemorySorobanState {
             LedgerEntryData::ContractCode(cc) => LedgerKeyContractCode {
                 hash: cc.hash.clone(),
             },
-            _ => return Err(LedgerError::InvalidEntry("not a contract code entry".into())),
+            _ => {
+                return Err(LedgerError::InvalidEntry(
+                    "not a contract code entry".into(),
+                ))
+            }
         };
 
         let key_hash = Self::contract_code_key_hash(&key);
 
         if self.contract_code_entries.contains_key(&key_hash) {
-            return Err(LedgerError::InvalidEntry("contract code already exists".into()));
+            return Err(LedgerError::InvalidEntry(
+                "contract code already exists".into(),
+            ));
         }
 
         // Check for pending TTL
@@ -517,14 +522,19 @@ impl InMemorySorobanState {
             LedgerEntryData::ContractCode(cc) => LedgerKeyContractCode {
                 hash: cc.hash.clone(),
             },
-            _ => return Err(LedgerError::InvalidEntry("not a contract code entry".into())),
+            _ => {
+                return Err(LedgerError::InvalidEntry(
+                    "not a contract code entry".into(),
+                ))
+            }
         };
 
         let key_hash = Self::contract_code_key_hash(&key);
 
-        let old_entry = self.contract_code_entries.remove(&key_hash).ok_or_else(|| {
-            LedgerError::InvalidEntry("contract code does not exist".into())
-        })?;
+        let old_entry = self
+            .contract_code_entries
+            .remove(&key_hash)
+            .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
 
         // Calculate new size for rent
         let new_size = self.calculate_code_size(&entry, protocol_version);
@@ -551,9 +561,10 @@ impl InMemorySorobanState {
     pub fn delete_contract_code(&mut self, key: &LedgerKeyContractCode) -> Result<()> {
         let key_hash = Self::contract_code_key_hash(key);
 
-        let old_entry = self.contract_code_entries.remove(&key_hash).ok_or_else(|| {
-            LedgerError::InvalidEntry("contract code does not exist".into())
-        })?;
+        let old_entry = self
+            .contract_code_entries
+            .remove(&key_hash)
+            .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
 
         self.contract_code_state_size -= old_entry.size_bytes as i64;
 
@@ -701,15 +712,11 @@ impl InMemorySorobanState {
     /// Process a single entry creation.
     fn process_entry_create(&mut self, entry: &LedgerEntry, protocol_version: u32) -> Result<()> {
         match &entry.data {
-            LedgerEntryData::ContractData(_) => {
-                self.create_contract_data(entry.clone())
-            }
+            LedgerEntryData::ContractData(_) => self.create_contract_data(entry.clone()),
             LedgerEntryData::ContractCode(_) => {
                 self.create_contract_code(entry.clone(), protocol_version)
             }
-            LedgerEntryData::Ttl(_) => {
-                self.process_ttl_entry(entry)
-            }
+            LedgerEntryData::Ttl(_) => self.process_ttl_entry(entry),
             _ => Ok(()), // Ignore non-Soroban entries
         }
     }
@@ -748,9 +755,7 @@ impl InMemorySorobanState {
                     self.create_contract_code(entry.clone(), protocol_version)
                 }
             }
-            LedgerEntryData::Ttl(_) => {
-                self.process_ttl_entry(entry)
-            }
+            LedgerEntryData::Ttl(_) => self.process_ttl_entry(entry),
             _ => Ok(()), // Ignore non-Soroban entries
         }
     }
@@ -1116,7 +1121,9 @@ mod tests {
         let data_entry = make_contract_data_entry([1u8; 32]);
         let code_entry = make_contract_code_entry([2u8; 32]);
 
-        state.update_state(10, &[data_entry, code_entry], &[], &[], 25).unwrap();
+        state
+            .update_state(10, &[data_entry, code_entry], &[], &[], 25)
+            .unwrap();
 
         let stats = state.stats();
         assert_eq!(stats.ledger_seq, 10);

@@ -1967,7 +1967,6 @@ async fn cmd_verify_execution(
                 exec.advance_to_ledger(
                     seq,
                     cdp_header.scp_value.close_time.0,
-                    cdp_header.base_fee,
                     cdp_header.base_reserve,
                     cdp_header.ledger_version,
                     cdp_header.id_pool,
@@ -1977,7 +1976,6 @@ async fn cmd_verify_execution(
                 executor = Some(TransactionExecutor::new(
                     seq,
                     cdp_header.scp_value.close_time.0,
-                    cdp_header.base_fee,
                     cdp_header.base_reserve,
                     cdp_header.ledger_version,
                     network_id.clone(),

@@ -18,15 +18,15 @@
 //! The generalized format supports parallel execution stages for Soroban
 //! transactions and per-component fee overrides.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use stellar_core_common::Hash256;
 use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade, ScpHistoryEntry,
-    TransactionEnvelope, TransactionResultPair, TransactionResultSet, TransactionSet, Limits,
-    WriteXdr,
+    GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade, Limits,
+    ScpHistoryEntry, TransactionEnvelope, TransactionResultPair, TransactionResultSet,
+    TransactionSet, WriteXdr,
 };
-use std::cmp::Ordering;
-use std::collections::HashMap;
 
 /// Complete input data for closing a ledger.
 ///
@@ -236,7 +236,7 @@ impl TransactionSetVariant {
             stellar_xdr::curr::TransactionSetV1 {
                 previous_ledger_hash: header.previous_ledger_hash.clone(),
                 phases: stellar_xdr::curr::VecM::default(),
-            }
+            },
         ))
     }
 
@@ -335,7 +335,11 @@ fn less_than_xored(left: &Hash256, right: &Hash256, x: &Hash256) -> bool {
     false
 }
 
-fn apply_sort_cmp(a: &TransactionEnvelope, b: &TransactionEnvelope, set_hash: &Hash256) -> Ordering {
+fn apply_sort_cmp(
+    a: &TransactionEnvelope,
+    b: &TransactionEnvelope,
+    set_hash: &Hash256,
+) -> Ordering {
     let left = tx_hash(a);
     let right = tx_hash(b);
     if left == right {
@@ -350,12 +354,12 @@ fn apply_sort_cmp(a: &TransactionEnvelope, b: &TransactionEnvelope, set_hash: &H
 
 fn tx_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
     match tx {
-        TransactionEnvelope::TxV0(env) => {
-            stellar_core_tx::muxed_to_account_id(&stellar_xdr::curr::MuxedAccount::Ed25519(
-                env.tx.source_account_ed25519.clone(),
-            ))
+        TransactionEnvelope::TxV0(env) => stellar_core_tx::muxed_to_account_id(
+            &stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
+        ),
+        TransactionEnvelope::Tx(env) => {
+            stellar_core_tx::muxed_to_account_id(&env.tx.source_account)
         }
-        TransactionEnvelope::Tx(env) => stellar_core_tx::muxed_to_account_id(&env.tx.source_account),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
             stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 stellar_core_tx::muxed_to_account_id(&inner.tx.source_account)
@@ -419,13 +423,7 @@ fn sorted_for_apply_parallel(
 ) -> Vec<(TransactionEnvelope, Option<u32>)> {
     let mut stage_vec: Vec<Vec<Vec<TransactionEnvelope>>> = stages
         .iter()
-        .map(|stage| {
-            stage
-                .0
-                .iter()
-                .map(|cluster| cluster.0.to_vec())
-                .collect()
-        })
+        .map(|stage| stage.0.iter().map(|cluster| cluster.0.to_vec()).collect())
         .collect();
 
     for stage in stage_vec.iter_mut() {
@@ -760,11 +758,11 @@ mod tests {
     use stellar_core_crypto::Sha256Hasher;
     use stellar_xdr::curr::{
         DependentTxCluster, FeeBumpTransaction, FeeBumpTransactionEnvelope,
-        FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, Memo, MuxedAccount,
+        FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, Limits, Memo, MuxedAccount,
         ParallelTxExecutionStage, ParallelTxsComponent, Preconditions, Transaction,
         TransactionEnvelope, TransactionExt, TransactionPhase, TransactionSetV1,
         TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM,
-        Limits, WriteXdr,
+        WriteXdr,
     };
 
     fn make_tx(seed: u8, seq: i64) -> TransactionEnvelope {
@@ -837,7 +835,11 @@ mod tests {
         false
     }
 
-    fn apply_sort_cmp(a: &TransactionEnvelope, b: &TransactionEnvelope, set_hash: &Hash256) -> Ordering {
+    fn apply_sort_cmp(
+        a: &TransactionEnvelope,
+        b: &TransactionEnvelope,
+        set_hash: &Hash256,
+    ) -> Ordering {
         let left = tx_hash(a);
         let right = tx_hash(b);
         if left == right {
@@ -852,12 +854,12 @@ mod tests {
 
     fn fee_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
         match tx {
-            TransactionEnvelope::TxV0(env) => {
-                stellar_core_tx::muxed_to_account_id(&MuxedAccount::Ed25519(
-                    env.tx.source_account_ed25519.clone(),
-                ))
+            TransactionEnvelope::TxV0(env) => stellar_core_tx::muxed_to_account_id(
+                &MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
+            ),
+            TransactionEnvelope::Tx(env) => {
+                stellar_core_tx::muxed_to_account_id(&env.tx.source_account)
             }
-            TransactionEnvelope::Tx(env) => stellar_core_tx::muxed_to_account_id(&env.tx.source_account),
             TransactionEnvelope::TxFeeBump(env) => {
                 stellar_core_tx::muxed_to_account_id(&env.tx.fee_source)
             }
@@ -866,12 +868,12 @@ mod tests {
 
     fn inner_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
         match tx {
-            TransactionEnvelope::TxV0(env) => {
-                stellar_core_tx::muxed_to_account_id(&MuxedAccount::Ed25519(
-                    env.tx.source_account_ed25519.clone(),
-                ))
+            TransactionEnvelope::TxV0(env) => stellar_core_tx::muxed_to_account_id(
+                &MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
+            ),
+            TransactionEnvelope::Tx(env) => {
+                stellar_core_tx::muxed_to_account_id(&env.tx.source_account)
             }
-            TransactionEnvelope::Tx(env) => stellar_core_tx::muxed_to_account_id(&env.tx.source_account),
             TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
                 FeeBumpTransactionInnerTx::Tx(inner) => {
                     stellar_core_tx::muxed_to_account_id(&inner.tx.source_account)
@@ -1036,7 +1038,10 @@ mod tests {
         }
 
         let (set, expected, wrong) = chosen.expect("distinct apply order case");
-        assert_ne!(expected, wrong, "test should distinguish inner vs fee source");
+        assert_ne!(
+            expected, wrong,
+            "test should distinguish inner vs fee source"
+        );
 
         let variant = TransactionSetVariant::Classic(set);
         let actual: Vec<Hash256> = variant
@@ -1057,14 +1062,13 @@ mod tests {
         let soroban_c = make_tx(22, 1);
         let soroban_d = make_tx(23, 1);
 
-        let classic_component = TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-            TxSetComponentTxsMaybeDiscountedFee {
+        let classic_component =
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
                 base_fee: None,
                 txs: vec![classic_b.clone(), classic_a.clone()]
                     .try_into()
                     .unwrap(),
-            },
-        );
+            });
         let classic_phase = TransactionPhase::V0(vec![classic_component].try_into().unwrap());
 
         let cluster_a = DependentTxCluster(
@@ -1089,7 +1093,10 @@ mod tests {
         let set_hash = Hash256::hash_xdr(&gen_set).unwrap_or(Hash256::ZERO);
         let classic_expected = expected_apply_order(vec![classic_a, classic_b], set_hash, false);
         let soroban_expected = expected_parallel_order(
-            vec![vec![vec![soroban_a, soroban_b], vec![soroban_c]], vec![vec![soroban_d]]],
+            vec![
+                vec![vec![soroban_a, soroban_b], vec![soroban_c]],
+                vec![vec![soroban_d]],
+            ],
             set_hash,
         );
         let expected: Vec<Hash256> = classic_expected

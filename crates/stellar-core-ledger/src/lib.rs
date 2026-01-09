@@ -58,7 +58,7 @@
 //! use stellar_core_ledger::{LedgerManager, LedgerCloseData, TransactionSetVariant};
 //!
 //! // Create a ledger manager
-//! let manager = LedgerManager::new(db, bucket_manager, network_passphrase);
+//! let manager = LedgerManager::new(db, network_passphrase);
 //!
 //! // Initialize from buckets (during catchup)
 //! manager.initialize_from_buckets(bucket_list, None, header, Some(header_hash))?;
@@ -401,7 +401,10 @@ pub mod reserves {
         let min_bal = minimum_balance(account, base_reserve);
         let sell_liab = selling_liabilities(account);
 
-        account.balance.saturating_sub(min_bal).saturating_sub(sell_liab)
+        account
+            .balance
+            .saturating_sub(min_bal)
+            .saturating_sub(sell_liab)
     }
 
     /// Calculate the available capacity to receive XLM.
@@ -474,11 +477,17 @@ mod tests {
         let base_reserve = 5_000_000; // 0.5 XLM
 
         // (2 + 0) * 5_000_000 = 10_000_000
-        assert_eq!(reserves::minimum_balance(&account, base_reserve), 10_000_000);
+        assert_eq!(
+            reserves::minimum_balance(&account, base_reserve),
+            10_000_000
+        );
 
         let account2 = create_test_account(100_000_000, 3);
         // (2 + 3) * 5_000_000 = 25_000_000
-        assert_eq!(reserves::minimum_balance(&account2, base_reserve), 25_000_000);
+        assert_eq!(
+            reserves::minimum_balance(&account2, base_reserve),
+            25_000_000
+        );
     }
 
     #[test]
@@ -487,7 +496,10 @@ mod tests {
         let base_reserve = 5_000_000;
 
         // 100_000_000 - 10_000_000 - 0 = 90_000_000
-        assert_eq!(reserves::available_to_send(&account, base_reserve), 90_000_000);
+        assert_eq!(
+            reserves::available_to_send(&account, base_reserve),
+            90_000_000
+        );
     }
 
     #[test]

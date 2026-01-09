@@ -441,9 +441,9 @@ impl SnapshotBuilder {
 
     /// Build the snapshot.
     pub fn build(self) -> Result<LedgerSnapshot> {
-        let header = self.header.ok_or_else(|| {
-            LedgerError::Snapshot("header not set".to_string())
-        })?;
+        let header = self
+            .header
+            .ok_or_else(|| LedgerError::Snapshot("header not set".to_string()))?;
 
         Ok(LedgerSnapshot {
             ledger_seq: self.ledger_seq,

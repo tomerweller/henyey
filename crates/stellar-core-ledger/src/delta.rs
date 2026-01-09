@@ -121,9 +121,11 @@ pub fn entry_to_key(entry: &LedgerEntry) -> Result<LedgerKey> {
     use stellar_xdr::curr::LedgerEntryData;
 
     let key = match &entry.data {
-        LedgerEntryData::Account(account) => LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: account.account_id.clone(),
-        }),
+        LedgerEntryData::Account(account) => {
+            LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: account.account_id.clone(),
+            })
+        }
         LedgerEntryData::Trustline(trustline) => {
             LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
                 account_id: trustline.account_id.clone(),
@@ -260,8 +262,7 @@ impl LedgerDelta {
             match existing {
                 EntryChange::Created(_) => {
                     // Entry was already created, update with new value
-                    self.changes
-                        .insert(key_bytes, EntryChange::Created(entry));
+                    self.changes.insert(key_bytes, EntryChange::Created(entry));
                 }
                 EntryChange::Updated { previous, .. } => {
                     // Entry was updated, keep original previous and update current
@@ -387,9 +388,7 @@ impl LedgerDelta {
 
     /// Get all entry changes in the order they were recorded.
     pub fn changes(&self) -> impl Iterator<Item = &EntryChange> {
-        self.change_order
-            .iter()
-            .filter_map(|k| self.changes.get(k))
+        self.change_order.iter().filter_map(|k| self.changes.get(k))
     }
 
     /// Get the number of changes.

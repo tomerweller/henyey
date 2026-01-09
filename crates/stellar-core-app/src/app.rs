@@ -701,7 +701,6 @@ impl App {
         // Initialize ledger manager
         let ledger_manager = Arc::new(LedgerManager::with_config(
             db.clone(),
-            bucket_manager.clone(),
             config.network.passphrase.clone(),
             LedgerManagerConfig {
                 max_snapshots: 10,

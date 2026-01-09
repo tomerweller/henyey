@@ -5,8 +5,8 @@ use stellar_core_common::Hash256;
 use stellar_core_db::Database;
 use stellar_core_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
 use stellar_xdr::curr::{
-    Hash, LedgerCloseMeta, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt,
-    TimePoint, TransactionResultSet, TransactionSet, VecM,
+    Hash, LedgerCloseMeta, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint,
+    TransactionResultSet, TransactionSet, VecM,
 };
 
 fn make_genesis_header() -> LedgerHeader {
@@ -42,10 +42,9 @@ fn make_genesis_header() -> LedgerHeader {
 #[test]
 fn test_ledger_close_with_empty_tx_set() {
     let db = Database::open_in_memory().expect("db");
-    let bucket_dir = tempfile::tempdir().expect("bucket dir");
-    let bucket_manager = BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket mgr");
+    let _bucket_dir = tempfile::tempdir().expect("bucket dir");
 
-    let ledger = LedgerManager::new(db, Arc::new(bucket_manager), "Test Network".to_string());
+    let ledger = LedgerManager::new(db, "Test Network".to_string());
 
     let bucket_list = BucketList::new();
     let header = make_genesis_header();
@@ -76,7 +75,10 @@ fn test_ledger_close_with_empty_tx_set() {
         results: VecM::default(),
     };
     let expected_hash = Hash256::hash_xdr(&empty_results).expect("result hash");
-    assert_eq!(Hash256::from(result.header.tx_set_result_hash), expected_hash);
+    assert_eq!(
+        Hash256::from(result.header.tx_set_result_hash),
+        expected_hash
+    );
 
     let meta = result.meta.expect("ledger close meta");
     match meta {

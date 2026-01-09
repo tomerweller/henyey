@@ -27,7 +27,9 @@
 //! the live bucket list, and both contribute to the header's bucket list hash.
 
 use crate::{
-    close::{LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext},
+    close::{
+        LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
+    },
     delta::{EntryChange, LedgerDelta},
     execution::{execute_transaction_set, OperationInvariantRunner, TransactionExecutionResult},
     header::{compute_header_hash, create_next_header},
@@ -37,23 +39,22 @@ use crate::{
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellar_core_bucket::{BucketList, BucketManager};
+use stellar_core_bucket::BucketList;
 use stellar_core_common::{Hash256, NetworkId};
-use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_core_db::Database;
 use stellar_core_invariant::{
     AccountSubEntriesCountIsValid, BucketListHashMatchesHeader, CloseTimeNondecreasing,
     ConservationOfLumens, ConstantProductInvariant, Invariant, InvariantContext, InvariantManager,
-    LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerEntryChange, LedgerSeqIncrement,
+    LastModifiedLedgerSeqMatchesHeader, LedgerEntryChange, LedgerEntryIsValid, LedgerSeqIncrement,
     LiabilitiesMatchOffers, OrderBookIsNotCrossed, SponsorshipCountIsValid,
 };
+use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
     ConfigSettingScpTiming, GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt,
     LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, Limits,
-    TransactionMeta, TransactionEventStage, TransactionPhase, TransactionResultMetaV1,
-    TransactionSetV1, TxSetComponent,
+    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, Limits, TransactionEventStage,
+    TransactionMeta, TransactionPhase, TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
     TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM, WriteXdr,
 };
 use tracing::{debug, info};
@@ -70,12 +71,9 @@ fn prepend_fee_event(
         return;
     }
 
-    let mut manager = TxEventManager::new(true, protocol_version, network_id.clone(), classic_events);
-    manager.new_fee_event(
-        fee_source,
-        fee_charged,
-        TransactionEventStage::BeforeAllTxs,
-    );
+    let mut manager =
+        TxEventManager::new(true, protocol_version, network_id.clone(), classic_events);
+    manager.new_fee_event(fee_source, fee_charged, TransactionEventStage::BeforeAllTxs);
     let fee_events = manager.finalize();
     if fee_events.is_empty() {
         return;
@@ -212,10 +210,6 @@ pub struct LedgerManager {
     /// Database handle for persistent storage.
     db: Database,
 
-    /// Bucket manager for bucket file operations.
-    #[allow(dead_code)]
-    bucket_manager: Arc<BucketManager>,
-
     /// Live bucket list containing all current ledger entries.
     ///
     /// Wrapped in Arc for efficient sharing with snapshots.
@@ -256,18 +250,13 @@ impl LedgerManager {
     ///
     /// The ledger starts uninitialized and must be initialized via
     /// `initialize_from_buckets` or by loading from the database.
-    pub fn new(
-        db: Database,
-        bucket_manager: Arc<BucketManager>,
-        network_passphrase: String,
-    ) -> Self {
-        Self::with_config(db, bucket_manager, network_passphrase, LedgerManagerConfig::default())
+    pub fn new(db: Database, network_passphrase: String) -> Self {
+        Self::with_config(db, network_passphrase, LedgerManagerConfig::default())
     }
 
     /// Create a new ledger manager with custom configuration.
     pub fn with_config(
         db: Database,
-        bucket_manager: Arc<BucketManager>,
         network_passphrase: String,
         config: LedgerManagerConfig,
     ) -> Self {
@@ -287,7 +276,6 @@ impl LedgerManager {
 
         Self {
             db,
-            bucket_manager,
             bucket_list: Arc::new(RwLock::new(BucketList::default())),
             hot_archive_bucket_list: Arc::new(RwLock::new(None)),
             network_passphrase,
@@ -723,23 +711,21 @@ impl LedgerManager {
         let state = self.state.read();
         let entries = self.entry_cache.read().clone();
 
-        let snapshot = LedgerSnapshot::new(
-            state.header.clone(),
-            state.header_hash,
-            entries,
-        );
+        let snapshot = LedgerSnapshot::new(state.header.clone(), state.header_hash, entries);
 
         // Create a lookup function that queries the bucket list
         let bucket_list_lookup = self.bucket_list.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
-            bucket_list_lookup.read().get(key).map_err(LedgerError::Bucket)
+            bucket_list_lookup
+                .read()
+                .get(key)
+                .map_err(LedgerError::Bucket)
         });
 
         // Create a lookup function that queries the ledger header table
         let db = self.db.clone();
-        let header_lookup_fn: crate::snapshot::LedgerHeaderLookupFn = Arc::new(move |seq: u32| {
-            db.get_ledger_header(seq).map_err(LedgerError::from)
-        });
+        let header_lookup_fn: crate::snapshot::LedgerHeaderLookupFn =
+            Arc::new(move |seq: u32| db.get_ledger_header(seq).map_err(LedgerError::from));
 
         let bucket_list_entries = self.bucket_list.clone();
         let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
@@ -1008,10 +994,7 @@ impl<'a> LedgerCloseContext<'a> {
     /// This executes all transactions in order, recording state changes
     /// to the delta and collecting results.
     pub fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
-        let transactions = self
-            .close_data
-            .tx_set
-            .transactions_with_base_fee();
+        let transactions = self.close_data.tx_set.transactions_with_base_fee();
 
         if transactions.is_empty() {
             self.tx_results.clear();
@@ -1053,16 +1036,17 @@ impl<'a> LedgerCloseContext<'a> {
             op_invariants,
         )?;
         if classic_events.events_enabled(self.prev_header.ledger_version) {
-            for (idx, ((envelope, _), meta)) in
-                transactions.iter().zip(tx_result_metas.iter_mut()).enumerate()
+            for (idx, ((envelope, _), meta)) in transactions
+                .iter()
+                .zip(tx_result_metas.iter_mut())
+                .enumerate()
             {
                 let fee_charged = tx_results[idx].result.fee_charged;
                 let frame = TransactionFrame::with_network(
                     envelope.clone(),
                     self.manager.network_id.clone(),
                 );
-                let fee_source =
-                    stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+                let fee_source = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
                 prepend_fee_event(
                     &mut meta.tx_apply_processing,
                     &fee_source,
@@ -1083,7 +1067,8 @@ impl<'a> LedgerCloseContext<'a> {
         let op_count: usize = results.iter().map(|r| r.operation_results.len()).sum();
         let fees_collected: i64 = results.iter().map(|r| r.fee_charged).sum();
 
-        self.stats.record_transactions(tx_count, success_count, op_count);
+        self.stats
+            .record_transactions(tx_count, success_count, op_count);
         self.stats.record_fees(fees_collected);
 
         Ok(results)
@@ -1222,12 +1207,15 @@ impl<'a> LedgerCloseContext<'a> {
         let entries_created = self.delta.changes().filter(|c| c.is_created()).count();
         let entries_updated = self.delta.changes().filter(|c| c.is_updated()).count();
         let entries_deleted = self.delta.changes().filter(|c| c.is_deleted()).count();
-        self.stats.record_entry_changes(entries_created, entries_updated, entries_deleted);
+        self.stats
+            .record_entry_changes(entries_created, entries_updated, entries_deleted);
 
         // Commit to manager
-        self.manager.commit_close(self.delta, new_header.clone(), header_hash)?;
+        self.manager
+            .commit_close(self.delta, new_header.clone(), header_hash)?;
 
-        self.stats.set_close_time(start.elapsed().as_millis() as u64);
+        self.stats
+            .set_close_time(start.elapsed().as_millis() as u64);
 
         info!(
             ledger_seq = new_header.ledger_seq,
@@ -1244,13 +1232,16 @@ impl<'a> LedgerCloseContext<'a> {
             "Ledger closed"
         );
 
-        let meta = build_ledger_close_meta(&self.close_data, &new_header, header_hash, &self.tx_result_metas);
+        let meta = build_ledger_close_meta(
+            &self.close_data,
+            &new_header,
+            header_hash,
+            &self.tx_result_metas,
+        );
 
-        Ok(
-            LedgerCloseResult::new(new_header, header_hash)
-                .with_tx_results(self.tx_results)
-                .with_meta(meta),
-        )
+        Ok(LedgerCloseResult::new(new_header, header_hash)
+            .with_tx_results(self.tx_results)
+            .with_meta(meta))
     }
 
     /// Abort the ledger close without committing.

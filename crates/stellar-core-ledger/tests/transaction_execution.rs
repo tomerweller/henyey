@@ -1,34 +1,33 @@
+use std::sync::Arc;
 use stellar_core_common::NetworkId;
 use stellar_core_crypto::{sign_hash, SecretKey};
-use stellar_core_ledger::execution::{ExecutionFailure, TransactionExecutor};
 use stellar_core_ledger::execution::build_tx_result_pair;
+use stellar_core_ledger::execution::{ExecutionFailure, TransactionExecutor};
 use stellar_core_ledger::{LedgerSnapshot, SnapshotBuilder, SnapshotHandle};
 use stellar_core_tx::{soroban::SorobanConfig, ClassicEventConfig, OpEventManager};
-use std::sync::Arc;
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, AllowTrustOp, AlphaNum4, Asset, AssetCode, AssetCode4,
-    ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, ClawbackClaimableBalanceOp, ClawbackOp,
-    ClaimClaimableBalanceOp, ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId,
-    Claimant, ClaimantV0, ClaimPredicate, CreateAccountOp, CreateAccountResult,
-    CreateClaimableBalanceOp, CreateClaimableBalanceResult, LiquidityPoolConstantProductParameters,
-    LiquidityPoolDepositOp, LiquidityPoolEntry, LiquidityPoolEntryBody,
-    LiquidityPoolEntryConstantProduct, LiquidityPoolWithdrawOp, ManageSellOfferOp,
-    ManageSellOfferResult, OfferEntry, OfferEntryExt, PathPaymentStrictSendOp,
-    PathPaymentStrictSendResult, PathPaymentStrictSendResultSuccess,
-    SetTrustLineFlagsOp,
-    BytesM, ContractCodeEntry, ContractCodeEntryExt, ContractEventBody, ContractId, ContractIdPreimage,
-    DecoratedSignature, Duration, ExtendFootprintTtlOp, FeeBumpTransaction, FeeBumpTransactionEnvelope,
-    FeeBumpTransactionInnerTx, Hash, HashIdPreimage, HashIdPreimageContractId, InnerTransactionResultPair,
-    Int128Parts, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerFootprint, LedgerKey,
-    LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyLiquidityPool, LedgerKeyOffer,
-    LedgerKeyTrustLine, LedgerKeyTtl,
-    MuxedAccountMed25519, Memo, MuxedAccount, Operation, OperationBody, OperationResult,
-    OperationResultTr, Preconditions, PreconditionsV2, PublicKey, ScAddress, ScString, ScSymbol,
-    ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint, SignerKey, SorobanResources,
-    SorobanTransactionData, SorobanTransactionDataExt, String32, StringM, Thresholds, TimeBounds,
-    TimePoint, Transaction, TransactionEnvelope, TransactionEventStage, TransactionExt,
-    TransactionMeta, TransactionResultResult, TransactionV1Envelope, TrustLineAsset, TrustLineEntry,
-    TrustLineEntryExt, TrustLineFlags, TtlEntry, Uint256, VecM, PoolId, Price,
+    AccountEntry, AccountEntryExt, AccountId, AllowTrustOp, AlphaNum4, Asset, AssetCode,
+    AssetCode4, BytesM, ClaimAtom, ClaimClaimableBalanceOp, ClaimLiquidityAtom, ClaimOfferAtom,
+    ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId, Claimant,
+    ClaimantV0, ClawbackClaimableBalanceOp, ClawbackOp, ContractCodeEntry, ContractCodeEntryExt,
+    ContractEventBody, ContractId, ContractIdPreimage, CreateAccountOp, CreateAccountResult,
+    CreateClaimableBalanceOp, CreateClaimableBalanceResult, DecoratedSignature, Duration,
+    ExtendFootprintTtlOp, FeeBumpTransaction, FeeBumpTransactionEnvelope,
+    FeeBumpTransactionInnerTx, Hash, HashIdPreimage, HashIdPreimageContractId,
+    InnerTransactionResultPair, Int128Parts, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    LedgerFootprint, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyContractCode,
+    LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl,
+    LiquidityPoolConstantProductParameters, LiquidityPoolDepositOp, LiquidityPoolEntry,
+    LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolWithdrawOp,
+    ManageSellOfferOp, ManageSellOfferResult, Memo, MuxedAccount, MuxedAccountMed25519, OfferEntry,
+    OfferEntryExt, Operation, OperationBody, OperationResult, OperationResultTr,
+    PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultSuccess,
+    PoolId, Preconditions, PreconditionsV2, Price, PublicKey, ScAddress, ScString, ScSymbol, ScVal,
+    SequenceNumber, SetTrustLineFlagsOp, Signature as XdrSignature, SignatureHint, SignerKey,
+    SorobanResources, SorobanTransactionData, SorobanTransactionDataExt, String32, StringM,
+    Thresholds, TimeBounds, TimePoint, Transaction, TransactionEnvelope, TransactionEventStage,
+    TransactionExt, TransactionMeta, TransactionResultResult, TransactionV1Envelope,
+    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags, TtlEntry, Uint256, VecM,
 };
 
 fn create_account_entry_with_last_modified(
@@ -61,7 +60,11 @@ fn create_account_entry_with_last_modified(
     (key, entry)
 }
 
-fn create_account_entry(account_id: AccountId, seq_num: i64, balance: i64) -> (LedgerKey, LedgerEntry) {
+fn create_account_entry(
+    account_id: AccountId,
+    seq_num: i64,
+    balance: i64,
+) -> (LedgerKey, LedgerEntry) {
     create_account_entry_with_last_modified(account_id, seq_num, balance, 1)
 }
 
@@ -209,7 +212,11 @@ fn create_offer_entry(
     (key, entry)
 }
 
-fn sign_envelope(envelope: &TransactionEnvelope, secret: &SecretKey, network_id: &NetworkId) -> DecoratedSignature {
+fn sign_envelope(
+    envelope: &TransactionEnvelope,
+    secret: &SecretKey,
+    network_id: &NetworkId,
+) -> DecoratedSignature {
     let frame = stellar_core_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
     let hash = frame.hash(network_id).expect("tx hash");
     let signature = sign_hash(secret, &hash);
@@ -390,19 +397,17 @@ fn test_execute_transaction_missing_operation() {
 
     let snapshot = LedgerSnapshot::empty(1);
     let snapshot = SnapshotHandle::new(snapshot);
-    let mut executor =
-        TransactionExecutor::new(
-            1,
-            1000,
-            100,
-            5_000_000,
-            25,
-            NetworkId::testnet(),
-            0,
-            SorobanConfig::default(),
-            ClassicEventConfig::default(),
-            None,
-        );
+    let mut executor = TransactionExecutor::new(
+        1,
+        1000,
+        5_000_000,
+        25,
+        NetworkId::testnet(),
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+        None,
+    );
 
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -459,19 +464,17 @@ fn test_execute_transaction_time_bounds_too_early() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let mut executor =
-        TransactionExecutor::new(
-            1,
-            1_000,
-            100,
-            5_000_000,
-            25,
-            network_id,
-            0,
-            SorobanConfig::default(),
-            classic_events,
-            None,
-        );
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -537,7 +540,6 @@ fn test_execute_transaction_min_seq_num_precondition() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -560,7 +562,12 @@ fn test_execute_transaction_min_seq_age_precondition() {
     let last_modified_seq = 5;
     let last_close_time = 900;
 
-    let (key, entry) = create_account_entry_with_last_modified(account_id.clone(), 1, 10_000_000, last_modified_seq);
+    let (key, entry) = create_account_entry_with_last_modified(
+        account_id.clone(),
+        1,
+        10_000_000,
+        last_modified_seq,
+    );
     let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
         .expect("add entry")
@@ -618,19 +625,17 @@ fn test_execute_transaction_min_seq_age_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor =
-        TransactionExecutor::new(
-            10,
-            1_000,
-            100,
-            5_000_000,
-            25,
-            network_id,
-            0,
-            SorobanConfig::default(),
-            ClassicEventConfig::default(),
-            None,
-        );
+    let mut executor = TransactionExecutor::new(
+        10,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+        None,
+    );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -643,7 +648,8 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
     let secret = SecretKey::from_seed(&[13u8; 32]);
     let account_id: AccountId = (&secret.public_key()).into();
 
-    let (key, entry) = create_account_entry_with_last_modified(account_id.clone(), 1, 10_000_000, 8);
+    let (key, entry) =
+        create_account_entry_with_last_modified(account_id.clone(), 1, 10_000_000, 8);
     let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
         .expect("add entry")
@@ -689,19 +695,17 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor =
-        TransactionExecutor::new(
-            10,
-            1_000,
-            100,
-            5_000_000,
-            25,
-            network_id,
-            0,
-            SorobanConfig::default(),
-            ClassicEventConfig::default(),
-            None,
-        );
+    let mut executor = TransactionExecutor::new(
+        10,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+        None,
+    );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -768,7 +772,6 @@ fn test_execute_transaction_extra_signers_missing() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -911,7 +914,6 @@ fn test_operation_failure_rolls_back_changes() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -985,19 +987,17 @@ fn test_classic_events_emitted_for_payment() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let mut executor =
-        TransactionExecutor::new(
-            1,
-            1_000,
-            100,
-            5_000_000,
-            25,
-            network_id,
-            0,
-            SorobanConfig::default(),
-            classic_events,
-            None,
-        );
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+        None,
+    );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -1041,10 +1041,7 @@ fn test_classic_events_emitted_for_payment() {
         op_topics[3],
         ScVal::String(ScString(StringM::try_from("native").unwrap()))
     );
-    assert_eq!(
-        op_body.data,
-        ScVal::I128(i128_parts(100))
-    );
+    assert_eq!(op_body.data, ScVal::I128(i128_parts(100)));
 }
 
 #[test]
@@ -1104,7 +1101,6 @@ fn test_classic_events_payment_with_muxed_destination() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1204,7 +1200,6 @@ fn test_classic_events_payment_with_memo_data() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1309,7 +1304,6 @@ fn test_classic_events_payment_memo_precedence() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1400,7 +1394,6 @@ fn test_classic_events_emitted_for_account_merge() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1432,8 +1425,14 @@ fn test_classic_events_emitted_for_account_merge() {
     let op_topics: &[ScVal] = op_body.topics.as_ref();
     assert_eq!(op_topics.len(), 4);
     assert_eq!(op_topics[0], scval_symbol("transfer"));
-    assert_eq!(op_topics[1], ScVal::Address(ScAddress::Account(source_id.clone())));
-    assert_eq!(op_topics[2], ScVal::Address(ScAddress::Account(dest_id.clone())));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
+    assert_eq!(
+        op_topics[2],
+        ScVal::Address(ScAddress::Account(dest_id.clone()))
+    );
     assert_eq!(
         op_topics[3],
         ScVal::String(ScString(StringM::try_from("native").unwrap()))
@@ -1493,7 +1492,6 @@ fn test_classic_events_emitted_for_create_account() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1525,16 +1523,19 @@ fn test_classic_events_emitted_for_create_account() {
     let op_topics: &[ScVal] = op_body.topics.as_ref();
     assert_eq!(op_topics.len(), 4);
     assert_eq!(op_topics[0], scval_symbol("transfer"));
-    assert_eq!(op_topics[1], ScVal::Address(ScAddress::Account(source_id.clone())));
-    assert_eq!(op_topics[2], ScVal::Address(ScAddress::Account(dest_id.clone())));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
+    assert_eq!(
+        op_topics[2],
+        ScVal::Address(ScAddress::Account(dest_id.clone()))
+    );
     assert_eq!(
         op_topics[3],
         ScVal::String(ScString(StringM::try_from("native").unwrap()))
     );
-    assert_eq!(
-        op_body.data,
-        ScVal::I128(i128_parts(20_000_000))
-    );
+    assert_eq!(op_body.data, ScVal::I128(i128_parts(20_000_000)));
 }
 
 #[test]
@@ -1591,7 +1592,6 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1609,11 +1609,7 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
         "unexpected result: {:?}",
         result.operation_results
     );
-    let balance_id = match result
-        .operation_results
-        .get(0)
-        .expect("operation result")
-    {
+    let balance_id = match result.operation_results.get(0).expect("operation result") {
         OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(
             CreateClaimableBalanceResult::Success(balance_id),
         )) => balance_id.clone(),
@@ -1634,7 +1630,10 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
     let op_topics: &[ScVal] = op_body.topics.as_ref();
     assert_eq!(op_topics.len(), 4);
     assert_eq!(op_topics[0], scval_symbol("transfer"));
-    assert_eq!(op_topics[1], ScVal::Address(ScAddress::Account(source_id.clone())));
+    assert_eq!(
+        op_topics[1],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
     assert_eq!(
         op_topics[2],
         ScVal::Address(ScAddress::ClaimableBalance(balance_id.clone()))
@@ -1643,10 +1642,7 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
         op_topics[3],
         ScVal::String(ScString(StringM::try_from("native").unwrap()))
     );
-    assert_eq!(
-        op_body.data,
-        ScVal::I128(i128_parts(20_000_000))
-    );
+    assert_eq!(op_body.data, ScVal::I128(i128_parts(20_000_000)));
 }
 
 #[test]
@@ -1720,7 +1716,6 @@ fn test_classic_events_emitted_for_claim_claimable_balance() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1756,15 +1751,15 @@ fn test_classic_events_emitted_for_claim_claimable_balance() {
         op_topics[1],
         ScVal::Address(ScAddress::ClaimableBalance(balance_id.clone()))
     );
-    assert_eq!(op_topics[2], ScVal::Address(ScAddress::Account(source_id.clone())));
+    assert_eq!(
+        op_topics[2],
+        ScVal::Address(ScAddress::Account(source_id.clone()))
+    );
     assert_eq!(
         op_topics[3],
         ScVal::String(ScString(StringM::try_from("native").unwrap()))
     );
-    assert_eq!(
-        op_body.data,
-        ScVal::I128(i128_parts(20_000_000))
-    );
+    assert_eq!(op_body.data, ScVal::I128(i128_parts(20_000_000)));
 }
 
 #[test]
@@ -1836,7 +1831,6 @@ fn test_classic_events_emitted_for_allow_trust() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -1945,7 +1939,6 @@ fn test_classic_events_emitted_for_set_trustline_flags() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -2004,8 +1997,13 @@ fn test_classic_events_emitted_for_clawback() {
     let (issuer_key, issuer_entry) =
         create_account_entry_with_flags(issuer_id.clone(), 1, 50_000_000, 0x8);
     let (trustor_key, trustor_entry) = create_account_entry(trustor_id.clone(), 1, 20_000_000);
-    let (trustline_key, trustline_entry) =
-        create_trustline_entry(trustor_id.clone(), trustline_asset, 50_000_000, 100_000_000, 0);
+    let (trustline_key, trustline_entry) = create_trustline_entry(
+        trustor_id.clone(),
+        trustline_asset,
+        50_000_000,
+        100_000_000,
+        0,
+    );
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(issuer_key, issuer_entry)
@@ -2054,7 +2052,6 @@ fn test_classic_events_emitted_for_clawback() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -2087,10 +2084,7 @@ fn test_classic_events_emitted_for_clawback() {
         ScVal::Address(ScAddress::Account(trustor_id.clone()))
     );
     assert_eq!(op_topics[2], asset_string_scval(&asset));
-    assert_eq!(
-        op_body.data,
-        ScVal::I128(i128_parts(20_000_000))
-    );
+    assert_eq!(op_body.data, ScVal::I128(i128_parts(20_000_000)));
 }
 
 #[test]
@@ -2173,7 +2167,6 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -2206,10 +2199,7 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
         ScVal::Address(ScAddress::ClaimableBalance(balance_id.clone()))
     );
     assert_eq!(op_topics[2], asset_string_scval(&asset));
-    assert_eq!(
-        op_body.data,
-        ScVal::I128(i128_parts(20_000_000))
-    );
+    assert_eq!(op_body.data, ScVal::I128(i128_parts(20_000_000)));
 }
 
 #[test]
@@ -2308,7 +2298,6 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -2345,10 +2334,7 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
     );
     assert_eq!(first_topics[2], ScVal::Address(pool_address.clone()));
     assert_eq!(first_topics[3], asset_string_scval(&asset_a));
-    assert_eq!(
-        first_body.data,
-        ScVal::I128(i128_parts(10_000_000))
-    );
+    assert_eq!(first_body.data, ScVal::I128(i128_parts(10_000_000)));
 
     let second_event = &op_event_list[1];
     let ContractEventBody::V0(second_body) = &second_event.body;
@@ -2361,10 +2347,7 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
     );
     assert_eq!(second_topics[2], ScVal::Address(pool_address));
     assert_eq!(second_topics[3], asset_string_scval(&asset_b));
-    assert_eq!(
-        second_body.data,
-        ScVal::I128(i128_parts(20_000_000))
-    );
+    assert_eq!(second_body.data, ScVal::I128(i128_parts(20_000_000)));
 }
 
 #[test]
@@ -2462,7 +2445,6 @@ fn test_classic_events_emitted_for_liquidity_pool_withdraw() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -2663,7 +2645,6 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -2681,10 +2662,7 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
         "unexpected result: {:?}",
         result.operation_results
     );
-    let op_result = result
-        .operation_results
-        .get(0)
-        .expect("operation result");
+    let op_result = result.operation_results.get(0).expect("operation result");
     let claim_atoms: &[ClaimAtom] = match op_result {
         OperationResult::OpInner(OperationResultTr::ManageSellOffer(
             ManageSellOfferResult::Success(success),
@@ -2819,7 +2797,6 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -2839,15 +2816,15 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
     );
     let (claim_atoms, last): (&[ClaimAtom], &stellar_xdr::curr::SimplePaymentResult) =
         match result.operation_results.get(0).expect("op result") {
-        OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
-            PathPaymentStrictSendResult::Success(PathPaymentStrictSendResultSuccess {
-                offers,
-                last,
-                ..
-            }),
-        )) => (offers.as_ref(), last),
-        other => panic!("unexpected result: {:?}", other),
-    };
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
+                PathPaymentStrictSendResult::Success(PathPaymentStrictSendResultSuccess {
+                    offers,
+                    last,
+                    ..
+                }),
+            )) => (offers.as_ref(), last),
+            other => panic!("unexpected result: {:?}", other),
+        };
     assert!(!claim_atoms.is_empty());
 
     let tx_meta = result.tx_meta.expect("tx meta");
@@ -2903,7 +2880,9 @@ fn test_soroban_refund_event_after_all_txs() {
         use stellar_xdr::curr::WriteXdr;
 
         let mut hasher = Sha256::new();
-        let bytes = contract_key.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+        let bytes = contract_key
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
         hasher.update(&bytes);
         Hash(hasher.finalize().into())
     };
@@ -2977,7 +2956,6 @@ fn test_soroban_refund_event_after_all_txs() {
     let mut executor = TransactionExecutor::new(
         1,
         1_000,
-        100,
         5_000_000,
         25,
         network_id,
@@ -3006,8 +2984,5 @@ fn test_soroban_refund_event_after_all_txs() {
     assert_eq!(refund_event.stage, TransactionEventStage::AfterAllTxs);
     let ContractEventBody::V0(refund_body) = &refund_event.event.body;
     assert_eq!(refund_event.event.contract_id, Some(contract_id));
-    assert_eq!(
-        refund_body.data,
-        ScVal::I128(i128_parts(-900))
-    );
+    assert_eq!(refund_body.data, ScVal::I128(i128_parts(-900)));
 }

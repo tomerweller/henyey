@@ -25,18 +25,16 @@ fn testdata_path(name: &str) -> PathBuf {
 
 fn load_json(name: &str) -> JsonValue {
     let path = testdata_path(name);
-    let payload = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-    serde_json::from_str(&payload)
-        .unwrap_or_else(|e| panic!("parse {}: {}", path.display(), e))
+    let payload =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    serde_json::from_str(&payload).unwrap_or_else(|e| panic!("parse {}: {}", path.display(), e))
 }
 
 fn parse_hash(value: &JsonValue, ctx: &str) -> Hash {
     let text = value
         .as_str()
         .unwrap_or_else(|| panic!("{}: expected hex string", ctx));
-    let hash = Hash256::from_hex(text)
-        .unwrap_or_else(|e| panic!("{}: invalid hex: {}", ctx, e));
+    let hash = Hash256::from_hex(text).unwrap_or_else(|e| panic!("{}: invalid hex: {}", ctx, e));
     Hash::from(hash)
 }
 
@@ -65,15 +63,19 @@ fn parse_stellar_value(value: &JsonValue) -> StellarValue {
         .as_object()
         .unwrap_or_else(|| panic!("scpValue: expected object"));
     let tx_set_hash = parse_hash(
-        obj.get("txSetHash").unwrap_or_else(|| panic!("scpValue.txSetHash missing")),
+        obj.get("txSetHash")
+            .unwrap_or_else(|| panic!("scpValue.txSetHash missing")),
         "scpValue.txSetHash",
     );
     let close_time = parse_u32(
-        obj.get("closeTime").unwrap_or_else(|| panic!("scpValue.closeTime missing")),
+        obj.get("closeTime")
+            .unwrap_or_else(|| panic!("scpValue.closeTime missing")),
         "scpValue.closeTime",
     );
     let upgrades = VecM::default();
-    let ext_value = obj.get("ext").unwrap_or_else(|| panic!("scpValue.ext missing"));
+    let ext_value = obj
+        .get("ext")
+        .unwrap_or_else(|| panic!("scpValue.ext missing"));
     let ext = parse_stellar_value_ext(ext_value);
 
     StellarValue {
@@ -107,8 +109,7 @@ fn parse_stellar_value_ext(value: &JsonValue) -> StellarValueExt {
                 .unwrap_or_else(|| panic!("lcValueSignature.nodeID missing"));
             let pk = PublicKey::from_strkey(node_str)
                 .unwrap_or_else(|e| panic!("lcValueSignature.nodeID invalid: {}", e));
-            let node_id =
-                NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(*pk.as_bytes())));
+            let node_id = NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(*pk.as_bytes())));
 
             let sig_hex = sig_obj
                 .get("signature")
@@ -564,7 +565,9 @@ fn ledger_close_meta_tx_result_hash_vectors() {
                 .as_object()
                 .unwrap_or_else(|| panic!("ledgerHeader.header not object in {}", name))
                 .get("txSetResultHash")
-                .unwrap_or_else(|| panic!("ledgerHeader.header.txSetResultHash missing in {}", name)),
+                .unwrap_or_else(|| {
+                    panic!("ledgerHeader.header.txSetResultHash missing in {}", name)
+                }),
             "ledgerHeader.header.txSetResultHash",
         );
         let tx_result_set = parse_tx_result_set(
