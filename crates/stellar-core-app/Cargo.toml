@@ -59,5 +59,8 @@ base64.workspace = true
 url.workspace = true
 fs2.workspace = true
 
+# Synchronization primitives
+parking_lot.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

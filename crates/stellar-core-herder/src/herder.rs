@@ -348,6 +348,11 @@ impl Herder {
         *self.state.read()
     }
 
+    /// Set the Herder state.
+    pub fn set_state(&self, state: HerderState) {
+        *self.state.write() = state;
+    }
+
     /// Get the current tracking slot.
     pub fn tracking_slot(&self) -> u64 {
         *self.tracking_slot.read()
@@ -1115,6 +1120,27 @@ impl Herder {
     /// Get the local quorum set if configured.
     pub fn local_quorum_set(&self) -> Option<ScpQuorumSet> {
         self.scp_driver.get_local_quorum_set()
+    }
+
+    /// Purge SCP state for slots below the given slot.
+    ///
+    /// This is used during out-of-sync recovery to free memory and allow
+    /// fresh state to be fetched from peers.
+    pub fn purge_slots_below(&self, slot: SlotIndex) {
+        self.scp_driver.purge_slots_below(slot);
+        self.pending_envelopes.evict_expired();
+    }
+
+    /// Get the latest SCP messages for a slot.
+    ///
+    /// Returns envelopes that can be broadcast to peers during recovery.
+    pub fn get_latest_messages(&self, slot: SlotIndex) -> Option<Vec<ScpEnvelope>> {
+        let envelopes = self.scp_driver.get_local_envelopes(slot);
+        if envelopes.is_empty() {
+            None
+        } else {
+            Some(envelopes)
+        }
     }
 
     /// Remove applied transactions from the queue.

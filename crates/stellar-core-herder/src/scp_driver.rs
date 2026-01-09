@@ -662,6 +662,34 @@ impl ScpDriver {
         self.tx_set_cache.clear();
     }
 
+    /// Purge SCP state for slots below the given slot.
+    ///
+    /// This removes externalized slots and cached tx sets for old slots,
+    /// freeing memory during out-of-sync recovery.
+    pub fn purge_slots_below(&self, slot: SlotIndex) {
+        // Remove externalized slots below the threshold
+        let mut externalized = self.externalized.write();
+        let slots_to_remove: Vec<_> = externalized.keys().filter(|&s| *s < slot).cloned().collect();
+        for s in slots_to_remove {
+            externalized.remove(&s);
+        }
+        drop(externalized);
+
+        // Clean up pending tx set requests for old slots
+        self.cleanup_old_pending_slots(slot);
+    }
+
+    /// Get local SCP envelopes for a slot.
+    ///
+    /// Returns envelopes this node has emitted for the given slot.
+    /// Note: Currently returns empty since we don't store envelopes in ExternalizedSlot.
+    /// This can be enhanced to store and return actual envelopes if needed for recovery.
+    pub fn get_local_envelopes(&self, _slot: SlotIndex) -> Vec<ScpEnvelope> {
+        // ExternalizedSlot doesn't store the envelope, just the value.
+        // In a full implementation, we'd store envelopes separately.
+        Vec::new()
+    }
+
     /// Get our local quorum set.
     pub fn get_local_quorum_set(&self) -> Option<ScpQuorumSet> {
         self.local_quorum_set.read().clone()
