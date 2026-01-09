@@ -222,7 +222,7 @@ pub(crate) struct QueueEntry {
 }
 
 impl QueueEntry {
-    fn new(tx: QueuedTransaction, seed: u64) -> Self {
+    pub(crate) fn new(tx: QueuedTransaction, seed: u64) -> Self {
         let mut tie_breaker = tx.hash.0;
         if seed != 0 {
             let mut seed_bytes = seed.to_be_bytes();
@@ -270,7 +270,7 @@ impl Ord for QueueEntry {
 /// Result of visiting a transaction during priority queue iteration.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VisitTxResult {
+pub enum VisitTxResult {
     /// Transaction was skipped (e.g., sequence gap).
     Skipped,
     /// Transaction was rejected (e.g., validation failure).

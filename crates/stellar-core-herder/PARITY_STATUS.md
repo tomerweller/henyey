@@ -194,10 +194,12 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [x] **XDR serialization**: `to_xdr()`, `from_xdr()`
 - [x] **stellarValueToString()**: Human-readable StellarValue formatting
 
-#### TxQueueLimiter (`TxQueueLimiter.h/cpp`)
-- [ ] **TxQueueLimiter class**: Resource-aware queue limiting
-- [ ] **Multi-resource tracking**: Operations, bytes, Soroban resources
-- [ ] **Eviction candidate selection**: Finding lowest-fee eviction targets
+#### TxQueueLimiter (`TxQueueLimiter.h/cpp`) - `tx_queue_limiter.rs`
+- [x] **TxQueueLimiter class**: Resource-aware queue limiting
+- [x] **Multi-resource tracking**: Operations, bytes, Soroban resources
+- [x] **Eviction candidate selection**: Finding lowest-fee eviction targets
+- [x] **Evicted fee tracking**: Per-lane tracking of max evicted inclusion fee
+- [x] **Flood priority queue**: Separate queue for flooding with highest-fee priority
 
 #### FilteredEntries
 - [ ] **Filtered entry tracking**: For footprint-based transaction filtering

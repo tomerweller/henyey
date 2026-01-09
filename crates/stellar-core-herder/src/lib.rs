@@ -88,6 +88,7 @@
 //! - [`state`]: Herder state machine
 //! - [`surge_pricing`]: Lane configuration and priority queues
 //! - [`tx_queue`]: Transaction queue and set building
+//! - [`tx_queue_limiter`]: Resource-aware queue limiting with eviction
 
 mod error;
 mod herder;
@@ -100,6 +101,7 @@ mod scp_driver;
 mod state;
 mod surge_pricing;
 mod tx_queue;
+mod tx_queue_limiter;
 
 // Re-export main types
 pub use error::HerderError;
@@ -126,6 +128,10 @@ pub use herder_utils::{get_stellar_values, get_tx_set_hashes_from_envelope, to_s
 
 // LedgerCloseData
 pub use ledger_close_data::{LedgerCloseData, LedgerCloseDataError, stellar_value_to_string};
+
+// TxQueueLimiter and surge pricing
+pub use surge_pricing::VisitTxResult;
+pub use tx_queue_limiter::TxQueueLimiter;
 
 /// Result type for Herder operations.
 pub type Result<T> = std::result::Result<T, HerderError>;
