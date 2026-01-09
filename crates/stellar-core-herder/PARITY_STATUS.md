@@ -23,6 +23,18 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [x] `heard_from_quorum()` / `is_v_blocking()` checks
 - [x] `handle_nomination_timeout()` / `handle_ballot_timeout()` - Timeout handling
 
+#### SCP State Persistence (`persistence.rs` -> `HerderPersistence.h/cpp`)
+- [x] `PersistedSlotState` - Serializable SCP state for a slot
+- [x] `ScpStatePersistence` trait - Storage backend abstraction
+- [x] `InMemoryScpPersistence` - In-memory storage for testing
+- [x] `ScpPersistenceManager` - Persistence coordinator
+- [x] `persist_scp_state()` - Save SCP state with envelopes, tx sets, quorum sets
+- [x] `restore_scp_state()` - Load persisted state for recovery
+- [x] `cleanup()` - Remove old persisted state
+- [x] `get_tx_set_hashes()` - Extract tx set hashes from envelopes
+- [x] `get_quorum_set_hash()` - Extract quorum set hash from statements
+- [x] JSON/base64 serialization for state encoding
+
 #### SCP Driver (`scp_driver.rs` -> `HerderSCPDriver.h/cpp`)
 - [x] `SCPDriver` trait implementation (`HerderScpCallback`)
 - [x] `validate_value()` - StellarValue validation (close time, tx set hash, upgrades)
@@ -92,7 +104,6 @@ This section documents the parity between this Rust crate and the upstream C++ s
 ### Not Yet Implemented (Gaps)
 
 #### Core Herder
-- [ ] **Persistence**: `persistSCPState()` / `restoreSCPState()` - SCP state persistence to database
 - [ ] **Persistence**: `persistUpgrades()` / `restoreUpgrades()` - Upgrade parameters persistence
 - [ ] **Out-of-sync recovery**: `outOfSyncRecovery()`, `herderOutOfSync()`, `lostSync()` - Timeout-based recovery
 - [ ] **Dead node detection**: `startCheckForDeadNodesInterval()`, missing node tracking
@@ -207,7 +218,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 4. **Database Persistence**
    - **C++**: Direct SQL database access for SCP state
-   - **Rust**: Not implemented; would integrate with `stellar-core-db` when available
+   - **Rust**: `ScpStatePersistence` trait with `InMemoryScpPersistence` for testing; SQLite backend via `stellar-core-db` pending
 
 5. **Transaction Queue Architecture**
    - **C++**: Separate `ClassicTransactionQueue` and `SorobanTransactionQueue` classes

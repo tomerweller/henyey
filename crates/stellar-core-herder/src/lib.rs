@@ -80,6 +80,7 @@
 //! - [`error`]: Error types for Herder operations
 //! - [`herder`]: Main Herder implementation
 //! - [`pending`]: Pending SCP envelope management
+//! - [`persistence`]: SCP state persistence for crash recovery
 //! - [`quorum_tracker`]: Quorum participation tracking
 //! - [`scp_driver`]: SCP integration callbacks
 //! - [`state`]: Herder state machine
@@ -89,6 +90,7 @@
 mod error;
 mod herder;
 mod pending;
+mod persistence;
 mod quorum_tracker;
 mod scp_driver;
 mod state;
@@ -107,6 +109,12 @@ pub use scp_driver::{
 pub use state::HerderState;
 pub use tx_queue::{
     QueuedTransaction, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
+};
+
+// Persistence
+pub use persistence::{
+    get_quorum_set_hash, get_tx_set_hashes, InMemoryScpPersistence, PersistedSlotState,
+    RestoredScpState, ScpPersistenceManager, ScpStatePersistence,
 };
 
 /// Result type for Herder operations.

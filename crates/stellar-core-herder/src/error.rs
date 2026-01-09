@@ -53,4 +53,11 @@ pub enum HerderError {
     /// other categories.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// An invalid SCP envelope was received or processed.
+    ///
+    /// This can occur during serialization, deserialization, or validation
+    /// of SCP envelopes and related data structures.
+    #[error("invalid envelope: {0}")]
+    InvalidEnvelope(String),
 }
