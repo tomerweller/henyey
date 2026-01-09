@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, ReadXdr, Limits};
@@ -94,9 +94,6 @@ pub struct DiskBucket {
     index: Arc<BTreeMap<u64, IndexEntry>>,
     /// Total number of entries in this bucket.
     entry_count: usize,
-    /// Reserved for future file handle caching.
-    #[allow(dead_code)]
-    file_cache: Arc<RwLock<Option<File>>>,
 }
 
 impl DiskBucket {
@@ -124,7 +121,6 @@ impl DiskBucket {
             file_path: path.to_path_buf(),
             index: Arc::new(index),
             entry_count,
-            file_cache: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -150,7 +146,6 @@ impl DiskBucket {
             file_path: save_path.to_path_buf(),
             index: Arc::new(index),
             entry_count,
-            file_cache: Arc::new(RwLock::new(None)),
         })
     }
 
