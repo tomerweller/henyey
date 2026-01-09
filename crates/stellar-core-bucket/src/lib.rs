@@ -96,6 +96,7 @@ mod disk_bucket;
 mod entry;
 mod error;
 mod eviction;
+mod future_bucket;
 mod manager;
 mod merge;
 
@@ -145,6 +146,12 @@ pub use manager::{BucketManager, BucketManagerStats};
 // ============================================================================
 
 pub use merge::{merge_buckets, merge_buckets_with_options, merge_multiple, MergeIterator};
+
+// ============================================================================
+// Async bucket merging
+// ============================================================================
+
+pub use future_bucket::{FutureBucket, FutureBucketSnapshot, FutureBucketState, MergeKey};
 
 /// Result type for bucket operations.
 ///

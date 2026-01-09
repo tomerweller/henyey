@@ -47,14 +47,17 @@ This section documents the implementation status relative to the C++ stellar-cor
 - **is_soroban_entry** / **is_temporary_entry** / **is_persistent_entry** - Entry classification
 - **get_ttl_key** / **is_ttl_expired** - TTL entry helpers
 
-### Not Yet Implemented (Gaps)
+#### Async Merging (Implemented)
+- **FutureBucket** (`future_bucket.rs`) - Async bucket merging support:
+  - State machine for merge lifecycle (Clear, HashOutput, HashInputs, LiveOutput, LiveInputs)
+  - Background merge execution via tokio async tasks
+  - Serialization/deserialization via `FutureBucketSnapshot`
+  - `MergeKey` for merge operation deduplication
+  - `resolve()` async and `resolve_blocking()` sync resolution
+  - `make_live()` for restarting deserialized merges
+  - `to_snapshot()` / `from_snapshot()` for HistoryArchiveState persistence
 
-#### Async Merging
-- **FutureBucket** - Async bucket merging with `std::shared_future`. The Rust implementation uses synchronous merging. FutureBucket provides:
-  - Background merge threads that run in parallel with ledger closing
-  - State machine for merge lifecycle (FB_CLEAR, FB_HASH_OUTPUT, FB_HASH_INPUTS, FB_LIVE_OUTPUT, FB_LIVE_INPUTS)
-  - Serialization/deserialization of in-progress merges to HistoryArchiveState
-  - Merge result caching via `BucketMergeMap`
+### Not Yet Implemented (Gaps)
 
 #### Hot Archive Bucket List
 - **HotArchiveBucket** - Separate bucket type for archived persistent Soroban entries
@@ -143,7 +146,7 @@ The Rust implementation correctly handles:
 
 #### Future Work Priority
 
-1. **High Priority**: FutureBucket for async merging (performance critical)
+1. ~~**High Priority**: FutureBucket for async merging (performance critical)~~ ✓ Implemented
 2. **High Priority**: HotArchiveBucketList for Soroban state archival completeness
 3. **Medium Priority**: BucketSnapshotManager for concurrent access patterns
 4. **Medium Priority**: Advanced indexing (Bloom filters, caches) for query performance
