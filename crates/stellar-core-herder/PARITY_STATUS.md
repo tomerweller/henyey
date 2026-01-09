@@ -160,13 +160,13 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Discarded envelope tracking**: `mDiscardedEnvelopes`, `discardSCPEnvelope()`
 - [ ] **Quorum tracker integration**: `rebuildQuorumTrackerState()`, `forceRebuildQuorum()`
 
-#### Upgrades (`Upgrades.h/cpp`)
-- [ ] **Upgrades class**: Full upgrade scheduling and validation
-- [ ] **UpgradeParameters**: Version, base fee, max tx size, base reserve, flags
-- [ ] **ConfigUpgradeSetFrame**: Soroban config upgrade handling
-- [ ] **Upgrade creation**: `createUpgradesFor()` based on scheduled time
-- [ ] **Upgrade application**: `applyTo()` for ledger header updates
-- [ ] **Upgrade validation**: `isValid()`, `isValidForApply()`, `isValidForNomination()`
+#### Upgrades (`Upgrades.h/cpp`) - `upgrades.rs`
+- [x] **Upgrades class**: Upgrade scheduling and validation - see `upgrades.rs`
+- [x] **UpgradeParameters**: Version, base fee, max tx size, base reserve, flags, Soroban config
+- [ ] **ConfigUpgradeSetFrame**: Soroban config upgrade handling (requires ledger state access)
+- [x] **Upgrade creation**: `create_upgrades_for()` based on scheduled time
+- [ ] **Upgrade application**: `applyTo()` for ledger header updates (requires ledger txn)
+- [x] **Upgrade validation**: `is_valid_for_apply()` with XDR validation
 - [ ] **Upgrade persistence**: Database storage and restoration
 
 #### Quorum Intersection Checker (`QuorumIntersectionChecker.h/cpp`)

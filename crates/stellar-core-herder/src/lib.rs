@@ -105,6 +105,7 @@ mod state;
 mod surge_pricing;
 mod tx_queue;
 mod tx_queue_limiter;
+pub mod upgrades;
 
 // Re-export main types
 pub use error::HerderError;
