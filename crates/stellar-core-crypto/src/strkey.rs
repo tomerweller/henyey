@@ -147,7 +147,12 @@ pub fn decode_muxed_account(s: &str) -> Result<([u8; 32], u64), CryptoError> {
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&data[..32]);
-    let id = u64::from_be_bytes(data[32..40].try_into().unwrap());
+    // Safety: We've already verified data.len() == 40, so data[32..40] is exactly 8 bytes
+    let id = u64::from_be_bytes(
+        data[32..40]
+            .try_into()
+            .expect("slice is exactly 8 bytes after length check"),
+    );
     Ok((key, id))
 }
 

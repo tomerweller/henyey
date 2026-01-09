@@ -304,7 +304,14 @@ impl fmt::Debug for Signature {
 
 impl From<Signature> for stellar_xdr::curr::Signature {
     fn from(sig: Signature) -> Self {
-        stellar_xdr::curr::Signature(sig.0.to_vec().try_into().unwrap())
+        // Safety: Signature is always exactly 64 bytes, which is within
+        // the XDR Signature's BytesM::<64> limit.
+        stellar_xdr::curr::Signature(
+            sig.0
+                .to_vec()
+                .try_into()
+                .expect("64-byte signature always fits in BytesM::<64>"),
+        )
     }
 }
 

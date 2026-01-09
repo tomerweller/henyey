@@ -71,8 +71,7 @@ impl SignedMessage {
     pub fn new(secret_key: &SecretKey, message: Vec<u8>) -> Self {
         let signature = secret_key.sign(&message);
         let public_key = secret_key.public_key();
-        let key_bytes = public_key.as_bytes();
-        let hint = [key_bytes[28], key_bytes[29], key_bytes[30], key_bytes[31]];
+        let hint = signature_hint(&public_key);
 
         Self {
             message,
@@ -93,9 +92,7 @@ impl SignedMessage {
     /// - The signature verification fails
     pub fn verify(&self, public_key: &PublicKey) -> Result<(), CryptoError> {
         // Check hint matches before doing expensive signature verification
-        let key_bytes = public_key.as_bytes();
-        let expected_hint = [key_bytes[28], key_bytes[29], key_bytes[30], key_bytes[31]];
-        if self.hint != expected_hint {
+        if self.hint != signature_hint(public_key) {
             return Err(CryptoError::InvalidSignature);
         }
 
