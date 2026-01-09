@@ -32,7 +32,7 @@ The C++ implementation is spread across multiple files:
 | Account Management | Implemented | Basic operations only |
 | PostgreSQL Support | Not Implemented | Intentional - SQLite only |
 | Query Metrics | Not Implemented | Intentional |
-| Data Cleanup | Not Implemented | Gap |
+| Data Cleanup | Implemented | Full parity |
 | History Streaming | Not Implemented | Gap |
 | Ledger Entry SQL | Not Implemented | Architectural difference |
 
@@ -186,9 +186,9 @@ The C++ implementation is spread across multiple files:
 
 | C++ Feature | Status | Notes |
 |-------------|--------|-------|
-| `LedgerHeaderUtils::deleteOldEntries()` | **Gap** | Prune old ledger headers |
-| `HerderPersistence::deleteOldEntries()` | **Gap** | Prune old SCP history |
-| `DatabaseUtils::deleteOldEntriesHelper()` | **Gap** | Generic pruning helper |
+| `LedgerHeaderUtils::deleteOldEntries()` | Implemented | `delete_old_ledger_headers()` in `ledger.rs` |
+| `HerderPersistence::deleteOldEntries()` | Implemented | `delete_old_scp_entries()` in `scp.rs` |
+| `DatabaseUtils::deleteOldEntriesHelper()` | N/A | Rust uses direct SQL DELETE with LIMIT |
 
 ### History Streaming
 
@@ -274,21 +274,12 @@ The Rust crate starts fresh with its own version numbering since it:
 
 ## Recommendations for Future Work
 
-### Priority 1: Data Cleanup Operations
-
-Implement `deleteOldEntries` equivalents for:
-- Ledger headers
-- SCP history
-- Transaction history
-
-These are important for long-running nodes to manage database size.
-
-### Priority 2: History Streaming
+### Priority 1: History Streaming
 
 Implement `copyToStream` equivalents for history archive publishing.
 Currently history publishing works but could be optimized.
 
-### Priority 3: Additional SQLite Pragmas
+### Priority 2: Additional SQLite Pragmas
 
 Consider adding:
 - `mmap_size` for memory-mapped I/O performance

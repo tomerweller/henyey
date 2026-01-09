@@ -51,6 +51,7 @@ pub mod app;
 pub mod catchup_cmd;
 pub mod config;
 pub mod logging;
+pub mod maintainer;
 pub mod run_cmd;
 pub mod survey;
 
@@ -58,4 +59,5 @@ pub use app::{App, AppState, CatchupResult, CatchupTarget, SurveyReport};
 pub use catchup_cmd::{CatchupMode, CatchupOptions, run_catchup};
 pub use config::AppConfig;
 pub use logging::{init_with_handle, LogConfig, LogFormat, LogLevelHandle, LOG_PARTITIONS};
+pub use maintainer::{MaintenanceConfig, Maintainer, DEFAULT_MAINTENANCE_COUNT, DEFAULT_MAINTENANCE_PERIOD};
 pub use run_cmd::{run_node, RunMode, RunOptions};

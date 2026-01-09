@@ -298,6 +298,32 @@ impl Database {
         })
     }
 
+    // =========================================================================
+    // Maintenance / Cleanup Operations
+    // =========================================================================
+
+    /// Deletes old ledger headers up to and including `max_ledger`.
+    ///
+    /// Removes at most `count` entries. Used by the Maintainer for garbage
+    /// collection of old ledger history.
+    pub fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32> {
+        self.with_connection(|conn| {
+            use queries::LedgerQueries;
+            conn.delete_old_ledger_headers(max_ledger, count)
+        })
+    }
+
+    /// Deletes old SCP history entries up to and including `max_ledger`.
+    ///
+    /// Removes at most `count` entries from both scphistory and scpquorums
+    /// tables. Used by the Maintainer for garbage collection.
+    pub fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32> {
+        self.with_connection(|conn| {
+            use queries::ScpQueries;
+            conn.delete_old_scp_entries(max_ledger, count)
+        })
+    }
+
     /// Loads SCP envelopes for a ledger.
     ///
     /// Returns the consensus messages that were recorded for the specified ledger.

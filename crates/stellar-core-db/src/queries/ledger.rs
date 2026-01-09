@@ -37,6 +37,14 @@ pub trait LedgerQueries {
     /// The hash is computed from the XDR-encoded header data.
     /// Returns `None` if the ledger is not found.
     fn get_ledger_hash(&self, seq: u32) -> Result<Option<Hash256>, DbError>;
+
+    /// Deletes old ledger headers up to and including `max_ledger`.
+    ///
+    /// Removes at most `count` entries to limit the amount of work per call.
+    /// Returns the number of entries actually deleted.
+    ///
+    /// This is used by the Maintainer to garbage collect old ledger history.
+    fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 
 impl LedgerQueries for Connection {
@@ -111,6 +119,24 @@ impl LedgerQueries for Connection {
             }
             None => Ok(None),
         }
+    }
+
+    fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+        // Delete up to `count` entries with ledgerseq <= max_ledger
+        // Use a subquery to find the entries to delete (SQLite doesn't support LIMIT in DELETE)
+        let deleted = self.execute(
+            r#"
+            DELETE FROM ledgerheaders
+            WHERE ledgerseq IN (
+                SELECT ledgerseq FROM ledgerheaders
+                WHERE ledgerseq <= ?1
+                ORDER BY ledgerseq ASC
+                LIMIT ?2
+            )
+            "#,
+            params![max_ledger, count],
+        )?;
+        Ok(deleted as u32)
     }
 }
 
@@ -209,5 +235,35 @@ mod tests {
 
         // Non-existent ledger
         assert!(conn.get_ledger_hash(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_old_ledger_headers() {
+        let conn = setup_db();
+
+        // Add ledgers 1-10
+        for seq in 1..=10 {
+            let header = create_test_header(seq);
+            let data = header.to_xdr(Limits::none()).unwrap();
+            conn.store_ledger_header(&header, &data).unwrap();
+        }
+
+        // Delete ledgers up to 5, but only 3 at a time
+        let deleted = conn.delete_old_ledger_headers(5, 3).unwrap();
+        assert_eq!(deleted, 3);
+
+        // Delete more
+        let deleted = conn.delete_old_ledger_headers(5, 10).unwrap();
+        assert_eq!(deleted, 2); // Only 2 remaining under threshold
+
+        // Verify ledgers 6-10 remain
+        for seq in 6..=10 {
+            assert!(conn.load_ledger_header(seq).unwrap().is_some());
+        }
+
+        // Verify ledgers 1-5 are gone
+        for seq in 1..=5 {
+            assert!(conn.load_ledger_header(seq).unwrap().is_none());
+        }
     }
 }

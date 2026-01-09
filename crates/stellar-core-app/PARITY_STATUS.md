@@ -13,7 +13,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `CommandHandler.h` / `CommandHandler.cpp` | `run_cmd.rs` (StatusServer) | Partial |
 | `CommandLine.cpp` | `run_cmd.rs`, `catchup_cmd.rs` | Partial |
 | `PersistentState.h` / `PersistentState.cpp` | `stellar-core-db` crate | Partial |
-| `Maintainer.h` / `Maintainer.cpp` | Not implemented | Missing |
+| `Maintainer.h` / `Maintainer.cpp` | `maintainer.rs` | Implemented |
 | `ApplicationUtils.h` / `ApplicationUtils.cpp` | Distributed across modules | Partial |
 | `QueryServer.h` / `QueryServer.cpp` | Not implemented | Missing |
 
@@ -184,7 +184,7 @@ This crate corresponds to the following C++ stellar-core components:
 | TmpDirManager | Not Implemented | |
 | ProcessManager | Not Implemented | External process spawning |
 | WorkScheduler | Partial | Uses `stellar-core-work` with Tokio |
-| Maintainer | Not Implemented | Automatic table cleanup |
+| Maintainer | Implemented | Automatic table cleanup via `maintainer.rs` |
 | InvariantManager | Partial | Via `stellar-core-ledger` |
 | BanManager | Implemented | Via `stellar-core-overlay` |
 | StatusManager | Partial | Via HTTP endpoints |

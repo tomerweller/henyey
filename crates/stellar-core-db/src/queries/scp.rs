@@ -52,6 +52,15 @@ pub trait ScpQueries {
     ///
     /// Returns `None` if no quorum set with the given hash is stored.
     fn load_scp_quorum_set(&self, hash: &Hash256) -> Result<Option<ScpQuorumSet>, DbError>;
+
+    /// Deletes old SCP history entries up to and including `max_ledger`.
+    ///
+    /// Removes at most `count` entries from both the scphistory and scpquorums
+    /// tables to limit the amount of work per call.
+    /// Returns the total number of entries deleted (history + quorums).
+    ///
+    /// This is used by the Maintainer to garbage collect old SCP state.
+    fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 
 impl ScpQueries for Connection {
@@ -141,6 +150,40 @@ impl ScpQueries for Connection {
             Some(data) => Ok(Some(ScpQuorumSet::from_xdr(data.as_slice(), Limits::none())?)),
             None => Ok(None),
         }
+    }
+
+    fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+        // Delete old SCP history entries
+        // Note: scphistory may have multiple rows per ledger (one per node)
+        let history_deleted = self.execute(
+            r#"
+            DELETE FROM scphistory
+            WHERE rowid IN (
+                SELECT rowid FROM scphistory
+                WHERE ledgerseq <= ?1
+                ORDER BY ledgerseq ASC
+                LIMIT ?2
+            )
+            "#,
+            params![max_ledger, count],
+        )?;
+
+        // Delete old quorum sets that are no longer needed
+        // Only delete quorums whose lastledgerseq is below the threshold
+        let quorums_deleted = self.execute(
+            r#"
+            DELETE FROM scpquorums
+            WHERE qsethash IN (
+                SELECT qsethash FROM scpquorums
+                WHERE lastledgerseq <= ?1
+                ORDER BY lastledgerseq ASC
+                LIMIT ?2
+            )
+            "#,
+            params![max_ledger, count],
+        )?;
+
+        Ok((history_deleted + quorums_deleted) as u32)
     }
 }
 
@@ -433,5 +476,72 @@ mod tests {
         // Load all
         let all = conn.load_all_tx_set_data().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_old_scp_entries() {
+        let conn = setup_db();
+
+        // Store some SCP history and quorum sets
+        for seq in 1..=10u32 {
+            // Create a simple test envelope
+            let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([seq as u8; 32])));
+            let envelope = ScpEnvelope {
+                statement: stellar_xdr::curr::ScpStatement {
+                    node_id: node_id.clone(),
+                    slot_index: seq as u64,
+                    pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
+                        stellar_xdr::curr::ScpStatementPrepare {
+                            quorum_set_hash: Hash([0u8; 32]),
+                            ballot: stellar_xdr::curr::ScpBallot {
+                                counter: 1,
+                                value: vec![].try_into().unwrap(),
+                            },
+                            prepared: None,
+                            prepared_prime: None,
+                            n_c: 0,
+                            n_h: 0,
+                        },
+                    ),
+                },
+                signature: stellar_xdr::curr::Signature::default(),
+            };
+            conn.store_scp_history(seq, &[envelope]).unwrap();
+
+            // Also store a quorum set
+            let hash = Hash256::from([seq as u8; 32]);
+            let qset = ScpQuorumSet {
+                threshold: 1,
+                validators: vec![].try_into().unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            };
+            conn.store_scp_quorum_set(&hash, seq, &qset).unwrap();
+        }
+
+        // Verify we have 10 entries
+        for seq in 1..=10 {
+            let history = conn.load_scp_history(seq).unwrap();
+            assert_eq!(history.len(), 1);
+        }
+
+        // Delete entries up to ledger 5, with count limit of 3
+        let deleted = conn.delete_old_scp_entries(5, 3).unwrap();
+        assert!(deleted > 0);
+
+        // Delete remaining old entries
+        let deleted = conn.delete_old_scp_entries(5, 100).unwrap();
+        // May have deleted more from both tables
+
+        // Verify old entries are gone (1-5)
+        for seq in 1..=5 {
+            let history = conn.load_scp_history(seq).unwrap();
+            assert!(history.is_empty(), "ledger {} should have no history", seq);
+        }
+
+        // Verify recent entries remain (6-10)
+        for seq in 6..=10 {
+            let history = conn.load_scp_history(seq).unwrap();
+            assert_eq!(history.len(), 1, "ledger {} should have 1 history entry", seq);
+        }
     }
 }
