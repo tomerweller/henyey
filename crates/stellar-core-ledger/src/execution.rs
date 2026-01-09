@@ -2303,6 +2303,16 @@ impl TransactionExecutor {
                             .map_err(|e| LedgerError::Serialization(e.to_string()))?;
                         let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
                         self.load_liquidity_pool(snapshot, &pool_id)?;
+
+                        // Load trustlines for underlying pool assets - needed for validation
+                        // that source has trustlines for both assets
+                        let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
+                        if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_a) {
+                            self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                        }
+                        if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_b) {
+                            self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                        }
                     }
                     _ => {}
                 }
