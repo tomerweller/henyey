@@ -617,6 +617,21 @@ mod tests {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])))
     }
 
+    fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }
+    }
+
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
     }
@@ -626,6 +641,9 @@ mod tests {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id();
+
+        // Add the source account to state
+        state.create_account(create_test_account(source.clone(), 100_000_000));
 
         // Test that Inflation returns NotTime (deprecated since Protocol 12)
         let op = Operation {

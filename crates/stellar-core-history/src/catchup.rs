@@ -193,10 +193,10 @@ pub struct CheckpointData {
 /// use stellar_core_bucket::BucketManager;
 /// use stellar_core_db::Database;
 ///
-/// # async fn example() -> Result<(), stellar_core_history::HistoryError> {
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")?;
-/// let bucket_manager = BucketManager::new("/tmp/buckets".into());
-/// let db = Database::open_or_create("/tmp/stellar.db")?;
+/// let bucket_manager = BucketManager::new("/tmp/buckets".into())?;
+/// let db = Database::open("/tmp/stellar.db")?;
 ///
 /// let mut manager = CatchupManager::new(vec![archive], bucket_manager, db);
 /// let output = manager.catchup_to_ledger(1000000).await?;

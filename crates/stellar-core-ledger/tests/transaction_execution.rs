@@ -827,6 +827,7 @@ fn test_fee_bump_result_encoding() {
     let exec = stellar_core_ledger::execution::TransactionExecutionResult {
         success: true,
         fee_charged: 200,
+        fee_refund: 0,
         operation_results: vec![OperationResult::OpInner(OperationResultTr::CreateAccount(
             CreateAccountResult::Success,
         ))],
