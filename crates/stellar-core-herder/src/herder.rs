@@ -567,16 +567,26 @@ impl Herder {
             .write()
             .record_envelope(slot, envelope.statement.node_id.clone());
 
+        // Early check: reject envelopes for already-closed slots (from catchup)
+        let lcl = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|m| m.current_ledger_seq() as u64);
+
         // Special handling for EXTERNALIZE messages - they can fast-forward our state
         // even if from future slots, as they represent network consensus
         if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) = &envelope.statement.pledges {
-            // Extract tx set hash from the externalized value and request it immediately
-            // This ensures we request tx sets as soon as we learn about them, not after externalization
-            if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
-                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                // Request this tx set immediately - don't wait for ledger close
-                if self.scp_driver.request_tx_set(tx_set_hash, slot) {
-                    info!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
+            // Only request tx sets for slots we haven't already closed via catchup
+            if lcl.map_or(true, |l| slot > l) {
+                // Extract tx set hash from the externalized value and request it immediately
+                // This ensures we request tx sets as soon as we learn about them, not after externalization
+                if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
+                    let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                    // Request this tx set immediately - don't wait for ledger close
+                    if self.scp_driver.request_tx_set(tx_set_hash, slot) {
+                        info!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
+                    }
                 }
             }
 
@@ -658,6 +668,20 @@ impl Herder {
                     warn!("Pending envelope buffer full");
                     return EnvelopeState::Invalid;
                 }
+            }
+        }
+
+        // Check if this slot has already been closed via catchup
+        // If we've already closed this ledger, don't process stale SCP envelopes
+        // This prevents unnecessary tx set requests for old slots after catchup
+        if let Some(l) = lcl {
+            if slot <= l {
+                debug!(
+                    slot,
+                    lcl = l,
+                    "Rejecting envelope for already-closed slot"
+                );
+                return EnvelopeState::TooOld;
             }
         }
 
