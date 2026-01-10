@@ -45,7 +45,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `catchup` | Implemented | `run_catchup()` in `catchup_cmd.rs` |
 | `version` | Implemented | Via `--version` flag |
 | `help` | Implemented | Via `--help` flag |
-| `verify-checkpoints` | Not Implemented | |
+| `verify-checkpoints` | Implemented | Via `offline verify-checkpoints` in rs-stellar-core |
 | `convert-id` | Implemented | `offline convert-key` in rs-stellar-core |
 | `diag-bucket-stats` | Not Implemented | |
 | `dump-ledger` | Not Implemented | |

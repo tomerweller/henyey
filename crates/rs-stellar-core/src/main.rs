@@ -422,6 +422,26 @@ enum OfflineCommands {
     /// this offline command performs full bucket verification which may take
     /// significant time on large databases.
     SelfCheck,
+
+    /// Write verified checkpoint ledger hashes to a file
+    ///
+    /// Downloads checkpoint headers from history archives, verifies the header
+    /// chain, and writes verified checkpoint hashes to a JSON file. This file
+    /// can be used with `--trusted-checkpoint-hashes` during catchup to verify
+    /// against known-good hashes.
+    VerifyCheckpoints {
+        /// Output file path for verified checkpoint hashes
+        #[arg(long, short, required = true)]
+        output: PathBuf,
+
+        /// Start ledger sequence (defaults to genesis)
+        #[arg(long)]
+        from: Option<u32>,
+
+        /// End ledger sequence (defaults to current)
+        #[arg(long)]
+        to: Option<u32>,
+    },
 }
 
 #[tokio::main]
@@ -3307,6 +3327,9 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
         OfflineCommands::SelfCheck => {
             cmd_self_check(config).await
         }
+        OfflineCommands::VerifyCheckpoints { output, from, to } => {
+            cmd_verify_checkpoints(config, output, from, to).await
+        }
     }
 }
 
@@ -4082,6 +4105,154 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
         println!("Self-check failed");
         std::process::exit(1);
     }
+}
+
+/// Write verified checkpoint ledger hashes to a file.
+///
+/// Downloads checkpoint headers from history archives, verifies the header
+/// chain, and writes verified checkpoint hashes to a JSON file.
+///
+/// Equivalent to C++ stellar-core verify-checkpoints.
+async fn cmd_verify_checkpoints(
+    config: AppConfig,
+    output: PathBuf,
+    from: Option<u32>,
+    to: Option<u32>,
+) -> anyhow::Result<()> {
+    use stellar_core_history::{HistoryArchive, verify, checkpoint};
+    use stellar_core_ledger::compute_header_hash;
+    use std::io::Write;
+
+    println!("Verifying checkpoint hashes...");
+    println!();
+
+    // Create archive clients from config
+    let archives: Vec<HistoryArchive> = config.history.archives
+        .iter()
+        .filter(|a| a.get_enabled)
+        .filter_map(|a| {
+            match HistoryArchive::new(&a.url) {
+                Ok(archive) => Some(archive),
+                Err(e) => {
+                    println!("Warning: Failed to create archive {}: {}", a.url, e);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if archives.is_empty() {
+        anyhow::bail!("No history archives available");
+    }
+
+    println!("Using {} archive(s)", archives.len());
+
+    let archive = &archives[0];
+    let root_has = archive.get_root_has().await?;
+    let current_ledger = root_has.current_ledger;
+
+    let start = from.unwrap_or(63); // First checkpoint
+    let end = to.unwrap_or(current_ledger);
+
+    println!("Verifying checkpoint range: {} to {}", start, end);
+    println!();
+
+    // Calculate checkpoint-aligned start and end
+    let start_checkpoint = checkpoint::checkpoint_containing(start);
+    let end_checkpoint = checkpoint::checkpoint_containing(end);
+
+    // Collect verified checkpoint hashes
+    let mut verified_checkpoints: Vec<serde_json::Value> = Vec::new();
+    let mut prev_header: Option<stellar_xdr::curr::LedgerHeader> = None;
+    let mut verified_count = 0;
+    let mut error_count = 0;
+
+    let mut current_checkpoint = start_checkpoint;
+    while current_checkpoint <= end_checkpoint {
+        print!("  Checkpoint {}: ", current_checkpoint);
+        std::io::stdout().flush()?;
+
+        // Download headers for this checkpoint
+        match archive.get_ledger_headers(current_checkpoint).await {
+            Ok(history_entries) => {
+                if history_entries.is_empty() {
+                    println!("FAIL (no headers)");
+                    error_count += 1;
+                    current_checkpoint = checkpoint::next_checkpoint(current_checkpoint);
+                    continue;
+                }
+
+                // Extract headers
+                let headers: Vec<stellar_xdr::curr::LedgerHeader> = history_entries
+                    .iter()
+                    .map(|entry| entry.header.clone())
+                    .collect();
+
+                // Verify header chain within this checkpoint
+                if let Err(e) = verify::verify_header_chain(&headers) {
+                    println!("FAIL (chain broken: {})", e);
+                    error_count += 1;
+                    current_checkpoint = checkpoint::next_checkpoint(current_checkpoint);
+                    continue;
+                }
+
+                // Verify linkage to previous checkpoint
+                if let Some(ref prev) = prev_header {
+                    let first_header = &headers[0];
+                    let prev_hash = compute_header_hash(prev)?;
+                    if first_header.previous_ledger_hash != prev_hash.into() {
+                        println!("FAIL (cross-checkpoint link broken)");
+                        error_count += 1;
+                        current_checkpoint = checkpoint::next_checkpoint(current_checkpoint);
+                        continue;
+                    }
+                }
+
+                // Get the checkpoint ledger header (last header in the set)
+                let checkpoint_header = headers.last().unwrap();
+                let checkpoint_hash = compute_header_hash(checkpoint_header)?;
+
+                // Store for JSON output
+                verified_checkpoints.push(serde_json::json!({
+                    "ledger": current_checkpoint,
+                    "hash": hex::encode(checkpoint_hash.as_bytes())
+                }));
+
+                println!("OK (hash: {})", hex::encode(&checkpoint_hash.as_bytes()[..8]));
+                verified_count += 1;
+
+                // Update previous header for next iteration
+                prev_header = Some(checkpoint_header.clone());
+            }
+            Err(e) => {
+                println!("FAIL (download: {})", e);
+                error_count += 1;
+            }
+        }
+
+        current_checkpoint = checkpoint::next_checkpoint(current_checkpoint);
+    }
+
+    println!();
+    println!("Verified {} checkpoints, {} errors", verified_count, error_count);
+
+    // Write output file
+    let output_json = serde_json::json!({
+        "network_passphrase": config.network.passphrase,
+        "checkpoints": verified_checkpoints
+    });
+
+    let mut file = std::fs::File::create(&output)?;
+    serde_json::to_writer_pretty(&file, &output_json)?;
+    file.flush()?;
+
+    println!("Wrote verified checkpoint hashes to: {}", output.display());
+
+    if error_count > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 /// Send an HTTP command to a running stellar-core node.

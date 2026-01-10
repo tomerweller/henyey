@@ -27,6 +27,7 @@ This section documents the feature parity between this Rust implementation and t
 | `diag-bucket-stats` / `bucket-info` | Partial | Basic bucket info (not full per-account aggregation) |
 | `dump-ledger` | Implemented | Dump ledger entries to JSON with type/limit filtering |
 | `self-check` | Implemented | Header chain, bucket hash verification, crypto benchmarking |
+| `verify-checkpoints` | Implemented | Write verified checkpoint ledger hashes to file |
 
 #### Offline Tools (Unique to Rust)
 
@@ -93,7 +94,6 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | Command | C++ Description | Priority |
 |---------|-----------------|----------|
 | `replay-debug-meta` | Apply ledgers from local debug metadata files | Low |
-| `verify-checkpoints` | Write verified checkpoint ledger hashes to file | Medium |
 | `dump-xdr` | Dump XDR file (with streaming support) | Low |
 | `dump-wasm` | Dump WASM blobs from ledger | Low |
 | `force-scp` | Force SCP flag (deprecated in C++) | Low |
