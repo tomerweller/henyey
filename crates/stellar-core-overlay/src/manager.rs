@@ -1192,6 +1192,40 @@ impl OverlayManager {
         self.broadcast(message).await
     }
 
+    /// Request a transaction set by hash from a specific peer.
+    ///
+    /// Used by ItemFetcher to request TxSets from individual peers with retry logic.
+    pub async fn send_get_tx_set(&self, peer_id: &PeerId, hash: &[u8; 32]) -> Result<()> {
+        let message = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(*hash));
+        tracing::debug!(
+            peer = %peer_id,
+            hash = hex::encode(hash),
+            "Requesting transaction set from peer"
+        );
+        self.send_to(peer_id, message).await
+    }
+
+    /// Request a quorum set by hash from a specific peer.
+    ///
+    /// Used by ItemFetcher to request QuorumSets from individual peers with retry logic.
+    pub async fn send_get_quorum_set(&self, peer_id: &PeerId, hash: &[u8; 32]) -> Result<()> {
+        let message = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(*hash));
+        tracing::debug!(
+            peer = %peer_id,
+            hash = hex::encode(hash),
+            "Requesting quorum set from peer"
+        );
+        self.send_to(peer_id, message).await
+    }
+
+    /// Get all authenticated peer IDs.
+    ///
+    /// Returns the list of peers that have completed authentication handshake.
+    /// Used by ItemFetcher to know which peers are available for fetching.
+    pub fn authenticated_peers(&self) -> Vec<PeerId> {
+        self.connected_peers()
+    }
+
     /// Request peers from all connected peers.
     /// Note: GetPeers was removed in Protocol 24. Peers are now pushed via the Peers message.
     pub async fn request_peers(&self) -> Result<usize> {

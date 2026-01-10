@@ -51,6 +51,7 @@ use stellar_xdr::curr::{
 };
 
 use crate::error::HerderError;
+use crate::fetching_envelopes::{FetchingEnvelopes, FetchingStats};
 use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
@@ -200,6 +201,8 @@ pub struct Herder {
     tx_queue: TransactionQueue,
     /// Pending envelopes for future slots.
     pending_envelopes: PendingEnvelopes,
+    /// Fetching envelopes waiting for TxSet/QuorumSet dependencies.
+    fetching_envelopes: FetchingEnvelopes,
     /// SCP driver for consensus callbacks.
     scp_driver: Arc<ScpDriver>,
     /// SCP consensus protocol instance.
@@ -241,6 +244,7 @@ impl Herder {
         let scp_driver = Arc::new(ScpDriver::new(scp_driver_config, config.network_id));
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
         let pending_envelopes = PendingEnvelopes::new(pending_config);
+        let fetching_envelopes = FetchingEnvelopes::with_defaults();
 
         // SCP is None for non-validators (they just observe)
         let slot_quorum_tracker =
@@ -273,6 +277,7 @@ impl Herder {
             state: RwLock::new(HerderState::Booting),
             tx_queue,
             pending_envelopes,
+            fetching_envelopes,
             scp_driver,
             scp: None,
             tracking_slot: RwLock::new(0),
@@ -310,6 +315,7 @@ impl Herder {
 
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
         let pending_envelopes = PendingEnvelopes::new(pending_config);
+        let fetching_envelopes = FetchingEnvelopes::with_defaults();
 
         // Create SCP instance for validators
         let node_id = node_id_from_public_key(&config.node_public_key);
@@ -359,6 +365,7 @@ impl Herder {
             state: RwLock::new(HerderState::Booting),
             tx_queue,
             pending_envelopes,
+            fetching_envelopes,
             scp_driver,
             scp,
             tracking_slot: RwLock::new(0),
@@ -1286,6 +1293,77 @@ impl Herder {
             pending_envelope_stats: self.pending_envelopes.stats(),
             tx_queue_stats: self.tx_queue.stats(),
         }
+    }
+
+    // --- FetchingEnvelopes integration ---
+
+    /// Receive a TxSet from a peer.
+    ///
+    /// Called when a TxSet or GeneralizedTxSet message is received.
+    /// Returns true if the TxSet was needed and envelopes may be ready.
+    pub fn recv_tx_set(&self, hash: Hash256, slot: u64, data: Vec<u8>) -> bool {
+        self.fetching_envelopes.recv_tx_set(hash, slot, data)
+    }
+
+    /// Receive a QuorumSet from a peer.
+    ///
+    /// Called when an ScpQuorumset message is received.
+    /// Returns true if the QuorumSet was needed and envelopes may be ready.
+    pub fn recv_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) -> bool {
+        self.fetching_envelopes.recv_quorum_set(hash, quorum_set)
+    }
+
+    /// Process pending fetch requests.
+    ///
+    /// Should be called periodically (e.g., every second) to handle timeouts
+    /// and retry fetching from different peers. Returns the number of requests sent.
+    pub fn process_fetching(&self) -> usize {
+        self.fetching_envelopes.process_pending()
+    }
+
+    /// Update the list of available peers for fetching.
+    pub fn set_fetching_peers(&self, peers: Vec<stellar_core_overlay::PeerId>) {
+        self.fetching_envelopes.set_available_peers(peers);
+    }
+
+    /// Get statistics about envelope fetching.
+    pub fn fetching_stats(&self) -> FetchingStats {
+        self.fetching_envelopes.stats()
+    }
+
+    /// Get the number of envelopes currently being fetched.
+    pub fn fetching_count(&self) -> usize {
+        self.fetching_envelopes.fetching_count()
+    }
+
+    /// Get the number of envelopes ready for processing.
+    pub fn ready_count(&self) -> usize {
+        self.fetching_envelopes.ready_count()
+    }
+
+    /// Pop a ready envelope for a slot.
+    pub fn pop_ready_envelope(&self, slot: u64) -> Option<ScpEnvelope> {
+        self.fetching_envelopes.pop(slot)
+    }
+
+    /// Get all slots with ready envelopes.
+    pub fn ready_slots(&self) -> Vec<u64> {
+        self.fetching_envelopes.ready_slots()
+    }
+
+    /// Erase fetching data for old slots.
+    pub fn erase_fetching_below(&self, slot_index: u64, slot_to_keep: u64) {
+        self.fetching_envelopes.erase_below(slot_index, slot_to_keep);
+    }
+
+    /// Check if we have a cached TxSet in the fetching envelopes cache.
+    pub fn has_fetching_tx_set(&self, hash: &Hash256) -> bool {
+        self.fetching_envelopes.has_tx_set(hash)
+    }
+
+    /// Check if we have a cached QuorumSet in the fetching envelopes cache.
+    pub fn has_fetching_quorum_set(&self, hash: &Hash256) -> bool {
+        self.fetching_envelopes.has_quorum_set(hash)
     }
 }
 
