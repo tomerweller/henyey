@@ -114,7 +114,7 @@ pub use bucket_list::{BucketLevel, BucketList, BucketListStats, BUCKET_LIST_LEVE
 // Disk-backed storage
 // ============================================================================
 
-pub use disk_bucket::{DiskBucket, DiskBucketIter};
+pub use disk_bucket::{DiskBucket, DiskBucketIter, DEFAULT_BLOOM_SEED};
 
 // ============================================================================
 // Bloom filter for fast negative lookups

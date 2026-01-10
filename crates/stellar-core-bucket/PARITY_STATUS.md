@@ -12,9 +12,9 @@ This section documents the implementation status relative to the C++ stellar-cor
 | FutureBucket (Async Merging) | Complete | Tokio-based async merges |
 | Hot Archive Bucket List | Complete | Protocol 23+ Soroban state archival |
 | Eviction Scanning | Complete | Incremental scanning with iterator |
-| Disk-Backed Storage | Partial | Simpler index than C++ |
+| Disk-Backed Storage | Complete | Index with integrated bloom filter |
 | BucketSnapshot/SnapshotManager | Complete | Thread-safe read snapshots with historical ledger support |
-| Advanced Indexing | Partial | Bloom filters implemented, no DiskIndex/InMemoryIndex |
+| Advanced Indexing | Partial | Bloom filters integrated with DiskBucket; no DiskIndex/InMemoryIndex page indexes |
 | Specialized Queries | Partial | Inflation winners, type scanning implemented; pool share lookups pending |
 | Metrics/Monitoring | Not Implemented | Medida integration |
 
@@ -133,12 +133,13 @@ This section documents the implementation status relative to the C++ stellar-cor
   - Memory-limited cache sizing
   - `maybeInitializeCache()` based on bucket list account size
   - Thread-safe access via shared mutex
-- **Bloom filter** - Implemented as `BucketBloomFilter` in `bloom_filter.rs`:
+- **Bloom filter** - Implemented as `BucketBloomFilter` in `bloom_filter.rs` and integrated with `DiskBucket`:
   - Uses `BinaryFuse16` (same algorithm as C++ via xorf crate)
   - False positive rate ~1/65536 (~0.0015%)
   - SipHash-2-4 key hashing for C++ compatibility
   - `may_contain()` / `may_contain_hash()` for fast negative lookups
-  - Standalone module; not yet integrated with DiskBucket
+  - Automatically built for DiskBucket entries (requires >= 2 entries)
+  - `DiskBucket::get()` checks bloom filter first to skip disk I/O for missing keys
 - **Asset-to-PoolID mapping** - `getPoolIDsByAsset()` for liquidity pool queries - Not Implemented
 - **HotArchiveBucketIndex** - Index for hot archive buckets - Not Implemented
 - The Rust `DiskBucket` uses a simpler 8-byte key hash to file offset index (no range index, no page index)
@@ -202,11 +203,11 @@ This section documents the implementation status relative to the C++ stellar-cor
 
 2. **Single Bucket Type**: Rust uses a unified `Bucket` type with storage modes (InMemory/DiskBacked), while C++ has separate `LiveBucket` and `HotArchiveBucket` classes with distinct index types (`LiveBucketIndex` vs `HotArchiveBucketIndex`).
 
-3. **Index Design**: The Rust `DiskBucket` uses a simple hash-to-offset index (16 bytes per entry: 8-byte key hash + 8-byte offset/length), while C++ `LiveBucketIndex` supports:
+3. **Index Design**: The Rust `DiskBucket` uses a simple hash-to-offset index (16 bytes per entry: 8-byte key hash + 8-byte offset/length) with an integrated bloom filter for fast negative lookups, while C++ `LiveBucketIndex` supports:
    - Both in-memory and disk-based page indexes
-   - Bloom filters for fast negative lookups
-   - RandomEvictionCache for account entries
-   - Asset-to-PoolID mappings
+   - Bloom filters for fast negative lookups (also in Rust)
+   - RandomEvictionCache for account entries (not in Rust)
+   - Asset-to-PoolID mappings (not in Rust)
 
 4. **Snapshot Architecture**: C++ has a sophisticated snapshot system (`BucketSnapshotManager`) for concurrent read access with historical snapshots, while Rust relies on `Arc` and cloning for thread safety.
 
@@ -223,7 +224,7 @@ The Rust implementation correctly handles:
 
 #### Performance Considerations
 
-- The simpler index design may require optimization for mainnet performance (no Bloom filter means more disk I/O)
+- Bloom filter integration reduces disk I/O for negative lookups (fast rejection of missing keys)
 - Disk-backed buckets reduce memory usage during catchup but load entries on-demand
 - No cache layer for frequently-accessed entries (e.g., accounts) unlike C++'s RandomEvictionCache
 - No in-memory level 0 optimization
@@ -236,10 +237,11 @@ The Rust implementation correctly handles:
 
 ### Future Work Priority
 
-1. **Medium Priority**: Advanced indexing (Bloom filters, caches) for query performance
-2. **Medium Priority**: SearchableBucketListSnapshot specialized queries (pool shares, inflation winners)
+1. **Medium Priority**: RandomEvictionCache for frequently-accessed account entries
+2. **Medium Priority**: SearchableBucketListSnapshot specialized queries (pool shares)
 3. **Lower Priority**: Metrics integration (observability)
 4. **Lower Priority**: In-memory level 0 optimizations
+5. **Lower Priority**: Asset-to-PoolID mapping for liquidity pool queries
 
 ### C++ to Rust File Mapping
 
@@ -257,7 +259,7 @@ The Rust implementation correctly handles:
 | BucketOutputIterator.h/cpp | bucket.rs | Simplified (no streaming) |
 | LiveBucketIndex.h/cpp | disk_bucket.rs | Simplified |
 | HotArchiveBucketIndex.h/cpp | hot_archive.rs | Simplified |
-| DiskIndex.h/cpp | disk_bucket.rs | Simplified |
+| DiskIndex.h/cpp | disk_bucket.rs | Partial (bloom filter yes, page index no) |
 | InMemoryIndex.h/cpp | bucket.rs (key_index) | Partial |
 | BucketSnapshot.h/cpp | snapshot.rs | Complete |
 | BucketSnapshotManager.h/cpp | snapshot.rs | Complete |
@@ -270,4 +272,4 @@ The Rust implementation correctly handles:
 | LedgerCmp.h | entry.rs (compare_keys) | Complete |
 | MergeKey.h/cpp | future_bucket.rs (MergeKey) | Complete |
 | BucketUtils.h/cpp | entry.rs, eviction.rs | Complete |
-| BinaryFuseFilter.h/cpp | bloom_filter.rs | Complete (via xorf crate) |
+| BinaryFuseFilter.h/cpp | bloom_filter.rs, disk_bucket.rs | Complete (integrated with DiskBucket) |

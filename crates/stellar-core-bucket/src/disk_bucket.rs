@@ -46,8 +46,17 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, ReadXdr, Limits};
 
 use stellar_core_common::Hash256;
 
+use crate::bloom_filter::{BucketBloomFilter, HashSeed};
 use crate::entry::BucketEntry;
 use crate::{BucketError, Result};
+
+/// Minimum number of entries required to build a bloom filter.
+/// Smaller buckets don't benefit enough from bloom filter lookups to justify the overhead.
+const BLOOM_FILTER_MIN_ENTRIES: usize = 2;
+
+/// Default hash seed for bloom filter construction.
+/// This is used when no custom seed is provided.
+pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 
 /// Entry in the bucket index: file offset and record length.
 ///
@@ -73,6 +82,12 @@ struct IndexEntry {
 /// `IndexEntry` containing the file offset and record length. This uses
 /// a `BTreeMap` for ordered iteration and reasonable lookup performance.
 ///
+/// # Bloom Filter
+///
+/// For buckets with 2 or more entries, a Binary Fuse Filter is built to enable
+/// fast negative lookups. This allows `get()` to quickly determine that a key
+/// is definitely NOT in the bucket without reading from disk.
+///
 /// # Hash Collisions
 ///
 /// Since we only use 8 bytes of the key hash, collisions are possible
@@ -94,6 +109,11 @@ pub struct DiskBucket {
     index: Arc<BTreeMap<u64, IndexEntry>>,
     /// Total number of entries in this bucket.
     entry_count: usize,
+    /// Optional bloom filter for fast negative lookups.
+    /// None if the bucket has fewer than 2 entries.
+    bloom_filter: Option<Arc<BucketBloomFilter>>,
+    /// Hash seed used for the bloom filter.
+    bloom_seed: HashSeed,
 }
 
 impl DiskBucket {
@@ -101,6 +121,13 @@ impl DiskBucket {
     ///
     /// This parses the file to build the index but doesn't keep entries in memory.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_file_with_seed(path, DEFAULT_BLOOM_SEED)
+    }
+
+    /// Create a disk bucket from an XDR file with a custom bloom filter seed.
+    ///
+    /// This parses the file to build the index but doesn't keep entries in memory.
+    pub fn from_file_with_seed(path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
@@ -114,18 +141,38 @@ impl DiskBucket {
         let hash = Hash256::hash(&bytes);
 
         // Build index by scanning the file
-        let (index, entry_count) = Self::build_index(&bytes)?;
+        let (index, key_hashes, entry_count) = Self::build_index(&bytes, &bloom_seed)?;
+
+        // Build bloom filter if we have enough entries
+        let bloom_filter = if key_hashes.len() >= BLOOM_FILTER_MIN_ENTRIES {
+            match BucketBloomFilter::from_hashes(&key_hashes, &bloom_seed) {
+                Ok(filter) => Some(Arc::new(filter)),
+                Err(e) => {
+                    tracing::warn!("Failed to build bloom filter for bucket: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
             index: Arc::new(index),
             entry_count,
+            bloom_filter,
+            bloom_seed,
         })
     }
 
     /// Create a disk bucket from raw XDR bytes, saving to the specified path.
     pub fn from_xdr_bytes(bytes: &[u8], save_path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_xdr_bytes_with_seed(bytes, save_path, DEFAULT_BLOOM_SEED)
+    }
+
+    /// Create a disk bucket from raw XDR bytes with a custom bloom filter seed.
+    pub fn from_xdr_bytes_with_seed(bytes: &[u8], save_path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
         use std::io::Write;
 
         let save_path = save_path.as_ref();
@@ -134,7 +181,20 @@ impl DiskBucket {
         let hash = Hash256::hash(bytes);
 
         // Build index
-        let (index, entry_count) = Self::build_index(bytes)?;
+        let (index, key_hashes, entry_count) = Self::build_index(bytes, &bloom_seed)?;
+
+        // Build bloom filter if we have enough entries
+        let bloom_filter = if key_hashes.len() >= BLOOM_FILTER_MIN_ENTRIES {
+            match BucketBloomFilter::from_hashes(&key_hashes, &bloom_seed) {
+                Ok(filter) => Some(Arc::new(filter)),
+                Err(e) => {
+                    tracing::warn!("Failed to build bloom filter for bucket: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Save to disk
         let mut file = File::create(save_path)?;
@@ -146,20 +206,23 @@ impl DiskBucket {
             file_path: save_path.to_path_buf(),
             index: Arc::new(index),
             entry_count,
+            bloom_filter,
+            bloom_seed,
         })
     }
 
     /// Build an index from XDR bytes.
     ///
-    /// Returns (index, entry_count).
-    fn build_index(bytes: &[u8]) -> Result<(BTreeMap<u64, IndexEntry>, usize)> {
+    /// Returns (index, bloom_key_hashes, entry_count).
+    fn build_index(bytes: &[u8], bloom_seed: &HashSeed) -> Result<(BTreeMap<u64, IndexEntry>, Vec<u64>, usize)> {
         use tracing::debug;
 
         if bytes.is_empty() {
-            return Ok((BTreeMap::new(), 0));
+            return Ok((BTreeMap::new(), Vec::new(), 0));
         }
 
         let mut index = BTreeMap::new();
+        let mut bloom_key_hashes = Vec::new();
         let mut offset: u64 = 0;
         let mut entry_count = 0;
 
@@ -197,6 +260,8 @@ impl DiskBucket {
                             offset: record_start,
                             length: record_len as u32,
                         });
+                        // Also compute bloom filter hash
+                        bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, bloom_seed));
                     }
                     entry_count += 1;
                 }
@@ -223,6 +288,8 @@ impl DiskBucket {
                                 offset: entry_start,
                                 length: (entry_end - entry_start) as u32,
                             });
+                            // Also compute bloom filter hash
+                            bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, bloom_seed));
                         }
                         entry_count += 1;
                     }
@@ -231,8 +298,8 @@ impl DiskBucket {
             }
         }
 
-        debug!("Built index with {} entries", entry_count);
-        Ok((index, entry_count))
+        debug!("Built index with {} entries, {} keys for bloom filter", entry_count, bloom_key_hashes.len());
+        Ok((index, bloom_key_hashes, entry_count))
     }
 
     /// Extract the key from a bucket entry.
@@ -275,10 +342,35 @@ impl DiskBucket {
         &self.file_path
     }
 
+    /// Returns true if this bucket has a bloom filter for fast negative lookups.
+    pub fn has_bloom_filter(&self) -> bool {
+        self.bloom_filter.is_some()
+    }
+
+    /// Returns the size of the bloom filter in bytes, or 0 if no filter exists.
+    pub fn bloom_filter_size_bytes(&self) -> usize {
+        self.bloom_filter.as_ref().map_or(0, |f| f.size_bytes())
+    }
+
+    /// Returns the hash seed used for the bloom filter.
+    pub fn bloom_seed(&self) -> &HashSeed {
+        &self.bloom_seed
+    }
+
     /// Look up an entry by key.
     ///
-    /// This reads from disk using the index.
+    /// This reads from disk using the index. If a bloom filter is available,
+    /// it first checks the filter to quickly reject keys that are definitely
+    /// not present (avoiding disk I/O).
     pub fn get(&self, key: &LedgerKey) -> Result<Option<BucketEntry>> {
+        // Check bloom filter first for fast negative lookup
+        if let Some(ref filter) = self.bloom_filter {
+            if !filter.may_contain(key, &self.bloom_seed) {
+                // Key is definitely not in the bucket
+                return Ok(None);
+            }
+        }
+
         let key_hash = Self::hash_key(key);
 
         let index_entry = match self.index.get(&key_hash) {
@@ -514,5 +606,149 @@ mod tests {
 
         let entry = bucket.get(&key).unwrap();
         assert!(entry.is_some());
+    }
+
+    fn make_multi_entry_bucket_bytes(count: usize) -> Vec<u8> {
+        use stellar_xdr::curr::WriteXdr;
+
+        let mut bytes = Vec::new();
+
+        for i in 0..count {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+
+            let account = AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(id))),
+                balance: i as i64 * 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Vec::new().try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            };
+
+            let entry = LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(account),
+                ext: LedgerEntryExt::V0,
+            };
+
+            let bucket_entry = stellar_xdr::curr::BucketEntry::Liveentry(entry);
+            let entry_bytes = bucket_entry.to_xdr(Limits::none()).unwrap();
+
+            // Write with record mark
+            let record_mark = (entry_bytes.len() as u32) | 0x80000000;
+            bytes.extend_from_slice(&record_mark.to_be_bytes());
+            bytes.extend_from_slice(&entry_bytes);
+        }
+
+        bytes
+    }
+
+    #[test]
+    fn test_disk_bucket_no_bloom_filter_with_single_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bucket");
+
+        let bytes = make_test_bucket_bytes(); // Only 1 entry
+        let bucket = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        // Single entry bucket should not have a bloom filter
+        assert!(!bucket.has_bloom_filter());
+        assert_eq!(bucket.bloom_filter_size_bytes(), 0);
+    }
+
+    #[test]
+    fn test_disk_bucket_bloom_filter_with_multiple_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bucket");
+
+        let bytes = make_multi_entry_bucket_bytes(10);
+        let bucket = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        assert_eq!(bucket.len(), 10);
+        // Multiple entries should have a bloom filter
+        assert!(bucket.has_bloom_filter());
+        assert!(bucket.bloom_filter_size_bytes() > 0);
+    }
+
+    #[test]
+    fn test_disk_bucket_bloom_filter_no_false_negatives() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bucket");
+
+        let count = 50;
+        let bytes = make_multi_entry_bucket_bytes(count);
+        let bucket = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        assert!(bucket.has_bloom_filter());
+
+        // All keys that are in the bucket must be found
+        for i in 0..count {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            let key = LedgerKey::Account(LedgerKeyAccount {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(id))),
+            });
+
+            let entry = bucket.get(&key).unwrap();
+            assert!(entry.is_some(), "Entry {} should be found", i);
+        }
+    }
+
+    #[test]
+    fn test_disk_bucket_bloom_filter_rejects_missing_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bucket");
+
+        // Create bucket with entries 0-9
+        let bytes = make_multi_entry_bucket_bytes(10);
+        let bucket = DiskBucket::from_xdr_bytes(&bytes, &path).unwrap();
+
+        assert!(bucket.has_bloom_filter());
+
+        // Keys 100-199 should not be found
+        for i in 100..200 {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            let key = LedgerKey::Account(LedgerKeyAccount {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(id))),
+            });
+
+            let entry = bucket.get(&key).unwrap();
+            assert!(entry.is_none(), "Entry {} should not be found", i);
+        }
+    }
+
+    #[test]
+    fn test_disk_bucket_with_custom_bloom_seed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bucket");
+
+        let custom_seed: HashSeed = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+        ];
+
+        let bytes = make_multi_entry_bucket_bytes(10);
+        let bucket = DiskBucket::from_xdr_bytes_with_seed(&bytes, &path, custom_seed).unwrap();
+
+        assert!(bucket.has_bloom_filter());
+        assert_eq!(bucket.bloom_seed(), &custom_seed);
+
+        // Should still find all entries
+        for i in 0..10 {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            let key = LedgerKey::Account(LedgerKeyAccount {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(id))),
+            });
+
+            let entry = bucket.get(&key).unwrap();
+            assert!(entry.is_some(), "Entry {} should be found", i);
+        }
     }
 }
