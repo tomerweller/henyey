@@ -160,7 +160,12 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 #### Core Herder (`HerderImpl`)
 - [ ] **Persistence**: `persistUpgrades()` / `restoreUpgrades()` - Upgrade parameters persistence to database
-- [ ] **Dead node detection**: `startCheckForDeadNodesInterval()`, `CHECK_FOR_DEAD_NODES_MINUTES` - Missing node tracking
+- [x] **Dead node detection**: Implemented via `DeadNodeTracker` in `dead_node_tracker.rs`
+  - `CHECK_FOR_DEAD_NODES_MINUTES` constant (15 minutes)
+  - Tracks `missing_nodes` and `dead_nodes` across intervals
+  - `record_node_activity()` to mark active nodes
+  - `check_interval()` rotates missing → dead and resets
+  - `get_maybe_dead_nodes()` / `is_maybe_dead()` for diagnostics
 - [ ] **Metrics**: Full medida-style metrics (counters, timers, histograms)
 - [ ] **Node ID resolution**: `resolveNodeID()` - Config-based node lookup from name
 - [ ] **Upgrade scheduling API**: `setUpgrades()`, `getUpgradesJson()` - Admin endpoint for upgrade scheduling
@@ -172,7 +177,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 #### SCP Driver (`HerderSCPDriver`)
 - [ ] **SCP execution metrics**: `recordSCPExecutionMetrics()`, `recordSCPEvent()`, `recordSCPExternalizeEvent()`
 - [ ] **Externalize lag tracking**: `getExternalizeLag()`, `mQSetLag` per-node timers
-- [ ] **Missing node reporting**: `getMaybeDeadNodes()`, `mMissingNodes`, `mDeadNodes`
+- [x] **Missing node reporting**: Implemented via `DeadNodeTracker` - `get_maybe_dead_nodes()`, missing/dead node tracking
 - [ ] **Node weight function**: `getNodeWeight()` - Application-specific leader election (protocol 22+)
 - [ ] **TxSet validity caching**: `TxSetValidityKey`, `mTxSetValidCache` with `RandomEvictionCache`
 - [ ] **Value wrapper**: `wrapStellarValue()`, `wrapValue()` with `ValueWrapperPtr`

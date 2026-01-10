@@ -91,6 +91,7 @@
 //! - [`tx_queue_limiter`]: Resource-aware queue limiting with eviction
 //! - [`json_api`]: JSON structures for admin/diagnostic endpoints
 
+pub mod dead_node_tracker;
 pub mod drift_tracker;
 mod error;
 pub mod flow_control;
@@ -156,6 +157,9 @@ pub use tx_broadcast::{
     BroadcastCommand, TxBroadcastCallback, TxBroadcastHandle, TxBroadcastManager,
     TxBroadcastStats, DEFAULT_FLOOD_PERIOD_MS,
 };
+
+// Dead node detection
+pub use dead_node_tracker::{DeadNodeTracker, CHECK_FOR_DEAD_NODES_MINUTES};
 
 /// Result type for Herder operations.
 pub type Result<T> = std::result::Result<T, HerderError>;
