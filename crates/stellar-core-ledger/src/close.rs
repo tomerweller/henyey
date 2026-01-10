@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use stellar_core_common::Hash256;
 use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade, Limits,
-    ScpHistoryEntry, TransactionEnvelope, TransactionResultPair, TransactionResultSet,
+    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade,
+    Limits, ScpHistoryEntry, TransactionEnvelope, TransactionResultPair, TransactionResultSet,
     TransactionSet, WriteXdr,
 };
 
@@ -617,6 +617,30 @@ impl UpgradeContext {
             }
         }
         None
+    }
+
+    /// Get all config upgrade keys, if any.
+    ///
+    /// Multiple config upgrades can be included, all will be returned
+    /// in the order they appear.
+    pub fn config_upgrade_keys(&self) -> Vec<ConfigUpgradeSetKey> {
+        self.upgrades
+            .iter()
+            .filter_map(|u| {
+                if let LedgerUpgrade::Config(key) = u {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Check if there are any config upgrades.
+    pub fn has_config_upgrades(&self) -> bool {
+        self.upgrades
+            .iter()
+            .any(|u| matches!(u, LedgerUpgrade::Config(_)))
     }
 
     /// Apply upgrades to a header, returning the modified values.

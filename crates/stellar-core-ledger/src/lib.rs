@@ -84,6 +84,7 @@
 //! - **Protocol 23**: Hot archive bucket list for state archival
 
 mod close;
+pub mod config_upgrade;
 mod delta;
 mod error;
 pub mod execution;
@@ -97,6 +98,7 @@ mod soroban_state;
 pub use close::{
     LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
 };
+pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 pub use delta::{entry_to_key, EntryChange, LedgerDelta};
 pub use error::LedgerError;
 pub use header::{
