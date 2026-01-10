@@ -7,7 +7,7 @@ This document details the parity between `stellar-core-common` and the C++ upstr
 | Category | Status | Notes |
 |----------|--------|-------|
 | Protocol Version | Full | All version checks and constants match C++ |
-| Resource Accounting | Partial | Core ops implemented; scaling/division missing |
+| Resource Accounting | Full | All operations including scaling/division |
 | Metadata Normalization | Full | Matches C++ sorting behavior exactly |
 | Hash/Types | Partial | Core Hash256 done; many type utilities missing |
 | Network Identity | Full | Passphrase-based derivation matches C++ |
@@ -40,7 +40,7 @@ Additional Rust utilities:
 
 ### Resource Accounting (`resource.rs` <-> `TxResource.h/.cpp`)
 
-**Status: Partial Parity**
+**Status: Full Parity**
 
 | C++ Feature | Rust Equivalent | Status |
 |-------------|-----------------|--------|
@@ -67,11 +67,15 @@ Additional Rust utilities:
 | `anyGreater()` | `any_greater()` | Implemented |
 | `subtractNonNegative()` | `subtract_non_negative()` | Implemented |
 | `limitTo()` | `limit_to()` | Implemented |
-| `toString()` | Not implemented | Missing |
-| `getStringFromType()` | Not implemented | Missing |
-| `multiplyByDouble()` | Not implemented | Missing |
-| `saturatedMultiplyByDouble()` | Not implemented | Missing |
-| `bigDivideOrThrow()` for Resource | Not implemented | Missing |
+| `toString()` | `Display` impl | Implemented |
+| `getStringFromType()` | `ResourceType::as_str()` | Implemented |
+| `multiplyByDouble()` | `multiply_by_double()` | Implemented |
+| `saturatedMultiplyByDouble()` | `saturated_multiply_by_double()` | Implemented |
+| `bigDivideOrThrow()` for Resource | `big_divide_resource()` | Implemented |
+
+Additional Rust utilities:
+- `ResourceType::all()` - Returns slice of all resource type variants
+- `ResourceType::as_str()` - Returns display string for type
 
 ### Metadata Normalization (`meta.rs` <-> `MetaUtils.h/.cpp`)
 
@@ -289,10 +293,9 @@ Uses Rust's `Result<T, E>` pattern instead of C++ exceptions:
 Features likely needed for full parity (in rough priority order):
 
 1. **Type utilities** (`isAssetValid`, `addBalance`, asset conversions) - Needed for ledger operations
-2. **Resource scaling** (`multiplyByDouble`, `bigDivideOrThrow` for Resource) - Needed for surge pricing
-3. **XDR streaming** - Needed for history archive access
-4. **RandomEvictionCache** - Needed for performance optimization
-5. **VirtualClock/Scheduler** - Needed for testing infrastructure
+2. **XDR streaming** - Needed for history archive access
+3. **RandomEvictionCache** - Needed for performance optimization
+4. **VirtualClock/Scheduler** - Needed for testing infrastructure
 
 ## Verification
 

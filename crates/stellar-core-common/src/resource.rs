@@ -293,3 +293,277 @@ pub fn limit_to(current: &Resource, limit: &Resource) -> Resource {
             .collect(),
     )
 }
+
+impl std::fmt::Display for Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let values: Vec<String> = self.values.iter().map(|v| v.to_string()).collect();
+        write!(f, "{}", values.join(", "))
+    }
+}
+
+impl std::fmt::Display for ResourceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ResourceType::Operations => "Operations",
+            ResourceType::Instructions => "Instructions",
+            ResourceType::TxByteSize => "TxByteSize",
+            ResourceType::DiskReadBytes => "DiskReadBytes",
+            ResourceType::WriteBytes => "WriteBytes",
+            ResourceType::ReadLedgerEntries => "ReadLedgerEntries",
+            ResourceType::WriteLedgerEntries => "WriteLedgerEntries",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+impl ResourceType {
+    /// Returns all resource types as a slice.
+    pub const fn all() -> &'static [ResourceType] {
+        &[
+            ResourceType::Operations,
+            ResourceType::Instructions,
+            ResourceType::TxByteSize,
+            ResourceType::DiskReadBytes,
+            ResourceType::WriteBytes,
+            ResourceType::ReadLedgerEntries,
+            ResourceType::WriteLedgerEntries,
+        ]
+    }
+
+    /// Returns the resource type name as a string.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ResourceType::Operations => "Operations",
+            ResourceType::Instructions => "Instructions",
+            ResourceType::TxByteSize => "TxByteSize",
+            ResourceType::DiskReadBytes => "DiskReadBytes",
+            ResourceType::WriteBytes => "WriteBytes",
+            ResourceType::ReadLedgerEntries => "ReadLedgerEntries",
+            ResourceType::WriteLedgerEntries => "WriteLedgerEntries",
+        }
+    }
+}
+
+/// Multiplies each dimension of a resource by a double.
+///
+/// # Panics
+///
+/// Panics if:
+/// - The result is negative
+/// - The result is not representable as i64 (overflow)
+///
+/// # Example
+///
+/// ```rust
+/// use stellar_core_common::resource::{Resource, multiply_by_double};
+///
+/// let r = Resource::new(vec![100, 200]);
+/// let scaled = multiply_by_double(&r, 1.5);
+/// assert_eq!(scaled.get_val(stellar_core_common::resource::ResourceType::Operations), 150);
+/// ```
+pub fn multiply_by_double(res: &Resource, m: f64) -> Resource {
+    let values: Vec<i64> = res
+        .values
+        .iter()
+        .map(|&v| {
+            let result = (v as f64) * m;
+            assert!(result >= 0.0, "multiply_by_double: negative result");
+            assert!(
+                is_representable_as_i64(result),
+                "multiply_by_double: result not representable as i64"
+            );
+            result as i64
+        })
+        .collect();
+    Resource::new(values)
+}
+
+/// Multiplies each dimension of a resource by a double, saturating at i64::MAX.
+///
+/// Unlike [`multiply_by_double`], this function clamps the result to i64::MAX
+/// instead of panicking on overflow.
+///
+/// # Panics
+///
+/// Panics if the result is negative.
+///
+/// # Example
+///
+/// ```rust
+/// use stellar_core_common::resource::{Resource, saturated_multiply_by_double};
+///
+/// let r = Resource::new(vec![i64::MAX / 2, 100]);
+/// let scaled = saturated_multiply_by_double(&r, 3.0);
+/// // First dimension saturates to i64::MAX
+/// ```
+pub fn saturated_multiply_by_double(res: &Resource, m: f64) -> Resource {
+    let values: Vec<i64> = res
+        .values
+        .iter()
+        .map(|&v| {
+            let result = (v as f64) * m;
+            assert!(result >= 0.0, "saturated_multiply_by_double: negative result");
+            if is_representable_as_i64(result) {
+                result as i64
+            } else {
+                i64::MAX
+            }
+        })
+        .collect();
+    Resource::new(values)
+}
+
+/// Check if a f64 value can be represented as an i64.
+fn is_representable_as_i64(v: f64) -> bool {
+    v >= i64::MIN as f64 && v <= i64::MAX as f64
+}
+
+/// Divides each dimension of a resource using big integer division.
+///
+/// Computes `(resource * B) / C` for each dimension using 128-bit
+/// intermediate arithmetic to avoid overflow.
+///
+/// # Arguments
+///
+/// * `res` - The resource to divide
+/// * `b` - The numerator multiplier
+/// * `c` - The denominator
+/// * `rounding` - Rounding mode (up or down)
+///
+/// # Errors
+///
+/// Returns an error if any division would overflow or produce an invalid result.
+///
+/// # Example
+///
+/// ```rust
+/// use stellar_core_common::resource::{Resource, big_divide_resource};
+/// use stellar_core_common::math::Rounding;
+///
+/// let r = Resource::new(vec![1000, 2000]);
+/// let divided = big_divide_resource(&r, 1, 10, Rounding::Down).unwrap();
+/// ```
+pub fn big_divide_resource(
+    res: &Resource,
+    b: i64,
+    c: i64,
+    rounding: crate::math::Rounding,
+) -> Result<Resource, crate::math::MathError> {
+    let mut values = Vec::with_capacity(res.values.len());
+    for &v in &res.values {
+        values.push(crate::math::big_divide_or_throw(v, b, c, rounding)?);
+    }
+    Ok(Resource::new(values))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resource_display() {
+        let r = Resource::new(vec![100, 200]);
+        assert_eq!(format!("{}", r), "100, 200");
+
+        let r = Resource::make_empty_soroban();
+        assert_eq!(format!("{}", r), "0, 0, 0, 0, 0, 0, 0");
+    }
+
+    #[test]
+    fn test_resource_type_display() {
+        assert_eq!(format!("{}", ResourceType::Operations), "Operations");
+        assert_eq!(format!("{}", ResourceType::Instructions), "Instructions");
+        assert_eq!(format!("{}", ResourceType::TxByteSize), "TxByteSize");
+    }
+
+    #[test]
+    fn test_resource_type_as_str() {
+        assert_eq!(ResourceType::Operations.as_str(), "Operations");
+        assert_eq!(ResourceType::WriteLedgerEntries.as_str(), "WriteLedgerEntries");
+    }
+
+    #[test]
+    fn test_resource_type_all() {
+        let all = ResourceType::all();
+        assert_eq!(all.len(), 7);
+        assert_eq!(all[0], ResourceType::Operations);
+        assert_eq!(all[6], ResourceType::WriteLedgerEntries);
+    }
+
+    #[test]
+    fn test_multiply_by_double() {
+        let r = Resource::new(vec![100, 200]);
+        let scaled = multiply_by_double(&r, 1.5);
+        assert_eq!(scaled.get_val(ResourceType::Operations), 150);
+        assert_eq!(scaled.get_val(ResourceType::Instructions), 300);
+    }
+
+    #[test]
+    fn test_multiply_by_double_zero() {
+        let r = Resource::new(vec![100, 200]);
+        let scaled = multiply_by_double(&r, 0.0);
+        assert!(scaled.is_zero());
+    }
+
+    #[test]
+    fn test_multiply_by_double_fractional() {
+        let r = Resource::new(vec![100, 200]);
+        let scaled = multiply_by_double(&r, 0.1);
+        assert_eq!(scaled.get_val(ResourceType::Operations), 10);
+        assert_eq!(scaled.get_val(ResourceType::Instructions), 20);
+    }
+
+    #[test]
+    #[should_panic(expected = "negative result")]
+    fn test_multiply_by_double_negative_panics() {
+        let r = Resource::new(vec![100, 200]);
+        multiply_by_double(&r, -1.0);
+    }
+
+    #[test]
+    fn test_saturated_multiply_by_double() {
+        let r = Resource::new(vec![100, 200]);
+        let scaled = saturated_multiply_by_double(&r, 1.5);
+        assert_eq!(scaled.get_val(ResourceType::Operations), 150);
+        assert_eq!(scaled.get_val(ResourceType::Instructions), 300);
+    }
+
+    #[test]
+    fn test_saturated_multiply_by_double_saturates() {
+        let r = Resource::new(vec![i64::MAX / 2, 100]);
+        let scaled = saturated_multiply_by_double(&r, 3.0);
+        assert_eq!(scaled.get_val(ResourceType::Operations), i64::MAX);
+        assert_eq!(scaled.get_val(ResourceType::Instructions), 300);
+    }
+
+    #[test]
+    fn test_big_divide_resource() {
+        use crate::math::Rounding;
+
+        let r = Resource::new(vec![1000, 2000]);
+        let divided = big_divide_resource(&r, 1, 10, Rounding::Down).unwrap();
+        assert_eq!(divided.get_val(ResourceType::Operations), 100);
+        assert_eq!(divided.get_val(ResourceType::Instructions), 200);
+    }
+
+    #[test]
+    fn test_big_divide_resource_round_up() {
+        use crate::math::Rounding;
+
+        let r = Resource::new(vec![1001, 2001]);
+        let divided = big_divide_resource(&r, 1, 10, Rounding::Up).unwrap();
+        assert_eq!(divided.get_val(ResourceType::Operations), 101);
+        assert_eq!(divided.get_val(ResourceType::Instructions), 201);
+    }
+
+    #[test]
+    fn test_big_divide_resource_with_multiplier() {
+        use crate::math::Rounding;
+
+        // (100 * 3) / 2 = 150
+        let r = Resource::new(vec![100, 200]);
+        let divided = big_divide_resource(&r, 3, 2, Rounding::Down).unwrap();
+        assert_eq!(divided.get_val(ResourceType::Operations), 150);
+        assert_eq!(divided.get_val(ResourceType::Instructions), 300);
+    }
+}
