@@ -200,7 +200,7 @@ rs-stellar-core/
 |-------|---------|--------|
 | [`rs-stellar-core`](crates/rs-stellar-core/README.md) | CLI entrypoint, argument parsing, command dispatch | [~90%](crates/rs-stellar-core/PARITY_STATUS.md) |
 | [`stellar-core-app`](crates/stellar-core-app/README.md) | Application wiring, lifecycle management, run/catchup orchestration | [~85%](crates/stellar-core-app/PARITY_STATUS.md) |
-| [`stellar-core-common`](crates/stellar-core-common/README.md) | Shared types, config helpers, time utilities | [~95%](crates/stellar-core-common/PARITY_STATUS.md) |
+| [`stellar-core-common`](crates/stellar-core-common/README.md) | Shared types, config helpers, time utilities | [~98%](crates/stellar-core-common/PARITY_STATUS.md) |
 | [`stellar-core-crypto`](crates/stellar-core-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [~98%](crates/stellar-core-crypto/PARITY_STATUS.md) |
 | [`stellar-core-db`](crates/stellar-core-db/README.md) | SQLite schema, migrations, query layer | [~90%](crates/stellar-core-db/PARITY_STATUS.md) |
 
