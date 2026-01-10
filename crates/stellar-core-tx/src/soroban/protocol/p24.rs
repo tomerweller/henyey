@@ -519,5 +519,7 @@ pub fn invoke_host_function(
         encoded_contract_events,
         cpu_insns,
         mem_bytes,
+        // P24 doesn't have auto-restore, so no live BL restorations
+        live_bucket_list_restores: Vec::new(),
     })
 }

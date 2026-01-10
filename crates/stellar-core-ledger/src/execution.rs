@@ -2119,14 +2119,33 @@ impl TransactionExecutor {
                         );
                         let op_snapshots = self.state.end_op_snapshot();
 
-                        // For Soroban operations, extract hot archive restored keys and footprint
-                        let (hot_archive_keys, footprint) = if op_type.is_soroban() {
-                            (
-                                extract_hot_archive_restored_keys(soroban_data, op_type),
-                                soroban_data.map(|d| &d.resources.footprint),
-                            )
+                        // For Soroban operations, extract restored entries (hot archive and live BL)
+                        let (restored_entries, footprint) = if op_type.is_soroban() {
+                            let mut restored = RestoredEntries::default();
+
+                            // Get live BL restorations from the Soroban execution result
+                            if let Some(meta) = &op_exec.soroban_meta {
+                                for live_bl_restore in &meta.live_bucket_list_restores {
+                                    restored.live_bucket_list.insert(live_bl_restore.key.clone());
+                                    restored.live_bucket_list_entries.insert(
+                                        live_bl_restore.key.clone(),
+                                        live_bl_restore.entry.clone(),
+                                    );
+                                    // Also track the TTL entry
+                                    restored.live_bucket_list.insert(live_bl_restore.ttl_key.clone());
+                                    restored.live_bucket_list_entries.insert(
+                                        live_bl_restore.ttl_key.clone(),
+                                        live_bl_restore.ttl_entry.clone(),
+                                    );
+                                }
+                            }
+
+                            // Also get hot archive keys for InvokeHostFunction
+                            let hot_archive = extract_hot_archive_restored_keys(soroban_data, op_type);
+                            restored.hot_archive.extend(hot_archive);
+                            (restored, soroban_data.map(|d| &d.resources.footprint))
                         } else {
-                            (HashSet::new(), None)
+                            (RestoredEntries::default(), None)
                         };
 
                         let op_changes_local = build_entry_changes_with_hot_archive(
@@ -2138,7 +2157,7 @@ impl TransactionExecutor {
                             &delta_changes.delete_states,
                             &delta_changes.change_order,
                             &op_snapshots,
-                            &hot_archive_keys,
+                            &restored_entries,
                             footprint,
                         );
 
@@ -2726,12 +2745,28 @@ fn pool_reserves(pool: &LiquidityPoolEntry) -> Option<(Asset, Asset, i64, i64)> 
     }
 }
 
+/// Tracks entries restored from different sources per CAP-0066.
+#[derive(Debug, Default)]
+struct RestoredEntries {
+    /// Keys restored from hot archive (evicted entries).
+    /// These will have CREATED changes that should be converted to RESTORED.
+    hot_archive: HashSet<LedgerKey>,
+    /// Keys restored from live BucketList (expired TTL but not yet evicted).
+    /// TTL entries will have STATE+UPDATED that should be converted to RESTORED.
+    /// Associated data/code entries need RESTORED meta added even if not modified.
+    live_bucket_list: HashSet<LedgerKey>,
+    /// For live BL restores, maps data/code keys to their entry values.
+    /// These are needed to emit RESTORED for data/code that wasn't directly modified.
+    live_bucket_list_entries: HashMap<LedgerKey, LedgerEntry>,
+}
+
 /// Extract keys of entries being restored from the hot archive.
 ///
 /// For InvokeHostFunction: `archived_soroban_entries` contains indices into the
 /// read_write footprint that point to entries being auto-restored from hot archive.
 ///
-/// For RestoreFootprint: ALL read_write footprint entries are being restored.
+/// For RestoreFootprint: entries are from hot archive if they don't exist in live BL,
+/// otherwise they're from live BL (detected separately).
 ///
 /// Per CAP-0066, these entries should be emitted as RESTORED (not CREATED or STATE/UPDATED)
 /// in the transaction meta. Both the data/code entry AND its associated TTL entry are restored.
@@ -2745,19 +2780,15 @@ fn extract_hot_archive_restored_keys(
         return keys;
     };
 
-    // For RestoreFootprint, ALL read_write entries are being restored
+    // For InvokeHostFunction: extract archived entry indices from the extension
+    // For RestoreFootprint: hot archive keys are those that will be CREATED (not UPDATED)
+    // We'll handle RestoreFootprint detection at change-building time
     if op_type == OperationType::RestoreFootprint {
-        for key in data.resources.footprint.read_write.iter() {
-            keys.insert(key.clone());
-            // Also add the associated TTL key
-            if let Some(ttl_key) = get_ttl_key_for_entry(key) {
-                keys.insert(ttl_key);
-            }
-        }
+        // Don't add all keys here - we'll detect at change-building time
+        // based on whether entries are CREATED (hot archive) or UPDATED (live BL)
         return keys;
     }
 
-    // For InvokeHostFunction: extract archived entry indices from the extension
     let archived_indices: Vec<u32> = match &data.ext {
         SorobanTransactionDataExt::V1(ext) => {
             ext.archived_soroban_entries.iter().copied().collect()
@@ -3191,9 +3222,10 @@ fn build_entry_changes_with_state_overrides(
     deleted: &[LedgerKey],
     state_overrides: &HashMap<LedgerKey, LedgerEntry>,
 ) -> LedgerEntryChanges {
-    // Call with empty change_order and hot archive set for non-operation changes
+    // Call with empty change_order and restored set for non-operation changes
     // Empty change_order triggers the fallback type-grouped ordering
     // Empty update_states/delete_states - we'll use snapshot lookup for these cases
+    let empty_restored = RestoredEntries::default();
     build_entry_changes_with_hot_archive(
         state,
         created,
@@ -3203,16 +3235,20 @@ fn build_entry_changes_with_state_overrides(
         &[], // delete_states - empty, will use snapshot fallback
         &[],
         state_overrides,
-        &HashSet::new(),
+        &empty_restored,
         None,
     )
 }
 
-/// Build entry changes with support for hot archive restoration tracking.
+/// Build entry changes with support for hot archive and live BL restoration tracking.
 ///
-/// For entries in `hot_archive_restored_keys`:
-/// - Emit RESTORED instead of STATE/UPDATED (entry was restored from hot archive per CAP-0066)
+/// For entries in `restored.hot_archive`:
+/// - Emit RESTORED instead of CREATED (entry was restored from hot archive per CAP-0066)
 /// - For deleted entries that were restored, emit RESTORED then REMOVED
+///
+/// For entries in `restored.live_bucket_list`:
+/// - Convert STATE+UPDATED to RESTORED (entry had expired TTL in live BL)
+/// - Emit RESTORED for associated data/code entries even if not directly modified
 ///
 /// When `footprint` is provided (for Soroban operations), entries are ordered according to
 /// the footprint's read_write order to match C++ stellar-core behavior.
@@ -3228,7 +3264,7 @@ fn build_entry_changes_with_hot_archive(
     delete_states: &[LedgerEntry],
     change_order: &[stellar_core_tx::ChangeRef],
     state_overrides: &HashMap<LedgerKey, LedgerEntry>,
-    hot_archive_restored_keys: &HashSet<LedgerKey>,
+    restored: &RestoredEntries,
     footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
 ) -> LedgerEntryChanges {
     fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
@@ -3241,10 +3277,10 @@ fn build_entry_changes_with_hot_archive(
     fn push_created_or_restored(
         changes: &mut Vec<LedgerEntryChange>,
         entry: &LedgerEntry,
-        hot_archive_restored_keys: &HashSet<LedgerKey>,
+        restored: &RestoredEntries,
     ) {
         if let Ok(key) = crate::delta::entry_to_key(entry) {
-            if hot_archive_restored_keys.contains(&key) {
+            if restored.hot_archive.contains(&key) {
                 changes.push(LedgerEntryChange::Restored(entry.clone()));
                 return;
             }
@@ -3384,7 +3420,7 @@ fn build_entry_changes_with_hot_archive(
                             push_created_or_restored(
                                 &mut changes,
                                 entry,
-                                hot_archive_restored_keys,
+                                restored,
                             );
                         }
                     }
@@ -3394,14 +3430,14 @@ fn build_entry_changes_with_hot_archive(
                     let key_bytes = entry_key_bytes(entry);
                     if !created_keys.contains(&key_bytes) {
                         created_keys.insert(key_bytes);
-                        push_created_or_restored(&mut changes, entry, hot_archive_restored_keys);
+                        push_created_or_restored(&mut changes, entry, restored);
                     }
                 }
                 ChangeGroup::SingleUpdate { idx } => {
                     if idx < updated.len() {
                         let post_state = &updated[idx];
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            if hot_archive_restored_keys.contains(&key) {
+                            if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
                                 changes.push(LedgerEntryChange::Restored(post_state.clone()));
                             } else {
                                 // Get pre-state from update_states or snapshot
@@ -3424,7 +3460,7 @@ fn build_entry_changes_with_hot_archive(
                 ChangeGroup::SingleDelete { idx } => {
                     if idx < deleted.len() {
                         let key = &deleted[idx];
-                        if hot_archive_restored_keys.contains(key) {
+                        if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
                             let pre_state = if idx < delete_states.len() {
                                 Some(delete_states[idx].clone())
                             } else {
@@ -3476,7 +3512,7 @@ fn build_entry_changes_with_hot_archive(
                             push_created_or_restored(
                                 &mut changes,
                                 entry,
-                                hot_archive_restored_keys,
+                                restored,
                             );
                         }
                     }
@@ -3486,7 +3522,7 @@ fn build_entry_changes_with_hot_archive(
                         let post_state = &updated[*idx];
 
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            if hot_archive_restored_keys.contains(&key) {
+                            if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
                                 // Use entry value for hot archive restored entries
                                 changes.push(LedgerEntryChange::Restored(post_state.clone()));
                             } else {
@@ -3512,7 +3548,7 @@ fn build_entry_changes_with_hot_archive(
                 stellar_core_tx::ChangeRef::Deleted(idx) => {
                     if *idx < deleted.len() {
                         let key = &deleted[*idx];
-                        if hot_archive_restored_keys.contains(key) {
+                        if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
                             // Use the pre-state stored in the delta at the same index
                             let pre_state = if *idx < delete_states.len() {
                                 Some(delete_states[*idx].clone())
@@ -3549,7 +3585,7 @@ fn build_entry_changes_with_hot_archive(
         // Fallback: no change_order available (e.g., fee/seq changes)
         // Use type-grouped order: deleted -> updated -> created
         for key in deleted {
-            if hot_archive_restored_keys.contains(key) {
+            if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
                 if let Some(state_entry) = state_overrides
                     .get(key)
                     .cloned()
@@ -3579,7 +3615,7 @@ fn build_entry_changes_with_hot_archive(
                 seen_keys.insert(key_bytes.clone());
                 if let Some(final_entry) = final_updated.get(&key_bytes) {
                     if let Ok(key) = crate::delta::entry_to_key(final_entry) {
-                        if hot_archive_restored_keys.contains(&key) {
+                        if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
                             changes.push(LedgerEntryChange::Restored(final_entry.clone()));
                         } else {
                             if let Some(state_entry) = state_overrides
@@ -3599,7 +3635,34 @@ fn build_entry_changes_with_hot_archive(
         }
 
         for entry in created {
-            push_created_or_restored(&mut changes, entry, hot_archive_restored_keys);
+            push_created_or_restored(&mut changes, entry, restored);
+        }
+    }
+
+    // For live BL restores, add RESTORED changes for data/code entries that weren't
+    // directly modified (only their TTL was extended). Per C++ TransactionMeta.cpp:
+    // "RestoreOp will create both the TTL and Code/Data entry in the hot archive case.
+    // However, when restoring from live BucketList, only the TTL value will be modified,
+    // so we have to manually insert the RESTORED meta for the Code/Data entry here."
+    for (key, entry) in &restored.live_bucket_list_entries {
+        // Skip if this key was already processed (appears in updated or created)
+        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+        let already_processed = changes.iter().any(|change| {
+            let change_key = match change {
+                LedgerEntryChange::State(e)
+                | LedgerEntryChange::Created(e)
+                | LedgerEntryChange::Updated(e)
+                | LedgerEntryChange::Restored(e) => crate::delta::entry_to_key(e).ok(),
+                LedgerEntryChange::Removed(k) => Some(k.clone()),
+            };
+            change_key
+                .and_then(|k| k.to_xdr(Limits::none()).ok())
+                .map(|b| b == key_bytes)
+                .unwrap_or(false)
+        });
+
+        if !already_processed {
+            changes.push(LedgerEntryChange::Restored(entry.clone()));
         }
     }
 

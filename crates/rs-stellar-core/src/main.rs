@@ -2798,14 +2798,18 @@ fn extract_upgrade_changes(
 
 /// Converts a `LedgerEntryChange` to a sortable key for order-independent comparison.
 ///
-/// Returns `(change_type_order, key_xdr)` where:
-/// - `change_type_order` is 0=State, 1=Created, 2=Updated, 3=Removed, 4=Restored
-/// - `key_xdr` is the XDR-serialized ledger key
+/// Returns `(key_xdr, remapped_type, content_hash)` matching C++ stellar-core's MetaUtils.cpp.
+///
+/// C++ ordering from sortChanges():
+/// - Primary: ledger key (via LedgerEntryIdCmp)
+/// - Secondary: remapped type where REMOVED=0, STATE=1, CREATED=2, UPDATED=3, RESTORED=4
+/// - Tertiary: sha256 hash of the entire change XDR
 ///
 /// This enables consistent sorting since C++ stellar-core uses UnorderedMap with
 /// a random hash mixer, producing non-deterministic ordering across runs.
-fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (u8, Vec<u8>) {
+fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (Vec<u8>, u8, [u8; 32]) {
     use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, WriteXdr, Limits};
+    use sha2::{Sha256, Digest};
 
     fn entry_to_key_xdr(entry: &stellar_xdr::curr::LedgerEntry) -> Vec<u8> {
         // Extract the key from the entry and serialize it
@@ -2874,12 +2878,26 @@ fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (u8, Vec<u8
         key.to_xdr(Limits::none()).unwrap_or_default()
     }
 
+    // Compute sha256 hash of entire change XDR for tie-breaking
+    fn change_hash(change: &LedgerEntryChange) -> [u8; 32] {
+        let xdr_bytes = change.to_xdr(Limits::none()).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&xdr_bytes);
+        hasher.finalize().into()
+    }
+
+    // C++ remapped type order from MetaUtils.cpp:
+    // LEDGER_ENTRY_REMOVED (3) -> 0
+    // LEDGER_ENTRY_STATE (0) -> 1
+    // LEDGER_ENTRY_CREATED (1) -> 2
+    // LEDGER_ENTRY_UPDATED (2) -> 3
+    // LEDGER_ENTRY_RESTORED (4) -> 4
     match change {
-        LedgerEntryChange::State(entry) => (0, entry_to_key_xdr(entry)),
-        LedgerEntryChange::Created(entry) => (1, entry_to_key_xdr(entry)),
-        LedgerEntryChange::Updated(entry) => (2, entry_to_key_xdr(entry)),
-        LedgerEntryChange::Removed(key) => (3, key_to_xdr(key)),
-        LedgerEntryChange::Restored(entry) => (4, entry_to_key_xdr(entry)),
+        LedgerEntryChange::State(entry) => (entry_to_key_xdr(entry), 1, change_hash(change)),
+        LedgerEntryChange::Created(entry) => (entry_to_key_xdr(entry), 2, change_hash(change)),
+        LedgerEntryChange::Updated(entry) => (entry_to_key_xdr(entry), 3, change_hash(change)),
+        LedgerEntryChange::Removed(key) => (key_to_xdr(key), 0, change_hash(change)),
+        LedgerEntryChange::Restored(entry) => (entry_to_key_xdr(entry), 4, change_hash(change)),
     }
 }
 
@@ -2887,7 +2905,8 @@ fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (u8, Vec<u8
 ///
 /// C++ stellar-core's UnorderedMap uses RandHasher with a random gMixer per process,
 /// so metadata entry ordering is non-deterministic between different runs.
-/// This comparison sorts changes by (type, key) before comparing.
+/// This comparison sorts changes by (key, remapped_type, content_hash) before comparing,
+/// matching C++ MetaUtils.cpp sortChanges() ordering.
 ///
 /// # Returns
 ///
@@ -2911,7 +2930,7 @@ fn compare_entry_changes(
         ));
     }
 
-    // Sort both lists by (change_type, key_xdr) for order-independent comparison
+    // Sort both lists by (key_xdr, remapped_type, content_hash) matching C++ MetaUtils.cpp
     let mut our_sorted: Vec<_> = our_changes.iter().collect();
     let mut cdp_sorted: Vec<_> = cdp_changes.iter().collect();
     our_sorted.sort_by_key(|c| change_sort_key(c));
@@ -3113,7 +3132,7 @@ fn compare_transaction_meta(
         ));
     }
 
-    // Sort both lists by (change_type, key_xdr) for order-independent comparison
+    // Sort both lists by (key_xdr, remapped_type, content_hash) matching C++ MetaUtils.cpp
     let mut our_sorted: Vec<_> = our_changes.iter().collect();
     let mut cdp_sorted: Vec<_> = cdp_changes.iter().collect();
     our_sorted.sort_by_key(|c| change_sort_key(c));

@@ -89,6 +89,9 @@ pub struct SorobanOperationMeta {
     pub event_size_bytes: u32,
     /// Rent fee charged for storage changes.
     pub rent_fee: i64,
+    /// Entries restored from the live BucketList (expired TTL but not yet evicted).
+    /// These need RESTORED ledger entry changes emitted in transaction meta.
+    pub live_bucket_list_restores: Vec<crate::soroban::protocol::LiveBucketListRestore>,
 }
 
 pub struct OperationExecutionResult {
@@ -449,6 +452,7 @@ pub fn execute_operation_with_soroban(
                     return_value: None,
                     event_size_bytes: 0,
                     rent_fee,
+                    live_bucket_list_restores: Vec::new(),
                 });
             }
             Ok(exec)
@@ -495,6 +499,7 @@ pub fn execute_operation_with_soroban(
                     return_value: None,
                     event_size_bytes: 0,
                     rent_fee,
+                    live_bucket_list_restores: Vec::new(),
                 });
             }
             Ok(exec)

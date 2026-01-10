@@ -18,6 +18,22 @@ pub struct InvokeHostFunctionOutput {
     pub cpu_insns: u64,
     /// Memory bytes consumed.
     pub mem_bytes: u64,
+    /// Entries restored from the live BucketList (expired TTL but not yet evicted).
+    /// These need RESTORED ledger entry changes emitted in transaction meta.
+    pub live_bucket_list_restores: Vec<LiveBucketListRestore>,
+}
+
+/// An entry restored from the live BucketList (had expired TTL but wasn't yet evicted).
+#[derive(Debug, Clone)]
+pub struct LiveBucketListRestore {
+    /// The ledger key of the restored entry (ContractData or ContractCode).
+    pub key: LedgerKey,
+    /// The entry that was restored (pre-modification state).
+    pub entry: LedgerEntry,
+    /// The TTL key for this entry.
+    pub ttl_key: LedgerKey,
+    /// The TTL entry that was restored (pre-modification state with old expired TTL).
+    pub ttl_entry: LedgerEntry,
 }
 
 /// A change to a ledger entry from contract execution.

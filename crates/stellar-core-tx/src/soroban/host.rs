@@ -50,6 +50,8 @@ pub struct SorobanExecutionResult {
     pub contract_events_and_return_value_size: u32,
     /// Rent fee charged for storage changes.
     pub rent_fee: i64,
+    /// Entries restored from the live BucketList (expired TTL but not yet evicted).
+    pub live_bucket_list_restores: Vec<super::protocol::LiveBucketListRestore>,
 }
 
 /// Error from Soroban execution that includes consumed resources.
@@ -165,6 +167,78 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                     ))
                 })?;
                 Ok(Some((Rc::new(entry), live_until)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get an archived entry and check if it's a live BL restore.
+    /// Returns (p24 entry, live_until, live_bl_restore info if applicable).
+    pub fn get_archived_with_restore_info(
+        &self,
+        key: &Rc<soroban_env_host24::xdr::LedgerKey>,
+        current_key: &LedgerKey,
+    ) -> Result<Option<(Rc<soroban_env_host24::xdr::LedgerEntry>, Option<u32>, Option<super::protocol::LiveBucketListRestore>)>, HostErrorP24> {
+        let result = self.get_archived(key)?;
+
+        match result {
+            Some((entry, live_until)) => {
+                // Check if this is a live BL restore: entry exists AND TTL is expired
+                let live_bl_restore = if let Some(lu) = live_until {
+                    if lu < self.current_ledger {
+                        // Get the entry in current format (not p24)
+                        let current_entry = match current_key {
+                            LedgerKey::ContractData(cd_key) => {
+                                self.state.get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+                                    .map(|cd| LedgerEntry {
+                                        last_modified_ledger_seq: self.current_ledger,
+                                        data: LedgerEntryData::ContractData(cd.clone()),
+                                        ext: LedgerEntryExt::V0,
+                                    })
+                            }
+                            LedgerKey::ContractCode(cc_key) => {
+                                self.state.get_contract_code(&cc_key.hash).map(|code| LedgerEntry {
+                                    last_modified_ledger_seq: self.current_ledger,
+                                    data: LedgerEntryData::ContractCode(code.clone()),
+                                    ext: LedgerEntryExt::V0,
+                                })
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(e) = current_entry {
+                            // Get the TTL entry for the restore info
+                            let key_hash = compute_key_hash(current_key);
+                            let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash: key_hash.clone() });
+                            let ttl_entry = self.state.get_ttl(&key_hash).map(|ttl| {
+                                LedgerEntry {
+                                    last_modified_ledger_seq: self.current_ledger,
+                                    data: LedgerEntryData::Ttl(ttl.clone()),
+                                    ext: LedgerEntryExt::V0,
+                                }
+                            });
+
+                            if let Some(te) = ttl_entry {
+                                Some(super::protocol::LiveBucketListRestore {
+                                    key: current_key.clone(),
+                                    entry: e,
+                                    ttl_key,
+                                    ttl_entry: te,
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                Ok(Some((entry, live_until, live_bl_restore)))
             }
             None => Ok(None),
         }
@@ -341,6 +415,53 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
 
         match entry {
             Some(e) => Ok(Some((Rc::new(e), live_until))),
+            None => Ok(None),
+        }
+    }
+
+    /// Get an archived entry and check if it's a live BL restore.
+    /// Returns (entry, live_until, is_live_bl_restore, ttl_entry_if_live_bl).
+    pub fn get_archived_with_restore_info(
+        &self,
+        key: &Rc<LedgerKey>,
+    ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>, Option<super::protocol::LiveBucketListRestore>)>, HostErrorP25> {
+        let result = self.get_archived(key)?;
+
+        match result {
+            Some((entry, live_until)) => {
+                // Check if this is a live BL restore: entry exists AND TTL is expired
+                let live_bl_restore = if let Some(lu) = live_until {
+                    if lu < self.current_ledger {
+                        // Get the TTL entry for the restore info
+                        let key_hash = compute_key_hash(key.as_ref());
+                        let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash: key_hash.clone() });
+                        let ttl_entry = self.state.get_ttl(&key_hash).map(|ttl| {
+                            LedgerEntry {
+                                last_modified_ledger_seq: self.current_ledger,
+                                data: LedgerEntryData::Ttl(ttl.clone()),
+                                ext: LedgerEntryExt::V0,
+                            }
+                        });
+
+                        if let Some(te) = ttl_entry {
+                            Some(super::protocol::LiveBucketListRestore {
+                                key: key.as_ref().clone(),
+                                entry: entry.as_ref().clone(),
+                                ttl_key,
+                                ttl_entry: te,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                Ok(Some((entry, live_until, live_bl_restore)))
+            }
             None => Ok(None),
         }
     }
@@ -789,6 +910,9 @@ fn execute_host_function_p24(
         );
     }
 
+    // Track entries restored from live BucketList (expired TTL but not yet evicted)
+    let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
+
     for (idx, key) in soroban_data.resources.footprint.read_write.iter().enumerate() {
         let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(|| {
             make_setup_error(HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
@@ -797,18 +921,26 @@ fn execute_host_function_p24(
             )))
         })?;
 
-        // For archived entries being restored, use get_archived which doesn't check TTL
+        // For archived entries being restored, use get_archived_with_restore_info
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
-        let entry_result = if is_being_restored {
-            let result = snapshot.get_archived(&Rc::new(key_p24)).map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?;
-            if let Some((ref _entry, live_until)) = result {
-                tracing::warn!(
+        if is_being_restored {
+            let result = snapshot.get_archived_with_restore_info(&Rc::new(key_p24), key)
+                .map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?;
+            if let Some((entry, live_until, live_bl_restore)) = result {
+                tracing::info!(
                     idx = idx,
                     key_type = ?std::mem::discriminant(key),
                     live_until = ?live_until,
                     current_ledger = context.sequence,
+                    is_live_bl_restore = live_bl_restore.is_some(),
                     "P24: Archived entry found for restoration"
                 );
+                add_entry(key, &entry, live_until)?;
+
+                // Track live BL restorations
+                if let Some(restore) = live_bl_restore {
+                    live_bl_restores.push(restore);
+                }
             } else {
                 tracing::warn!(
                     idx = idx,
@@ -816,13 +948,11 @@ fn execute_host_function_p24(
                     "P24: Archived entry being restored but NOT FOUND in state"
                 );
             }
-            result
         } else {
-            snapshot.get(&Rc::new(key_p24)).map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?
-        };
-
-        if let Some((entry, live_until)) = entry_result {
-            add_entry(key, &entry, live_until)?;
+            // Normal entry - use standard TTL-filtered lookup
+            if let Some((entry, live_until)) = snapshot.get(&Rc::new(key_p24)).map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))? {
+                add_entry(key, &entry, live_until)?;
+            }
         }
     }
 
@@ -830,7 +960,8 @@ fn execute_host_function_p24(
         ledger_entries_count = encoded_ledger_entries.len(),
         ttl_entries_count = encoded_ttl_entries.len(),
         restored_count = restored_rw_entry_indices.len(),
-        "Prepared entries for e2e_invoke"
+        live_bl_restore_count = live_bl_restores.len(),
+        "P24: Prepared entries for e2e_invoke"
     );
 
     // Call e2e_invoke - iterator yields &Vec<u8> which implements AsRef<[u8]>
@@ -945,6 +1076,7 @@ fn execute_host_function_p24(
         mem_bytes,
         contract_events_and_return_value_size,
         rent_fee,
+        live_bucket_list_restores: live_bl_restores,
     })
 }
 
@@ -1121,31 +1253,39 @@ fn execute_host_function_p25(
         );
     }
 
+    // Track entries restored from live BucketList (expired TTL but not yet evicted)
+    let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
+
     for (idx, key) in soroban_data.resources.footprint.read_write.iter().enumerate() {
-        // For archived entries being restored, use get_archived which doesn't check TTL
+        // For archived entries being restored, use get_archived_with_restore_info
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
-        let entry_result = if is_being_restored {
-            let result = snapshot.get_archived(&Rc::new(key.clone())).map_err(make_setup_error)?;
-            if result.is_none() {
+        if is_being_restored {
+            let result = snapshot.get_archived_with_restore_info(&Rc::new(key.clone())).map_err(make_setup_error)?;
+            if let Some((entry, live_until, live_bl_restore)) = result {
+                tracing::info!(
+                    idx = idx,
+                    key_type = ?std::mem::discriminant(key),
+                    is_live_bl_restore = live_bl_restore.is_some(),
+                    "P25: Archived entry found for restoration"
+                );
+                add_entry(key, &entry, live_until)?;
+
+                // Track live BL restorations
+                if let Some(restore) = live_bl_restore {
+                    live_bl_restores.push(restore);
+                }
+            } else {
                 tracing::warn!(
                     idx = idx,
                     key_type = ?std::mem::discriminant(key),
                     "P25: Archived entry being restored but NOT FOUND in state"
                 );
-            } else {
-                tracing::info!(
-                    idx = idx,
-                    key_type = ?std::mem::discriminant(key),
-                    "P25: Archived entry found for restoration"
-                );
             }
-            result
         } else {
-            snapshot.get(&Rc::new(key.clone())).map_err(make_setup_error)?
-        };
-
-        if let Some((entry, live_until)) = entry_result {
-            add_entry(key, &entry, live_until)?;
+            // Normal entry - use standard TTL-filtered lookup
+            if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone())).map_err(make_setup_error)? {
+                add_entry(key, &entry, live_until)?;
+            }
         }
     }
 
@@ -1153,6 +1293,7 @@ fn execute_host_function_p25(
         ledger_entries_count = encoded_ledger_entries.len(),
         ttl_entries_count = encoded_ttl_entries.len(),
         restored_count = restored_rw_entry_indices.len(),
+        live_bl_restore_count = live_bl_restores.len(),
         "P25: Prepared entries for e2e_invoke"
     );
 
@@ -1267,6 +1408,7 @@ fn execute_host_function_p25(
         mem_bytes,
         contract_events_and_return_value_size,
         rent_fee,
+        live_bucket_list_restores: live_bl_restores,
     })
 }
 
