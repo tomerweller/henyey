@@ -2822,8 +2822,16 @@ impl LedgerStateManager {
         self.modified_claimable_balances.clear();
         self.modified_liquidity_pools.clear();
 
-        // Reset delta
+        // Reset delta but preserve fee_charged.
+        // Fees are always collected even for failed transactions, and we accumulate
+        // them across all transactions in a ledger. The fee for the current transaction
+        // was already added during fee deduction phase (before operations ran), so
+        // we preserve it here to avoid losing it when resetting entry changes.
+        let fee_charged = self.delta.fee_charged();
         self.delta = LedgerDelta::new(self.ledger_seq);
+        if fee_charged != 0 {
+            self.delta.add_fee(fee_charged);
+        }
     }
 
     /// Commit changes by clearing snapshots (changes become permanent).
@@ -3581,6 +3589,46 @@ mod tests {
         manager.rollback();
         assert!(manager.get_account(&account_id).is_none());
         assert!(!manager.has_changes());
+    }
+
+    #[test]
+    fn test_rollback_preserves_fee_charged() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Add fee from first transaction
+        manager.delta_mut().add_fee(400);
+        assert_eq!(manager.delta().fee_charged(), 400);
+
+        // Create an account (simulating transaction changes)
+        let account1 = create_test_account_entry(1);
+        manager.create_account(account1.clone());
+
+        // Rollback first transaction (simulating failed tx)
+        manager.rollback();
+        // After rollback, fee should be preserved
+        assert_eq!(manager.delta().fee_charged(), 400, "Fee from first tx should be preserved after rollback");
+
+        // Add fee from second transaction
+        manager.delta_mut().add_fee(100);
+        assert_eq!(manager.delta().fee_charged(), 500, "Fee should accumulate");
+
+        // Create another account
+        let account2 = create_test_account_entry(2);
+        manager.create_account(account2.clone());
+
+        // Rollback second transaction
+        manager.rollback();
+        // After rollback, fees from both transactions should be preserved
+        assert_eq!(manager.delta().fee_charged(), 500, "Fees from both failed txs should be preserved");
+
+        // Add fee from third transaction (successful)
+        manager.delta_mut().add_fee(100);
+        assert_eq!(manager.delta().fee_charged(), 600, "Total fees should be 600");
+
+        // Commit third transaction
+        manager.commit();
+        // Commit doesn't reset fee_charged
+        assert_eq!(manager.delta().fee_charged(), 600, "Total fees should remain after commit");
     }
 
     #[test]

@@ -2212,9 +2212,9 @@ impl TransactionExecutor {
             );
             self.state.rollback();
             restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
-            // Re-add the fee to the delta since rollback() resets the delta's fee_charged.
-            // Even though the transaction failed, fees are always collected.
-            self.state.delta_mut().add_fee(fee);
+            // Note: fee is already preserved by rollback() - no need to re-add.
+            // The fee was added during fee deduction phase and rollback() now preserves
+            // accumulated fees to avoid losing fees from previous failed transactions.
             if self.protocol_version >= 10 {
                 restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
             }
