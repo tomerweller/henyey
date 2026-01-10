@@ -118,7 +118,7 @@ fn execute_contract_invocation(
                 )));
             }
             // Apply storage changes back to our state.
-            apply_soroban_storage_changes(state, &result.storage_changes);
+            apply_soroban_storage_changes(state, &result.storage_changes, &soroban_data.resources.footprint);
 
             // Compute result hash from success preimage (return value + events)
             let result_hash = compute_success_preimage_hash(
@@ -415,7 +415,18 @@ fn build_soroban_operation_meta(
 fn apply_soroban_storage_changes(
     state: &mut LedgerStateManager,
     changes: &[crate::soroban::StorageChange],
+    footprint: &stellar_xdr::curr::LedgerFootprint,
 ) {
+    use std::collections::HashSet;
+
+    // Track all keys that were created or modified by the host
+    let mut created_and_modified_keys: HashSet<LedgerKey> = HashSet::new();
+    for change in changes {
+        if change.new_entry.is_some() {
+            created_and_modified_keys.insert(change.key.clone());
+        }
+    }
+
     // Reorder changes so that Soroban entry creates/updates come before classic entry updates.
     // The Soroban host returns changes in key order (Account=0 < ContractData=6 < TTL=9),
     // but C++ stellar-core uses hash-based iteration which produces a different order.
@@ -446,6 +457,42 @@ fn apply_soroban_storage_changes(
     // Then apply classic changes (Account, Trustline updates from SAC)
     for change in &classic_changes {
         apply_soroban_storage_change(state, change);
+    }
+
+    // C++ stellar-core behavior: delete any read-write footprint entries that weren't
+    // returned by the host. This handles entries that were explicitly deleted by the
+    // host or had expired TTL. The host passes through all entries it touches, so
+    // entries NOT returned are considered deleted.
+    // See: InvokeHostFunctionOpFrame.cpp recordStorageChanges()
+    for key in footprint.read_write.iter() {
+        if created_and_modified_keys.contains(key) {
+            continue;
+        }
+
+        // Only delete Soroban entries (ContractData, ContractCode)
+        // Account and Trustline entries are handled differently
+        match key {
+            LedgerKey::ContractData(cd_key) => {
+                if state.get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability).is_some() {
+                    state.delete_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability);
+                    // Also delete the associated TTL entry
+                    let key_hash = compute_key_hash(key);
+                    state.delete_ttl(&key_hash);
+                }
+            }
+            LedgerKey::ContractCode(cc_key) => {
+                if state.get_contract_code(&cc_key.hash).is_some() {
+                    state.delete_contract_code(&cc_key.hash);
+                    // Also delete the associated TTL entry
+                    let key_hash = compute_key_hash(key);
+                    state.delete_ttl(&key_hash);
+                }
+            }
+            // TTL entries are handled along with their associated data/code entries above
+            LedgerKey::Ttl(_) => {}
+            // Classic entries (Account, Trustline) are not deleted this way
+            _ => {}
+        }
     }
 }
 
