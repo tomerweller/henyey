@@ -1575,7 +1575,7 @@ impl App {
                 .send_survey_request(peer_id.clone(), nonce, ledger_num, inbound_index, outbound_index)
                 .await;
             if !ok {
-                tracing::debug!(peer = ?peer_id, "Survey request failed to send");
+                tracing::debug!(peer = %peer_id, "Survey request failed to send");
             }
         }
     }
@@ -1613,7 +1613,7 @@ impl App {
         let message_bytes = match message.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encode survey request");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey request");
                 return false;
             }
         };
@@ -2462,7 +2462,7 @@ impl App {
                             if let Some(ref overlay) = *overlay {
                                 let request = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
                                 if let Err(e) = overlay.send_to(&peer, request).await {
-                                    tracing::debug!(peer = ?peer, error = %e, "Failed to request quorum set");
+                                    tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
                                 }
                             }
                         }
@@ -2488,7 +2488,7 @@ impl App {
                                         );
                                         if let Err(e) = overlay.send_to(&peer, request).await {
                                             tracing::debug!(
-                                                peer = ?peer,
+                                                peer = %peer,
                                                 error = %e,
                                                 "Failed to request tx set from externalize peer"
                                             );
@@ -2512,10 +2512,10 @@ impl App {
                         tracing::info!(slot, tracking, "SCP envelope too old");
                     }
                     EnvelopeState::Invalid => {
-                        tracing::warn!(slot, peer = ?msg.from_peer, "Invalid SCP envelope");
+                        tracing::warn!(slot, peer = %msg.from_peer, "Invalid SCP envelope");
                     }
                     EnvelopeState::InvalidSignature => {
-                        tracing::warn!(slot, peer = ?msg.from_peer, "SCP envelope with invalid signature");
+                        tracing::warn!(slot, peer = %msg.from_peer, "SCP envelope with invalid signature");
                     }
                 }
             }
@@ -2524,7 +2524,7 @@ impl App {
                 let tx_hash = self.tx_hash(&tx_env);
                 match self.herder.receive_transaction(tx_env.clone()) {
                     stellar_core_herder::TxQueueResult::Added => {
-                        tracing::debug!(peer = ?msg.from_peer, "Transaction added to queue");
+                        tracing::debug!(peer = %msg.from_peer, "Transaction added to queue");
                         if let Some(hash) = tx_hash {
                             self.record_tx_pull_latency(hash, &msg.from_peer).await;
                         }
@@ -2571,7 +2571,7 @@ impl App {
                 let is_ping = matches!(dont_have.type_, stellar_xdr::curr::MessageType::ScpQuorumset);
                 if is_tx_set {
                     tracing::info!(
-                        peer = ?msg.from_peer,
+                        peer = %msg.from_peer,
                         hash = hex::encode(dont_have.req_hash.0),
                         "Peer reported DontHave for TxSet"
                     );
@@ -2593,17 +2593,17 @@ impl App {
             }
 
             StellarMessage::GetScpState(ledger_seq) => {
-                tracing::debug!(ledger_seq, peer = ?msg.from_peer, "Peer requested SCP state");
+                tracing::debug!(ledger_seq, peer = %msg.from_peer, "Peer requested SCP state");
                 self.send_scp_state(&msg.from_peer, ledger_seq).await;
             }
 
             StellarMessage::GetScpQuorumset(hash) => {
-                tracing::debug!(hash = hex::encode(hash.0), peer = ?msg.from_peer, "Peer requested quorum set");
+                tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested quorum set");
                 self.send_quorum_set(&msg.from_peer, hash).await;
             }
 
             StellarMessage::ScpQuorumset(quorum_set) => {
-                tracing::debug!(peer = ?msg.from_peer, "Received quorum set");
+                tracing::debug!(peer = %msg.from_peer, "Received quorum set");
                 let hash = stellar_core_scp::hash_quorum_set(&quorum_set);
                 self.process_ping_response(&msg.from_peer, hash.0).await;
                 self.handle_quorum_set(&msg.from_peer, quorum_set).await;
@@ -2629,22 +2629,22 @@ impl App {
             }
 
             StellarMessage::Peers(peer_list) => {
-                tracing::debug!(count = peer_list.len(), peer = ?msg.from_peer, "Received peer list");
+                tracing::debug!(count = peer_list.len(), peer = %msg.from_peer, "Received peer list");
                 self.process_peer_list(peer_list).await;
             }
 
             StellarMessage::TxSet(tx_set) => {
-                tracing::info!(peer = ?msg.from_peer, "Received TxSet");
+                tracing::info!(peer = %msg.from_peer, "Received TxSet");
                 self.handle_tx_set(tx_set).await;
             }
 
             StellarMessage::GeneralizedTxSet(gen_tx_set) => {
-                tracing::info!(peer = ?msg.from_peer, "Received GeneralizedTxSet");
+                tracing::info!(peer = %msg.from_peer, "Received GeneralizedTxSet");
                 self.handle_generalized_tx_set(gen_tx_set).await;
             }
 
             StellarMessage::GetTxSet(hash) => {
-                tracing::debug!(hash = hex::encode(hash.0), peer = ?msg.from_peer, "Peer requested TxSet");
+                tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested TxSet");
                 self.send_tx_set(&msg.from_peer, &hash.0).await;
             }
 
@@ -3555,7 +3555,7 @@ impl App {
         if let Some(qs) = quorum_set {
             let msg = StellarMessage::ScpQuorumset(qs);
             if let Err(e) = overlay.send_to(peer_id, msg).await {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to send quorum set");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
             }
         }
 
@@ -3563,12 +3563,12 @@ impl App {
         for envelope in envelopes {
             let msg = StellarMessage::ScpMessage(envelope);
             if let Err(e) = overlay.send_to(peer_id, msg).await {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to send SCP envelope");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to send SCP envelope");
                 break; // Stop if we can't send
             }
         }
 
-        tracing::debug!(peer = ?peer_id, from_ledger, "Sent SCP state response");
+        tracing::debug!(peer = %peer_id, from_ledger, "Sent SCP state response");
     }
 
     /// Respond to a GetScpQuorumset message.
@@ -3586,7 +3586,7 @@ impl App {
         let req = requested_hash.0;
         if let Some(qs) = self.herder.get_quorum_set_by_hash(&req) {
             if let Err(e) = overlay.send_to(peer_id, StellarMessage::ScpQuorumset(qs)).await {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to send quorum set");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
             }
         } else {
             let msg = StellarMessage::DontHave(stellar_xdr::curr::DontHave {
@@ -3594,7 +3594,7 @@ impl App {
                 req_hash: requested_hash,
             });
             if let Err(e) = overlay.send_to(peer_id, msg).await {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to send DontHave for quorum set");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to send DontHave for quorum set");
             }
         }
     }
@@ -3623,7 +3623,7 @@ impl App {
         let message_bytes = match message.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encode survey start message");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey start message");
                 return;
             }
         };
@@ -3640,7 +3640,7 @@ impl App {
             || self.verify_survey_signature(&message.surveyor_id, &message_bytes, &signed.signature),
         );
         if !is_valid {
-            tracing::debug!(peer = ?peer_id, "Survey start rejected by limiter");
+            tracing::debug!(peer = %peer_id, "Survey start rejected by limiter");
             return;
         }
 
@@ -3671,9 +3671,9 @@ impl App {
             dropped,
             initially_out_of_sync,
         ) {
-            tracing::debug!(peer = ?peer_id, "Survey collection started");
+            tracing::debug!(peer = %peer_id, "Survey collection started");
         } else {
-            tracing::debug!(peer = ?peer_id, "Survey collection already active");
+            tracing::debug!(peer = %peer_id, "Survey collection already active");
         }
     }
 
@@ -3686,7 +3686,7 @@ impl App {
         let message_bytes = match message.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encode survey stop message");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey stop message");
                 return;
             }
         };
@@ -3701,7 +3701,7 @@ impl App {
             || self.verify_survey_signature(&message.surveyor_id, &message_bytes, &signed.signature),
         );
         if !is_valid {
-            tracing::debug!(peer = ?peer_id, "Survey stop rejected by limiter");
+            tracing::debug!(peer = %peer_id, "Survey stop rejected by limiter");
             return;
         }
 
@@ -3722,9 +3722,9 @@ impl App {
 
         let mut survey_data = self.survey_data.write().await;
         if survey_data.stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync) {
-            tracing::debug!(peer = ?peer_id, "Survey collection stopped");
+            tracing::debug!(peer = %peer_id, "Survey collection stopped");
         } else {
-            tracing::debug!(peer = ?peer_id, "Survey stop ignored (inactive or nonce mismatch)");
+            tracing::debug!(peer = %peer_id, "Survey stop ignored (inactive or nonce mismatch)");
         }
     }
 
@@ -3737,7 +3737,7 @@ impl App {
         let request_bytes = match request.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encode survey request");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey request");
                 return;
             }
         };
@@ -3764,7 +3764,7 @@ impl App {
             },
         );
         if !is_valid {
-            tracing::debug!(peer = ?peer_id, "Survey request rejected by limiter");
+            tracing::debug!(peer = %peer_id, "Survey request rejected by limiter");
             return;
         }
 
@@ -3780,7 +3780,7 @@ impl App {
                 match survey_data.fill_survey_data(request) {
                     Some(body) => body,
                     None => {
-                        tracing::debug!(peer = ?peer_id, "Survey request without reporting data");
+                        tracing::debug!(peer = %peer_id, "Survey request without reporting data");
                         return;
                     }
                 }
@@ -3791,7 +3791,7 @@ impl App {
         let response_body_bytes = match response_body.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encode survey response body");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey response body");
                 return;
             }
         };
@@ -3801,14 +3801,14 @@ impl App {
         ) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encrypt survey response body");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encrypt survey response body");
                 return;
             }
         };
         let encrypted_body = match encrypted_body_bytes.try_into() {
             Ok(body) => EncryptedBody(body),
             Err(_) => {
-                tracing::debug!(peer = ?peer_id, "Survey response body exceeded XDR limits");
+                tracing::debug!(peer = %peer_id, "Survey response body exceeded XDR limits");
                 return;
             }
         };
@@ -3829,7 +3829,7 @@ impl App {
         let response_bytes = match response_message.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encode survey response");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey response");
                 return;
             }
         };
@@ -3847,7 +3847,7 @@ impl App {
                 .send_to(peer_id, StellarMessage::TimeSlicedSurveyResponse(signed_response))
                 .await
             {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to send survey response");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to send survey response");
             }
         }
     }
@@ -3861,7 +3861,7 @@ impl App {
         let response_bytes = match response_message.to_xdr(stellar_xdr::curr::Limits::none()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to encode survey response");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to encode survey response");
                 return;
             }
         };
@@ -3883,7 +3883,7 @@ impl App {
             },
         );
         if !is_valid {
-            tracing::debug!(peer = ?peer_id, "Survey response rejected by limiter");
+            tracing::debug!(peer = %peer_id, "Survey response rejected by limiter");
             return;
         }
 
@@ -3899,7 +3899,7 @@ impl App {
         let secret = match secret {
             Some(secret) => secret,
             None => {
-                tracing::debug!(peer = ?peer_id, "Survey response without matching secret");
+                tracing::debug!(peer = %peer_id, "Survey response without matching secret");
                 return;
             }
         };
@@ -3910,7 +3910,7 @@ impl App {
         ) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to decrypt survey response");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to decrypt survey response");
                 let mut reporting = self.survey_reporting.write().await;
                 reporting.bad_response_nodes.insert(peer_id.clone());
                 return;
@@ -3923,7 +3923,7 @@ impl App {
         ) {
             Ok(body) => body,
             Err(e) => {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to decode survey response body");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to decode survey response body");
                 let mut reporting = self.survey_reporting.write().await;
                 reporting.bad_response_nodes.insert(peer_id.clone());
                 return;
@@ -3944,7 +3944,7 @@ impl App {
             (entry.inbound_peers.0.len(), entry.outbound_peers.0.len())
         };
         tracing::debug!(
-            peer = ?peer_id,
+            peer = %peer_id,
             inbound = body.inbound_peers.0.len(),
             outbound = body.outbound_peers.0.len(),
             "Decrypted survey response"
@@ -4256,7 +4256,7 @@ impl App {
                 ) {
                     Ok(vec) => vec,
                     Err(_) => {
-                        tracing::debug!(peer = ?peer_id, "Failed to build tx advert vector");
+                        tracing::debug!(peer = %peer_id, "Failed to build tx advert vector");
                         continue;
                     }
                 };
@@ -4265,7 +4265,7 @@ impl App {
                     .send_to(&peer_id, StellarMessage::FloodAdvert(advert))
                     .await
                 {
-                    tracing::debug!(peer = ?peer_id, error = %e, "Failed to send tx advert batch");
+                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send tx advert batch");
                 }
             }
         }
@@ -4356,7 +4356,7 @@ impl App {
             let delta = now.duration_since(*peer_demanded);
             tracing::debug!(
                 hash = %hash.to_hex(),
-                peer = ?peer,
+                peer = %peer,
                 latency_ms = delta.as_millis(),
                 "Pulled transaction from peer"
             );
@@ -4530,7 +4530,7 @@ impl App {
             ) {
                 Ok(vec) => vec,
                 Err(_) => {
-                    tracing::debug!(peer = ?peer_id, "Failed to build tx demand vector");
+                    tracing::debug!(peer = %peer_id, "Failed to build tx demand vector");
                     continue;
                 }
             };
@@ -4539,7 +4539,7 @@ impl App {
                 .send_to(&peer_id, StellarMessage::FloodDemand(demand))
                 .await
             {
-                tracing::debug!(peer = ?peer_id, error = %e, "Failed to send flood demand");
+                tracing::debug!(peer = %peer_id, error = %e, "Failed to send flood demand");
             }
         }
     }
@@ -4765,7 +4765,7 @@ impl App {
         for (peer, hash) in to_ping {
             let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
             if let Err(e) = overlay.send_to(&peer, msg).await {
-                tracing::debug!(peer = ?peer, error = %e, "Failed to send ping");
+                tracing::debug!(peer = %peer, error = %e, "Failed to send ping");
                 let mut inflight = self.ping_inflight.write().await;
                 inflight.remove(&hash);
                 let mut peer_inflight = self.peer_ping_inflight.write().await;
@@ -4880,7 +4880,7 @@ impl App {
             let message_bytes = match message.to_xdr(stellar_xdr::curr::Limits::none()) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    tracing::debug!(peer = ?peer, error = %e, "Failed to encode survey request");
+                    tracing::debug!(peer = %peer, error = %e, "Failed to encode survey request");
                     ok = false;
                     continue;
                 }
@@ -4954,7 +4954,7 @@ impl App {
         let mut ok = true;
         for peer in peers {
             if let Err(e) = overlay.send_to(peer, message.clone()).await {
-                tracing::debug!(peer = ?peer, error = %e, "Failed to send survey message");
+                tracing::debug!(peer = %peer, error = %e, "Failed to send survey message");
                 ok = false;
             }
         }
@@ -5049,7 +5049,7 @@ impl App {
                     .send_to(peer_id, StellarMessage::Transaction(tx.envelope))
                     .await
                 {
-                    tracing::debug!(peer = ?peer_id, error = %e, "Failed to send demanded transaction");
+                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send demanded transaction");
                 }
             } else {
                 let dont_have = DontHave {
@@ -5060,7 +5060,7 @@ impl App {
                     .send_to(peer_id, StellarMessage::DontHave(dont_have))
                     .await
                 {
-                    tracing::debug!(peer = ?peer_id, error = %e, "Failed to send DontHave for transaction");
+                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send DontHave for transaction");
                 }
             }
         }
@@ -5572,7 +5572,7 @@ impl App {
         let tx_set = match self.herder.get_tx_set(&hash256) {
             Some(ts) => ts,
             None => {
-                tracing::debug!(hash = hex::encode(hash), peer = ?peer_id, "TxSet not found in cache");
+                tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "TxSet not found in cache");
                 let overlay = self.overlay.lock().await;
                 if let Some(ref overlay) = *overlay {
                     let ledger_version = self.ledger_manager.current_header().ledger_version;
@@ -5586,7 +5586,7 @@ impl App {
                         req_hash: stellar_xdr::curr::Uint256(*hash),
                     });
                     if let Err(e) = overlay.send_to(peer_id, msg).await {
-                        tracing::debug!(hash = hex::encode(hash), peer = ?peer_id, error = %e, "Failed to send DontHave for TxSet");
+                        tracing::debug!(hash = hex::encode(hash), peer = %peer_id, error = %e, "Failed to send DontHave for TxSet");
                     }
                 }
                 return;
@@ -5612,9 +5612,9 @@ impl App {
                     let overlay = self.overlay.lock().await;
                     if let Some(ref overlay) = *overlay {
                         if let Err(e) = overlay.send_to(peer_id, message).await {
-                            tracing::warn!(hash = %hash256, peer = ?peer_id, error = %e, "Failed to send GeneralizedTxSet");
+                            tracing::warn!(hash = %hash256, peer = %peer_id, error = %e, "Failed to send GeneralizedTxSet");
                         } else {
-                            tracing::debug!(hash = %hash256, peer = ?peer_id, "Sent GeneralizedTxSet");
+                            tracing::debug!(hash = %hash256, peer = %peer_id, "Sent GeneralizedTxSet");
                         }
                     }
                     return;
@@ -5635,9 +5635,9 @@ impl App {
         let overlay = self.overlay.lock().await;
         if let Some(ref overlay) = *overlay {
             if let Err(e) = overlay.send_to(peer_id, message).await {
-                tracing::warn!(hash = hex::encode(hash), peer = ?peer_id, error = %e, "Failed to send TxSet");
+                tracing::warn!(hash = hex::encode(hash), peer = %peer_id, error = %e, "Failed to send TxSet");
             } else {
-                tracing::debug!(hash = hex::encode(hash), peer = ?peer_id, "Sent TxSet");
+                tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "Sent TxSet");
             }
         }
     }
@@ -5775,10 +5775,10 @@ impl App {
         };
 
         for (hash, peer_id) in requests {
-            tracing::info!(hash = %hash, peer = ?peer_id, "Requesting tx set");
+            tracing::info!(hash = %hash, peer = %peer_id, "Requesting tx set");
             let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
             if let Err(e) = overlay.send_to(&peer_id, request).await {
-                tracing::warn!(hash = %hash, peer = ?peer_id, error = %e, "Failed to request TxSet");
+                tracing::warn!(hash = %hash, peer = %peer_id, error = %e, "Failed to request TxSet");
             }
         }
     }
