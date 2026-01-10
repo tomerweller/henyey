@@ -1,13 +1,14 @@
 //! Item fetcher for TxSet and QuorumSet retrieval.
 //!
 //! This module implements the ItemFetcher and Tracker classes from C++ stellar-core.
-//! It manages asking peers for Transaction Sets and Quorum Sets.
+//! It manages asking peers for Transaction Sets and Quorum Sets during SCP consensus.
 //!
 //! # Overview
 //!
-//! - `ItemFetcher` manages multiple `Tracker` instances, one per item being fetched
-//! - `Tracker` handles the state machine for fetching a single item from peers
+//! - [`ItemFetcher`] manages multiple [`Tracker`] instances, one per item being fetched
+//! - [`Tracker`] handles the state machine for fetching a single item from peers
 //! - Items are identified by their SHA-256 hash
+//! - A callback mechanism allows integration with the overlay manager for sending requests
 //!
 //! # Protocol
 //!
@@ -16,6 +17,37 @@
 //! 3. If a peer responds with DONT_HAVE, we try the next peer
 //! 4. If we exhaust all peers, we restart with exponential backoff
 //! 5. When the item is received, all waiting envelopes are re-processed
+//!
+//! # Callback Integration
+//!
+//! The ItemFetcher supports a callback mechanism for requesting items from peers:
+//!
+//! 1. Configure the callback with [`ItemFetcher::set_ask_peer`]
+//! 2. Update available peers with [`ItemFetcher::set_available_peers`]
+//! 3. When [`ItemFetcher::fetch`] is called, the callback is invoked immediately
+//! 4. Call [`ItemFetcher::process_pending`] periodically to handle timeouts and retries
+//!
+//! # Example
+//!
+//! ```ignore
+//! use stellar_core_overlay::{ItemFetcher, ItemFetcherConfig, ItemType};
+//!
+//! let mut fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default());
+//!
+//! // Set up callback to request items from peers
+//! fetcher.set_ask_peer(Box::new(|peer_id, hash, item_type| {
+//!     overlay_manager.send_get_tx_set(peer_id, hash);
+//! }));
+//!
+//! // Update available peers
+//! fetcher.set_available_peers(overlay_manager.authenticated_peers());
+//!
+//! // Start fetching - callback is invoked immediately
+//! fetcher.fetch(tx_set_hash, &envelope);
+//!
+//! // Periodically process timeouts (e.g., every second)
+//! fetcher.process_pending();
+//! ```
 
 use crate::PeerId;
 use std::collections::HashMap;
@@ -34,7 +66,8 @@ pub enum ItemType {
 }
 
 /// Callback type for asking a peer for an item.
-pub type AskPeerFn = Box<dyn Fn(&PeerId, &Hash) + Send + Sync>;
+/// Parameters: peer_id, item_hash, item_type
+pub type AskPeerFn = Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>;
 
 /// Configuration for item fetching.
 #[derive(Debug, Clone)]
@@ -294,6 +327,8 @@ pub struct ItemFetcher {
     trackers: Mutex<HashMap<Hash, Tracker>>,
     /// Callback to request items from peers.
     ask_peer: Option<AskPeerFn>,
+    /// Available peers (updated externally).
+    available_peers: Mutex<Vec<PeerId>>,
 }
 
 impl ItemFetcher {
@@ -304,6 +339,7 @@ impl ItemFetcher {
             item_type,
             trackers: Mutex::new(HashMap::new()),
             ask_peer: None,
+            available_peers: Mutex::new(Vec::new()),
         }
     }
 
@@ -317,10 +353,22 @@ impl ItemFetcher {
         self.ask_peer = Some(f);
     }
 
+    /// Update the list of available peers.
+    pub fn set_available_peers(&self, peers: Vec<PeerId>) {
+        *self.available_peers.lock().unwrap() = peers;
+    }
+
+    /// Get the current list of available peers.
+    pub fn get_available_peers(&self) -> Vec<PeerId> {
+        self.available_peers.lock().unwrap().clone()
+    }
+
     /// Start fetching an item needed by an envelope.
     ///
     /// Multiple envelopes may need the same item.
+    /// Immediately tries to fetch from a peer if callback is set.
     pub fn fetch(&self, item_hash: Hash, envelope: &ScpEnvelope) {
+        let available_peers = self.available_peers.lock().unwrap().clone();
         let mut trackers = self.trackers.lock().unwrap();
 
         trace!("fetch {:?} {}", self.item_type, hex::encode(&item_hash.0));
@@ -332,6 +380,25 @@ impl ItemFetcher {
             // Create new tracker
             let mut tracker = Tracker::new(item_hash.clone(), self.config.clone());
             tracker.listen(envelope);
+
+            // Immediately try to fetch from a peer (like C++ stellar-core)
+            if let Some(ref ask_peer) = self.ask_peer {
+                match tracker.try_next_peer(&available_peers) {
+                    NextPeerResult::AskPeer { ref peer, .. } => {
+                        trace!(
+                            "Immediately asking peer {} for {:?} {}",
+                            peer,
+                            self.item_type,
+                            hex::encode(&item_hash.0)
+                        );
+                        ask_peer(peer, &item_hash, self.item_type);
+                    }
+                    NextPeerResult::Wait { .. } => {
+                        // No peers available yet, will retry later
+                    }
+                }
+            }
+
             trackers.insert(item_hash, tracker);
         }
     }
@@ -475,6 +542,40 @@ impl ItemFetcher {
         }
 
         requests
+    }
+
+    /// Process pending requests and invoke callbacks for items that need fetching.
+    ///
+    /// This should be called periodically (e.g., every second) to handle timeouts
+    /// and retry fetching from different peers. Returns the number of requests sent.
+    pub fn process_pending(&self) -> usize {
+        let available_peers = self.available_peers.lock().unwrap().clone();
+        let requests = self.get_pending_requests(&available_peers);
+
+        if requests.is_empty() {
+            return 0;
+        }
+
+        let mut sent = 0;
+        if let Some(ref ask_peer) = self.ask_peer {
+            for request in &requests {
+                trace!(
+                    "Processing pending {:?} {} -> peer {}",
+                    self.item_type,
+                    hex::encode(&request.item_hash.0),
+                    request.peer
+                );
+                ask_peer(&request.peer, &request.item_hash, self.item_type);
+                sent += 1;
+            }
+        }
+
+        debug!(
+            "Processed {} pending {:?} requests",
+            sent,
+            self.item_type
+        );
+        sent
     }
 
     /// Check if an item is being tracked.

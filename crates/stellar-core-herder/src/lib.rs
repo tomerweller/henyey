@@ -94,6 +94,7 @@
 pub mod dead_node_tracker;
 pub mod drift_tracker;
 mod error;
+pub mod fetching_envelopes;
 pub mod flow_control;
 mod herder;
 mod herder_utils;
@@ -114,6 +115,7 @@ pub mod upgrades;
 
 // Re-export main types
 pub use error::HerderError;
+pub use fetching_envelopes::{FetchingConfig, FetchingEnvelopes, FetchingStats, RecvResult};
 pub use herder::{EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseInfo};
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 pub use quorum_tracker::{QuorumTracker, SlotQuorumTracker};
