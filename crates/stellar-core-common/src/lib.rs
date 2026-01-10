@@ -9,6 +9,7 @@
 //!
 //! The crate is organized into the following modules:
 //!
+//! - [`asset`] - Asset validation, conversion, and balance utilities
 //! - [`config`] - Configuration types for node setup (network, database, history archives)
 //! - [`error`] - Common error types and the [`Result`] type alias
 //! - [`math`] - 128-bit arithmetic and overflow-safe math operations
@@ -42,6 +43,7 @@
 //! let config = Config::testnet();
 //! ```
 
+pub mod asset;
 pub mod config;
 pub mod error;
 pub mod math;

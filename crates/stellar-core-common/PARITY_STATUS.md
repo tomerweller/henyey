@@ -9,7 +9,7 @@ This document details the parity between `stellar-core-common` and the C++ upstr
 | Protocol Version | Full | All version checks and constants match C++ |
 | Resource Accounting | Full | All operations including scaling/division |
 | Metadata Normalization | Full | Matches C++ sorting behavior exactly |
-| Hash/Types | Partial | Core Hash256 done; many type utilities missing |
+| Hash/Types | Full | Hash256, asset validation, balance utilities |
 | Network Identity | Full | Passphrase-based derivation matches C++ |
 | Time Utilities | Partial | Basic conversions done; VirtualClock not implemented |
 | Math Utilities | Full | bigDivide, saturating ops, sqrt implemented |
@@ -91,32 +91,37 @@ Additional Rust utilities:
 | Support for TransactionMeta V0-V4 | V0-V4 support | Full coverage |
 | Support for LedgerCloseMeta V0-V2 | V0-V2 support | Full coverage |
 
-### Core Types (`types.rs` <-> `types.h/.cpp`)
+### Core Types (`types.rs`, `asset.rs` <-> `types.h/.cpp`)
 
-**Status: Partial Parity**
+**Status: Full Parity**
 
 | C++ Feature | Rust Equivalent | Status |
 |-------------|-----------------|--------|
 | `Hash` type (xdr::opaque_array<32>) | `Hash256` | Implemented |
 | `isZero(uint256 const&)` | `Hash256::is_zero()` | Implemented |
-| `LedgerEntryKey()` | `ledger_entry_key()` in meta.rs | Implemented |
-| `operator^=` for Hash | Not implemented | Missing |
-| `lessThanXored()` | Not implemented | Missing |
-| `isStringValid()` | Not implemented | Missing |
-| `isAssetValid()` | Not implemented | Missing |
-| `compareAsset()` | Not implemented | Missing |
-| `unsignedToSigned()` | Not implemented | Missing |
-| `formatSize()` | Not implemented | Missing |
-| `addBalance()` | Not implemented | Missing |
-| `iequals()` | Not implemented | Missing |
-| `Price` comparison operators | Not implemented | Missing |
-| `assetCodeToStr()` / `strToAssetCode()` | Not implemented | Missing |
-| `assetToString()` | Not implemented | Missing |
-| `getIssuer()` / `isIssuer()` | Not implemented | Missing |
-| `getBucketLedgerKey()` | Not implemented | Missing |
-| `roundDown()` | Not implemented | Missing |
-| `LedgerKeySet` typedef | Not implemented | Missing |
-| ASCII utilities (`isAsciiAlphaNumeric`, etc.) | Not implemented | Missing |
+| `LedgerEntryKey()` | `ledger_entry_key()` | Implemented |
+| `operator^=` for Hash | `BitXorAssign` for Hash256 | Implemented |
+| `lessThanXored()` | `less_than_xored()` | Implemented |
+| `isStringValid()` | `is_string_valid()` | Implemented |
+| `isAssetValid()` | `is_asset_valid()` | Implemented |
+| `compareAsset()` | `compare_asset()` | Implemented |
+| `unsignedToSigned()` | `unsigned_to_signed_32/64()` | Implemented |
+| `formatSize()` | `format_size()` | Implemented |
+| `addBalance()` | `add_balance()` | Implemented |
+| `iequals()` | `iequals()` | Implemented |
+| `Price` comparison operators | `price_ge()`, `price_gt()`, `price_eq()` | Implemented |
+| `assetCodeToStr()` / `strToAssetCode()` | `asset_code_to_str()` / `str_to_asset_code()` | Implemented |
+| `assetToString()` | `asset_to_string()` | Implemented |
+| `getIssuer()` / `isIssuer()` | `get_issuer()` / `is_issuer()` | Implemented |
+| `getBucketLedgerKey()` | `get_bucket_ledger_key()`, `get_hot_archive_bucket_ledger_key()` | Implemented |
+| `roundDown()` | `round_down()` | Implemented |
+| `LedgerKeySet` typedef | Use `std::collections::BTreeSet<LedgerKey>` | Rust idiom |
+| `isAsciiAlphaNumeric()` | `is_ascii_alphanumeric()` | Implemented |
+| `isAsciiNonControl()` | `is_ascii_non_control()` | Implemented |
+| `toAsciiLower()` | `to_ascii_lower()` | Implemented |
+| `isPoolShareAssetValid()` | Part of `is_change_trust_asset_valid()` | Implemented |
+| `isTrustLineAssetValid()` | `is_trustline_asset_valid()` | Implemented |
+| `isChangeTrustAssetValid()` | `is_change_trust_asset_valid()` | Implemented |
 
 ### Network Identity (`network.rs`)
 
@@ -292,10 +297,9 @@ Uses Rust's `Result<T, E>` pattern instead of C++ exceptions:
 
 Features likely needed for full parity (in rough priority order):
 
-1. **Type utilities** (`isAssetValid`, `addBalance`, asset conversions) - Needed for ledger operations
-2. **XDR streaming** - Needed for history archive access
-3. **RandomEvictionCache** - Needed for performance optimization
-4. **VirtualClock/Scheduler** - Needed for testing infrastructure
+1. **XDR streaming** - Needed for history archive access
+2. **RandomEvictionCache** - Needed for performance optimization
+3. **VirtualClock/Scheduler** - Needed for testing infrastructure
 
 ## Verification
 
