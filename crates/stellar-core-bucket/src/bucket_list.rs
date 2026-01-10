@@ -146,6 +146,12 @@ impl BucketLevel {
         }
     }
 
+    /// Get a reference to the next bucket if any (pending merge result).
+    /// Used for lookups to check pending merges.
+    pub fn next(&self) -> Option<&Bucket> {
+        self.next.as_ref()
+    }
+
     /// Snap the current bucket to become the new snapshot.
     ///
     /// This implements the bucket list spill behavior:
@@ -168,6 +174,8 @@ impl BucketLevel {
     /// higher levels first.
     ///
     /// - `normalize_init`: If true, INIT entries are converted to LIVE (for level crossings)
+    /// - `use_empty_curr`: If true, use an empty bucket instead of self.curr for the merge.
+    ///   This is used when the level is about to snap its curr (shouldMergeWithEmptyCurr).
     fn prepare_with_normalization(
         &mut self,
         _ledger_seq: u32,
@@ -175,15 +183,22 @@ impl BucketLevel {
         incoming: Bucket,
         keep_dead_entries: bool,
         normalize_init: bool,
+        use_empty_curr: bool,
     ) -> Result<()> {
         if self.next.is_some() {
             return Err(BucketError::Merge("bucket merge already in progress".to_string()));
         }
 
-        // Merge curr with the incoming bucket
-        // curr may be empty if this level was already snapped
+        // Choose curr or empty based on shouldMergeWithEmptyCurr
+        let curr_for_merge = if use_empty_curr {
+            Bucket::empty()
+        } else {
+            self.curr.clone()
+        };
+
+        // Merge curr (or empty) with the incoming bucket
         let merged = merge_buckets_with_options(
-            &self.curr,
+            &curr_for_merge,
             &incoming,
             keep_dead_entries,
             protocol_version,
@@ -349,6 +364,26 @@ impl BucketList {
                 };
             }
 
+            // Check next bucket if any (pending merge result)
+            // This matches C++ behavior where resolved mNextCurr is also checked
+            if let Some(next) = level.next() {
+                if let Some(entry) = next.get(key)? {
+                    if debug {
+                        tracing::info!(
+                            level = level_idx,
+                            bucket = "next",
+                            entry_type = ?std::mem::discriminant(&entry),
+                            "Found entry in bucket list"
+                        );
+                    }
+                    return match entry {
+                        BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
+                        BucketEntry::Dead(_) => Ok(None), // Entry is deleted
+                        BucketEntry::Metadata(_) => continue,
+                    };
+                }
+            }
+
             // Then check snap bucket
             if let Some(entry) = level.snap.get(key)? {
                 if debug {
@@ -382,6 +417,11 @@ impl BucketList {
             if let Some(entry) = level.curr.get(key)? {
                 results.push((level_idx, "curr", entry));
             }
+            if let Some(next) = level.next() {
+                if let Some(entry) = next.get(key)? {
+                    results.push((level_idx, "next", entry));
+                }
+            }
             if let Some(entry) = level.snap.get(key)? {
                 results.push((level_idx, "snap", entry));
             }
@@ -396,7 +436,14 @@ impl BucketList {
         let mut entries = Vec::new();
 
         for level in &self.levels {
-            for bucket in [&level.curr, &level.snap] {
+            // Collect buckets to iterate: curr, next (if any), snap
+            let mut buckets: Vec<&Bucket> = vec![&level.curr];
+            if let Some(next) = level.next() {
+                buckets.push(next);
+            }
+            buckets.push(&level.snap);
+
+            for bucket in buckets {
                 for entry in bucket.iter() {
                     match entry {
                         BucketEntry::Live(live) | BucketEntry::Init(live) => {
@@ -554,14 +601,19 @@ impl BucketList {
                 // In C++ stellar-core, INIT normalization is tied to !keepDeadEntries:
                 // - Levels 0-9: keep_dead=true, so normalize_init=false (INIT stays INIT)
                 // - Level 10: keep_dead=false, so normalize_init=true (INIT becomes LIVE)
+                //
+                // Additionally, check shouldMergeWithEmptyCurr: when a level is about
+                // to snap its own curr, we use an empty bucket instead of curr.
                 let keep_dead = Self::keep_tombstone_entries(i);
                 let normalize_init = !keep_dead;
+                let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
                     protocol_version,
                     spilling_snap,
                     keep_dead,
                     normalize_init,
+                    use_empty_curr,
                 )?;
 
                 tracing::debug!(
@@ -575,6 +627,7 @@ impl BucketList {
         // Step 2: Apply new entries to level 0
         // Prepare level 0: merge curr with new entries
         // Don't normalize INIT entries at level 0 - they stay as INIT
+        // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_dead_0 = Self::keep_tombstone_entries(0);
 
         self.levels[0].prepare_with_normalization(
@@ -583,16 +636,19 @@ impl BucketList {
             new_bucket,
             keep_dead_0,
             false, // don't normalize at level 0
+            false, // level 0 never uses empty curr
         )?;
 
         self.levels[0].commit();
 
-        // Step 3: Resolve any ready futures (commit all pending merges)
-        // In C++ stellar-core, this is done by resolveAnyReadyFutures()
-        // Since we're doing synchronous merges, all prepares are already complete
-        for level in &mut self.levels {
-            level.commit();
-        }
+        // Note: We do NOT commit all levels here. In C++ stellar-core, merges are
+        // asynchronous and the commit only happens when the level is about to receive
+        // a new spill (at the start of the loop iteration). The shouldMergeWithEmptyCurr
+        // logic relies on curr being preserved until the level snaps.
+        //
+        // If we committed all levels here, entries would be lost when shouldMergeWithEmptyCurr
+        // is true, because the merge result (which doesn't include curr) would overwrite
+        // the actual curr before it has a chance to be snapped.
 
         Ok(())
     }
@@ -631,6 +687,54 @@ impl BucketList {
 
     fn keep_tombstone_entries(level: usize) -> bool {
         level < BUCKET_LIST_LEVELS - 1
+    }
+
+    /// Determines whether to merge with an empty curr bucket instead of the actual curr.
+    ///
+    /// This is a critical piece of the bucket list merge algorithm that prevents data
+    /// duplication. When a level is about to snap its curr bucket (because the next
+    /// spill boundary will affect this level), we should NOT merge with curr. Instead,
+    /// we merge with an empty bucket and let curr be preserved until it becomes snap.
+    ///
+    /// # Why This Matters
+    ///
+    /// Consider level 1 (half=8, size=16):
+    /// - At ledger 6: Level 0 spills, level 1 receives data. But ledger 8 is when
+    ///   level 1 itself will spill. If we merge with curr at ledger 6, and then at
+    ///   ledger 8 curr becomes snap, we'd have duplicated the data in curr.
+    /// - Solution: At ledger 6, we merge with empty instead of curr. Curr stays
+    ///   unchanged. At ledger 8, curr becomes snap (preserving its entries), and
+    ///   the merge result from ledger 6 becomes the new curr.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Calculate when the merge was started: `roundDown(ledger, levelHalf(level-1))`
+    /// 2. Calculate when the next change would happen: `mergeStart + levelHalf(level-1)`
+    /// 3. If the next change would cause this level to spill, use empty curr
+    ///
+    /// # Synchronous vs Asynchronous
+    ///
+    /// In C++ stellar-core, merges are asynchronous and the result stays in `mNextCurr`
+    /// until committed. In our synchronous implementation, the result goes into `next`
+    /// and we check `next` during lookups to make entries accessible. The key invariant
+    /// is that `curr` is preserved until the level snaps.
+    ///
+    /// Matches C++ stellar-core's `shouldMergeWithEmptyCurr` in BucketListBase.cpp.
+    fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
+        if level == 0 {
+            // Level 0 always merges with its curr
+            return false;
+        }
+
+        // Round down to when the merge was started
+        let merge_start_ledger = Self::round_down(ledger_seq, Self::level_half(level - 1));
+
+        // Calculate when the next spill would happen
+        let next_change_ledger = merge_start_ledger + Self::level_half(level - 1);
+
+        // If the next spill would affect this level, use empty curr
+        // because curr is about to be snapped
+        Self::level_should_spill(next_change_ledger, level)
     }
 
     /// Get all hashes in the bucket list (for serialization).
@@ -1246,7 +1350,7 @@ mod tests {
         .unwrap();
 
         level
-            .prepare_with_normalization(5, TEST_PROTOCOL, incoming, false, true)
+            .prepare_with_normalization(5, TEST_PROTOCOL, incoming, false, true, false)
             .unwrap();
         level.commit();
 
@@ -1340,6 +1444,81 @@ mod tests {
             let key = make_account_key(id);
             let found = bl.get(&key).unwrap();
             assert!(found.is_some(), "Entry {} not found", i);
+        }
+    }
+
+    #[test]
+    fn test_should_merge_with_empty_curr() {
+        // Level 0 always returns false
+        assert!(!BucketList::should_merge_with_empty_curr(1, 0));
+        assert!(!BucketList::should_merge_with_empty_curr(2, 0));
+        assert!(!BucketList::should_merge_with_empty_curr(100, 0));
+
+        // Level 1: half=8, size=16
+        // At ledger 2: mergeStartLedger=2, nextChangeLedger=4
+        // levelShouldSpill(4, 1) = false (4 is not at 8 or 16 boundary)
+        assert!(!BucketList::should_merge_with_empty_curr(2, 1));
+
+        // At ledger 4: mergeStartLedger=4, nextChangeLedger=6
+        // levelShouldSpill(6, 1) = false
+        assert!(!BucketList::should_merge_with_empty_curr(4, 1));
+
+        // At ledger 6: mergeStartLedger=6, nextChangeLedger=8
+        // levelShouldSpill(8, 1) = true (8 is at half boundary for level 1)
+        assert!(BucketList::should_merge_with_empty_curr(6, 1));
+
+        // At ledger 8: mergeStartLedger=8, nextChangeLedger=10
+        // levelShouldSpill(10, 1) = false
+        assert!(!BucketList::should_merge_with_empty_curr(8, 1));
+
+        // At ledger 14: mergeStartLedger=14, nextChangeLedger=16
+        // levelShouldSpill(16, 1) = true (16 is at size boundary for level 1)
+        assert!(BucketList::should_merge_with_empty_curr(14, 1));
+    }
+
+    #[test]
+    fn test_entries_preserved_across_should_merge_with_empty_curr() {
+        // This test specifically verifies that entries are not lost when
+        // shouldMergeWithEmptyCurr returns true.
+        //
+        // The critical ledger sequence for level 1 is:
+        // - Ledger 4: Entry added, spill to level 1, shouldMergeWithEmptyCurr(4,1)=false
+        // - Ledger 6: Entry added, spill to level 1, shouldMergeWithEmptyCurr(6,1)=true
+        // - Ledger 8: Entry added, level 1 snaps, shouldMergeWithEmptyCurr(8,1)=false
+        //
+        // Entry from ledger 4 should be accessible at ledger 6 (in level 1's next),
+        // at ledger 7 (in level 1's next), and at ledger 8 (in level 1's snap).
+
+        let mut bl = BucketList::new();
+
+        // Add entries at ledgers 1-8
+        for ledger in 1..=8u32 {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&ledger.to_be_bytes());
+            let entry = make_account_entry(id, ledger as i64 * 100);
+            bl.add_batch(
+                ledger,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+            // Verify ALL previous entries are still accessible
+            for prev_ledger in 1..=ledger {
+                let mut prev_id = [0u8; 32];
+                prev_id[0..4].copy_from_slice(&prev_ledger.to_be_bytes());
+                let key = make_account_key(prev_id);
+                let found = bl.get(&key).unwrap();
+                assert!(
+                    found.is_some(),
+                    "Entry from ledger {} not found at ledger {}",
+                    prev_ledger,
+                    ledger
+                );
+            }
         }
     }
 }

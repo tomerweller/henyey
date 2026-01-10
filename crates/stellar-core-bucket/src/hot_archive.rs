@@ -216,11 +216,15 @@ impl HotArchiveBucketLevel {
     }
 
     /// Prepare a merge with an incoming bucket.
+    ///
+    /// - `use_empty_curr`: If true, use an empty bucket instead of self.curr for the merge.
+    ///   This is used when the level is about to snap its curr (shouldMergeWithEmptyCurr).
     fn prepare(
         &mut self,
         protocol_version: u32,
         incoming: HotArchiveBucket,
         keep_tombstones: bool,
+        use_empty_curr: bool,
     ) -> Result<()> {
         if self.next.is_some() {
             return Err(BucketError::Merge(
@@ -228,7 +232,14 @@ impl HotArchiveBucketLevel {
             ));
         }
 
-        let merged = merge_hot_archive_buckets(&self.curr, &incoming, protocol_version, keep_tombstones)?;
+        // Choose curr or empty based on shouldMergeWithEmptyCurr
+        let curr_for_merge = if use_empty_curr {
+            HotArchiveBucket::empty()
+        } else {
+            self.curr.clone()
+        };
+
+        let merged = merge_hot_archive_buckets(&curr_for_merge, &incoming, protocol_version, keep_tombstones)?;
         self.next = Some(merged);
         Ok(())
     }
@@ -341,19 +352,19 @@ impl HotArchiveBucketList {
                 self.levels[i].commit();
 
                 let keep_tombstones = Self::keep_tombstone_entries(i);
-                self.levels[i].prepare(protocol_version, spilling_snap, keep_tombstones)?;
+                let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
+                self.levels[i].prepare(protocol_version, spilling_snap, keep_tombstones, use_empty_curr)?;
             }
         }
 
         // Add new entries to level 0
+        // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_tombstones_0 = Self::keep_tombstone_entries(0);
-        self.levels[0].prepare(protocol_version, new_bucket, keep_tombstones_0)?;
+        self.levels[0].prepare(protocol_version, new_bucket, keep_tombstones_0, false)?;
         self.levels[0].commit();
 
-        // Commit all pending merges
-        for level in &mut self.levels {
-            level.commit();
-        }
+        // Note: We do NOT commit all levels here. See the comment in BucketList::add_batch_internal
+        // for the explanation of why this is necessary for shouldMergeWithEmptyCurr to work correctly.
 
         Ok(())
     }
@@ -412,6 +423,28 @@ impl HotArchiveBucketList {
     /// Check if tombstone entries should be kept at a level.
     fn keep_tombstone_entries(level: usize) -> bool {
         level < HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1
+    }
+
+    /// Determines whether to merge with an empty curr bucket instead of the actual curr.
+    /// This happens when the level is about to snap its curr bucket - in that case,
+    /// we just propagate the snap from the previous level without merging with curr.
+    ///
+    /// Matches C++ stellar-core's `shouldMergeWithEmptyCurr`.
+    fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
+        if level == 0 {
+            // Level 0 always merges with its curr
+            return false;
+        }
+
+        // Round down to when the merge was started
+        let merge_start_ledger = Self::round_down(ledger_seq, Self::level_half(level - 1));
+
+        // Calculate when the next spill would happen
+        let next_change_ledger = merge_start_ledger + Self::level_half(level - 1);
+
+        // If the next spill would affect this level, use empty curr
+        // because curr is about to be snapped
+        Self::level_should_spill(next_change_ledger, level)
     }
 
     /// Get statistics about the bucket list.
