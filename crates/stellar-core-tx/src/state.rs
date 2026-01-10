@@ -131,8 +131,7 @@ pub struct LedgerStateManager {
     op_snapshots_active: bool,
     /// Whether we're in a multi-operation transaction.
     /// When true, flush_modified_entries records STATE/UPDATED for every access,
-    /// even if values are identical. C++ stellar-core records per-operation entries
-    /// for multi-op transactions but not for single-op transactions.
+    /// even if values are identical.
     multi_op_mode: bool,
     /// Active sponsorship stack for the current transaction.
     sponsorship_stack: Vec<SponsorshipContext>,
@@ -322,9 +321,7 @@ impl LedgerStateManager {
     /// Set multi-operation mode.
     ///
     /// When enabled, flush_modified_entries records STATE/UPDATED for every
-    /// accessed entry even if values are identical. C++ stellar-core records
-    /// per-operation entries for multi-op transactions but not for single-op
-    /// transactions.
+    /// accessed entry even if values are identical.
     pub fn set_multi_op_mode(&mut self, enabled: bool) {
         self.multi_op_mode = enabled;
     }
@@ -2922,8 +2919,6 @@ impl LedgerStateManager {
 
     /// Flush a specific account's changes to the delta.
     ///
-    /// This allows operations to control the order of STATE/UPDATED pairs,
-    /// which is important for matching C++ stellar-core's change ordering.
     /// Returns true if the account was in the modified list and was flushed.
     pub fn flush_account(&mut self, account_id: &AccountId) -> bool {
         let key = crate::account_id_to_key(account_id);

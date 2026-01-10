@@ -430,35 +430,8 @@ fn apply_soroban_storage_changes(
         }
     }
 
-    // Reorder changes so that Soroban entry creates/updates come before classic entry updates.
-    // The Soroban host returns changes in key order (Account=0 < ContractData=6 < TTL=9),
-    // but C++ stellar-core uses hash-based iteration which produces a different order.
-    // To match C++ behavior where creates appear before SAC updates in the tx meta,
-    // we process Soroban entries first, then classic entries.
-    let (soroban_changes, classic_changes): (Vec<_>, Vec<_>) = changes.iter().partition(|change| {
-        if let Some(entry) = &change.new_entry {
-            matches!(&entry.data,
-                stellar_xdr::curr::LedgerEntryData::ContractData(_) |
-                stellar_xdr::curr::LedgerEntryData::ContractCode(_) |
-                stellar_xdr::curr::LedgerEntryData::Ttl(_)
-            )
-        } else {
-            // Deletions - check the key type
-            matches!(&change.key,
-                LedgerKey::ContractData(_) |
-                LedgerKey::ContractCode(_) |
-                LedgerKey::Ttl(_)
-            )
-        }
-    });
-
-    // Apply Soroban changes first (creates/updates to contract data, code, TTL)
-    for change in &soroban_changes {
-        apply_soroban_storage_change(state, change);
-    }
-
-    // Then apply classic changes (Account, Trustline updates from SAC)
-    for change in &classic_changes {
+    // Apply all storage changes from the host
+    for change in changes {
         apply_soroban_storage_change(state, change);
     }
 

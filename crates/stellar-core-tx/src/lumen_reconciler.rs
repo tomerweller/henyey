@@ -64,8 +64,7 @@ use crate::frame::muxed_to_account_id;
 ///
 /// # Event Ordering
 ///
-/// Mint events are inserted at the beginning of the event list to ensure proper
-/// ordering for historical replay. This matches C++ stellar-core behavior.
+/// Mint events are inserted at the beginning of the event list.
 pub fn reconcile_events(
     tx_source_account: &MuxedAccount,
     operation: &Operation,

@@ -127,8 +127,7 @@ pub enum ChangeRef {
 ///
 /// # Order Preservation
 ///
-/// The `change_order` field tracks the sequence of changes, which is important
-/// for generating correct transaction metadata that matches C++ stellar-core.
+/// The `change_order` field tracks the sequence of changes for metadata construction.
 ///
 /// # Example
 ///

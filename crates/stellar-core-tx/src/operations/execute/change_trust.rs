@@ -195,16 +195,13 @@ pub fn execute_change_trust(
             ext: TrustLineEntryExt::V0,
         };
 
-        // Apply sponsorship FIRST (updates sponsor account), then create trustline.
-        // C++ stellar-core records sponsor STATE/UPDATED BEFORE CREATED trustline.
-        if let Some(sponsor) = sponsor.as_ref() {
+        // Apply sponsorship if present
+        if sponsor.is_some() {
             let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
                 account_id: source.clone(),
                 asset: tl_asset.clone(),
             });
             state.apply_entry_sponsorship(ledger_key, source, multiplier)?;
-            // Flush just the sponsor changes before creating trustline
-            state.flush_account(sponsor);
         }
         state.create_trustline(trustline);
 

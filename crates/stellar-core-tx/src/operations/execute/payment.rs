@@ -181,7 +181,7 @@ fn execute_credit_payment(
         }
     }
 
-    // Apply the transfer - update destination first, then source (matches C++ order)
+    // Apply the transfer - update destination first, then source
     if issuer != dest {
         let dest_trustline_mut = state
             .get_trustline_mut(dest, asset)

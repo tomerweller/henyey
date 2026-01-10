@@ -73,16 +73,12 @@ pub fn execute_manage_data(
                     state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 1)?;
                 }
 
-                // Decrease sub-entry count BEFORE deleting to match C++ order
-                // C++ emits: STATE Account -> UPDATED Account -> STATE Data -> REMOVED Data
+                // Decrease sub-entry count before deleting
                 if let Some(account) = state.get_account_mut(source) {
                     if account.num_sub_entries > 0 {
                         account.num_sub_entries -= 1;
                     }
                 }
-
-                // Flush the account update before the delete
-                state.flush_modified_entries();
 
                 state.delete_data(source, &data_name);
             } else {
