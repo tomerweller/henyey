@@ -11,7 +11,7 @@ stellar-core `src/historywork/` directory (v25.x).
 | Core Publish Workflow | Implemented (simplified) |
 | Verification | Implemented inline (no background threads) |
 | Batch Operations | Complete |
-| Hot Archive Buckets | Not implemented |
+| Hot Archive Buckets | Implemented |
 | Metrics | Not implemented |
 
 ## Implemented Work Items
@@ -116,12 +116,12 @@ C++ has a more complex pipeline with differential uploads (only new files).
 
 ### Hot Archive Buckets (Protocol 25)
 
-| C++ Feature | Purpose | Priority |
-|-------------|---------|----------|
-| `HotArchiveBucket` support in `DownloadBucketsWork` | Download both live and hot archive buckets | High for full P25 support |
+| C++ Feature | Rust Status | Notes |
+|-------------|------------|-------|
+| `HotArchiveBucket` download | Implemented | `unique_bucket_hashes()` includes hot archive hashes |
+| `HotArchiveBucketList` reconstruction | Implemented | Catchup code builds hot archive bucket list from HAS |
 
-The C++ `DownloadBucketsWork` handles both `LiveBucket` and `HotArchiveBucket` types.
-The Rust implementation only downloads live buckets currently.
+The Rust `DownloadBucketsWork` downloads all bucket hashes from the HAS, including hot archive buckets. The `unique_bucket_hashes()` method collects hashes from both `current_buckets` and `hot_archive_buckets` fields. During catchup, the hot archive bucket list is reconstructed from the downloaded buckets.
 
 ## Architecture Differences
 
@@ -174,8 +174,6 @@ The C++ implementation includes extensive metrics via `medida`:
 
 ## Recommendations for Future Work
 
-1. **High Priority**: Add `HotArchiveBucket` support for full Protocol 25 parity.
+1. **Low Priority**: Add metrics collection for monitoring and debugging.
 
-2. **Low Priority**: Add metrics collection for monitoring and debugging.
-
-3. **Low Priority**: Consider disk-based bucket storage for large catchup operations.
+2. **Low Priority**: Consider disk-based bucket storage for large catchup operations.
