@@ -3102,15 +3102,20 @@ fn augment_soroban_ttl_metadata(
 
 /// Compare transaction meta to find differences in ledger entry changes.
 /// For fee bump transactions with separate fee source, fee_changes from Phase 1 should be prepended.
-/// Uses order-independent comparison since C++ stellar-core's UnorderedMap iteration order
-/// is non-deterministic (depends on RandHasher's gMixer random value).
+/// Uses order-independent (multiset) comparison since C++ stellar-core's UnorderedMap iteration
+/// order is non-deterministic (depends on RandHasher's gMixer random value).
+///
+/// The comparison is fully order-independent: as long as both metas contain the same set of
+/// changes (same XDR content, same multiplicity), the comparison passes regardless of order.
 fn compare_transaction_meta(
     our_meta: &stellar_xdr::curr::TransactionMeta,
     cdp_meta: &stellar_xdr::curr::TransactionMeta,
     fee_changes: Option<&stellar_xdr::curr::LedgerEntryChanges>,
     show_diff: bool,
 ) -> (bool, Vec<String>) {
-    use stellar_xdr::curr::{WriteXdr, Limits};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 
     let mut diffs = Vec::new();
 
@@ -3123,40 +3128,126 @@ fn compare_transaction_meta(
     our_changes.extend(extract_changes_from_meta(our_meta));
     let cdp_changes = extract_changes_from_meta(cdp_meta);
 
-    // Compare the number of changes
+    // Compare the number of changes first (quick check)
     if our_changes.len() != cdp_changes.len() {
         diffs.push(format!(
             "Change count mismatch: ours={}, expected={}",
             our_changes.len(),
             cdp_changes.len()
         ));
+        // If counts differ, we already know it won't match, but continue to show diffs
     }
 
-    // Sort both lists by (key_xdr, remapped_type, content_hash) matching C++ MetaUtils.cpp
-    let mut our_sorted: Vec<_> = our_changes.iter().collect();
-    let mut cdp_sorted: Vec<_> = cdp_changes.iter().collect();
-    our_sorted.sort_by_key(|c| change_sort_key(c));
-    cdp_sorted.sort_by_key(|c| change_sort_key(c));
+    // Build multiset (hash -> count) for each set of changes
+    // This is fully order-independent: we just count occurrences of each unique change
+    fn build_change_multiset(
+        changes: &[stellar_xdr::curr::LedgerEntryChange],
+    ) -> HashMap<[u8; 32], (usize, Vec<u8>)> {
+        let mut multiset = HashMap::new();
+        for change in changes {
+            let xdr = change
+                .to_xdr(Limits::none())
+                .unwrap_or_default();
+            let mut hasher = Sha256::new();
+            hasher.update(&xdr);
+            let hash: [u8; 32] = hasher.finalize().into();
+            let entry = multiset.entry(hash).or_insert((0, xdr));
+            entry.0 += 1;
+        }
+        multiset
+    }
 
-    // Compare individual changes after sorting
-    if show_diff {
-        for (i, (our, cdp)) in our_sorted.iter().zip(cdp_sorted.iter()).enumerate() {
-            let our_xdr = our.to_xdr(Limits::none()).unwrap_or_default();
-            let cdp_xdr = cdp.to_xdr(Limits::none()).unwrap_or_default();
+    let our_multiset = build_change_multiset(&our_changes);
+    let cdp_multiset = build_change_multiset(&cdp_changes);
 
-            if our_xdr != cdp_xdr {
-                diffs.push(format!("Change {} differs", i));
+    // Compare multisets
+    // Check for items in ours but not in CDP (or different count)
+    for (hash, (our_count, our_xdr)) in &our_multiset {
+        match cdp_multiset.get(hash) {
+            Some((cdp_count, _)) if our_count == cdp_count => {
+                // Match - same count
+            }
+            Some((cdp_count, _)) => {
+                // Count mismatch
+                if show_diff {
+                    diffs.push(format!(
+                        "Change count differs: ours={} vs expected={} for change: {}",
+                        our_count,
+                        cdp_count,
+                        describe_change(&stellar_xdr::curr::LedgerEntryChange::from_xdr(
+                            our_xdr,
+                            Limits::none()
+                        )
+                        .unwrap_or(stellar_xdr::curr::LedgerEntryChange::Removed(
+                            stellar_xdr::curr::LedgerKey::Account(
+                                stellar_xdr::curr::LedgerKeyAccount {
+                                    account_id: stellar_xdr::curr::AccountId(
+                                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                                            stellar_xdr::curr::Uint256([0u8; 32])
+                                        )
+                                    ),
+                                }
+                            )
+                        )))
+                    ));
+                } else {
+                    diffs.push("Count mismatch".to_string());
+                }
+            }
+            None => {
+                // Not found in CDP
+                if show_diff {
+                    diffs.push(format!(
+                        "Extra change in ours (count={}): {}",
+                        our_count,
+                        describe_change(&stellar_xdr::curr::LedgerEntryChange::from_xdr(
+                            our_xdr,
+                            Limits::none()
+                        )
+                        .unwrap_or(stellar_xdr::curr::LedgerEntryChange::Removed(
+                            stellar_xdr::curr::LedgerKey::Account(
+                                stellar_xdr::curr::LedgerKeyAccount {
+                                    account_id: stellar_xdr::curr::AccountId(
+                                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                                            stellar_xdr::curr::Uint256([0u8; 32])
+                                        )
+                                    ),
+                                }
+                            )
+                        )))
+                    ));
+                } else {
+                    diffs.push("Extra change in ours".to_string());
+                }
             }
         }
-    } else {
-        // Even without showing diffs, still need to check if changes match
-        for (our, cdp) in our_sorted.iter().zip(cdp_sorted.iter()) {
-            let our_xdr = our.to_xdr(Limits::none()).unwrap_or_default();
-            let cdp_xdr = cdp.to_xdr(Limits::none()).unwrap_or_default();
+    }
 
-            if our_xdr != cdp_xdr {
-                diffs.push("Content mismatch".to_string());
-                break;
+    // Check for items in CDP but not in ours
+    for (hash, (cdp_count, cdp_xdr)) in &cdp_multiset {
+        if !our_multiset.contains_key(hash) {
+            if show_diff {
+                diffs.push(format!(
+                    "Missing change from CDP (count={}): {}",
+                    cdp_count,
+                    describe_change(&stellar_xdr::curr::LedgerEntryChange::from_xdr(
+                        cdp_xdr,
+                        Limits::none()
+                    )
+                    .unwrap_or(stellar_xdr::curr::LedgerEntryChange::Removed(
+                        stellar_xdr::curr::LedgerKey::Account(
+                            stellar_xdr::curr::LedgerKeyAccount {
+                                account_id: stellar_xdr::curr::AccountId(
+                                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                                        stellar_xdr::curr::Uint256([0u8; 32])
+                                    )
+                                ),
+                            }
+                        )
+                    )))
+                ));
+            } else {
+                diffs.push("Missing change from CDP".to_string());
             }
         }
     }
