@@ -2068,6 +2068,20 @@ async fn cmd_verify_execution(
     // need to reflect those changes when processing later ledgers
     let mut executor: Option<TransactionExecutor> = None;
 
+    // Track the previous ledger's id_pool to use when creating the executor.
+    // The executor needs the id_pool from BEFORE the ledger's transactions execute,
+    // which is the previous ledger's CLOSING id_pool.
+    //
+    // For the first ledger we process (init_checkpoint + 1), we need the id_pool
+    // from init_checkpoint's header. Load it from the archive now.
+    let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
+    let init_id_pool = init_headers
+        .iter()
+        .find(|h| h.header.ledger_seq == init_checkpoint)
+        .map(|h| h.header.id_pool)
+        .unwrap_or(0);
+    let mut prev_id_pool: Option<u64> = Some(init_id_pool);
+
     let mut current_cp = process_from_cp;
     while current_cp <= end_checkpoint {
         let next_cp = checkpoint::next_checkpoint(current_cp);
@@ -2078,8 +2092,13 @@ async fn cmd_verify_execution(
             let header = &header_entry.header;
             let seq = header.ledger_seq;
 
+            // Track the id_pool from each ledger header so we can use the PREVIOUS
+            // ledger's id_pool when starting a new ledger
+            let current_id_pool = header.id_pool;
+
             // Skip ledgers before our initial state or after our target
             if seq <= init_checkpoint || seq > end_ledger {
+                prev_id_pool = Some(current_id_pool);
                 continue;
             }
 
@@ -2185,13 +2204,17 @@ async fn cmd_verify_execution(
             // Create or advance the transaction executor
             // Keeping the executor across ledgers preserves state changes from earlier ledgers
             // (e.g., account balance updates), which is critical for correct execution
+            //
+            // For id_pool: We need the value from BEFORE this ledger's transactions execute.
+            // This is the previous ledger's CLOSING id_pool, not the current ledger's.
+            let starting_id_pool = prev_id_pool.unwrap_or(0);
             if let Some(ref mut exec) = executor {
                 exec.advance_to_ledger(
                     seq,
                     cdp_header.scp_value.close_time.0,
                     cdp_header.base_reserve,
                     cdp_header.ledger_version,
-                    cdp_header.id_pool,
+                    starting_id_pool, // Not used internally (see advance_to_ledger docs)
                     soroban_config,
                 );
             } else {
@@ -2201,12 +2224,15 @@ async fn cmd_verify_execution(
                     cdp_header.base_reserve,
                     cdp_header.ledger_version,
                     network_id.clone(),
-                    cdp_header.id_pool,
+                    starting_id_pool, // Use previous ledger's id_pool
                     soroban_config,
                     ClassicEventConfig::default(),
                     None, // No invariant checking for now
                 ));
             }
+
+            // Update prev_id_pool for the next ledger
+            prev_id_pool = Some(current_id_pool);
             let executor = executor.as_mut().unwrap();
 
             // Execute each transaction and compare (using aligned envelope/result/meta)
@@ -2321,6 +2347,11 @@ async fn cmd_verify_execution(
             // separately in CDP's post_tx_apply_fee_processing and must be applied
             // after each transaction to keep state aligned.
 
+            // For protocol 23+, post-transaction fee changes (refunds) are applied AFTER ALL
+            // transactions, not after each one. Collect them here and apply at the end.
+            let mut deferred_post_fee_changes: Vec<stellar_xdr::curr::LedgerEntryChanges> = Vec::new();
+            let defer_post_fee_meta = cdp_header.ledger_version >= 23;
+
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
@@ -2375,8 +2406,14 @@ async fn cmd_verify_execution(
                         cdp_changes.try_into().unwrap_or_default();
                     executor.apply_ledger_entry_changes(&cdp_changes_vec);
 
+                    // For protocol 23+, defer post_fee_meta (refunds) until after ALL transactions.
+                    // For older protocols, apply immediately after each transaction.
                     if !tx_info.post_fee_meta.is_empty() {
-                        executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
+                        if defer_post_fee_meta {
+                            deferred_post_fee_changes.push(tx_info.post_fee_meta.clone());
+                        } else {
+                            executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
+                        }
                     }
                 }
 
@@ -2493,6 +2530,14 @@ async fn cmd_verify_execution(
                             println!("    TX {}: EXECUTION ERROR: {}", tx_idx, e);
                         }
                     }
+                }
+            }
+
+            // Apply deferred post-fee changes (protocol 23+ refunds) AFTER all transactions
+            // This matches C++ stellar-core's processPostTxSetApply behavior
+            if defer_post_fee_meta && !deferred_post_fee_changes.is_empty() {
+                for post_fee_changes in &deferred_post_fee_changes {
+                    executor.apply_ledger_entry_changes(post_fee_changes);
                 }
             }
 

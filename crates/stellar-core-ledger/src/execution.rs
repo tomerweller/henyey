@@ -662,13 +662,20 @@ impl TransactionExecutor {
     /// Advance to a new ledger, preserving the current state.
     /// This is useful for replaying multiple consecutive ledgers without
     /// losing state changes between them.
+    ///
+    /// Note: id_pool is NOT reset here because:
+    /// 1. The executor's internal id_pool evolves correctly as transactions execute
+    /// 2. The id_pool from the ledger header is the POST-execution value (after the ledger closes)
+    /// 3. Using the header's id_pool would give us the wrong starting value for the next ledger
+    /// For the first ledger in a replay session, use TransactionExecutor::new() which takes
+    /// the PREVIOUS ledger's closing id_pool (which equals this ledger's starting id_pool).
     pub fn advance_to_ledger(
         &mut self,
         ledger_seq: u32,
         close_time: u64,
         base_reserve: u32,
         protocol_version: u32,
-        id_pool: u64,
+        _id_pool: u64, // Intentionally unused - see note above
         soroban_config: SorobanConfig,
     ) {
         self.ledger_seq = ledger_seq;
@@ -676,7 +683,7 @@ impl TransactionExecutor {
         self.base_reserve = base_reserve;
         self.protocol_version = protocol_version;
         self.soroban_config = soroban_config;
-        self.state.set_id_pool(id_pool);
+        // Do NOT reset id_pool - it should continue from where it was
         self.state.set_ledger_seq(ledger_seq);
         // Note: loaded_accounts cache is preserved - this is intentional because
         // accounts that were loaded/created in previous ledgers remain valid
@@ -2228,11 +2235,13 @@ impl TransactionExecutor {
         let mut fee_refund = 0i64;
         if let Some(tracker) = refundable_fee_tracker {
             let refund = tracker.refund_amount();
-            if refund > 0 {
+            // For protocol < 23, apply refund immediately to the transaction's delta.
+            // For protocol >= 23, refund is applied after ALL transactions in the tx set,
+            // so we do NOT modify the delta here - it's handled separately in ledger close.
+            if refund > 0 && self.protocol_version < 23 {
                 // Apply refund directly to the last account update in the delta.
-                // In C++ stellar-core, the refund is NOT a separate meta change - it's
+                // In C++ stellar-core (pre-v23), the refund is NOT a separate meta change - it's
                 // incorporated into the final account balance of the existing update.
-                // We need to update the most recent account entry in the delta to include the refund.
                 self.state.apply_refund_to_delta(&fee_source_id, refund);
                 self.state.delta_mut().add_fee(-refund);
             }
