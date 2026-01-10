@@ -112,6 +112,7 @@ pub mod verify;
 pub mod cdp;
 pub mod publish;
 pub mod publish_queue;
+pub mod remote_archive;
 
 // Error handling
 pub mod error;
@@ -134,6 +135,7 @@ pub use download::DownloadConfig;
 pub use error::HistoryError;
 pub use paths::{bucket_path, checkpoint_ledger, checkpoint_path};
 pub use publish_queue::{PublishQueue, PublishQueueStats};
+pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
 pub use replay::{LedgerReplayResult, ReplayConfig, ReplayedLedgerState};
 pub use verify::{compute_header_hash, verify_bucket_hash, verify_header_chain};
 

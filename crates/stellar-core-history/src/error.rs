@@ -125,4 +125,19 @@ pub enum HistoryError {
     /// Database error from stellar-core-db crate.
     #[error("database error: {0}")]
     Database(#[from] stellar_core_db::DbError),
+
+    /// Remote archive command not configured.
+    #[error("remote archive not configured: {0}")]
+    RemoteNotConfigured(String),
+
+    /// Remote archive command failed.
+    #[error("remote command failed: {command} (exit code: {exit_code:?})")]
+    RemoteCommandFailed {
+        /// The command that failed.
+        command: String,
+        /// The exit code, if any.
+        exit_code: Option<i32>,
+        /// Standard error output.
+        stderr: String,
+    },
 }

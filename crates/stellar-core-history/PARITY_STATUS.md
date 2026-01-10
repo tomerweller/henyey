@@ -8,6 +8,7 @@ This document tracks the parity between this Rust crate (`stellar-core-history`)
 |-------------|-------------|--------|
 | `lib.rs` | `HistoryManager.h` | Partial |
 | `archive.rs` | `HistoryArchive.h/cpp` | Partial |
+| `remote_archive.rs` | `HistoryArchive.h` (putFileCmd, mkdirCmd) | Complete |
 | `archive_state.rs` | `HistoryArchive.h` (HistoryArchiveState) | Complete |
 | `catchup.rs` | `historywork/*.cpp` (CatchupWork, etc.) | Partial |
 | `checkpoint.rs` | `HistoryManager.h` (static methods) | Complete |
@@ -198,12 +199,14 @@ This document tracks the parity between this Rust crate (`stellar-core-history`)
 - [ ] **Archive initialization** (`initializeHistoryArchive()`)
   - Create `.well-known/stellar-history.json` in new archive
   - Currently Rust only reads from archives
-- [ ] **Remote put/mkdir commands**
-  - C++ supports configurable shell commands for remote upload (`putFileCmd`, `mkdirCmd`)
-  - Templates with `{0}` (local) and `{1}` (remote) placeholders
-  - Rust only writes to local filesystem
+- [x] **Remote put/mkdir commands** - Implemented via `RemoteArchive` in `remote_archive.rs`
+  - Supports configurable shell commands for remote upload (`put_cmd`, `mkdir_cmd`)
+  - Templates with `{0}` (local) and `{1}` (remote) placeholders matching C++
+  - `RemoteArchive::put_file()`, `RemoteArchive::mkdir()`, `RemoteArchive::get_file()`
+  - `put_file_with_mkdir()` for convenience with directory creation
 - [ ] **Get command templating** (`getFileCmd`)
   - C++ can use shell commands for fetch, not just HTTP
+  - Rust has `RemoteArchive::get_file()` but HTTP fetch is still via `reqwest`
 
 #### HistoryArchiveManager
 
