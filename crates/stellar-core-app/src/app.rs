@@ -333,6 +333,8 @@ pub struct App {
     /// When we detected consensus is stuck (for timeout detection).
     /// Stores (current_ledger, first_buffered, stuck_start_time, last_recovery_attempt).
     consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
+    /// When catchup last completed (for cooldown).
+    last_catchup_completed_at: RwLock<Option<Instant>>,
     /// SCP latency samples for surveys.
     scp_latency: RwLock<ScpLatencyTracker>,
 
@@ -823,6 +825,7 @@ impl App {
             tx_set_last_request: RwLock::new(HashMap::new()),
             tx_set_all_peers_exhausted: AtomicBool::new(false),
             consensus_stuck_state: RwLock::new(None),
+            last_catchup_completed_at: RwLock::new(None),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: RwLock::new(SurveyScheduler::new()),
             survey_nonce: RwLock::new(1),
@@ -2996,10 +2999,22 @@ impl App {
 
                             // Use faster timeout when:
                             // 1. All peers have explicitly said DontHave, OR
-                            // 2. We have pending tx set requests that have been waiting too long
+                            // 2. We have pending tx set requests that have been waiting too long, OR
+                            // 3. Recovery attempts have failed to make progress (gap persists)
+                            //    This handles the case where peers don't have SCP envelopes for gap slots
+                            // BUT: if we just completed catchup, use normal timeout to avoid
+                            // catching up repeatedly to the same checkpoint.
                             let all_peers_exhausted = self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
                             let has_stale_requests = self.herder.has_stale_pending_tx_set(TX_SET_UNAVAILABLE_TIMEOUT_SECS);
-                            let use_fast_timeout = all_peers_exhausted || has_stale_requests;
+                            let recovery_failed = state.recovery_attempts >= 2;
+
+                            // Cooldown: don't use fast timeout if we just completed catchup
+                            // This prevents catching up to the same checkpoint repeatedly
+                            const CATCHUP_COOLDOWN_SECS: u64 = 15;
+                            let recently_caught_up = self.last_catchup_completed_at.read().await
+                                .map_or(false, |t| t.elapsed().as_secs() < CATCHUP_COOLDOWN_SECS);
+
+                            let use_fast_timeout = !recently_caught_up && (all_peers_exhausted || has_stale_requests || recovery_failed);
                             let effective_timeout = if use_fast_timeout {
                                 TX_SET_UNAVAILABLE_TIMEOUT_SECS
                             } else {
@@ -3017,6 +3032,8 @@ impl App {
                                     recovery_attempts = state.recovery_attempts,
                                     all_peers_exhausted,
                                     has_stale_requests,
+                                    recovery_failed,
+                                    recently_caught_up,
                                     effective_timeout,
                                     "Buffered catchup stuck timeout; triggering catchup"
                                 );
@@ -3131,6 +3148,19 @@ impl App {
             return;
         }
 
+        // When using CatchupTarget::Current, check if we're already at a checkpoint end.
+        // If current_ledger ends at a checkpoint boundary (mod 64 == 63), the archive's
+        // latest checkpoint is likely equal to current_ledger, so catchup would be a no-op.
+        if use_current_target && is_checkpoint_ledger(current_ledger) {
+            tracing::info!(
+                current_ledger,
+                first_buffered,
+                "Skipping catchup: already at checkpoint end, waiting for next checkpoint"
+            );
+            self.catchup_in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
+
 
         tracing::info!(
             current_ledger,
@@ -3167,6 +3197,8 @@ impl App {
                 } else {
                     self.set_state(AppState::Synced).await;
                 }
+                // Record catchup completion time for cooldown
+                *self.last_catchup_completed_at.write().await = Some(Instant::now());
                 tracing::info!(
                     ledger_seq = result.ledger_seq,
                     "Buffered catchup complete"
@@ -3231,6 +3263,8 @@ impl App {
                 } else {
                     self.set_state(AppState::Synced).await;
                 }
+                // Record catchup completion time for cooldown
+                *self.last_catchup_completed_at.write().await = Some(Instant::now());
                 tracing::info!(
                     ledger_seq = result.ledger_seq,
                     "Externalized catchup complete"
