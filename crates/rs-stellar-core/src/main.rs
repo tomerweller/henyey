@@ -410,6 +410,18 @@ enum OfflineCommands {
         #[arg(long)]
         last_modified_ledger_count: Option<u32>,
     },
+
+    /// Perform diagnostic self-checks
+    ///
+    /// This command performs comprehensive diagnostic checks including:
+    /// - Header chain verification (verify hash linkage)
+    /// - Bucket hash verification (verify all buckets have correct hashes)
+    /// - Crypto benchmarking (Ed25519 sign/verify performance)
+    ///
+    /// Unlike the HTTP /self-check endpoint (which only runs quick online checks),
+    /// this offline command performs full bucket verification which may take
+    /// significant time on large databases.
+    SelfCheck,
 }
 
 #[tokio::main]
@@ -3292,6 +3304,9 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
         } => {
             cmd_dump_ledger(config, output, entry_type, limit, last_modified_ledger_count).await
         }
+        OfflineCommands::SelfCheck => {
+            cmd_self_check(config).await
+        }
     }
 }
 
@@ -3914,6 +3929,159 @@ async fn cmd_dump_ledger(
     println!("Dumped {} entries to {}", entry_count, output.display());
 
     Ok(())
+}
+
+/// Perform offline self-checks (equivalent to C++ self-check command).
+///
+/// This command performs comprehensive diagnostic checks:
+/// 1. Header chain verification - ensures ledger headers form a valid chain
+/// 2. Bucket hash verification - verifies all bucket files have correct hashes
+/// 3. Crypto benchmarking - measures Ed25519 sign/verify performance
+async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
+    use stellar_core_bucket::BucketManager;
+    use stellar_core_crypto::SecretKey;
+    use std::time::Instant;
+
+    let mut all_ok = true;
+
+    // Phase 1: Header chain verification
+    println!("Self-check phase 1: header chain verification");
+    let db = stellar_core_db::Database::open(&config.database.path)?;
+
+    let Some(latest_seq) = db.get_latest_ledger_seq()? else {
+        println!("  No ledger data in database. Skipping header verification.");
+        println!();
+        return Ok(());
+    };
+
+    if latest_seq == 0 {
+        println!("  At genesis ledger. Header chain is trivially valid.");
+    } else {
+        // Verify header chain going backwards
+        let depth = std::cmp::min(latest_seq, 100); // Check up to 100 ledgers
+        let mut current_seq = latest_seq;
+        let mut verified = 0u32;
+
+        while current_seq > 0 && verified < depth {
+            let current = db.get_ledger_header(current_seq)?
+                .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", current_seq))?;
+            let prev_seq = current_seq - 1;
+            let prev = db.get_ledger_header(prev_seq)?
+                .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", prev_seq))?;
+
+            let prev_hash = stellar_core_ledger::compute_header_hash(&prev)?;
+
+            if current.previous_ledger_hash != prev_hash.into() {
+                println!("  ERROR: Header chain broken at ledger {}", current_seq);
+                println!("    Previous hash in header: {:?}", current.previous_ledger_hash);
+                println!("    Computed hash of previous: {:?}", prev_hash);
+                all_ok = false;
+                break;
+            }
+
+            current_seq = prev_seq;
+            verified += 1;
+        }
+
+        if verified == depth {
+            println!("  Verified {} ledger headers (from {} to {})", verified, latest_seq, latest_seq - verified + 1);
+        }
+    }
+
+    // Phase 2: Bucket hash verification
+    println!();
+    println!("Self-check phase 2: bucket hash verification");
+
+    let bucket_manager = BucketManager::with_cache_size(
+        config.buckets.directory.clone(),
+        config.buckets.cache_size,
+    )?;
+
+    // Get the checkpoint for the current ledger
+    let checkpoint = stellar_core_history::checkpoint::latest_checkpoint_before_or_at(latest_seq)
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", latest_seq))?;
+
+    let levels = db.load_bucket_list(checkpoint)?
+        .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot at {}", checkpoint))?;
+
+    let mut buckets_verified = 0;
+    let mut buckets_failed = 0;
+
+    // Collect all unique bucket hashes using a set for deduplication
+    let hashes_to_verify: std::collections::HashSet<_> = levels.iter()
+        .flat_map(|(curr, snap)| [*curr, *snap])
+        .filter(|h| !h.is_zero())
+        .collect();
+
+    println!("  Verifying {} bucket files...", hashes_to_verify.len());
+
+    for hash in &hashes_to_verify {
+        match bucket_manager.load_bucket(hash) {
+            Ok(bucket) => {
+                // The bucket's hash is computed from its contents when loaded
+                // If it loads successfully, the hash matches
+                if bucket.hash() != *hash {
+                    println!("  ERROR: Bucket hash mismatch for {}", hash);
+                    println!("    Expected: {}", hash);
+                    println!("    Computed: {}", bucket.hash());
+                    buckets_failed += 1;
+                    all_ok = false;
+                } else {
+                    buckets_verified += 1;
+                }
+            }
+            Err(e) => {
+                println!("  ERROR: Failed to load bucket {}: {}", hash, e);
+                buckets_failed += 1;
+                all_ok = false;
+            }
+        }
+    }
+
+    println!("  Verified {} buckets, {} failures", buckets_verified, buckets_failed);
+
+    // Phase 3: Crypto benchmarking
+    println!();
+    println!("Self-check phase 3: crypto benchmarking");
+
+    const BENCHMARK_OPS: usize = 10000;
+    let message = b"stellar benchmark test message for ed25519 signing";
+
+    // Generate a keypair for benchmarking
+    let secret = SecretKey::generate();
+    let public = secret.public_key();
+
+    // Benchmark signing
+    let start = Instant::now();
+    for _ in 0..BENCHMARK_OPS {
+        let _ = secret.sign(message);
+    }
+    let sign_duration = start.elapsed();
+    let sign_per_sec = (BENCHMARK_OPS as f64 / sign_duration.as_secs_f64()) as u64;
+
+    // Generate signatures for verification benchmark
+    let signature = secret.sign(message);
+
+    // Benchmark verification
+    let start = Instant::now();
+    for _ in 0..BENCHMARK_OPS {
+        let _ = public.verify(message, &signature);
+    }
+    let verify_duration = start.elapsed();
+    let verify_per_sec = (BENCHMARK_OPS as f64 / verify_duration.as_secs_f64()) as u64;
+
+    println!("  Benchmarked {} signatures / sec", sign_per_sec);
+    println!("  Benchmarked {} verifications / sec", verify_per_sec);
+
+    // Final result
+    println!();
+    if all_ok {
+        println!("Self-check succeeded");
+        Ok(())
+    } else {
+        println!("Self-check failed");
+        std::process::exit(1);
+    }
 }
 
 /// Send an HTTP command to a running stellar-core node.

@@ -55,7 +55,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `force-scp` | Not Implemented | Deprecated in C++ |
 | `gen-seed` | Implemented | `new-keypair` command in rs-stellar-core |
 | `http-command` | Not Implemented | |
-| `self-check` (CLI) | Not Implemented | HTTP endpoint exists |
+| `self-check` (CLI) | Implemented | Via `offline self-check` in rs-stellar-core |
 | `merge-bucketlist` | Not Implemented | |
 | `dump-archival-stats` | Not Implemented | |
 | `new-db` | Not Implemented | |
