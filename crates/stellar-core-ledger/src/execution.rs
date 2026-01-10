@@ -41,6 +41,7 @@ use soroban_env_host_p25::fees::{
     RentFeeConfiguration, RentWriteFeeConfiguration,
 };
 use stellar_core_common::{Hash256, NetworkId};
+use stellar_core_crypto::account_id_to_strkey;
 use stellar_core_invariant::{
     ConstantProductInvariant, InvariantContext, InvariantManager,
     LedgerEntryChange as InvariantLedgerEntryChange, LiabilitiesMatchOffers, OrderBookIsNotCrossed,
@@ -690,7 +691,7 @@ impl TransactionExecutor {
         // First check if the account was created/updated by a previous transaction in this ledger
         // This is important for intra-ledger dependencies (e.g., TX0 creates account, TX1 uses it)
         if self.state.get_account(account_id).is_some() {
-            tracing::trace!(account = ?account_id, "load_account: found in state");
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: found in state");
             return Ok(true);
         }
 
@@ -698,7 +699,7 @@ impl TransactionExecutor {
 
         // Check if we've already tried to load from snapshot
         if self.loaded_accounts.contains_key(&key_bytes) {
-            tracing::trace!(account = ?account_id, "load_account: already tried, not found");
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: already tried, not found");
             return Ok(false); // Already tried and not found
         }
 
@@ -711,12 +712,12 @@ impl TransactionExecutor {
         });
 
         if let Some(entry) = snapshot.get_entry(&key)? {
-            tracing::trace!(account = ?account_id, "load_account: found in bucket list");
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: found in bucket list");
             self.state.load_entry(entry);
             return Ok(true);
         }
 
-        tracing::debug!(account = ?account_id, "load_account: NOT FOUND in bucket list");
+        tracing::debug!(account = %account_id_to_strkey(account_id), "load_account: NOT FOUND in bucket list");
         Ok(false)
     }
 
@@ -2176,8 +2177,8 @@ impl TransactionExecutor {
                 .unwrap_or_else(|_| "unknown".to_string());
             warn!(
                 tx_hash = %tx_hash,
-                fee_source = ?fee_source_id,
-                inner_source = ?inner_source_id,
+                fee_source = %account_id_to_strkey(&fee_source_id),
+                inner_source = %account_id_to_strkey(&inner_source_id),
                 results = ?operation_results,
                 "Transaction failed; rolling back changes"
             );

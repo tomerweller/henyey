@@ -66,6 +66,29 @@ pub fn encode_account_id(key: &[u8; 32]) -> String {
     encode_check(VERSION_ACCOUNT_ID, key)
 }
 
+/// Converts an XDR AccountId to its strkey representation (G...).
+///
+/// This is a convenience function for converting the XDR AccountId type
+/// directly to a human-readable strkey format, suitable for logging.
+///
+/// # Example
+///
+/// ```
+/// use stellar_core_crypto::account_id_to_strkey;
+/// use stellar_xdr::curr::{AccountId, PublicKey, Uint256};
+///
+/// let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+/// let strkey = account_id_to_strkey(&account_id);
+/// assert!(strkey.starts_with('G'));
+/// ```
+pub fn account_id_to_strkey(account_id: &stellar_xdr::curr::AccountId) -> String {
+    match &account_id.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
+            encode_account_id(bytes)
+        }
+    }
+}
+
 /// Decodes a Stellar account ID (G...) to raw key bytes.
 ///
 /// # Errors
