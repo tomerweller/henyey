@@ -103,9 +103,15 @@ impl Database {
             }
         }
 
-        let manager = r2d2_sqlite::SqliteConnectionManager::file(path);
+        let manager = r2d2_sqlite::SqliteConnectionManager::file(path)
+            .with_init(|conn| {
+                // Set busy_timeout on every new connection for lock contention handling
+                conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
+                Ok(())
+            });
         let pool = r2d2::Pool::builder()
             .max_size(10)
+            .connection_timeout(std::time::Duration::from_secs(30))
             .build(manager)?;
 
         let db = Self { pool };
@@ -150,6 +156,7 @@ impl Database {
             PRAGMA cache_size = -64000;
             PRAGMA foreign_keys = ON;
             PRAGMA temp_store = MEMORY;
+            PRAGMA busy_timeout = 30000;
         "#,
         )?;
 

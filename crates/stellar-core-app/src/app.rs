@@ -6115,11 +6115,14 @@ impl HerderCallback for App {
         );
 
         // Commit the ledger
+        tracing::debug!(ledger_seq, "Committing ledger close context");
         let result = close_ctx.commit().map_err(|e| {
             stellar_core_herder::HerderError::Internal(format!("Failed to commit ledger: {}", e))
         })?;
+        tracing::debug!(ledger_seq, "Ledger close context committed");
 
         let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
+        tracing::debug!(ledger_seq, "Persisting ledger close data");
         if let Err(err) = self.persist_ledger_close(
             &result.header,
             &tx_set_variant,
@@ -6128,6 +6131,7 @@ impl HerderCallback for App {
         ) {
             tracing::warn!(error = %err, "Failed to persist ledger close data");
         }
+        tracing::debug!(ledger_seq, "Ledger close data persisted");
 
         // Separate successful and failed transactions for queue management.
         // Results are in the same order as tx_set.transactions.
@@ -6176,10 +6180,13 @@ impl HerderCallback for App {
         }
 
         // Update current ledger tracking
+        tracing::debug!(ledger_seq, "Updating current ledger tracking");
         *self.current_ledger.write().await = ledger_seq;
+        tracing::debug!(ledger_seq, "Clearing tx advert history");
         self.clear_tx_advert_history(ledger_seq).await;
 
         // Signal heartbeat to sync recovery - ledger close is progress
+        tracing::debug!(ledger_seq, "Signaling sync recovery heartbeat");
         self.sync_recovery_heartbeat();
 
         tracing::info!(
@@ -6188,6 +6195,7 @@ impl HerderCallback for App {
             "Ledger closed successfully"
         );
 
+        tracing::debug!(ledger_seq, "Ledger close function returning");
         Ok(result.header_hash)
     }
 
