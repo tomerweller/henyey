@@ -114,6 +114,10 @@ const MAX_TX_SET_REQUESTS_PER_TICK: usize = 32;
 /// we trigger out-of-sync recovery.
 const CONSENSUS_STUCK_TIMEOUT_SECS: u64 = 35;
 
+/// Faster timeout when all peers report DontHave or disconnect.
+/// This allows us to trigger catchup sooner when we know peers don't have the tx sets.
+const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
+
 /// Recovery timer for out-of-sync recovery attempts.
 /// Matches C++ stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
@@ -323,6 +327,9 @@ pub struct App {
     tx_set_dont_have: RwLock<HashMap<Hash256, HashSet<stellar_core_overlay::PeerId>>>,
     /// Last time we requested a tx set by hash (throttling).
     tx_set_last_request: RwLock<HashMap<Hash256, TxSetRequestState>>,
+    /// Tracks when all peers have been exhausted for a tx set (all said DontHave or disconnected).
+    /// When this is true, we use a faster timeout to trigger catchup.
+    tx_set_all_peers_exhausted: AtomicBool,
     /// When we detected consensus is stuck (for timeout detection).
     /// Stores (current_ledger, first_buffered, stuck_start_time, last_recovery_attempt).
     consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
@@ -814,6 +821,7 @@ impl App {
             tx_pending_demands: RwLock::new(VecDeque::new()),
             tx_set_dont_have: RwLock::new(HashMap::new()),
             tx_set_last_request: RwLock::new(HashMap::new()),
+            tx_set_all_peers_exhausted: AtomicBool::new(false),
             consensus_stuck_state: RwLock::new(None),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: RwLock::new(SurveyScheduler::new()),
@@ -1800,6 +1808,9 @@ impl App {
 
         progress.set_phase(crate::logging::CatchupPhase::Complete);
         progress.summary();
+
+        // Reset the tx set exhausted flag after catchup - fresh start
+        self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
 
         Ok(CatchupResult {
             ledger_seq: output.result.ledger_seq,
@@ -2983,7 +2994,19 @@ impl App {
                             let elapsed = state.stuck_start.elapsed().as_secs();
                             let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
 
-                            if elapsed >= CONSENSUS_STUCK_TIMEOUT_SECS {
+                            // Use faster timeout when:
+                            // 1. All peers have explicitly said DontHave, OR
+                            // 2. We have pending tx set requests that have been waiting too long
+                            let all_peers_exhausted = self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
+                            let has_stale_requests = self.herder.has_stale_pending_tx_set(TX_SET_UNAVAILABLE_TIMEOUT_SECS);
+                            let use_fast_timeout = all_peers_exhausted || has_stale_requests;
+                            let effective_timeout = if use_fast_timeout {
+                                TX_SET_UNAVAILABLE_TIMEOUT_SECS
+                            } else {
+                                CONSENSUS_STUCK_TIMEOUT_SECS
+                            };
+
+                            if elapsed >= effective_timeout {
                                 tracing::warn!(
                                     current_ledger,
                                     first_buffered,
@@ -2992,9 +3015,14 @@ impl App {
                                     trigger,
                                     elapsed_secs = elapsed,
                                     recovery_attempts = state.recovery_attempts,
+                                    all_peers_exhausted,
+                                    has_stale_requests,
+                                    effective_timeout,
                                     "Buffered catchup stuck timeout; triggering catchup"
                                 );
                                 *stuck_state = None;
+                                // Reset the exhausted flag since we're triggering catchup
+                                self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
                                 ConsensusStuckAction::TriggerCatchup
                             } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
                                 state.last_recovery_attempt = now;
@@ -5718,6 +5746,14 @@ impl App {
                                 }
                             }
                             found.or_else(|| {
+                                // All peers have said DontHave for this tx set
+                                tracing::warn!(
+                                    hash = %hash,
+                                    peers_asked = set.len(),
+                                    total_peers = peers.len(),
+                                    "All peers exhausted for tx set - triggering faster catchup"
+                                );
+                                self.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
                                 set.clear();
                                 peers.get(start_idx)
                             })
@@ -6188,6 +6224,9 @@ impl HerderCallback for App {
         // Signal heartbeat to sync recovery - ledger close is progress
         tracing::debug!(ledger_seq, "Signaling sync recovery heartbeat");
         self.sync_recovery_heartbeat();
+
+        // Reset the tx set exhausted flag - we're making progress
+        self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
 
         tracing::info!(
             ledger_seq = result.ledger_seq(),

@@ -391,6 +391,16 @@ impl ScpDriver {
         old_count - new_count
     }
 
+    /// Check if any pending tx set request has been waiting longer than the given duration.
+    /// Returns true if at least one request has exceeded the timeout.
+    pub fn has_stale_pending_tx_set(&self, max_wait_secs: u64) -> bool {
+        let now = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(max_wait_secs);
+        self.pending_tx_sets
+            .iter()
+            .any(|entry| now.duration_since(entry.value().requested_at) >= max_wait)
+    }
+
     /// Get the network ID.
     pub fn network_id(&self) -> Hash256 {
         self.network_id

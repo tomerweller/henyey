@@ -1214,6 +1214,12 @@ impl Herder {
         self.scp_driver.cleanup_old_pending_slots(current_slot)
     }
 
+    /// Check if any pending tx set request has been waiting longer than the given duration.
+    /// This is used to detect when tx sets are unavailable and faster catchup should be triggered.
+    pub fn has_stale_pending_tx_set(&self, max_wait_secs: u64) -> bool {
+        self.scp_driver.has_stale_pending_tx_set(max_wait_secs)
+    }
+
     /// Check if we need a transaction set.
     pub fn needs_tx_set(&self, hash: &Hash256) -> bool {
         self.scp_driver.needs_tx_set(hash)
