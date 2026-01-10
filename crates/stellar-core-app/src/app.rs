@@ -2675,50 +2675,54 @@ impl App {
 
         // Check if we've already processed this slot
         let last_processed = *self.last_processed_slot.read().await;
-        if latest_externalized <= last_processed {
-            tracing::debug!(latest_externalized, last_processed, "Already processed");
-            return;
-        }
+        let has_new_slots = latest_externalized > last_processed;
 
-        tracing::debug!(latest_externalized, last_processed, "Need to process");
+        if has_new_slots {
+            tracing::debug!(latest_externalized, last_processed, "Need to process");
 
-        let prev_latest = self
-            .last_externalized_slot
-            .swap(latest_externalized, Ordering::Relaxed);
-        if latest_externalized != prev_latest {
-            *self.last_externalized_at.write().await = Instant::now();
-        }
+            let prev_latest = self
+                .last_externalized_slot
+                .swap(latest_externalized, Ordering::Relaxed);
+            if latest_externalized != prev_latest {
+                *self.last_externalized_at.write().await = Instant::now();
+            }
 
-        let mut missing_tx_set = false;
-        let mut buffered_count = 0usize;
-        let mut advance_to = last_processed;
-        {
-            let mut buffer = self.syncing_ledgers.write().await;
-            for slot in (last_processed + 1)..=latest_externalized {
-                if let Some(info) = self.herder.check_ledger_close(slot) {
-                    if info.tx_set.is_none() {
-                        missing_tx_set = true;
-                    }
-                    buffer.entry(info.slot as u32).or_insert(info);
-                    buffered_count += 1;
-                    if slot == advance_to + 1 {
-                        advance_to = slot;
+            let mut missing_tx_set = false;
+            let mut buffered_count = 0usize;
+            let mut advance_to = last_processed;
+            {
+                let mut buffer = self.syncing_ledgers.write().await;
+                for slot in (last_processed + 1)..=latest_externalized {
+                    if let Some(info) = self.herder.check_ledger_close(slot) {
+                        if info.tx_set.is_none() {
+                            missing_tx_set = true;
+                        }
+                        buffer.entry(info.slot as u32).or_insert(info);
+                        buffered_count += 1;
+                        if slot == advance_to + 1 {
+                            advance_to = slot;
+                        }
                     }
                 }
             }
+
+            *self.last_processed_slot.write().await = advance_to;
+
+            if missing_tx_set {
+                self.request_pending_tx_sets().await;
+            }
+            if buffered_count == 0 {
+                self.maybe_start_externalized_catchup(latest_externalized)
+                    .await;
+            }
+        } else {
+            tracing::debug!(latest_externalized, last_processed, "Already processed");
         }
 
-        *self.last_processed_slot.write().await = advance_to;
-
-        if missing_tx_set {
-            self.request_pending_tx_sets().await;
-        }
+        // Always try to apply buffered ledgers and check for catchup,
+        // even when no new slots - we may need to trigger stuck recovery.
         self.try_apply_buffered_ledgers().await;
         self.maybe_start_buffered_catchup().await;
-        if buffered_count == 0 {
-            self.maybe_start_externalized_catchup(latest_externalized)
-                .await;
-        }
     }
 
     fn first_ledger_in_checkpoint(ledger: u32) -> u32 {
@@ -3448,9 +3452,13 @@ impl App {
 
         // Get recent SCP envelopes to broadcast
         let from_slot = current_ledger.saturating_sub(5) as u64;
+        tracing::debug!(from_slot, "Getting SCP state for recovery");
         let (envelopes, _quorum_set) = self.herder.get_scp_state(from_slot);
+        tracing::debug!(envelope_count = envelopes.len(), "Got SCP state for recovery");
 
+        tracing::debug!("Acquiring overlay lock for recovery");
         let overlay = self.overlay.lock().await;
+        tracing::debug!("Acquired overlay lock for recovery");
         let overlay = match overlay.as_ref() {
             Some(o) => o,
             None => {

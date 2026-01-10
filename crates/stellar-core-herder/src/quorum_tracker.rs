@@ -320,6 +320,11 @@ impl QuorumTracker {
         &self.quorum
     }
 
+    /// Return the number of nodes being tracked.
+    pub fn tracked_node_count(&self) -> usize {
+        self.quorum.len()
+    }
+
     /// Return the closest validators in the local quorum set for a node.
     pub fn find_closest_validators(&self, node_id: &NodeId) -> Option<&BTreeSet<NodeId>> {
         self.quorum.get(node_id).map(|info| &info.closest_validators)

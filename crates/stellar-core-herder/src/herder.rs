@@ -248,7 +248,24 @@ impl Herder {
         let local_node_id = node_id_from_public_key(&config.node_public_key);
         let mut quorum_tracker = QuorumTracker::new(local_node_id.clone());
         if let Some(ref quorum_set) = config.local_quorum_set {
+            info!(
+                validators = quorum_set.validators.len(),
+                threshold = quorum_set.threshold,
+                "Initializing quorum tracker with local quorum set"
+            );
+            for v in quorum_set.validators.iter() {
+                let key_hex = match &v.0 {
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                        stellar_xdr::curr::Uint256(bytes),
+                    ) => hex::encode(bytes),
+                };
+                info!(validator = %key_hex, "Quorum set validator");
+            }
             let _ = quorum_tracker.expand(&local_node_id, quorum_set.clone());
+            info!(
+                tracked_nodes = quorum_tracker.tracked_node_count(),
+                "Quorum tracker initialized"
+            );
         }
 
         Self {
@@ -317,7 +334,24 @@ impl Herder {
             SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
         let mut quorum_tracker = QuorumTracker::new(node_id.clone());
         if let Some(ref quorum_set) = config.local_quorum_set {
+            info!(
+                validators = quorum_set.validators.len(),
+                threshold = quorum_set.threshold,
+                "Initializing quorum tracker with local quorum set (validator)"
+            );
+            for v in quorum_set.validators.iter() {
+                let key_hex = match &v.0 {
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                        stellar_xdr::curr::Uint256(bytes),
+                    ) => hex::encode(bytes),
+                };
+                info!(validator = %key_hex, "Quorum set validator");
+            }
             let _ = quorum_tracker.expand(&node_id, quorum_set.clone());
+            info!(
+                tracked_nodes = quorum_tracker.tracked_node_count(),
+                "Quorum tracker initialized"
+            );
         }
 
         Self {

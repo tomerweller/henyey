@@ -219,9 +219,16 @@ impl QuorumSetConfig {
         let mut validators = Vec::new();
         for v in &self.validators {
             // Parse G... public key to bytes
-            let pubkey = stellar_core_crypto::PublicKey::from_strkey(v).ok()?;
-            let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(*pubkey.as_bytes())));
-            validators.push(node_id);
+            match stellar_core_crypto::PublicKey::from_strkey(v) {
+                Ok(pubkey) => {
+                    let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(*pubkey.as_bytes())));
+                    validators.push(node_id);
+                }
+                Err(e) => {
+                    tracing::error!(validator = %v, error = %e, "Failed to parse validator public key - check strkey format");
+                    return None;
+                }
+            }
         }
 
         // Recursively convert inner sets
