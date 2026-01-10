@@ -1079,6 +1079,38 @@ impl App {
         self.ledger_manager.soroban_network_info()
     }
 
+    /// Manually close a ledger (for testing/manual close mode).
+    ///
+    /// This triggers the herder to close the next ledger. It requires:
+    /// - The node must be configured as a validator (`is_validator = true`)
+    /// - Manual close mode must be enabled (`manual_close = true`)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(new_ledger_seq)` - The ledger was successfully triggered
+    /// * `Err` - An error occurred (not a validator, manual close not enabled, etc.)
+    pub async fn manual_close_ledger(&self) -> anyhow::Result<u32> {
+        // Check if node is a validator
+        if !self.config.node.is_validator {
+            anyhow::bail!("Issuing a manual ledger close requires NODE_IS_VALIDATOR to be set to true.");
+        }
+
+        // Check if manual close mode is enabled
+        if !self.config.node.manual_close {
+            anyhow::bail!("Manual close is disabled. Set manual_close = true in configuration.");
+        }
+
+        // Get the next ledger sequence
+        let (current_ledger, _, _, _) = self.ledger_info();
+        let next_ledger = current_ledger + 1;
+
+        // Trigger the herder to close the next ledger
+        self.herder.trigger_next_ledger(next_ledger).await
+            .map_err(|e| anyhow::anyhow!("Failed to trigger next ledger: {}", e))?;
+
+        Ok(next_ledger)
+    }
+
     pub fn self_check(&self, depth: u32) -> anyhow::Result<SelfCheckResult> {
         let Some(latest) = self.db.get_latest_ledger_seq()? else {
             return Ok(SelfCheckResult {

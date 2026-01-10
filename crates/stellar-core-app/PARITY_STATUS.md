@@ -109,7 +109,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `/health` | Implemented | Health check endpoint |
 | `/ledger` | Implemented | Current ledger info (Rust-specific) |
 | `/status` | Implemented | Current node status (Rust-specific) |
-| `/manualclose` | Stub | Requires RUN_STANDALONE mode |
+| `/manualclose` | Implemented | Triggers manual ledger close (requires is_validator and manual_close config) |
 | `/sorobaninfo` | Implemented | Basic format, reads actual config from ledger |
 | `/logRotate` | Not Implemented | |
 | `/maintenance` | Not Implemented | |

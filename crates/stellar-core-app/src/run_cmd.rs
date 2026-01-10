@@ -1643,25 +1643,19 @@ async fn ll_handler(
 
 /// Handler for /manualclose endpoint - manually close a ledger.
 ///
-/// Only works in MANUAL_CLOSE / RUN_STANDALONE mode.
+/// Triggers a manual ledger close. Requires:
+/// - The node must be configured as a validator (`is_validator = true`)
+/// - Manual close mode must be enabled (`manual_close = true`)
+///
+/// Parameters (ledgerSeq, closeTime) are only accepted in RUN_STANDALONE mode,
+/// which is not currently implemented. Without parameters, triggers the next
+/// ledger close via the herder.
 async fn manualclose_handler(
     State(state): State<Arc<ServerState>>,
     Query(params): Query<ManualCloseParams>,
 ) -> impl IntoResponse {
-    // Check if running in standalone mode (would need config access)
-    // For now, this endpoint is stubbed as manual close requires
-    // significant infrastructure that may not be present
-
-    let app_state = state.app.state().await;
-    let (current_ledger, _, _, _) = state.app.ledger_info();
-
-    // In a full implementation:
-    // 1. Verify RUN_STANDALONE mode
-    // 2. Create a synthetic close with provided ledger_seq and close_time
-    // 3. Trigger the ledger manager to close
-
+    // RUN_STANDALONE mode is not implemented, so parameters are not accepted
     if params.ledger_seq.is_some() || params.close_time.is_some() {
-        // Parameters provided but not in standalone mode
         return (
             StatusCode::BAD_REQUEST,
             Json(ManualCloseResponse {
@@ -1674,18 +1668,29 @@ async fn manualclose_handler(
         );
     }
 
-    // For now, report current state but note manual close is not fully implemented
-    (
-        StatusCode::OK,
-        Json(ManualCloseResponse {
-            success: false,
-            ledger_seq: Some(current_ledger),
-            message: Some(format!(
-                "Manual close not yet implemented. Current state: {}, ledger: {}",
-                app_state, current_ledger
-            )),
-        }),
-    )
+    // Try to trigger manual close
+    match state.app.manual_close_ledger().await {
+        Ok(new_ledger) => {
+            (
+                StatusCode::OK,
+                Json(ManualCloseResponse {
+                    success: true,
+                    ledger_seq: Some(new_ledger),
+                    message: Some(format!("Triggered manual close for ledger {}", new_ledger)),
+                }),
+            )
+        }
+        Err(e) => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ManualCloseResponse {
+                    success: false,
+                    ledger_seq: None,
+                    message: Some(e.to_string()),
+                }),
+            )
+        }
+    }
 }
 
 /// Handler for /sorobaninfo endpoint - get Soroban network configuration.

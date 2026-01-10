@@ -153,6 +153,14 @@ pub struct NodeConfig {
     /// Quorum set configuration.
     #[serde(default)]
     pub quorum_set: QuorumSetConfig,
+
+    /// Enable manual ledger close mode.
+    ///
+    /// When true, the node won't automatically close ledgers based on
+    /// consensus timing. Instead, ledgers are closed via the /manualclose
+    /// HTTP endpoint. This is primarily used for testing.
+    #[serde(default)]
+    pub manual_close: bool,
 }
 
 impl Default for NodeConfig {
@@ -163,6 +171,7 @@ impl Default for NodeConfig {
             is_validator: false,
             home_domain: None,
             quorum_set: QuorumSetConfig::default(),
+            manual_close: false,
         }
     }
 }
