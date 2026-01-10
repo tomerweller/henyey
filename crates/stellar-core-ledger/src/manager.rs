@@ -1150,49 +1150,78 @@ impl<'a> LedgerCloseContext<'a> {
     /// Commit the ledger close and produce the new header.
     pub fn commit(mut self) -> Result<LedgerCloseResult> {
         let start = std::time::Instant::now();
+        tracing::debug!(ledger_seq = self.close_data.ledger_seq, "LedgerCloseContext::commit starting");
 
         // Compute transaction result hash
         let result_set = stellar_xdr::curr::TransactionResultSet {
             results: self.tx_results.clone().try_into().unwrap_or_default(),
         };
         let tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
+        tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Computed tx result hash");
 
         let mut upgraded_header = self.prev_header.clone();
         self.upgrade_ctx.apply_to_header(&mut upgraded_header);
         let protocol_version = upgraded_header.ledger_version;
 
+        // Load state archival settings BEFORE acquiring bucket list lock to avoid deadlock.
+        // The snapshot's lookup_fn tries to acquire a read lock on bucket_list, which would
+        // deadlock if we're already holding the write lock.
+        let eviction_settings = if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+            tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Loading state archival settings");
+            let settings = load_state_archival_settings_from_snapshot(&self.snapshot)
+                .unwrap_or_default();
+            tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Loaded state archival settings");
+            Some(settings)
+        } else {
+            None
+        };
+
         // Apply delta to bucket list FIRST, then compute its hash
         // This ensures the bucket_list_hash in the header matches the actual state
+        tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Acquiring bucket list write lock");
         let bucket_list_hash = {
             let mut bucket_list = self.manager.bucket_list.write();
+            tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Acquired bucket list write lock");
             let init_entries = self.delta.init_entries();
             let mut live_entries = self.delta.live_entries();
             let mut dead_entries = self.delta.dead_entries();
+            tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Got delta entries");
 
             // Run incremental eviction scan for Protocol 23+
             // This must happen BEFORE applying transaction changes to match C++ stellar-core
             let mut archived_entries: Vec<LedgerEntry> = Vec::new();
 
             if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Acquiring hot archive read lock");
                 let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
+                tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Acquired hot archive read lock");
+                tracing::debug!(ledger_seq = self.close_data.ledger_seq, hot_archive_present = hot_archive_guard.is_some(), "Checking hot archive presence");
                 if hot_archive_guard.is_some() {
+                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Dropping hot archive read lock");
                     drop(hot_archive_guard); // Release read lock before write operations
+                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Dropped hot archive read lock");
 
-                    // Load eviction state
-                    let eviction_settings = load_state_archival_settings_from_snapshot(&self.snapshot)
-                        .unwrap_or_default();
+                    // Use pre-loaded eviction settings (loaded before bucket list lock)
+                    let eviction_settings = eviction_settings.clone().unwrap_or_default();
+
+                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Loading eviction iterator from bucket list");
                     let eviction_iterator = load_eviction_iterator_from_bucket_list(&bucket_list);
+                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, has_iterator = eviction_iterator.is_some(), "Loaded eviction iterator");
 
                     let mut iter = eviction_iterator.unwrap_or_else(|| {
+                        tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Creating new EvictionIterator");
                         EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
                     });
+                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "EvictionIterator ready");
 
                     // Update starting level if needed (matches C++ behavior)
+                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Updating starting eviction iterator");
                     update_starting_eviction_iterator(
                         &mut iter,
                         eviction_settings.starting_eviction_scan_level,
                         self.close_data.ledger_seq,
                     );
+                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Updated starting eviction iterator");
 
                     tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
