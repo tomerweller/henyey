@@ -22,12 +22,14 @@ use sha2::{Digest, Sha256};
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
-    ContractDataDurability, Hash, LedgerEntry, LedgerKey, LedgerKeyContractData, Limits, ReadXdr,
-    ScAddress, ScVal, WriteXdr,
+    ContractDataDurability, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
+    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+use crate::delta::LedgerDelta;
+use crate::error::LedgerError;
 use crate::snapshot::SnapshotHandle;
 
 /// Validity of a configuration upgrade.
@@ -329,6 +331,88 @@ impl ConfigUpgradeSetFrame {
         self.config_upgrade_set
             .to_xdr(Limits::none())
             .unwrap_or_default()
+    }
+
+    /// Apply the configuration upgrades to the ledger.
+    ///
+    /// Updates all CONFIG_SETTING entries in the upgrade set.
+    ///
+    /// Returns a tuple of:
+    /// - `state_archival_changed`: Whether StateArchival settings were modified
+    /// - `memory_limit_changed`: Whether memory limit settings were modified
+    ///
+    /// These flags are used by the caller to trigger special handling:
+    /// - StateArchival changes may affect the state size window
+    /// - Memory limit changes require Soroban host reconfiguration
+    pub fn apply_to(
+        &self,
+        snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+    ) -> Result<(bool, bool), LedgerError> {
+        let mut state_archival_changed = false;
+        let mut memory_limit_changed = false;
+
+        for new_entry in self.config_upgrade_set.updated_entry.iter() {
+            let setting_id = new_entry.discriminant();
+
+            // Construct the ledger key for this config setting
+            let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                config_setting_id: setting_id,
+            });
+
+            // Load the current entry from the ledger
+            let current_entry = snapshot.get_entry(&key).map_err(|e| {
+                LedgerError::Internal(format!("Failed to load config setting {:?}: {}", setting_id, e))
+            })?;
+
+            let previous = match current_entry {
+                Some(entry) => entry,
+                None => {
+                    // Entry doesn't exist - this shouldn't happen for valid upgrades
+                    // as all config settings should exist after protocol 20
+                    warn!(
+                        setting_id = ?setting_id,
+                        "Config setting entry not found during upgrade"
+                    );
+                    continue;
+                }
+            };
+
+            // Create the new entry
+            let new_ledger_entry = LedgerEntry {
+                last_modified_ledger_seq: delta.ledger_seq(),
+                data: LedgerEntryData::ConfigSetting(new_entry.clone()),
+                ext: LedgerEntryExt::V0,
+            };
+
+            // Record the update
+            delta.record_update(previous.clone(), new_ledger_entry)?;
+
+            // Track special changes
+            if matches!(setting_id, ConfigSettingId::StateArchival) {
+                state_archival_changed = true;
+            }
+
+            if matches!(setting_id, ConfigSettingId::ContractComputeV0) {
+                // Check if memory limit changed
+                if let (
+                    LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(old)),
+                    ConfigSettingEntry::ContractComputeV0(new),
+                ) = (&previous.data, new_entry)
+                {
+                    if old.tx_memory_limit != new.tx_memory_limit {
+                        memory_limit_changed = true;
+                    }
+                }
+            }
+
+            info!(
+                setting_id = ?setting_id,
+                "Applied config upgrade"
+            );
+        }
+
+        Ok((state_archival_changed, memory_limit_changed))
     }
 
     // --- Validation helpers ---

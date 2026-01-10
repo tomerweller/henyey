@@ -1344,6 +1344,27 @@ impl<'a> LedgerCloseContext<'a> {
         // Apply upgrades to header fields (e.g., ledger_version, base_fee)
         self.upgrade_ctx.apply_to_header(&mut new_header);
 
+        // Apply config upgrades (Soroban settings stored in CONTRACT_DATA)
+        if self.upgrade_ctx.has_config_upgrades() {
+            let (state_archival_changed, memory_limit_changed) = self
+                .upgrade_ctx
+                .apply_config_upgrades(&self.snapshot, &mut self.delta)?;
+
+            if state_archival_changed {
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    "State archival settings changed via config upgrade"
+                );
+            }
+
+            if memory_limit_changed {
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    "Memory limit settings changed via config upgrade"
+                );
+            }
+        }
+
         // Also set the raw upgrades in scp_value.upgrades for correct header hash
         // The upgrades need to be XDR-encoded as UpgradeType (opaque bytes)
         let raw_upgrades: Vec<stellar_xdr::curr::UpgradeType> = self

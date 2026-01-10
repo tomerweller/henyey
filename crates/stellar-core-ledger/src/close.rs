@@ -28,6 +28,11 @@ use stellar_xdr::curr::{
     TransactionSet, WriteXdr,
 };
 
+use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
+use crate::delta::LedgerDelta;
+use crate::error::LedgerError;
+use crate::snapshot::SnapshotHandle;
+
 /// Complete input data for closing a ledger.
 ///
 /// This struct contains all the data needed to process a ledger close,
@@ -641,6 +646,75 @@ impl UpgradeContext {
         self.upgrades
             .iter()
             .any(|u| matches!(u, LedgerUpgrade::Config(_)))
+    }
+
+    /// Apply all config upgrades to the ledger.
+    ///
+    /// Loads and validates each config upgrade, then applies the configuration
+    /// changes to the ledger delta.
+    ///
+    /// Returns a tuple of:
+    /// - `state_archival_changed`: Whether any StateArchival settings were modified
+    /// - `memory_limit_changed`: Whether any memory limit settings were modified
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A config upgrade cannot be loaded from the ledger
+    /// - A config upgrade fails validation
+    /// - The delta update fails
+    pub fn apply_config_upgrades(
+        &self,
+        snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+    ) -> Result<(bool, bool), LedgerError> {
+        let mut state_archival_changed = false;
+        let mut memory_limit_changed = false;
+
+        for key in self.config_upgrade_keys() {
+            // Load the upgrade set from the ledger
+            let frame = match ConfigUpgradeSetFrame::make_from_key(snapshot, &key) {
+                Some(f) => f,
+                None => {
+                    tracing::warn!(
+                        contract_id = ?key.contract_id,
+                        "Config upgrade set not found or expired"
+                    );
+                    continue;
+                }
+            };
+
+            // Validate the upgrade
+            match frame.is_valid_for_apply() {
+                ConfigUpgradeValidity::Valid => {}
+                ConfigUpgradeValidity::XdrInvalid => {
+                    tracing::warn!(
+                        contract_id = ?key.contract_id,
+                        "Config upgrade set has invalid XDR"
+                    );
+                    continue;
+                }
+                ConfigUpgradeValidity::Invalid => {
+                    tracing::warn!(
+                        contract_id = ?key.contract_id,
+                        "Config upgrade set is invalid"
+                    );
+                    continue;
+                }
+            }
+
+            // Apply the upgrade
+            let (archival, memory) = frame.apply_to(snapshot, delta)?;
+            state_archival_changed |= archival;
+            memory_limit_changed |= memory;
+
+            tracing::info!(
+                contract_id = ?key.contract_id,
+                "Applied config upgrade"
+            );
+        }
+
+        Ok((state_archival_changed, memory_limit_changed))
     }
 
     /// Apply upgrades to a header, returning the modified values.
