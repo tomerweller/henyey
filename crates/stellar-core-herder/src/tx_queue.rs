@@ -14,6 +14,8 @@
 //! - **Sequence number handling**: Maintains contiguous sequences per account
 //! - **Lane-based limits**: Separate limits for classic, DEX, and Soroban transactions
 //! - **Eviction**: Lower-fee transactions are evicted when limits are exceeded
+//! - **Per-account limits**: One transaction per account (sequence-number-source)
+//! - **Fee balance validation**: Validates fee-source has sufficient balance
 //!
 //! # Transaction Set Building
 //!
@@ -31,10 +33,19 @@
 //! can be included in the same ledger. Additionally, once a Soroban transaction
 //! appears in the sequence, subsequent classic transactions are excluded
 //! (Soroban and classic transactions execute in different phases).
+//!
+//! # Per-Account Limits
+//!
+//! The queue enforces a one-transaction-per-account limit (based on the
+//! sequence-number-source). Fee-bump transactions can replace an existing
+//! transaction with the same sequence number if the new fee is at least
+//! 10x the existing fee rate. Transactions that are not included in a ledger
+//! for too many consecutive ledgers (pending_depth) are automatically banned.
 
 use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use stellar_core_common::{
@@ -73,12 +84,46 @@ pub enum TxQueueResult {
     Banned,
     /// Transaction contains a filtered operation type.
     Filtered,
+    /// Account already has a pending transaction. Try again later or use fee-bump.
+    TryAgainLater,
+}
+
+/// Result of the shift() operation after ledger close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShiftResult {
+    /// Number of transactions that were unbanned (reached end of ban period).
+    pub unbanned_count: usize,
+    /// Number of transactions that were auto-banned due to age (pending too long).
+    pub evicted_due_to_age: usize,
 }
 
 const MAX_TX_SET_ALLOWANCE_BYTES: u32 = 10 * 1024 * 1024;
 const MAX_CLASSIC_BYTE_ALLOWANCE: u32 = MAX_TX_SET_ALLOWANCE_BYTES / 2;
 const MAX_SOROBAN_BYTE_ALLOWANCE: u32 = MAX_TX_SET_ALLOWANCE_BYTES / 2;
 
+/// Trait for providing ledger account balance information.
+///
+/// This trait is used for fee balance validation during transaction queue
+/// operations. Implementations should provide the available balance for
+/// an account that can be used to pay transaction fees.
+pub trait FeeBalanceProvider: Send + Sync {
+    /// Get the available balance for an account that can be used for fees.
+    ///
+    /// Returns the native asset balance minus any reserves or holds,
+    /// or None if the account doesn't exist.
+    fn get_available_balance(&self, account_id: &AccountId) -> Option<i64>;
+}
+
+/// Result of fee balance validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeBalanceResult {
+    /// Balance is sufficient for the transaction.
+    Sufficient,
+    /// Balance is insufficient for the transaction.
+    Insufficient,
+    /// Account does not exist.
+    AccountNotFound,
+}
 
 /// Configuration for the transaction queue.
 #[derive(Debug, Clone)]
@@ -256,6 +301,59 @@ impl QueuedTransaction {
     }
 }
 
+/// A timestamped transaction wrapper for per-account tracking.
+///
+/// This struct tracks additional metadata needed for per-account queue limits:
+/// - Insertion time for delay metrics
+/// - Whether the transaction was submitted locally
+#[derive(Debug, Clone)]
+pub struct TimestampedTx {
+    /// The queued transaction.
+    pub tx: QueuedTransaction,
+    /// When this transaction was inserted into the queue.
+    pub insertion_time: Instant,
+    /// Whether this transaction was submitted from this node (vs received from network).
+    pub submitted_from_self: bool,
+}
+
+/// Per-account state in the transaction queue.
+///
+/// C++ parity: An AccountID is tracked in mAccountStates if and only if:
+/// - total_fees > 0 (account is fee-source for at least one tx), OR
+/// - transaction.is_some() (account is seq-number-source for a queued tx)
+///
+/// The fee-source and sequence-number-source can be different accounts
+/// (e.g., in fee-bump transactions where another account pays the fee).
+#[derive(Debug, Clone, Default)]
+pub struct AccountState {
+    /// Sum of full fees for all transactions where this account is the fee-source.
+    /// This tracks the total fees this account is liable for across all queued
+    /// transactions, which may include transactions where the sequence-number-source
+    /// is a different account.
+    pub total_fees: i64,
+    /// Number of ledgers that have closed since the last ledger in which a transaction
+    /// from this sequence-number-source was included. Always 0 if transaction is None.
+    /// Used for auto-ban: when age reaches pending_depth, the transaction is banned.
+    pub age: u32,
+    /// The single pending transaction for which this account is the sequence-number-source.
+    /// C++ enforces one transaction per account (non-fee-bump) in the queue.
+    pub transaction: Option<TimestampedTx>,
+}
+
+impl AccountState {
+    /// Check if this account state can be removed (no transaction and no fees tracked).
+    pub fn is_empty(&self) -> bool {
+        self.transaction.is_none() && self.total_fees == 0
+    }
+}
+
+/// Fee multiplier required for replace-by-fee with fee-bump transactions.
+/// A fee-bump must have a fee at least FEE_MULTIPLIER times the existing fee rate.
+const FEE_MULTIPLIER: u64 = 10;
+
+/// Default pending depth (number of ledgers before auto-ban).
+const DEFAULT_PENDING_DEPTH: u32 = 10;
+
 fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, u64, u32)> {
     QueuedTransaction::extract_fee_and_ops(envelope)
         .ok()
@@ -302,6 +400,43 @@ fn min_inclusion_fee_to_beat(evicted: (u64, u32), tx: &QueuedTransaction) -> u64
         compute_better_fee(evicted.0, evicted.1, tx.op_count)
     } else {
         0
+    }
+}
+
+/// Check if a fee-bump transaction can replace an existing transaction.
+/// For replace-by-fee to work, the new fee must be at least FEE_MULTIPLIER times the old fee rate.
+/// Returns Ok(()) if replacement is allowed, or Err(min_fee) if the fee is insufficient.
+fn can_replace_by_fee(
+    new_fee: u64,
+    new_ops: u32,
+    old_fee: u64,
+    old_ops: u32,
+) -> std::result::Result<(), u64> {
+    // newFee / newOps >= FEE_MULTIPLIER * oldFee / oldOps
+    // Cross-multiply to avoid division:
+    // newFee * oldOps >= FEE_MULTIPLIER * oldFee * newOps
+    let left = (new_fee as u128).saturating_mul(old_ops as u128);
+    let right = (FEE_MULTIPLIER as u128)
+        .saturating_mul(old_fee as u128)
+        .saturating_mul(new_ops as u128);
+
+    if left < right {
+        // Calculate minimum fee required:
+        // minFee * oldOps >= FEE_MULTIPLIER * oldFee * newOps
+        // minFee >= (FEE_MULTIPLIER * oldFee * newOps) / oldOps + 1 (round up)
+        let min_fee = if old_ops > 0 {
+            let numerator = right;
+            let denominator = old_ops as u128;
+            let quotient = numerator / denominator;
+            let remainder = numerator % denominator;
+            let rounded = if remainder > 0 { quotient + 1 } else { quotient };
+            u64::try_from(rounded).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        Err(min_fee)
+    } else {
+        Ok(())
     }
 }
 
@@ -354,6 +489,48 @@ fn account_id_from_envelope(envelope: &TransactionEnvelope) -> AccountId {
         },
     };
     stellar_core_tx::muxed_to_account_id(&source)
+}
+
+/// Get the fee-source account key (for fee bump, this is the outer source; otherwise same as inner).
+fn fee_source_key(envelope: &TransactionEnvelope) -> Vec<u8> {
+    let fee_source = match envelope {
+        TransactionEnvelope::TxV0(env) => {
+            stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
+        }
+        TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
+        TransactionEnvelope::TxFeeBump(env) => env.tx.fee_source.clone(),
+    };
+    let account_id = stellar_core_tx::muxed_to_account_id(&fee_source);
+    account_id
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .unwrap_or_default()
+}
+
+/// Get sequence number from a TransactionEnvelope.
+fn envelope_seq_num(envelope: &TransactionEnvelope) -> i64 {
+    match envelope {
+        TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
+        TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+        },
+    }
+}
+
+/// Check if envelope is a fee-bump transaction.
+fn is_fee_bump_envelope(envelope: &TransactionEnvelope) -> bool {
+    matches!(envelope, TransactionEnvelope::TxFeeBump(_))
+}
+
+/// Convert an XDR-encoded account key back to AccountId.
+fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
+    use stellar_xdr::curr::ReadXdr;
+    AccountId::from_xdr(key, Limits::none()).unwrap_or_else(|_| {
+        // Fallback to a zero account ID if decoding fails
+        AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([0; 32]),
+        ))
+    })
 }
 
 /// A set of transactions for a ledger.
@@ -666,6 +843,17 @@ fn summary_generalized_tx_set(gen: &GeneralizedTransactionSet) -> String {
 /// Queue of pending transactions.
 ///
 /// Maintains transactions waiting to be included in a ledger, ordered by fee.
+///
+/// # Per-Account Limits
+///
+/// C++ parity: The queue enforces one transaction per account (sequence-number-source).
+/// This prevents spam and ensures predictable transaction ordering. Accounts can
+/// replace their pending transaction with a fee-bump (10x fee multiplier required).
+///
+/// # Transaction Aging
+///
+/// Transactions that sit in the queue for too long (pending_depth ledgers) are
+/// automatically banned. This prevents stale transactions from occupying queue space.
 pub struct TransactionQueue {
     /// Configuration.
     config: TxQueueConfig,
@@ -687,6 +875,15 @@ pub struct TransactionQueue {
     banned_transactions: RwLock<std::collections::VecDeque<HashSet<Hash256>>>,
     /// Depth of the ban deque (number of ledgers transactions stay banned).
     _ban_depth: u32,
+    /// Per-account state tracking for one-tx-per-account limit.
+    /// Key is the XDR-encoded AccountId bytes.
+    account_states: RwLock<HashMap<Vec<u8>, AccountState>>,
+    /// Number of ledgers before auto-banning stale transactions.
+    pending_depth: u32,
+    /// Optional fee balance provider for validating fee-source balances.
+    /// When set, transactions are validated to ensure the fee-source has
+    /// sufficient balance to cover all pending fees plus the new transaction fee.
+    fee_balance_provider: RwLock<Option<Arc<dyn FeeBalanceProvider>>>,
 }
 
 /// Default ban depth (number of ledgers transactions stay banned).
@@ -695,11 +892,22 @@ const DEFAULT_BAN_DEPTH: u32 = 10;
 impl TransactionQueue {
     /// Create a new transaction queue.
     pub fn new(config: TxQueueConfig) -> Self {
-        Self::with_ban_depth(config, DEFAULT_BAN_DEPTH)
+        Self::with_depths(config, DEFAULT_BAN_DEPTH, DEFAULT_PENDING_DEPTH)
     }
 
     /// Create a new transaction queue with custom ban depth.
     pub fn with_ban_depth(config: TxQueueConfig, ban_depth: u32) -> Self {
+        Self::with_depths(config, ban_depth, DEFAULT_PENDING_DEPTH)
+    }
+
+    /// Create a new transaction queue with custom ban and pending depths.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Queue configuration
+    /// * `ban_depth` - Number of ledgers transactions stay banned
+    /// * `pending_depth` - Number of ledgers before stale transactions are auto-banned
+    pub fn with_depths(config: TxQueueConfig, ban_depth: u32, pending_depth: u32) -> Self {
         let mut ctx = ValidationContext::default();
         ctx.base_fee = config.min_fee_per_op;
 
@@ -719,7 +927,23 @@ impl TransactionQueue {
             global_evicted_inclusion_fee: RwLock::new((0, 0)),
             banned_transactions: RwLock::new(banned),
             _ban_depth: ban_depth,
+            account_states: RwLock::new(HashMap::new()),
+            pending_depth,
+            fee_balance_provider: RwLock::new(None),
         }
+    }
+
+    /// Set the fee balance provider for validating fee-source balances.
+    ///
+    /// When set, transactions are validated to ensure the fee-source account
+    /// has sufficient balance to cover all pending fees plus the new transaction fee.
+    pub fn set_fee_balance_provider(&self, provider: Arc<dyn FeeBalanceProvider>) {
+        *self.fee_balance_provider.write() = Some(provider);
+    }
+
+    /// Clear the fee balance provider.
+    pub fn clear_fee_balance_provider(&self) {
+        *self.fee_balance_provider.write() = None;
     }
 
     /// Create with default configuration.
@@ -888,6 +1112,59 @@ impl TransactionQueue {
         // Check for duplicate in queue
         if by_hash.contains_key(&queued.hash) {
             return TxQueueResult::Duplicate;
+        }
+
+        // Per-account limit check: one transaction per account (sequence-number-source)
+        let seq_source_key = account_key(&queued.envelope);
+        let new_seq = envelope_seq_num(&queued.envelope);
+        let is_fee_bump = is_fee_bump_envelope(&queued.envelope);
+        let new_fee_source_key = fee_source_key(&queued.envelope);
+
+        // Track the transaction being replaced (for fee-bump replace-by-fee)
+        let mut replaced_tx: Option<QueuedTransaction> = None;
+
+        {
+            let account_states = self.account_states.read();
+            if let Some(state) = account_states.get(&seq_source_key) {
+                if let Some(ref timestamped) = state.transaction {
+                    let current_tx = &timestamped.tx;
+
+                    // Check if it's a duplicate (same hash)
+                    if current_tx.hash == queued.hash {
+                        return TxQueueResult::Duplicate;
+                    }
+
+                    // Any transaction older than the current one is invalid
+                    let current_seq = envelope_seq_num(&current_tx.envelope);
+                    if new_seq < current_seq {
+                        return TxQueueResult::Invalid;
+                    }
+
+                    // If not a fee-bump, reject (only one tx per account allowed)
+                    if !is_fee_bump {
+                        return TxQueueResult::TryAgainLater;
+                    }
+
+                    // Fee-bump must have the same sequence number to replace
+                    if new_seq != current_seq {
+                        return TxQueueResult::TryAgainLater;
+                    }
+
+                    // Check if fee-bump meets the 10x fee multiplier requirement
+                    if let Err(_min_fee) = can_replace_by_fee(
+                        queued.total_fee,
+                        queued.op_count,
+                        current_tx.total_fee,
+                        current_tx.op_count,
+                    ) {
+                        // Fee is insufficient for replace-by-fee
+                        return TxQueueResult::FeeTooLow;
+                    }
+
+                    // Fee-bump replacement is valid - mark the current tx for replacement
+                    replaced_tx = Some(current_tx.clone());
+                }
+            }
         }
 
         let mut pending_evictions: HashSet<Hash256> = HashSet::new();
@@ -1132,8 +1409,114 @@ impl TransactionQueue {
             }
         }
 
+        // Fee balance validation (if provider is set)
+        // Check that fee-source has sufficient balance for total fees + new fee
+        if let Some(ref provider) = *self.fee_balance_provider.read() {
+            let fee_source_id = account_id_from_fee_source_key(&new_fee_source_key);
+
+            // Calculate the net new fee being added
+            let net_new_fee = if let Some(ref old_tx) = replaced_tx {
+                let old_fee_source_key = fee_source_key(&old_tx.envelope);
+                if old_fee_source_key == new_fee_source_key {
+                    // Same fee source - only the difference is new
+                    (queued.total_fee as i64).saturating_sub(old_tx.total_fee as i64)
+                } else {
+                    // Different fee source - full new fee
+                    queued.total_fee as i64
+                }
+            } else {
+                queued.total_fee as i64
+            };
+
+            // Get current total fees for this fee-source
+            let current_total_fees = {
+                let account_states = self.account_states.read();
+                account_states
+                    .get(&new_fee_source_key)
+                    .map(|s| s.total_fees)
+                    .unwrap_or(0)
+            };
+
+            // Check if fee-source has sufficient balance
+            if let Some(available) = provider.get_available_balance(&fee_source_id) {
+                // available - net_new_fee < current_total_fees means insufficient
+                if available.saturating_sub(net_new_fee) < current_total_fees {
+                    return TxQueueResult::Invalid; // txINSUFFICIENT_BALANCE
+                }
+            } else {
+                // Account doesn't exist
+                return TxQueueResult::Invalid;
+            }
+        }
+
+        // Handle fee-bump replacement if applicable
+        if let Some(ref old_tx) = replaced_tx {
+            // Remove the old transaction from by_hash
+            by_hash.remove(&old_tx.hash);
+
+            // If the old tx has a different fee-source, release the fee from that account
+            let old_fee_source_key = fee_source_key(&old_tx.envelope);
+            if old_fee_source_key != new_fee_source_key {
+                let mut account_states = self.account_states.write();
+                if let Some(old_fee_state) = account_states.get_mut(&old_fee_source_key) {
+                    old_fee_state.total_fees =
+                        old_fee_state.total_fees.saturating_sub(old_tx.total_fee as i64);
+                    // Remove the account state if it's empty
+                    if old_fee_state.is_empty() {
+                        account_states.remove(&old_fee_source_key);
+                    }
+                }
+            }
+        }
+
         // Add to queue
         let hash = queued.hash;
+        let new_fee = queued.total_fee;
+
+        // Update account_states
+        {
+            let mut account_states = self.account_states.write();
+
+            // Update the sequence-source account state (stores the pending transaction)
+            let seq_state = account_states
+                .entry(seq_source_key.clone())
+                .or_insert_with(AccountState::default);
+
+            // If replacing, and same fee source as old tx, adjust the fee delta
+            let fee_to_add = if let Some(ref old_tx) = replaced_tx {
+                let old_fee_source_key = fee_source_key(&old_tx.envelope);
+                if old_fee_source_key == new_fee_source_key {
+                    // Same fee source - only add the difference
+                    (new_fee as i64).saturating_sub(old_tx.total_fee as i64)
+                } else {
+                    // Different fee source - add full new fee
+                    new_fee as i64
+                }
+            } else {
+                // New transaction - add full fee
+                new_fee as i64
+            };
+
+            seq_state.transaction = Some(TimestampedTx {
+                tx: queued.clone(),
+                insertion_time: Instant::now(),
+                submitted_from_self: false, // TODO: track this properly when we have peer tracking
+            });
+
+            // Update the fee-source account state (tracks total_fees)
+            // Note: seq_source and fee_source may be the same account
+            if seq_source_key == new_fee_source_key {
+                // Same account - already have the entry
+                seq_state.total_fees = seq_state.total_fees.saturating_add(fee_to_add);
+            } else {
+                // Different accounts - update fee-source separately
+                let fee_state = account_states
+                    .entry(new_fee_source_key)
+                    .or_insert_with(AccountState::default);
+                fee_state.total_fees = fee_state.total_fees.saturating_add(fee_to_add);
+            }
+        }
+
         by_hash.insert(hash, queued);
         self.seen.write().insert(hash);
 
@@ -1634,8 +2017,11 @@ impl TransactionQueue {
         }
     }
 
-    /// Remove transactions that were applied in a ledger.
-    pub fn remove_applied(&self, tx_hashes: &[Hash256]) {
+    /// Remove transactions that were applied in a ledger (simple version).
+    ///
+    /// This is a simplified version that only removes by hash.
+    /// For full per-account tracking, use `remove_applied_with_seq()`.
+    pub fn remove_applied_by_hash(&self, tx_hashes: &[Hash256]) {
         let mut by_hash = self.by_hash.write();
         for hash in tx_hashes {
             by_hash.remove(hash);
@@ -1764,25 +2150,189 @@ impl TransactionQueue {
         })
     }
 
-    /// Shift the ban queue after a ledger close.
+    /// Remove applied transactions from the queue and reset their source account ages.
     ///
-    /// This should be called after each ledger close. It removes the oldest
-    /// set of banned transactions (unbanning them) and adds a new empty set
-    /// for the next ledger.
+    /// This should be called after transactions are applied in a ledger, before `shift()`.
+    ///
+    /// For each applied transaction:
+    /// 1. Find the account state by sequence-number-source
+    /// 2. If a queued tx exists with seq_num <= applied seq_num, drop it
+    /// 3. Reset the account's age to 0
+    /// 4. Release the fee from the fee-source account's total_fees
+    /// 5. Ban the applied transaction hash (prevents re-submission)
+    ///
+    /// # Arguments
+    ///
+    /// * `applied_txs` - List of (envelope, sequence_number) pairs for applied transactions
+    pub fn remove_applied(&self, applied_txs: &[(TransactionEnvelope, i64)]) {
+        if applied_txs.is_empty() {
+            return;
+        }
+
+        let mut account_states = self.account_states.write();
+        let mut by_hash = self.by_hash.write();
+        let mut banned = self.banned_transactions.write();
+
+        // Collect fee releases to apply after processing all transactions
+        let mut fee_releases: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut accounts_to_cleanup: Vec<Vec<u8>> = Vec::new();
+
+        for (envelope, applied_seq) in applied_txs {
+            let frame = stellar_core_tx::TransactionFrame::with_network(
+                envelope.clone(),
+                self.config.network_id,
+            );
+
+            // Get sequence-number-source (inner source for fee-bump)
+            let seq_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
+            let seq_source_key = account_key_from_account_id(&seq_source_id);
+
+            // Get fee-source
+            let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+            let fee_source_key = account_key_from_account_id(&fee_source_id);
+
+            // Process sequence-source account
+            if let Some(state) = account_states.get_mut(&seq_source_key) {
+                if let Some(ref timestamped) = state.transaction {
+                    // Drop if queued tx has seq <= applied seq
+                    if timestamped.tx.sequence_number() <= *applied_seq {
+                        // Remove from by_hash
+                        by_hash.remove(&timestamped.tx.hash);
+
+                        // Collect fee release info
+                        let tx_fee = timestamped.tx.total_fee as i64;
+                        let tx_fee_source_id = stellar_core_tx::muxed_to_account_id(
+                            &stellar_core_tx::TransactionFrame::with_network(
+                                timestamped.tx.envelope.clone(),
+                                self.config.network_id,
+                            )
+                            .fee_source_account(),
+                        );
+                        let tx_fee_source_key = account_key_from_account_id(&tx_fee_source_id);
+                        fee_releases.push((tx_fee_source_key, tx_fee));
+
+                        state.transaction = None;
+                        state.age = 0;
+                    }
+                }
+            }
+
+            // Ban the applied tx hash
+            let applied_hash = Hash256::hash_xdr(envelope).unwrap_or_default();
+            if let Some(newest) = banned.back_mut() {
+                newest.insert(applied_hash);
+            }
+
+            // Track accounts for cleanup
+            accounts_to_cleanup.push(seq_source_key);
+            if fee_source_key != accounts_to_cleanup.last().cloned().unwrap_or_default() {
+                accounts_to_cleanup.push(fee_source_key);
+            }
+        }
+
+        // Apply fee releases
+        for (fee_source_key, tx_fee) in fee_releases {
+            if let Some(fee_state) = account_states.get_mut(&fee_source_key) {
+                fee_state.total_fees = fee_state.total_fees.saturating_sub(tx_fee);
+            }
+        }
+
+        // Clean up empty account states
+        for account_key in accounts_to_cleanup {
+            if let Some(state) = account_states.get(&account_key) {
+                if state.is_empty() {
+                    account_states.remove(&account_key);
+                }
+            }
+        }
+    }
+
+    /// Shift the queue after a ledger close.
+    ///
+    /// This should be called after `remove_applied()`. It:
+    /// 1. Rotates the ban deque (unbans old transactions, makes room for new bans)
+    /// 2. Increments age for all accounts with pending transactions
+    /// 3. Auto-bans transactions that reach pending_depth age
+    /// 4. Resets eviction thresholds for the new ledger
     ///
     /// # Returns
     ///
-    /// The number of transactions that were unbanned.
-    pub fn shift(&self) -> usize {
+    /// A `ShiftResult` with details about unbanned and auto-banned transactions.
+    pub fn shift(&self) -> ShiftResult {
         let mut banned = self.banned_transactions.write();
+        let mut account_states = self.account_states.write();
+        let mut by_hash = self.by_hash.write();
 
         // Remove the oldest set (front) to unban those transactions
-        let unbanned = banned.pop_front().map(|s| s.len()).unwrap_or(0);
+        let unbanned_count = banned.pop_front().map(|s| s.len()).unwrap_or(0);
 
         // Add a new empty set at the back for the next ledger
         banned.push_back(HashSet::new());
 
-        unbanned
+        let mut evicted_due_to_age = 0;
+        let mut accounts_to_remove = Vec::new();
+        // Collect fee releases to apply after iteration (to avoid borrow conflicts)
+        let mut fee_releases: Vec<(Vec<u8>, u64)> = Vec::new();
+
+        // Process account states: increment age, auto-ban stale transactions
+        for (account_key, state) in account_states.iter_mut() {
+            // Only increment age if there's a pending transaction
+            if state.transaction.is_some() {
+                state.age += 1;
+
+                // Auto-ban at pending_depth
+                if state.age >= self.pending_depth {
+                    if let Some(ref timestamped) = state.transaction {
+                        // Add to banned set
+                        if let Some(newest) = banned.back_mut() {
+                            newest.insert(timestamped.tx.hash);
+                        }
+                        // Remove from by_hash
+                        by_hash.remove(&timestamped.tx.hash);
+
+                        // Track fee release for the fee-source account
+                        let tx_fee_source_key = fee_source_key(&timestamped.tx.envelope);
+                        fee_releases.push((tx_fee_source_key, timestamped.tx.total_fee));
+
+                        evicted_due_to_age += 1;
+                    }
+                    state.transaction = None;
+
+                    // Mark for removal if no fees tracked (will check again after fee release)
+                    if state.total_fees == 0 {
+                        accounts_to_remove.push(account_key.clone());
+                    } else {
+                        state.age = 0;
+                    }
+                }
+            }
+        }
+
+        // Apply fee releases
+        for (fee_source_key, tx_fee) in fee_releases {
+            if let Some(fee_state) = account_states.get_mut(&fee_source_key) {
+                fee_state.total_fees = fee_state.total_fees.saturating_sub(tx_fee as i64);
+                // Mark for removal if now empty
+                if fee_state.is_empty() && !accounts_to_remove.contains(&fee_source_key) {
+                    accounts_to_remove.push(fee_source_key);
+                }
+            }
+        }
+
+        // Remove empty account states
+        for account_key in accounts_to_remove {
+            account_states.remove(&account_key);
+        }
+
+        // Reset eviction thresholds for the new ledger
+        self.classic_lane_evicted_inclusion_fee.write().clear();
+        self.soroban_lane_evicted_inclusion_fee.write().clear();
+        *self.global_evicted_inclusion_fee.write() = (0, 0);
+
+        ShiftResult {
+            unbanned_count,
+            evicted_due_to_age,
+        }
     }
 
     /// Get the total number of currently banned transactions.
@@ -2265,8 +2815,8 @@ mod tests {
         assert!(queue.is_banned(&hash));
         queue.shift(); // ledger 2
         assert!(queue.is_banned(&hash));
-        let unbanned = queue.shift(); // ledger 3 - oldest set removed
-        assert_eq!(unbanned, 1);
+        let shift_result = queue.shift(); // ledger 3 - oldest set removed
+        assert_eq!(shift_result.unbanned_count, 1);
         assert!(!queue.is_banned(&hash)); // Now unbanned
 
         // Should be able to add again
@@ -2406,10 +2956,13 @@ mod tests {
 
     #[test]
     fn test_sequence_order_preserved() {
+        // With one-tx-per-account limit, each transaction needs a different source account
         let queue = TransactionQueue::with_defaults();
 
         let mut tx_a = make_test_envelope(200, 1);
         let mut tx_b = make_test_envelope(200, 1);
+        set_source(&mut tx_a, 1);
+        set_source(&mut tx_b, 2); // Different account
         if let TransactionEnvelope::Tx(env) = &mut tx_a {
             env.tx.seq_num = SequenceNumber(1);
         }
@@ -2428,27 +2981,23 @@ mod tests {
 
     #[test]
     fn test_sequence_blocks_classic_after_soroban() {
+        // With one-tx-per-account limit, only one tx per account can be added.
+        // Use different accounts to test that both classic and soroban can coexist.
         let queue = TransactionQueue::with_defaults();
 
         let mut classic = make_test_envelope(250, 1);
         let mut soroban = make_soroban_envelope(200);
-        let mut classic_late = make_test_envelope(200, 1);
         set_source(&mut classic, 7);
-        set_source(&mut soroban, 7);
-        set_source(&mut classic_late, 7);
+        set_source(&mut soroban, 8); // Different account
         if let TransactionEnvelope::Tx(env) = &mut classic {
             env.tx.seq_num = SequenceNumber(1);
         }
         if let TransactionEnvelope::Tx(env) = &mut soroban {
             env.tx.seq_num = SequenceNumber(2);
         }
-        if let TransactionEnvelope::Tx(env) = &mut classic_late {
-            env.tx.seq_num = SequenceNumber(3);
-        }
 
-        queue.try_add(classic);
-        queue.try_add(soroban);
-        queue.try_add(classic_late);
+        assert_eq!(queue.try_add(classic), TxQueueResult::Added);
+        assert_eq!(queue.try_add(soroban), TxQueueResult::Added);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
@@ -2458,14 +3007,15 @@ mod tests {
 
     #[test]
     fn test_sequence_allows_soroban_suffix() {
+        // With one-tx-per-account limit, use different accounts for each transaction
         let queue = TransactionQueue::with_defaults();
 
         let mut classic = make_test_envelope(200, 1);
         let mut soroban_a = make_soroban_envelope(200);
         let mut soroban_b = make_soroban_envelope(200);
         set_source(&mut classic, 7);
-        set_source(&mut soroban_a, 7);
-        set_source(&mut soroban_b, 7);
+        set_source(&mut soroban_a, 8); // Different account
+        set_source(&mut soroban_b, 9); // Different account
         if let TransactionEnvelope::Tx(env) = &mut classic {
             env.tx.seq_num = SequenceNumber(1);
         }
@@ -2476,9 +3026,9 @@ mod tests {
             env.tx.seq_num = SequenceNumber(3);
         }
 
-        queue.try_add(classic);
-        queue.try_add(soroban_a);
-        queue.try_add(soroban_b);
+        assert_eq!(queue.try_add(classic), TxQueueResult::Added);
+        assert_eq!(queue.try_add(soroban_a), TxQueueResult::Added);
+        assert_eq!(queue.try_add(soroban_b), TxQueueResult::Added);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
@@ -2488,10 +3038,13 @@ mod tests {
 
     #[test]
     fn test_sequence_respects_starting_seq() {
+        // With one-tx-per-account limit, use different accounts
         let queue = TransactionQueue::with_defaults();
 
         let mut tx_a = make_test_envelope(200, 1);
         let mut tx_b = make_test_envelope(200, 1);
+        set_source(&mut tx_a, 1);
+        set_source(&mut tx_b, 2); // Different account
         if let TransactionEnvelope::Tx(env) = &mut tx_a {
             env.tx.seq_num = SequenceNumber(5);
         }
@@ -2499,26 +3052,31 @@ mod tests {
             env.tx.seq_num = SequenceNumber(6);
         }
 
-        queue.try_add(tx_a);
+        queue.try_add(tx_a.clone());
         queue.try_add(tx_b);
 
-        let account_id = account_id_from_envelope(&make_test_envelope(200, 1));
+        // Set starting sequence for account 1 to 5, so tx_a (seq 5) should be filtered out
+        let account_id = account_id_from_envelope(&tx_a);
         let mut starting = std::collections::HashMap::new();
         starting.insert(account_key_from_account_id(&account_id), 5);
 
         let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         seqs.sort();
+        // tx_a with seq 5 is filtered (starting_seq >= 5), only tx_b with seq 6 remains
         assert_eq!(seqs, vec![6]);
     }
 
     #[test]
     fn test_starting_sequence_boundary() {
+        // With one-tx-per-account limit, use different accounts
         let queue = TransactionQueue::with_defaults();
 
         let starting_seq = (4_i64) << 32;
         let mut tx_starting = make_test_envelope(200, 1);
         let mut tx_next = make_test_envelope(200, 1);
+        set_source(&mut tx_starting, 1);
+        set_source(&mut tx_next, 2); // Different account
         if let TransactionEnvelope::Tx(env) = &mut tx_starting {
             env.tx.seq_num = SequenceNumber(starting_seq);
         }
@@ -2526,16 +3084,18 @@ mod tests {
             env.tx.seq_num = SequenceNumber(starting_seq + 1);
         }
 
-        queue.try_add(tx_starting);
+        queue.try_add(tx_starting.clone());
         queue.try_add(tx_next);
 
-        let account_id = account_id_from_envelope(&make_test_envelope(200, 1));
+        // Set starting sequence for account 1, so tx_starting should be filtered out
+        let account_id = account_id_from_envelope(&tx_starting);
         let mut starting = std::collections::HashMap::new();
         starting.insert(account_key_from_account_id(&account_id), starting_seq);
 
         let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
         let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
         seqs.sort();
+        // tx_starting is filtered (starting_seq >= starting_seq), only tx_next remains
         assert_eq!(seqs, vec![starting_seq + 1]);
     }
 
@@ -3420,6 +3980,8 @@ mod tests {
 
     #[test]
     fn test_queue_ops_limit_rejects_same_account_eviction() {
+        // With one-tx-per-account limit, the second transaction is rejected with TryAgainLater
+        // (not QueueFull) because the account already has a pending transaction.
         let config = TxQueueConfig {
             max_queue_ops: Some(1),
             max_size: 10,
@@ -3439,7 +4001,8 @@ mod tests {
         }
 
         assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
-        assert_eq!(queue.try_add(tx_high), TxQueueResult::QueueFull);
+        // With one-tx-per-account, second tx from same account is rejected as TryAgainLater
+        assert_eq!(queue.try_add(tx_high), TxQueueResult::TryAgainLater);
         assert_eq!(queue.len(), 1);
     }
 
@@ -3661,15 +4224,24 @@ mod tests {
 
     #[test]
     fn test_queue_full() {
+        // With one-tx-per-account limit, use different accounts for each transaction
         let config = TxQueueConfig {
             max_size: 2,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
 
-        queue.try_add(make_test_envelope(100, 1));
-        queue.try_add(make_test_envelope(200, 1));
-        let result = queue.try_add(make_test_envelope(300, 1));
+        let mut tx1 = make_test_envelope(100, 1);
+        let mut tx2 = make_test_envelope(200, 1);
+        let mut tx3 = make_test_envelope(300, 1);
+        set_source(&mut tx1, 1);
+        set_source(&mut tx2, 2);
+        set_source(&mut tx3, 3);
+
+        queue.try_add(tx1);
+        queue.try_add(tx2);
+        // Third transaction should evict the lowest-fee one
+        let result = queue.try_add(tx3);
         assert_eq!(result, TxQueueResult::Added);
     }
 
@@ -3705,7 +4277,7 @@ mod tests {
         let hash = full_hash(&tx);
         assert!(queue.contains(&hash));
 
-        queue.remove_applied(&[hash]);
+        queue.remove_applied_by_hash(&[hash]);
         assert!(!queue.contains(&hash));
         assert_eq!(queue.len(), 0);
     }

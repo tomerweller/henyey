@@ -212,6 +212,20 @@ impl TransactionFrame {
         }
     }
 
+    /// Get the fee-paying account ID (unwrapped from MuxedAccount).
+    /// For fee bump transactions, this is the outer source. For regular transactions,
+    /// this is the same as the inner source.
+    pub fn fee_source_account_id(&self) -> AccountId {
+        muxed_to_account_id(&self.fee_source_account())
+    }
+
+    /// Get the inner source account ID (unwrapped from MuxedAccount).
+    /// For fee bump transactions, this is the inner tx source (sequence-number-source).
+    /// For regular transactions, this is the same as the fee source.
+    pub fn inner_source_account_id(&self) -> AccountId {
+        muxed_to_account_id(&self.inner_source_account())
+    }
+
     /// Get the sequence number.
     pub fn sequence_number(&self) -> i64 {
         match &self.envelope {

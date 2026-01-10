@@ -2554,6 +2554,9 @@ impl App {
                     stellar_core_herder::TxQueueResult::Filtered => {
                         tracing::debug!("Transaction filtered by operation type");
                     }
+                    stellar_core_herder::TxQueueResult::TryAgainLater => {
+                        tracing::debug!("Transaction rejected: account already has pending transaction");
+                    }
                 }
             }
 
@@ -6244,9 +6247,13 @@ impl HerderCallback for App {
         );
 
         // Shift the transaction ban queue - ages out old bans after each ledger close.
-        let unbanned = self.herder.tx_queue().shift();
-        if unbanned > 0 {
-            tracing::debug!(unbanned, "Shifted transaction ban queue");
+        let shift_result = self.herder.tx_queue().shift();
+        if shift_result.unbanned_count > 0 || shift_result.evicted_due_to_age > 0 {
+            tracing::debug!(
+                unbanned = shift_result.unbanned_count,
+                evicted = shift_result.evicted_due_to_age,
+                "Shifted transaction ban queue"
+            );
         }
 
         // Update current ledger tracking
@@ -6748,8 +6755,9 @@ mod tests {
 
         let app = App::new(config).await.unwrap();
 
-        // Shift with empty ban queue should return 0
-        let unbanned = app.herder.tx_queue().shift();
-        assert_eq!(unbanned, 0);
+        // Shift with empty ban queue should return zero counts
+        let shift_result = app.herder.tx_queue().shift();
+        assert_eq!(shift_result.unbanned_count, 0);
+        assert_eq!(shift_result.evicted_due_to_age, 0);
     }
 }

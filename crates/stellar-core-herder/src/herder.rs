@@ -809,6 +809,9 @@ impl Herder {
             TxQueueResult::Filtered => {
                 debug!("Transaction rejected due to filtered operation type");
             }
+            TxQueueResult::TryAgainLater => {
+                debug!("Transaction rejected: account already has pending transaction");
+            }
         }
 
         result
@@ -972,7 +975,7 @@ impl Herder {
         info!(slot, txs = applied_tx_hashes.len(), "Ledger closed");
 
         // Remove applied transactions from queue
-        self.tx_queue.remove_applied(applied_tx_hashes);
+        self.tx_queue.remove_applied_by_hash(applied_tx_hashes);
 
         // Drop pending tx set requests for slots older than the next slot.
         let _ = self.scp_driver.cleanup_old_pending_slots(slot.saturating_add(1));
@@ -1203,7 +1206,7 @@ impl Herder {
 
     /// Remove applied transactions from the queue.
     pub fn remove_applied_transactions(&self, tx_hashes: &[Hash256]) {
-        self.tx_queue.remove_applied(tx_hashes);
+        self.tx_queue.remove_applied_by_hash(tx_hashes);
     }
 
     /// Clean up old data.

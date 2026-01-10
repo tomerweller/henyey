@@ -1524,6 +1524,9 @@ async fn submit_tx_handler(
         stellar_core_herder::TxQueueResult::Filtered => {
             (false, Some("Transaction filtered by operation type".to_string()))
         }
+        stellar_core_herder::TxQueueResult::TryAgainLater => {
+            (false, Some("Account already has pending transaction".to_string()))
+        }
     };
 
     (

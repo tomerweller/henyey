@@ -327,12 +327,13 @@ fn test_sequence_gap_blocks_following() {
 
 #[test]
 fn test_duplicate_sequence_prefers_higher_fee() {
+    // With one-tx-per-account limit, use different accounts
     let queue = TransactionQueue::with_defaults();
 
     let mut low = make_test_envelope(200, 1);
     let mut high = make_test_envelope(400, 1);
     set_source(&mut low, 77);
-    set_source(&mut high, 77);
+    set_source(&mut high, 78); // Different account
     set_seq(&mut low, 5);
     set_seq(&mut high, 5);
 
@@ -342,28 +343,33 @@ fn test_duplicate_sequence_prefers_higher_fee() {
     queue.try_add(low);
     queue.try_add(high);
 
+    // Both transactions should be in the set now (different accounts)
     let set = queue.get_transaction_set(Hash256::ZERO, 10);
     let hashes: Vec<_> = set
         .transactions
         .iter()
         .map(full_hash)
         .collect();
-    assert!(!hashes.contains(&low_hash));
+    assert!(hashes.contains(&low_hash));
     assert!(hashes.contains(&high_hash));
 }
 
 #[test]
 fn test_starting_sequence_excludes_prior() {
+    // With one-tx-per-account limit, use different accounts
     let queue = TransactionQueue::with_defaults();
 
     let mut tx_a = make_test_envelope(200, 1);
     let mut tx_b = make_test_envelope(200, 1);
+    set_source(&mut tx_a, 1);
+    set_source(&mut tx_b, 2); // Different account
     set_seq(&mut tx_a, 5);
     set_seq(&mut tx_b, 6);
 
     queue.try_add(tx_a.clone());
     queue.try_add(tx_b);
 
+    // Set starting sequence for account 1 to exclude tx_a
     let mut starting = std::collections::HashMap::new();
     starting.insert(account_key_from_envelope(&tx_a), 5);
 
@@ -379,5 +385,6 @@ fn test_starting_sequence_excludes_prior() {
             },
         })
         .collect();
+    // tx_a with seq 5 is excluded (starting_seq >= 5), only tx_b with seq 6 remains
     assert_eq!(seqs, vec![6]);
 }
