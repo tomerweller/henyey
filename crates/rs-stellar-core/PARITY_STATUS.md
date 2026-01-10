@@ -25,6 +25,7 @@ This section documents the feature parity between this Rust implementation and t
 | `sec-to-pub` | Implemented | Print public key from secret key (stdin) |
 | `http-command` | Implemented | Send HTTP command to running node |
 | `diag-bucket-stats` / `bucket-info` | Partial | Basic bucket info (not full per-account aggregation) |
+| `dump-ledger` | Implemented | Dump ledger entries to JSON with type/limit filtering |
 
 #### Offline Tools (Unique to Rust)
 
@@ -97,7 +98,6 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `force-scp` | Force SCP flag (deprecated in C++) | Low |
 | `merge-bucketlist` | Write diagnostic merged bucket list | Low |
 | `dump-archival-stats` | Print state archival statistics | Low |
-| `dump-ledger` | Dump current ledger state as JSON with filtering | Medium |
 | `new-hist` | Initialize history archives (create structure) | Low |
 | `report-last-history-checkpoint` | Report last checkpoint info | Low |
 | `get-settings-upgrade-txs` | Get settings upgrade transactions | Low |

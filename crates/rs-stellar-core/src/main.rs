@@ -387,6 +387,29 @@ enum OfflineCommands {
     ///
     /// Reads a secret key seed (S...) from stdin and prints the public key.
     SecToPub,
+
+    /// Dump ledger entries to JSON
+    ///
+    /// Dumps ledger entries from the bucket list to a JSON file for debugging.
+    /// Supports filtering by entry type and limiting output count.
+    DumpLedger {
+        /// Output file path
+        #[arg(long, short)]
+        output: PathBuf,
+
+        /// Filter by entry type (account, trustline, offer, data, claimable_balance,
+        /// liquidity_pool, contract_data, contract_code, config_setting, ttl)
+        #[arg(long)]
+        entry_type: Option<String>,
+
+        /// Maximum number of entries to output
+        #[arg(long)]
+        limit: Option<u64>,
+
+        /// Only include entries modified in the last N ledgers
+        #[arg(long)]
+        last_modified_ledger_count: Option<u32>,
+    },
 }
 
 #[tokio::main]
@@ -3261,6 +3284,14 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
         OfflineCommands::SecToPub => {
             sec_to_pub()
         }
+        OfflineCommands::DumpLedger {
+            output,
+            entry_type,
+            limit,
+            last_modified_ledger_count,
+        } => {
+            cmd_dump_ledger(config, output, entry_type, limit, last_modified_ledger_count).await
+        }
     }
 }
 
@@ -3746,6 +3777,141 @@ fn sec_to_pub() -> anyhow::Result<()> {
 
     let public_key = secret_key.public_key();
     println!("{}", encode_account_id(public_key.as_bytes()));
+
+    Ok(())
+}
+
+/// Dump ledger entries from the bucket list to a JSON file.
+///
+/// This is equivalent to C++ stellar-core dump-ledger command.
+/// It iterates over all entries in the bucket list and outputs them as JSON.
+async fn cmd_dump_ledger(
+    config: AppConfig,
+    output: PathBuf,
+    entry_type: Option<String>,
+    limit: Option<u64>,
+    last_modified_ledger_count: Option<u32>,
+) -> anyhow::Result<()> {
+    use stellar_core_bucket::BucketManager;
+    use stellar_xdr::curr::LedgerEntryType;
+    use std::io::Write;
+
+    // Parse entry type filter if provided
+    let type_filter: Option<LedgerEntryType> = if let Some(ref type_str) = entry_type {
+        Some(match type_str.to_lowercase().as_str() {
+            "account" => LedgerEntryType::Account,
+            "trustline" => LedgerEntryType::Trustline,
+            "offer" => LedgerEntryType::Offer,
+            "data" => LedgerEntryType::Data,
+            "claimable_balance" | "claimablebalance" => LedgerEntryType::ClaimableBalance,
+            "liquidity_pool" | "liquiditypool" => LedgerEntryType::LiquidityPool,
+            "contract_data" | "contractdata" => LedgerEntryType::ContractData,
+            "contract_code" | "contractcode" => LedgerEntryType::ContractCode,
+            "config_setting" | "configsetting" => LedgerEntryType::ConfigSetting,
+            "ttl" => LedgerEntryType::Ttl,
+            _ => anyhow::bail!(
+                "Unknown entry type: {}. Valid types: account, trustline, offer, data, \
+                claimable_balance, liquidity_pool, contract_data, contract_code, \
+                config_setting, ttl",
+                type_str
+            ),
+        })
+    } else {
+        None
+    };
+
+    // Open database and bucket manager
+    let db = stellar_core_db::Database::open(&config.database.path)?;
+    let bucket_manager = BucketManager::with_cache_size(
+        config.buckets.directory.clone(),
+        config.buckets.cache_size,
+    )?;
+
+    // Get current ledger
+    let current_ledger = db.get_latest_ledger_seq()?
+        .ok_or_else(|| anyhow::anyhow!("No ledger data in database. Run catchup first."))?;
+
+    println!("Current ledger: {}", current_ledger);
+
+    // Calculate minimum last modified ledger if filter is set
+    let min_last_modified: Option<u32> = last_modified_ledger_count.map(|count| {
+        current_ledger.saturating_sub(count)
+    });
+
+    // Load bucket list snapshot for the current checkpoint
+    let checkpoint = stellar_core_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger))?;
+
+    println!("Using checkpoint: {}", checkpoint);
+
+    let levels = db.load_bucket_list(checkpoint)?
+        .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot at {}", checkpoint))?;
+
+    // Open output file
+    let mut file = std::fs::File::create(&output)?;
+
+    let mut entry_count: u64 = 0;
+    let limit_val = limit.unwrap_or(u64::MAX);
+
+    println!("Dumping entries to {}...", output.display());
+
+    // Iterate over all bucket levels
+    for (level_idx, (curr_hash, snap_hash)) in levels.iter().enumerate() {
+        if entry_count >= limit_val {
+            break;
+        }
+
+        // Process curr bucket
+        for hash in [curr_hash, snap_hash] {
+            if entry_count >= limit_val {
+                break;
+            }
+
+            let bucket = bucket_manager.load_bucket(hash)?;
+            for entry in bucket.entries() {
+                if entry_count >= limit_val {
+                    break;
+                }
+
+                // Skip dead entries and metadata
+                let live_entry = match entry {
+                    stellar_core_bucket::BucketEntry::Live(e) |
+                    stellar_core_bucket::BucketEntry::Init(e) => e,
+                    stellar_core_bucket::BucketEntry::Dead(_) |
+                    stellar_core_bucket::BucketEntry::Metadata(_) => continue,
+                };
+
+                // Apply type filter
+                if let Some(ref filter_type) = type_filter {
+                    if live_entry.data.discriminant() != *filter_type {
+                        continue;
+                    }
+                }
+
+                // Apply last modified ledger filter
+                if let Some(min_ledger) = min_last_modified {
+                    if live_entry.last_modified_ledger_seq < min_ledger {
+                        continue;
+                    }
+                }
+
+                // Serialize to JSON
+                let json = serde_json::to_string_pretty(&live_entry)?;
+                writeln!(file, "{}", json)?;
+
+                entry_count += 1;
+
+                // Progress reporting
+                if entry_count % 10000 == 0 {
+                    print!("\rProcessed {} entries (level {})...", entry_count, level_idx);
+                    std::io::stdout().flush()?;
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("Dumped {} entries to {}", entry_count, output.display());
 
     Ok(())
 }
