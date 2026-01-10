@@ -618,7 +618,8 @@ fn ledger_key_type(key: &LedgerKey) -> LedgerEntryType {
 /// A searchable wrapper around a hot archive bucket list snapshot.
 pub struct SearchableHotArchiveBucketListSnapshot {
     snapshot: HotArchiveBucketListSnapshot,
-    historical_snapshots: BTreeMap<u32, HotArchiveBucketListSnapshot>,
+    // TODO: Add methods to query historical snapshots (like SearchableBucketListSnapshot)
+    _historical_snapshots: BTreeMap<u32, HotArchiveBucketListSnapshot>,
 }
 
 impl SearchableHotArchiveBucketListSnapshot {
@@ -629,7 +630,7 @@ impl SearchableHotArchiveBucketListSnapshot {
     ) -> Self {
         Self {
             snapshot,
-            historical_snapshots,
+            _historical_snapshots: historical_snapshots,
         }
     }
 
