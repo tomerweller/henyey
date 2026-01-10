@@ -76,6 +76,66 @@ use crate::delta::LedgerDelta;
 use crate::snapshot::SnapshotHandle;
 use crate::{LedgerError, Result};
 
+/// Soroban network configuration information for the /sorobaninfo endpoint.
+///
+/// This struct contains all the Soroban-related configuration settings from
+/// the ledger, matching the format returned by C++ stellar-core's `/sorobaninfo`
+/// HTTP endpoint in "basic" format.
+#[derive(Debug, Clone, Default)]
+pub struct SorobanNetworkInfo {
+    /// Maximum contract code size in bytes.
+    pub max_contract_size: u32,
+    /// Maximum contract data key size in bytes.
+    pub max_contract_data_key_size: u32,
+    /// Maximum contract data entry size in bytes.
+    pub max_contract_data_entry_size: u32,
+    /// Per-transaction compute limits.
+    pub tx_max_instructions: i64,
+    /// Per-ledger compute limits.
+    pub ledger_max_instructions: i64,
+    /// Fee rate per instructions increment.
+    pub fee_rate_per_instructions_increment: i64,
+    /// Transaction memory limit.
+    pub tx_memory_limit: u32,
+    /// Per-ledger disk read limits.
+    pub ledger_max_read_ledger_entries: u32,
+    pub ledger_max_read_bytes: u32,
+    pub ledger_max_write_ledger_entries: u32,
+    pub ledger_max_write_bytes: u32,
+    /// Per-transaction disk read/write limits.
+    pub tx_max_read_ledger_entries: u32,
+    pub tx_max_read_bytes: u32,
+    pub tx_max_write_ledger_entries: u32,
+    pub tx_max_write_bytes: u32,
+    /// Fees per entry and per KB.
+    pub fee_read_ledger_entry: i64,
+    pub fee_write_ledger_entry: i64,
+    pub fee_read_1kb: i64,
+    pub fee_write_1kb: i64,
+    pub fee_historical_1kb: i64,
+    /// Contract events settings.
+    pub tx_max_contract_events_size_bytes: u32,
+    pub fee_contract_events_size_1kb: i64,
+    /// Bandwidth settings.
+    pub ledger_max_tx_size_bytes: u32,
+    pub tx_max_size_bytes: u32,
+    pub fee_transaction_size_1kb: i64,
+    /// General ledger settings.
+    pub ledger_max_tx_count: u32,
+    /// State archival settings.
+    pub max_entry_ttl: u32,
+    pub min_temporary_ttl: u32,
+    pub min_persistent_ttl: u32,
+    pub persistent_rent_rate_denominator: i64,
+    pub temp_rent_rate_denominator: i64,
+    pub max_entries_to_archive: u32,
+    pub bucketlist_size_window_sample_size: u32,
+    pub eviction_scan_size: i64,
+    pub starting_eviction_scan_level: u32,
+    /// Computed value: average bucket list size.
+    pub average_bucket_list_size: u64,
+}
+
 /// Load a ConfigSettingEntry from the snapshot by ID.
 fn load_config_setting(
     snapshot: &SnapshotHandle,
@@ -316,6 +376,128 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle) -> SorobanConfig {
     }
 
     config
+}
+
+/// Load SorobanNetworkInfo from the ledger's ConfigSettingEntry entries.
+///
+/// This loads all the configuration settings needed for the /sorobaninfo endpoint,
+/// matching the "basic" format from C++ stellar-core.
+pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNetworkInfo> {
+    // Check if we have any Soroban config (indicates protocol 20+)
+    let compute_v0 = load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)?;
+
+    let mut info = SorobanNetworkInfo::default();
+
+    // Load contract size limits
+    if let Some(ConfigSettingEntry::ContractDataKeySizeBytes(size)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractDataKeySizeBytes)
+    {
+        info.max_contract_data_key_size = size;
+    }
+    if let Some(ConfigSettingEntry::ContractDataEntrySizeBytes(size)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)
+    {
+        info.max_contract_data_entry_size = size;
+    }
+    if let Some(ConfigSettingEntry::ContractMaxSizeBytes(size)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)
+    {
+        info.max_contract_size = size;
+    }
+
+    // Load compute settings
+    if let ConfigSettingEntry::ContractComputeV0(compute) = compute_v0 {
+        info.tx_max_instructions = compute.tx_max_instructions as i64;
+        info.ledger_max_instructions = compute.ledger_max_instructions as i64;
+        info.fee_rate_per_instructions_increment =
+            compute.fee_rate_per_instructions_increment;
+        info.tx_memory_limit = compute.tx_memory_limit;
+    }
+
+    // Load ledger access settings
+    if let Some(ConfigSettingEntry::ContractLedgerCostV0(cost)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostV0)
+    {
+        info.ledger_max_read_ledger_entries = cost.ledger_max_disk_read_entries;
+        info.ledger_max_read_bytes = cost.ledger_max_disk_read_bytes;
+        info.ledger_max_write_ledger_entries = cost.ledger_max_write_ledger_entries;
+        info.ledger_max_write_bytes = cost.ledger_max_write_bytes;
+        info.tx_max_read_ledger_entries = cost.tx_max_disk_read_entries;
+        info.tx_max_read_bytes = cost.tx_max_disk_read_bytes;
+        info.tx_max_write_ledger_entries = cost.tx_max_write_ledger_entries;
+        info.tx_max_write_bytes = cost.tx_max_write_bytes;
+        info.fee_read_ledger_entry = cost.fee_disk_read_ledger_entry;
+        info.fee_write_ledger_entry = cost.fee_write_ledger_entry;
+        info.fee_read_1kb = cost.fee_disk_read1_kb;
+    }
+
+    // Load fee_write_1kb from extended cost settings
+    if let Some(ConfigSettingEntry::ContractLedgerCostExtV0(ext)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)
+    {
+        info.fee_write_1kb = ext.fee_write1_kb;
+    }
+
+    // Load historical data settings
+    if let Some(ConfigSettingEntry::ContractHistoricalDataV0(hist)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractHistoricalDataV0)
+    {
+        info.fee_historical_1kb = hist.fee_historical1_kb;
+    }
+
+    // Load contract events settings
+    if let Some(ConfigSettingEntry::ContractEventsV0(events)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractEventsV0)
+    {
+        info.tx_max_contract_events_size_bytes = events.tx_max_contract_events_size_bytes;
+        info.fee_contract_events_size_1kb = events.fee_contract_events1_kb;
+    }
+
+    // Load bandwidth settings
+    if let Some(ConfigSettingEntry::ContractBandwidthV0(bandwidth)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractBandwidthV0)
+    {
+        info.ledger_max_tx_size_bytes = bandwidth.ledger_max_txs_size_bytes;
+        info.tx_max_size_bytes = bandwidth.tx_max_size_bytes;
+        info.fee_transaction_size_1kb = bandwidth.fee_tx_size1_kb;
+    }
+
+    // Load execution lanes settings for ledger tx count
+    if let Some(ConfigSettingEntry::ContractExecutionLanes(lanes)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractExecutionLanes)
+    {
+        info.ledger_max_tx_count = lanes.ledger_max_tx_count;
+    }
+
+    // Load state archival settings
+    if let Some(ConfigSettingEntry::StateArchival(archival)) =
+        load_config_setting(snapshot, ConfigSettingId::StateArchival)
+    {
+        info.max_entry_ttl = archival.max_entry_ttl;
+        info.min_temporary_ttl = archival.min_temporary_ttl;
+        info.min_persistent_ttl = archival.min_persistent_ttl;
+        info.persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator;
+        info.temp_rent_rate_denominator = archival.temp_rent_rate_denominator;
+        info.max_entries_to_archive = archival.max_entries_to_archive;
+        info.bucketlist_size_window_sample_size = archival.live_soroban_state_size_window_sample_size;
+        info.eviction_scan_size = archival.eviction_scan_size as i64;
+        info.starting_eviction_scan_level = archival.starting_eviction_scan_level;
+    }
+
+    // Load average bucket list size from live window
+    if let Some(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) =
+        load_config_setting(snapshot, ConfigSettingId::LiveSorobanStateSizeWindow)
+    {
+        if !window.is_empty() {
+            let mut sum: u64 = 0;
+            for size in window.iter() {
+                sum = sum.saturating_add(*size);
+            }
+            info.average_bucket_list_size = sum / window.len() as u64;
+        }
+    }
+
+    Some(info)
 }
 
 struct RefundableFeeTracker {

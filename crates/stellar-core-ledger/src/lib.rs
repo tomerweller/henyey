@@ -104,6 +104,7 @@ pub use header::{
     is_before_protocol_version, protocol_version, skip_list_target_seq, verify_header_chain,
     verify_skip_list, SKIP_LIST_SIZE,
 };
+pub use execution::SorobanNetworkInfo;
 pub use manager::{LedgerCloseContext, LedgerManager, LedgerManagerConfig, LedgerManagerStats};
 pub use snapshot::{
     EntriesLookupFn, LedgerSnapshot, SnapshotBuilder, SnapshotHandle, SnapshotManager,

@@ -31,7 +31,10 @@ use crate::{
         LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
     },
     delta::{EntryChange, LedgerDelta},
-    execution::{execute_transaction_set, OperationInvariantRunner, TransactionExecutionResult},
+    execution::{
+        execute_transaction_set, load_soroban_network_info, OperationInvariantRunner,
+        SorobanNetworkInfo, TransactionExecutionResult,
+    },
     header::{compute_header_hash, create_next_header},
     snapshot::{LedgerSnapshot, SnapshotHandle, SnapshotManager},
     LedgerError, Result,
@@ -895,6 +898,18 @@ impl LedgerManager {
     /// Register an additional invariant to enforce on ledger close.
     pub fn add_invariant<I: Invariant + 'static>(&self, invariant: I) {
         self.invariants.write().add(invariant);
+    }
+
+    /// Get Soroban network configuration information.
+    ///
+    /// Returns the Soroban-related configuration settings from the current ledger
+    /// state, or `None` if not available (pre-protocol 20 or not initialized).
+    pub fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
+        if !self.is_initialized() {
+            return None;
+        }
+        let snapshot = self.create_snapshot().ok()?;
+        load_soroban_network_info(&snapshot)
     }
 }
 

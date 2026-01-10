@@ -67,7 +67,7 @@ use stellar_core_historywork::{
     build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
 };
 use stellar_core_ledger::{
-    LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
+    LedgerCloseData, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo, TransactionSetVariant,
 };
 use stellar_core_overlay::{
     ConnectionDirection, LocalNode, OverlayConfig as OverlayManagerConfig, OverlayManager,
@@ -1069,6 +1069,14 @@ impl App {
 
     pub fn proposed_upgrades(&self) -> Vec<LedgerUpgrade> {
         self.config.upgrades.to_ledger_upgrades()
+    }
+
+    /// Get Soroban network configuration information.
+    ///
+    /// Returns the Soroban-related configuration settings from the current ledger
+    /// state, or `None` if not available (pre-protocol 20 or not initialized).
+    pub fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
+        self.ledger_manager.soroban_network_info()
     }
 
     pub fn self_check(&self, depth: u32) -> anyhow::Result<SelfCheckResult> {

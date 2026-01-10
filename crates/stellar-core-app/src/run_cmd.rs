@@ -1709,50 +1709,58 @@ async fn sorobaninfo_handler(
 
     match format {
         "basic" => {
-            // Return Soroban configuration in basic format
-            // These are placeholder values - in a full implementation,
-            // these would be read from the ledger's ConfigSettingEntry values
+            // Load Soroban configuration from ledger state
+            let Some(info) = state.app.soroban_network_info() else {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "error": "Soroban config not available (ledger not initialized or pre-protocol 20)",
+                        "protocol_version": protocol_version
+                    })),
+                );
+            };
+
             let response = SorobanInfoResponse {
-                max_contract_size: 65536,
-                max_contract_data_key_size: 256,
-                max_contract_data_entry_size: 65536,
+                max_contract_size: info.max_contract_size,
+                max_contract_data_key_size: info.max_contract_data_key_size,
+                max_contract_data_entry_size: info.max_contract_data_entry_size,
                 tx: SorobanTxLimits {
-                    max_instructions: 100_000_000,
-                    memory_limit: 41943040,
-                    max_read_ledger_entries: 40,
-                    max_read_bytes: 200000,
-                    max_write_ledger_entries: 25,
-                    max_write_bytes: 66560,
-                    max_contract_events_size_bytes: 8198,
-                    max_size_bytes: 71680,
+                    max_instructions: info.tx_max_instructions,
+                    memory_limit: info.tx_memory_limit,
+                    max_read_ledger_entries: info.tx_max_read_ledger_entries,
+                    max_read_bytes: info.tx_max_read_bytes,
+                    max_write_ledger_entries: info.tx_max_write_ledger_entries,
+                    max_write_bytes: info.tx_max_write_bytes,
+                    max_contract_events_size_bytes: info.tx_max_contract_events_size_bytes,
+                    max_size_bytes: info.tx_max_size_bytes,
                 },
                 ledger: SorobanLedgerLimits {
-                    max_instructions: 2_500_000_000,
-                    max_read_ledger_entries: 200,
-                    max_read_bytes: 1000000,
-                    max_write_ledger_entries: 125,
-                    max_write_bytes: 332800,
-                    max_tx_size_bytes: 71680,
-                    max_tx_count: 100,
+                    max_instructions: info.ledger_max_instructions,
+                    max_read_ledger_entries: info.ledger_max_read_ledger_entries,
+                    max_read_bytes: info.ledger_max_read_bytes,
+                    max_write_ledger_entries: info.ledger_max_write_ledger_entries,
+                    max_write_bytes: info.ledger_max_write_bytes,
+                    max_tx_size_bytes: info.ledger_max_tx_size_bytes,
+                    max_tx_count: info.ledger_max_tx_count,
                 },
-                fee_rate_per_instructions_increment: 25,
-                fee_read_ledger_entry: 6250,
-                fee_write_ledger_entry: 10000,
-                fee_read_1kb: 1786,
-                fee_write_1kb: 11800,
-                fee_historical_1kb: 16235,
-                fee_contract_events_size_1kb: 10000,
-                fee_transaction_size_1kb: 1624,
+                fee_rate_per_instructions_increment: info.fee_rate_per_instructions_increment,
+                fee_read_ledger_entry: info.fee_read_ledger_entry,
+                fee_write_ledger_entry: info.fee_write_ledger_entry,
+                fee_read_1kb: info.fee_read_1kb,
+                fee_write_1kb: info.fee_write_1kb,
+                fee_historical_1kb: info.fee_historical_1kb,
+                fee_contract_events_size_1kb: info.fee_contract_events_size_1kb,
+                fee_transaction_size_1kb: info.fee_transaction_size_1kb,
                 state_archival: SorobanStateArchival {
-                    max_entry_ttl: 31536000,
-                    min_temporary_ttl: 17280,
-                    min_persistent_ttl: 2073600,
-                    persistent_rent_rate_denominator: 2103840,
-                    temp_rent_rate_denominator: 4096,
-                    max_entries_to_archive: 100,
-                    bucketlist_size_window_sample_size: 30,
-                    eviction_scan_size: 100000,
-                    starting_eviction_scan_level: 7,
+                    max_entry_ttl: info.max_entry_ttl,
+                    min_temporary_ttl: info.min_temporary_ttl,
+                    min_persistent_ttl: info.min_persistent_ttl,
+                    persistent_rent_rate_denominator: info.persistent_rent_rate_denominator,
+                    temp_rent_rate_denominator: info.temp_rent_rate_denominator,
+                    max_entries_to_archive: info.max_entries_to_archive,
+                    bucketlist_size_window_sample_size: info.bucketlist_size_window_sample_size,
+                    eviction_scan_size: info.eviction_scan_size,
+                    starting_eviction_scan_level: info.starting_eviction_scan_level,
                 },
             };
             (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))

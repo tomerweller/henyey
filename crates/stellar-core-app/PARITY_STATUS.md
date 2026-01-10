@@ -110,7 +110,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `/ledger` | Implemented | Current ledger info (Rust-specific) |
 | `/status` | Implemented | Current node status (Rust-specific) |
 | `/manualclose` | Stub | Requires RUN_STANDALONE mode |
-| `/sorobaninfo` | Partial | Basic format only |
+| `/sorobaninfo` | Implemented | Basic format, reads actual config from ledger |
 | `/logRotate` | Not Implemented | |
 | `/maintenance` | Not Implemented | |
 | `/clearMetrics` | Not Implemented | |

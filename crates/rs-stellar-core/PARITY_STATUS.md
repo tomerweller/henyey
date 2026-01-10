@@ -64,6 +64,7 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `/survey/reporting/stop` | Implemented | Stop survey reporting |
 | `/getsurveyresult` | Implemented | Get survey results |
 | `/ll` | Implemented | Dynamic log level changes via tracing-subscriber reload layer |
+| `/sorobaninfo` | Implemented | Soroban network configuration (basic format) |
 
 #### Core Subsystems
 
@@ -124,7 +125,6 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `/manualclose` | Manual ledger close (testing) | Medium |
 | `/maintenance` | Run maintenance | Low |
 | `/dumpproposedsettings` | Dump proposed settings | Low |
-| `/sorobaninfo` | Soroban-specific info and config | Medium |
 | `/stopsurvey` | Stop survey (deprecated) | Low |
 | `/generateload` | Generate synthetic load (test) | Low |
 | `/testacc` | Test account operations (test) | Low |
