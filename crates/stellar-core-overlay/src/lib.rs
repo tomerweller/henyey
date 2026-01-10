@@ -385,8 +385,7 @@ impl std::fmt::Display for PeerAddress {
 ///
 /// # Display Format
 ///
-/// When displayed, only the first 8 hex characters are shown followed by "..."
-/// for brevity. Use [`PeerId::to_hex()`] for the full hex representation.
+/// When displayed, the full strkey format (G...) is shown for easy identification.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerId(pub stellar_xdr::curr::PublicKey);
 
@@ -440,9 +439,8 @@ impl PeerId {
 
 impl std::fmt::Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Display first 8 chars of hex
-        let hex = self.to_hex();
-        write!(f, "{}...", &hex[..8])
+        // Display strkey format (G...)
+        write!(f, "{}", self.to_strkey())
     }
 }
 
