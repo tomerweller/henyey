@@ -352,6 +352,10 @@ enum OfflineCommands {
         /// Disable caching (use temp directories)
         #[arg(long)]
         no_cache: bool,
+
+        /// Quiet mode: only output summary and errors
+        #[arg(long, short = 'q')]
+        quiet: bool,
     },
 
     /// Debug: inspect an account in the bucket list at a checkpoint
@@ -1886,6 +1890,7 @@ async fn cmd_verify_execution(
     cdp_date: &str,
     cache_dir: Option<std::path::PathBuf>,
     no_cache: bool,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     use std::sync::{Arc, RwLock};
     use stellar_core_bucket::{BucketList, BucketManager};
@@ -1898,10 +1903,12 @@ async fn cmd_verify_execution(
     use stellar_core_tx::ClassicEventConfig;
     use stellar_xdr::curr::{LedgerKey, LedgerEntry, BucketListType};
 
-    println!("Transaction Execution Verification");
-    println!("===================================");
-    println!("Re-executes transactions and compares results against CDP metadata.");
-    println!();
+    if !quiet {
+        println!("Transaction Execution Verification");
+        println!("===================================");
+        println!("Re-executes transactions and compares results against CDP metadata.");
+        println!();
+    }
 
     // Determine network ID and network name
     let (network_id, network_name) = if config.network.passphrase.contains("Test") {
@@ -1926,12 +1933,14 @@ async fn cmd_verify_execution(
         .find_map(|a| HistoryArchive::new(&a.url).ok())
         .ok_or_else(|| anyhow::anyhow!("No history archives available"))?;
 
-    println!("Archive: {}", config.history.archives[0].url);
-    println!("CDP: {} ({})", cdp_url, cdp_date);
-    if let Some(ref cache) = cache_base {
-        println!("Cache: {}", cache.display());
-    } else {
-        println!("Cache: disabled (using temp directories)");
+    if !quiet {
+        println!("Archive: {}", config.history.archives[0].url);
+        println!("CDP: {} ({})", cdp_url, cdp_date);
+        if let Some(ref cache) = cache_base {
+            println!("Cache: {}", cache.display());
+        } else {
+            println!("Cache: disabled (using temp directories)");
+        }
     }
 
     // Get current ledger and calculate range
@@ -1955,9 +1964,11 @@ async fn cmd_verify_execution(
     // Calculate checkpoint range needed for headers
     let end_checkpoint = checkpoint::checkpoint_containing(end_ledger);
 
-    println!("Ledger range: {} to {}", start_ledger, end_ledger);
-    println!("Initial state: checkpoint {}", init_checkpoint);
-    println!();
+    if !quiet {
+        println!("Ledger range: {} to {}", start_ledger, end_ledger);
+        println!("Initial state: checkpoint {}", init_checkpoint);
+        println!();
+    }
 
     // Create CDP client with caching
     let cdp = if let Some(ref cache) = cache_base {
@@ -1973,10 +1984,14 @@ async fn cmd_verify_execution(
     let cached = cdp.cached_count(prefetch_start, prefetch_end);
     let total = (prefetch_end - prefetch_start + 1) as usize;
     if cached < total {
-        println!("Prefetching CDP metadata: {} cached, {} to download", cached, total - cached);
+        if !quiet {
+            println!("Prefetching CDP metadata: {} cached, {} to download", cached, total - cached);
+        }
         cdp.prefetch(prefetch_start, prefetch_end).await;
-        println!();
-    } else {
+        if !quiet {
+            println!();
+        }
+    } else if !quiet {
         println!("CDP metadata: {} ledgers cached", cached);
         println!();
     }
@@ -1997,7 +2012,9 @@ async fn cmd_verify_execution(
     };
     let bucket_manager = Arc::new(BucketManager::new(bucket_path.clone())?);
 
-    println!("Downloading initial state at checkpoint {}...", init_checkpoint);
+    if !quiet {
+        println!("Downloading initial state at checkpoint {}...", init_checkpoint);
+    }
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
     // Download buckets for state lookups (both live and hot archive)
@@ -2025,9 +2042,11 @@ async fn cmd_verify_execution(
         .filter(|h| !h.is_zero())
         .collect();
 
-    print!("Buckets ({} required):", all_hashes.len());
+    if !quiet {
+        print!("Buckets ({} required):", all_hashes.len());
+    }
     let (cached, downloaded) = download_buckets_parallel(&archive, bucket_manager.as_ref(), all_hashes).await?;
-    if downloaded == 0 {
+    if !quiet && downloaded == 0 {
         println!(" {} cached", cached);
     }
 
@@ -2045,12 +2064,13 @@ async fn cmd_verify_execution(
         })
     }).transpose()?.map(|bl| Arc::new(RwLock::new(bl)));
 
-    println!("Initial live bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
-    if let Some(ref hot) = hot_archive_bucket_list {
-        println!("Initial hot archive hash: {}", hot.read().unwrap().hash().to_hex());
+    if !quiet {
+        println!("Initial live bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
+        if let Some(ref hot) = hot_archive_bucket_list {
+            println!("Initial hot archive hash: {}", hot.read().unwrap().hash().to_hex());
+        }
+        println!();
     }
-
-    println!();
 
     // Track results
     let mut ledgers_verified = 0u32;
@@ -2460,7 +2480,7 @@ async fn cmd_verify_execution(
 
                             if success_matches && (result.success == false || meta_matches) {
                                 transactions_matched += 1;
-                                if show_diff {
+                                if show_diff && !quiet {
                                     let change_count = result.tx_meta
                                         .as_ref()
                                         .map(|m| extract_changes_from_meta(m).len())
@@ -2575,11 +2595,14 @@ async fn cmd_verify_execution(
 
             if in_test_range {
                 if ledger_matched || tx_processing.is_empty() {
-                    println!("  Ledger {}: {} transactions - {}",
-                        seq, tx_processing.len(),
-                        if tx_processing.is_empty() { "no txs" } else { "all matched" }
-                    );
+                    if !quiet {
+                        println!("  Ledger {}: {} transactions - {}",
+                            seq, tx_processing.len(),
+                            if tx_processing.is_empty() { "no txs" } else { "all matched" }
+                        );
+                    }
                 } else {
+                    // Always print mismatches, even in quiet mode
                     println!("  Ledger {}: {} transactions - SOME MISMATCHES", seq, tx_processing.len());
                     if stop_on_error {
                         anyhow::bail!("Stopping on first error");
@@ -3466,8 +3489,9 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
             cdp_date,
             cache_dir,
             no_cache,
+            quiet,
         } => {
-            cmd_verify_execution(config, from, to, stop_on_error, show_diff, &cdp_url, &cdp_date, cache_dir, no_cache).await
+            cmd_verify_execution(config, from, to, stop_on_error, show_diff, &cdp_url, &cdp_date, cache_dir, no_cache, quiet).await
         }
         OfflineCommands::DebugBucketEntry {
             checkpoint,
