@@ -2906,11 +2906,35 @@ impl App {
                     self.clear_tx_advert_history(next_seq).await;
                 }
                 Err(e) => {
+                    let error_str = e.to_string();
+                    let is_hash_mismatch = error_str.contains("hash mismatch");
                     tracing::error!(
                         ledger_seq = next_seq,
                         error = %e,
+                        is_hash_mismatch,
                         "Failed to apply buffered ledger"
                     );
+                    if is_hash_mismatch {
+                        // Hash mismatch means we're out of sync with the network.
+                        // All buffered ledgers are invalid since they're based on the wrong chain.
+                        // Clear everything and let catchup rebuild state correctly.
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        let cleared_count = buffer.len();
+                        buffer.clear();
+                        tracing::warn!(
+                            ledger_seq = next_seq,
+                            cleared_count,
+                            "Hash mismatch detected - cleared all buffered ledgers, will trigger catchup"
+                        );
+                    } else {
+                        // For other errors, just remove this entry to prevent infinite retry
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        buffer.remove(&next_seq);
+                        tracing::info!(
+                            ledger_seq = next_seq,
+                            "Removed failed buffered ledger entry"
+                        );
+                    }
                     return;
                 }
             }
