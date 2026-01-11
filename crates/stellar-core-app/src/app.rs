@@ -1770,6 +1770,9 @@ impl App {
                 target_ledger,
                 "Already at or past target; skipping catchup"
             );
+            // Record skip time for cooldown to prevent repeated catchup attempts.
+            // We need to wait for the next checkpoint to become available.
+            *self.last_catchup_completed_at.write().await = Some(Instant::now());
             return Ok(CatchupResult {
                 ledger_seq: current,
                 ledger_hash: Hash256::default(),
@@ -3191,6 +3194,9 @@ impl App {
                         // When we're at a checkpoint boundary waiting for the next checkpoint,
                         // peers may have responded DontHave for tx_sets that are now current.
                         self.reset_tx_set_tracking_after_catchup().await;
+                        // Record skip time for cooldown to prevent repeated archive queries.
+                        // This uses the same cooldown mechanism as catchup completion.
+                        *self.last_catchup_completed_at.write().await = Some(Instant::now());
                         self.catchup_in_progress.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -3207,6 +3213,8 @@ impl App {
                         error = %e,
                         "Failed to query archive for latest checkpoint, skipping catchup"
                     );
+                    // Record skip time for cooldown to prevent repeated archive queries.
+                    *self.last_catchup_completed_at.write().await = Some(Instant::now());
                     self.catchup_in_progress.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -5850,8 +5858,9 @@ impl App {
                                     break;
                                 }
                             }
-                            found.or_else(|| {
-                                // All peers have said DontHave for this tx set
+                            if found.is_none() {
+                                // All peers have said DontHave for this tx set.
+                                // Don't retry - trigger faster catchup instead.
                                 tracing::warn!(
                                     hash = %hash,
                                     peers_asked = set.len(),
@@ -5859,9 +5868,10 @@ impl App {
                                     "All peers exhausted for tx set - triggering faster catchup"
                                 );
                                 self.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
-                                set.clear();
-                                peers.get(start_idx)
-                            })
+                                // Don't clear the set or return a peer - stop requesting this tx set
+                                // until catchup or tx_set tracking is reset.
+                            }
+                            found
                         }
                         None => peers.get(start_idx),
                     };
