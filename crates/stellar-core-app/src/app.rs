@@ -3151,17 +3151,38 @@ impl App {
             return;
         }
 
-        // When using CatchupTarget::Current, check if we're already at a checkpoint end.
-        // If current_ledger ends at a checkpoint boundary (mod 64 == 63), the archive's
-        // latest checkpoint is likely equal to current_ledger, so catchup would be a no-op.
+        // When using CatchupTarget::Current, check if the archive has a newer checkpoint.
+        // We need to actually query the archive rather than assuming no newer checkpoint exists.
         if use_current_target && is_checkpoint_ledger(current_ledger) {
-            tracing::info!(
-                current_ledger,
-                first_buffered,
-                "Skipping catchup: already at checkpoint end, waiting for next checkpoint"
-            );
-            self.catchup_in_progress.store(false, Ordering::SeqCst);
-            return;
+            match self.get_latest_checkpoint().await {
+                Ok(latest_checkpoint) => {
+                    if latest_checkpoint <= current_ledger {
+                        tracing::info!(
+                            current_ledger,
+                            latest_checkpoint,
+                            first_buffered,
+                            "Skipping catchup: archive has no newer checkpoint"
+                        );
+                        self.catchup_in_progress.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    tracing::info!(
+                        current_ledger,
+                        latest_checkpoint,
+                        first_buffered,
+                        "Archive has newer checkpoint, proceeding with catchup"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        current_ledger,
+                        error = %e,
+                        "Failed to query archive for latest checkpoint, skipping catchup"
+                    );
+                    self.catchup_in_progress.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
         }
 
 
