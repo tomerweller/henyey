@@ -13,18 +13,18 @@ This section documents the feature parity between this Rust implementation and t
 | `new-db` | Implemented | Database creation with --force overwrite |
 | `upgrade-db` | Implemented | Database schema upgrades |
 | `new-keypair` / `gen-seed` | Implemented | Keypair generation |
-| `info` / `offline-info` | Implemented | Node information display |
+| `info` | Implemented | Includes offline fallback output if app init fails (no separate `offline-info`) |
 | `verify-history` | Implemented | History archive verification (HAS, headers, tx sets, results, SCP) |
 | `publish` / `publish-history` | Implemented | History publishing (local paths and remote via put commands) |
 | `check-quorum-intersection` | Implemented | Quorum intersection checking from JSON (v1 algorithm) |
 | `sample-config` | Implemented | Configuration template generation |
 | `convert-id` / `convert-key` | Implemented | Key format conversion (strkey/hex) |
-| `decode-xdr` / `print-xdr` | Implemented | XDR decoding (LedgerHeader, TransactionEnvelope, TransactionResult) |
-| `encode-xdr` / `encode-asset` | Implemented | XDR encoding (AccountId, MuxedAccount, Asset, Hash) |
+| `decode-xdr` | Implemented | Base64 input only; partial `print-xdr` parity for LedgerHeader, TransactionEnvelope, TransactionResult |
+| `encode-xdr` | Implemented | Encodes AccountId, MuxedAccount, Asset, Hash (covers `encode-asset`) |
 | `sign-transaction` | Implemented | Add signature to transaction envelope |
 | `sec-to-pub` | Implemented | Print public key from secret key (stdin) |
 | `http-command` | Implemented | Send HTTP command to running node |
-| `diag-bucket-stats` / `bucket-info` | Partial | Basic bucket info (not full per-account aggregation) |
+| `bucket-info` | Implemented | Basic bucket info (not full per-account aggregation) |
 | `dump-ledger` | Implemented | Dump ledger entries to JSON with type/limit filtering |
 | `self-check` | Implemented | Header chain, bucket hash verification, crypto benchmarking |
 | `verify-checkpoints` | Implemented | Write verified checkpoint ledger hashes to file |
@@ -64,8 +64,8 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `/survey/start` | Implemented | Start survey collecting |
 | `/survey/stop` | Implemented | Stop survey collecting |
 | `/survey/topology` | Implemented | Survey topology request |
+| `/survey` | Implemented | Survey report data |
 | `/survey/reporting/stop` | Implemented | Stop survey reporting |
-| `/getsurveyresult` | Implemented | Get survey results |
 | `/ll` | Implemented | Dynamic log level changes via tracing-subscriber reload layer |
 | `/sorobaninfo` | Implemented | Soroban network configuration (basic format) |
 | `/manualclose` | Implemented | Manual ledger close (requires is_validator and manual_close config) |
@@ -98,6 +98,7 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `dump-xdr` | Dump XDR file (with streaming support) | Low |
 | `dump-wasm` | Dump WASM blobs from ledger | Low |
 | `force-scp` | Force SCP flag (deprecated in C++) | Low |
+| `diag-bucket-stats` | Diagnostic bucket statistics | Low |
 | `merge-bucketlist` | Write diagnostic merged bucket list | Low |
 | `dump-archival-stats` | Print state archival statistics | Low |
 | `new-hist` | Initialize history archives (create structure) | Low |

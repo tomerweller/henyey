@@ -115,11 +115,8 @@ This section documents the implementation status relative to the C++ stellar-cor
 #### Specialized Queries (SearchableBucketList.h)
 - **SearchableLiveBucketListSnapshot** specialized queries:
   - `loadPoolShareTrustLinesByAccountAndAsset()` - Pool share lookups - **Not Implemented** (requires asset-to-poolID index)
-  - `loadInflationWinners()` - **Implemented** as `load_inflation_winners()` in `snapshot.rs`
   - `scanForEviction()` - Background eviction scanning - Partial (basic eviction in eviction.rs)
-  - `scanForEntriesOfType()` - **Implemented** as `scan_for_entries_of_type()` in `snapshot.rs`
-- **SearchableHotArchiveBucketListSnapshot** - Hot archive snapshot queries - Basic structure exists
-- **InflationWinner** struct - **Implemented** in `snapshot.rs`
+- **SearchableHotArchiveBucketListSnapshot** - Hot archive snapshot queries - Partial (basic structure exists)
 
 #### Advanced Indexing (LiveBucketIndex.h, DiskIndex.h, InMemoryIndex.h)
 - **LiveBucketIndex** - Sophisticated index supporting:

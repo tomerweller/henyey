@@ -121,6 +121,11 @@ This document tracks the parity between this Rust crate (`stellar-core-history`)
   - Bucket files from bucket list entries
   - HAS file generation (JSON)
 - [x] **Directory structure creation** following archive layout
+- [x] **Remote archive commands** via `RemoteArchive` in `remote_archive.rs`
+  - Configurable shell commands for upload and mkdir (`put_cmd`, `mkdir_cmd`)
+  - Templates with `{0}` (local) and `{1}` (remote) placeholders matching C++
+  - `RemoteArchive::put_file()`, `RemoteArchive::mkdir()`, `RemoteArchive::get_file()`
+  - `put_file_with_mkdir()` convenience helper
 - [x] **Verification before publishing**
   - Header chain verification
   - Transaction set and result hash verification
@@ -199,11 +204,6 @@ This document tracks the parity between this Rust crate (`stellar-core-history`)
 - [ ] **Archive initialization** (`initializeHistoryArchive()`)
   - Create `.well-known/stellar-history.json` in new archive
   - Currently Rust only reads from archives
-- [x] **Remote put/mkdir commands** - Implemented via `RemoteArchive` in `remote_archive.rs`
-  - Supports configurable shell commands for remote upload (`put_cmd`, `mkdir_cmd`)
-  - Templates with `{0}` (local) and `{1}` (remote) placeholders matching C++
-  - `RemoteArchive::put_file()`, `RemoteArchive::mkdir()`, `RemoteArchive::get_file()`
-  - `put_file_with_mkdir()` for convenience with directory creation
 - [ ] **Get command templating** (`getFileCmd`)
   - C++ can use shell commands for fetch, not just HTTP
   - Rust has `RemoteArchive::get_file()` but HTTP fetch is still via `reqwest`
@@ -275,7 +275,8 @@ put = "aws s3 cp {1} s3://bucket{0} --region us-east-1"
 mkdir = "aws s3 mb s3://bucket{0}"
 ```
 
-Rust currently only writes to local filesystem. Remote upload would need external tooling or a separate upload utility.
+Rust supports remote upload via configured shell commands (`put_cmd`, `mkdir_cmd`) through
+`RemoteArchive`, while fetch still uses HTTP via `reqwest`.
 
 #### Crash Safety
 

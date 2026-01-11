@@ -39,6 +39,9 @@ This crate corresponds to the following C++ stellar-core components:
 
 ### CLI Commands (CommandLine.cpp)
 
+CLI commands are implemented in the `rs-stellar-core` binary crate. This crate provides the
+run/catchup handlers and HTTP server wiring used by those commands.
+
 | C++ Command | Rust Status | Notes |
 |-------------|-------------|-------|
 | `run` | Implemented | `run_node()` in `run_cmd.rs` |
@@ -48,27 +51,27 @@ This crate corresponds to the following C++ stellar-core components:
 | `verify-checkpoints` | Implemented | Via `offline verify-checkpoints` in rs-stellar-core |
 | `convert-id` | Implemented | `offline convert-key` in rs-stellar-core |
 | `diag-bucket-stats` | Not Implemented | |
-| `dump-ledger` | Not Implemented | |
+| `dump-ledger` | Implemented | `offline dump-ledger` in rs-stellar-core |
 | `dump-xdr` | Not Implemented | |
 | `dump-wasm` | Not Implemented | |
-| `encode-asset` | Not Implemented | |
+| `encode-asset` | Implemented | `offline encode-xdr --type Asset` in rs-stellar-core |
 | `force-scp` | Not Implemented | Deprecated in C++ |
 | `gen-seed` | Implemented | `new-keypair` command in rs-stellar-core |
-| `http-command` | Not Implemented | |
+| `http-command` | Implemented | `http-command` in rs-stellar-core |
 | `self-check` (CLI) | Implemented | Via `offline self-check` in rs-stellar-core |
 | `merge-bucketlist` | Not Implemented | |
 | `dump-archival-stats` | Not Implemented | |
-| `new-db` | Not Implemented | |
+| `new-db` | Implemented | `new-db` in rs-stellar-core |
 | `new-hist` | Not Implemented | |
-| `offline-info` | Not Implemented | |
-| `print-xdr` | Not Implemented | |
-| `publish` | Not Implemented | |
+| `offline-info` | Partial | `info` shows basic offline info if app init fails |
+| `print-xdr` | Partial | `offline decode-xdr` in rs-stellar-core (base64 input only) |
+| `publish` | Implemented | `publish-history` in rs-stellar-core |
 | `report-last-history-checkpoint` | Not Implemented | |
 | `sec-to-pub` | Implemented | Via `offline sec-to-pub` in rs-stellar-core |
 | `sign-transaction` | Implemented | Via `offline sign-transaction` in rs-stellar-core |
-| `upgrade-db` | Not Implemented | |
+| `upgrade-db` | Implemented | `upgrade-db` in rs-stellar-core |
 | `get-settings-upgrade-txs` | Not Implemented | |
-| `check-quorum-intersection` | Not Implemented | |
+| `check-quorum-intersection` | Implemented | `check-quorum-intersection` in rs-stellar-core |
 | `print-publish-queue` | Not Implemented | |
 | `replay-debug-meta` | Not Implemented | |
 
@@ -147,7 +150,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `ARTIFICIALLY_*_FOR_TESTING` | Not Implemented | Testing-only options |
 | `LOADGEN_*` | Not Implemented | Load generation options |
 | `APPLY_LOAD_*` | Not Implemented | Apply-load benchmarking |
-| `MANUAL_CLOSE` | Not Implemented | Manual ledger close mode |
+| `MANUAL_CLOSE` | Implemented | `node.manual_close` enables manual close mode |
 | `RUN_STANDALONE` | Not Implemented | Standalone mode |
 | Parallel ledger application | Not Implemented | `EXPERIMENTAL_PARALLEL_LEDGER_APPLY` |
 | Background overlay processing | Different | Always uses async via Tokio |

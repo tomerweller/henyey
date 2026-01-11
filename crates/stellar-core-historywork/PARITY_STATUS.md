@@ -58,6 +58,20 @@ a dedicated work item that uses async HTTP via `stellar-core-history`.
 | `VerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | C++ runs in background thread. Rust verifies against headers inline. |
 | Header chain verification | Inline in `DownloadLedgerHeadersWork` | Uses `stellar_core_history::verify::verify_header_chain()` |
 
+### Batch and Range Operations
+
+| C++ Class | Rust Equivalent | Parity Notes |
+|-----------|-----------------|--------------|
+| `BatchDownloadWork` | `BatchDownloadWork` | Full parity. Downloads files for a `CheckpointRange` with 16 concurrent downloads. |
+| `CheckpointRange` | `CheckpointRange` | Full parity. Supports iteration, count, and ledger range calculation. |
+| `FileType` | `HistoryFileType` | Full parity. Ledger, Transactions, Results, Scp variants. |
+| `BatchDownloadWorkBuilder` | `BatchDownloadWorkBuilder` | Rust-specific. Creates all four batch download work items with proper dependencies. |
+| `BatchDownloadState` | `BatchDownloadState` | Rust-specific. Shared state for multi-checkpoint downloads keyed by checkpoint sequence. |
+| `DownloadVerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | Verification integrated into download work. |
+
+The Rust implementation supports full multi-checkpoint range operations for catchup.
+Downloads are parallelized with up to 16 concurrent requests per batch.
+
 ## Not Implemented
 
 ### Low-Level File/Shell Operations
@@ -73,20 +87,6 @@ These are not needed as Rust uses native libraries instead of shell commands.
 | `GzipFileWork` | Compress via shell | `flate2` crate |
 | `PutRemoteFileWork` | Upload via shell commands | `ArchiveWriter` trait |
 | `MakeRemoteDirWork` | Create remote dirs via shell | `ArchiveWriter` handles this |
-
-### Batch and Range Operations
-
-| C++ Class | Rust Equivalent | Parity Notes |
-|-----------|-----------------|--------------|
-| `BatchDownloadWork` | `BatchDownloadWork` | Full parity. Downloads files for a `CheckpointRange` with 16 concurrent downloads. |
-| `CheckpointRange` | `CheckpointRange` | Full parity. Supports iteration, count, and ledger range calculation. |
-| `FileType` | `HistoryFileType` | Full parity. Ledger, Transactions, Results, Scp variants. |
-| `BatchDownloadWorkBuilder` | `BatchDownloadWorkBuilder` | Rust-specific. Creates all four batch download work items with proper dependencies. |
-| `BatchDownloadState` | `BatchDownloadState` | Rust-specific. Shared state for multi-checkpoint downloads keyed by checkpoint sequence. |
-| `DownloadVerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | Verification integrated into download work. |
-
-The Rust implementation supports full multi-checkpoint range operations for catchup.
-Downloads are parallelized with up to 16 concurrent requests per batch.
 
 ### Advanced Verification and Tools
 
