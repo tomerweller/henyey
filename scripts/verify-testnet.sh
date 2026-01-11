@@ -203,7 +203,7 @@ if [ $TOTAL_FAILED -gt 0 ]; then
 fi
 
 if [ $TOTAL_TX_MISMATCHED -gt 0 ]; then
-    echo -e "${YELLOW}Some transactions had mismatches (may be meta ordering, not execution errors)${NC}"
+    echo -e "${YELLOW}Some transactions had mismatches (order-independent meta comparison is used)${NC}"
 fi
 
 echo -e "${GREEN}Verification complete!${NC}"
