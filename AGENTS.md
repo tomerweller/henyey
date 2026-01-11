@@ -42,9 +42,14 @@
 ## Commit & Pull Request Guidelines
 
 - Commit messages are short, imperative, and sentence case (examples: "Implement disk-backed bucket storage", "Optimize memory usage").
+- If Codex contributed to the changes, include a clear note in the commit message body and add a trailer: `Co-authored-by: Codex <codex@openai.com>`.
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
 - Link related issues or upstream references (e.g., stellar-core v25) where relevant.
 - When possible, fixes should be committed alongside regression tests that would have caught the bug.
+
+## Agent Communication
+
+- Format assistant messages in a Claude-like style: concise, direct, and structured with short sections or bullets when helpful.
 
 ## Configuration & Operational Notes
 
