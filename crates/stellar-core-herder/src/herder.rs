@@ -70,6 +70,14 @@ use crate::Result;
 /// is generous enough to handle network partitions while preventing attacks.
 const MAX_EXTERNALIZE_SLOT_DISTANCE: u64 = 1000;
 
+/// Maximum number of slots to accept behind the current tracking slot.
+///
+/// This matches the C++ stellar-core MAX_SLOTS_TO_REMEMBER constant. Slots
+/// within this window of the tracking slot are accepted for processing.
+/// This allows the node to catch up on recent slots after catchup without
+/// rejecting valid SCP envelopes as "too old".
+const MAX_SLOTS_TO_REMEMBER: u64 = 12;
+
 /// Result of receiving an SCP envelope.
 ///
 /// Indicates what happened when the Herder processed an incoming SCP envelope.
@@ -648,8 +656,39 @@ impl Herder {
             }
         }
 
+        // Calculate the minimum acceptable slot using C++ stellar-core logic:
+        // minLedgerSeq = currSlot - MAX_SLOTS_TO_REMEMBER + 1
+        // This allows slots within MAX_SLOTS_TO_REMEMBER of tracking_slot to be processed,
+        // which is essential after catchup when we need to catch up on recent slots.
+        let min_acceptable_slot = if current_slot > MAX_SLOTS_TO_REMEMBER {
+            current_slot - MAX_SLOTS_TO_REMEMBER + 1
+        } else {
+            1 // Genesis ledger
+        };
+
+        // The effective minimum is the max of min_acceptable_slot and lcl+1
+        // (we never want to process slots we've already closed)
+        let effective_min = lcl.map_or(min_acceptable_slot, |l| min_acceptable_slot.max(l + 1));
+
+        // Reject slots that are too old (below the acceptable window)
+        if slot < effective_min {
+            debug!(
+                slot,
+                current_slot,
+                min_acceptable_slot,
+                effective_min,
+                lcl = lcl.unwrap_or(0),
+                "Rejecting envelope: slot below acceptable window"
+            );
+            return EnvelopeState::TooOld;
+        }
+
         // Check if this is for a future slot
         if slot > current_slot {
+            // Clone the envelope in case we need to process it after pending.add fails
+            // due to a race condition (another thread advanced pending.current_slot)
+            let envelope_clone = envelope.clone();
+
             // Buffer for later
             match self.pending_envelopes.add(slot, envelope) {
                 PendingResult::Added => {
@@ -669,7 +708,17 @@ impl Herder {
                     return EnvelopeState::Invalid;
                 }
                 PendingResult::SlotTooOld => {
-                    return EnvelopeState::TooOld;
+                    // This can happen due to race condition when pending.current_slot
+                    // was advanced by another thread. Since we already checked against
+                    // effective_min, treat this as a race and process directly.
+                    debug!(
+                        slot,
+                        current_slot,
+                        pending_slot,
+                        "Pending said TooOld but slot is within window, processing directly"
+                    );
+                    // Process using the clone since original was consumed
+                    return self.process_scp_envelope(envelope_clone);
                 }
                 PendingResult::BufferFull => {
                     warn!("Pending envelope buffer full");
@@ -678,21 +727,7 @@ impl Herder {
             }
         }
 
-        // Check if this slot has already been closed via catchup
-        // If we've already closed this ledger, don't process stale SCP envelopes
-        // This prevents unnecessary tx set requests for old slots after catchup
-        if let Some(l) = lcl {
-            if slot <= l {
-                debug!(
-                    slot,
-                    lcl = l,
-                    "Rejecting envelope for already-closed slot"
-                );
-                return EnvelopeState::TooOld;
-            }
-        }
-
-        // Process the envelope
+        // Process the envelope - it's for current slot or a recent slot within the window
         self.process_scp_envelope(envelope)
     }
 
