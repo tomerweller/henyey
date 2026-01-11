@@ -3163,6 +3163,10 @@ impl App {
                             first_buffered,
                             "Skipping catchup: archive has no newer checkpoint"
                         );
+                        // Reset tx_set tracking to give pending requests a fresh chance.
+                        // When we're at a checkpoint boundary waiting for the next checkpoint,
+                        // peers may have responded DontHave for tx_sets that are now current.
+                        self.reset_tx_set_tracking_after_catchup().await;
                         self.catchup_in_progress.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -3209,13 +3213,16 @@ impl App {
                 *self.last_processed_slot.write().await = result.ledger_seq as u64;
                 self.clear_tx_advert_history(result.ledger_seq).await;
                 self.herder.bootstrap(result.ledger_seq);
+                // Purge old externalized slots to prevent matching new tx_sets to old slots
+                self.herder.purge_slots_below(result.ledger_seq as u64);
                 let cleaned = self
                     .herder
                     .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
                 if cleaned > 0 {
                     tracing::info!(cleaned, "Dropped stale pending tx set requests after catchup");
                 }
-                self.prune_tx_set_tracking().await;
+                // Reset tx_set tracking to give pending requests a fresh chance
+                self.reset_tx_set_tracking_after_catchup().await;
                 if self.is_validator {
                     self.set_state(AppState::Validating).await;
                 } else {
@@ -3275,13 +3282,16 @@ impl App {
                 *self.last_processed_slot.write().await = result.ledger_seq as u64;
                 self.clear_tx_advert_history(result.ledger_seq).await;
                 self.herder.bootstrap(result.ledger_seq);
+                // Purge old externalized slots to prevent matching new tx_sets to old slots
+                self.herder.purge_slots_below(result.ledger_seq as u64);
                 let cleaned = self
                     .herder
                     .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
                 if cleaned > 0 {
                     tracing::info!(cleaned, "Dropped stale pending tx set requests after catchup");
                 }
-                self.prune_tx_set_tracking().await;
+                // Reset tx_set tracking to give pending requests a fresh chance
+                self.reset_tx_set_tracking_after_catchup().await;
                 if self.is_validator {
                     self.set_state(AppState::Validating).await;
                 } else {
@@ -3375,17 +3385,30 @@ impl App {
         Some(target)
     }
 
-    async fn prune_tx_set_tracking(&self) {
-        let pending: HashSet<Hash256> = self
-            .herder
-            .get_pending_tx_sets()
-            .into_iter()
-            .map(|(hash, _)| hash)
-            .collect();
+    /// Reset tx_set tracking after catchup to give pending tx_sets a fresh chance.
+    ///
+    /// After catchup, the node's current_ledger has jumped significantly.
+    /// Pending tx_set requests that were "DontHave" before catchup may now
+    /// be available from peers (since those slots are now current, not future).
+    /// Clearing the tracking allows fresh requests to all peers.
+    async fn reset_tx_set_tracking_after_catchup(&self) {
         let mut dont_have = self.tx_set_dont_have.write().await;
-        dont_have.retain(|hash, _| pending.contains(hash));
+        let cleared_dont_have = dont_have.len();
+        dont_have.clear();
+        drop(dont_have);
+
         let mut last_request = self.tx_set_last_request.write().await;
-        last_request.retain(|hash, _| pending.contains(hash));
+        let cleared_last_request = last_request.len();
+        last_request.clear();
+        drop(last_request);
+
+        if cleared_dont_have > 0 || cleared_last_request > 0 {
+            tracing::info!(
+                cleared_dont_have,
+                cleared_last_request,
+                "Reset tx_set tracking after catchup"
+            );
+        }
     }
 
     fn tx_set_start_index(hash: &Hash256, peers_len: usize, peer_offset: usize) -> usize {
