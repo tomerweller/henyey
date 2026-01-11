@@ -646,6 +646,12 @@ impl Herder {
                 self.scp_driver
                     .cleanup_externalized(self.config.max_externalized_slots);
 
+                // Inform the SCP library about this externalization so that
+                // subsequent envelopes for this slot are properly validated
+                if let Some(ref scp) = self.scp {
+                    scp.force_externalize(slot, value.clone());
+                }
+
                 // Store for reference
                 *self.prev_value.write() = value;
 

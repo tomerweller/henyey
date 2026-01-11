@@ -282,6 +282,23 @@ impl BallotProtocol {
         }
     }
 
+    /// Force the ballot protocol to the externalized state with the given value.
+    ///
+    /// This is used when fast-forwarding via EXTERNALIZE messages from the network.
+    /// It ensures that subsequent envelopes for this slot are properly validated
+    /// against the externalized value.
+    pub fn force_externalize(&mut self, value: Value) {
+        let ballot = ScpBallot {
+            counter: u32::MAX, // Infinite ballot for externalize
+            value: value.clone(),
+        };
+        self.commit = Some(ballot.clone());
+        self.high_ballot = Some(ballot.clone());
+        self.current_ballot = Some(ballot);
+        self.value = Some(value);
+        self.phase = BallotPhase::Externalize;
+    }
+
     /// Get the last envelope constructed by this node.
     pub fn get_last_envelope(&self) -> Option<&ScpEnvelope> {
         self.last_envelope.as_ref()

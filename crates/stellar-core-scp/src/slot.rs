@@ -409,12 +409,14 @@ impl Slot {
     /// Force externalize with a specific value.
     ///
     /// This is used during catchup when we receive historical ledgers
-    /// that have already been externalized by the network.
+    /// that have already been externalized by the network, or when
+    /// fast-forwarding via EXTERNALIZE messages from the network.
     pub fn force_externalize(&mut self, value: Value) {
-        self.externalized_value = Some(value);
+        self.externalized_value = Some(value.clone());
         self.fully_validated = true;
         self.nomination.stop();
         self.nomination.set_fully_validated(true);
+        self.ballot.force_externalize(value);
         self.ballot.set_fully_validated(true);
     }
 
