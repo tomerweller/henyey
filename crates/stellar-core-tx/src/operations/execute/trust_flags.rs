@@ -28,7 +28,7 @@ pub fn execute_allow_trust(
     op: &AllowTrustOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the issuer)
     let issuer = match state.get_account(source) {
@@ -38,8 +38,9 @@ pub fn execute_allow_trust(
         }
     };
 
-    // Check if issuer has AUTH_REQUIRED flag
-    if issuer.flags & AUTH_REQUIRED_FLAG == 0 {
+    // Check if issuer has AUTH_REQUIRED flag (only for protocol versions before 16)
+    // In protocol 16+, this check was removed as part of CAP-0035.
+    if context.protocol_version < 16 && issuer.flags & AUTH_REQUIRED_FLAG == 0 {
         return Ok(make_allow_trust_result(AllowTrustResultCode::TrustNotRequired));
     }
 

@@ -347,25 +347,9 @@ impl BucketList {
     pub fn get_with_debug(&self, key: &LedgerKey, debug: bool) -> Result<Option<LedgerEntry>> {
         // Search from newest to oldest
         for (level_idx, level) in self.levels.iter().enumerate() {
-            // Check curr bucket first (newer)
-            if let Some(entry) = level.curr.get(key)? {
-                if debug {
-                    tracing::info!(
-                        level = level_idx,
-                        bucket = "curr",
-                        entry_type = ?std::mem::discriminant(&entry),
-                        "Found entry in bucket list"
-                    );
-                }
-                return match entry {
-                    BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
-                    BucketEntry::Dead(_) => Ok(None), // Entry is deleted
-                    BucketEntry::Metadata(_) => continue,
-                };
-            }
-
-            // Check next bucket if any (pending merge result)
-            // This matches C++ behavior where resolved mNextCurr is also checked
+            // Check next bucket FIRST if any (pending merge result contains NEWER entries)
+            // This is critical: when a merge is pending, `next` contains the merge result
+            // of curr + incoming entries. If we check curr first, we'd return stale data.
             if let Some(next) = level.next() {
                 if let Some(entry) = next.get(key)? {
                     if debug {
@@ -382,6 +366,23 @@ impl BucketList {
                         BucketEntry::Metadata(_) => continue,
                     };
                 }
+            }
+
+            // Check curr bucket (only if next didn't have the entry)
+            if let Some(entry) = level.curr.get(key)? {
+                if debug {
+                    tracing::info!(
+                        level = level_idx,
+                        bucket = "curr",
+                        entry_type = ?std::mem::discriminant(&entry),
+                        "Found entry in bucket list"
+                    );
+                }
+                return match entry {
+                    BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
+                    BucketEntry::Dead(_) => Ok(None), // Entry is deleted
+                    BucketEntry::Metadata(_) => continue,
+                };
             }
 
             // Then check snap bucket
@@ -410,17 +411,19 @@ impl BucketList {
 
     /// Debug method to find ALL occurrences of a key across all buckets.
     /// Returns a list of (level, bucket_type, entry) for each occurrence.
+    /// Order: next (newest) → curr → snap (oldest) within each level.
     pub fn find_all_occurrences(&self, key: &LedgerKey) -> Result<Vec<(usize, &'static str, BucketEntry)>> {
         let mut results = Vec::new();
 
         for (level_idx, level) in self.levels.iter().enumerate() {
-            if let Some(entry) = level.curr.get(key)? {
-                results.push((level_idx, "curr", entry));
-            }
+            // Check next first (pending merge result, newest)
             if let Some(next) = level.next() {
                 if let Some(entry) = next.get(key)? {
                     results.push((level_idx, "next", entry));
                 }
+            }
+            if let Some(entry) = level.curr.get(key)? {
+                results.push((level_idx, "curr", entry));
             }
             if let Some(entry) = level.snap.get(key)? {
                 results.push((level_idx, "snap", entry));
@@ -436,11 +439,13 @@ impl BucketList {
         let mut entries = Vec::new();
 
         for level in &self.levels {
-            // Collect buckets to iterate: curr, next (if any), snap
-            let mut buckets: Vec<&Bucket> = vec![&level.curr];
+            // Collect buckets to iterate: next (newest), curr, snap (oldest)
+            // The order matters because first occurrence shadows later ones.
+            let mut buckets: Vec<&Bucket> = Vec::new();
             if let Some(next) = level.next() {
                 buckets.push(next);
             }
+            buckets.push(&level.curr);
             buckets.push(&level.snap);
 
             for bucket in buckets {
