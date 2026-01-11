@@ -471,6 +471,65 @@ impl LedgerStateManager {
         self.ledger_seq = ledger_seq;
     }
 
+    /// Clear all cached ledger entries.
+    ///
+    /// This clears all entry storage (accounts, trustlines, offers, etc.) while
+    /// preserving ledger-level state like id_pool. Use this at the start of a new
+    /// ledger in verification mode to ensure entries are reloaded from the
+    /// authoritative bucket list state.
+    pub fn clear_cached_entries(&mut self) {
+        self.accounts.clear();
+        self.trustlines.clear();
+        self.offers.clear();
+        self.data_entries.clear();
+        self.contract_data.clear();
+        self.contract_code.clear();
+        self.ttl_entries.clear();
+        self.claimable_balances.clear();
+        self.liquidity_pools.clear();
+        self.entry_sponsorships.clear();
+        self.entry_last_modified.clear();
+
+        // Clear all transaction-level state
+        self.op_entry_snapshots.clear();
+        self.op_snapshots_active = false;
+        self.multi_op_mode = false;
+        self.sponsorship_stack.clear();
+        self.delta = LedgerDelta::new(self.ledger_seq);
+
+        self.modified_accounts.clear();
+        self.modified_trustlines.clear();
+        self.modified_offers.clear();
+        self.modified_data.clear();
+        self.modified_contract_data.clear();
+        self.modified_contract_code.clear();
+        self.modified_ttl.clear();
+        self.modified_claimable_balances.clear();
+        self.modified_liquidity_pools.clear();
+
+        self.account_snapshots.clear();
+        self.trustline_snapshots.clear();
+        self.offer_snapshots.clear();
+        self.data_snapshots.clear();
+        self.contract_data_snapshots.clear();
+        self.contract_code_snapshots.clear();
+        self.ttl_snapshots.clear();
+        self.claimable_balance_snapshots.clear();
+        self.liquidity_pool_snapshots.clear();
+        self.entry_sponsorship_snapshots.clear();
+        self.entry_last_modified_snapshots.clear();
+
+        self.created_accounts.clear();
+        self.created_trustlines.clear();
+        self.created_offers.clear();
+        self.created_data.clear();
+        self.created_contract_data.clear();
+        self.created_contract_code.clear();
+        self.created_ttl.clear();
+        self.created_claimable_balances.clear();
+        self.created_liquidity_pools.clear();
+    }
+
     /// Clear active sponsorship state (start of a new transaction).
     pub fn clear_sponsorship_stack(&mut self) {
         self.sponsorship_stack.clear();

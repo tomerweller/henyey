@@ -689,6 +689,36 @@ impl TransactionExecutor {
         // accounts that were loaded/created in previous ledgers remain valid
     }
 
+    /// Advance to a new ledger and clear all cached entries.
+    ///
+    /// This is used in verification mode where we apply authoritative CDP metadata
+    /// to the bucket list between ledgers. Clearing cached entries ensures that
+    /// all entries are reloaded from the bucket list, reflecting the true state
+    /// after the previous ledger's changes.
+    ///
+    /// Without this, stale entries (e.g., offers that were deleted in the bucket list)
+    /// would remain in the executor's cache and cause incorrect execution results.
+    pub fn advance_to_ledger_with_fresh_state(
+        &mut self,
+        ledger_seq: u32,
+        close_time: u64,
+        base_reserve: u32,
+        protocol_version: u32,
+        _id_pool: u64,
+        soroban_config: SorobanConfig,
+    ) {
+        self.ledger_seq = ledger_seq;
+        self.close_time = close_time;
+        self.base_reserve = base_reserve;
+        self.protocol_version = protocol_version;
+        self.soroban_config = soroban_config;
+        self.state.set_ledger_seq(ledger_seq);
+        // Clear all cached entries so they're reloaded from the bucket list
+        self.state.clear_cached_entries();
+        // Also clear loaded_accounts cache
+        self.loaded_accounts.clear();
+    }
+
     /// Load an account from the snapshot into the state manager.
     pub fn load_account(
         &mut self,
