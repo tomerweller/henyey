@@ -4360,6 +4360,44 @@ pub fn execute_transaction_set_with_fee_mode(
         tx_result_metas.push(tx_result_meta);
     }
 
+    // Protocol 23+: Apply Soroban fee refunds after ALL transactions
+    // This matches C++ stellar-core's processPostTxSetApply() phase
+    if protocol_version >= 23 && deduct_fee {
+        let mut total_refunds = 0i64;
+        for (idx, (tx, _)) in transactions.iter().enumerate() {
+            let refund = results[idx].fee_refund;
+            if refund > 0 {
+                let frame =
+                    TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
+                let fee_source_id =
+                    stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+
+                // Apply refund to the account balance in the delta
+                executor.state.apply_refund_to_delta(&fee_source_id, refund);
+
+                // Subtract refund from fee pool
+                executor.state.delta_mut().add_fee(-refund);
+                total_refunds += refund;
+
+                tracing::info!(
+                    ledger_seq = ledger_seq,
+                    tx_index = idx,
+                    refund = refund,
+                    fee_source = %account_id_to_strkey(&fee_source_id),
+                    "Applied P23+ Soroban fee refund"
+                );
+            }
+        }
+        if total_refunds > 0 {
+            tracing::info!(
+                ledger_seq = ledger_seq,
+                total_refunds = total_refunds,
+                tx_count = transactions.len(),
+                "P23+ Soroban fee refunds applied"
+            );
+        }
+    }
+
     // Apply all changes to the delta
     executor.apply_to_delta(snapshot, delta)?;
 
