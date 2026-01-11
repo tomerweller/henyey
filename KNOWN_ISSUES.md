@@ -7,7 +7,7 @@ This document tracks known issues in rs-stellar-core that affect network synchro
 **Status:** Unresolved
 **Severity:** Critical - Prevents real-time sync
 **Component:** Catchup / Herder
-**Last Verified:** 2026-01-11
+**Last Verified:** 2026-01-11 - Observed on fresh testnet run
 
 ### Description
 After catchup completes to a checkpoint ledger, the node cannot close subsequent ledgers because the required transaction sets (tx_sets) are no longer available from peers.
@@ -44,30 +44,49 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ---
 
-## 2. Ledger Header Hash Mismatch (Partially Fixed)
+## 2. Ledger Header Hash Mismatch (Critical - Unresolved)
 
-**Status:** Fix implemented, pending full verification
+**Status:** Unresolved - root cause not yet identified
 **Severity:** Critical - Prevents ledger closing
-**Component:** Ledger Manager / Transaction Execution
+**Component:** Ledger Manager / Bucket List / Header Computation
 **First Observed:** 2026-01-11
-**Fix Committed:** 2026-01-11 (5648f8e)
+**Last Verified:** 2026-01-11 - Still occurring on live testnet node
 
 ### Description
 After catching up from history archives, the node's locally computed ledger header hash does not match the network's expected `prev_ledger_hash`. This prevents the node from closing new ledgers and participating in consensus.
 
-### Fix Applied
-**Root Cause Identified:** For Protocol 23+, Soroban fee refunds were not being applied after ALL transactions in the tx set. C++ stellar-core's `processPostTxSetApply()` phase applies fee refunds after all transaction execution completes, but rs-stellar-core was missing this phase.
+### Latest Test Results (2026-01-11)
+```
+INFO  Ledger manager initialized from catchup ledger_seq=434751
+INFO  Evaluating buffered catchup current_ledger=434752 first_buffered=434753
+ERROR Hash mismatch - our computed header hash differs from network's prev_ledger_hash
+      current_seq=434752 close_seq=434753
+      our_hash=6d7c70ea089bfff9d1be0c82d1a8d28a68f7d75544ed1d95e6f37c7973a36a20
+      network_prev_hash=23eb28d09dd5cfcecc9bc1fb80a26195c00fa468a1529e1c46b3954c67ad1607
+```
 
-**Solution:** Added P23+ Soroban fee refund processing to `execute_transaction_set_with_fee_mode()` in `crates/stellar-core-ledger/src/execution.rs`. The fix:
-1. Iterates through all transactions after execution completes
-2. Applies any fee refunds to account balances in the delta
-3. Adjusts the fee pool accordingly
+### Investigation Progress
 
-**Verification Status:**
-- **verify-execution tool**: 200 transactions across 51 ledgers - zero mismatches
-- **Live node testing**: Blocked by Issue #1 (Buffered Gap After Catchup)
+**P23+ Soroban Fee Refunds (Commit 5648f8e):** Added post-transaction refund processing for Protocol 23+, matching C++ stellar-core's `processPostTxSetApply()`. However, the hash mismatch still occurs even for ledgers with NO Soroban transactions with refunds, indicating this was not the root cause.
 
-The execution logic is validated to match C++ stellar-core. Full live node verification will be possible once Issue #1 is resolved.
+**verify-execution Tool:** Passes with zero mismatches (200 transactions, 51 ledgers). However, this tool:
+- Syncs state with CDP metadata after each transaction
+- Compares entry changes but NOT ledger header hash computation
+- Does not verify bucket_list_hash, fee_pool, or overall header hash
+
+**Important:** verify-execution passing does NOT guarantee correct ledger header hash computation. The tool validates transaction execution results match, but the live node's header hash computation may still diverge.
+
+### Likely Root Causes (Prioritized)
+1. **Bucket list state divergence after catchup** - The bucket list restored from archive may not exactly match the expected state
+2. **Bucket list update after execution** - The add_batch() call may produce different level hashes than C++ stellar-core
+3. **Fee pool calculation** - Accumulated fees may be computed differently
+4. **Header hash computation** - Some field may be serialized or hashed differently
+
+### Next Investigation Steps
+1. Add logging to compare bucket_list_hash after catchup vs expected
+2. Compare our computed header fields against CDP/archive header for the same ledger
+3. Verify bucket list add_batch() produces correct level hashes
+4. Check if fee_pool delta matches expected values
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
