@@ -69,24 +69,28 @@ ERROR Hash mismatch - our computed header hash differs from network's prev_ledge
 
 **P23+ Soroban Fee Refunds (Commit 5648f8e):** Added post-transaction refund processing for Protocol 23+, matching C++ stellar-core's `processPostTxSetApply()`. However, the hash mismatch still occurs even for ledgers with NO Soroban transactions with refunds, indicating this was not the root cause.
 
-**verify-execution Tool:** Passes with zero mismatches (200 transactions, 51 ledgers). However, this tool:
-- Syncs state with CDP metadata after each transaction
-- Compares entry changes but NOT ledger header hash computation
-- Does not verify bucket_list_hash, fee_pool, or overall header hash
+**Enhanced verify-execution Tool (Commit 3a92735):** Added header hash verification to verify-execution tool. The tool now compares bucket_list_hash, fee_pool, tx_result_hash, and overall header_hash against CDP expected values.
 
-**Important:** verify-execution passing does NOT guarantee correct ledger header hash computation. The tool validates transaction execution results match, but the live node's header hash computation may still diverge.
+### ROOT CAUSE IDENTIFIED: Bucket List Hash Divergence
 
-### Likely Root Causes (Prioritized)
-1. **Bucket list state divergence after catchup** - The bucket list restored from archive may not exactly match the expected state
-2. **Bucket list update after execution** - The add_batch() call may produce different level hashes than C++ stellar-core
-3. **Fee pool calculation** - Accumulated fees may be computed differently
-4. **Header hash computation** - Some field may be serialized or hashed differently
+**Key Finding:** The verify-execution tool with header verification shows:
+```
+Ledger 434700: HEADER MISMATCH
+    bucket_list_hash: ours=5fdcdc0c... expected=ae6ad870...
+    header_hash: ours=7dd1b09d... expected=ead8fc6c...
+```
+
+- **fee_pool**: MATCHES (no divergence)
+- **tx_result_hash**: MATCHES (no divergence)
+- **bucket_list_hash**: DOES NOT MATCH - **THIS IS THE ROOT CAUSE**
+
+The transaction execution is correct (all transactions match CDP), and fee tracking is correct. The divergence is in how the bucket list state is updated via `add_batch()`.
 
 ### Next Investigation Steps
-1. Add logging to compare bucket_list_hash after catchup vs expected
-2. Compare our computed header fields against CDP/archive header for the same ledger
-3. Verify bucket list add_batch() produces correct level hashes
-4. Check if fee_pool delta matches expected values
+1. **Investigate bucket list add_batch()** - Compare our implementation vs C++ stellar-core's BucketList::addBatch()
+2. **Check level spill logic** - Verify entries spill between levels correctly
+3. **Check hash computation** - Verify bucket level hash computation matches C++
+4. **Debug specific level hashes** - Add logging to compare level-by-level hashes
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
