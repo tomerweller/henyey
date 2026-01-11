@@ -46,6 +46,7 @@
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
 - Link related issues or upstream references (e.g., stellar-core v25) where relevant.
 - When possible, fixes should be committed alongside regression tests that would have caught the bug.
+- If a push is rejected, pull with rebase and retry the push.
 
 ## Agent Communication
 
