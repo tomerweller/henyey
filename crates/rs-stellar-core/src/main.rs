@@ -2229,12 +2229,14 @@ async fn cmd_verify_execution(
             // This is the previous ledger's CLOSING id_pool, not the current ledger's.
             let starting_id_pool = prev_id_pool.unwrap_or(0);
             if let Some(ref mut exec) = executor {
-                exec.advance_to_ledger(
+                // Use fresh state to clear cached entries that may be stale after
+                // applying CDP metadata to the bucket list in the previous ledger.
+                exec.advance_to_ledger_with_fresh_state(
                     seq,
                     cdp_header.scp_value.close_time.0,
                     cdp_header.base_reserve,
                     cdp_header.ledger_version,
-                    starting_id_pool, // Not used internally (see advance_to_ledger docs)
+                    starting_id_pool,
                     soroban_config,
                 );
             } else {
