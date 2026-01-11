@@ -150,6 +150,7 @@ As of 2026-01-11, testnet connections show stable peer connectivity with 3 peers
 **Status:** Expected Behavior (consequence of Issue #1)
 **Severity:** Low
 **Component:** Overlay
+**Last Verified:** 2026-01-11 - NOT observed in 10+ minute test session
 
 ### Description
 Peers disconnect the node with "random disconnect due to out of sync" when the node falls too far behind the network.
@@ -161,32 +162,96 @@ Peers disconnect the node with "random disconnect due to out of sync" when the n
 ### Root Cause
 This is expected C++ stellar-core behavior. Peers disconnect nodes that are significantly behind to avoid wasting resources. This is a consequence of Issue #1, not a separate bug.
 
+### Recent Observations (2026-01-11)
+In a 10+ minute testnet run, this issue was **not observed**:
+- Node maintained stable connections to all 3 SDF testnet validators
+- No "out of sync" disconnection errors logged
+- Peers remained connected despite node being ~60 ledgers behind due to hash mismatch issue
+
+The issue may only manifest when the node falls significantly further behind (100+ ledgers).
+
 ---
 
 ## 5. heard_from_quorum=false Persistent Warning
 
-**Status:** Unresolved
+**Status:** Unresolved - Root cause identified
 **Severity:** Medium - Indicates consensus issues
-**Component:** Herder / SCP
+**Component:** Herder / SCP / Quorum Tracker
+**Last Verified:** 2026-01-11 - CONFIRMED still occurs
 
 ### Description
-The node continuously reports that it has not heard from its quorum, even while receiving SCP messages.
+The node continuously reports that it has not heard from its quorum, even while receiving and processing valid SCP messages from all configured validators.
 
 ### Symptoms
-- Heartbeat shows `heard_from_quorum=false`
-- Warning: "Have not heard from quorum - may be experiencing network partition"
-- Occurs despite processing valid SCP envelopes
+- Heartbeat shows `heard_from_quorum=false` (has **never** been true in any test run)
+- `is_v_blocking` occasionally flips to `true` briefly, then returns to `false`
+- Occurs despite:
+  - Successfully connecting to all 3 SDF testnet validators
+  - Processing valid SCP envelopes from all validators
+  - Externalizing slots (latest_ext advances normally)
 
 ### Example Log Pattern
 ```
-INFO  Heartbeat tracking_slot=430445 ledger=430400 latest_ext=430444 peers=1 heard_from_quorum=false is_v_blocking=false
-WARN  Have not heard from quorum - may be experiencing network partition
+INFO  Heartbeat tracking_slot=432633 ledger=432576 latest_ext=432632 peers=3 heard_from_quorum=false is_v_blocking=false
 ```
 
-### Potential Causes
-- Quorum intersection calculation not considering all received envelopes
-- Timing issue - quorum check runs before envelopes are fully processed
-- Related to the out-of-sync state from Issue #1
+Note: Despite `peers=3` and `latest_ext` advancing, `heard_from_quorum` remains false.
+
+### Root Cause Analysis
+
+The issue is in the `is_quorum` function in `stellar-core-scp/src/quorum.rs`. The function requires knowing each node's quorum set to verify that all nodes in the potential quorum have their own quorum slices satisfied:
+
+```rust
+// From quorum.rs:143-151
+for node in nodes {
+    if let Some(qs) = get_quorum_set(node) {
+        if !is_quorum_slice(&qs, nodes, &get_quorum_set) {
+            return false;
+        }
+    } else {
+        // Unknown node - can't verify quorum
+        return false;  // <-- This is the problem!
+    }
+}
+```
+
+**The critical issue**: We don't have the quorum sets for the SDF validators stored.
+
+The `heard_from_quorum` check calls:
+```rust
+self.slot_quorum_tracker.read().has_quorum(slot, |node_id| {
+    self.scp_driver.get_quorum_set(node_id)
+})
+```
+
+When we don't have a validator's quorum set stored, `get_quorum_set(node_id)` returns `None`, and `is_quorum` returns `false`.
+
+**Why we don't have the validators' quorum sets**:
+1. Quorum sets are received via `ScpQuorumset` messages in response to requests
+2. The node must actively request quorum sets when it sees unknown hashes in SCP envelopes
+3. Either we're not requesting them, or we're not properly storing them
+
+### Evidence from Logs
+```
+INFO  Loaded quorum set configuration threshold=2 validators=3 inner_sets=0
+INFO  Initializing quorum tracker with local quorum set validators=3 threshold=2
+INFO  Quorum set validator validator=a824cd18...  (GDKXE2...)
+INFO  Quorum set validator validator=b55d10b2...  (GCUCJT...)
+INFO  Quorum set validator validator=d57269d9...  (GC2V2E...)
+```
+
+Only the LOCAL quorum set is logged at startup. No `ScpQuorumset` messages received from network.
+
+### Potential Fixes
+1. **Request missing quorum sets**: When processing SCP envelopes, extract the quorum set hash and request it if unknown
+2. **Bootstrap quorum sets**: Pre-populate known validator quorum sets from configuration or first SCP message
+3. **Relax quorum check**: For non-validator nodes, consider a simpler "quorum slice" check that doesn't require knowing peer quorum sets
+
+### Related Files
+- `crates/stellar-core-scp/src/quorum.rs:133-155` - `is_quorum` function
+- `crates/stellar-core-herder/src/quorum_tracker.rs:111-124` - `has_quorum` method
+- `crates/stellar-core-herder/src/herder.rs:509-512` - `heard_from_quorum` method
+- `crates/stellar-core-herder/src/scp_driver.rs:732-743` - `get_quorum_set` lookup
 
 ---
 
