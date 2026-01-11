@@ -171,6 +171,21 @@ This document tracks the parity between this Rust crate (`stellar-core-history`)
 
 ### Not Yet Implemented (Gaps)
 
+#### Catchup Work Pipeline (`src/catchup/*`)
+
+- [ ] **Work-based catchup orchestration**
+  - C++ uses `CatchupWork` + `CatchupConfiguration` and an explicit work graph
+  - Rust uses a direct `CatchupManager` without per-step work objects
+- [ ] **Bucket indexing and application works**
+  - `IndexBucketsWork` (index build) and `ApplyBucketsWork` (apply bucket list)
+  - Rust restores bucket lists directly via `BucketList::restore_from_hashes`
+- [ ] **Buffered ledger apply pipeline**
+  - `ApplyBufferedLedgersWork`, `ApplyCheckpointWork`, `ApplyLedgerWork`
+  - Rust replays and applies ledgers inline in `catchup.rs`
+- [ ] **Ledger chain verification work**
+  - `VerifyLedgerChainWork` for header chain verification as a work item
+  - Rust runs header chain verification inline during catchup
+
 #### CheckpointBuilder (`CheckpointBuilder.h/cpp`)
 
 - [ ] **ACID transactional checkpoint building**
