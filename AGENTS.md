@@ -37,6 +37,7 @@
 - Run focused tests when possible to speed iteration, then run `cargo test --all` before submitting.
 - No fuzz testing is required for this project.
 - No baseline transaction meta testing is required.
+- Perform testing on testnet, not mainnet.
 
 ## Commit & Pull Request Guidelines
 

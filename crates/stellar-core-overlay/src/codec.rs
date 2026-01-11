@@ -106,13 +106,23 @@ impl MessageCodec {
     /// Encodes a message to bytes with length prefix.
     ///
     /// Returns a `Vec<u8>` containing the 4-byte length prefix followed by
-    /// the XDR-encoded message body.
+    /// the XDR-encoded message body. The length prefix has bit 31 set for
+    /// authenticated messages (all except Hello).
     pub fn encode_message(message: &AuthenticatedMessage) -> Result<Vec<u8>> {
+        // Determine if this message should have the authentication bit set.
+        // HELLO messages don't have the auth bit; all others do.
+        let is_authenticated = match message {
+            AuthenticatedMessage::V0(v0) => {
+                !matches!(v0.message, stellar_xdr::curr::StellarMessage::Hello(_))
+            }
+        };
+
         let xdr_bytes = message.to_xdr(Limits::none())?;
         let len = xdr_bytes.len() as u32;
+        let auth_bit = if is_authenticated { 0x80000000u32 } else { 0 };
 
         let mut buf = Vec::with_capacity(4 + xdr_bytes.len());
-        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&(len | auth_bit).to_be_bytes());
         buf.extend_from_slice(&xdr_bytes);
 
         Ok(buf)
@@ -196,6 +206,17 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
     type Error = OverlayError;
 
     fn encode(&mut self, message: AuthenticatedMessage, dst: &mut BytesMut) -> Result<()> {
+        // Determine if this message should have the authentication bit set.
+        // HELLO messages are sent before keys are established, so they use
+        // sequence 0 and an all-zero MAC field - no auth bit.
+        // All other messages (AUTH and post-auth) have valid MACs and need
+        // the auth bit set so the receiver knows to verify the MAC.
+        let is_authenticated = match &message {
+            AuthenticatedMessage::V0(v0) => {
+                !matches!(v0.message, stellar_xdr::curr::StellarMessage::Hello(_))
+            }
+        };
+
         // Encode to XDR
         let xdr_bytes = message.to_xdr(Limits::none())?;
 
@@ -207,10 +228,13 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
             )));
         }
 
-        // Write length prefix
+        // Write length prefix with authentication bit
+        // Bit 31 set = message has valid MAC that should be verified
+        // Bit 31 clear = message has zero MAC (Hello during handshake)
         let len = xdr_bytes.len() as u32;
+        let auth_bit = if is_authenticated { 0x80000000 } else { 0 };
         dst.reserve(4 + xdr_bytes.len());
-        dst.put_u32(len);
+        dst.put_u32(len | auth_bit);
 
         // Write message body
         dst.extend_from_slice(&xdr_bytes);
@@ -311,9 +335,13 @@ mod tests {
         // Should have 4-byte length prefix
         assert!(encoded.len() > 4);
 
-        // Length should match
-        let len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+        // Length should match (mask off auth bit)
+        let raw_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+        let len = (raw_len & 0x7FFFFFFF) as usize;
         assert_eq!(len, encoded.len() - 4);
+
+        // Non-Hello messages should have auth bit set
+        assert!(raw_len & 0x80000000 != 0, "auth bit should be set for non-Hello messages");
 
         // Should decode
         let decoded = MessageCodec::decode_message(&encoded[4..]).unwrap();
@@ -323,6 +351,63 @@ mod tests {
                 assert!(matches!(v0.message, StellarMessage::Peers(_)));
             }
         }
+    }
+
+    #[test]
+    fn test_auth_bit_set_for_authenticated_messages() {
+        // Non-Hello messages should have auth bit set
+        let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 1,
+            message: StellarMessage::Peers(VecM::default()),
+            mac: HmacSha256Mac { mac: [0u8; 32] },
+        });
+        let encoded = MessageCodec::encode_message(&msg).unwrap();
+        let raw_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+
+        assert!(raw_len & 0x80000000 != 0, "auth bit should be set");
+        assert_eq!((raw_len & 0x7FFFFFFF) as usize, encoded.len() - 4);
+    }
+
+    #[test]
+    fn test_auth_bit_not_set_for_hello() {
+        // Hello messages should NOT have auth bit set
+        let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 0,
+            message: StellarMessage::Hello(Default::default()),
+            mac: HmacSha256Mac { mac: [0u8; 32] },
+        });
+        let encoded = MessageCodec::encode_message(&msg).unwrap();
+        let raw_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+
+        assert!(raw_len & 0x80000000 == 0, "auth bit should NOT be set for Hello");
+        assert_eq!(raw_len as usize, encoded.len() - 4);
+    }
+
+    #[test]
+    fn test_codec_roundtrip_with_auth_bit() {
+        // Test that encode/decode roundtrip preserves the auth bit correctly
+        let mut codec = MessageCodec::new();
+        let mut buf = BytesMut::new();
+
+        // Authenticated message (non-Hello)
+        let auth_msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 5,
+            message: StellarMessage::Peers(VecM::default()),
+            mac: HmacSha256Mac { mac: [42u8; 32] },
+        });
+        codec.encode(auth_msg, &mut buf).unwrap();
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert!(frame.is_authenticated, "decoded frame should be marked as authenticated");
+
+        // Hello message (unauthenticated)
+        let hello_msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 0,
+            message: StellarMessage::Hello(Default::default()),
+            mac: HmacSha256Mac { mac: [0u8; 32] },
+        });
+        codec.encode(hello_msg, &mut buf).unwrap();
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert!(!frame.is_authenticated, "Hello message should NOT be marked as authenticated");
     }
 
     #[test]
