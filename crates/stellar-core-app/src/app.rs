@@ -2275,9 +2275,11 @@ impl App {
                     let peers = overlay.as_ref().map(|o| o.peer_count()).unwrap_or(0);
                     drop(overlay);
 
-                    // Check quorum status for the tracking slot
-                    let heard_from_quorum = self.herder.heard_from_quorum(tracking_slot);
-                    let is_v_blocking = self.herder.is_v_blocking(tracking_slot);
+                    // Check quorum status - use latest_ext if available since we have
+                    // actual SCP messages for that slot, otherwise fall back to tracking_slot
+                    let quorum_check_slot = if latest_ext > 0 { latest_ext } else { tracking_slot };
+                    let heard_from_quorum = self.herder.heard_from_quorum(quorum_check_slot);
+                    let is_v_blocking = self.herder.is_v_blocking(quorum_check_slot);
 
                     tracing::info!(
                         tracking_slot,
@@ -2461,15 +2463,18 @@ impl App {
 
                 if let Some(hash) = Self::scp_quorum_set_hash(&envelope.statement) {
                     let hash256 = stellar_core_common::Hash256::from_bytes(hash.0);
-                    if !self.herder.has_quorum_set_hash(&hash256) {
-                        if self.herder.request_quorum_set(hash256) {
-                            let peer = msg.from_peer.clone();
-                            let overlay = self.overlay.lock().await;
-                            if let Some(ref overlay) = *overlay {
-                                let request = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-                                if let Err(e) = overlay.send_to(&peer, request).await {
-                                    tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
-                                }
+                    let sender_node_id = envelope.statement.node_id.clone();
+                    // Always call request_quorum_set to associate the quorum set with the node_id.
+                    // If we already have the quorum set by hash, it will be associated with this
+                    // node_id. If not, we'll create a pending request.
+                    if self.herder.request_quorum_set(hash256, sender_node_id) {
+                        // New pending request - need to fetch from network
+                        let peer = msg.from_peer.clone();
+                        let overlay = self.overlay.lock().await;
+                        if let Some(ref overlay) = *overlay {
+                            let request = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+                            if let Err(e) = overlay.send_to(&peer, request).await {
+                                tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
                             }
                         }
                     }
@@ -3715,15 +3720,28 @@ impl App {
     /// Store a quorum set received from a peer.
     async fn handle_quorum_set(
         &self,
-        peer_id: &stellar_core_overlay::PeerId,
+        _peer_id: &stellar_core_overlay::PeerId,
         quorum_set: stellar_xdr::curr::ScpQuorumSet,
     ) {
-        let node_id = stellar_xdr::curr::NodeId(peer_id.0.clone());
         let hash = stellar_core_scp::hash_quorum_set(&quorum_set);
+
+        // Get the node_ids that were waiting for this quorum set
+        let node_ids = self.herder.get_pending_quorum_set_node_ids(&hash);
+
         if let Err(err) = self.db.store_scp_quorum_set(&hash, self.ledger_manager.current_ledger_seq(), &quorum_set) {
             tracing::warn!(error = %err, "Failed to store quorum set");
         }
-        self.herder.store_quorum_set(&node_id, quorum_set);
+
+        // Store for all node_ids that use this quorum set
+        if node_ids.is_empty() {
+            tracing::debug!(%hash, "Received quorum set with no pending requests");
+        } else {
+            for node_id in &node_ids {
+                tracing::debug!(%hash, node_id = ?node_id, "Storing quorum set for node");
+                self.herder.store_quorum_set(node_id, quorum_set.clone());
+            }
+        }
+
         self.herder.clear_quorum_set_request(&hash);
     }
 

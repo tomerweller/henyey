@@ -496,13 +496,19 @@ impl Herder {
     }
 
     /// Register a quorum set request if needed.
-    pub fn request_quorum_set(&self, hash: Hash256) -> bool {
-        self.scp_driver.request_quorum_set(hash)
+    /// The node_id is the envelope sender that uses this quorum set.
+    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId) -> bool {
+        self.scp_driver.request_quorum_set(hash, node_id)
     }
 
     /// Clear a quorum set request.
     pub fn clear_quorum_set_request(&self, hash: &Hash256) {
         self.scp_driver.clear_quorum_set_request(hash);
+    }
+
+    /// Get the node IDs that are waiting for a quorum set with the given hash.
+    pub fn get_pending_quorum_set_node_ids(&self, hash: &Hash256) -> Vec<NodeId> {
+        self.scp_driver.get_pending_quorum_set_node_ids(hash)
     }
 
     /// Check whether we've heard from quorum for a slot.

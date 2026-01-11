@@ -24,19 +24,20 @@
 //! - [`ExternalizedSlot`]: Records a slot that has reached consensus
 //! - [`PendingTxSet`]: Tracks transaction sets we need but haven't received yet
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use stellar_core_common::Hash256;
 use stellar_core_crypto::{PublicKey, SecretKey, Signature};
 use stellar_core_ledger::LedgerManager;
 use stellar_core_scp::{hash_quorum_set, SCPDriver, SlotIndex, ValidationLevel};
 use stellar_xdr::curr::{
-    LedgerUpgrade, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatement, StellarValue, Value, WriteXdr,
+    LedgerUpgrade, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatement, StellarValue, Value,
+    WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -132,6 +133,8 @@ pub struct PendingTxSet {
 pub struct PendingQuorumSet {
     /// Number of times we've requested this.
     pub request_count: u32,
+    /// Node IDs that use this quorum set (envelope senders).
+    pub node_ids: HashSet<NodeId>,
 }
 
 /// SCP driver that integrates consensus with the Herder.
@@ -289,22 +292,32 @@ impl ScpDriver {
 
     /// Register a pending quorum set request.
     /// Returns true if this is a new request, false if already pending or known.
-    pub fn request_quorum_set(&self, hash: Hash256) -> bool {
-        if self.quorum_sets_by_hash.contains_key(&hash.0) {
+    /// The node_id is the envelope sender that uses this quorum set.
+    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId) -> bool {
+        // If we already have this quorum set, store the association with this node_id
+        // Clone the quorum set before dropping the lock to avoid deadlock
+        let existing_qs = self.quorum_sets_by_hash.get(&hash.0).map(|qs| qs.clone());
+        if let Some(qs) = existing_qs {
+            trace!(%hash, node_id = ?node_id, "Associating existing quorum set with node");
+            self.store_quorum_set(&node_id, qs);
             return false;
         }
 
-        if self.pending_quorum_sets.contains_key(&hash) {
-            if let Some(mut entry) = self.pending_quorum_sets.get_mut(&hash) {
-                entry.request_count += 1;
-            }
+        // If already pending, add this node_id to the set
+        if let Some(mut entry) = self.pending_quorum_sets.get_mut(&hash) {
+            entry.request_count += 1;
+            entry.node_ids.insert(node_id);
             return false;
         }
 
+        // New request - create pending entry with this node_id
+        let mut node_ids = HashSet::new();
+        node_ids.insert(node_id);
         self.pending_quorum_sets.insert(
             hash,
             PendingQuorumSet {
                 request_count: 1,
+                node_ids,
             },
         );
         info!(%hash, "Registered pending quorum set request");
@@ -314,6 +327,14 @@ impl ScpDriver {
     /// Clear a quorum set request once it has been satisfied.
     pub fn clear_quorum_set_request(&self, hash: &Hash256) {
         self.pending_quorum_sets.remove(hash);
+    }
+
+    /// Get the node IDs that are waiting for a quorum set with the given hash.
+    pub fn get_pending_quorum_set_node_ids(&self, hash: &Hash256) -> Vec<NodeId> {
+        self.pending_quorum_sets
+            .get(hash)
+            .map(|entry| entry.node_ids.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Get all pending tx set hashes that need to be fetched.
@@ -869,12 +890,24 @@ mod cache_tests {
         };
         let driver = ScpDriver::new(config, Hash256::hash(b"network"));
 
+        // Create a test node_id for the request
+        let sender_node_id = stellar_xdr::curr::NodeId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                [2u8; 32],
+            )),
+        );
+
         let known_hash = hash_quorum_set(&quorum_set);
-        assert!(!driver.request_quorum_set(known_hash));
+        assert!(!driver.request_quorum_set(known_hash, sender_node_id.clone()));
 
         let unknown_hash = Hash256::from_bytes([42u8; 32]);
-        assert!(driver.request_quorum_set(unknown_hash));
-        assert!(!driver.request_quorum_set(unknown_hash));
+        assert!(driver.request_quorum_set(unknown_hash, sender_node_id.clone()));
+        assert!(!driver.request_quorum_set(unknown_hash, sender_node_id.clone()));
+
+        // Verify the node_id was tracked
+        let pending_ids = driver.get_pending_quorum_set_node_ids(&unknown_hash);
+        assert_eq!(pending_ids.len(), 1);
+        assert_eq!(pending_ids[0], sender_node_id);
     }
 }
 
