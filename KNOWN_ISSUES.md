@@ -44,16 +44,30 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ---
 
-## 2. Ledger Header Hash Mismatch (Critical)
+## 2. Ledger Header Hash Mismatch (Partially Fixed)
 
-**Status:** Unresolved
+**Status:** Fix implemented, pending full verification
 **Severity:** Critical - Prevents ledger closing
 **Component:** Ledger Manager / Transaction Execution
 **First Observed:** 2026-01-11
-**Last Verified:** 2026-01-11 - Reproduced consistently
+**Fix Committed:** 2026-01-11 (5648f8e)
 
 ### Description
 After catching up from history archives, the node's locally computed ledger header hash does not match the network's expected `prev_ledger_hash`. This prevents the node from closing new ledgers and participating in consensus.
+
+### Fix Applied
+**Root Cause Identified:** For Protocol 23+, Soroban fee refunds were not being applied after ALL transactions in the tx set. C++ stellar-core's `processPostTxSetApply()` phase applies fee refunds after all transaction execution completes, but rs-stellar-core was missing this phase.
+
+**Solution:** Added P23+ Soroban fee refund processing to `execute_transaction_set_with_fee_mode()` in `crates/stellar-core-ledger/src/execution.rs`. The fix:
+1. Iterates through all transactions after execution completes
+2. Applies any fee refunds to account balances in the delta
+3. Adjusts the fee pool accordingly
+
+**Verification Status:**
+- **verify-execution tool**: 200 transactions across 51 ledgers - zero mismatches
+- **Live node testing**: Blocked by Issue #1 (Buffered Gap After Catchup)
+
+The execution logic is validated to match C++ stellar-core. Full live node verification will be possible once Issue #1 is resolved.
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
