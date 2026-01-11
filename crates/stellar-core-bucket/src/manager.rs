@@ -219,6 +219,37 @@ impl BucketManager {
         Ok(bucket)
     }
 
+    /// Load a hot archive bucket by its hash.
+    ///
+    /// Hot archive buckets contain `HotArchiveBucketEntry` instead of `BucketEntry`.
+    /// This method loads and parses the bucket file with the correct entry type.
+    ///
+    /// Note: Hot archive buckets are not cached (they use a different entry type).
+    pub fn load_hot_archive_bucket(&self, hash: &Hash256) -> Result<crate::hot_archive::HotArchiveBucket> {
+        // Check if it's the empty bucket
+        if hash.is_zero() {
+            return Ok(crate::hot_archive::HotArchiveBucket::empty());
+        }
+
+        // Load from disk
+        let path = self.bucket_path(hash);
+        if !path.exists() {
+            return Err(BucketError::NotFound(hash.to_hex()));
+        }
+
+        let bucket = crate::hot_archive::HotArchiveBucket::load_from_file(&path)?;
+
+        // Verify hash matches
+        if bucket.hash() != *hash {
+            return Err(BucketError::HashMismatch {
+                expected: hash.to_hex(),
+                actual: bucket.hash().to_hex(),
+            });
+        }
+
+        Ok(bucket)
+    }
+
     /// Check if a bucket exists (in cache or on disk).
     pub fn bucket_exists(&self, hash: &Hash256) -> bool {
         if hash.is_zero() {

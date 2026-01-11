@@ -1582,7 +1582,7 @@ async fn cmd_replay_bucket_list(
     cdp_url: &str,
     cdp_date: &str,
 ) -> anyhow::Result<()> {
-    use stellar_core_bucket::{BucketList, BucketManager};
+    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList};
     use stellar_core_common::Hash256;
     use stellar_core_history::{HistoryArchive, checkpoint};
     use stellar_core_history::cdp::{CdpDataLake, extract_transaction_metas, extract_evicted_keys, extract_upgrade_metas};
@@ -1686,9 +1686,11 @@ async fn cmd_replay_bucket_list(
         bucket_manager.load_bucket(hash).map(|b| (*b).clone())
     })?;
 
-    let hot_archive_bucket_list: Option<BucketList> = hot_archive_hashes.as_ref().map(|hashes| {
-        BucketList::restore_from_hashes(hashes, |hash| {
-            bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+    // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
+    // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
+    let hot_archive_bucket_list: Option<HotArchiveBucketList> = hot_archive_hashes.as_ref().map(|hashes| {
+        HotArchiveBucketList::restore_from_hashes(hashes, |hash| {
+            bucket_manager.load_hot_archive_bucket(hash)
         })
     }).transpose()?;
 
@@ -1893,7 +1895,7 @@ async fn cmd_verify_execution(
     quiet: bool,
 ) -> anyhow::Result<()> {
     use std::sync::{Arc, RwLock};
-    use stellar_core_bucket::{BucketList, BucketManager};
+    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList};
     use stellar_core_common::{Hash256, NetworkId};
     use stellar_core_history::{HistoryArchive, checkpoint};
     use stellar_core_history::cdp::{CachedCdpDataLake, extract_ledger_header, extract_upgrade_metas};
@@ -2058,16 +2060,20 @@ async fn cmd_verify_execution(
     ));
 
     // Restore hot archive bucket list if present (protocol 23+)
-    let hot_archive_bucket_list: Option<Arc<RwLock<BucketList>>> = hot_archive_hashes.as_ref().map(|hashes| {
-        BucketList::restore_from_hashes(hashes, |hash| {
-            bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+    // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
+    // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
+    let hot_archive_bucket_list: Option<Arc<RwLock<HotArchiveBucketList>>> = hot_archive_hashes.as_ref().map(|hashes| {
+        HotArchiveBucketList::restore_from_hashes(hashes, |hash| {
+            bucket_manager.load_hot_archive_bucket(hash)
         })
     }).transpose()?.map(|bl| Arc::new(RwLock::new(bl)));
 
     if !quiet {
         println!("Initial live bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
+        println!("Live bucket list stats: {:?}", bucket_list.read().unwrap().stats());
         if let Some(ref hot) = hot_archive_bucket_list {
             println!("Initial hot archive hash: {}", hot.read().unwrap().hash().to_hex());
+            println!("Hot archive stats: {:?}", hot.read().unwrap().stats());
         }
         println!();
     }
@@ -2181,7 +2187,7 @@ async fn cmd_verify_execution(
 
             // Create snapshot handle with bucket list lookup (checks both live and hot archive)
             let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
-            let hot_archive_clone: Option<Arc<RwLock<BucketList>>> = hot_archive_bucket_list.clone();
+            let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> = hot_archive_bucket_list.clone();
             let lookup_fn: Arc<dyn Fn(&LedgerKey) -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> + Send + Sync> =
                 Arc::new(move |key: &LedgerKey| {
                     // First try the live bucket list
@@ -2191,11 +2197,12 @@ async fn cmd_verify_execution(
                         return Ok(Some(entry));
                     }
                     // Then try the hot archive bucket list (for archived/evicted entries)
+                    // HotArchiveBucketList::get returns Option<&LedgerEntry>, so we clone
                     if let Some(ref hot_archive) = hot_archive_clone {
                         if let Some(entry) = hot_archive.read().unwrap().get(key).map_err(|e| {
                             LedgerError::Internal(format!("Hot archive bucket lookup failed: {}", e))
                         })? {
-                            return Ok(Some(entry));
+                            return Ok(Some(entry.clone()));
                         }
                     }
                     Ok(None)

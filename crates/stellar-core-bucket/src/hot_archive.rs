@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use stellar_xdr::curr::{
     BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry,
-    LedgerEntry, LedgerKey, Limits, WriteXdr,
+    LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr,
 };
 
 use stellar_core_common::Hash256;
@@ -153,6 +153,110 @@ impl HotArchiveBucket {
         let mut hash_bytes = [0u8; 32];
         hash_bytes.copy_from_slice(&result);
         Ok(Hash256::from_bytes(hash_bytes))
+    }
+
+    /// Load a hot archive bucket from a gzipped XDR file.
+    ///
+    /// This parses a bucket file containing `HotArchiveBucketEntry` values.
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        use std::io::{BufReader, Read};
+        use flate2::read::GzDecoder;
+
+        let path = path.as_ref();
+        let file = std::fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut decoder = GzDecoder::new(reader);
+
+        // Read and decompress
+        let mut uncompressed = Vec::new();
+        decoder.read_to_end(&mut uncompressed)?;
+
+        Self::from_xdr_bytes(&uncompressed)
+    }
+
+    /// Create a hot archive bucket from uncompressed XDR bytes.
+    ///
+    /// Parses bucket files using XDR Record Marking Standard (RFC 5531).
+    pub fn from_xdr_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            return Ok(Self::empty());
+        }
+
+        let mut entries = BTreeMap::new();
+        let mut offset = 0;
+
+        // Check if the file uses XDR record marking (high bit set in first 4 bytes)
+        let uses_record_marks = if bytes.len() >= 4 {
+            bytes[0] & 0x80 != 0
+        } else {
+            false
+        };
+
+        if uses_record_marks {
+            // Parse using XDR Record Marking Standard
+            while offset + 4 <= bytes.len() {
+                // Read 4-byte record mark (big-endian)
+                let record_mark = u32::from_be_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]);
+                offset += 4;
+
+                // High bit is "last fragment" flag, remaining 31 bits are length
+                let record_len = (record_mark & 0x7FFFFFFF) as usize;
+
+                if offset + record_len > bytes.len() {
+                    return Err(BucketError::Serialization(format!(
+                        "Record length {} exceeds remaining data {} at offset {}",
+                        record_len,
+                        bytes.len() - offset,
+                        offset - 4
+                    )));
+                }
+
+                // Parse the XDR record as HotArchiveBucketEntry
+                let record_data = &bytes[offset..offset + record_len];
+                match HotArchiveBucketEntry::from_xdr(record_data, Limits::none()) {
+                    Ok(entry) => {
+                        let key = hot_archive_entry_to_key(&entry)?;
+                        entries.insert(key, entry);
+                    }
+                    Err(e) => {
+                        return Err(BucketError::Serialization(format!(
+                            "Failed to parse hot archive bucket entry: {}",
+                            e
+                        )));
+                    }
+                }
+
+                offset += record_len;
+            }
+        } else {
+            // Parse as raw XDR stream (legacy format)
+            use stellar_xdr::curr::{Limited, ReadXdr};
+            let cursor = std::io::Cursor::new(bytes);
+            let mut limited = Limited::new(cursor, Limits::none());
+
+            while limited.inner.position() < bytes.len() as u64 {
+                match HotArchiveBucketEntry::read_xdr(&mut limited) {
+                    Ok(entry) => {
+                        let key = hot_archive_entry_to_key(&entry)?;
+                        entries.insert(key, entry);
+                    }
+                    Err(_) => {
+                        // End of stream or error
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Compute hash from raw bytes (including record marks)
+        let hash = Hash256::hash(bytes);
+
+        Ok(Self { entries, hash })
     }
 }
 
@@ -468,6 +572,53 @@ impl HotArchiveBucketList {
             total_entries,
             total_buckets,
         }
+    }
+
+    /// Restore a hot archive bucket list from bucket hashes.
+    ///
+    /// This is used to restore state from a history archive checkpoint.
+    ///
+    /// # Arguments
+    ///
+    /// * `hashes` - The bucket hashes (curr and snap for each level, 22 total)
+    /// * `load_bucket` - Function to load a HotArchiveBucket by hash
+    pub fn restore_from_hashes<F>(hashes: &[Hash256], mut load_bucket: F) -> Result<Self>
+    where
+        F: FnMut(&Hash256) -> Result<HotArchiveBucket>,
+    {
+        if hashes.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS * 2 {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} hot archive bucket hashes, got {}",
+                HOT_ARCHIVE_BUCKET_LIST_LEVELS * 2,
+                hashes.len()
+            )));
+        }
+
+        let mut levels = Vec::with_capacity(HOT_ARCHIVE_BUCKET_LIST_LEVELS);
+
+        for (i, chunk) in hashes.chunks(2).enumerate() {
+            let curr_hash = &chunk[0];
+            let snap_hash = &chunk[1];
+
+            let curr = if curr_hash.is_zero() {
+                HotArchiveBucket::empty()
+            } else {
+                load_bucket(curr_hash)?
+            };
+
+            let snap = if snap_hash.is_zero() {
+                HotArchiveBucket::empty()
+            } else {
+                load_bucket(snap_hash)?
+            };
+
+            let mut level = HotArchiveBucketLevel::new(i);
+            level.curr = curr;
+            level.snap = snap;
+            levels.push(level);
+        }
+
+        Ok(Self { levels, ledger_seq: 0 })
     }
 }
 
