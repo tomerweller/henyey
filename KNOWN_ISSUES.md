@@ -43,36 +43,109 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ---
 
-## 2. Auth Sequence Errors with Peers
+## 2. Ledger Header Hash Mismatch (Critical)
 
 **Status:** Unresolved
-**Severity:** Medium - Causes peer disconnections
+**Severity:** Critical - Prevents ledger closing
+**Component:** Ledger Manager / Transaction Execution
+**First Observed:** 2026-01-11
+
+### Description
+After catching up from history archives, the node's locally computed ledger header hash does not match the network's expected `prev_ledger_hash`. This prevents the node from closing new ledgers and participating in consensus.
+
+### Symptoms
+- Node catches up successfully to a checkpoint ledger
+- When attempting to close the next ledger, hash mismatch error occurs
+- Repeated ERROR logs: "Hash mismatch - our computed header hash differs from network's prev_ledger_hash"
+- Node clears buffered ledgers and may trigger re-catchup
+- Node state shows "Synced" but cannot advance ledgers
+
+### Example Log Pattern
+```
+ERROR Hash mismatch - our computed header hash differs from network's prev_ledger_hash
+      current_seq=432512 close_seq=432513
+      our_hash=33cc2081dafcb857bf397fe67aa967bada5f14d3f1d60e2d3d33a6dce322cb47
+      network_prev_hash=90f6e2ce99bf44f1cb9b966ab9ecf3be5660cc24c4d274312781ad64d9b2c155
+      header_version=25
+      header_bucket_list_hash=2854f44500d9400832aee9e63ede64401a7899c1d90490702063b47a0f686610
+      header_tx_result_hash=74ae054c8f35c9ad2f7b960401ea316b3599b9a0e8dbaf2d07270cf464abf6de
+      header_total_coins=1000000000000000000
+      header_fee_pool=67689576225
+      header_close_time=1768156899
+      header_tx_set_hash=9a32a70d3195e3ce797952e0e912cf4583be56495550af3485343a81630a5a3b
+      header_upgrades_count=0
+
+ERROR Failed to apply buffered ledger ledger_seq=432513
+      error=internal error: Failed to begin close: ledger hash mismatch
+
+WARN  Hash mismatch detected - cleared all buffered ledgers, will trigger catchup
+```
+
+### Root Cause Analysis
+The ledger header hash is computed from multiple components:
+1. `ledgerVersion` - Protocol version
+2. `previousLedgerHash` - Hash of prior ledger header
+3. `scpValue` - SCP consensus value (close time, tx set hash, upgrades)
+4. `txSetResultHash` - Merkle root of transaction results
+5. `bucketListHash` - Hash of the bucket list state
+6. `ledgerSeq` - Ledger sequence number
+7. `totalCoins` - Total lumens in existence
+8. `feePool` - Accumulated fees
+9. `inflationSeq` - Inflation sequence (deprecated)
+10. `idPool` - ID pool counter
+11. `baseFee` / `baseReserve` - Network parameters
+12. `maxTxSetSize` - Max transactions per ledger
+13. `skipList` - Recent header hashes for verification
+
+Potential sources of divergence:
+- **Bucket list hash mismatch**: State from catchup may differ from network state due to:
+  - Incorrect bucket application order
+  - Missing or incorrect handling of DEADENTRY markers
+  - Hot archive bucket state divergence
+- **Transaction result hash mismatch**: Transaction execution produces different results:
+  - Fee calculation differences
+  - Operation result encoding differences
+  - State changes not matching C++ stellar-core
+- **Fee pool divergence**: Accumulated fees computed differently
+- **Protocol upgrade handling**: Upgrade application timing/logic differs
+
+### Investigation Steps
+1. Compare bucket list hash at catchup checkpoint vs network expectation
+2. Verify transaction execution parity with C++ stellar-core for specific ledger
+3. Check fee calculation and accumulation logic
+4. Verify ledger header XDR serialization matches upstream format
+
+### Related Files
+- `crates/stellar-core-ledger/src/manager.rs` - Ledger header computation
+- `crates/stellar-core-ledger/src/header.rs` - Header hash calculation
+- `crates/stellar-core-bucket/` - Bucket list management
+- `crates/stellar-core-tx/` - Transaction execution
+
+---
+
+## 3. Auth Sequence Errors with Peers (Resolved)
+
+**Status:** Resolved
+**Severity:** Medium - Caused peer disconnections
 **Component:** Overlay
 
 ### Description
-Peers disconnect with "unexpected auth sequence" errors shortly after authentication.
+Peers disconnected with "unexpected auth sequence" errors shortly after authentication.
 
-### Symptoms
+### Resolution
+Fixed in auth.rs codec improvements. The issue was related to MAC computation and sequence number handling in the overlay authentication protocol.
+
+### Previous Symptoms
 - Peer authenticates successfully
 - Within seconds, peer sends ERROR with "unexpected auth sequence"
 - Peer disconnects
 
-### Example Log Pattern
-```
-INFO  Authenticated with peer GCIU45Y5BYUV5AWKFOWV5V7AN4CW5TADON7S6SGXJ43TZIBKRP45DQVW
-INFO  Accepted peer: GCIU45Y5BYUV5AWKFOWV5V7AN4CW5TADON7S6SGXJ43TZIBKRP45DQVW
-WARN  Peer GCIU45Y5... sent ERROR: code=Auth, msg=unexpected auth sequence
-INFO  Peer GCIU45Y5... disconnected
-```
-
-### Potential Causes
-- Sequence number mismatch in authenticated messages
-- MAC verification failure
-- Message ordering issue
+### Verification
+As of 2026-01-11, testnet connections show stable peer connectivity with 3 peers and no auth sequence errors. SCP envelopes are being processed as valid from all connected validators.
 
 ---
 
-## 3. Out-of-Sync Peer Disconnections
+## 4. Out-of-Sync Peer Disconnections
 
 **Status:** Expected Behavior (consequence of Issue #1)
 **Severity:** Low
@@ -90,7 +163,7 @@ This is expected C++ stellar-core behavior. Peers disconnect nodes that are sign
 
 ---
 
-## 4. heard_from_quorum=false Persistent Warning
+## 5. heard_from_quorum=false Persistent Warning
 
 **Status:** Unresolved
 **Severity:** Medium - Indicates consensus issues
