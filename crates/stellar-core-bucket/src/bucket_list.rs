@@ -154,17 +154,15 @@ impl BucketLevel {
 
     /// Snap the current bucket to become the new snapshot.
     ///
-    /// This implements the bucket list spill behavior:
-    /// - Returns the OLD snap (which flows to the next level)
-    /// - Sets snap = old curr (curr becomes the new snap)
+    /// This implements the bucket list spill behavior (matches C++ BucketLevel::snap):
+    /// - Sets snap = curr (old curr becomes the new snap)
     /// - Clears curr (ready for new entries)
+    /// - Returns the NEW snap (old curr), which flows to the next level
     fn snap(&mut self) -> Bucket {
-        // Take old snap - this is what flows to the next level
-        let old_snap = std::mem::take(&mut self.snap);
         // Move curr to snap (curr becomes empty via replace)
         self.snap = std::mem::replace(&mut self.curr, Bucket::empty());
-        // Return old snap for merging into next level
-        old_snap
+        // Return the new snap (old curr) for merging into next level
+        self.snap.clone()
     }
 
     /// Prepare the next bucket for this level with explicit INIT normalization control.
@@ -577,8 +575,8 @@ impl BucketList {
         // Step 1: Process spills from highest level down to level 1
         // This matches C++ stellar-core's BucketListBase::addBatchInternal
         //
-        // The key insight is that snap() moves curr→snap and returns the OLD snap.
-        // This OLD snap is what flows to the next level.
+        // The key insight is that snap() moves curr→snap and returns the NEW snap
+        // (which is the old curr). This is the bucket that flows to the next level.
         //
         // By processing from highest to lowest, we ensure each level's curr is
         // available to be snapped before any modifications occur.
@@ -588,8 +586,8 @@ impl BucketList {
 
         for i in (1..BUCKET_LIST_LEVELS).rev() {
             if Self::level_should_spill(ledger_seq, i - 1) {
-                // Snap level i-1: moves curr→snap, returns OLD snap
-                // This OLD snap is what flows to level i
+                // Snap level i-1: moves curr→snap, returns the NEW snap (old curr)
+                // This is the bucket that flows to level i
                 let spilling_snap = self.levels[i - 1].snap();
 
                 tracing::debug!(

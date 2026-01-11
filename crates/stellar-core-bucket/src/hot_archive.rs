@@ -312,11 +312,10 @@ impl HotArchiveBucketLevel {
         }
     }
 
-    /// Snap curr to snap and return the old snap.
+    /// Snap curr to snap and return the new snap (matches C++ BucketLevel::snap).
     fn snap(&mut self) -> HotArchiveBucket {
-        let old_snap = std::mem::take(&mut self.snap);
         self.snap = std::mem::replace(&mut self.curr, HotArchiveBucket::empty());
-        old_snap
+        self.snap.clone()
     }
 
     /// Prepare a merge with an incoming bucket.
