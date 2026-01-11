@@ -44,16 +44,16 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ---
 
-## 2. Ledger Header Hash Mismatch (Resolved)
+## 2. Ledger Header Hash Mismatch (Critical - Unresolved)
 
-**Status:** Resolved
-**Severity:** Critical - Prevented ledger closing
+**Status:** Unresolved - snap() fix was partial, additional bugs remain
+**Severity:** Critical - Prevents ledger closing
 **Component:** Ledger Manager / Bucket List / Header Computation
 **First Observed:** 2026-01-11
-**Resolved:** 2026-01-11 - Fixed snap() bug in bucket list
+**Last Verified:** 2026-01-11 - Still occurring after snap() fix
 
 ### Description
-After catching up from history archives, the node's locally computed ledger header hash did not match the network's expected `prev_ledger_hash`. This prevented the node from closing new ledgers and participating in consensus.
+After catching up from history archives, the node's locally computed ledger header hash does not match the network's expected `prev_ledger_hash`. This prevents the node from closing new ledgers and participating in consensus.
 
 ### Latest Test Results (2026-01-11)
 ```
@@ -91,20 +91,25 @@ This caused the wrong bucket to be merged into the next level during spills, lea
 
 ### Verification Status
 
-**VERIFIED (2026-01-11):** Live testnet node ran successfully after snap() fix:
-- Node caught up to ledger 435455
-- Bucket list restored with correct hash: `aaaa8cd4368122a9758a26e6e56c495bfd2ed32c05148e922eb990cf312e98f9`
-- Ledger manager initialized correctly
-- State transitioned to **Synced**
-- **Zero hash mismatch errors** in logs
+**PARTIALLY FIXED (2026-01-11):** The snap() fix was necessary but not sufficient:
+- Node catches up successfully to checkpoint
+- Node can close 1 ledger after catchup (e.g., 435584)
+- Hash mismatch occurs when trying to close subsequent ledgers
+- verify-execution tool confirms bucket_list_hash divergence at all levels
 
-The node is now blocked by Issue #1 (buffered gap after catchup), not the hash mismatch issue.
+**verify-execution output (ledger 380000):**
+```
+Ledger 380000: HEADER MISMATCH
+  bucket_list_hash: ours=0757c234... expected=0d0d8ad0...
+  Level hashes show divergence at all 11 levels
+```
 
-Note: The verify-execution tool still shows mismatches because it doesn't update the hot archive bucket list. For Protocol 23+, `bucket_list_hash = SHA256(live_hash || hot_archive_hash)`. The tool limitation causes false-positive mismatches in testing, but the live node verification confirms the fix is correct.
+The snap() bug was one issue, but there's additional bucket list divergence that needs investigation.
 
-### Symptoms (Historical - Before Fix)
-- Node caught up successfully to a checkpoint ledger
-- When attempting to close the next ledger, hash mismatch error occurred
+### Symptoms
+- Node catches up successfully to a checkpoint ledger
+- Node may close 1 ledger successfully after catchup
+- Hash mismatch error occurs when attempting to close subsequent ledgers
 - Repeated ERROR logs: "Hash mismatch - our computed header hash differs from network's prev_ledger_hash"
 - Node clears buffered ledgers and may trigger re-catchup
 - Node state shows "Synced" but cannot advance ledgers
@@ -261,13 +266,13 @@ INFO  Heartbeat tracking_slot=433383 ledger=433343 latest_ext=433382 peers=3 hea
 
 ## Recently Fixed Issues
 
-### Ledger Header Hash Mismatch / Bucket List snap() Bug (Fixed)
+### Bucket List snap() Bug (Partial Fix)
 
 **Fix:** Fixed `snap()` in `bucket_list.rs` and `hot_archive.rs` to return new snap instead of old snap
 
-The Rust `BucketLevel::snap()` method was returning the wrong bucket. C++ returns the NEW snap (old curr) but we were returning the OLD snap. This caused wrong bucket to be merged during level spills, leading to bucket_list_hash divergence.
+The Rust `BucketLevel::snap()` method was returning the wrong bucket. C++ returns the NEW snap (old curr) but we were returning the OLD snap. This caused wrong bucket to be merged during level spills.
 
-**Verified:** Live testnet node caught up and synced without hash mismatch errors. See Issue #2 above for full details.
+**Status:** This fix was necessary but not sufficient. Issue #2 (hash mismatch) still occurs - there are additional bugs in bucket list handling that need investigation.
 
 ---
 
