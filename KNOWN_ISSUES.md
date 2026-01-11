@@ -7,6 +7,7 @@ This document tracks known issues in rs-stellar-core that affect network synchro
 **Status:** Unresolved
 **Severity:** Critical - Prevents real-time sync
 **Component:** Catchup / Herder
+**Last Verified:** 2026-01-11
 
 ### Description
 After catchup completes to a checkpoint ledger, the node cannot close subsequent ledgers because the required transaction sets (tx_sets) are no longer available from peers.
@@ -49,6 +50,7 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 **Severity:** Critical - Prevents ledger closing
 **Component:** Ledger Manager / Transaction Execution
 **First Observed:** 2026-01-11
+**Last Verified:** 2026-01-11 - Reproduced consistently
 
 ### Description
 After catching up from history archives, the node's locally computed ledger header hash does not match the network's expected `prev_ledger_hash`. This prevents the node from closing new ledgers and participating in consensus.
@@ -163,10 +165,11 @@ Peers disconnect the node with "random disconnect due to out of sync" when the n
 This is expected C++ stellar-core behavior. Peers disconnect nodes that are significantly behind to avoid wasting resources. This is a consequence of Issue #1, not a separate bug.
 
 ### Recent Observations (2026-01-11)
-In a 10+ minute testnet run, this issue was **not observed**:
+In multiple testnet runs totaling 15+ minutes, this issue was **not observed**:
 - Node maintained stable connections to all 3 SDF testnet validators
 - No "out of sync" disconnection errors logged
-- Peers remained connected despite node being ~60 ledgers behind due to hash mismatch issue
+- Peers remained connected despite node being 20-60 ledgers behind due to hash mismatch issue
+- Node caught up from checkpoint 433407 to 433472 without peer disconnections
 
 The issue may only manifest when the node falls significantly further behind (100+ ledgers).
 
