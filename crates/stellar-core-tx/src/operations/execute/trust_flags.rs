@@ -111,6 +111,12 @@ pub fn execute_allow_trust(
 /// Execute a SetTrustLineFlags operation.
 ///
 /// This operation sets or clears specific flags on a trustline.
+/// Auth revocable flag on accounts
+const AUTH_REVOCABLE_FLAG: u32 = 0x2;
+
+/// Trustline auth flags mask
+const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
+
 pub fn execute_set_trust_line_flags(
     op: &SetTrustLineFlagsOp,
     source: &AccountId,
@@ -118,9 +124,12 @@ pub fn execute_set_trust_line_flags(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the issuer)
-    if state.get_account(source).is_none() {
-        return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Malformed));
-    }
+    let source_account = match state.get_account(source) {
+        Some(a) => a.clone(),
+        None => {
+            return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Malformed));
+        }
+    };
 
     // The source must be the issuer of the asset
     let issuer = match &op.asset {
@@ -142,6 +151,22 @@ pub fn execute_set_trust_line_flags(
             return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::NoTrustLine));
         }
     };
+
+    // Check AUTH_REVOCABLE_FLAG for revocation operations.
+    // If AUTH_REVOCABLE is not set on the issuer account, the following transitions
+    // are not allowed:
+    // 1. AUTHORIZED_FLAG -> AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG
+    // 2. AUTHORIZED_FLAG -> 0
+    // 3. AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG -> 0
+    // These are all cases where we're clearing auth flags without setting AUTHORIZED.
+    let auth_revocable = source_account.flags & AUTH_REVOCABLE_FLAG != 0;
+    if !auth_revocable {
+        let clearing_any_auth = (op.clear_flags & TRUSTLINE_AUTH_FLAGS) != 0;
+        let setting_authorized = (op.set_flags & AUTHORIZED_FLAG) != 0;
+        if clearing_any_auth && !setting_authorized {
+            return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::CantRevoke));
+        }
+    }
 
     // Cannot set both AUTHORIZED and AUTHORIZED_TO_MAINTAIN_LIABILITIES
     if (op.set_flags & AUTHORIZED_FLAG != 0)

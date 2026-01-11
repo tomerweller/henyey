@@ -137,12 +137,10 @@ fn execute_credit_payment(
         return Ok(make_result(PaymentResultCode::NoDestination));
     }
 
-    let issuer_account = match state.get_account(issuer) {
-        Some(account) => account,
-        None => return Ok(make_result(PaymentResultCode::NoIssuer)),
-    };
-
-    let auth_required = issuer_account.flags & AUTH_REQUIRED_FLAG != 0;
+    // Check issuer exists
+    if state.get_account(issuer).is_none() {
+        return Ok(make_result(PaymentResultCode::NoIssuer));
+    }
 
     // Check destination trustline first (C++ updateDestBalance is called before updateSourceBalance)
     if issuer != dest {
@@ -151,7 +149,8 @@ fn execute_credit_payment(
             None => return Ok(make_result(PaymentResultCode::NoTrust)),
         };
 
-        if auth_required && !is_trustline_authorized(dest_trustline.flags) {
+        // Check destination is authorized - this is unconditional (not dependent on auth_required)
+        if !is_trustline_authorized(dest_trustline.flags) {
             return Ok(make_result(PaymentResultCode::NotAuthorized));
         }
 
@@ -170,7 +169,10 @@ fn execute_credit_payment(
             None => return Ok(make_result(PaymentResultCode::SrcNoTrust)),
         };
 
-        if auth_required && !is_trustline_authorized(source_trustline.flags) {
+        // Check source is authorized - this is unconditional (not dependent on auth_required)
+        // The AUTH_REQUIRED flag on issuer only affects whether NEW trustlines start authorized,
+        // but once a trustline exists, its AUTHORIZED flag controls whether it can send.
+        if !is_trustline_authorized(source_trustline.flags) {
             return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
         }
 

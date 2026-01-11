@@ -374,7 +374,10 @@ fn update_source_balance(
         code: PathPaymentStrictReceiveResultCode::SrcNoTrust,
         no_issuer_asset: None,
     })?;
-    if issuer_requires_auth(asset, state) && !is_trustline_authorized(source_trustline.flags) {
+    // Check source is authorized - this is unconditional (not dependent on issuer's auth_required)
+    // The AUTH_REQUIRED flag on issuer only affects whether NEW trustlines start authorized,
+    // but once a trustline exists, its AUTHORIZED flag controls whether it can send.
+    if !is_trustline_authorized(source_trustline.flags) {
         return Err(TransferError {
             code: PathPaymentStrictReceiveResultCode::SrcNotAuthorized,
             no_issuer_asset: None,
@@ -438,7 +441,8 @@ fn update_dest_balance(
         code: PathPaymentStrictReceiveResultCode::NoTrust,
         no_issuer_asset: None,
     })?;
-    if issuer_requires_auth(asset, state) && !is_trustline_authorized(dest_trustline.flags) {
+    // Check destination is authorized - this is unconditional (not dependent on issuer's auth_required)
+    if !is_trustline_authorized(dest_trustline.flags) {
         return Err(TransferError {
             code: PathPaymentStrictReceiveResultCode::NotAuthorized,
             no_issuer_asset: None,
@@ -481,15 +485,6 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
     }
 }
 
-fn issuer_requires_auth(asset: &Asset, state: &LedgerStateManager) -> bool {
-    let Some(issuer) = issuer_for_asset(asset) else {
-        return false;
-    };
-    state
-        .get_account(issuer)
-        .map(|account| account.flags & AUTH_REQUIRED_FLAG != 0)
-        .unwrap_or(false)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConvertResult {
