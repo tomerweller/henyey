@@ -2565,11 +2565,67 @@ async fn cmd_verify_execution(
 
             // Apply changes to bucket list for next ledger using CDP metadata
             // This ensures subsequent ledgers have correct state for lookups
-            // Note: CDP metadata already includes Soroban refunds in tx_changes_after
+            //
+            // IMPORTANT: Changes must be added in the correct order:
+            // 1. fee_meta (fee phase - before tx execution)
+            // 2. tx_meta (transaction phase - where sequence increments)
+            // 3. post_fee_meta (post-tx phase - refunds)
+            //
+            // Since deduplication keeps the LAST entry for each key, we need
+            // fee_meta FIRST, then tx_meta, then post_fee_meta.
             {
-                // Extract metas from tx_processing
+                let mut init_entries: Vec<LedgerEntry> = Vec::new();
+                let mut live_entries: Vec<LedgerEntry> = Vec::new();
+                let mut dead_entries: Vec<LedgerKey> = Vec::new();
+
+                // 1. Fee phase changes (before tx execution)
+                for tx_info in &tx_processing {
+                    for change in tx_info.fee_meta.iter() {
+                        match change {
+                            stellar_xdr::curr::LedgerEntryChange::Created(entry) => {
+                                init_entries.push(entry.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::Updated(entry) => {
+                                live_entries.push(entry.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
+                                dead_entries.push(key.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::Restored(entry) => {
+                                live_entries.push(entry.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::State(_) => {}
+                        }
+                    }
+                }
+
+                // 2. Transaction phase changes (from extract_ledger_changes)
                 let tx_metas: Vec<_> = tx_processing.iter().map(|tp| tp.meta.clone()).collect();
-                let (init_entries, live_entries, dead_entries) = extract_ledger_changes(&tx_metas)?;
+                let (tx_init, tx_live, tx_dead) = extract_ledger_changes(&tx_metas)?;
+                init_entries.extend(tx_init);
+                live_entries.extend(tx_live);
+                dead_entries.extend(tx_dead);
+
+                // 3. Post-tx fee processing (refunds)
+                for tx_info in &tx_processing {
+                    for change in tx_info.post_fee_meta.iter() {
+                        match change {
+                            stellar_xdr::curr::LedgerEntryChange::Created(entry) => {
+                                init_entries.push(entry.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::Updated(entry) => {
+                                live_entries.push(entry.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
+                                dead_entries.push(key.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::Restored(entry) => {
+                                live_entries.push(entry.clone());
+                            }
+                            stellar_xdr::curr::LedgerEntryChange::State(_) => {}
+                        }
+                    }
+                }
 
                 // Also process upgrade changes
                 let upgrade_metas = extract_upgrade_metas(&lcm);
