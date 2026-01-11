@@ -2101,12 +2101,29 @@ async fn cmd_verify_execution(
     // For the first ledger we process (init_checkpoint + 1), we need the id_pool
     // from init_checkpoint's header. Load it from the archive now.
     let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
-    let init_id_pool = init_headers
+    let init_header_entry = init_headers
         .iter()
-        .find(|h| h.header.ledger_seq == init_checkpoint)
+        .find(|h| h.header.ledger_seq == init_checkpoint);
+    let init_id_pool = init_header_entry
         .map(|h| h.header.id_pool)
         .unwrap_or(0);
     let mut prev_id_pool: Option<u64> = Some(init_id_pool);
+
+    // Track header fields for verification
+    let mut tracked_fee_pool: i64 = init_header_entry
+        .map(|h| h.header.fee_pool)
+        .unwrap_or(0);
+    let mut tracked_total_coins: i64 = init_header_entry
+        .map(|h| h.header.total_coins)
+        .unwrap_or(0);
+    let mut prev_header_hash: Hash256 = init_header_entry
+        .map(|h| Hash256::from(h.hash.0))
+        .unwrap_or(Hash256::ZERO);
+    let mut prev_header: Option<stellar_xdr::curr::LedgerHeader> = init_header_entry
+        .map(|h| h.header.clone());
+
+    // Track header verification mismatches
+    let mut header_mismatches: u32 = 0;
 
     let mut current_cp = process_from_cp;
     while current_cp <= end_checkpoint {
@@ -2658,6 +2675,127 @@ async fn cmd_verify_execution(
                 )?;
             }
 
+            // Header verification: Compare our computed header fields against CDP
+            if in_test_range {
+                // 1. Compute bucket list hash
+                let our_bucket_list_hash = {
+                    let bl = bucket_list.read().unwrap();
+                    let live_hash = bl.hash();
+
+                    // For Protocol 23+, combine live and hot archive hashes
+                    if cdp_header.ledger_version >= 23 {
+                        if let Some(ref hot_archive) = hot_archive_bucket_list {
+                            use sha2::{Digest, Sha256};
+                            let hot_hash = hot_archive.read().unwrap().hash();
+                            let mut hasher = Sha256::new();
+                            hasher.update(live_hash.as_bytes());
+                            hasher.update(hot_hash.as_bytes());
+                            let result = hasher.finalize();
+                            let mut bytes = [0u8; 32];
+                            bytes.copy_from_slice(&result);
+                            Hash256::from_bytes(bytes)
+                        } else {
+                            live_hash
+                        }
+                    } else {
+                        live_hash
+                    }
+                };
+                let expected_bucket_list_hash = Hash256::from(cdp_header.bucket_list_hash.0);
+                let bucket_list_matches = our_bucket_list_hash == expected_bucket_list_hash;
+
+                // 2. Compute fee pool: previous fee_pool + fees charged this ledger
+                let fees_this_ledger: i64 = tx_processing.iter()
+                    .map(|tp| tp.result.result.fee_charged)
+                    .sum();
+                let our_fee_pool = tracked_fee_pool + fees_this_ledger;
+                let expected_fee_pool = cdp_header.fee_pool;
+                let fee_pool_matches = our_fee_pool == expected_fee_pool;
+
+                // 3. Compute tx_set_result_hash from results
+                let result_set = stellar_xdr::curr::TransactionResultSet {
+                    results: tx_processing.iter()
+                        .map(|tp| tp.result.clone())
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap_or_default(),
+                };
+                let our_tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
+                let expected_tx_result_hash = Hash256::from(cdp_header.tx_set_result_hash.0);
+                let tx_result_hash_matches = our_tx_result_hash == expected_tx_result_hash;
+
+                // 4. Compute full header hash if we have the previous header
+                let mut header_hash_matches = true;
+                let mut our_header_hash = Hash256::ZERO;
+                let expected_header_hash = Hash256::from(header_entry.hash.0);
+
+                if let Some(ref prev_hdr) = prev_header {
+                    use stellar_core_ledger::{create_next_header, compute_header_hash};
+
+                    // Create the header as the live node would
+                    let mut computed_header = create_next_header(
+                        prev_hdr,
+                        prev_header_hash,
+                        cdp_header.scp_value.close_time.0,
+                        Hash256::from(cdp_header.scp_value.tx_set_hash.0),
+                        our_bucket_list_hash,
+                        our_tx_result_hash,
+                        tracked_total_coins, // Total coins typically stays constant
+                        our_fee_pool,
+                        prev_hdr.inflation_seq,
+                    );
+
+                    // Apply upgrades to match CDP header fields
+                    computed_header.ledger_version = cdp_header.ledger_version;
+                    computed_header.base_fee = cdp_header.base_fee;
+                    computed_header.base_reserve = cdp_header.base_reserve;
+                    computed_header.max_tx_set_size = cdp_header.max_tx_set_size;
+                    computed_header.id_pool = cdp_header.id_pool;
+                    computed_header.scp_value.upgrades = cdp_header.scp_value.upgrades.clone();
+
+                    if let Ok(hash) = compute_header_hash(&computed_header) {
+                        our_header_hash = hash;
+                        header_hash_matches = our_header_hash == expected_header_hash;
+                    }
+                }
+
+                // Report mismatches
+                let all_header_fields_match = bucket_list_matches && fee_pool_matches && tx_result_hash_matches && header_hash_matches;
+                if !all_header_fields_match {
+                    header_mismatches += 1;
+                    println!("  Ledger {}: HEADER MISMATCH", seq);
+                    if !bucket_list_matches {
+                        println!("    bucket_list_hash: ours={} expected={}",
+                            our_bucket_list_hash.to_hex(), expected_bucket_list_hash.to_hex());
+                    }
+                    if !fee_pool_matches {
+                        println!("    fee_pool: ours={} expected={} (prev={} + fees={})",
+                            our_fee_pool, expected_fee_pool, tracked_fee_pool, fees_this_ledger);
+                    }
+                    if !tx_result_hash_matches {
+                        println!("    tx_result_hash: ours={} expected={}",
+                            our_tx_result_hash.to_hex(), expected_tx_result_hash.to_hex());
+                    }
+                    if !header_hash_matches {
+                        println!("    header_hash: ours={} expected={}",
+                            our_header_hash.to_hex(), expected_header_hash.to_hex());
+                    }
+                    if stop_on_error {
+                        anyhow::bail!("Header mismatch at ledger {}", seq);
+                    }
+                }
+            }
+
+            // ALWAYS update tracked values for next ledger (even outside test range)
+            // This ensures header tracking stays in sync with bucket list state
+            {
+                let expected_header_hash = Hash256::from(header_entry.hash.0);
+                tracked_fee_pool = cdp_header.fee_pool; // Use expected to avoid accumulating errors
+                tracked_total_coins = cdp_header.total_coins;
+                prev_header_hash = expected_header_hash; // Use expected hash for next ledger
+                prev_header = Some(cdp_header.clone());
+            }
+
             if in_test_range {
                 if ledger_matched || tx_processing.is_empty() {
                     if !quiet {
@@ -2688,6 +2826,8 @@ async fn cmd_verify_execution(
     println!("  Phase 1 fee calculations mismatched: {}", phase1_fee_mismatches);
     println!("  Phase 2 execution matched: {}", transactions_matched);
     println!("  Phase 2 execution mismatched: {}", transactions_mismatched);
+    println!("  Header verifications: {} passed, {} failed",
+        ledgers_verified.saturating_sub(header_mismatches), header_mismatches);
 
     if phase1_fee_mismatches > 0 {
         println!();
@@ -2697,6 +2837,12 @@ async fn cmd_verify_execution(
     if transactions_mismatched > 0 {
         println!();
         println!("WARNING: {} transactions had Phase 2 execution differences!", transactions_mismatched);
+    }
+
+    if header_mismatches > 0 {
+        println!();
+        println!("WARNING: {} ledgers had header hash mismatches!", header_mismatches);
+        println!("This indicates divergence in bucket list state, fee pool calculation, or header computation.");
     }
 
     Ok(())
