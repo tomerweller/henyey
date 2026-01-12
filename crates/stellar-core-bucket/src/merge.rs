@@ -223,7 +223,9 @@ pub fn merge_buckets_with_options(
         return Ok(Bucket::empty());
     }
 
-    let result = Bucket::from_entries(merged)?;
+    // Use from_sorted_entries since the merge algorithm maintains sorted order.
+    // This avoids the overhead of re-sorting already-sorted data.
+    let result = Bucket::from_sorted_entries(merged)?;
     tracing::trace!(
         result_hash = %result.hash(),
         result_entries = result.len(),
