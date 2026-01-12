@@ -172,21 +172,44 @@ ext: BucketMetadataExt::V1(BucketListType::HotArchive),
 **Files Modified:**
 - `crates/stellar-core-bucket/src/hot_archive.rs` - Fixed in `fresh()` and `merge_hot_archive_buckets()`
 
-**Status:** Fix applied but issue persists. The hot archive hash still diverges after the first ledger, suggesting additional differences in bucket list processing.
+**Status:** Multiple fixes applied but issue persists. The hot archive hash still diverges after the first ledger.
+
+**Fix Applied (2026-01-12): Empty Bucket Handling**
+
+Fixed `add_batch` to always call `HotArchiveBucket::fresh()` even when there are no entries.
+
+**Bug:** When no archived entries or restored keys, we created an empty bucket with no entries:
+```rust
+let new_bucket = if !has_entries {
+    HotArchiveBucket::empty()  // hash = 0, no metadata
+} else { ... }
+```
+
+**Fix:** Always create a fresh bucket with metadata:
+```rust
+let new_bucket = HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
+```
+
+This matches C++ behavior where `HotArchiveBucket::fresh()` is always called, creating a bucket with at least a metadata entry.
+
+**Current Status:**
+- Both V1 metadata and empty bucket fixes have been applied
+- Hot archive hash still diverges after first ledger
+- Initial state at checkpoint IS CORRECT
+- Live bucket list works correctly (0 mismatches in live-only mode)
 
 **Observations:**
 - No evictions occurring in test ledger range (evicted_keys is empty)
 - Hot archive hash changes from `80821fbe...` to `e2d90763...` on first ledger
 - This change happens even with empty archived_entries and restored_keys
 - Likely caused by spills committing pending merges from restart_merges
-- The live bucket list works correctly (0 mismatches in live-only mode)
-- Initial state at checkpoint IS CORRECT (hash matches expected)
+- The same spills should happen in C++, so why does the expected hash differ?
 
-**Potential Root Causes:**
-1. Difference in how empty buckets are handled - when no entries, C++ still creates bucket with metadata but we use HotArchiveBucket::empty()
-2. Difference in how pending merges are computed vs C++
-3. Subtle difference in spill timing logic for hot archive
-4. Bucket hash computation difference (entry ordering, serialization)
+**Remaining Potential Root Causes:**
+1. Protocol version mismatch in restart_merges - C++ uses bucket's metadata version, we use passed parameter
+2. Subtle difference in spill timing logic for hot archive
+3. Bucket hash computation difference (entry ordering, serialization)
+4. Difference in how merge results are computed
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
