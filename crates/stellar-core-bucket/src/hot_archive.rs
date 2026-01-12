@@ -1127,8 +1127,6 @@ fn compare_sc_address(
     a: &stellar_xdr::curr::ScAddress,
     b: &stellar_xdr::curr::ScAddress,
 ) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
     // Compare by type discriminant first, then by content
     // Use XDR byte comparison for simplicity
     let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();

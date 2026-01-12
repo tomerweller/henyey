@@ -251,10 +251,61 @@ This matches C++ behavior where `HotArchiveBucket::fresh()` is always called, cr
 
 3. **Merge optimization with tombstone consideration:** Added optimization to skip merge when one input is empty, but ONLY when `keep_tombstones=true` to avoid skipping tombstone removal at bottom levels.
 
-**Remaining Issue:** Hot archive hash still diverges from C++ after processing ledgers. The initial checkpoint state matches, but subsequent updates produce different hashes. Possible causes:
-1. Different handling of level spills/commits in hot archive
-2. Metadata protocol version differences in merge outputs
-3. Different order of operations in add_batch_internal
+**Fix Applied (2026-01-12): TTL Key Filtering in Restored Keys**
+
+Fixed `extract_restored_keys()` in `cdp.rs` to filter out TTL keys. C++ stellar-core only records CONTRACT_DATA and CONTRACT_CODE keys in the hot archive - TTL keys are NOT included.
+
+**Bug:** Our Rust code was extracting ALL restored keys from transaction metadata:
+```rust
+if let LedgerEntryChange::Restored(entry) = change {
+    if let Some(key) = stellar_core_bucket::ledger_entry_to_key(entry) {
+        restored_keys.push(key);  // Includes TTL keys (WRONG)
+    }
+}
+```
+
+**Fix:** Added filtering to match C++ LedgerManagerImpl.cpp:2860-2864:
+```rust
+match &key {
+    LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
+        restored_keys.push(key);
+    }
+    _ => {
+        // Skip TTL keys and any other key types
+    }
+}
+```
+
+**Files Modified:**
+- `crates/stellar-core-history/src/cdp.rs` - Updated `extract_restored_keys()` to filter out TTL keys
+
+**Remaining Issue:** Hot archive hash still diverges from C++ after processing ledgers. The initial checkpoint state matches, but subsequent updates produce different hashes.
+
+**Investigation Findings (2026-01-12):**
+
+1. **Spill/Commit Timing Analysis:**
+   - Hot archive hash changes even when NO entries are added (empty archived_entries and restored_keys)
+   - The change occurs due to spill/commit cycle at each ledger
+   - At even ledgers (e.g., 380000), level 0 spills, which triggers:
+     - `snap()` on level 0 → moves curr to snap, curr becomes empty
+     - `commit()` on level 1 → moves pending merge result to curr
+   - These structural changes affect the overall hash
+
+2. **restart_merges Verification:**
+   - Pre-restart and post-restart hashes are identical
+   - This confirms restart_merges does NOT incorrectly change the bucket list
+   - The hash change occurs during add_batch, not restart_merges
+
+3. **Merge Optimization:**
+   - When snap is empty and keep_tombstones=true, merge returns curr unchanged
+   - Level 0 merges with empty fresh bucket → returns curr unchanged
+   - But `snap()` call still changes bucket list structure
+
+4. **Suspected Root Cause:**
+   The hot archive and live bucket list use the same spill timing formulas, yet live bucket list works (0 mismatches) while hot archive doesn't. The difference must be in:
+   - How empty batches affect the hot archive vs live bucket list
+   - How pending merges are handled during spills
+   - Possible difference in when `commit()` is called for hot archive
 
 The live bucket list is now verified working. The hot archive requires further investigation.
 
