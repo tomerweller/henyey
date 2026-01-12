@@ -136,15 +136,37 @@ The remaining issue is with the **hot archive bucket list**. Hot archive entry e
 4. Exported `is_persistent_entry` from stellar-core-bucket for use in main.rs
 
 **Current Status:**
-- Live bucket list hash matches (0 mismatches in live-only mode)
+- Live bucket list hash shows 0 mismatches in live-only mode
+- **Initial state at checkpoint IS CORRECT** - verified against checkpoint header hash
 - Hot archive hash changes after first ledger but then stays constant
-- Combined hash still doesn't match expected value from header
+- Combined hash diverges from expected starting at first ledger after checkpoint
 
-**Potential Issues:**
-1. There may be no actual evictions happening in the test ledgers
-2. The evicted_keys from CDP may not include all necessary entries
-3. The hot archive restart_merges may be computing a different initial state
-4. Timing difference between when evictions are processed vs when hashes are computed
+**Key Finding (2026-01-12):**
+The initial state at checkpoint (e.g., 379967) matches the expected hash from the header:
+```
+Verifying initial state at checkpoint 379967...
+  Checkpoint 379967: INITIAL STATE OK
+```
+This confirms:
+1. Bucket restoration from HAS works correctly
+2. restart_merges implementation is correct
+3. The combined hash (SHA256(live || hot_archive)) matches at checkpoint time
+
+The hash divergence occurs when processing the FIRST ledger after checkpoint (e.g., 380000),
+not during restoration. Investigation ongoing.
+
+**Observations:**
+- No evictions occurring in test ledger range (evicted_keys is empty)
+- Hot archive hash changes from `80821fbe...` to `c8541383...` on first ledger
+- This change happens even with empty archived_entries and restored_keys
+- Likely caused by spills committing pending merges from restart_merges
+- But the SAME should happen in C++, so why does the expected hash differ?
+
+**Potential Root Causes:**
+1. Difference in how pending merges are computed vs C++
+2. Protocol version mismatch in merge computation
+3. Subtle difference in spill timing logic
+4. Issue with how empty buckets are handled in add_batch
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
