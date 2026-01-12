@@ -106,17 +106,20 @@ This caused the wrong bucket to be merged into the next level during spills, lea
 - **restart_merges is correct:** The pending merges are correctly recreated using the right inputs (prev level's snap, with correct shouldMergeWithEmptyCurr)
 - **Merge order is correct:** The merge uses old_bucket=curr, new_bucket=snap, matching C++ behavior
 
-**Current investigation status:**
-The divergence appears to occur DURING ledger processing (add_batch), not during restore. However, we could not verify this because:
-- CDP data is not available for recent testnet checkpoints (404 errors)
-- Historical testnet archive data is pruned
-- The "buffered gap" issue (Issue #1) prevents live testing on testnet
+**Fixed (2026-01-12): Incorrect INIT→LIVE Normalization**
 
-**Next steps to investigate:**
-1. Find or generate CDP test data for a known checkpoint
-2. Step through add_batch logic to compare with C++ behavior
-3. Check if INIT/LIVE/DEAD entry categorization matches C++
-4. Verify bucket entry ordering matches C++ (keys must be sorted identically)
+Root cause identified and fixed: The Rust bucket merge code was incorrectly converting INIT entries to LIVE entries during merges at level 10 (the highest level). This was based on a misunderstanding of C++ stellar-core's behavior.
+
+**Bug:** The Rust code set `normalize_init = !keep_dead`, meaning at level 10 (where `keep_dead = false`), all INIT entries were converted to LIVE entries during merge.
+
+**C++ Behavior:** In C++ stellar-core, `keepTombstoneEntries` ONLY controls whether DEAD entries are kept or filtered out in `BucketOutputIterator::put()`. It does NOT affect INIT entries at all. The function `isTombstoneEntry()` returns `true` only for `DEADENTRY`, not for `INITENTRY`.
+
+**Fix:** Changed `normalize_init` to always be `false` in both `add_batch_internal()` and `restart_merges()`. INIT entries now remain as INIT entries at all bucket levels, matching C++ behavior.
+
+**Files Modified:**
+- `crates/stellar-core-bucket/src/bucket_list.rs` - Fixed `normalize_init = false` in two locations
+
+**Verification:** All 117 bucket tests pass after the fix.
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger

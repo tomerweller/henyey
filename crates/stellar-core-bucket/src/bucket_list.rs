@@ -171,7 +171,10 @@ impl BucketLevel {
     /// The curr may be empty if this level was already snapped from processing
     /// higher levels first.
     ///
-    /// - `normalize_init`: If true, INIT entries are converted to LIVE (for level crossings)
+    /// - `normalize_init`: If true, INIT entries are converted to LIVE. Note: This should
+    ///   ALWAYS be false in production to match C++ stellar-core behavior. C++ never
+    ///   normalizes INIT entries to LIVE during merges. This parameter exists for
+    ///   backward compatibility with tests.
     /// - `use_empty_curr`: If true, use an empty bucket instead of self.curr for the merge.
     ///   This is used when the level is about to snap its curr (shouldMergeWithEmptyCurr).
     fn prepare_with_normalization(
@@ -630,14 +633,14 @@ impl BucketList {
                 self.levels[i].commit();
 
                 // Prepare level i: merge curr with the spilling_snap from level i-1
-                // In C++ stellar-core, INIT normalization is tied to !keepDeadEntries:
-                // - Levels 0-9: keep_dead=true, so normalize_init=false (INIT stays INIT)
-                // - Level 10: keep_dead=false, so normalize_init=true (INIT becomes LIVE)
+                // In C++ stellar-core, INIT entries are NEVER normalized to LIVE during merges.
+                // The keepTombstoneEntries flag only controls whether DEAD entries are kept
+                // or discarded at the output iterator level - it does not affect INIT entries.
                 //
                 // Additionally, check shouldMergeWithEmptyCurr: when a level is about
                 // to snap its own curr, we use an empty bucket instead of curr.
                 let keep_dead = Self::keep_tombstone_entries(i);
-                let normalize_init = !keep_dead;
+                let normalize_init = false; // C++ never normalizes INIT to LIVE during merges
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
@@ -870,8 +873,10 @@ impl BucketList {
             );
 
             // Determine merge parameters
+            // Note: C++ never normalizes INIT to LIVE during merges - the keepTombstoneEntries
+            // flag only affects DEAD entry filtering, not INIT entry transformation.
             let keep_dead = Self::keep_tombstone_entries(i);
-            let normalize_init = !keep_dead;
+            let normalize_init = false; // C++ never normalizes INIT to LIVE during merges
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
             // Start the merge with the previous level's snap
