@@ -1786,10 +1786,14 @@ async fn cmd_replay_bucket_list(
             // for persistent entries that need to go to the hot archive.
             // We must do this BEFORE adding to dead_entries since the entries will be gone after add_batch.
             let mut archived_entries = Vec::new();
+            let mut evicted_ttl_count = 0usize;
+            let mut evicted_not_found = 0usize;
+            let mut evicted_not_persistent = 0usize;
             if !live_only && hot_archive_bucket_list.is_some() {
                 for key in &evicted_keys {
                     // Skip TTL keys - they don't go to hot archive
                     if matches!(key, stellar_xdr::curr::LedgerKey::Ttl(_)) {
+                        evicted_ttl_count += 1;
                         continue;
                     }
                     // Look up the full entry in the bucket list
@@ -1797,8 +1801,18 @@ async fn cmd_replay_bucket_list(
                         // Only persistent entries go to hot archive
                         if is_persistent_entry(&entry) {
                             archived_entries.push(entry);
+                        } else {
+                            evicted_not_persistent += 1;
                         }
+                    } else {
+                        evicted_not_found += 1;
                     }
+                }
+                // Debug: show eviction stats if there are any evictions
+                if !evicted_keys.is_empty() {
+                    println!("  Ledger {}: evicted {} keys (TTL:{}, not_found:{}, temp:{}, archived:{})",
+                        seq, evicted_keys.len(), evicted_ttl_count, evicted_not_found,
+                        evicted_not_persistent, archived_entries.len());
                 }
             }
 
@@ -1824,6 +1838,11 @@ async fn cmd_replay_bucket_list(
 
             // Update hot archive bucket list with archived/restored entries
             if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+                // Log if there are any evictions or restorations
+                if !archived_entries.is_empty() || !restored_keys.is_empty() {
+                    println!("  Ledger {}: hot archive update - {} archived, {} restored",
+                        seq, archived_entries.len(), restored_keys.len());
+                }
                 hot_archive.add_batch(
                     seq,
                     header.ledger_version,
@@ -1934,10 +1953,10 @@ async fn cmd_verify_execution(
     quiet: bool,
 ) -> anyhow::Result<()> {
     use std::sync::{Arc, RwLock};
-    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList};
+    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList, is_persistent_entry};
     use stellar_core_common::{Hash256, NetworkId};
     use stellar_core_history::{HistoryArchive, checkpoint};
-    use stellar_core_history::cdp::{CachedCdpDataLake, extract_ledger_header, extract_upgrade_metas};
+    use stellar_core_history::cdp::{CachedCdpDataLake, extract_ledger_header, extract_upgrade_metas, extract_evicted_keys, extract_restored_keys};
     use stellar_core_history::replay::extract_ledger_changes;
     use stellar_core_ledger::{LedgerSnapshot, SnapshotHandle, LedgerError};
     use stellar_core_ledger::execution::{TransactionExecutor, load_soroban_config};
@@ -2704,6 +2723,37 @@ async fn cmd_verify_execution(
                 let upgrade_metas = extract_upgrade_metas(&lcm);
                 let (upgrade_init, upgrade_live, upgrade_dead) = extract_upgrade_changes(&upgrade_metas)?;
 
+                // Extract eviction data (Protocol 23+)
+                let evicted_keys = extract_evicted_keys(&lcm);
+
+                // Before evicting entries from the live bucket list, look up full entry data
+                // for persistent entries that need to go to the hot archive.
+                let mut archived_entries = Vec::new();
+                if hot_archive_bucket_list.is_some() {
+                    let bl = bucket_list.read().unwrap();
+                    for key in &evicted_keys {
+                        // Skip TTL keys - they don't go to hot archive
+                        if matches!(key, stellar_xdr::curr::LedgerKey::Ttl(_)) {
+                            continue;
+                        }
+                        // Look up the full entry in the bucket list
+                        if let Ok(Some(entry)) = bl.get(key) {
+                            // Only persistent entries go to hot archive
+                            if is_persistent_entry(&entry) {
+                                archived_entries.push(entry);
+                            }
+                        }
+                    }
+                }
+
+                // Extract restored keys from transaction meta (entries restored from hot archive)
+                let tx_metas_for_restore: Vec<_> = tx_processing.iter().map(|tp| tp.meta.clone()).collect();
+                let restored_keys = if hot_archive_bucket_list.is_some() {
+                    extract_restored_keys(&tx_metas_for_restore)
+                } else {
+                    Vec::new()
+                };
+
                 // Combine all changes
                 let all_init: Vec<LedgerEntry> = init_entries.into_iter()
                     .chain(upgrade_init)
@@ -2711,7 +2761,11 @@ async fn cmd_verify_execution(
                 let all_live: Vec<LedgerEntry> = live_entries.into_iter()
                     .chain(upgrade_live)
                     .collect();
-                let all_dead: Vec<LedgerKey> = dead_entries.into_iter().chain(upgrade_dead).collect();
+                // Add evicted keys to dead entries (they're removed from live bucket list)
+                let all_dead: Vec<LedgerKey> = dead_entries.into_iter()
+                    .chain(upgrade_dead)
+                    .chain(evicted_keys)
+                    .collect();
 
                 // Apply to bucket list
                 bucket_list.write().unwrap().add_batch(
@@ -2723,15 +2777,14 @@ async fn cmd_verify_execution(
                     all_dead,
                 )?;
 
-                // Hot archive bucket list must also have add_batch called for spill consistency
-                // even though we don't have full archived entry data from CDP
+                // Update hot archive bucket list with archived/restored entries
                 if cdp_header.ledger_version >= 23 {
                     if let Some(ref hot_archive) = hot_archive_bucket_list {
                         hot_archive.write().unwrap().add_batch(
                             seq,
                             cdp_header.ledger_version,
-                            vec![], // No archived entries from CDP
-                            vec![], // No restored keys from CDP
+                            archived_entries,
+                            restored_keys,
                         )?;
                     }
                 }
