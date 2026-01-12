@@ -28,7 +28,7 @@
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use stellar_xdr::curr::{
-    BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry,
+    BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry,
     LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr,
 };
 
@@ -88,10 +88,10 @@ impl HotArchiveBucket {
     ) -> Result<Self> {
         let mut entries = Vec::with_capacity(1 + archived_entries.len() + restored_keys.len());
 
-        // Add metadata
+        // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
         entries.push(HotArchiveBucketEntry::Metaentry(BucketMetadata {
             ledger_version: protocol_version,
-            ext: BucketMetadataExt::V0,
+            ext: BucketMetadataExt::V1(BucketListType::HotArchive),
         }));
 
         // Add archived entries
@@ -814,10 +814,10 @@ pub fn merge_hot_archive_buckets(
     // Build result
     let mut result_entries = Vec::with_capacity(merged_entries.len() + 1);
 
-    // Add metadata
+    // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
     result_entries.push(HotArchiveBucketEntry::Metaentry(BucketMetadata {
         ledger_version: protocol_version,
-        ext: BucketMetadataExt::V0,
+        ext: BucketMetadataExt::V1(BucketListType::HotArchive),
     }));
 
     // Add merged entries
@@ -933,7 +933,7 @@ mod tests {
         let curr = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
-                ext: BucketMetadataExt::V0,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
             }),
             HotArchiveBucketEntry::Archived(entry),
         ])
@@ -942,7 +942,7 @@ mod tests {
         let snap = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
-                ext: BucketMetadataExt::V0,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
             }),
             HotArchiveBucketEntry::Live(key.clone()),
         ])
@@ -963,7 +963,7 @@ mod tests {
         let curr = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
-                ext: BucketMetadataExt::V0,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
             }),
             HotArchiveBucketEntry::Live(key.clone()),
         ])
@@ -972,7 +972,7 @@ mod tests {
         let snap = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
-                ext: BucketMetadataExt::V0,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
             }),
             HotArchiveBucketEntry::Archived(entry),
         ])
@@ -991,7 +991,7 @@ mod tests {
         let bucket = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
-                ext: BucketMetadataExt::V0,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
             }),
             HotArchiveBucketEntry::Live(key.clone()),
         ])

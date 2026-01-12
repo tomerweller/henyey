@@ -155,18 +155,38 @@ This confirms:
 The hash divergence occurs when processing the FIRST ledger after checkpoint (e.g., 380000),
 not during restoration. Investigation ongoing.
 
+**Fix Applied (2026-01-12): Hot Archive Metadata Extension**
+
+Fixed the `BucketMetadataExt` in hot archive bucket creation. C++ uses V1 extension with `BucketListType::HotArchive`, but our Rust code was using V0:
+
+**Bug:** Our Rust code used:
+```rust
+ext: BucketMetadataExt::V0,
+```
+
+**Fix:** Changed to match C++:
+```rust
+ext: BucketMetadataExt::V1(BucketListType::HotArchive),
+```
+
+**Files Modified:**
+- `crates/stellar-core-bucket/src/hot_archive.rs` - Fixed in `fresh()` and `merge_hot_archive_buckets()`
+
+**Status:** Fix applied but issue persists. The hot archive hash still diverges after the first ledger, suggesting additional differences in bucket list processing.
+
 **Observations:**
 - No evictions occurring in test ledger range (evicted_keys is empty)
-- Hot archive hash changes from `80821fbe...` to `c8541383...` on first ledger
+- Hot archive hash changes from `80821fbe...` to `e2d90763...` on first ledger
 - This change happens even with empty archived_entries and restored_keys
 - Likely caused by spills committing pending merges from restart_merges
-- But the SAME should happen in C++, so why does the expected hash differ?
+- The live bucket list works correctly (0 mismatches in live-only mode)
+- Initial state at checkpoint IS CORRECT (hash matches expected)
 
 **Potential Root Causes:**
-1. Difference in how pending merges are computed vs C++
-2. Protocol version mismatch in merge computation
-3. Subtle difference in spill timing logic
-4. Issue with how empty buckets are handled in add_batch
+1. Difference in how empty buckets are handled - when no entries, C++ still creates bucket with metadata but we use HotArchiveBucket::empty()
+2. Difference in how pending merges are computed vs C++
+3. Subtle difference in spill timing logic for hot archive
+4. Bucket hash computation difference (entry ordering, serialization)
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
