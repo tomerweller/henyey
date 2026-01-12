@@ -1694,6 +1694,14 @@ async fn cmd_replay_bucket_list(
         })
     }).transpose()?;
 
+    // Debug: hash before restart_merges
+    let pre_restart_live_hash = bucket_list.hash();
+    let pre_restart_hot_hash = hot_archive_bucket_list.as_ref().map(|h| h.hash());
+    println!("Pre-restart live hash: {}", pre_restart_live_hash.to_hex());
+    if let Some(ref hot_hash) = pre_restart_hot_hash {
+        println!("Pre-restart hot archive hash: {}", hot_hash.to_hex());
+    }
+
     // Restart any pending merges that should have been in progress at the checkpoint.
     // Use protocol version 25 (current testnet) for merge parameters.
     let protocol_version = 25u32;
@@ -1797,6 +1805,21 @@ async fn cmd_replay_bucket_list(
             // Extract eviction data (Protocol 23+)
             let evicted_keys = extract_evicted_keys(&lcm);
 
+            // Debug: show evicted keys count and meta version for first few ledgers
+            if seq <= init_checkpoint + 5 && !live_only {
+                let meta_version = match &lcm {
+                    stellar_xdr::curr::LedgerCloseMeta::V0(_) => "V0",
+                    stellar_xdr::curr::LedgerCloseMeta::V1(_) => "V1",
+                    stellar_xdr::curr::LedgerCloseMeta::V2(_) => "V2",
+                };
+                tracing::debug!(
+                    ledger = seq,
+                    meta_version = meta_version,
+                    evicted_keys_count = evicted_keys.len(),
+                    "replay-bucket-list: extracted evicted keys from CDP"
+                );
+            }
+
             // Extract upgrade changes and apply them
             let upgrade_metas = extract_upgrade_metas(&lcm);
             for upgrade_meta in &upgrade_metas {
@@ -1866,6 +1889,33 @@ async fn cmd_replay_bucket_list(
             // Add evicted keys to dead entries (they're removed from live bucket list)
             dead_entries.extend(evicted_keys);
 
+            // Capture counts for debug output before the data is moved
+            let init_entries_count = init_entries.len();
+            let live_entries_count = live_entries.len();
+            let dead_entries_count = dead_entries.len();
+
+            // Debug: Show first few entry keys for the first test ledger
+            if in_test_range && seq == start_ledger {
+                println!("  [DEBUG] Ledger {} entry summary:", seq);
+                println!("    Init entries ({}):", init_entries_count);
+                for (i, entry) in init_entries.iter().enumerate().take(3) {
+                    let key = stellar_core_bucket::ledger_entry_to_key(entry);
+                    if let Some(ref k) = key {
+                        println!("      {}: {:?}", i, k);
+                    }
+                }
+                println!("    Live entries ({}):", live_entries_count);
+                for (i, entry) in live_entries.iter().enumerate().take(3) {
+                    let key = stellar_core_bucket::ledger_entry_to_key(entry);
+                    if let Some(ref k) = key {
+                        println!("      {}: {:?}", i, k);
+                    }
+                }
+                if init_entries_count > 3 || live_entries_count > 3 {
+                    println!("    ... (truncated)");
+                }
+            }
+
             // Apply changes to live bucket list (always call add_batch for spill timing)
             bucket_list.add_batch(
                 seq,
@@ -1875,6 +1925,23 @@ async fn cmd_replay_bucket_list(
                 live_entries,
                 dead_entries,
             )?;
+
+            // Debug: trace live bucket list level states for first few ledgers
+            if in_test_range && seq <= start_ledger + 3 {
+                println!("  [DEBUG] Ledger {} changes: init={}, live={}, dead={}",
+                    seq, init_entries_count, live_entries_count, dead_entries_count);
+                println!("  [DEBUG] Live bucket list state after add_batch:");
+                let levels = bucket_list.levels();
+                for level_idx in 0..4.min(levels.len()) {
+                    let level = &levels[level_idx];
+                    let curr_hash = &level.curr.hash().to_hex()[..16];
+                    let snap_hash = &level.snap.hash().to_hex()[..16];
+                    let has_pending = level.next().is_some();
+                    println!("    Level {}: curr={}, snap={}, pending={}",
+                        level_idx, curr_hash, snap_hash, has_pending);
+                }
+                println!("    Overall live hash: {}", &bucket_list.hash().to_hex()[..32]);
+            }
 
             // Update hot archive bucket list with archived/restored entries
             if let Some(ref mut hot_archive) = hot_archive_bucket_list {
@@ -1889,6 +1956,11 @@ async fn cmd_replay_bucket_list(
                     archived_entries,
                     restored_keys,
                 )?;
+
+                // Debug: trace hot archive hash after add_batch for first few ledgers
+                if in_test_range && seq <= start_ledger + 3 {
+                    println!("    Hot archive hash: {}", &hot_archive.hash().to_hex()[..32]);
+                }
             }
 
             // Compute hash for comparison

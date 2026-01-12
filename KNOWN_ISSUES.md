@@ -127,6 +127,30 @@ Tested with `replay-bucket-list --live-only` which verifies only the live bucket
 - **Result:** 0 mismatches across all tested ledgers
 - This confirms the live bucket list implementation is now correct
 
+**CRITICAL FIX (2026-01-12): compare_sc_val Semantic Comparison**
+
+The `compare_sc_val` function in `entry.rs` was using XDR byte comparison, which is WRONG for signed integers:
+- XDR encodes signed integers as two's complement big-endian
+- Byte comparison of -1 vs 1: 0xFFFFFFFF > 0x00000001 (WRONG)
+- Semantic comparison of -1 vs 1: -1 < 1 (CORRECT)
+
+**Bug:** The entry sorting code used XDR byte comparison for ScVal:
+```rust
+let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+a_bytes.cmp(&b_bytes)  // Wrong for signed integers!
+```
+
+**Fix:** Replaced with semantic comparison matching C++ xdrpp's operator<:
+- Compare discriminant first (type ordering)
+- Then compare values semantically (I32/I64/I128/I256 use signed comparison)
+- Falls back to XDR bytes only for complex types without simple ordering
+
+**Files Modified:**
+- `crates/stellar-core-bucket/src/entry.rs` - Complete rewrite of `compare_sc_val()` and added `sc_val_type_discriminant()`
+
+**Verification:** Live bucket list now passes with 0 mismatches in --live-only mode.
+
 The remaining issue is with the **hot archive bucket list**. Hot archive entry extraction has been implemented but the combined hash still doesn't match:
 
 **Implemented (2026-01-12):**
@@ -219,12 +243,20 @@ This matches C++ behavior where `HotArchiveBucket::fresh()` is always called, cr
 - CONTRACT_DATA compared by: contract (ScAddress), key (ScVal), durability
 - ScAddress and ScVal compared using XDR byte comparison for complex types
 
-**Remaining Issue:** Fresh bucket hashes still differ from C++. Possible causes:
-1. Subtle difference in comparison order for specific ScVal types
-2. Difference in how entries are extracted/serialized before sorting
-3. Something different about how C++ processes the same entries
+**Hot Archive Fixes (2026-01-12):**
 
-The issue requires deeper debugging with actual entry-level comparison to identify why our sorted order differs from C++'s.
+1. **Empty bucket handling in fresh():** Fixed `HotArchiveBucket::fresh()` to return an empty bucket (zero hash) when there are no archived entries or restored keys, matching C++ BucketOutputIterator behavior.
+
+2. **Empty bucket handling in merge:** Fixed `merge_hot_archive_buckets()` to return an empty bucket when the result has no entries (matching C++ behavior).
+
+3. **Merge optimization with tombstone consideration:** Added optimization to skip merge when one input is empty, but ONLY when `keep_tombstones=true` to avoid skipping tombstone removal at bottom levels.
+
+**Remaining Issue:** Hot archive hash still diverges from C++ after processing ledgers. The initial checkpoint state matches, but subsequent updates produce different hashes. Possible causes:
+1. Different handling of level spills/commits in hot archive
+2. Metadata protocol version differences in merge outputs
+3. Different order of operations in add_batch_internal
+
+The live bucket list is now verified working. The hot archive requires further investigation.
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger

@@ -158,6 +158,9 @@ impl BucketLevel {
     /// - Sets snap = curr (old curr becomes the new snap)
     /// - Clears curr (ready for new entries)
     /// - Returns the NEW snap (old curr), which flows to the next level
+    ///
+    /// Note: Unlike commit(), snap() does NOT commit pending merges. In C++,
+    /// mNextCurr is a FutureBucket that stays pending until explicitly committed.
     fn snap(&mut self) -> Bucket {
         // Move curr to snap (curr becomes empty via replace)
         self.snap = std::mem::replace(&mut self.curr, Bucket::empty());
