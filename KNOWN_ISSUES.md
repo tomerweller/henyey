@@ -121,6 +121,23 @@ Root cause identified and fixed: The Rust bucket merge code was incorrectly conv
 
 **Verification:** All 117 bucket tests pass after the fix.
 
+**Live Bucket List Now Works (2026-01-12):**
+
+Tested with `replay-bucket-list --live-only` which verifies only the live bucket list hash:
+- **Result:** 0 mismatches across all tested ledgers
+- This confirms the live bucket list implementation is now correct
+
+The remaining issue is with the **hot archive bucket list**, which is not being updated correctly:
+- Hot archive requires `archived_entries` (evicted Soroban entries) and `restored_keys` (entries restored from archive)
+- These entries are not currently being extracted from CDP transaction meta
+- The replay tool passes empty vectors to hot_archive.add_batch()
+- This is a known limitation - hot archive updates need full eviction/restore data
+
+**Next Steps for Hot Archive:**
+1. Extract archived entries from transaction meta (evicted persistent data/code)
+2. Extract restored keys from transaction meta (restored entries)
+3. Pass these to hot_archive.add_batch() during replay
+
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
 - Node may close 1 ledger successfully after catchup
