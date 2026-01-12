@@ -1805,6 +1805,14 @@ async fn cmd_replay_bucket_list(
             // Extract eviction data (Protocol 23+)
             let evicted_keys = extract_evicted_keys(&lcm);
 
+            // Debug: show hot archive state before add_batch for first few ledgers
+            if seq <= init_checkpoint + 3 && !live_only {
+                if let Some(ref hot_archive) = hot_archive_bucket_list {
+                    println!("  [HOT ARCHIVE BEFORE] Ledger {}: hash={}",
+                        seq, &hot_archive.hash().to_hex()[..32]);
+                }
+            }
+
             // Debug: show evicted keys count and meta version for first few ledgers
             if seq <= init_checkpoint + 5 && !live_only {
                 let meta_version = match &lcm {
@@ -1958,8 +1966,9 @@ async fn cmd_replay_bucket_list(
                 )?;
 
                 // Debug: trace hot archive hash after add_batch for first few ledgers
-                if in_test_range && seq <= start_ledger + 3 {
-                    println!("    Hot archive hash: {}", &hot_archive.hash().to_hex()[..32]);
+                if seq <= init_checkpoint + 3 {
+                    println!("  [HOT ARCHIVE AFTER] Ledger {}: hash={}",
+                        seq, &hot_archive.hash().to_hex()[..32]);
                 }
             }
 

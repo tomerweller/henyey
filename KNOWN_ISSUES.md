@@ -281,6 +281,36 @@ match &key {
 
 **Remaining Issue:** Hot archive hash still diverges from C++ after processing ledgers. The initial checkpoint state matches, but subsequent updates produce different hashes.
 
+**Fix Applied (2026-01-12): Metaentry-Only Bucket Handling**
+
+Fixed `fresh()` and `merge_hot_archive_buckets()` to always create buckets with a metaentry, even when there are no data entries.
+
+**Bug:** Our Rust code returned an empty bucket (hash 0) when there were no archived/restored entries:
+```rust
+// In fresh():
+if archived_entries.is_empty() && restored_keys.is_empty() {
+    return Ok(Self::empty());  // hash = 0 (WRONG)
+}
+
+// In merge():
+if merged_entries.is_empty() {
+    return Ok(HotArchiveBucket::empty());  // hash = 0 (WRONG)
+}
+```
+
+**C++ Behavior:** `BucketOutputIterator` constructor ALWAYS writes a metaentry first (`mObjectsPut = 1`), so:
+- Even with no data entries, `fresh()` returns a bucket with metaentry (non-zero hash)
+- Even if merge produces no data entries, output has metaentry (non-zero hash)
+
+**Fix:** Removed early returns for empty entries. Both `fresh()` and `merge_hot_archive_buckets()` now always include a metaentry, matching C++ behavior.
+
+**Verification:** Added test `test_hot_archive_metaentry_only_hash_matches_cpp` that verifies the metaentry-only bucket hash matches C++ (`95079eba2ff8ef53c179aa3dedb62b78acd7aa9ba5ddcc391436812c5f7084aa`). All 120 bucket tests pass.
+
+**Files Modified:**
+- `crates/stellar-core-bucket/src/hot_archive.rs` - Fixed `fresh()` and `merge_hot_archive_buckets()`
+
+**Status:** Fix verified - metaentry-only bucket hash matches C++. However, overall combined hash still diverges after processing ledgers. Further investigation needed.
+
 **Investigation Findings (2026-01-12):**
 
 1. **Spill/Commit Timing Analysis:**

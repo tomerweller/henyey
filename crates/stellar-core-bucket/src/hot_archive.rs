@@ -26,7 +26,7 @@
 //! Hot archive is only supported from Protocol 23+ (Soroban state archival).
 
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry,
     LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr,
@@ -94,18 +94,16 @@ impl HotArchiveBucket {
     /// This is the primary way to create a new hot archive bucket when entries
     /// are evicted from the live bucket list.
     ///
-    /// Returns an empty bucket if there are no entries to add (matching C++ behavior).
+    /// Even when there are no data entries, a metaentry-only bucket is created
+    /// (matching C++ behavior where BucketOutputIterator always writes metaentry first).
     pub fn fresh(
         protocol_version: u32,
         archived_entries: Vec<LedgerEntry>,
         restored_keys: Vec<LedgerKey>,
     ) -> Result<Self> {
-        // If there are no entries, return an empty bucket (matching C++ behavior)
-        // C++ stellar-core's BucketOutputIterator returns an empty bucket when mObjectsPut == 0
-        if archived_entries.is_empty() && restored_keys.is_empty() {
-            return Ok(Self::empty());
-        }
-
+        // In C++, BucketOutputIterator constructor always writes a metaentry first,
+        // so fresh buckets always have at least a metaentry (even with no data entries).
+        // mObjectsPut is 1 after writing metaentry, so getBucket() creates a bucket file.
         let mut entries = Vec::with_capacity(1 + archived_entries.len() + restored_keys.len());
 
         // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
@@ -1312,77 +1310,43 @@ pub fn merge_hot_archive_buckets(
         "hot_archive merge: starting merge"
     );
 
-    // Optimization: if one bucket is empty, return the other unchanged
-    // This preserves the bucket's hash including its original metadata
-    // and matches C++ behavior where merging with empty is a no-op
+    // NOTE: We intentionally do NOT optimize for empty buckets here.
+    // C++ stellar-core always goes through the full merge process even when
+    // one input is empty. This is important because:
+    // 1. The output bucket gets new metadata (protocol version)
+    // 2. The bucket hash includes metadata
+    // 3. Returning input unchanged would preserve old metadata and wrong hash
     //
-    // IMPORTANT: We can only use this optimization if keep_tombstones is true,
-    // because tombstones (Live entries) need to be dropped at the bottom level.
-    // When keep_tombstones is false, we must process the merge to drop tombstones.
-    if keep_tombstones {
-        if snap.is_empty() {
-            tracing::trace!("hot_archive merge: snap is empty, returning curr unchanged");
-            return Ok(curr.clone());
-        }
-        if curr.is_empty() {
-            tracing::trace!("hot_archive merge: curr is empty, returning snap unchanged");
-            return Ok(snap.clone());
-        }
-    } else {
-        // When keep_tombstones is false, we can still skip if both are empty
-        if snap.is_empty() && curr.is_empty() {
-            tracing::trace!("hot_archive merge: both empty, returning empty");
-            return Ok(HotArchiveBucket::empty());
-        }
+    // The only optimization is when BOTH inputs are empty.
+    if snap.is_empty() && curr.is_empty() {
+        tracing::trace!("hot_archive merge: both empty, returning empty");
+        return Ok(HotArchiveBucket::empty());
     }
 
     let mut merged_entries: HashMap<Vec<u8>, HotArchiveBucketEntry> = HashMap::new();
-    let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
 
-    // Process curr entries first (newer)
+    // Process curr entries first (older entries)
     for entry in curr.iter() {
         if matches!(entry, HotArchiveBucketEntry::Metaentry(_)) {
             continue;
         }
 
         let key = hot_archive_entry_to_key(entry)?;
-        seen_keys.insert(key.clone());
         merged_entries.insert(key, entry.clone());
     }
 
-    // Process snap entries
+    // Process snap entries (newer entries)
+    // C++ HotArchiveBucket::mergeCasesWithEqualKeys always takes the newer entry,
+    // so snap entries always win when there's a key match.
     for entry in snap.iter() {
         if matches!(entry, HotArchiveBucketEntry::Metaentry(_)) {
             continue;
         }
 
         let key = hot_archive_entry_to_key(entry)?;
-
-        if let Some(curr_entry) = merged_entries.get(&key) {
-            // Apply merge rules
-            match (curr_entry, entry) {
-                // Archived in curr + Live in snap = Keep Archived (normal case)
-                (HotArchiveBucketEntry::Archived(_), HotArchiveBucketEntry::Live(_)) => {
-                    // Keep curr (Archived)
-                }
-                // Live in curr + Archived in snap = Annihilate
-                (HotArchiveBucketEntry::Live(_), HotArchiveBucketEntry::Archived(_)) => {
-                    merged_entries.remove(&key);
-                }
-                // Archived + Archived = Keep curr (newer)
-                (HotArchiveBucketEntry::Archived(_), HotArchiveBucketEntry::Archived(_)) => {
-                    // Keep curr
-                }
-                // Live + Live = Keep curr
-                (HotArchiveBucketEntry::Live(_), HotArchiveBucketEntry::Live(_)) => {
-                    // Keep curr
-                }
-                _ => {}
-            }
-        } else {
-            // Entry only in snap
-            merged_entries.insert(key, entry.clone());
-        }
+        // Always insert snap entry - it will either add a new entry
+        // or replace an existing curr entry (newer always wins)
+        merged_entries.insert(key, entry.clone());
     }
 
     // Drop tombstones at bottom level
@@ -1390,23 +1354,24 @@ pub fn merge_hot_archive_buckets(
         merged_entries.retain(|_, v| !is_hot_archive_tombstone(v));
     }
 
-    // If there are no entries after merge, return an empty bucket
-    // This matches C++ stellar-core's BucketOutputIterator which returns
-    // an empty bucket when mObjectsPut == 0
-    if merged_entries.is_empty() {
-        tracing::trace!(
-            "hot_archive merge: result is empty, returning empty bucket"
-        );
-        return Ok(HotArchiveBucket::empty());
-    }
-
     // Build result
+    // NOTE: Even if merged_entries is empty, we still create a bucket with metaentry.
+    // In C++, BucketOutputIterator constructor ALWAYS writes a metaentry first,
+    // so merge output always has at least a metaentry (mObjectsPut >= 1).
+    // This is critical for hash consistency.
     let mut result_entries = Vec::with_capacity(merged_entries.len() + 1);
+
+    // Calculate output protocol version as max of inputs, matching C++ behavior.
+    // C++ calculateMergeProtocolVersion does: max(oi.metadata.ledgerVersion, ni.metadata.ledgerVersion)
+    // The passed protocol_version acts as an upper bound (maxProtocolVersion).
+    let curr_version = curr.get_protocol_version();
+    let snap_version = snap.get_protocol_version();
+    let output_version = curr_version.max(snap_version).min(protocol_version);
 
     // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
     // Metadata is only included when there are actual entries to add
     result_entries.push(HotArchiveBucketEntry::Metaentry(BucketMetadata {
-        ledger_version: protocol_version,
+        ledger_version: output_version,
         ext: BucketMetadataExt::V1(BucketListType::HotArchive),
     }));
 
@@ -1472,6 +1437,63 @@ mod tests {
     }
 
     #[test]
+    fn test_hot_archive_bucket_fresh_metaentry_only() {
+        // Fresh bucket with no data entries should still have metaentry
+        // This matches C++ behavior where BucketOutputIterator always writes metaentry first
+        let bucket = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
+
+        // Should have 1 entry (just the metaentry)
+        assert_eq!(bucket.len(), 1);
+        // Should NOT be considered empty (has metaentry)
+        assert!(!bucket.is_empty());
+        // Should have non-zero hash
+        assert!(!bucket.hash().is_zero());
+        // Should have correct protocol version
+        assert_eq!(bucket.get_protocol_version(), 25);
+    }
+
+    #[test]
+    fn test_hot_archive_merge_metaentry_only_buckets() {
+        // Merging two metaentry-only buckets should produce a metaentry-only bucket
+        // This is critical for hash consistency with C++
+        let bucket1 = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
+        let bucket2 = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
+
+        let merged = merge_hot_archive_buckets(&bucket1, &bucket2, 25, true).unwrap();
+
+        // Should have 1 entry (just the metaentry)
+        assert_eq!(merged.len(), 1);
+        // Should NOT be considered empty
+        assert!(!merged.is_empty());
+        // Should have non-zero hash
+        assert!(!merged.hash().is_zero());
+        // Should have correct protocol version
+        assert_eq!(merged.get_protocol_version(), 25);
+    }
+
+    #[test]
+    fn test_hot_archive_metaentry_only_hash_matches_cpp() {
+        // This test verifies the hash of a metaentry-only bucket matches C++ stellar-core
+        // Bucket 95079eba2ff8ef53c179aa3dedb62b78acd7aa9ba5ddcc391436812c5f7084aa from testnet
+        // Contains only a METAENTRY with protocol version 25
+        //
+        // Raw bytes (hex): 80000010 ffffffff 00000019 00000001 00000001
+        // - 80000010: XDR record mark (0x10 = 16 bytes, high bit set)
+        // - ffffffff: HotArchiveBucketEntryType::Metaentry = -1
+        // - 00000019: ledger_version = 25
+        // - 00000001: ext.v = 1
+        // - 00000001: BucketListType::HotArchive = 1
+        let bucket = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
+
+        let expected_hash = "95079eba2ff8ef53c179aa3dedb62b78acd7aa9ba5ddcc391436812c5f7084aa";
+        assert_eq!(
+            bucket.hash().to_hex(),
+            expected_hash,
+            "Metaentry-only bucket hash should match C++ stellar-core"
+        );
+    }
+
+    #[test]
     fn test_hot_archive_bucket_lookup() {
         let entry = make_contract_data_entry([1u8; 32], b"key1", 100);
         let key = make_contract_data_key([1u8; 32], b"key1");
@@ -1525,11 +1547,12 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_archived_plus_live_annihilates() {
+    fn test_merge_newer_always_wins_archived_then_live() {
         let entry = make_contract_data_entry([1u8; 32], b"key1", 100);
         let key = make_contract_data_key([1u8; 32], b"key1");
 
-        // curr has Archived, snap has Live
+        // curr (old) has Archived, snap (new) has Live
+        // C++ always takes newer entry, so Live should win
         let curr = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
@@ -1550,16 +1573,19 @@ mod tests {
 
         let merged = merge_hot_archive_buckets(&curr, &snap, 25, true).unwrap();
 
-        // Archived should remain (Live in snap doesn't affect Archived in curr)
-        assert!(merged.get(&key).unwrap().is_some());
+        // Live from snap (newer) wins - entry exists but is a tombstone
+        let entry_result = merged.get(&key).unwrap();
+        assert!(entry_result.is_some());
+        assert!(matches!(entry_result.unwrap(), HotArchiveBucketEntry::Live(_)));
     }
 
     #[test]
-    fn test_merge_live_plus_archived_annihilates() {
+    fn test_merge_newer_always_wins_live_then_archived() {
         let entry = make_contract_data_entry([1u8; 32], b"key1", 100);
         let key = make_contract_data_key([1u8; 32], b"key1");
 
-        // curr has Live, snap has Archived - should annihilate
+        // curr (old) has Live, snap (new) has Archived
+        // C++ always takes newer entry, so Archived should win
         let curr = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
@@ -1574,14 +1600,21 @@ mod tests {
                 ledger_version: 25,
                 ext: BucketMetadataExt::V1(BucketListType::HotArchive),
             }),
-            HotArchiveBucketEntry::Archived(entry),
+            HotArchiveBucketEntry::Archived(entry.clone()),
         ])
         .unwrap();
 
         let merged = merge_hot_archive_buckets(&curr, &snap, 25, true).unwrap();
 
-        // Entry should be gone (annihilated)
-        assert!(merged.get(&key).unwrap().is_none());
+        // Archived from snap (newer) wins
+        let entry_result = merged.get(&key).unwrap();
+        assert!(entry_result.is_some());
+        match entry_result.unwrap() {
+            HotArchiveBucketEntry::Archived(e) => {
+                assert_eq!(e.last_modified_ledger_seq, entry.last_modified_ledger_seq);
+            }
+            _ => panic!("Expected Archived entry"),
+        }
     }
 
     #[test]
