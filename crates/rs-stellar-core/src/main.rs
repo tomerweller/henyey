@@ -1702,9 +1702,49 @@ async fn cmd_replay_bucket_list(
         hot.restart_merges(init_checkpoint, protocol_version)?;
     }
 
-    println!("Initial live bucket hash: {}", bucket_list.hash().to_hex());
-    if let Some(ref hot) = hot_archive_bucket_list {
-        println!("Initial hot archive hash: {}", hot.hash().to_hex());
+    let initial_live_hash = bucket_list.hash();
+    let initial_hot_hash = hot_archive_bucket_list.as_ref().map(|h| h.hash());
+
+    println!("Initial live bucket hash: {}", initial_live_hash.to_hex());
+    if let Some(ref hot_hash) = initial_hot_hash {
+        println!("Initial hot archive hash: {}", hot_hash.to_hex());
+
+        // Compute combined hash for verification
+        let combined = stellar_core_crypto::sha256_multi(&[
+            initial_live_hash.as_bytes(),
+            hot_hash.as_bytes(),
+        ]);
+        println!("Initial combined hash: {}", combined.to_hex());
+    }
+
+    // Verify initial hash against checkpoint header
+    println!();
+    println!("Verifying initial state at checkpoint {}...", init_checkpoint);
+    let init_cp_headers = archive.get_ledger_headers(init_checkpoint).await?;
+    if let Some(init_header) = init_cp_headers.iter().find(|h| h.header.ledger_seq == init_checkpoint) {
+        let expected_hash = Hash256::from(init_header.header.bucket_list_hash.0);
+        let our_hash = if let Some(ref hot_hash) = initial_hot_hash {
+            stellar_core_crypto::sha256_multi(&[
+                initial_live_hash.as_bytes(),
+                hot_hash.as_bytes(),
+            ])
+        } else {
+            initial_live_hash
+        };
+
+        if our_hash == expected_hash {
+            println!("  Checkpoint {}: INITIAL STATE OK", init_checkpoint);
+        } else {
+            println!("  Checkpoint {}: INITIAL STATE MISMATCH!", init_checkpoint);
+            println!("    Expected: {}", expected_hash.to_hex());
+            println!("    Got:      {}", our_hash.to_hex());
+            println!("    Live:     {}", initial_live_hash.to_hex());
+            if let Some(ref hot_hash) = initial_hot_hash {
+                println!("    Hot:      {}", hot_hash.to_hex());
+            }
+        }
+    } else {
+        println!("  Could not find header for checkpoint {}", init_checkpoint);
     }
     println!();
 
