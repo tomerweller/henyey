@@ -426,12 +426,10 @@ impl HotArchiveBucketList {
             )));
         }
 
-        let has_entries = !archived_entries.is_empty() || !restored_keys.is_empty();
-        let new_bucket = if !has_entries {
-            HotArchiveBucket::empty()
-        } else {
-            HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?
-        };
+        // Always create a fresh bucket with metadata, even when there are no entries.
+        // C++ stellar-core always calls HotArchiveBucket::fresh() which includes metadata,
+        // so we must do the same to ensure hash consistency.
+        let new_bucket = HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;
