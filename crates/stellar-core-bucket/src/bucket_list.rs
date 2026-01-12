@@ -189,10 +189,31 @@ impl BucketLevel {
 
         // Choose curr or empty based on shouldMergeWithEmptyCurr
         let curr_for_merge = if use_empty_curr {
+            tracing::debug!(
+                level = self.level,
+                "prepare_with_normalization: using EMPTY curr (shouldMergeWithEmptyCurr=true)"
+            );
             Bucket::empty()
         } else {
+            tracing::debug!(
+                level = self.level,
+                curr_hash = %self.curr.hash(),
+                curr_entries = self.curr.len(),
+                "prepare_with_normalization: using actual curr"
+            );
             self.curr.clone()
         };
+
+        tracing::debug!(
+            level = self.level,
+            curr_for_merge_hash = %curr_for_merge.hash(),
+            curr_for_merge_entries = curr_for_merge.len(),
+            incoming_hash = %incoming.hash(),
+            incoming_entries = incoming.len(),
+            keep_dead_entries = keep_dead_entries,
+            normalize_init = normalize_init,
+            "prepare_with_normalization: about to merge"
+        );
 
         // Merge curr (or empty) with the incoming bucket
         let merged = merge_buckets_with_options(
@@ -202,6 +223,14 @@ impl BucketLevel {
             protocol_version,
             normalize_init,
         )?;
+
+        tracing::debug!(
+            level = self.level,
+            merged_hash = %merged.hash(),
+            merged_entries = merged.len(),
+            "prepare_with_normalization: merge complete"
+        );
+
         self.next = Some(merged);
         Ok(())
     }
@@ -677,7 +706,8 @@ impl BucketList {
     }
 
     /// Returns true if a level should spill at a given ledger.
-    fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
+    /// This matches C++ stellar-core's `levelShouldSpill`.
+    pub fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
         if level == BUCKET_LIST_LEVELS - 1 {
             return false;
         }
@@ -788,6 +818,82 @@ impl BucketList {
         }
 
         Ok(Self { levels, ledger_seq: 0 })
+    }
+
+    /// Restart any pending merges after restoring from a History Archive State (HAS).
+    ///
+    /// When a bucket list is restored from HAS, there may be merges that should have been
+    /// in progress at that checkpoint ledger. This function recreates those pending merges
+    /// by examining the current and snap buckets and starting merges where appropriate.
+    ///
+    /// This matches C++ stellar-core's BucketListBase::restartMerges().
+    ///
+    /// For each level > 0 with no pending merge:
+    /// 1. Check if the previous level's snap is non-empty
+    /// 2. If so, start a merge using that snap
+    /// 3. The merge will be committed when the next spill occurs
+    pub fn restart_merges(&mut self, ledger: u32, protocol_version: u32) -> Result<()> {
+        tracing::debug!(
+            ledger = ledger,
+            "restart_merges: restarting pending merges after HAS restore"
+        );
+
+        for i in 1..BUCKET_LIST_LEVELS {
+            // Skip if there's already a pending merge
+            if self.levels[i].next.is_some() {
+                tracing::trace!(level = i, "restart_merges: level already has pending merge");
+                continue;
+            }
+
+            // Clone the previous level's snap to avoid borrow conflicts
+            let prev_snap = self.levels[i - 1].snap.clone();
+
+            // If the previous level's snap is empty, this and all higher levels
+            // are uninitialized (haven't received enough data yet)
+            if prev_snap.is_empty() {
+                tracing::debug!(
+                    level = i,
+                    "restart_merges: previous level snap is empty, stopping"
+                );
+                break;
+            }
+
+            // Calculate the ledger when this merge would have started
+            // This is roundDown(ledger, levelHalf(i - 1))
+            let merge_start_ledger = Self::round_down(ledger, Self::level_half(i - 1));
+
+            tracing::debug!(
+                level = i,
+                merge_start_ledger = merge_start_ledger,
+                prev_snap_hash = %prev_snap.hash(),
+                "restart_merges: restarting merge"
+            );
+
+            // Determine merge parameters
+            let keep_dead = Self::keep_tombstone_entries(i);
+            let normalize_init = !keep_dead;
+            let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
+
+            // Start the merge with the previous level's snap
+            self.levels[i].prepare_with_normalization(
+                merge_start_ledger,
+                protocol_version,
+                prev_snap,
+                keep_dead,
+                normalize_init,
+                use_empty_curr,
+            )?;
+
+            tracing::debug!(
+                level = i,
+                "restart_merges: merge restarted successfully"
+            );
+        }
+
+        // Update the ledger sequence to the restored ledger
+        self.ledger_seq = ledger;
+
+        Ok(())
     }
 
     /// Get statistics about the bucket list.

@@ -71,6 +71,8 @@ ERROR Hash mismatch - our computed header hash differs from network's prev_ledge
 
 **Enhanced verify-execution Tool (Commit 3a92735):** Added header hash verification to verify-execution tool. The tool now compares bucket_list_hash, fee_pool, tx_result_hash, and overall header_hash against CDP expected values.
 
+**restart_merges Implementation (2026-01-11):** After restoring bucket list from HAS, we now call `restart_merges()` to recreate pending merges that should have been in progress at the checkpoint. This matches C++ stellar-core's `BucketListBase::restartMerges()`. **Result:** Bucket levels 1+ now have non-empty curr buckets after catchup (they were previously empty). However, the hash still doesn't match - the merge results themselves differ from C++.
+
 ### ROOT CAUSE IDENTIFIED: Bucket List snap() Bug
 
 **Key Finding:** The `BucketLevel::snap()` method was returning the WRONG bucket.
@@ -91,20 +93,30 @@ This caused the wrong bucket to be merged into the next level during spills, lea
 
 ### Verification Status
 
-**PARTIALLY FIXED (2026-01-11):** The snap() fix was necessary but not sufficient:
-- Node catches up successfully to checkpoint
-- Node can close 1 ledger after catchup (e.g., 435584)
-- Hash mismatch occurs when trying to close subsequent ledgers
-- verify-execution tool confirms bucket_list_hash divergence at all levels
+**PARTIALLY FIXED (2026-01-12):** The bucket list restoration from HAS is now verified correct. Multiple fixes have been applied:
 
-**verify-execution output (ledger 380000):**
-```
-Ledger 380000: HEADER MISMATCH
-  bucket_list_hash: ours=0757c234... expected=0d0d8ad0...
-  Level hashes show divergence at all 11 levels
-```
+1. **snap() fix:** Fixed the bucket level snap() method to return the correct bucket
+2. **restart_merges fix:** Added restart_merges() to recreate pending merges after HAS restore
+3. **Hot archive add_batch:** Added hot archive bucket list updates during verify-execution
 
-The snap() bug was one issue, but there's additional bucket list divergence that needs investigation.
+**Verified correct (2026-01-12):**
+- **HAS restore is correct:** The bucket list hash computed from HAS buckets at checkpoint 379903 matches the expected hash in the ledger header:
+  - Expected (from ledger header): `c1360254031d14858d00c48fc5cae3eb90b140be31094088c3dab41fe159c8e6`
+  - Computed (live + hot archive combined): `c1360254031d14858d00c48fc5cae3eb90b140be31094088c3dab41fe159c8e6` ✓
+- **restart_merges is correct:** The pending merges are correctly recreated using the right inputs (prev level's snap, with correct shouldMergeWithEmptyCurr)
+- **Merge order is correct:** The merge uses old_bucket=curr, new_bucket=snap, matching C++ behavior
+
+**Current investigation status:**
+The divergence appears to occur DURING ledger processing (add_batch), not during restore. However, we could not verify this because:
+- CDP data is not available for recent testnet checkpoints (404 errors)
+- Historical testnet archive data is pruned
+- The "buffered gap" issue (Issue #1) prevents live testing on testnet
+
+**Next steps to investigate:**
+1. Find or generate CDP test data for a known checkpoint
+2. Step through add_batch logic to compare with C++ behavior
+3. Check if INIT/LIVE/DEAD entry categorization matches C++
+4. Verify bucket entry ordering matches C++ (keys must be sorted identically)
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
@@ -265,6 +277,26 @@ INFO  Heartbeat tracking_slot=433383 ledger=433343 latest_ext=433382 peers=3 hea
 ---
 
 ## Recently Fixed Issues
+
+### Missing restart_merges After HAS Restore (Partial Fix)
+
+**Fix:** Implemented `restart_merges()` in `bucket_list.rs` and `hot_archive.rs`, called after restoring from HAS.
+
+When a bucket list is restored from a History Archive State (HAS), any pending merges that should have been in progress at that checkpoint must be recreated. This matches C++ stellar-core's `BucketListBase::restartMerges()`.
+
+**Implementation:**
+- For each level > 0 with no pending merge, check if the previous level's snap is non-empty
+- If so, calculate when the merge would have started: `roundDown(ledger, levelHalf(i-1))`
+- Start a merge using the previous level's snap bucket
+
+**Result:** Bucket levels 1+ now have non-empty curr buckets after catchup (they were previously all zeros). However, the merge results still differ from C++ stellar-core, indicating additional issues in the merge logic.
+
+**Files Modified:**
+- `crates/stellar-core-bucket/src/bucket_list.rs` - Added `restart_merges()` method
+- `crates/stellar-core-bucket/src/hot_archive.rs` - Added `restart_merges()` method
+- `crates/rs-stellar-core/src/main.rs` - Call `restart_merges()` after bucket list restoration
+
+---
 
 ### Bucket List snap() Bug (Partial Fix)
 

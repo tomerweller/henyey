@@ -1688,11 +1688,19 @@ async fn cmd_replay_bucket_list(
 
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
     // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
-    let hot_archive_bucket_list: Option<HotArchiveBucketList> = hot_archive_hashes.as_ref().map(|hashes| {
+    let mut hot_archive_bucket_list: Option<HotArchiveBucketList> = hot_archive_hashes.as_ref().map(|hashes| {
         HotArchiveBucketList::restore_from_hashes(hashes, |hash| {
             bucket_manager.load_hot_archive_bucket(hash)
         })
     }).transpose()?;
+
+    // Restart any pending merges that should have been in progress at the checkpoint.
+    // Use protocol version 25 (current testnet) for merge parameters.
+    let protocol_version = 25u32;
+    bucket_list.restart_merges(init_checkpoint, protocol_version)?;
+    if let Some(ref mut hot) = hot_archive_bucket_list {
+        hot.restart_merges(init_checkpoint, protocol_version)?;
+    }
 
     println!("Initial live bucket hash: {}", bucket_list.hash().to_hex());
     if let Some(ref hot) = hot_archive_bucket_list {
@@ -2067,6 +2075,16 @@ async fn cmd_verify_execution(
             bucket_manager.load_hot_archive_bucket(hash)
         })
     }).transpose()?.map(|bl| Arc::new(RwLock::new(bl)));
+
+    // Restart any pending merges that should have been in progress at the checkpoint.
+    // This is critical for correct bucket list hash computation after catchup.
+    // In C++ stellar-core, this is done by BucketListBase::restartMerges().
+    // Use protocol version 25 (current testnet) for merge parameters.
+    let protocol_version = 25u32;
+    bucket_list.write().unwrap().restart_merges(init_checkpoint, protocol_version)?;
+    if let Some(ref hot) = hot_archive_bucket_list {
+        hot.write().unwrap().restart_merges(init_checkpoint, protocol_version)?;
+    }
 
     if !quiet {
         println!("Initial live bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
@@ -2673,32 +2691,48 @@ async fn cmd_verify_execution(
                     all_live,
                     all_dead,
                 )?;
+
+                // Hot archive bucket list must also have add_batch called for spill consistency
+                // even though we don't have full archived entry data from CDP
+                if cdp_header.ledger_version >= 23 {
+                    if let Some(ref hot_archive) = hot_archive_bucket_list {
+                        hot_archive.write().unwrap().add_batch(
+                            seq,
+                            cdp_header.ledger_version,
+                            vec![], // No archived entries from CDP
+                            vec![], // No restored keys from CDP
+                        )?;
+                    }
+                }
             }
 
             // Header verification: Compare our computed header fields against CDP
             if in_test_range {
                 // 1. Compute bucket list hash
-                let our_bucket_list_hash = {
-                    let bl = bucket_list.read().unwrap();
-                    let live_hash = bl.hash();
+                let bl = bucket_list.read().unwrap();
+                let our_live_hash = bl.hash();
+                drop(bl);
 
+                let our_hot_hash = hot_archive_bucket_list.as_ref()
+                    .map(|hot| hot.read().unwrap().hash());
+
+                let our_bucket_list_hash = {
                     // For Protocol 23+, combine live and hot archive hashes
                     if cdp_header.ledger_version >= 23 {
-                        if let Some(ref hot_archive) = hot_archive_bucket_list {
+                        if let Some(hot_hash) = our_hot_hash {
                             use sha2::{Digest, Sha256};
-                            let hot_hash = hot_archive.read().unwrap().hash();
                             let mut hasher = Sha256::new();
-                            hasher.update(live_hash.as_bytes());
+                            hasher.update(our_live_hash.as_bytes());
                             hasher.update(hot_hash.as_bytes());
                             let result = hasher.finalize();
                             let mut bytes = [0u8; 32];
                             bytes.copy_from_slice(&result);
                             Hash256::from_bytes(bytes)
                         } else {
-                            live_hash
+                            our_live_hash
                         }
                     } else {
-                        live_hash
+                        our_live_hash
                     }
                 };
                 let expected_bucket_list_hash = Hash256::from(cdp_header.bucket_list_hash.0);
@@ -2767,6 +2801,36 @@ async fn cmd_verify_execution(
                     if !bucket_list_matches {
                         println!("    bucket_list_hash: ours={} expected={}",
                             our_bucket_list_hash.to_hex(), expected_bucket_list_hash.to_hex());
+                        println!("    live_hash:        {}", our_live_hash.to_hex());
+                        if let Some(hot_hash) = our_hot_hash {
+                            println!("    hot_archive_hash: {}", hot_hash.to_hex());
+                        }
+                        // Print which levels should have spilled at this ledger
+                        let spilling_levels: Vec<usize> = (0..10)
+                            .filter(|&lvl| stellar_core_bucket::BucketList::level_should_spill(seq, lvl))
+                            .collect();
+                        if !spilling_levels.is_empty() {
+                            println!("    Levels that spilled at ledger {}: {:?}", seq, spilling_levels);
+                        }
+                        // Print level-by-level hashes for debugging
+                        let bl = bucket_list.read().unwrap();
+                        println!("    Level-by-level live bucket hashes:");
+                        for i in 0..11 {
+                            if let Some(level) = bl.level(i) {
+                                let curr_hash = level.curr.hash();
+                                let snap_hash = level.snap.hash();
+                                let level_hash = {
+                                    use sha2::{Digest, Sha256};
+                                    let mut hasher = Sha256::new();
+                                    hasher.update(curr_hash.as_bytes());
+                                    hasher.update(snap_hash.as_bytes());
+                                    let result = hasher.finalize();
+                                    hex::encode(&result[..8])
+                                };
+                                println!("      L{}: curr={}... snap={}... (level_hash={}...)",
+                                    i, &curr_hash.to_hex()[..16], &snap_hash.to_hex()[..16], level_hash);
+                            }
+                        }
                     }
                     if !fee_pool_matches {
                         println!("    fee_pool: ours={} expected={} (prev={} + fees={})",
@@ -2930,9 +2994,12 @@ async fn cmd_debug_bucket_entry(
     }
 
     // Restore bucket list
-    let bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
+    let mut bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
         bucket_manager.load_bucket(hash).map(|b| (*b).clone())
     })?;
+
+    // Restart pending merges (for correct state)
+    bucket_list.restart_merges(checkpoint_seq, 25)?;
 
     println!("Bucket list hash: {}", bucket_list.hash().to_hex());
     println!();

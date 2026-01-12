@@ -619,6 +619,76 @@ impl HotArchiveBucketList {
 
         Ok(Self { levels, ledger_seq: 0 })
     }
+
+    /// Restart any pending merges after restoring from a History Archive State (HAS).
+    ///
+    /// When a hot archive bucket list is restored from HAS, there may be merges that should
+    /// have been in progress at that checkpoint ledger. This function recreates those pending
+    /// merges by examining the current and snap buckets and starting merges where appropriate.
+    ///
+    /// This matches C++ stellar-core's BucketListBase::restartMerges() for hot archive.
+    pub fn restart_merges(&mut self, ledger: u32, protocol_version: u32) -> Result<()> {
+        tracing::debug!(
+            ledger = ledger,
+            "hot_archive restart_merges: restarting pending merges after HAS restore"
+        );
+
+        for i in 1..HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            // Skip if there's already a pending merge
+            if self.levels[i].next.is_some() {
+                tracing::trace!(
+                    level = i,
+                    "hot_archive restart_merges: level already has pending merge"
+                );
+                continue;
+            }
+
+            // Clone the previous level's snap to avoid borrow conflicts
+            let prev_snap = self.levels[i - 1].snap.clone();
+
+            // If the previous level's snap is empty, this and all higher levels
+            // are uninitialized (haven't received enough data yet)
+            if prev_snap.is_empty() {
+                tracing::debug!(
+                    level = i,
+                    "hot_archive restart_merges: previous level snap is empty, stopping"
+                );
+                break;
+            }
+
+            // Calculate the ledger when this merge would have started
+            let merge_start_ledger = Self::round_down(ledger, Self::level_half(i - 1));
+
+            tracing::debug!(
+                level = i,
+                merge_start_ledger = merge_start_ledger,
+                prev_snap_hash = %prev_snap.hash(),
+                "hot_archive restart_merges: restarting merge"
+            );
+
+            // Determine merge parameters
+            let keep_tombstones = Self::keep_tombstone_entries(i);
+            let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
+
+            // Start the merge with the previous level's snap
+            self.levels[i].prepare(
+                protocol_version,
+                prev_snap,
+                keep_tombstones,
+                use_empty_curr,
+            )?;
+
+            tracing::debug!(
+                level = i,
+                "hot_archive restart_merges: merge restarted successfully"
+            );
+        }
+
+        // Update the ledger sequence to the restored ledger
+        self.ledger_seq = ledger;
+
+        Ok(())
+    }
 }
 
 impl Default for HotArchiveBucketList {
