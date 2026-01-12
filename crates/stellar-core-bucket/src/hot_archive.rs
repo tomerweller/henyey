@@ -46,8 +46,12 @@ pub const HOT_ARCHIVE_BUCKET_LIST_LEVELS: usize = 11;
 /// A hot archive bucket containing archived persistent Soroban entries.
 #[derive(Clone, Debug)]
 pub struct HotArchiveBucket {
-    /// Entries in the bucket, indexed by key.
+    /// Entries in the bucket, indexed by key (for lookups).
     entries: BTreeMap<Vec<u8>, HotArchiveBucketEntry>,
+    /// Entries in original/sorted order (for hash computation).
+    /// This preserves C++ stellar-core's entry order which uses semantic comparison,
+    /// not XDR byte comparison.
+    ordered_entries: Vec<HotArchiveBucketEntry>,
     /// Hash of the bucket contents.
     hash: Hash256,
 }
@@ -57,21 +61,29 @@ impl HotArchiveBucket {
     pub fn empty() -> Self {
         Self {
             entries: BTreeMap::new(),
+            ordered_entries: Vec::new(),
             hash: Hash256::from_bytes([0u8; 32]),
         }
     }
 
     /// Create a hot archive bucket from entries.
+    ///
+    /// **Important**: The entries MUST be pre-sorted in C++ stellar-core order
+    /// (using LedgerEntryIdCmp comparison). The entries are stored in the
+    /// provided order for hash computation.
     pub fn from_entries(entries: Vec<HotArchiveBucketEntry>) -> Result<Self> {
+        let mut entry_map = BTreeMap::new();
+
+        for entry in &entries {
+            let key = hot_archive_entry_to_key(entry)?;
+            entry_map.insert(key, entry.clone());
+        }
+
         let mut bucket = Self {
-            entries: BTreeMap::new(),
+            entries: entry_map,
+            ordered_entries: entries,
             hash: Hash256::from_bytes([0u8; 32]),
         };
-
-        for entry in entries {
-            let key = hot_archive_entry_to_key(&entry)?;
-            bucket.entries.insert(key, entry);
-        }
 
         bucket.hash = bucket.compute_hash()?;
         Ok(bucket)
@@ -104,7 +116,21 @@ impl HotArchiveBucket {
             entries.push(HotArchiveBucketEntry::Live(key));
         }
 
-        Self::from_entries(entries)
+        // Sort entries using C++ stellar-core's comparison order
+        // This matches BucketEntryIdCmp<HotArchiveBucket>
+        entries.sort_by(compare_hot_archive_entries);
+
+        let bucket = Self::from_entries(entries)?;
+
+        // Debug: log the fresh bucket creation
+        tracing::debug!(
+            version = protocol_version,
+            num_entries = bucket.ordered_entries.len(),
+            hash = %bucket.hash,
+            "hot_archive fresh: created bucket"
+        );
+
+        Ok(bucket)
     }
 
     /// Get the hash of this bucket.
@@ -122,6 +148,20 @@ impl HotArchiveBucket {
         self.entries.len()
     }
 
+    /// Get the protocol version (bucket version) from the metadata entry.
+    ///
+    /// This matches C++ stellar-core's `getBucketVersion()` method.
+    /// Returns the ledger_version from the bucket's metadata entry, or 0 if no metadata.
+    pub fn get_protocol_version(&self) -> u32 {
+        // Metadata entry is stored with empty key
+        if let Some(entry) = self.entries.get(&Vec::new()) {
+            if let HotArchiveBucketEntry::Metaentry(meta) = entry {
+                return meta.ledger_version;
+            }
+        }
+        0
+    }
+
     /// Look up an entry by key.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<&HotArchiveBucketEntry>> {
         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
@@ -136,16 +176,34 @@ impl HotArchiveBucket {
     }
 
     /// Compute the hash of the bucket contents.
+    ///
+    /// This must match C++ stellar-core's bucket hashing:
+    /// Each entry is written with an XDR record mark (4-byte size prefix with high bit set),
+    /// and the hash is computed over the entire serialized content including record marks.
+    ///
+    /// **Important**: We iterate over `ordered_entries` which preserves the original
+    /// entry order from the file or from fresh() sorting. This is critical because
+    /// C++ uses semantic comparison (LedgerEntryIdCmp) which differs from XDR byte order.
     fn compute_hash(&self) -> Result<Hash256> {
-        if self.entries.is_empty() {
+        if self.ordered_entries.is_empty() {
             return Ok(Hash256::from_bytes([0u8; 32]));
         }
 
         let mut hasher = Sha256::new();
-        for entry in self.entries.values() {
+        for entry in &self.ordered_entries {
             let bytes = entry.to_xdr(Limits::none()).map_err(|e| {
                 BucketError::Serialization(format!("failed to serialize entry: {}", e))
             })?;
+
+            // Write XDR record mark: 4-byte size (big-endian) with high bit set
+            let sz = bytes.len() as u32;
+            let record_mark: [u8; 4] = [
+                ((sz >> 24) & 0xFF) as u8 | 0x80, // High bit set as continuation bit
+                ((sz >> 16) & 0xFF) as u8,
+                ((sz >> 8) & 0xFF) as u8,
+                (sz & 0xFF) as u8,
+            ];
+            hasher.update(&record_mark);
             hasher.update(&bytes);
         }
 
@@ -177,12 +235,14 @@ impl HotArchiveBucket {
     /// Create a hot archive bucket from uncompressed XDR bytes.
     ///
     /// Parses bucket files using XDR Record Marking Standard (RFC 5531).
+    /// Preserves the original file order for hash computation.
     pub fn from_xdr_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() {
             return Ok(Self::empty());
         }
 
         let mut entries = BTreeMap::new();
+        let mut ordered_entries = Vec::new();
         let mut offset = 0;
 
         // Check if the file uses XDR record marking (high bit set in first 4 bytes)
@@ -221,7 +281,8 @@ impl HotArchiveBucket {
                 match HotArchiveBucketEntry::from_xdr(record_data, Limits::none()) {
                     Ok(entry) => {
                         let key = hot_archive_entry_to_key(&entry)?;
-                        entries.insert(key, entry);
+                        entries.insert(key, entry.clone());
+                        ordered_entries.push(entry);
                     }
                     Err(e) => {
                         return Err(BucketError::Serialization(format!(
@@ -243,7 +304,8 @@ impl HotArchiveBucket {
                 match HotArchiveBucketEntry::read_xdr(&mut limited) {
                     Ok(entry) => {
                         let key = hot_archive_entry_to_key(&entry)?;
-                        entries.insert(key, entry);
+                        entries.insert(key, entry.clone());
+                        ordered_entries.push(entry);
                     }
                     Err(_) => {
                         // End of stream or error
@@ -256,7 +318,11 @@ impl HotArchiveBucket {
         // Compute hash from raw bytes (including record marks)
         let hash = Hash256::hash(bytes);
 
-        Ok(Self { entries, hash })
+        Ok(Self {
+            entries,
+            ordered_entries,
+            hash,
+        })
     }
 }
 
@@ -426,10 +492,26 @@ impl HotArchiveBucketList {
             )));
         }
 
+        // IMPORTANT: C++ stellar-core uses mLedger (the bucket list's current ledger before
+        // this call) as the "protocolVersion" for HotArchiveBucket::fresh(), not the actual
+        // protocol version. This is technically wrong (ledger seq != protocol version), but
+        // we must match it for hash consistency.
+        // See: HotArchiveBucketList::addBatch() calls fresh() with mLedger.
+        let bucket_version = self.ledger_seq;
+
+        tracing::debug!(
+            ledger_seq = ledger_seq,
+            bucket_version = bucket_version,
+            protocol_version = protocol_version,
+            num_archived = archived_entries.len(),
+            num_restored = restored_keys.len(),
+            "hot_archive add_batch: creating fresh bucket"
+        );
+
         // Always create a fresh bucket with metadata, even when there are no entries.
         // C++ stellar-core always calls HotArchiveBucket::fresh() which includes metadata,
         // so we must do the same to ensure hash consistency.
-        let new_bucket = HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
+        let new_bucket = HotArchiveBucket::fresh(bucket_version, archived_entries, restored_keys)?;
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;
@@ -668,9 +750,14 @@ impl HotArchiveBucketList {
             let keep_tombstones = Self::keep_tombstone_entries(i);
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
+            // Use the protocol version from the snap bucket's metadata, matching C++ behavior.
+            // C++ stellar-core's restartMerges uses snap->getBucketVersion() for the merge.
+            let bucket_version = prev_snap.get_protocol_version();
+            let version_to_use = if bucket_version > 0 { bucket_version } else { protocol_version };
+
             // Start the merge with the previous level's snap
             self.levels[i].prepare(
-                protocol_version,
+                version_to_use,
                 prev_snap,
                 keep_tombstones,
                 use_empty_curr,
@@ -734,6 +821,346 @@ fn hot_archive_entry_to_key(entry: &HotArchiveBucketEntry) -> Result<Vec<u8>> {
             // Metadata uses a special key (empty)
             Ok(Vec::new())
         }
+    }
+}
+
+/// Compare two hot archive bucket entries for sorting, matching C++ stellar-core's
+/// `BucketEntryIdCmp<HotArchiveBucket>`.
+///
+/// Comparison order:
+/// 1. Metaentry always comes first
+/// 2. For other entries, compare by LedgerKey using the same order as C++
+pub fn compare_hot_archive_entries(
+    a: &HotArchiveBucketEntry,
+    b: &HotArchiveBucketEntry,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // Metaentry always sorts first
+    match (a, b) {
+        (HotArchiveBucketEntry::Metaentry(_), HotArchiveBucketEntry::Metaentry(_)) => {
+            return Ordering::Equal;
+        }
+        (HotArchiveBucketEntry::Metaentry(_), _) => {
+            return Ordering::Less;
+        }
+        (_, HotArchiveBucketEntry::Metaentry(_)) => {
+            return Ordering::Greater;
+        }
+        _ => {}
+    }
+
+    // Get LedgerKey from each entry
+    let key_a = match a {
+        HotArchiveBucketEntry::Archived(e) => ledger_entry_to_key(e),
+        HotArchiveBucketEntry::Live(k) => Some(k.clone()),
+        HotArchiveBucketEntry::Metaentry(_) => unreachable!(),
+    };
+
+    let key_b = match b {
+        HotArchiveBucketEntry::Archived(e) => ledger_entry_to_key(e),
+        HotArchiveBucketEntry::Live(k) => Some(k.clone()),
+        HotArchiveBucketEntry::Metaentry(_) => unreachable!(),
+    };
+
+    match (key_a, key_b) {
+        (Some(ka), Some(kb)) => compare_ledger_keys(&ka, &kb),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Compare two LedgerKeys using the same order as C++ stellar-core's `LedgerEntryIdCmp`.
+///
+/// This matches the comparison order used in bucket files.
+fn compare_ledger_keys(a: &LedgerKey, b: &LedgerKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    use stellar_xdr::curr::LedgerKey::*;
+
+    // Compare by type first
+    let type_a = ledger_key_type_discriminant(a);
+    let type_b = ledger_key_type_discriminant(b);
+    if type_a != type_b {
+        return type_a.cmp(&type_b);
+    }
+
+    // Same type, compare by type-specific fields
+    match (a, b) {
+        (Account(a), Account(b)) => a.account_id.cmp(&b.account_id),
+        (Trustline(a), Trustline(b)) => {
+            match a.account_id.cmp(&b.account_id) {
+                Ordering::Equal => compare_trust_line_asset(&a.asset, &b.asset),
+                other => other,
+            }
+        }
+        (Offer(a), Offer(b)) => {
+            match a.seller_id.cmp(&b.seller_id) {
+                Ordering::Equal => a.offer_id.cmp(&b.offer_id),
+                other => other,
+            }
+        }
+        (Data(a), Data(b)) => {
+            match a.account_id.cmp(&b.account_id) {
+                Ordering::Equal => a.data_name.as_slice().cmp(b.data_name.as_slice()),
+                other => other,
+            }
+        }
+        (ClaimableBalance(a), ClaimableBalance(b)) => {
+            compare_claimable_balance_id(&a.balance_id, &b.balance_id)
+        }
+        (LiquidityPool(a), LiquidityPool(b)) => {
+            a.liquidity_pool_id.0.cmp(&b.liquidity_pool_id.0)
+        }
+        (ContractData(a), ContractData(b)) => {
+            match compare_sc_address(&a.contract, &b.contract) {
+                Ordering::Equal => {
+                    match compare_sc_val(&a.key, &b.key) {
+                        Ordering::Equal => (a.durability as i32).cmp(&(b.durability as i32)),
+                        other => other,
+                    }
+                }
+                other => other,
+            }
+        }
+        (ContractCode(a), ContractCode(b)) => a.hash.0.cmp(&b.hash.0),
+        (ConfigSetting(a), ConfigSetting(b)) => {
+            (a.config_setting_id as i32).cmp(&(b.config_setting_id as i32))
+        }
+        (Ttl(a), Ttl(b)) => a.key_hash.0.cmp(&b.key_hash.0),
+        _ => Ordering::Equal, // Different types should not reach here
+    }
+}
+
+fn ledger_key_type_discriminant(k: &LedgerKey) -> i32 {
+    use stellar_xdr::curr::LedgerKey::*;
+    match k {
+        Account(_) => 0,
+        Trustline(_) => 1,
+        Offer(_) => 2,
+        Data(_) => 3,
+        ClaimableBalance(_) => 4,
+        LiquidityPool(_) => 5,
+        ContractData(_) => 6,
+        ContractCode(_) => 7,
+        ConfigSetting(_) => 8,
+        Ttl(_) => 9,
+    }
+}
+
+fn compare_trust_line_asset(
+    a: &stellar_xdr::curr::TrustLineAsset,
+    b: &stellar_xdr::curr::TrustLineAsset,
+) -> std::cmp::Ordering {
+    use stellar_xdr::curr::TrustLineAsset::*;
+    use std::cmp::Ordering;
+
+    let type_a = match a {
+        Native => 0,
+        CreditAlphanum4(_) => 1,
+        CreditAlphanum12(_) => 2,
+        PoolShare(_) => 3,
+    };
+    let type_b = match b {
+        Native => 0,
+        CreditAlphanum4(_) => 1,
+        CreditAlphanum12(_) => 2,
+        PoolShare(_) => 3,
+    };
+
+    if type_a != type_b {
+        return type_a.cmp(&type_b);
+    }
+
+    match (a, b) {
+        (Native, Native) => Ordering::Equal,
+        (CreditAlphanum4(a), CreditAlphanum4(b)) => {
+            match a.asset_code.cmp(&b.asset_code) {
+                Ordering::Equal => a.issuer.cmp(&b.issuer),
+                other => other,
+            }
+        }
+        (CreditAlphanum12(a), CreditAlphanum12(b)) => {
+            match a.asset_code.cmp(&b.asset_code) {
+                Ordering::Equal => a.issuer.cmp(&b.issuer),
+                other => other,
+            }
+        }
+        (PoolShare(a), PoolShare(b)) => a.0.cmp(&b.0),
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_claimable_balance_id(
+    a: &stellar_xdr::curr::ClaimableBalanceId,
+    b: &stellar_xdr::curr::ClaimableBalanceId,
+) -> std::cmp::Ordering {
+    use stellar_xdr::curr::ClaimableBalanceId::*;
+    match (a, b) {
+        (ClaimableBalanceIdTypeV0(a), ClaimableBalanceIdTypeV0(b)) => a.0.cmp(&b.0),
+    }
+}
+
+fn compare_sc_address(
+    a: &stellar_xdr::curr::ScAddress,
+    b: &stellar_xdr::curr::ScAddress,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // Compare by type discriminant first, then by content
+    // Use XDR byte comparison for simplicity
+    let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+    let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+    a_bytes.cmp(&b_bytes)
+}
+
+/// Compare two ScVal values using the same order as C++ stellar-core.
+///
+/// This uses XDR byte comparison as a fallback for complex types,
+/// which should be correct for most practical cases.
+fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) -> std::cmp::Ordering {
+    use stellar_xdr::curr::ScVal::*;
+    use std::cmp::Ordering;
+
+    // Compare by type discriminant first
+    let type_a = sc_val_type_discriminant(a);
+    let type_b = sc_val_type_discriminant(b);
+    if type_a != type_b {
+        return type_a.cmp(&type_b);
+    }
+
+    // Same type, compare by value
+    match (a, b) {
+        (Bool(a), Bool(b)) => a.cmp(b),
+        (Void, Void) => Ordering::Equal,
+        (Error(a), Error(b)) => {
+            // Compare by XDR bytes
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+        (U32(a), U32(b)) => a.cmp(b),
+        (I32(a), I32(b)) => a.cmp(b),
+        (U64(a), U64(b)) => a.cmp(b),
+        (I64(a), I64(b)) => a.cmp(b),
+        (Timepoint(a), Timepoint(b)) => a.cmp(b),
+        (Duration(a), Duration(b)) => a.cmp(b),
+        (U128(a), U128(b)) => {
+            match a.hi.cmp(&b.hi) {
+                Ordering::Equal => a.lo.cmp(&b.lo),
+                other => other,
+            }
+        }
+        (I128(a), I128(b)) => {
+            match a.hi.cmp(&b.hi) {
+                Ordering::Equal => a.lo.cmp(&b.lo),
+                other => other,
+            }
+        }
+        (U256(a), U256(b)) => {
+            for (a_part, b_part) in [
+                (a.hi_hi, b.hi_hi),
+                (a.hi_lo, b.hi_lo),
+                (a.lo_hi, b.lo_hi),
+                (a.lo_lo, b.lo_lo),
+            ] {
+                match a_part.cmp(&b_part) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            Ordering::Equal
+        }
+        (I256(a), I256(b)) => {
+            // I256 has mixed types for hi/lo parts, use XDR bytes
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+        (Bytes(a), Bytes(b)) => a.as_slice().cmp(b.as_slice()),
+        (String(a), String(b)) => a.as_slice().cmp(b.as_slice()),
+        (Symbol(a), Symbol(b)) => a.as_slice().cmp(b.as_slice()),
+        (Vec(a_opt), Vec(b_opt)) => {
+            match (a_opt, b_opt) {
+                (Some(a), Some(b)) => {
+                    for (a_elem, b_elem) in a.iter().zip(b.iter()) {
+                        match compare_sc_val(a_elem, b_elem) {
+                            Ordering::Equal => continue,
+                            other => return other,
+                        }
+                    }
+                    a.len().cmp(&b.len())
+                }
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            }
+        }
+        (Map(a_opt), Map(b_opt)) => {
+            match (a_opt, b_opt) {
+                (Some(a), Some(b)) => {
+                    for (a_entry, b_entry) in a.iter().zip(b.iter()) {
+                        match compare_sc_val(&a_entry.key, &b_entry.key) {
+                            Ordering::Equal => {
+                                match compare_sc_val(&a_entry.val, &b_entry.val) {
+                                    Ordering::Equal => continue,
+                                    other => return other,
+                                }
+                            }
+                            other => return other,
+                        }
+                    }
+                    a.len().cmp(&b.len())
+                }
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            }
+        }
+        (Address(a), Address(b)) => compare_sc_address(a, b),
+        (LedgerKeyContractInstance, LedgerKeyContractInstance) => Ordering::Equal,
+        (LedgerKeyNonce(a), LedgerKeyNonce(b)) => a.nonce.cmp(&b.nonce),
+        (ContractInstance(a), ContractInstance(b)) => {
+            // Compare by XDR bytes as fallback
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+        // For any remaining cases, use XDR byte comparison
+        _ => {
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+    }
+}
+
+fn sc_val_type_discriminant(v: &stellar_xdr::curr::ScVal) -> i32 {
+    use stellar_xdr::curr::ScVal::*;
+    // Values must match XDR ScValType enum discriminants
+    match v {
+        Bool(_) => 0,
+        Void => 1,
+        Error(_) => 2,
+        U32(_) => 3,
+        I32(_) => 4,
+        U64(_) => 5,
+        I64(_) => 6,
+        Timepoint(_) => 7,
+        Duration(_) => 8,
+        U128(_) => 9,
+        I128(_) => 10,
+        U256(_) => 11,
+        I256(_) => 12,
+        Bytes(_) => 13,
+        String(_) => 14,
+        Symbol(_) => 15,
+        Vec(_) => 16,
+        Map(_) => 17,
+        Address(_) => 18,
+        ContractInstance(_) => 19,
+        LedgerKeyContractInstance => 20,
+        LedgerKeyNonce(_) => 21,
     }
 }
 
@@ -820,6 +1247,10 @@ pub fn merge_hot_archive_buckets(
 
     // Add merged entries
     result_entries.extend(merged_entries.into_values());
+
+    // Sort entries using C++ stellar-core's comparison order
+    // This is critical for hash consistency with C++
+    result_entries.sort_by(compare_hot_archive_entries);
 
     HotArchiveBucket::from_entries(result_entries)
 }

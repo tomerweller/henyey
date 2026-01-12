@@ -199,17 +199,32 @@ This matches C++ behavior where `HotArchiveBucket::fresh()` is always called, cr
 - Live bucket list works correctly (0 mismatches in live-only mode)
 
 **Observations:**
-- No evictions occurring in test ledger range (evicted_keys is empty)
-- Hot archive hash changes from `80821fbe...` to `e2d90763...` on first ledger
-- This change happens even with empty archived_entries and restored_keys
-- Likely caused by spills committing pending merges from restart_merges
-- The same spills should happen in C++, so why does the expected hash differ?
+- Evictions at ledger 379965 archive 3 entries into hot archive
+- Hot archive hash changes from initial `464dd144...` to `80821fbe...` after processing
+- Expected combined hash at 379967: `dfd52ae9...`, got: `4a15b298...`
 
-**Remaining Potential Root Causes:**
-1. Protocol version mismatch in restart_merges - C++ uses bucket's metadata version, we use passed parameter
-2. Subtle difference in spill timing logic for hot archive
-3. Bucket hash computation difference (entry ordering, serialization)
-4. Difference in how merge results are computed
+**Extensive Investigation (2026-01-12):**
+
+1. **Hash computation with XDR record marks (Fixed):** C++ bucket hash includes 4-byte XDR record marks (size prefix with high bit set) for each entry. Fixed `compute_hash()` to include record marks.
+
+2. **Entry order preservation (Fixed):** C++ bucket files have entries in semantic order (using LedgerEntryIdCmp), not XDR byte order. Added `ordered_entries` Vec to preserve file order for loaded buckets and implemented C++ comparison function for fresh buckets.
+
+3. **Metadata version in fresh buckets (Fixed):** C++ HotArchiveBucketList::addBatch uses `mLedger` (previous ledger seq) as the protocol version for fresh buckets, not the actual protocol version. Fixed to match.
+
+4. **Round-trip hash verification:** After fixing entry ordering, loaded buckets now have matching hashes when recomputed. No more round-trip mismatch warnings.
+
+**C++ Comparison Implementation:** Added `compare_hot_archive_entries()` and supporting functions that match C++ `BucketEntryIdCmp`:
+- Metadata entries sort first
+- Other entries compared by LedgerKey using `compare_ledger_keys()`
+- CONTRACT_DATA compared by: contract (ScAddress), key (ScVal), durability
+- ScAddress and ScVal compared using XDR byte comparison for complex types
+
+**Remaining Issue:** Fresh bucket hashes still differ from C++. Possible causes:
+1. Subtle difference in comparison order for specific ScVal types
+2. Difference in how entries are extracted/serialized before sorting
+3. Something different about how C++ processes the same entries
+
+The issue requires deeper debugging with actual entry-level comparison to identify why our sorted order differs from C++'s.
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger
