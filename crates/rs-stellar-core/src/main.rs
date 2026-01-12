@@ -1582,10 +1582,10 @@ async fn cmd_replay_bucket_list(
     cdp_url: &str,
     cdp_date: &str,
 ) -> anyhow::Result<()> {
-    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList};
+    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList, is_persistent_entry};
     use stellar_core_common::Hash256;
     use stellar_core_history::{HistoryArchive, checkpoint};
-    use stellar_core_history::cdp::{CdpDataLake, extract_transaction_metas, extract_evicted_keys, extract_upgrade_metas};
+    use stellar_core_history::cdp::{CdpDataLake, extract_transaction_metas, extract_evicted_keys, extract_upgrade_metas, extract_restored_keys};
     use stellar_core_history::replay::extract_ledger_changes;
 
     println!("Bucket List Replay Test");
@@ -1599,8 +1599,8 @@ async fn cmd_replay_bucket_list(
     } else {
         println!();
         println!("NOTE: For protocol 23+, the header stores SHA256(live || hot_archive).");
-        println!("      Hot archive updates require entry lookup (not yet implemented).");
-        println!("      Use --live-only to test live bucket list without hot archive.");
+        println!("      Hot archive entries are looked up from live bucket list before eviction.");
+        println!("      Use --live-only to test only the live bucket list hash.");
     }
     println!();
 
@@ -1782,6 +1782,33 @@ async fn cmd_replay_bucket_list(
                 }
             }
 
+            // Before evicting entries from the live bucket list, look up full entry data
+            // for persistent entries that need to go to the hot archive.
+            // We must do this BEFORE adding to dead_entries since the entries will be gone after add_batch.
+            let mut archived_entries = Vec::new();
+            if !live_only && hot_archive_bucket_list.is_some() {
+                for key in &evicted_keys {
+                    // Skip TTL keys - they don't go to hot archive
+                    if matches!(key, stellar_xdr::curr::LedgerKey::Ttl(_)) {
+                        continue;
+                    }
+                    // Look up the full entry in the bucket list
+                    if let Ok(Some(entry)) = bucket_list.get(key) {
+                        // Only persistent entries go to hot archive
+                        if is_persistent_entry(&entry) {
+                            archived_entries.push(entry);
+                        }
+                    }
+                }
+            }
+
+            // Extract restored keys from transaction meta (entries restored from hot archive)
+            let restored_keys = if !live_only && hot_archive_bucket_list.is_some() {
+                extract_restored_keys(&tx_metas)
+            } else {
+                Vec::new()
+            };
+
             // Add evicted keys to dead entries (they're removed from live bucket list)
             dead_entries.extend(evicted_keys);
 
@@ -1795,11 +1822,15 @@ async fn cmd_replay_bucket_list(
                 dead_entries,
             )?;
 
-            // Note: Hot archive updates would require looking up the evicted entries
-            // from the live bucket list before they're deleted. For now, we skip hot
-            // archive updates since the XDR doesn't provide the full entry data.
-            // This means the hot archive hash won't be updated, but we still test
-            // the live bucket list functionality.
+            // Update hot archive bucket list with archived/restored entries
+            if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+                hot_archive.add_batch(
+                    seq,
+                    header.ledger_version,
+                    archived_entries,
+                    restored_keys,
+                )?;
+            }
 
             // Compute hash for comparison
             // If live_only, we just compare the live bucket list hash

@@ -126,7 +126,7 @@ pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 // Entry types and comparison
 // ============================================================================
 
-pub use entry::{compare_entries, compare_keys, ledger_entry_to_key, BucketEntry};
+pub use entry::{compare_entries, compare_keys, is_persistent_entry, ledger_entry_to_key, BucketEntry};
 
 // ============================================================================
 // Error handling

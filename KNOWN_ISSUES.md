@@ -127,16 +127,24 @@ Tested with `replay-bucket-list --live-only` which verifies only the live bucket
 - **Result:** 0 mismatches across all tested ledgers
 - This confirms the live bucket list implementation is now correct
 
-The remaining issue is with the **hot archive bucket list**, which is not being updated correctly:
-- Hot archive requires `archived_entries` (evicted Soroban entries) and `restored_keys` (entries restored from archive)
-- These entries are not currently being extracted from CDP transaction meta
-- The replay tool passes empty vectors to hot_archive.add_batch()
-- This is a known limitation - hot archive updates need full eviction/restore data
+The remaining issue is with the **hot archive bucket list**. Hot archive entry extraction has been implemented but the combined hash still doesn't match:
 
-**Next Steps for Hot Archive:**
-1. Extract archived entries from transaction meta (evicted persistent data/code)
-2. Extract restored keys from transaction meta (restored entries)
-3. Pass these to hot_archive.add_batch() during replay
+**Implemented (2026-01-12):**
+1. Added `extract_restored_keys()` function to cdp.rs - extracts keys from `LedgerEntryChange::Restored` entries in transaction meta
+2. Before processing evicted keys, we look up full entry data from the bucket list for persistent entries
+3. Pass archived_entries and restored_keys to `hot_archive.add_batch()` during replay
+4. Exported `is_persistent_entry` from stellar-core-bucket for use in main.rs
+
+**Current Status:**
+- Live bucket list hash matches (0 mismatches in live-only mode)
+- Hot archive hash changes after first ledger but then stays constant
+- Combined hash still doesn't match expected value from header
+
+**Potential Issues:**
+1. There may be no actual evictions happening in the test ledgers
+2. The evicted_keys from CDP may not include all necessary entries
+3. The hot archive restart_merges may be computing a different initial state
+4. Timing difference between when evictions are processed vs when hashes are computed
 
 ### Symptoms
 - Node catches up successfully to a checkpoint ledger

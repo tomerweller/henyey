@@ -845,6 +845,86 @@ pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::Le
     }
 }
 
+/// Extract restored ledger keys from transaction metadata.
+/// These are entries that were restored from the hot archive back to the live bucket list.
+/// For the hot archive, these become "Live" markers indicating the entry was restored.
+pub fn extract_restored_keys(tx_metas: &[stellar_xdr::curr::TransactionMeta]) -> Vec<stellar_xdr::curr::LedgerKey> {
+    use stellar_xdr::curr::{LedgerEntryChange, TransactionMeta};
+
+    let mut restored_keys = Vec::new();
+
+    fn process_change(change: &LedgerEntryChange, restored_keys: &mut Vec<stellar_xdr::curr::LedgerKey>) {
+        if let LedgerEntryChange::Restored(entry) = change {
+            if let Some(key) = stellar_core_bucket::ledger_entry_to_key(entry) {
+                restored_keys.push(key);
+            }
+        }
+    }
+
+    for meta in tx_metas {
+        match meta {
+            TransactionMeta::V0(operations) => {
+                for op_meta in operations.iter() {
+                    for change in op_meta.changes.iter() {
+                        process_change(change, &mut restored_keys);
+                    }
+                }
+            }
+            TransactionMeta::V1(v1) => {
+                for change in v1.tx_changes.iter() {
+                    process_change(change, &mut restored_keys);
+                }
+                for op_changes in v1.operations.iter() {
+                    for change in op_changes.changes.iter() {
+                        process_change(change, &mut restored_keys);
+                    }
+                }
+            }
+            TransactionMeta::V2(v2) => {
+                for change in v2.tx_changes_before.iter() {
+                    process_change(change, &mut restored_keys);
+                }
+                for op_changes in v2.operations.iter() {
+                    for change in op_changes.changes.iter() {
+                        process_change(change, &mut restored_keys);
+                    }
+                }
+                for change in v2.tx_changes_after.iter() {
+                    process_change(change, &mut restored_keys);
+                }
+            }
+            TransactionMeta::V3(v3) => {
+                for change in v3.tx_changes_before.iter() {
+                    process_change(change, &mut restored_keys);
+                }
+                for op_changes in v3.operations.iter() {
+                    for change in op_changes.changes.iter() {
+                        process_change(change, &mut restored_keys);
+                    }
+                }
+                for change in v3.tx_changes_after.iter() {
+                    process_change(change, &mut restored_keys);
+                }
+            }
+            TransactionMeta::V4(v4) => {
+                for change in v4.tx_changes_before.iter() {
+                    process_change(change, &mut restored_keys);
+                }
+                for op_changes in v4.operations.iter() {
+                    for change in op_changes.changes.iter() {
+                        process_change(change, &mut restored_keys);
+                    }
+                }
+                for change in v4.tx_changes_after.iter() {
+                    process_change(change, &mut restored_keys);
+                }
+            }
+        }
+    }
+
+    restored_keys
+}
+
 /// Extract upgrade changes from LedgerCloseMeta.
 /// These are ledger entry changes from protocol upgrades (not from transactions).
 pub fn extract_upgrade_metas(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::UpgradeEntryMeta> {
