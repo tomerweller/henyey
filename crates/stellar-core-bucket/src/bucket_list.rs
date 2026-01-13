@@ -536,56 +536,48 @@ impl BucketList {
     ) -> Result<()> {
         let use_init = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
 
-        // If there are no entries to add, use an empty bucket
-        // Metadata is only included when there are actual entries
-        let has_entries = !init_entries.is_empty() || !live_entries.is_empty() || !dead_entries.is_empty();
+        let mut entries: Vec<BucketEntry> = Vec::new();
 
-        let new_bucket = if !has_entries {
-            Bucket::empty()
+        if use_init {
+            let mut meta = BucketMetadata {
+                ledger_version: protocol_version,
+                ext: BucketMetadataExt::V0,
+            };
+            if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                meta.ext = BucketMetadataExt::V1(bucket_list_type);
+            }
+            entries.push(BucketEntry::Metadata(meta));
+        }
+
+        // Deduplicate init_entries - keep only the last occurrence of each key
+        // This handles the case where the same entry is created and updated in the same ledger
+        let dedup_init = deduplicate_entries(init_entries);
+        if use_init {
+            entries.extend(dedup_init.into_iter().map(BucketEntry::Init));
         } else {
-            let mut entries: Vec<BucketEntry> = Vec::new();
+            entries.extend(dedup_init.into_iter().map(BucketEntry::Live));
+        }
 
-            if use_init {
-                let mut meta = BucketMetadata {
-                    ledger_version: protocol_version,
-                    ext: BucketMetadataExt::V0,
-                };
-                if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
-                    meta.ext = BucketMetadataExt::V1(bucket_list_type);
+        // Deduplicate live_entries - keep only the last occurrence of each key
+        // This handles the case where the same entry is updated multiple times in the same ledger
+        let dedup_live = deduplicate_entries(live_entries);
+        entries.extend(dedup_live.into_iter().map(BucketEntry::Live));
+
+        // Deduplicate dead_entries - keep only unique keys
+        let mut seen_dead: HashSet<Vec<u8>> = HashSet::new();
+        let dedup_dead: Vec<LedgerKey> = dead_entries
+            .into_iter()
+            .filter(|key| {
+                if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                    seen_dead.insert(key_bytes)
+                } else {
+                    true
                 }
-                entries.push(BucketEntry::Metadata(meta));
-            }
+            })
+            .collect();
+        entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
 
-            // Deduplicate init_entries - keep only the last occurrence of each key
-            // This handles the case where the same entry is created and updated in the same ledger
-            let dedup_init = deduplicate_entries(init_entries);
-            if use_init {
-                entries.extend(dedup_init.into_iter().map(BucketEntry::Init));
-            } else {
-                entries.extend(dedup_init.into_iter().map(BucketEntry::Live));
-            }
-
-            // Deduplicate live_entries - keep only the last occurrence of each key
-            // This handles the case where the same entry is updated multiple times in the same ledger
-            let dedup_live = deduplicate_entries(live_entries);
-            entries.extend(dedup_live.into_iter().map(BucketEntry::Live));
-
-            // Deduplicate dead_entries - keep only unique keys
-            let mut seen_dead: HashSet<Vec<u8>> = HashSet::new();
-            let dedup_dead: Vec<LedgerKey> = dead_entries
-                .into_iter()
-                .filter(|key| {
-                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                        seen_dead.insert(key_bytes)
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-            entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
-
-            Bucket::from_entries(entries)?
-        };
+        let new_bucket = Bucket::from_entries(entries)?;
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;
@@ -882,10 +874,14 @@ impl BucketList {
             let normalize_init = false; // C++ never normalizes INIT to LIVE during merges
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
+            // Use the protocol version from the snap bucket's metadata if available,
+            // matching C++ behavior in restartMerges.
+            let version_to_use = prev_snap.protocol_version().unwrap_or(protocol_version);
+
             // Start the merge with the previous level's snap
             self.levels[i].prepare_with_normalization(
                 merge_start_ledger,
-                protocol_version,
+                version_to_use,
                 prev_snap,
                 keep_dead,
                 normalize_init,

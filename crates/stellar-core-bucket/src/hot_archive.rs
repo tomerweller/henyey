@@ -127,64 +127,7 @@ impl HotArchiveBucket {
         // This matches BucketEntryIdCmp<HotArchiveBucket>
         entries.sort_by(compare_hot_archive_entries);
 
-        // Debug: log entry order for debugging hash issues
-        if entries.len() > 1 {  // More than just metadata
-            for (i, entry) in entries.iter().enumerate() {
-                match entry {
-                    HotArchiveBucketEntry::Metaentry(m) => {
-                        tracing::debug!(
-                            idx = i,
-                            entry_type = "META",
-                            version = m.ledger_version,
-                            "hot_archive fresh: entry order"
-                        );
-                    }
-                    HotArchiveBucketEntry::Archived(e) => {
-                        if let Some(key) = ledger_entry_to_key(e) {
-                            let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-                            // Show more details for CONTRACT_DATA keys
-                            let key_type = ledger_key_type_discriminant(&key);
-                            let key_detail = match &key {
-                                LedgerKey::ContractData(cd) => {
-                                    let sc_val_type = sc_val_type_discriminant(&cd.key);
-                                    format!("sc_val_type={} durability={:?}", sc_val_type, cd.durability)
-                                }
-                                _ => String::new(),
-                            };
-                            tracing::debug!(
-                                idx = i,
-                                entry_type = "ARCHIVED",
-                                key_type = key_type,
-                                key_detail = %key_detail,
-                                key_hex = %hex::encode(&key_bytes),
-                                "hot_archive fresh: entry order"
-                            );
-                        }
-                    }
-                    HotArchiveBucketEntry::Live(k) => {
-                        let key_bytes = k.to_xdr(Limits::none()).unwrap_or_default();
-                        let key_type = ledger_key_type_discriminant(k);
-                        tracing::debug!(
-                            idx = i,
-                            entry_type = "LIVE",
-                            key_type = key_type,
-                            key_hex = %hex::encode(&key_bytes),
-                            "hot_archive fresh: entry order"
-                        );
-                    }
-                }
-            }
-        }
-
         let bucket = Self::from_entries(entries)?;
-
-        // Debug: log the fresh bucket creation
-        tracing::debug!(
-            version = protocol_version,
-            num_entries = bucket.ordered_entries.len(),
-            hash = %bucket.hash,
-            "hot_archive fresh: created bucket"
-        );
 
         Ok(bucket)
     }
@@ -500,15 +443,6 @@ impl HotArchiveBucketList {
         let mut hasher = Sha256::new();
         for (i, level) in self.levels.iter().enumerate() {
             let level_hash = level.hash();
-            if i == 0 {
-                tracing::trace!(
-                    level = i,
-                    curr_hash = %level.curr.hash().to_hex(),
-                    snap_hash = %level.snap.hash().to_hex(),
-                    level_hash = %level_hash.to_hex(),
-                    "hot_archive hash: level 0 state"
-                );
-            }
             hasher.update(level_hash.as_bytes());
         }
 
@@ -558,42 +492,25 @@ impl HotArchiveBucketList {
             )));
         }
 
-        tracing::debug!(
+        tracing::info!(
             ledger_seq = ledger_seq,
             protocol_version = protocol_version,
             num_archived = archived_entries.len(),
             num_restored = restored_keys.len(),
-            "hot_archive add_batch: creating fresh bucket"
+            "hot_archive add_batch: input stats"
         );
 
-        // C++ stellar-core uses currLedgerProtocol (the actual protocol version) for
-        // HotArchiveBucket::fresh(), NOT mLedger. This is called from prepareFirstLevel()
-        // which passes currLedgerProtocol directly to fresh().
-        // See: BucketLevel<HotArchiveBucket>::prepareFirstLevel() in BucketListBase.cpp
         let new_bucket = HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
+        
+        tracing::info!(
+            ledger_seq = ledger_seq,
+            new_bucket_hash = %new_bucket.hash().to_hex(),
+            "hot_archive add_batch: new fresh bucket created"
+        );
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;
 
-        // Debug: trace the overall hash and all level states after add_batch
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
-                ledger_seq = ledger_seq,
-                overall_hash = %self.hash().to_hex(),
-                "hot_archive add_batch: completed"
-            );
-            // Show state of first few levels
-            for i in 0..4.min(self.levels.len()) {
-                tracing::debug!(
-                    ledger_seq = ledger_seq,
-                    level = i,
-                    curr_hash = %self.levels[i].curr.hash().to_hex(),
-                    snap_hash = %self.levels[i].snap.hash().to_hex(),
-                    has_pending = self.levels[i].next.is_some(),
-                    "hot_archive add_batch: level state"
-                );
-            }
-        }
         Ok(())
     }
 
@@ -610,26 +527,8 @@ impl HotArchiveBucketList {
         // Process spills from highest level down
         for i in (1..HOT_ARCHIVE_BUCKET_LIST_LEVELS).rev() {
             if Self::level_should_spill(ledger_seq, i - 1) {
-                let old_curr_hash = self.levels[i].curr.hash();
-                let had_next = self.levels[i].next.is_some();
-
                 let spilling_snap = self.levels[i - 1].snap();
                 self.levels[i].commit();
-
-                let new_curr_hash = self.levels[i].curr.hash();
-
-                if i <= 3 {  // Only trace first few levels to avoid spam
-                    tracing::trace!(
-                        ledger_seq = ledger_seq,
-                        level = i,
-                        prev_level = i - 1,
-                        spilling_snap_hash = %spilling_snap.hash().to_hex(),
-                        old_curr_hash = %old_curr_hash.to_hex(),
-                        had_pending = had_next,
-                        new_curr_hash = %new_curr_hash.to_hex(),
-                        "hot_archive add_batch: level spill processing"
-                    );
-                }
 
                 let keep_tombstones = Self::keep_tombstone_entries(i);
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
@@ -641,24 +540,8 @@ impl HotArchiveBucketList {
         // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_tombstones_0 = Self::keep_tombstone_entries(0);
 
-        tracing::trace!(
-            ledger_seq = ledger_seq,
-            new_bucket_hash = %new_bucket.hash().to_hex(),
-            old_curr_hash = %self.levels[0].curr.hash().to_hex(),
-            "hot_archive add_batch: preparing level 0 merge"
-        );
-
         self.levels[0].prepare(protocol_version, new_bucket, keep_tombstones_0, false)?;
         self.levels[0].commit();
-
-        tracing::trace!(
-            ledger_seq = ledger_seq,
-            new_curr_hash = %self.levels[0].curr.hash().to_hex(),
-            "hot_archive add_batch: level 0 committed"
-        );
-
-        // Note: We do NOT commit all levels here. See the comment in BucketList::add_batch_internal
-        // for the explanation of why this is necessary for shouldMergeWithEmptyCurr to work correctly.
 
         Ok(())
     }
@@ -1030,15 +913,6 @@ fn compare_ledger_keys(a: &LedgerKey, b: &LedgerKey) -> std::cmp::Ordering {
             }
             let key_cmp = compare_sc_val(&a.key, &b.key);
             if key_cmp != Ordering::Equal {
-                // Debug: log ScVal comparison result for CONTRACT_DATA
-                let a_type = sc_val_type_discriminant(&a.key);
-                let b_type = sc_val_type_discriminant(&b.key);
-                tracing::trace!(
-                    a_sc_val_type = a_type,
-                    b_sc_val_type = b_type,
-                    result = ?key_cmp,
-                    "hot_archive compare_ledger_keys: ScVal comparison"
-                );
                 return key_cmp;
             }
             (a.durability as i32).cmp(&(b.durability as i32))
