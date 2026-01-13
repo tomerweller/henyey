@@ -251,6 +251,7 @@ mod tests {
     use stellar_xdr::curr::*;
 
     const AUTH_REQUIRED_FLAG: u32 = 0x1;
+    const AUTHORIZED_FLAG: u32 = 0x1; // TrustLineFlags::AuthorizedFlag
 
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
@@ -694,12 +695,15 @@ mod tests {
 
     #[test]
     fn test_credit_payment_success_no_auth_required() {
+        // When issuer doesn't have AUTH_REQUIRED_FLAG, trustlines are automatically
+        // authorized (per ChangeTrust logic). This test verifies payments work in this case.
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
         let source_id = create_test_account_id(0);
         let dest_id = create_test_account_id(1);
+        // Issuer has no AUTH_REQUIRED_FLAG (flags=0)
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
@@ -708,6 +712,7 @@ mod tests {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
             issuer: issuer_id.clone(),
         });
+        // Trustlines are automatically authorized when issuer has no AUTH_REQUIRED
         state.create_trustline(create_test_trustline(
             source_id.clone(),
             TrustLineAsset::CreditAlphanum4(AlphaNum4 {
@@ -716,7 +721,7 @@ mod tests {
             }),
             100,
             1_000_000,
-            0,
+            AUTHORIZED_FLAG,
         ));
         state.create_trustline(create_test_trustline(
             dest_id.clone(),
@@ -726,7 +731,7 @@ mod tests {
             }),
             0,
             1_000_000,
-            0,
+            AUTHORIZED_FLAG,
         ));
 
         let op = PaymentOp {
@@ -758,6 +763,7 @@ mod tests {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
             issuer: issuer_id.clone(),
         });
+        // Trustline is auto-authorized when issuer has no AUTH_REQUIRED
         state.create_trustline(create_test_trustline(
             dest_id.clone(),
             TrustLineAsset::CreditAlphanum4(AlphaNum4 {
@@ -766,7 +772,7 @@ mod tests {
             }),
             0,
             1_000_000,
-            0,
+            AUTHORIZED_FLAG,
         ));
 
         let op = PaymentOp {
@@ -798,6 +804,7 @@ mod tests {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
             issuer: issuer_id.clone(),
         });
+        // Trustline is auto-authorized when issuer has no AUTH_REQUIRED
         state.create_trustline(create_test_trustline(
             source_id.clone(),
             TrustLineAsset::CreditAlphanum4(AlphaNum4 {
@@ -806,7 +813,7 @@ mod tests {
             }),
             100,
             1_000_000,
-            0,
+            AUTHORIZED_FLAG,
         ));
 
         let op = PaymentOp {

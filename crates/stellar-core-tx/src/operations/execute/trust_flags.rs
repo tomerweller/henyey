@@ -303,6 +303,8 @@ mod tests {
 
     #[test]
     fn test_allow_trust_no_auth_required() {
+        // In protocol 16+ (CAP-0035), the AUTH_REQUIRED check was removed from AllowTrust.
+        // AllowTrust should succeed even when issuer doesn't have AUTH_REQUIRED flag.
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
 
@@ -313,6 +315,20 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
         state.create_account(create_test_account(trustor_id.clone(), 10_000_000, 0));
 
+        // Create a trustline for the trustor (auto-authorized since issuer has no AUTH_REQUIRED)
+        state.create_trustline(create_test_trustline_with_liabilities(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+            0,
+            0,
+        ));
+
         let op = AllowTrustOp {
             trustor: trustor_id,
             asset: AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
@@ -322,9 +338,10 @@ mod tests {
         let result = execute_allow_trust(&op, &issuer_id, &mut state, &context);
         assert!(result.is_ok());
 
+        // In protocol 16+, AllowTrust succeeds even without AUTH_REQUIRED
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
-                assert!(matches!(r, AllowTrustResult::TrustNotRequired));
+                assert!(matches!(r, AllowTrustResult::Success));
             }
             _ => panic!("Unexpected result type"),
         }
