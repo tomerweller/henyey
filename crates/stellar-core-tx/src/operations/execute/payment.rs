@@ -201,7 +201,6 @@ fn execute_credit_payment(
     Ok(make_result(PaymentResultCode::Success))
 }
 
-const AUTH_REQUIRED_FLAG: u32 = 0x1;
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 
 fn is_trustline_authorized(flags: u32) -> bool {
@@ -250,6 +249,8 @@ fn make_result(code: PaymentResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use stellar_xdr::curr::*;
+
+    const AUTH_REQUIRED_FLAG: u32 = 0x1;
 
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))

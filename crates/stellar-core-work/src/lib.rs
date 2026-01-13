@@ -813,8 +813,10 @@ impl WorkScheduler {
     /// This is a lightweight operation that scans all entries once.
     /// For detailed per-item information, use [`snapshot`](Self::snapshot).
     pub fn metrics(&self) -> WorkSchedulerMetrics {
-        let mut metrics = WorkSchedulerMetrics::default();
-        metrics.total = self.entries.len();
+        let mut metrics = WorkSchedulerMetrics {
+            total: self.entries.len(),
+            ..Default::default()
+        };
         for (id, entry) in &self.entries {
             match self.states.get(id).copied().unwrap_or(WorkState::Pending) {
                 WorkState::Pending => metrics.pending += 1,

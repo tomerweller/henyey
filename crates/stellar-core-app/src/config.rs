@@ -304,7 +304,7 @@ impl Default for SurgePricingConfig {
 }
 
 /// Classic event emission configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventsConfig {
     /// Emit classic asset events in transaction metadata.
     #[serde(default)]
@@ -313,15 +313,6 @@ pub struct EventsConfig {
     /// Backfill classic asset events to pre-23 format.
     #[serde(default)]
     pub backfill_stellar_asset_events: bool,
-}
-
-impl Default for EventsConfig {
-    fn default() -> Self {
-        Self {
-            emit_classic_events: false,
-            backfill_stellar_asset_events: false,
-        }
-    }
 }
 
 /// Proposed protocol upgrades configuration.

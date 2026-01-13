@@ -114,17 +114,6 @@ pub trait FeeBalanceProvider: Send + Sync {
     fn get_available_balance(&self, account_id: &AccountId) -> Option<i64>;
 }
 
-/// Result of fee balance validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FeeBalanceResult {
-    /// Balance is sufficient for the transaction.
-    Sufficient,
-    /// Balance is insufficient for the transaction.
-    Insufficient,
-    /// Account does not exist.
-    AccountNotFound,
-}
-
 /// Configuration for the transaction queue.
 #[derive(Debug, Clone)]
 pub struct TxQueueConfig {
@@ -301,19 +290,11 @@ impl QueuedTransaction {
     }
 }
 
-/// A timestamped transaction wrapper for per-account tracking.
-///
-/// This struct tracks additional metadata needed for per-account queue limits:
-/// - Insertion time for delay metrics
-/// - Whether the transaction was submitted locally
+/// A transaction wrapper for per-account tracking.
 #[derive(Debug, Clone)]
 pub struct TimestampedTx {
     /// The queued transaction.
     pub tx: QueuedTransaction,
-    /// When this transaction was inserted into the queue.
-    pub insertion_time: Instant,
-    /// Whether this transaction was submitted from this node (vs received from network).
-    pub submitted_from_self: bool,
 }
 
 /// Per-account state in the transaction queue.
@@ -1499,8 +1480,6 @@ impl TransactionQueue {
 
             seq_state.transaction = Some(TimestampedTx {
                 tx: queued.clone(),
-                insertion_time: Instant::now(),
-                submitted_from_self: false, // TODO: track this properly when we have peer tracking
             });
 
             // Update the fee-source account state (tracks total_fees)

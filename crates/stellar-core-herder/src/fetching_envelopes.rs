@@ -71,8 +71,6 @@ impl Default for FetchingConfig {
 /// this manager starts fetching it from peers. Once received, envelopes
 /// waiting for that data become ready for processing.
 pub struct FetchingEnvelopes {
-    /// Configuration.
-    config: FetchingConfig,
     /// Per-slot envelope state.
     slots: DashMap<SlotIndex, SlotEnvelopes>,
     /// TxSet fetcher.
@@ -116,7 +114,6 @@ impl FetchingEnvelopes {
                 ItemType::QuorumSet,
                 config.quorum_set_fetcher_config.clone(),
             ),
-            config,
             slots: DashMap::new(),
             tx_set_cache: DashMap::new(),
             quorum_set_cache: DashMap::new(),

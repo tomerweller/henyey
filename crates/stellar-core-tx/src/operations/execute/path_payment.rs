@@ -464,7 +464,6 @@ fn update_dest_balance(
     Ok(())
 }
 
-const AUTH_REQUIRED_FLAG: u32 = 0x1;
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
     TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
@@ -1322,6 +1321,8 @@ fn make_strict_send_result_with_asset(
 mod tests {
     use super::*;
     use stellar_xdr::curr::*;
+
+    const AUTH_REQUIRED_FLAG: u32 = 0x1;
 
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))

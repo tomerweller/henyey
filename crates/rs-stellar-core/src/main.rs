@@ -2458,7 +2458,7 @@ async fn cmd_verify_execution(
                     cdp_header.scp_value.close_time.0,
                     cdp_header.base_reserve,
                     cdp_header.ledger_version,
-                    network_id.clone(),
+                    network_id,
                     starting_id_pool, // Use previous ledger's id_pool
                     soroban_config,
                     ClassicEventConfig::default(),
@@ -2693,7 +2693,7 @@ async fn cmd_verify_execution(
                             // Check that success status matches
                             let success_matches = result.success == cdp_succeeded;
 
-                            if success_matches && (result.success == false || meta_matches) {
+                            if success_matches && (!result.success || meta_matches) {
                                 transactions_matched += 1;
                                 if show_diff && !quiet {
                                     let change_count = result.tx_meta
@@ -2736,7 +2736,7 @@ async fn cmd_verify_execution(
                                 // Print detailed changes for diagnosis
                                 let our_changes = result.tx_meta
                                     .as_ref()
-                                    .map(|m| extract_changes_from_meta(m))
+                                    .map(extract_changes_from_meta)
                                     .unwrap_or_default();
                                 let cdp_changes = extract_changes_from_meta(&tx_info.meta);
                                 let max_len = our_changes.len().max(cdp_changes.len());
@@ -2744,13 +2744,13 @@ async fn cmd_verify_execution(
                                 // Show side-by-side comparison with detailed values for differing entries
                                 println!("      Changes comparison (ours={}, cdp={}):", our_changes.len(), cdp_changes.len());
                                 for i in 0..max_len {
-                                    let our_str = our_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
-                                    let _cdp_str = cdp_changes.get(i).map(|c| describe_change(c)).unwrap_or_else(|| "-".to_string());
+                                    let our_str = our_changes.get(i).map(describe_change).unwrap_or_else(|| "-".to_string());
+                                    let _cdp_str = cdp_changes.get(i).map(describe_change).unwrap_or_else(|| "-".to_string());
                                     let differs = our_changes.get(i) != cdp_changes.get(i);
                                     if differs {
                                         println!("        {} DIFFERS:", i);
-                                        let our_detail = our_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
-                                        let cdp_detail = cdp_changes.get(i).map(|c| describe_change_detailed(c)).unwrap_or_else(|| "-".to_string());
+                                        let our_detail = our_changes.get(i).map(describe_change_detailed).unwrap_or_else(|| "-".to_string());
+                                        let cdp_detail = cdp_changes.get(i).map(describe_change_detailed).unwrap_or_else(|| "-".to_string());
                                         println!("          ours: {}", our_detail);
                                         println!("          cdp:  {}", cdp_detail);
                                     } else {
@@ -3357,7 +3357,7 @@ fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (Vec<u8>, u
                 LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
                     contract: cd.contract.clone(),
                     key: cd.key.clone(),
-                    durability: cd.durability.clone(),
+                    durability: cd.durability,
                 })
             }
             stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
@@ -4052,7 +4052,7 @@ fn convert_key(key: &str) -> anyhow::Result<()> {
         let hash = decode_pre_auth_tx(key)?;
         println!("StrKey:");
         println!("  type: STRKEY_PRE_AUTH_TX");
-        println!("  hex: {}", hex::encode(&hash));
+        println!("  hex: {}", hex::encode(hash));
         return Ok(());
     }
 

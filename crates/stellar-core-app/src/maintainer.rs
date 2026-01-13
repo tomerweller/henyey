@@ -190,11 +190,7 @@ impl Maintainer {
         // Calculate the minimum ledger we need to keep
         // We need to keep enough history to support checkpoint publishing
         let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = if qmin >= CHECKPOINT_FREQUENCY {
-            qmin - CHECKPOINT_FREQUENCY
-        } else {
-            0
-        };
+        let lmin = qmin.saturating_sub(CHECKPOINT_FREQUENCY);
 
         debug!(
             lcl = lcl,
@@ -246,11 +242,7 @@ impl Maintainer {
     pub fn perform_maintenance_with_count(&self, count: u32) {
         let (lcl, min_queued) = (self.get_ledger_bounds)();
         let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = if qmin >= CHECKPOINT_FREQUENCY {
-            qmin - CHECKPOINT_FREQUENCY
-        } else {
-            0
-        };
+        let lmin = qmin.saturating_sub(CHECKPOINT_FREQUENCY);
 
         info!(
             trim_below = lmin,

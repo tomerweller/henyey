@@ -40,9 +40,9 @@ pub const LIQUIDITY_POOL_FEE_V18: i32 = 30;
 #[inline]
 pub fn is_ascii_alphanumeric(c: char) -> bool {
     let uc = c as u8;
-    ('a' as u8 <= uc && uc <= 'z' as u8)
-        || ('A' as u8 <= uc && uc <= 'Z' as u8)
-        || ('0' as u8 <= uc && uc <= '9' as u8)
+    uc.is_ascii_lowercase()
+        || uc.is_ascii_uppercase()
+        || uc.is_ascii_digit()
 }
 
 /// Check if a character is a printable ASCII non-control character.
@@ -60,8 +60,8 @@ pub fn is_ascii_non_control(c: char) -> bool {
 #[inline]
 pub fn to_ascii_lower(c: char) -> char {
     let uc = c as u8;
-    if ('A' as u8) <= uc && uc <= ('Z' as u8) {
-        (uc + ('a' as u8 - 'A' as u8)) as char
+    if uc.is_ascii_uppercase() {
+        (uc + (b'a' - b'A')) as char
     } else {
         c
     }
@@ -285,9 +285,7 @@ pub fn is_change_trust_asset_valid(asset: &ChangeTrustAsset, ledger_version: u32
                 return false;
             }
 
-            let cp = match lp {
-                stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) => cp,
-            };
+            let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = lp;
 
             is_asset_valid(&cp.asset_a, ledger_version)
                 && is_asset_valid(&cp.asset_b, ledger_version)
