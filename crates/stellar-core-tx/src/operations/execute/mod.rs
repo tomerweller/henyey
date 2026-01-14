@@ -143,7 +143,7 @@ fn ledger_key_hash(key: &stellar_xdr::curr::LedgerKey) -> stellar_xdr::curr::Has
     stellar_xdr::curr::Hash(hasher.finalize().into())
 }
 
-fn entry_size_for_rent_by_protocol(
+pub fn entry_size_for_rent_by_protocol(
     protocol_version: u32,
     entry: &stellar_xdr::curr::LedgerEntry,
     entry_xdr_size: u32,

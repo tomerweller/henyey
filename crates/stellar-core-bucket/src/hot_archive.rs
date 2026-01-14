@@ -441,7 +441,7 @@ impl HotArchiveBucketList {
     /// Get the hash of the entire bucket list.
     pub fn hash(&self) -> Hash256 {
         let mut hasher = Sha256::new();
-        for (i, level) in self.levels.iter().enumerate() {
+        for (_i, level) in self.levels.iter().enumerate() {
             let level_hash = level.hash();
             hasher.update(level_hash.as_bytes());
         }

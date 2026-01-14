@@ -46,10 +46,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_core_common::Hash256;
+use soroban_env_host_p25::budget::Budget;
+use soroban_env_host_p25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
+use soroban_env_host_p25::xdr as soroban_xdr_p25;
+use soroban_xdr_p25::ReadXdr;
 use stellar_xdr::curr::{
-    LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode, LedgerKeyContractData,
-    LedgerKeyTtl, Limits, TtlEntry, WriteXdr,
+    ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
+    LedgerKeyContractData, LedgerKeyTtl, Limits, TtlEntry, WriteXdr,
 };
+use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
 use tracing::{debug, trace, warn};
 
 use crate::{LedgerError, Result};
@@ -85,6 +90,59 @@ impl TtlData {
     pub fn is_initialized(&self) -> bool {
         self.live_until_ledger_seq > 0
     }
+}
+
+/// Minimal Soroban config needed for rent size calculations.
+#[derive(Debug, Clone)]
+pub struct SorobanRentConfig {
+    pub cpu_cost_params: ContractCostParams,
+    pub mem_cost_params: ContractCostParams,
+    pub tx_max_instructions: u64,
+    pub tx_max_memory_bytes: u64,
+}
+
+impl SorobanRentConfig {
+    pub fn has_valid_cost_params(&self) -> bool {
+        !self.cpu_cost_params.0.is_empty() && !self.mem_cost_params.0.is_empty()
+    }
+}
+
+impl Default for SorobanRentConfig {
+    fn default() -> Self {
+        Self {
+            cpu_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),
+            mem_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),
+            tx_max_instructions: 0,
+            tx_max_memory_bytes: 0,
+        }
+    }
+}
+
+fn convert_contract_cost_params_to_p25(
+    params: &stellar_xdr::curr::ContractCostParams,
+) -> Option<soroban_xdr_p25::ContractCostParams> {
+    let bytes = params.to_xdr(Limits::none()).ok()?;
+    soroban_xdr_p25::ContractCostParams::from_xdr(&bytes, soroban_xdr_p25::Limits::none()).ok()
+}
+
+fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
+    let Some(config) = rent_config else {
+        return Budget::default();
+    };
+    if !config.has_valid_cost_params() {
+        return Budget::default();
+    }
+
+    let cpu_cost_params = convert_contract_cost_params_to_p25(&config.cpu_cost_params);
+    let mem_cost_params = convert_contract_cost_params_to_p25(&config.mem_cost_params);
+    let (Some(cpu_cost_params), Some(mem_cost_params)) = (cpu_cost_params, mem_cost_params) else {
+        return Budget::default();
+    };
+
+    let instruction_limit = config.tx_max_instructions.saturating_mul(2);
+    let memory_limit = config.tx_max_memory_bytes.saturating_mul(2);
+    Budget::try_from_configs(instruction_limit, memory_limit, cpu_cost_params, mem_cost_params)
+        .unwrap_or_else(|_| Budget::default())
 }
 
 /// A contract data entry with co-located TTL.
@@ -467,6 +525,7 @@ impl InMemorySorobanState {
         &mut self,
         entry: LedgerEntry,
         protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
     ) -> Result<()> {
         let key = match &entry.data {
             LedgerEntryData::ContractCode(cc) => LedgerKeyContractCode {
@@ -491,7 +550,7 @@ impl InMemorySorobanState {
         let ttl_data = self.pending_ttls.remove(&key_hash).unwrap_or_default();
 
         // Calculate size for rent
-        let size_bytes = self.calculate_code_size(&entry, protocol_version);
+        let size_bytes = self.calculate_code_size(&entry, protocol_version, rent_config);
 
         let map_entry = ContractCodeMapEntry {
             ledger_entry: Arc::new(entry),
@@ -517,6 +576,7 @@ impl InMemorySorobanState {
         &mut self,
         entry: LedgerEntry,
         protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
     ) -> Result<()> {
         let key = match &entry.data {
             LedgerEntryData::ContractCode(cc) => LedgerKeyContractCode {
@@ -537,7 +597,7 @@ impl InMemorySorobanState {
             .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
 
         // Calculate new size for rent
-        let new_size = self.calculate_code_size(&entry, protocol_version);
+        let new_size = self.calculate_code_size(&entry, protocol_version, rent_config);
 
         let new_entry = ContractCodeMapEntry {
             ledger_entry: Arc::new(entry),
@@ -621,26 +681,21 @@ impl InMemorySorobanState {
     }
 
     /// Calculate the in-memory size for a contract code entry.
-    ///
-    /// For Protocol 23+, this includes the compiled module overhead.
-    /// For earlier protocols, uses XDR size only.
-    fn calculate_code_size(&self, entry: &LedgerEntry, protocol_version: u32) -> u32 {
-        // Get base XDR size
+    fn calculate_code_size(
+        &self,
+        entry: &LedgerEntry,
+        protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
+    ) -> u32 {
         let xdr_size = entry
             .to_xdr(Limits::none())
             .map(|v| v.len() as u32)
             .unwrap_or(0);
-
-        // Protocol 23+ may include compiled module overhead
-        // For now, use XDR size as a baseline
-        // TODO: Integrate with Soroban host for accurate compiled module sizing
-        if protocol_version >= 23 {
-            // Estimate compiled module overhead as ~2x XDR size
-            // This is a placeholder until proper Soroban host integration
-            xdr_size * 2
-        } else {
-            xdr_size
+        if protocol_version < 25 {
+            return entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size);
         }
+        let budget = build_rent_budget(rent_config);
+        entry_size_for_rent_p25(&budget, entry, xdr_size).unwrap_or(xdr_size)
     }
 
     /// Update state with new entries from a ledger close.
@@ -665,6 +720,7 @@ impl InMemorySorobanState {
         live_entries: &[LedgerEntry],
         dead_entries: &[LedgerKey],
         protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
     ) -> Result<()> {
         // Validate sequence progression
         if self.last_closed_ledger_seq > 0 && ledger_seq != self.last_closed_ledger_seq + 1 {
@@ -676,12 +732,12 @@ impl InMemorySorobanState {
 
         // Process init entries (creates)
         for entry in init_entries {
-            self.process_entry_create(entry, protocol_version)?;
+            self.process_entry_create(entry, protocol_version, rent_config)?;
         }
 
         // Process live entries (updates)
         for entry in live_entries {
-            self.process_entry_update(entry, protocol_version)?;
+            self.process_entry_update(entry, protocol_version, rent_config)?;
         }
 
         // Process dead entries (deletes)
@@ -710,11 +766,16 @@ impl InMemorySorobanState {
     }
 
     /// Process a single entry creation.
-    fn process_entry_create(&mut self, entry: &LedgerEntry, protocol_version: u32) -> Result<()> {
+    fn process_entry_create(
+        &mut self,
+        entry: &LedgerEntry,
+        protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
+    ) -> Result<()> {
         match &entry.data {
             LedgerEntryData::ContractData(_) => self.create_contract_data(entry.clone()),
             LedgerEntryData::ContractCode(_) => {
-                self.create_contract_code(entry.clone(), protocol_version)
+                self.create_contract_code(entry.clone(), protocol_version, rent_config)
             }
             LedgerEntryData::Ttl(_) => self.process_ttl_entry(entry),
             _ => Ok(()), // Ignore non-Soroban entries
@@ -722,7 +783,12 @@ impl InMemorySorobanState {
     }
 
     /// Process a single entry update.
-    fn process_entry_update(&mut self, entry: &LedgerEntry, protocol_version: u32) -> Result<()> {
+    fn process_entry_update(
+        &mut self,
+        entry: &LedgerEntry,
+        protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
+    ) -> Result<()> {
         match &entry.data {
             LedgerEntryData::ContractData(_) => {
                 // Check if this is actually an update or a create
@@ -750,9 +816,9 @@ impl InMemorySorobanState {
                 };
                 let key_hash = Self::contract_code_key_hash(&key);
                 if self.contract_code_entries.contains_key(&key_hash) {
-                    self.update_contract_code(entry.clone(), protocol_version)
+                    self.update_contract_code(entry.clone(), protocol_version, rent_config)
                 } else {
-                    self.create_contract_code(entry.clone(), protocol_version)
+                    self.create_contract_code(entry.clone(), protocol_version, rent_config)
                 }
             }
             LedgerEntryData::Ttl(_) => self.process_ttl_entry(entry),
@@ -998,7 +1064,7 @@ mod tests {
         let mut state = InMemorySorobanState::new();
         let entry = make_contract_code_entry([2u8; 32]);
 
-        state.create_contract_code(entry, 25).unwrap();
+        state.create_contract_code(entry, 25, None).unwrap();
 
         assert_eq!(state.contract_code_count(), 1);
         assert!(state.contract_code_state_size > 0);
@@ -1012,7 +1078,7 @@ mod tests {
         let code_entry = make_contract_code_entry([2u8; 32]);
 
         state
-            .update_state(1, &[data_entry.clone(), code_entry.clone()], &[], &[], 25)
+            .update_state(1, &[data_entry.clone(), code_entry.clone()], &[], &[], 25, None)
             .unwrap();
 
         assert_eq!(state.ledger_seq(), 1);
@@ -1122,7 +1188,7 @@ mod tests {
         let code_entry = make_contract_code_entry([2u8; 32]);
 
         state
-            .update_state(10, &[data_entry, code_entry], &[], &[], 25)
+            .update_state(10, &[data_entry, code_entry], &[], &[], 25, None)
             .unwrap();
 
         let stats = state.stats();

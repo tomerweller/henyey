@@ -1835,7 +1835,7 @@ fn load_eviction_iterator_from_bucket_list(
         Ok(Some(entry)) => {
             if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(xdr_iter)) = entry.data {
                 let iter = stellar_core_bucket::EvictionIterator {
-                    bucket_file_offset: xdr_iter.bucket_file_offset as u32,
+                    bucket_file_offset: xdr_iter.bucket_file_offset,
                     bucket_list_level: xdr_iter.bucket_list_level,
                     is_curr_bucket: xdr_iter.is_curr_bucket,
                 };

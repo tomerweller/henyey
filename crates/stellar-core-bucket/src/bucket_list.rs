@@ -47,6 +47,7 @@ use std::collections::{HashMap, HashSet};
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits, WriteXdr,
 };
+use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 
 use stellar_core_common::Hash256;
 
@@ -378,30 +379,10 @@ impl BucketList {
 
     /// Look up an entry by its key with optional debug tracing.
     pub fn get_with_debug(&self, key: &LedgerKey, debug: bool) -> Result<Option<LedgerEntry>> {
-        // Search from newest to oldest
+        // Search from newest to oldest (curr then snap). Pending merges (next)
+        // are not part of the bucket list state yet.
         for (level_idx, level) in self.levels.iter().enumerate() {
-            // Check next bucket FIRST if any (pending merge result contains NEWER entries)
-            // This is critical: when a merge is pending, `next` contains the merge result
-            // of curr + incoming entries. If we check curr first, we'd return stale data.
-            if let Some(next) = level.next() {
-                if let Some(entry) = next.get(key)? {
-                    if debug {
-                        tracing::info!(
-                            level = level_idx,
-                            bucket = "next",
-                            entry_type = ?std::mem::discriminant(&entry),
-                            "Found entry in bucket list"
-                        );
-                    }
-                    return match entry {
-                        BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
-                        BucketEntry::Dead(_) => Ok(None), // Entry is deleted
-                        BucketEntry::Metadata(_) => continue,
-                    };
-                }
-            }
-
-            // Check curr bucket (only if next didn't have the entry)
+            // Check curr bucket first
             if let Some(entry) = level.curr.get(key)? {
                 if debug {
                     tracing::info!(
@@ -444,17 +425,11 @@ impl BucketList {
 
     /// Debug method to find ALL occurrences of a key across all buckets.
     /// Returns a list of (level, bucket_type, entry) for each occurrence.
-    /// Order: next (newest) → curr → snap (oldest) within each level.
+    /// Order: curr (newest) → snap (oldest) within each level.
     pub fn find_all_occurrences(&self, key: &LedgerKey) -> Result<Vec<(usize, &'static str, BucketEntry)>> {
         let mut results = Vec::new();
 
         for (level_idx, level) in self.levels.iter().enumerate() {
-            // Check next first (pending merge result, newest)
-            if let Some(next) = level.next() {
-                if let Some(entry) = next.get(key)? {
-                    results.push((level_idx, "next", entry));
-                }
-            }
             if let Some(entry) = level.curr.get(key)? {
                 results.push((level_idx, "curr", entry));
             }
@@ -472,14 +447,9 @@ impl BucketList {
         let mut entries = Vec::new();
 
         for level in &self.levels {
-            // Collect buckets to iterate: next (newest), curr, snap (oldest)
+            // Collect buckets to iterate: curr (newest), snap (oldest)
             // The order matters because first occurrence shadows later ones.
-            let mut buckets: Vec<&Bucket> = Vec::new();
-            if let Some(next) = level.next() {
-                buckets.push(next);
-            }
-            buckets.push(&level.curr);
-            buckets.push(&level.snap);
+            let buckets: [&Bucket; 2] = [&level.curr, &level.snap];
 
             for bucket in buckets {
                 for entry in bucket.iter() {
@@ -1159,37 +1129,27 @@ impl BucketList {
         let mut entries_scanned = 0;
         let mut bytes_used = 0u64;
 
-        // Skip to the current offset (entry index)
-        // Note: bucket_file_offset is used as entry index for in-memory buckets
-        let start_index = iter.bucket_file_offset as usize;
-        let total_entries = bucket.len();
+        // Skip buckets that predate Soroban; they cannot contain evictable entries.
+        let bucket_protocol = bucket.protocol_version().unwrap_or(0);
+        if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
+            iter.bucket_file_offset = 0;
+            return Ok((entries_scanned, bytes_used, true));
+        }
+
+        // bucket_file_offset is a byte offset in the bucket file.
+        let start_offset = iter.bucket_file_offset;
+        let mut current_offset = 0u64;
 
         // Iterate directly instead of collecting all entries into memory
         // This is critical for performance with disk-backed buckets
-        for (i, entry) in bucket.iter().enumerate() {
-            // Skip entries before start_index
-            if i < start_index {
-                continue;
-            }
+        for entry in bucket.iter() {
             let entry = &entry;
-            // Estimate entry size (XDR serialized size)
-            let entry_size = match entry {
-                BucketEntry::Live(e) | BucketEntry::Init(e) => {
-                    e.to_xdr(Limits::none()).map(|v| v.len()).unwrap_or(100) as u64
-                }
-                BucketEntry::Dead(k) => {
-                    k.to_xdr(Limits::none()).map(|v| v.len()).unwrap_or(50) as u64
-                }
-                BucketEntry::Metadata(m) => {
-                    m.to_xdr(Limits::none()).map(|v| v.len()).unwrap_or(20) as u64
-                }
-            };
+            let entry_size = entry.to_xdr()?.len() as u64 + 4; // 4-byte record mark
 
-            // Check if we've scanned enough bytes
-            if bytes_used + entry_size > max_bytes && entries_scanned > 0 {
-                // Update iterator to current position and return
-                iter.bucket_file_offset = i as u32;
-                return Ok((entries_scanned, bytes_used, false));
+            let entry_end = current_offset + entry_size;
+            if entry_end <= start_offset {
+                current_offset = entry_end;
+                continue;
             }
 
             bytes_used += entry_size;
@@ -1203,48 +1163,102 @@ impl BucketList {
                     if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
                         seen_keys.insert(key_bytes);
                     }
+                    current_offset = entry_end;
+                    if bytes_used >= max_bytes {
+                        iter.bucket_file_offset = current_offset;
+                        return Ok((entries_scanned, bytes_used, false));
+                    }
                     continue;
                 }
-                BucketEntry::Metadata(_) => continue,
+                BucketEntry::Metadata(_) => {
+                    current_offset = entry_end;
+                    if bytes_used >= max_bytes {
+                        iter.bucket_file_offset = current_offset;
+                        return Ok((entries_scanned, bytes_used, false));
+                    }
+                    continue;
+                }
             };
 
             // Only check Soroban entries
             if !is_soroban_entry(live_entry) {
+                current_offset = entry_end;
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = current_offset;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
                 continue;
             }
 
             // Get the key for this entry
             let Some(key) = ledger_entry_to_key(live_entry) else {
+                current_offset = entry_end;
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = current_offset;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
                 continue;
             };
 
             // Check if we've already seen this key (from a newer bucket)
             let key_bytes = match key.to_xdr(Limits::none()) {
                 Ok(bytes) => bytes,
-                Err(_) => continue,
+                Err(_) => {
+                    current_offset = entry_end;
+                    if bytes_used >= max_bytes {
+                        iter.bucket_file_offset = current_offset;
+                        return Ok((entries_scanned, bytes_used, false));
+                    }
+                    continue;
+                }
             };
 
             if !seen_keys.insert(key_bytes) {
+                current_offset = entry_end;
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = current_offset;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
                 // Already processed from a newer level
                 continue;
             }
 
             // Get the TTL key
             let Some(ttl_key) = get_ttl_key(&key) else {
+                current_offset = entry_end;
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = current_offset;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
                 continue;
             };
 
             // Look up the TTL entry
             let Some(ttl_entry) = self.get(&ttl_key)? else {
+                current_offset = entry_end;
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = current_offset;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
                 continue;
             };
 
             // Check if expired
             let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
+                current_offset = entry_end;
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = current_offset;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
                 continue;
             };
 
             if !is_expired {
+                current_offset = entry_end;
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = current_offset;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
                 continue;
             }
 
@@ -1256,10 +1270,16 @@ impl BucketList {
                 archived_entries.push(live_entry.clone());
                 evicted_keys.push(key);
             }
+
+            current_offset = entry_end;
+            if bytes_used >= max_bytes {
+                iter.bucket_file_offset = current_offset;
+                return Ok((entries_scanned, bytes_used, false));
+            }
         }
 
         // Finished the bucket
-        iter.bucket_file_offset = total_entries as u32;
+        iter.bucket_file_offset = current_offset;
         Ok((entries_scanned, bytes_used, true))
     }
 }

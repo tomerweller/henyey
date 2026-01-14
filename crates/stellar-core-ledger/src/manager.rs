@@ -42,9 +42,7 @@ use crate::{
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellar_core_bucket::{
-    update_starting_eviction_iterator, BucketList, EvictionIterator, StateArchivalSettings,
-};
+use stellar_core_bucket::{BucketList, EvictionIterator, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
 use stellar_core_invariant::{
@@ -113,7 +111,7 @@ fn load_eviction_iterator_from_bucket_list(bucket_list: &BucketList) -> Option<E
                 entry.data
             {
                 Some(EvictionIterator {
-                    bucket_file_offset: xdr_iter.bucket_file_offset as u32,
+                    bucket_file_offset: xdr_iter.bucket_file_offset,
                     bucket_list_level: xdr_iter.bucket_list_level,
                     is_curr_bucket: xdr_iter.is_curr_bucket,
                 })
@@ -1208,20 +1206,11 @@ impl<'a> LedgerCloseContext<'a> {
                     let eviction_iterator = load_eviction_iterator_from_bucket_list(&bucket_list);
                     tracing::debug!(ledger_seq = self.close_data.ledger_seq, has_iterator = eviction_iterator.is_some(), "Loaded eviction iterator");
 
-                    let mut iter = eviction_iterator.unwrap_or_else(|| {
+                    let iter = eviction_iterator.unwrap_or_else(|| {
                         tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Creating new EvictionIterator");
                         EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
                     });
                     tracing::debug!(ledger_seq = self.close_data.ledger_seq, "EvictionIterator ready");
-
-                    // Update starting level if needed (matches C++ behavior)
-                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Updating starting eviction iterator");
-                    update_starting_eviction_iterator(
-                        &mut iter,
-                        eviction_settings.starting_eviction_scan_level,
-                        self.close_data.ledger_seq,
-                    );
-                    tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Updated starting eviction iterator");
 
                     tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,

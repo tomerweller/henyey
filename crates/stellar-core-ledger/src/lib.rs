@@ -113,7 +113,7 @@ pub use snapshot::{
 };
 pub use soroban_state::{
     ContractCodeMapEntry, ContractDataMapEntry, InMemorySorobanState, SharedSorobanState,
-    SorobanStateStats, TtlData,
+    SorobanRentConfig, SorobanStateStats, TtlData,
 };
 
 /// Result type for ledger operations.

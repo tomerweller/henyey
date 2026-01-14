@@ -47,7 +47,7 @@
 
 use crate::{verify, HistoryError, Result};
 use sha2::{Digest, Sha256};
-use stellar_core_bucket::{update_starting_eviction_iterator, EvictionIterator, StateArchivalSettings};
+use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_invariant::LedgerEntryChange;
 use stellar_core_ledger::{
@@ -453,14 +453,9 @@ pub fn replay_ledger_with_execution(
         && header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
         && hot_archive_bucket_list.is_some()
     {
-        let mut iter = updated_eviction_iterator.unwrap_or_else(|| {
+        let iter = updated_eviction_iterator.unwrap_or_else(|| {
             EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
         });
-        update_starting_eviction_iterator(
-            &mut iter,
-            eviction_settings.starting_eviction_scan_level,
-            header.ledger_seq,
-        );
         let eviction_result = bucket_list
             .scan_for_eviction_incremental(iter, header.ledger_seq, &eviction_settings)
             .map_err(HistoryError::Bucket)?;
@@ -495,7 +490,7 @@ pub fn replay_ledger_with_execution(
                 last_modified_ledger_seq: header.ledger_seq,
                 data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
                     XdrEvictionIterator {
-                        bucket_file_offset: iter.bucket_file_offset as u64,
+                        bucket_file_offset: iter.bucket_file_offset,
                         bucket_list_level: iter.bucket_list_level,
                         is_curr_bucket: iter.is_curr_bucket,
                     },

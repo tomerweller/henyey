@@ -261,15 +261,8 @@ impl BucketListSnapshot {
     /// the first live entry found or `None` if the key is dead or not present.
     pub fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
         for level in &self.levels {
-            // Collect buckets: curr, next (if any), snap
-            let mut buckets: Vec<&BucketSnapshot> = vec![&level.curr];
-            if let Some(next) = &level.next {
-                buckets.push(next);
-            }
-            buckets.push(&level.snap);
-
-            // Check buckets in order (newer to older)
-            for bucket in buckets {
+            // Check buckets in order (newer to older): curr then snap
+            for bucket in [&level.curr, &level.snap] {
                 if let Some(entry) = bucket.get(key) {
                     match entry {
                         BucketEntry::Live(e) | BucketEntry::Init(e) => return Some(e),
@@ -443,15 +436,8 @@ impl SearchableBucketListSnapshot {
         let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
 
         for level in &self.snapshot.levels {
-            // Collect buckets: curr, next (if any), snap
-            let mut buckets: Vec<&BucketSnapshot> = vec![&level.curr];
-            if let Some(next) = &level.next {
-                buckets.push(next);
-            }
-            buckets.push(&level.snap);
-
-            // Process buckets in order (newer to older)
-            for bucket in buckets {
+            // Process buckets in order (newer to older): curr then snap
+            for bucket in [&level.curr, &level.snap] {
                 // Iterate through all entries in the bucket
                 for bucket_entry in bucket.raw_bucket().iter() {
                     // Check if this entry matches the requested type
@@ -518,14 +504,7 @@ impl SearchableBucketListSnapshot {
 
         // Scan all account entries
         for level in &self.snapshot.levels {
-            // Collect buckets: curr, next (if any), snap
-            let mut buckets: Vec<&BucketSnapshot> = vec![&level.curr];
-            if let Some(next) = &level.next {
-                buckets.push(next);
-            }
-            buckets.push(&level.snap);
-
-            for bucket in buckets {
+            for bucket in [&level.curr, &level.snap] {
                 for bucket_entry in bucket.raw_bucket().iter() {
                     match &bucket_entry {
                         BucketEntry::Live(entry) | BucketEntry::Init(entry) => {

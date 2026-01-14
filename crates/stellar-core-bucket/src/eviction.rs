@@ -109,8 +109,8 @@ pub const DEFAULT_STARTING_EVICTION_SCAN_LEVEL: u32 = 6;
 /// 4. ... (continues to top level, then wraps to starting level)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvictionIterator {
-    /// Current byte offset (or entry index) within the bucket.
-    pub bucket_file_offset: u32,
+    /// Current byte offset within the bucket file.
+    pub bucket_file_offset: u64,
     /// Current bucket list level being scanned (0 to NUM_LEVELS-1).
     pub bucket_list_level: u32,
     /// Whether scanning the curr bucket (true) or snap bucket (false).
@@ -146,11 +146,20 @@ impl EvictionIterator {
     /// Returns true if we've wrapped back to the starting position (completed a full cycle).
     pub fn advance_to_next_bucket(&mut self, starting_level: u32) -> bool {
         let mut wrapped = false;
+        let last_level = BUCKET_LIST_LEVELS as u32 - 1;
 
         if self.is_curr_bucket {
-            // Move from curr to snap at same level
-            self.is_curr_bucket = false;
-            self.bucket_file_offset = 0;
+            // Move from curr to snap at same level, except for the last level
+            if self.bucket_list_level != last_level {
+                self.is_curr_bucket = false;
+                self.bucket_file_offset = 0;
+            } else {
+                // Last level has no snap scan; wrap to starting level
+                self.is_curr_bucket = true;
+                self.bucket_file_offset = 0;
+                self.bucket_list_level = starting_level;
+                wrapped = true;
+            }
         } else {
             // Move from snap to curr at next level
             self.bucket_list_level += 1;
@@ -158,7 +167,7 @@ impl EvictionIterator {
             self.bucket_file_offset = 0;
 
             // Wrap around at top level
-            if self.bucket_list_level >= BUCKET_LIST_LEVELS as u32 {
+            if self.bucket_list_level > last_level {
                 self.bucket_list_level = starting_level;
                 wrapped = true;
             }
@@ -309,12 +318,16 @@ pub fn update_starting_eviction_iterator(
         was_reset = true;
     }
 
+    // C++ checks spill activity from the previous ledger because the iterator
+    // is persisted before spills are applied.
+    let prev_ledger = ledger_seq.saturating_sub(1);
+
     // Check if the bucket we're scanning has received new data
     if iter.is_curr_bucket {
         // Curr bucket receives data when the level below spills
         if iter.bucket_list_level > 0 {
             let level_below = iter.bucket_list_level - 1;
-            if level_should_spill(ledger_seq, level_below) {
+            if level_should_spill(prev_ledger, level_below) {
                 iter.bucket_file_offset = 0;
                 was_reset = true;
             }
@@ -325,7 +338,7 @@ pub fn update_starting_eviction_iterator(
         }
     } else {
         // Snap bucket receives data when its own level spills
-        if level_should_spill(ledger_seq, iter.bucket_list_level) {
+        if level_should_spill(prev_ledger, iter.bucket_list_level) {
             iter.bucket_file_offset = 0;
             was_reset = true;
         }

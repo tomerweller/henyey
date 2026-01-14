@@ -166,10 +166,12 @@ pub fn merge_buckets_with_options(
             (Some(ref ok), Some(ref nk)) => {
                 match compare_keys(ok, nk) {
                     Ordering::Less => {
-                        // Old entry comes first, no shadow
-                        // DON'T normalize old entries - they should stay as-is
-                        // Init entries in old bucket are from before this merge boundary
-                        merged.push(old_entry.clone());
+                        // Old entry comes first, no shadow.
+                        // DON'T normalize old entries - they should stay as-is.
+                        // Init entries in old bucket are from before this merge boundary.
+                        if should_keep_entry(old_entry, keep_dead_entries) {
+                            merged.push(old_entry.clone());
+                        }
                         old_idx += 1;
                     }
                     Ordering::Greater => {
@@ -204,7 +206,7 @@ pub fn merge_buckets_with_options(
     // Add remaining old entries
     while old_idx < old_entries.len() {
         let entry = &old_entries[old_idx];
-        if !entry.is_metadata() {
+        if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
             merged.push(entry.clone());
         }
         old_idx += 1;

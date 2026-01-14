@@ -262,359 +262,77 @@ pub fn ledger_entry_to_key(entry: &LedgerEntry) -> Option<LedgerKey> {
 /// This function is deterministic and must produce the same ordering as
 /// stellar-core's C++ implementation to ensure bucket hashes match.
 pub fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
-    use stellar_xdr::curr::*;
-
-    // First compare by discriminant
-    let disc_a = key_discriminant(a);
-    let disc_b = key_discriminant(b);
-
-    match disc_a.cmp(&disc_b) {
-        Ordering::Equal => {}
-        other => return other,
+    let a_type = ledger_key_type(a);
+    let b_type = ledger_key_type(b);
+    match a_type.cmp(&b_type) {
+        Ordering::Equal => compare_keys_same_type(a, b),
+        other => other,
     }
+}
 
-    // Then compare by type-specific fields
+fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
+    match key {
+        LedgerKey::Account(_) => stellar_xdr::curr::LedgerEntryType::Account,
+        LedgerKey::Trustline(_) => stellar_xdr::curr::LedgerEntryType::Trustline,
+        LedgerKey::Offer(_) => stellar_xdr::curr::LedgerEntryType::Offer,
+        LedgerKey::Data(_) => stellar_xdr::curr::LedgerEntryType::Data,
+        LedgerKey::ClaimableBalance(_) => stellar_xdr::curr::LedgerEntryType::ClaimableBalance,
+        LedgerKey::LiquidityPool(_) => stellar_xdr::curr::LedgerEntryType::LiquidityPool,
+        LedgerKey::ContractData(_) => stellar_xdr::curr::LedgerEntryType::ContractData,
+        LedgerKey::ContractCode(_) => stellar_xdr::curr::LedgerEntryType::ContractCode,
+        LedgerKey::ConfigSetting(_) => stellar_xdr::curr::LedgerEntryType::ConfigSetting,
+        LedgerKey::Ttl(_) => stellar_xdr::curr::LedgerEntryType::Ttl,
+    }
+}
+
+fn compare_keys_same_type(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     match (a, b) {
-        (LedgerKey::Account(a), LedgerKey::Account(b)) => {
-            compare_account_id(&a.account_id, &b.account_id)
-        }
+        (LedgerKey::Account(a), LedgerKey::Account(b)) => a.account_id.cmp(&b.account_id),
         (LedgerKey::Trustline(a), LedgerKey::Trustline(b)) => {
-            compare_account_id(&a.account_id, &b.account_id)
-                .then_with(|| compare_trust_line_asset(&a.asset, &b.asset))
+            a.account_id
+                .cmp(&b.account_id)
+                .then_with(|| a.asset.cmp(&b.asset))
         }
-        (LedgerKey::Offer(a), LedgerKey::Offer(b)) => {
-            compare_account_id(&a.seller_id, &b.seller_id)
-                .then_with(|| a.offer_id.cmp(&b.offer_id))
-        }
-        (LedgerKey::Data(a), LedgerKey::Data(b)) => {
-            compare_account_id(&a.account_id, &b.account_id)
-                .then_with(|| a.data_name.as_slice().cmp(b.data_name.as_slice()))
-        }
+        (LedgerKey::Offer(a), LedgerKey::Offer(b)) => a
+            .seller_id
+            .cmp(&b.seller_id)
+            .then_with(|| a.offer_id.cmp(&b.offer_id)),
+        (LedgerKey::Data(a), LedgerKey::Data(b)) => a
+            .account_id
+            .cmp(&b.account_id)
+            .then_with(|| a.data_name.cmp(&b.data_name)),
         (LedgerKey::ClaimableBalance(a), LedgerKey::ClaimableBalance(b)) => {
-            compare_claimable_balance_id(&a.balance_id, &b.balance_id)
+            a.balance_id.cmp(&b.balance_id)
         }
         (LedgerKey::LiquidityPool(a), LedgerKey::LiquidityPool(b)) => {
-            a.liquidity_pool_id.0.cmp(&b.liquidity_pool_id.0)
+            a.liquidity_pool_id.cmp(&b.liquidity_pool_id)
         }
         (LedgerKey::ContractData(a), LedgerKey::ContractData(b)) => {
             compare_sc_address(&a.contract, &b.contract)
                 .then_with(|| compare_sc_val(&a.key, &b.key))
-                .then_with(|| (a.durability as i32).cmp(&(b.durability as i32)))
+                .then_with(|| a.durability.cmp(&b.durability))
         }
-        (LedgerKey::ContractCode(a), LedgerKey::ContractCode(b)) => {
-            a.hash.0.cmp(&b.hash.0)
-        }
+        (LedgerKey::ContractCode(a), LedgerKey::ContractCode(b)) => a.hash.cmp(&b.hash),
         (LedgerKey::ConfigSetting(a), LedgerKey::ConfigSetting(b)) => {
-            (a.config_setting_id as i32).cmp(&(b.config_setting_id as i32))
+            a.config_setting_id.cmp(&b.config_setting_id)
         }
-        (LedgerKey::Ttl(a), LedgerKey::Ttl(b)) => {
-            a.key_hash.0.cmp(&b.key_hash.0)
-        }
-        _ => Ordering::Equal, // Should not happen if discriminants match
-    }
-}
-
-/// Get a numeric discriminant for a LedgerKey type.
-fn key_discriminant(key: &LedgerKey) -> i32 {
-    use stellar_xdr::curr::*;
-    match key {
-        LedgerKey::Account(_) => LedgerEntryType::Account as i32,
-        LedgerKey::Trustline(_) => LedgerEntryType::Trustline as i32,
-        LedgerKey::Offer(_) => LedgerEntryType::Offer as i32,
-        LedgerKey::Data(_) => LedgerEntryType::Data as i32,
-        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance as i32,
-        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool as i32,
-        LedgerKey::ContractData(_) => LedgerEntryType::ContractData as i32,
-        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode as i32,
-        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting as i32,
-        LedgerKey::Ttl(_) => LedgerEntryType::Ttl as i32,
-    }
-}
-
-/// Compare two AccountId values.
-fn compare_account_id(
-    a: &stellar_xdr::curr::AccountId,
-    b: &stellar_xdr::curr::AccountId,
-) -> Ordering {
-    // AccountId is PublicKey which is an enum
-    use stellar_xdr::curr::PublicKey;
-    match (&a.0, &b.0) {
-        (PublicKey::PublicKeyTypeEd25519(a), PublicKey::PublicKeyTypeEd25519(b)) => {
-            a.0.cmp(&b.0)
-        }
-    }
-}
-
-/// Compare two TrustLineAsset values.
-fn compare_trust_line_asset(
-    a: &stellar_xdr::curr::TrustLineAsset,
-    b: &stellar_xdr::curr::TrustLineAsset,
-) -> Ordering {
-    use stellar_xdr::curr::TrustLineAsset;
-
-    let disc_a = match a {
-        TrustLineAsset::Native => 0,
-        TrustLineAsset::CreditAlphanum4(_) => 1,
-        TrustLineAsset::CreditAlphanum12(_) => 2,
-        TrustLineAsset::PoolShare(_) => 3,
-    };
-    let disc_b = match b {
-        TrustLineAsset::Native => 0,
-        TrustLineAsset::CreditAlphanum4(_) => 1,
-        TrustLineAsset::CreditAlphanum12(_) => 2,
-        TrustLineAsset::PoolShare(_) => 3,
-    };
-
-    match disc_a.cmp(&disc_b) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-
-    match (a, b) {
-        (TrustLineAsset::Native, TrustLineAsset::Native) => Ordering::Equal,
-        (TrustLineAsset::CreditAlphanum4(a), TrustLineAsset::CreditAlphanum4(b)) => {
-            a.asset_code.as_slice().cmp(b.asset_code.as_slice())
-                .then_with(|| compare_account_id(&a.issuer, &b.issuer))
-        }
-        (TrustLineAsset::CreditAlphanum12(a), TrustLineAsset::CreditAlphanum12(b)) => {
-            a.asset_code.as_slice().cmp(b.asset_code.as_slice())
-                .then_with(|| compare_account_id(&a.issuer, &b.issuer))
-        }
-        (TrustLineAsset::PoolShare(a), TrustLineAsset::PoolShare(b)) => {
-            a.0.cmp(&b.0)
-        }
-        _ => Ordering::Equal, // Should not happen
-    }
-}
-
-/// Compare two ClaimableBalanceId values.
-fn compare_claimable_balance_id(
-    a: &stellar_xdr::curr::ClaimableBalanceId,
-    b: &stellar_xdr::curr::ClaimableBalanceId,
-) -> Ordering {
-    use stellar_xdr::curr::ClaimableBalanceId;
-    match (a, b) {
-        (
-            ClaimableBalanceId::ClaimableBalanceIdTypeV0(a),
-            ClaimableBalanceId::ClaimableBalanceIdTypeV0(b),
-        ) => a.0.cmp(&b.0),
-    }
-}
-
-/// Compare two ScAddress values.
-fn compare_sc_address(
-    a: &stellar_xdr::curr::ScAddress,
-    b: &stellar_xdr::curr::ScAddress,
-) -> Ordering {
-    use stellar_xdr::curr::ScAddress;
-
-    // Assign discriminant values for ordering
-    let disc_a = match a {
-        ScAddress::Account(_) => 0,
-        ScAddress::Contract(_) => 1,
-        ScAddress::MuxedAccount(_) => 2,
-        ScAddress::ClaimableBalance(_) => 3,
-        ScAddress::LiquidityPool(_) => 4,
-    };
-    let disc_b = match b {
-        ScAddress::Account(_) => 0,
-        ScAddress::Contract(_) => 1,
-        ScAddress::MuxedAccount(_) => 2,
-        ScAddress::ClaimableBalance(_) => 3,
-        ScAddress::LiquidityPool(_) => 4,
-    };
-
-    match disc_a.cmp(&disc_b) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-
-    match (a, b) {
-        (ScAddress::Account(a), ScAddress::Account(b)) => compare_account_id(a, b),
-        (ScAddress::Contract(a), ScAddress::Contract(b)) => a.0.cmp(&b.0),
-        (ScAddress::MuxedAccount(a), ScAddress::MuxedAccount(b)) => {
-            // Compare by the inner muxed account ID
-            a.to_string().cmp(&b.to_string())
-        }
-        (ScAddress::ClaimableBalance(a), ScAddress::ClaimableBalance(b)) => {
-            // ClaimableBalanceId is an enum, extract the hash for comparison
-            match (a, b) {
-                (
-                    stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(ha),
-                    stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(hb),
-                ) => ha.0.cmp(&hb.0),
-            }
-        }
-        (ScAddress::LiquidityPool(a), ScAddress::LiquidityPool(b)) => a.0.cmp(&b.0),
+        (LedgerKey::Ttl(a), LedgerKey::Ttl(b)) => a.key_hash.cmp(&b.key_hash),
         _ => Ordering::Equal,
     }
 }
 
-/// Compare two ScVal values using the same order as C++ stellar-core.
-///
-/// This uses semantic comparison (discriminant first, then field values)
-/// rather than XDR byte comparison, which is necessary for correct ordering
-/// of signed integer types (I32, I64, I128, I256).
+fn compare_sc_address(
+    a: &stellar_xdr::curr::ScAddress,
+    b: &stellar_xdr::curr::ScAddress,
+) -> Ordering {
+    a.cmp(b)
+}
+
 fn compare_sc_val(
     a: &stellar_xdr::curr::ScVal,
     b: &stellar_xdr::curr::ScVal,
 ) -> Ordering {
-    use stellar_xdr::curr::ScVal::*;
-
-    // Compare by type discriminant first
-    let type_a = sc_val_type_discriminant(a);
-    let type_b = sc_val_type_discriminant(b);
-    if type_a != type_b {
-        return type_a.cmp(&type_b);
-    }
-
-    // Same type, compare by value
-    match (a, b) {
-        (Bool(a), Bool(b)) => a.cmp(b),
-        (Void, Void) => Ordering::Equal,
-        (Error(a), Error(b)) => {
-            // Compare by XDR bytes
-            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
-            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
-            a_bytes.cmp(&b_bytes)
-        }
-        (U32(a), U32(b)) => a.cmp(b),
-        (I32(a), I32(b)) => a.cmp(b),
-        (U64(a), U64(b)) => a.cmp(b),
-        (I64(a), I64(b)) => a.cmp(b),
-        (Timepoint(a), Timepoint(b)) => a.cmp(b),
-        (Duration(a), Duration(b)) => a.cmp(b),
-        (U128(a), U128(b)) => {
-            match a.hi.cmp(&b.hi) {
-                Ordering::Equal => a.lo.cmp(&b.lo),
-                other => other,
-            }
-        }
-        (I128(a), I128(b)) => {
-            // For signed 128-bit integers, we need semantic comparison
-            // hi is i64 (signed), lo is u64 (unsigned)
-            match a.hi.cmp(&b.hi) {
-                Ordering::Equal => a.lo.cmp(&b.lo),
-                other => other,
-            }
-        }
-        (U256(a), U256(b)) => {
-            // All parts are u64, compare in order from most to least significant
-            for (a_part, b_part) in [
-                (a.hi_hi, b.hi_hi),
-                (a.hi_lo, b.hi_lo),
-                (a.lo_hi, b.lo_hi),
-                (a.lo_lo, b.lo_lo),
-            ] {
-                match a_part.cmp(&b_part) {
-                    Ordering::Equal => continue,
-                    other => return other,
-                }
-            }
-            Ordering::Equal
-        }
-        (I256(a), I256(b)) => {
-            // I256 has hi_hi as i64 (signed), others as u64
-            match a.hi_hi.cmp(&b.hi_hi) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-            match a.hi_lo.cmp(&b.hi_lo) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-            match a.lo_hi.cmp(&b.lo_hi) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-            a.lo_lo.cmp(&b.lo_lo)
-        }
-        (Bytes(a), Bytes(b)) => a.as_slice().cmp(b.as_slice()),
-        (String(a), String(b)) => a.as_slice().cmp(b.as_slice()),
-        (Symbol(a), Symbol(b)) => a.as_slice().cmp(b.as_slice()),
-        (Vec(a_opt), Vec(b_opt)) => {
-            match (a_opt, b_opt) {
-                (Some(a), Some(b)) => {
-                    for (a_elem, b_elem) in a.iter().zip(b.iter()) {
-                        match compare_sc_val(a_elem, b_elem) {
-                            Ordering::Equal => continue,
-                            other => return other,
-                        }
-                    }
-                    a.len().cmp(&b.len())
-                }
-                (Some(_), None) => Ordering::Greater,
-                (None, Some(_)) => Ordering::Less,
-                (None, None) => Ordering::Equal,
-            }
-        }
-        (Map(a_opt), Map(b_opt)) => {
-            match (a_opt, b_opt) {
-                (Some(a), Some(b)) => {
-                    for (a_entry, b_entry) in a.iter().zip(b.iter()) {
-                        match compare_sc_val(&a_entry.key, &b_entry.key) {
-                            Ordering::Equal => {
-                                match compare_sc_val(&a_entry.val, &b_entry.val) {
-                                    Ordering::Equal => continue,
-                                    other => return other,
-                                }
-                            }
-                            other => return other,
-                        }
-                    }
-                    a.len().cmp(&b.len())
-                }
-                (Some(_), None) => Ordering::Greater,
-                (None, Some(_)) => Ordering::Less,
-                (None, None) => Ordering::Equal,
-            }
-        }
-        (Address(a), Address(b)) => compare_sc_address(a, b),
-        (LedgerKeyContractInstance, LedgerKeyContractInstance) => Ordering::Equal,
-        (LedgerKeyNonce(a), LedgerKeyNonce(b)) => a.nonce.cmp(&b.nonce),
-        (ContractInstance(a), ContractInstance(b)) => {
-            // Compare by XDR bytes as fallback
-            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
-            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
-            a_bytes.cmp(&b_bytes)
-        }
-        // For any remaining cases, use XDR byte comparison
-        _ => {
-            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
-            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
-            a_bytes.cmp(&b_bytes)
-        }
-    }
-}
-
-/// Get the XDR type discriminant for an ScVal.
-fn sc_val_type_discriminant(v: &stellar_xdr::curr::ScVal) -> i32 {
-    use stellar_xdr::curr::ScVal::*;
-    // Values must match XDR ScValType enum discriminants
-    match v {
-        Bool(_) => 0,
-        Void => 1,
-        Error(_) => 2,
-        U32(_) => 3,
-        I32(_) => 4,
-        U64(_) => 5,
-        I64(_) => 6,
-        Timepoint(_) => 7,
-        Duration(_) => 8,
-        U128(_) => 9,
-        I128(_) => 10,
-        U256(_) => 11,
-        I256(_) => 12,
-        Bytes(_) => 13,
-        String(_) => 14,
-        Symbol(_) => 15,
-        Vec(_) => 16,
-        Map(_) => 17,
-        Address(_) => 18,
-        ContractInstance(_) => 19,
-        LedgerKeyContractInstance => 20,
-        LedgerKeyNonce(_) => 21,
-    }
+    a.cmp(b)
 }
 
 /// Compare two BucketEntry values by key.

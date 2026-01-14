@@ -44,12 +44,12 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ---
 
-## 2. Bucket List Hash Mismatch at P25 (Partially Resolved)
+## 2. Bucket List Hash Mismatch at P25 (Resolved)
 
-**Status:** Partially Resolved
+**Status:** Resolved
 **Severity:** Critical - Prevents ledger closing
 **Component:** Bucket List / Ledger State
-**Last Verified:** 2026-01-13
+**Last Verified:** 2026-01-14
 
 ### Description
 The locally computed `bucketListHash` diverges from the network's expected hash, specifically at the transition to ledger 379904 (testnet) on Protocol 25. While the initial state at the checkpoint (379903) is verified to be in perfect sync, the creation of the new L0 bucket in the subsequent ledger produces a different hash than C++ stellar-core.
@@ -63,16 +63,9 @@ An extensive investigation has successfully identified and resolved several crit
 
 3.  **Eviction Iterator Parity (Fixed):** Added the missing local `EvictionIterator` update to both the metadata replay and transaction execution paths. In Protocol 23+, nodes must deterministically scan buckets and update this `ConfigSetting` every ledger. Our implementation now correctly performs this scan, and the resulting iterator values have been verified to match between both paths.
 
-### Remaining Issue
-Despite these fixes, a mismatch persists. The divergence has been isolated to the content of the Level 0 `curr` bucket at ledger 379904.
+### Resolution
+The remaining divergence was caused by skipping `tx_changes_before` for failed transactions when replaying CDP metadata. In protocol 10+ this omission drops the sequence bump (and other pre-apply changes) from the L0 batch, causing the live bucket hash to drift at the first post-checkpoint ledger.
 
-- **CDP Replay vs. Execution**: Detailed XDR dumps show that our execution engine produces different `ContractData` entries for Soroban transactions compared to the authoritative CDP metadata (e.g., missing `write_timestamp` extensions).
-- **CDP Replay Failure**: Crucially, even when replaying the "correct" entries directly from CDP metadata, the final hash still does not match the expected network hash.
-
-This indicates the root cause is not just in transaction execution, but likely a subtle, protocol-level detail in how the L0 bucket is constructed or hashed in Protocol 25.
-
-### Next Steps
-- Further investigation into the XDR serialization of `BucketMetadata` for Protocol 25.
-- A line-by-line comparison of the C++ `Bucket::fresh` and `BucketOutputIterator` logic against our Rust implementation to identify any discrepancies in entry sorting or serialization for new buckets.
+Applying `tx_changes_before` for all transactions (and only applying operation/after changes for successful ones) restores parity. CDP replay now matches the expected bucket list hash at the protocol 25 transition.
 
 ---
