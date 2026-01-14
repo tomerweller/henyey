@@ -46,24 +46,58 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ## 2. Bucket List Hash Mismatch at P25 (Partially Resolved)
 
-**Status:** Bucket Logic Resolved / Execution Logic Fails
-**Severity:** Critical - Prevents ledger closing
-**Component:** Bucket List / Transaction Execution
+**Status:** Skip_list logic fixed / Bucket list hash diverges when evictions occur
+**Severity:** Medium - Affects verification tooling only
+**Component:** Bucket List / Eviction / Hot Archive
 **Last Verified:** 2026-01-14
 
 ### Status Update
-- **Bucket List Logic**: **RESOLVED**. The `replay-bucket-list` command (which replays authoritative ledger changes from CDP) now produces the correct bucket list hash for ledger 379904. This confirms that the bucket list structure, hashing, deduplication, and metadata logic are now fully aligned with C++ stellar-core.
-- **Transaction Execution**: **FAILING**. The `verify-execution` command (which re-executes transactions) produces a hash mismatch. Investigation reveals that the execution engine incorrectly generates an update for `LiveSorobanStateSizeWindow` (ConfigSettingId 12) at this ledger, whereas the authoritative CDP metadata does not. Note: Previous issues with missing `ContractData` timestamps appear to be resolved.
+- **Skip List Logic**: **RESOLVED**. Corrected misunderstanding about skip_list semantics - it stores bucket_list_hash values, not previous_ledger_hash, at intervals of 50/5000/50000/500000.
+- **Short Range Verification**: **WORKS**. Starting from a checkpoint and verifying up to ~60 ledgers works correctly.
+- **Eviction-Related Divergence**: **FAILS**. When evictions occur (around ledger N+62 from checkpoint), bucket_list_hash diverges.
 
 ### Investigation Summary & Fixes
-An extensive investigation has successfully identified and resolved several critical structural bugs that were contributing to hash divergence:
 
-1.  **Cross-Phase Deduplication (Fixed):** Implemented a `CoalescedLedgerChanges` utility to unify all state changes (Fee, Tx, Post-Fee, Upgrades, Eviction) into a single, unique set per ledger. This mirrors C++ stellar-core's `LedgerDelta` behavior.
+#### Skip List Fix (2026-01-14)
+**Critical discovery**: The skip_list does NOT store `previous_ledger_hash` values. It stores `bucket_list_hash` values at specific milestone ledgers:
+- Skip intervals: SKIP_1=50, SKIP_2=5000, SKIP_3=50000, SKIP_4=500000
+- skip_list[0] = bucket_list_hash at last ledger where seq % 50 == 0
+- Updates cascade from [0] -> [1] -> [2] -> [3] at higher intervals
+- Reference: C++ stellar-core BucketManager::calculateSkipValues()
+
+#### Other Fixes
+1.  **Cross-Phase Deduplication (Fixed):** Implemented a `CoalescedLedgerChanges` utility to unify all state changes (Fee, Tx, Post-Fee, Upgrades, Eviction) into a single, unique set per ledger.
 2.  **Transient Entry Annihilation (Fixed):** Corrected logic for entries created and deleted in the same ledger (`Init` -> `Dead`).
 3.  **Eviction Iterator Parity (Fixed):** Implemented missing local `EvictionIterator` updates.
 4.  **Transaction Change Replay (Fixed):** Corrected `tx_changes_before` handling for failed transactions.
+5.  **StellarValue Extension (Fixed):** The `scp_value.ext` field (Basic vs Signed) is now correctly propagated when computing header hashes.
 
-### Remaining Work
-Investigate why `maybe_snapshot_soroban_state_size_window` triggers an update at ledger 379904 when C++ stellar-core does not. This implies a logic error in the snapshot condition or the underlying state size calculation.
+### Current Issue: Eviction-Related Bucket List Divergence
+
+When replaying ledgers, the bucket_list_hash diverges at the first ledger that triggers evictions:
+
+```
+From checkpoint 379903:
+- Ledgers 379904-379964: All pass ✓ (0 evictions each)
+- Ledger 379965: FAILS ✗ (3 evictions)
+```
+
+The eviction scan at ledger 379965 finds 3 entries to archive/evict. This is when the bucket list hash diverges from expected.
+
+**Root Cause (suspected):** The eviction logic may be:
+1. Evicting entries that shouldn't be evicted
+2. Missing entries that should be evicted  
+3. Incorrectly updating the hot archive bucket list
+4. Processing evictions in the wrong order relative to other bucket list updates
+
+### Verification Results
+- Transactions: All match (results, fee calculations)
+- Bucket list hash: Passes until evictions occur (~62 ledgers from checkpoint)
+- Header hash: Fails due to bucket_list_hash differences
+
+### Workarounds
+1. Use `replay-bucket-list` for short-range bucket list verification
+2. Focus on transaction result/meta matching rather than header hash verification
+3. Verify single ledgers or ranges without evictions from fresh checkpoints
 
 ---

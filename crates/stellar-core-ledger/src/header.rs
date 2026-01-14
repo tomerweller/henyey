@@ -32,6 +32,13 @@ use stellar_xdr::curr::{Hash, LedgerHeader, Limits, WriteXdr};
 /// Number of entries in the skip list (fixed at 4 by protocol).
 pub const SKIP_LIST_SIZE: usize = 4;
 
+/// Skip list update intervals (from C++ stellar-core).
+/// The skip list stores bucket_list_hash values at these intervals.
+pub const SKIP_1: u32 = 50;
+pub const SKIP_2: u32 = 5000;
+pub const SKIP_3: u32 = 50000;
+pub const SKIP_4: u32 = 500000;
+
 /// Compute the canonical hash of a ledger header.
 ///
 /// The header hash is the SHA-256 digest of the XDR-encoded header.
@@ -49,56 +56,72 @@ pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
     Ok(Hash256::hash(&xdr_bytes))
 }
 
-/// Compute the skip list for a new ledger header.
+/// Update the skip list for a ledger header based on its bucket list hash.
 ///
-/// The skip list contains hashes of previous ledger headers at specific
-/// intervals, enabling O(log n) backward traversal of the ledger chain.
+/// The skip list contains bucket_list_hash values at specific ledger intervals,
+/// enabling efficient verification of bucket list state at historical points.
 ///
-/// # Algorithm
+/// # Algorithm (from C++ stellar-core BucketManager::calculateSkipValues)
 ///
-/// For a ledger at sequence N:
+/// The skip list is only updated when ledger_seq is divisible by SKIP_1 (50).
+/// At those points:
+/// - skipList[0] = current bucket_list_hash
+/// - skipList[1] = previous skipList[0] (when appropriate interval conditions are met)
+/// - skipList[2] = previous skipList[1] (when appropriate interval conditions are met)
+/// - skipList[3] = previous skipList[2] (when appropriate interval conditions are met)
 ///
-/// - Entry 0: Always points to N-1 (previous ledger)
-/// - Entry 1: Points to the previous ledger at a multiple of 4, or inherits
-/// - Entry 2: Points to the previous ledger at a multiple of 16, or inherits
-/// - Entry 3: Points to the previous ledger at a multiple of 64, or inherits
-///
-/// When the current sequence is at a boundary (divisible by the skip interval),
-/// the entry points to the previous ledger. Otherwise, it inherits the value
-/// from the previous header's skip list.
+/// The cascading updates happen based on complex interval conditions:
+/// - skipList[1] updates when (seq - SKIP_1) % SKIP_2 == 0
+/// - skipList[2] updates when additionally (seq - SKIP_2 - SKIP_1) % SKIP_3 == 0
+/// - skipList[3] updates when additionally (seq - SKIP_3 - SKIP_2 - SKIP_1) % SKIP_4 == 0
 ///
 /// # Arguments
 ///
-/// * `ledger_seq` - Sequence number of the new ledger
-/// * `prev_hash` - Hash of the previous ledger header
-/// * `prev_skip_list` - Skip list from the previous header
+/// * `header` - The ledger header to update (modified in place)
+///
+/// # Note
+///
+/// This must be called after setting the bucket_list_hash but before computing
+/// the header hash.
+pub fn calculate_skip_values(header: &mut LedgerHeader) {
+    let seq = header.ledger_seq;
+
+    if seq % SKIP_1 == 0 {
+        let v = seq.saturating_sub(SKIP_1) as i64;
+        if v > 0 && (v as u32) % SKIP_2 == 0 {
+            let v2 = seq.saturating_sub(SKIP_2).saturating_sub(SKIP_1) as i64;
+            if v2 > 0 && (v2 as u32) % SKIP_3 == 0 {
+                let v3 = seq
+                    .saturating_sub(SKIP_3)
+                    .saturating_sub(SKIP_2)
+                    .saturating_sub(SKIP_1) as i64;
+                if v3 > 0 && (v3 as u32) % SKIP_4 == 0 {
+                    header.skip_list[3] = header.skip_list[2].clone();
+                }
+                header.skip_list[2] = header.skip_list[1].clone();
+            }
+            header.skip_list[1] = header.skip_list[0].clone();
+        }
+        header.skip_list[0] = header.bucket_list_hash.clone();
+    }
+}
+
+/// Compute the skip list for a new ledger header (legacy interface).
+///
+/// **DEPRECATED**: This function is kept for backward compatibility but uses
+/// incorrect logic. Use `calculate_skip_values` instead, which modifies the
+/// header in place after setting the bucket_list_hash.
+///
+/// The skip list actually stores bucket_list_hash values, not previous_ledger_hash.
+/// This function returns a skip list that simply copies from the previous header's
+/// skip list, which is correct for ledgers where seq % 50 != 0.
 pub fn compute_skip_list(
-    ledger_seq: u32,
-    prev_hash: Hash256,
+    _ledger_seq: u32,
+    _prev_hash: Hash256,
     prev_skip_list: &[Hash; SKIP_LIST_SIZE],
 ) -> [Hash; SKIP_LIST_SIZE] {
-    let mut skip_list = std::array::from_fn(|_| Hash([0u8; 32]));
-
-    if ledger_seq == 0 {
-        return skip_list;
-    }
-
-    // Entry 0 is always the previous ledger hash
-    skip_list[0] = prev_hash.into();
-
-    // For entries 1-3, compute which previous skip list entry to use
-    for i in 1..SKIP_LIST_SIZE {
-        let mod_value = 1u32 << (2 * i); // 4, 16, 64 for i = 1, 2, 3
-        if ledger_seq % mod_value == 0 {
-            // We're at a boundary, use the prev_hash
-            skip_list[i] = prev_hash.into();
-        } else {
-            // Copy from the previous skip list
-            skip_list[i] = prev_skip_list[i].clone();
-        }
-    }
-
-    skip_list
+    // For non-update ledgers, just copy the previous skip list
+    prev_skip_list.clone()
 }
 
 /// Calculate the target ledger sequence for a skip list entry.
@@ -267,6 +290,9 @@ pub fn verify_skip_list(
 /// The returned header inherits `base_fee`, `base_reserve`, and `max_tx_set_size`
 /// from the previous header. These can be modified by protocol upgrades after
 /// header creation.
+///
+/// The skip_list is copied from the previous header and then updated via
+/// `calculate_skip_values` based on the new bucket_list_hash.
 pub fn create_next_header(
     prev_header: &LedgerHeader,
     prev_header_hash: Hash256,
@@ -279,9 +305,9 @@ pub fn create_next_header(
     inflation_seq: u32,
 ) -> LedgerHeader {
     let new_seq = prev_header.ledger_seq + 1;
-    let skip_list = compute_skip_list(new_seq, prev_header_hash, &prev_header.skip_list);
-
-    LedgerHeader {
+    
+    // Start with the previous header's skip_list, then update it
+    let mut header = LedgerHeader {
         ledger_version: prev_header.ledger_version,
         previous_ledger_hash: prev_header_hash.into(),
         scp_value: stellar_xdr::curr::StellarValue {
@@ -300,9 +326,14 @@ pub fn create_next_header(
         base_fee: prev_header.base_fee,
         base_reserve: prev_header.base_reserve,
         max_tx_set_size: prev_header.max_tx_set_size,
-        skip_list,
+        skip_list: prev_header.skip_list.clone(),
         ext: stellar_xdr::curr::LedgerHeaderExt::V0,
-    }
+    };
+    
+    // Update skip_list based on the new bucket_list_hash (only at seq % 50 == 0)
+    calculate_skip_values(&mut header);
+    
+    header
 }
 
 /// Extract the ledger close time from a header.
@@ -381,6 +412,29 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_skip_values() {
+        // Test that skip list is not updated when seq % 50 != 0
+        let mut header = create_test_header(5);
+        header.bucket_list_hash = Hash([1u8; 32]);
+        calculate_skip_values(&mut header);
+        assert_eq!(header.skip_list[0], Hash([0u8; 32])); // Unchanged
+
+        // Test that skip list[0] is updated when seq % 50 == 0
+        let mut header = create_test_header(SKIP_1); // seq = 50
+        header.bucket_list_hash = Hash([2u8; 32]);
+        calculate_skip_values(&mut header);
+        assert_eq!(header.skip_list[0], Hash([2u8; 32])); // Updated to bucket_list_hash
+
+        // Test that skip list[1] cascades at seq = SKIP_1 + SKIP_2
+        let mut header = create_test_header(SKIP_2 + SKIP_1); // seq = 5050
+        header.skip_list[0] = Hash([3u8; 32]); // Previous skip_list[0]
+        header.bucket_list_hash = Hash([4u8; 32]);
+        calculate_skip_values(&mut header);
+        assert_eq!(header.skip_list[0], Hash([4u8; 32])); // New bucket_list_hash
+        assert_eq!(header.skip_list[1], Hash([3u8; 32])); // Previous skip_list[0]
+    }
+
+    #[test]
     fn test_skip_list_target_seq() {
         // Entry 0 always points to previous
         assert_eq!(skip_list_target_seq(10, 0), Some(9));
@@ -395,11 +449,17 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_skip_list() {
+    fn test_compute_skip_list_copies_prev() {
+        // compute_skip_list now just copies the previous skip list
         let prev_hash = Hash256::hash(b"test");
-        let prev_skip = std::array::from_fn(|_| Hash([0u8; 32]));
+        let prev_skip = [
+            Hash([1u8; 32]),
+            Hash([2u8; 32]),
+            Hash([3u8; 32]),
+            Hash([4u8; 32]),
+        ];
 
-        let skip_list = compute_skip_list(1, prev_hash, &prev_skip);
-        assert_eq!(Hash256::from(skip_list[0].0), prev_hash);
+        let skip_list = compute_skip_list(51, prev_hash, &prev_skip);
+        assert_eq!(skip_list, prev_skip);
     }
 }

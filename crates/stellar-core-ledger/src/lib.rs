@@ -102,9 +102,9 @@ pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 pub use delta::{entry_to_key, EntryChange, LedgerDelta};
 pub use error::LedgerError;
 pub use header::{
-    close_time, compute_header_hash, compute_skip_list, create_next_header,
+    calculate_skip_values, close_time, compute_header_hash, compute_skip_list, create_next_header,
     is_before_protocol_version, protocol_version, skip_list_target_seq, verify_header_chain,
-    verify_skip_list, SKIP_LIST_SIZE,
+    verify_skip_list, SKIP_1, SKIP_2, SKIP_3, SKIP_4, SKIP_LIST_SIZE,
 };
 pub use execution::SorobanNetworkInfo;
 pub use manager::{LedgerCloseContext, LedgerManager, LedgerManagerConfig, LedgerManagerStats};

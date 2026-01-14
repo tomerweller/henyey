@@ -3293,6 +3293,7 @@ async fn cmd_verify_execution(
                     computed_header.max_tx_set_size = cdp_header.max_tx_set_size;
                     computed_header.id_pool = cdp_header.id_pool;
                     computed_header.scp_value.upgrades = cdp_header.scp_value.upgrades.clone();
+                    computed_header.scp_value.ext = cdp_header.scp_value.ext.clone();
 
                     if let Ok(hash) = compute_header_hash(&computed_header) {
                         our_header_hash = hash;
