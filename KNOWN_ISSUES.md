@@ -47,7 +47,7 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 ## 2. Bucket List Hash Mismatch at P25 (Partially Resolved)
 
 **Status:** Skip_list logic fixed / Bucket list hash diverges when evictions occur
-**Severity:** Medium - Affects verification tooling only
+**Severity:** Critical - Prevents live sync after ~60 ledgers from checkpoint
 **Component:** Bucket List / Eviction / Hot Archive
 **Last Verified:** 2026-01-14
 
@@ -55,6 +55,8 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 - **Skip List Logic**: **RESOLVED**. Corrected misunderstanding about skip_list semantics - it stores bucket_list_hash values, not previous_ledger_hash, at intervals of 50/5000/50000/500000.
 - **Short Range Verification**: **WORKS**. Starting from a checkpoint and verifying up to ~60 ledgers works correctly.
 - **Eviction-Related Divergence**: **FAILS**. When evictions occur (around ledger N+62 from checkpoint), bucket_list_hash diverges.
+
+**Impact:** In live catchup mode, this causes the node to compute incorrect ledger header hashes, preventing consensus with the network and blocking sync.
 
 ### Investigation Summary & Fixes
 
