@@ -42,10 +42,10 @@
 ## Commit & Pull Request Guidelines
 
 - Commit messages are short, imperative, and sentence case (examples: "Implement disk-backed bucket storage", "Optimize memory usage").
-- **AI Agent Co-authorship**: Any commit that was authored or co-authored by an AI agent MUST include that agent as a co-author using a Git trailer. Use the appropriate trailer for the agent involved:
+- **AI Agent Co-authorship**: Any commit that was authored or co-authored by an AI agent MUST include that agent (the tool/interface, not the underlying model) as a co-author using a Git trailer. Use the appropriate trailer for the agent involved:
+  - GitHub Copilot (CLI or IDE): `Co-authored-by: GitHub Copilot <copilot@github.com>`
   - Codex: `Co-authored-by: Codex <codex@openai.com>`
-  - Claude: `Co-authored-by: Claude <claude@anthropic.com>`
-  - GitHub Copilot: `Co-authored-by: GitHub Copilot <copilot@github.com>`
+  - Other agents: Use the agent/tool name, not the model name
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
 - Link related issues or upstream references (e.g., stellar-core v25) where relevant.
 - When possible, fixes should be committed alongside regression tests that would have caught the bug.
