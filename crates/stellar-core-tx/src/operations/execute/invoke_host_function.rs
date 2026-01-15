@@ -216,9 +216,9 @@ fn execute_upload_wasm(
         .unwrap_or(0);
 
     // Check if this code already exists
-    if state.get_contract_code(&code_hash).is_some() {
-        // Code already exists, just return success with the preimage hash
-        // No rent fee since we're not creating any new entries
+    if let Some(existing) = state.get_contract_code(&code_hash).cloned() {
+        // Code already exists; update last_modified to reflect the write.
+        state.update_contract_code(existing);
         return Ok(OperationExecutionResult::with_soroban_meta(
             make_result(InvokeHostFunctionResultCode::Success, result_hash),
             SorobanOperationMeta {

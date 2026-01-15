@@ -100,18 +100,15 @@ fn restore_entry(
 
     match current_ttl {
         Some(ttl) if ttl >= current_ledger => {
-            // Entry is still live, no restoration needed
-            // But we can still extend the TTL if requested
-            state.extend_ttl(&key_hash, new_ttl);
+            // Entry is still live, no restoration needed.
             Ok(())
         }
         Some(_) | None => {
             // Entry is archived or has no TTL entry
             // We need to check if the entry itself exists in state
             if state.get_entry(key).is_none() {
-                // Entry doesn't exist at all - cannot restore
-                // In a real implementation, we'd look for it in archive storage
-                return Err("Entry not found in archive");
+                // Neither live nor archived entry exists; skip per upstream behavior.
+                return Ok(());
             }
 
             // Create or update the TTL entry to restore the entry
