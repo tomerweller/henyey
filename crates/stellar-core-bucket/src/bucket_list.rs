@@ -600,7 +600,7 @@ impl BucketList {
 
                 // Prepare level i: merge curr with the spilling_snap from level i-1
                 let keep_dead = Self::keep_tombstone_entries(i);
-                let normalize_init = false; // EXPERIMENT: Disable normalization for 380032 verification
+                let normalize_init = false; // Never normalize INIT to LIVE during merges
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
