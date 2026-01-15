@@ -539,19 +539,20 @@ fn build_output_metadata(
     new_meta: Option<&BucketMetadata>,
     max_protocol_version: u32,
 ) -> Result<(u32, Option<BucketEntry>)> {
-    let protocol_version = if max_protocol_version > 0 {
-        max_protocol_version
-    } else {
-        // Fallback for tests or legacy callers where max_protocol_version might be 0
-        let mut v = 0u32;
-        if let Some(meta) = old_meta {
-            v = v.max(meta.ledger_version);
-        }
-        if let Some(meta) = new_meta {
-            v = v.max(meta.ledger_version);
-        }
-        v
-    };
+    let mut protocol_version = 0u32;
+    if let Some(meta) = old_meta {
+        protocol_version = protocol_version.max(meta.ledger_version);
+    }
+    if let Some(meta) = new_meta {
+        protocol_version = protocol_version.max(meta.ledger_version);
+    }
+
+    if max_protocol_version > 0 && protocol_version > max_protocol_version {
+        return Err(BucketError::Merge(format!(
+            "bucket protocol version {} exceeds max_protocol_version {}",
+            protocol_version, max_protocol_version
+        )));
+    }
 
     let use_meta = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
     if !use_meta {

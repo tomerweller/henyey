@@ -759,12 +759,16 @@ impl HotArchiveBucketList {
             );
 
             // Determine merge parameters
+            let merge_protocol_version = match prev_snap.get_protocol_version() {
+                0 => protocol_version,
+                version => version,
+            };
             let keep_tombstones = Self::keep_tombstone_entries(i);
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
             // Start the merge with the previous level's snap
             self.levels[i].prepare(
-                protocol_version,
+                merge_protocol_version,
                 prev_snap,
                 keep_tombstones,
                 use_empty_curr,

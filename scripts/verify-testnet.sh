@@ -31,6 +31,7 @@ echo "Binary: $BINARY"
 echo "Parallel jobs: $PARALLEL_JOBS"
 echo "Segment size: $SEGMENT_SIZE ledgers"
 echo "Results dir: $RESULTS_DIR"
+echo "Stats: ledgers/tx verified, tx match/mismatch, ledger tx/header mismatches, bucketlist-only vs tx-only"
 echo ""
 
 # Get the latest testnet ledger if END_LEDGER not specified
@@ -57,10 +58,13 @@ run_segment() {
     local seg_log="${RESULTS_DIR}/segment_${seg_num}.log"
     local seg_result="${RESULTS_DIR}/segment_${seg_num}.result"
 
-    # Skip if already completed successfully
-    if [ -f "$seg_result" ] && grep -q "^SUCCESS" "$seg_result"; then
-        echo "Segment $seg_num already completed successfully, skipping..."
-        return 0
+    # Skip if a prior result exists (SUCCESS or MISMATCH)
+    if [ -f "$seg_result" ]; then
+        local status=$(cut -d' ' -f1 "$seg_result")
+        if [ "$status" = "SUCCESS" ] || [ "$status" = "MISMATCH" ]; then
+            echo "Segment $seg_num already has a result ($status), skipping..."
+            return 0
+        fi
     fi
 
     echo "Starting segment $seg_num: ledgers $seg_start-$seg_end"
@@ -75,12 +79,23 @@ run_segment() {
         local verified=$(grep "Ledgers verified:" "$seg_log" | awk '{print $3}' || echo "0")
         local matched=$(grep "Phase 2 execution matched:" "$seg_log" | awk '{print $5}' || echo "0")
         local mismatched=$(grep "Phase 2 execution mismatched:" "$seg_log" | awk '{print $5}' || echo "0")
+        local ledger_tx_mismatches=$(grep "Ledgers with tx mismatches:" "$seg_log" | awk '{print $5}' || echo "0")
+        local ledger_header_mismatches=$(grep "Ledgers with header mismatches:" "$seg_log" | awk '{print $5}' || echo "0")
+        local ledger_both_mismatches=$(grep "Ledgers with tx+header mismatches:" "$seg_log" | awk '{print $5}' || echo "0")
+        local bucketlist_only=0
+        local tx_only=0
+        if [ "$ledger_header_mismatches" -ge "$ledger_both_mismatches" ]; then
+            bucketlist_only=$((ledger_header_mismatches - ledger_both_mismatches))
+        fi
+        if [ "$ledger_tx_mismatches" -ge "$ledger_both_mismatches" ]; then
+            tx_only=$((ledger_tx_mismatches - ledger_both_mismatches))
+        fi
 
         if [ "$mismatched" = "0" ]; then
-            echo "SUCCESS segment=$seg_num start=$seg_start end=$seg_end verified=$verified matched=$matched mismatched=$mismatched duration=${duration}s" > "$seg_result"
+            echo "SUCCESS segment=$seg_num start=$seg_start end=$seg_end verified=$verified matched=$matched mismatched=$mismatched ledger_tx_mismatches=$ledger_tx_mismatches ledger_header_mismatches=$ledger_header_mismatches ledger_both_mismatches=$ledger_both_mismatches bucketlist_only=$bucketlist_only tx_only=$tx_only duration=${duration}s" > "$seg_result"
             echo -e "${GREEN}Segment $seg_num PASSED${NC} ($verified ledgers, ${duration}s)"
         else
-            echo "MISMATCH segment=$seg_num start=$seg_start end=$seg_end verified=$verified matched=$matched mismatched=$mismatched duration=${duration}s" > "$seg_result"
+            echo "MISMATCH segment=$seg_num start=$seg_start end=$seg_end verified=$verified matched=$matched mismatched=$mismatched ledger_tx_mismatches=$ledger_tx_mismatches ledger_header_mismatches=$ledger_header_mismatches ledger_both_mismatches=$ledger_both_mismatches bucketlist_only=$bucketlist_only tx_only=$tx_only duration=${duration}s" > "$seg_result"
             echo -e "${YELLOW}Segment $seg_num completed with $mismatched mismatches${NC}"
         fi
     else
@@ -138,6 +153,11 @@ TOTAL_FAILED=0
 TOTAL_VERIFIED=0
 TOTAL_TX_MATCHED=0
 TOTAL_TX_MISMATCHED=0
+TOTAL_LEDGER_TX_MISMATCHES=0
+TOTAL_LEDGER_HEADER_MISMATCHES=0
+TOTAL_LEDGER_BOTH_MISMATCHES=0
+TOTAL_BUCKETLIST_ONLY=0
+TOTAL_TX_ONLY=0
 
 for result_file in "$RESULTS_DIR"/segment_*.result; do
     if [ -f "$result_file" ]; then
@@ -147,17 +167,47 @@ for result_file in "$RESULTS_DIR"/segment_*.result; do
                 TOTAL_SUCCESS=$((TOTAL_SUCCESS + 1))
                 verified=$(grep -o 'verified=[0-9]*' "$result_file" | cut -d= -f2)
                 matched=$(grep -o 'matched=[0-9]*' "$result_file" | head -1 | cut -d= -f2)
+                ledger_tx_mismatches=$(grep -o 'ledger_tx_mismatches=[0-9]*' "$result_file" | cut -d= -f2)
+                ledger_header_mismatches=$(grep -o 'ledger_header_mismatches=[0-9]*' "$result_file" | cut -d= -f2)
+                ledger_both_mismatches=$(grep -o 'ledger_both_mismatches=[0-9]*' "$result_file" | cut -d= -f2)
+                bucketlist_only=$(grep -o 'bucketlist_only=[0-9]*' "$result_file" | cut -d= -f2)
+                tx_only=$(grep -o 'tx_only=[0-9]*' "$result_file" | cut -d= -f2)
+                ledger_tx_mismatches=${ledger_tx_mismatches:-0}
+                ledger_header_mismatches=${ledger_header_mismatches:-0}
+                ledger_both_mismatches=${ledger_both_mismatches:-0}
+                bucketlist_only=${bucketlist_only:-0}
+                tx_only=${tx_only:-0}
                 TOTAL_VERIFIED=$((TOTAL_VERIFIED + verified))
                 TOTAL_TX_MATCHED=$((TOTAL_TX_MATCHED + matched))
+                TOTAL_LEDGER_TX_MISMATCHES=$((TOTAL_LEDGER_TX_MISMATCHES + ledger_tx_mismatches))
+                TOTAL_LEDGER_HEADER_MISMATCHES=$((TOTAL_LEDGER_HEADER_MISMATCHES + ledger_header_mismatches))
+                TOTAL_LEDGER_BOTH_MISMATCHES=$((TOTAL_LEDGER_BOTH_MISMATCHES + ledger_both_mismatches))
+                TOTAL_BUCKETLIST_ONLY=$((TOTAL_BUCKETLIST_ONLY + bucketlist_only))
+                TOTAL_TX_ONLY=$((TOTAL_TX_ONLY + tx_only))
                 ;;
             MISMATCH)
                 TOTAL_MISMATCH=$((TOTAL_MISMATCH + 1))
                 verified=$(grep -o 'verified=[0-9]*' "$result_file" | cut -d= -f2)
                 matched=$(grep -o 'matched=[0-9]*' "$result_file" | head -1 | cut -d= -f2)
                 mismatched=$(grep -o 'mismatched=[0-9]*' "$result_file" | tail -1 | cut -d= -f2)
+                ledger_tx_mismatches=$(grep -o 'ledger_tx_mismatches=[0-9]*' "$result_file" | cut -d= -f2)
+                ledger_header_mismatches=$(grep -o 'ledger_header_mismatches=[0-9]*' "$result_file" | cut -d= -f2)
+                ledger_both_mismatches=$(grep -o 'ledger_both_mismatches=[0-9]*' "$result_file" | cut -d= -f2)
+                bucketlist_only=$(grep -o 'bucketlist_only=[0-9]*' "$result_file" | cut -d= -f2)
+                tx_only=$(grep -o 'tx_only=[0-9]*' "$result_file" | cut -d= -f2)
+                ledger_tx_mismatches=${ledger_tx_mismatches:-0}
+                ledger_header_mismatches=${ledger_header_mismatches:-0}
+                ledger_both_mismatches=${ledger_both_mismatches:-0}
+                bucketlist_only=${bucketlist_only:-0}
+                tx_only=${tx_only:-0}
                 TOTAL_VERIFIED=$((TOTAL_VERIFIED + verified))
                 TOTAL_TX_MATCHED=$((TOTAL_TX_MATCHED + matched))
                 TOTAL_TX_MISMATCHED=$((TOTAL_TX_MISMATCHED + mismatched))
+                TOTAL_LEDGER_TX_MISMATCHES=$((TOTAL_LEDGER_TX_MISMATCHES + ledger_tx_mismatches))
+                TOTAL_LEDGER_HEADER_MISMATCHES=$((TOTAL_LEDGER_HEADER_MISMATCHES + ledger_header_mismatches))
+                TOTAL_LEDGER_BOTH_MISMATCHES=$((TOTAL_LEDGER_BOTH_MISMATCHES + ledger_both_mismatches))
+                TOTAL_BUCKETLIST_ONLY=$((TOTAL_BUCKETLIST_ONLY + bucketlist_only))
+                TOTAL_TX_ONLY=$((TOTAL_TX_ONLY + tx_only))
                 ;;
             FAILED)
                 TOTAL_FAILED=$((TOTAL_FAILED + 1))
@@ -174,6 +224,10 @@ echo ""
 echo "Total ledgers verified: $TOTAL_VERIFIED"
 echo "Total transactions matched: $TOTAL_TX_MATCHED"
 echo "Total transactions mismatched: $TOTAL_TX_MISMATCHED"
+echo "Total ledgers with tx mismatches: $TOTAL_LEDGER_TX_MISMATCHES"
+echo "Total ledgers with header mismatches: $TOTAL_LEDGER_HEADER_MISMATCHES"
+echo "Total ledgers with tx+header mismatches: $TOTAL_LEDGER_BOTH_MISMATCHES"
+echo "Ledger mismatch breakdown: bucketlist-only=$TOTAL_BUCKETLIST_ONLY, tx-only=$TOTAL_TX_ONLY, both=$TOTAL_LEDGER_BOTH_MISMATCHES"
 echo ""
 echo "Total duration: ${TOTAL_DURATION}s ($(( TOTAL_DURATION / 60 ))m $(( TOTAL_DURATION % 60 ))s)"
 
@@ -190,6 +244,10 @@ fi
     echo "Ledgers verified: $TOTAL_VERIFIED"
     echo "Transactions matched: $TOTAL_TX_MATCHED"
     echo "Transactions mismatched: $TOTAL_TX_MISMATCHED"
+    echo "Ledgers with tx mismatches: $TOTAL_LEDGER_TX_MISMATCHES"
+    echo "Ledgers with header mismatches: $TOTAL_LEDGER_HEADER_MISMATCHES"
+    echo "Ledgers with tx+header mismatches: $TOTAL_LEDGER_BOTH_MISMATCHES"
+    echo "Ledger mismatch breakdown: bucketlist-only=$TOTAL_BUCKETLIST_ONLY, tx-only=$TOTAL_TX_ONLY, both=$TOTAL_LEDGER_BOTH_MISMATCHES"
     echo "Duration: ${TOTAL_DURATION}s"
 } > "${RESULTS_DIR}/summary.txt"
 

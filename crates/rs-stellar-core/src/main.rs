@@ -1746,6 +1746,14 @@ async fn cmd_replay_bucket_list(
         })
     }).transpose()?;
 
+    let init_cp_headers = archive.get_ledger_headers(init_checkpoint).await?;
+    let init_header_entry = init_cp_headers
+        .iter()
+        .find(|h| h.header.ledger_seq == init_checkpoint);
+    let init_protocol_version = init_header_entry
+        .map(|h| h.header.ledger_version)
+        .unwrap_or(25);
+
     // Debug: hash before restart_merges
     let pre_restart_live_hash = bucket_list.hash();
     let pre_restart_hot_hash = hot_archive_bucket_list.as_ref().map(|h| h.hash());
@@ -1755,11 +1763,9 @@ async fn cmd_replay_bucket_list(
     }
 
     // Restart any pending merges that should have been in progress at the checkpoint.
-    // Use protocol version 25 (current testnet) for merge parameters.
-    let protocol_version = 25u32;
-    bucket_list.restart_merges(init_checkpoint, protocol_version)?;
+    bucket_list.restart_merges(init_checkpoint, init_protocol_version)?;
     if let Some(ref mut hot) = hot_archive_bucket_list {
-        hot.restart_merges(init_checkpoint, protocol_version)?;
+        hot.restart_merges(init_checkpoint, init_protocol_version)?;
     }
 
     let initial_live_hash = bucket_list.hash();
@@ -1780,7 +1786,6 @@ async fn cmd_replay_bucket_list(
     // Verify initial hash against checkpoint header
     println!();
     println!("Verifying initial state at checkpoint {}...", init_checkpoint);
-    let init_cp_headers = archive.get_ledger_headers(init_checkpoint).await?;
     if let Some(init_header) = init_cp_headers.iter().find(|h| h.header.ledger_seq == init_checkpoint) {
         let expected_hash = Hash256::from(init_header.header.bucket_list_hash.0);
         let our_hash = if let Some(ref hot_hash) = initial_hot_hash {
@@ -1810,7 +1815,7 @@ async fn cmd_replay_bucket_list(
 
     // Initialize in-memory Soroban state from the checkpoint.
     let mut soroban_state = InMemorySorobanState::new();
-    if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
         let live_entries = bucket_list.live_entries()?;
         let soroban_config = load_soroban_config_from_bucket_list(&bucket_list);
         soroban_state
@@ -1819,7 +1824,7 @@ async fn cmd_replay_bucket_list(
                 &live_entries,
                 &[],
                 &[],
-                protocol_version,
+                init_protocol_version,
                 Some(&soroban_config),
             )
             .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
@@ -2050,7 +2055,7 @@ async fn cmd_replay_bucket_list(
                 );
 
                 let (init, live, dead) = aggregator.clone().to_vectors();
-                if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+                if header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
                     let soroban_config = load_soroban_config_from_bucket_list(bl);
                     soroban_state
                         .update_state(
@@ -2434,14 +2439,20 @@ async fn cmd_verify_execution(
         })
     }).transpose()?.map(|bl| Arc::new(RwLock::new(bl)));
 
+    let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
+    let init_header_entry = init_headers
+        .iter()
+        .find(|h| h.header.ledger_seq == init_checkpoint);
+    let init_protocol_version = init_header_entry
+        .map(|h| h.header.ledger_version)
+        .unwrap_or(25);
+
     // Restart any pending merges that should have been in progress at the checkpoint.
     // This is critical for correct bucket list hash computation after catchup.
     // In C++ stellar-core, this is done by BucketListBase::restartMerges().
-    // Use protocol version 25 (current testnet) for merge parameters.
-    let protocol_version = 25u32;
-    bucket_list.write().unwrap().restart_merges(init_checkpoint, protocol_version)?;
+    bucket_list.write().unwrap().restart_merges(init_checkpoint, init_protocol_version)?;
     if let Some(ref hot) = hot_archive_bucket_list {
-        hot.write().unwrap().restart_merges(init_checkpoint, protocol_version)?;
+        hot.write().unwrap().restart_merges(init_checkpoint, init_protocol_version)?;
     }
 
     if !quiet {
@@ -2453,11 +2464,6 @@ async fn cmd_verify_execution(
         }
         println!();
     }
-
-    let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
-    let init_header_entry = init_headers
-        .iter()
-        .find(|h| h.header.ledger_seq == init_checkpoint);
     let init_rent_config = if let Some(init_header_entry) = init_header_entry {
         let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
         let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> = hot_archive_bucket_list.clone();
@@ -2497,7 +2503,7 @@ async fn cmd_verify_execution(
 
     // Initialize in-memory Soroban state from the checkpoint.
     let mut soroban_state = InMemorySorobanState::new();
-    if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
         let live_entries = bucket_list.read().unwrap().live_entries()?;
         soroban_state
             .update_state(
@@ -2505,7 +2511,7 @@ async fn cmd_verify_execution(
                 &live_entries,
                 &[],
                 &[],
-                protocol_version,
+                init_protocol_version,
                 Some(&init_rent_config),
             )
             .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
@@ -2517,6 +2523,9 @@ async fn cmd_verify_execution(
     let mut transactions_matched = 0u32;
     let mut transactions_mismatched = 0u32;
     let mut phase1_fee_mismatches = 0u32;
+    let mut ledgers_with_tx_mismatches = 0u32;
+    let mut ledgers_with_header_mismatches = 0u32;
+    let mut ledgers_with_both_mismatches = 0u32;
 
     // Process ledgers from init_checkpoint+1 to end_ledger
     let process_from = init_checkpoint + 1;
@@ -2717,6 +2726,8 @@ async fn cmd_verify_execution(
 
             // Execute each transaction and compare (using aligned envelope/result/meta)
             let mut ledger_matched = true;
+            let mut ledger_tx_mismatch = false;
+            let mut ledger_header_mismatch = false;
 
             // Capture ledger-start TTL entries for all Soroban read footprint entries.
             // This is needed because when multiple transactions access the same entry,
@@ -2950,6 +2961,7 @@ async fn cmd_verify_execution(
                             } else {
                                 transactions_mismatched += 1;
                                 ledger_matched = false;
+                                ledger_tx_mismatch = true;
                                 let cdp_result_code = format!("{:?}", tx_info.result.result.result);
                                 println!("    TX {}: MISMATCH - our: {} vs CDP: {} (cdp_succeeded: {})",
                                     tx_idx,
@@ -2996,6 +3008,7 @@ async fn cmd_verify_execution(
                         Err(e) => {
                             transactions_mismatched += 1;
                             ledger_matched = false;
+                            ledger_tx_mismatch = true;
                             println!("    TX {}: EXECUTION ERROR: {}", tx_idx, e);
                         }
                     }
@@ -3172,7 +3185,7 @@ async fn cmd_verify_execution(
                 );
 
                 let (all_init, all_live, all_dead) = aggregator.clone().to_vectors();
-                if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+                if cdp_header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
                     soroban_state
                         .update_state(
                             seq,
@@ -3342,6 +3355,7 @@ async fn cmd_verify_execution(
                 let all_header_fields_match = bucket_list_matches && fee_pool_matches && tx_result_hash_matches && header_hash_matches;
                 if !all_header_fields_match {
                     header_mismatches += 1;
+                    ledger_header_mismatch = true;
                     println!("  Ledger {}: HEADER MISMATCH", seq);
                     if !bucket_list_matches {
                         println!("    bucket_list_hash: ours={} expected={}",
@@ -3420,6 +3434,15 @@ async fn cmd_verify_execution(
                         anyhow::bail!("Stopping on first error");
                     }
                 }
+                if ledger_tx_mismatch {
+                    ledgers_with_tx_mismatches += 1;
+                }
+                if ledger_header_mismatch {
+                    ledgers_with_header_mismatches += 1;
+                }
+                if ledger_tx_mismatch && ledger_header_mismatch {
+                    ledgers_with_both_mismatches += 1;
+                }
                 ledgers_verified += 1;
             }
         }
@@ -3435,6 +3458,15 @@ async fn cmd_verify_execution(
     println!("  Phase 1 fee calculations mismatched: {}", phase1_fee_mismatches);
     println!("  Phase 2 execution matched: {}", transactions_matched);
     println!("  Phase 2 execution mismatched: {}", transactions_mismatched);
+    println!("  Ledgers with tx mismatches: {}", ledgers_with_tx_mismatches);
+    println!("  Ledgers with header mismatches: {}", ledgers_with_header_mismatches);
+    println!("  Ledgers with tx+header mismatches: {}", ledgers_with_both_mismatches);
+    let bucketlist_only = ledgers_with_header_mismatches.saturating_sub(ledgers_with_both_mismatches);
+    let tx_only = ledgers_with_tx_mismatches.saturating_sub(ledgers_with_both_mismatches);
+    println!(
+        "  Ledger mismatch breakdown: bucketlist-only={}, tx-only={}, both={}",
+        bucketlist_only, tx_only, ledgers_with_both_mismatches
+    );
     println!("  Header verifications: {} passed, {} failed",
         ledgers_verified.saturating_sub(header_mismatches), header_mismatches);
 
