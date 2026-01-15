@@ -52,59 +52,18 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 **Last Verified:** 2026-01-14
 
 ### Status Update
-- **Skip List Logic**: **RESOLVED**. Corrected skip_list semantics - stores bucket_list_hash at intervals 50/5000/50000/500000.
-- **Eviction Archive Logic**: **RESOLVED**. Fixed bug where evicted entries weren't being sent to hot archive (was filtering them as "dead").
-- **Short/Medium Range Verification**: **WORKS**. Ledgers 379904-380087 (184 ledgers) all pass from checkpoint 379903.
-- **Longer Range**: **FAILS**. Ledger 380088+ diverges for unknown reason.
-
-**Impact:** In live catchup mode, this causes the node to compute incorrect ledger header hashes after ~184 ledgers from a checkpoint, preventing consensus with the network.
+- **Bucket List Logic**: **Partially Resolved**. The `replay-bucket-list` command passes for short ranges (e.g., 379904..380087), confirming basic correctness. However, it **FAILS** at ledger 380088 (184 ledgers from checkpoint).
+- **Transaction Execution**: **Aligned**. `verify-execution` failure at 380088 matches the `replay-bucket-list` failure hash, confirming that transaction execution is producing the same (incorrect) state as the metadata replay. The divergence is now purely in how the bucket list handles the **Level 1 Spill** at ledger 380088.
 
 ### Investigation Summary & Fixes
-
-#### Skip List Fix (2026-01-14)
-**Critical discovery**: The skip_list stores `bucket_list_hash` values at specific milestone ledgers:
-- Skip intervals: SKIP_1=50, SKIP_2=5000, SKIP_3=50000, SKIP_4=500000
-- skip_list[0] = bucket_list_hash at last ledger where seq % 50 == 0
-- Updates cascade from [0] -> [1] -> [2] -> [3] at higher intervals
-- Reference: C++ stellar-core BucketManager::calculateSkipValues()
-
-#### Eviction Archive Fix (2026-01-14)
-**Bug fixed**: When looking up entries for hot archive archival, the code was computing `dead_keys` AFTER eviction changes were applied to the aggregator. This caused evicted keys to be filtered out because they were already marked "dead".
-
-**Solution**: Snapshot the aggregator's dead keys BEFORE applying eviction changes (`pre_eviction_dead`), and use this for the filter instead of post-eviction dead keys.
-
-#### Other Fixes
-1.  **Cross-Phase Deduplication (Fixed):** Implemented `CoalescedLedgerChanges` utility.
-2.  **Transient Entry Annihilation (Fixed):** Corrected `Init` -> `Dead` handling.
+An extensive investigation has successfully identified and resolved several critical structural bugs:
+1.  **Cross-Phase Deduplication (Fixed):** Implemented `CoalescedLedgerChanges`.
+2.  **Transient Entry Annihilation (Fixed):** Corrected `Init` -> `Dead` logic.
 3.  **Eviction Iterator Parity (Fixed):** Implemented local `EvictionIterator` updates.
-4.  **Transaction Change Replay (Fixed):** Corrected `tx_changes_before` for failed transactions.
-5.  **StellarValue Extension (Fixed):** `scp_value.ext` field correctly propagated.
+4.  **Transaction Change Replay (Fixed):** Corrected `tx_changes_before` handling.
 
-### Current Issue: Bucket List Hash Divergence at ~184 Ledgers
-
-After 184 ledgers from checkpoint 379903, the bucket list hash diverges at ledger 380088. This is NOT related to evictions (there are no evictions at 380088).
-
-**Observations:**
-- Checkpoint 379903, replay through 380087: All 184 ledgers PASS
-- Ledger 380088: FAILS with bucket list hash mismatch
-- Our combined hash: `4ba8bb98...`
-- Expected hash: `0021ea62...`
-- Our live hash: `75d6e2adf2dff827...`
-- Our hot archive: `a31e4626b3f6b5db...`
-
-**Suspected causes:**
-1. Merge timing differences between live bucket list and hot archive bucket list
-2. Bucket list spill/merge calculation divergence from C++ at specific ledger boundaries
-3. Hot archive bucket list state not correctly restored from checkpoint
-
-### Verification Results
-- Transactions: All match (results, fee calculations)
-- Bucket list hash: Passes up to ~184 ledgers from checkpoint
-- Header hash: Fails after 184 ledgers due to bucket_list_hash differences
-
-### Workarounds
-1. Use short/medium range verification (< 184 ledgers from checkpoint)
-2. Focus on transaction result/meta matching
-3. Verify single ledgers or ranges from fresh checkpoints
+### Remaining Work
+**Investigate L1 Spill at Ledger 380088.**
+Ledger 380088 triggers a Level 1 spill (merging L1 Snap into L2 Curr). Since 380080 (also an L1 spill) passed, the issue likely involves a specific merge interaction (e.g., shadowing, dead entry handling) between the new keys in 380080..380087 and the existing keys in L2.
 
 ---
