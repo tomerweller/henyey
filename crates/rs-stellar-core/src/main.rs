@@ -1916,7 +1916,7 @@ async fn cmd_replay_bucket_list(
             }
 
             // Deduplicate all changes for the live bucket list
-            let (all_init, all_live, all_dead) = {
+            let (all_init, all_live, all_dead, tx_dead_keys) = {
                 use stellar_xdr::curr::{ConfigSettingEntry, LedgerEntryData, LedgerEntryExt, LedgerEntryChange, LedgerEntry};
 
                 let mut aggregator = CoalescedLedgerChanges::new();
@@ -2013,7 +2013,14 @@ async fn cmd_replay_bucket_list(
                     }
                 }
 
-                // 3. Eviction changes (from CDP)
+                // Snapshot the aggregator state BEFORE evictions to get the
+                // non-eviction dead keys (entries deleted by transactions)
+                let pre_eviction_dead: Vec<stellar_xdr::curr::LedgerKey> = {
+                    let (_, _, dead) = aggregator.clone().to_vectors();
+                    dead
+                };
+
+                // 5. Eviction changes (from CDP)
                 for key in &evicted_keys {
                     apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Removed(key.clone()));
                 }
@@ -2059,7 +2066,7 @@ async fn cmd_replay_bucket_list(
 
                 let (init, live, dead) = aggregator.to_vectors();
 
-                (init, live, dead)
+                (init, live, dead, pre_eviction_dead)
             };
 
             // Before evicting entries from the live bucket list, look up full entry data
@@ -2074,8 +2081,10 @@ async fn cmd_replay_bucket_list(
                         changed_entries.insert(key, entry.clone());
                     }
                 }
+                // Use pre-eviction dead keys (entries deleted by transactions, NOT evictions)
+                // Evicted entries should still go to hot archive even if they're "dead"
                 let dead_keys: std::collections::HashSet<stellar_xdr::curr::LedgerKey> =
-                    all_dead.iter().cloned().collect();
+                    tx_dead_keys.iter().cloned().collect();
 
                 for key in &evicted_keys {
                     if matches!(key, stellar_xdr::curr::LedgerKey::Ttl(_)) {
@@ -2136,6 +2145,7 @@ async fn cmd_replay_bucket_list(
             // If live_only, we just compare the live bucket list hash
             // Otherwise, we compute combined hash: SHA256(live || hot_archive)
             let our_live_hash = bucket_list.hash();
+            
             let our_hash = if live_only || hot_archive_bucket_list.is_none() {
                 our_live_hash
             } else {
@@ -2157,7 +2167,10 @@ async fn cmd_replay_bucket_list(
                     println!("  Ledger {}: live hash = {} ({} txs)",
                         seq, &our_live_hash.to_hex()[..16], tx_processing.len());
                 } else if our_hash == expected_hash {
-                    println!("  Ledger {}: OK ({} txs)", seq, tx_processing.len());
+                    let hot_hash = hot_archive_bucket_list.as_ref().map(|h| h.hash().to_hex()).unwrap_or_default();
+                    println!("  Ledger {}: OK ({} txs) [live={}, hot={}]", seq, tx_processing.len(),
+                        &our_live_hash.to_hex()[..16],
+                        &hot_hash[..16.min(hot_hash.len())]);
                 } else {
                     println!("  Ledger {}: BUCKET LIST HASH MISMATCH", seq);
                     println!("    Expected (combined): {}", expected_hash.to_hex());
@@ -3058,6 +3071,13 @@ async fn cmd_verify_execution(
                     }
                 }
 
+                // Snapshot the aggregator state BEFORE evictions to get the
+                // non-eviction dead keys (entries deleted by transactions)
+                let pre_eviction_dead: Vec<LedgerKey> = {
+                    let (_, _, dead) = aggregator.clone().to_vectors();
+                    dead
+                };
+
                 // 5. Evicted keys (Protocol 23+)
                 let evicted_keys = extract_evicted_keys(&lcm);
                 for key in &evicted_keys {
@@ -3164,8 +3184,10 @@ async fn cmd_verify_execution(
                             changed_entries.insert(key, entry.clone());
                         }
                     }
+                    // Use pre-eviction dead keys (entries deleted by transactions, NOT evictions)
+                    // Evicted entries should still go to hot archive even if they're "dead"
                     let dead_keys: std::collections::HashSet<stellar_xdr::curr::LedgerKey> =
-                        all_dead.iter().cloned().collect();
+                        pre_eviction_dead.iter().cloned().collect();
 
                     for key in &evicted_keys {
                         if matches!(key, stellar_xdr::curr::LedgerKey::Ttl(_)) {

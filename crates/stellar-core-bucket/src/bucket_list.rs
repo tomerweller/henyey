@@ -893,6 +893,16 @@ impl BucketList {
         }
     }
 
+    /// Debug print level state.
+    pub fn debug_print_levels(&self) {
+        for (i, level) in self.levels.iter().enumerate() {
+            let curr_hash = level.curr.hash();
+            let snap_hash = level.snap.hash();
+            let next_hash = level.next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string());
+            eprintln!("  L{}: curr={}, snap={}, next={}", i, curr_hash.to_hex(), snap_hash.to_hex(), next_hash);
+        }
+    }
+
     /// Scan for expired Soroban entries in the bucket list.
     ///
     /// This scans all Soroban entries (ContractData, ContractCode) and checks their

@@ -46,6 +46,7 @@
   - GitHub Copilot (CLI or IDE): `Co-authored-by: GitHub Copilot <copilot@github.com>`
   - Codex: `Co-authored-by: Codex <codex@openai.com>`
   - Other agents: Use the agent/tool name, not the model name
+- **AI agents must only commit and push when explicitly directed by the user.** Do not autonomously commit or push changes.
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
 - Link related issues or upstream references (e.g., stellar-core v25) where relevant.
 - When possible, fixes should be committed alongside regression tests that would have caught the bug.

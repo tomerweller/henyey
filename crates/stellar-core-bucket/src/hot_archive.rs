@@ -500,12 +500,20 @@ impl HotArchiveBucketList {
             "hot_archive add_batch: input stats"
         );
 
+        // In C++, HotArchiveBucket::fresh() always creates a bucket with a metaentry,
+        // even when there are no data entries. The metaentry is written in the
+        // BucketOutputIterator constructor before any put() calls. So a bucket with
+        // no archived/restored entries still has mObjectsPut=1 and returns a bucket
+        // with hash 95079eba... (the metaentry-only bucket).
+        //
+        // We match this behavior by always calling fresh(), which creates a bucket
+        // with at least a metaentry.
         let new_bucket = HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
-        
         tracing::info!(
             ledger_seq = ledger_seq,
             new_bucket_hash = %new_bucket.hash().to_hex(),
-            "hot_archive add_batch: new fresh bucket created"
+            new_bucket_entries = new_bucket.len(),
+            "hot_archive add_batch: new bucket created"
         );
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
@@ -644,6 +652,16 @@ impl HotArchiveBucketList {
             num_levels: HOT_ARCHIVE_BUCKET_LIST_LEVELS,
             total_entries,
             total_buckets,
+        }
+    }
+
+    /// Debug print level state.
+    pub fn debug_print_levels(&self) {
+        for (i, level) in self.levels.iter().enumerate() {
+            let curr_hash = level.curr.hash();
+            let snap_hash = level.snap.hash();
+            let next_hash = level.next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string());
+            eprintln!("  HA_L{}: curr={}, snap={}, next={}", i, curr_hash.to_hex(), snap_hash.to_hex(), next_hash);
         }
     }
 
