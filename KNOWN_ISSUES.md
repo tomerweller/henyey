@@ -46,60 +46,65 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ## 2. Bucket List Hash Mismatch at P25 (Partially Resolved)
 
-**Status:** Skip_list logic fixed / Bucket list hash diverges when evictions occur
-**Severity:** Critical - Prevents live sync after ~60 ledgers from checkpoint
-**Component:** Bucket List / Eviction / Hot Archive
+**Status:** Eviction archive fix applied / Still failing at ~184 ledgers from checkpoint
+**Severity:** Critical - Prevents live sync after ~184 ledgers from checkpoint
+**Component:** Bucket List / Hot Archive
 **Last Verified:** 2026-01-14
 
 ### Status Update
-- **Skip List Logic**: **RESOLVED**. Corrected misunderstanding about skip_list semantics - it stores bucket_list_hash values, not previous_ledger_hash, at intervals of 50/5000/50000/500000.
-- **Short Range Verification**: **WORKS**. Starting from a checkpoint and verifying up to ~60 ledgers works correctly.
-- **Eviction-Related Divergence**: **FAILS**. When evictions occur (around ledger N+62 from checkpoint), bucket_list_hash diverges.
+- **Skip List Logic**: **RESOLVED**. Corrected skip_list semantics - stores bucket_list_hash at intervals 50/5000/50000/500000.
+- **Eviction Archive Logic**: **RESOLVED**. Fixed bug where evicted entries weren't being sent to hot archive (was filtering them as "dead").
+- **Short/Medium Range Verification**: **WORKS**. Ledgers 379904-380087 (184 ledgers) all pass from checkpoint 379903.
+- **Longer Range**: **FAILS**. Ledger 380088+ diverges for unknown reason.
 
-**Impact:** In live catchup mode, this causes the node to compute incorrect ledger header hashes, preventing consensus with the network and blocking sync.
+**Impact:** In live catchup mode, this causes the node to compute incorrect ledger header hashes after ~184 ledgers from a checkpoint, preventing consensus with the network.
 
 ### Investigation Summary & Fixes
 
 #### Skip List Fix (2026-01-14)
-**Critical discovery**: The skip_list does NOT store `previous_ledger_hash` values. It stores `bucket_list_hash` values at specific milestone ledgers:
+**Critical discovery**: The skip_list stores `bucket_list_hash` values at specific milestone ledgers:
 - Skip intervals: SKIP_1=50, SKIP_2=5000, SKIP_3=50000, SKIP_4=500000
 - skip_list[0] = bucket_list_hash at last ledger where seq % 50 == 0
 - Updates cascade from [0] -> [1] -> [2] -> [3] at higher intervals
 - Reference: C++ stellar-core BucketManager::calculateSkipValues()
 
+#### Eviction Archive Fix (2026-01-14)
+**Bug fixed**: When looking up entries for hot archive archival, the code was computing `dead_keys` AFTER eviction changes were applied to the aggregator. This caused evicted keys to be filtered out because they were already marked "dead".
+
+**Solution**: Snapshot the aggregator's dead keys BEFORE applying eviction changes (`pre_eviction_dead`), and use this for the filter instead of post-eviction dead keys.
+
 #### Other Fixes
-1.  **Cross-Phase Deduplication (Fixed):** Implemented a `CoalescedLedgerChanges` utility to unify all state changes (Fee, Tx, Post-Fee, Upgrades, Eviction) into a single, unique set per ledger.
-2.  **Transient Entry Annihilation (Fixed):** Corrected logic for entries created and deleted in the same ledger (`Init` -> `Dead`).
-3.  **Eviction Iterator Parity (Fixed):** Implemented missing local `EvictionIterator` updates.
-4.  **Transaction Change Replay (Fixed):** Corrected `tx_changes_before` handling for failed transactions.
-5.  **StellarValue Extension (Fixed):** The `scp_value.ext` field (Basic vs Signed) is now correctly propagated when computing header hashes.
+1.  **Cross-Phase Deduplication (Fixed):** Implemented `CoalescedLedgerChanges` utility.
+2.  **Transient Entry Annihilation (Fixed):** Corrected `Init` -> `Dead` handling.
+3.  **Eviction Iterator Parity (Fixed):** Implemented local `EvictionIterator` updates.
+4.  **Transaction Change Replay (Fixed):** Corrected `tx_changes_before` for failed transactions.
+5.  **StellarValue Extension (Fixed):** `scp_value.ext` field correctly propagated.
 
-### Current Issue: Eviction-Related Bucket List Divergence
+### Current Issue: Bucket List Hash Divergence at ~184 Ledgers
 
-When replaying ledgers, the bucket_list_hash diverges at the first ledger that triggers evictions:
+After 184 ledgers from checkpoint 379903, the bucket list hash diverges at ledger 380088. This is NOT related to evictions (there are no evictions at 380088).
 
-```
-From checkpoint 379903:
-- Ledgers 379904-379964: All pass ✓ (0 evictions each)
-- Ledger 379965: FAILS ✗ (3 evictions)
-```
+**Observations:**
+- Checkpoint 379903, replay through 380087: All 184 ledgers PASS
+- Ledger 380088: FAILS with bucket list hash mismatch
+- Our combined hash: `4ba8bb98...`
+- Expected hash: `0021ea62...`
+- Our live hash: `75d6e2adf2dff827...`
+- Our hot archive: `a31e4626b3f6b5db...`
 
-The eviction scan at ledger 379965 finds 3 entries to archive/evict. This is when the bucket list hash diverges from expected.
-
-**Root Cause (suspected):** The eviction logic may be:
-1. Evicting entries that shouldn't be evicted
-2. Missing entries that should be evicted  
-3. Incorrectly updating the hot archive bucket list
-4. Processing evictions in the wrong order relative to other bucket list updates
+**Suspected causes:**
+1. Merge timing differences between live bucket list and hot archive bucket list
+2. Bucket list spill/merge calculation divergence from C++ at specific ledger boundaries
+3. Hot archive bucket list state not correctly restored from checkpoint
 
 ### Verification Results
 - Transactions: All match (results, fee calculations)
-- Bucket list hash: Passes until evictions occur (~62 ledgers from checkpoint)
-- Header hash: Fails due to bucket_list_hash differences
+- Bucket list hash: Passes up to ~184 ledgers from checkpoint
+- Header hash: Fails after 184 ledgers due to bucket_list_hash differences
 
 ### Workarounds
-1. Use `replay-bucket-list` for short-range bucket list verification
-2. Focus on transaction result/meta matching rather than header hash verification
-3. Verify single ledgers or ranges without evictions from fresh checkpoints
+1. Use short/medium range verification (< 184 ledgers from checkpoint)
+2. Focus on transaction result/meta matching
+3. Verify single ledgers or ranges from fresh checkpoints
 
 ---
