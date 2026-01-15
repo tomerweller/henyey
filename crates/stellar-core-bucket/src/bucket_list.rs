@@ -636,20 +636,6 @@ impl BucketList {
 
         self.levels[0].commit();
 
-        if ledger_seq >= 380080 && ledger_seq <= 380088 {
-            for (i, level) in self.levels.iter().enumerate() {
-                if i > 2 { break; }
-                tracing::info!("Ledger {} Level {} curr entries: {}", ledger_seq, i, level.curr.len());
-                if ledger_seq == 380088 {
-                    for (idx, entry) in level.curr.entries().iter().enumerate() {
-                        if idx < 5 {
-                            tracing::info!("  L{} [{}]: {:?}", i, idx, entry);
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 

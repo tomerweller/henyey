@@ -44,25 +44,21 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ---
 
-## 2. Bucket List Hash Mismatch at P25 (Partially Resolved)
+## 2. Bucket List Hash Mismatch at P25 (Resolved)
 
-**Status:** Fixed up to ~180 ledgers from checkpoint / Failing at 380088
-**Severity:** Critical - Prevents live sync after ~180 ledgers from checkpoint
+**Status:** Resolved
+**Severity:** N/A - Fixed
 **Component:** Bucket List / Hot Archive
 **Last Verified:** 2026-01-15
 
-### Status Update
-- **Normalization Logic Fixed:** Disabling `INIT -> LIVE` normalization in `add_batch_internal` (L0 -> L1 spills) fixed mismatches at ledgers **380034** and **380080**.
-- **Progress:** `replay-bucket-list` now passes for ledgers **380032..380087**.
-- **Failure:** Ledger **380088** fails with a hash mismatch. This ledger corresponds to a Level 1 spill (L1 snaps to L2). The mismatch persists regardless of whether normalization is enabled or disabled, suggesting a more subtle issue with merge logic (possibly `shouldMergeWithEmptyCurr` interaction or specific entry type handling).
+### Resolution Summary
+The replay integration test (`test_catchup_replay_bucket_hash_verification`) now passes all ledger checkpoints including the previously failing L1 spill at ledger 380088.
 
-### Investigation Summary & Fixes
-1.  **Cross-Phase Deduplication (Fixed):** Implemented `CoalescedLedgerChanges`.
-2.  **Transient Entry Annihilation (Fixed):** Corrected `Init` -> `Dead` logic.
-3.  **Eviction Iterator Parity (Fixed):** Implemented local `EvictionIterator` updates.
-4.  **Transaction Change Replay (Fixed):** Corrected `tx_changes_before` handling.
-5.  **INIT Normalization (Fixed):** Disabled `normalize_init` for level spills, aligning with observed C++ behavior (contrary to some documentation).
-
-### Remaining Work
-**Investigate L1 Spill at Ledger 380088.**
-Ledger 380088 triggers a Level 1 spill where `L1` snaps and merges into `L2`. This is the first failure encountered after the initial checkpoint restore. Further investigation is needed to determine why the merge result at this specific boundary diverges from consensus.
+### Fixes Applied
+1. **Cross-Phase Deduplication:** Implemented `CoalescedLedgerChanges`.
+2. **Transient Entry Annihilation:** Corrected `Init` -> `Dead` logic.
+3. **Eviction Iterator Parity:** Implemented local `EvictionIterator` updates.
+4. **Transaction Change Replay:** Corrected `tx_changes_before` handling.
+5. **INIT Normalization:** Disabled `normalize_init` for level spills, aligning with observed C++ behavior.
+6. **Merge Bucket Optimizations:** Removed fast-path optimizations in `merge_buckets` to ensure metadata updates and normalization logic are always applied consistently.
+7. **Hot Archive Merge:** Fixed `merge_hot_archive_buckets` to prevent empty bucket optimization.
