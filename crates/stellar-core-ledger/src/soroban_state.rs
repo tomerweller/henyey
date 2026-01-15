@@ -55,7 +55,7 @@ use stellar_xdr::curr::{
     LedgerKeyContractData, LedgerKeyTtl, Limits, TtlEntry, WriteXdr,
 };
 use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::{LedgerError, Result};
 
@@ -291,30 +291,16 @@ impl InMemorySorobanState {
 
     /// Compute the TTL key hash for a CONTRACT_DATA key.
     pub fn contract_data_key_hash(key: &LedgerKeyContractData) -> [u8; 32] {
-        // Create a TTL key from the contract data key
-        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash256::hash_xdr(&LedgerKey::ContractData(key.clone()))
-                .map(|h| stellar_xdr::curr::Hash(*h.as_bytes()))
-                .unwrap_or_else(|_| stellar_xdr::curr::Hash([0u8; 32])),
-        });
-
-        // Hash the TTL key itself as the map key
-        Hash256::hash_xdr(&ttl_key)
+        // TTL key hash is the SHA-256 of the contract data key.
+        Hash256::hash_xdr(&LedgerKey::ContractData(key.clone()))
             .map(|h| *h.as_bytes())
             .unwrap_or([0u8; 32])
     }
 
     /// Compute the TTL key hash for a CONTRACT_CODE key.
     pub fn contract_code_key_hash(key: &LedgerKeyContractCode) -> [u8; 32] {
-        // Create a TTL key from the contract code key
-        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash256::hash_xdr(&LedgerKey::ContractCode(key.clone()))
-                .map(|h| stellar_xdr::curr::Hash(*h.as_bytes()))
-                .unwrap_or_else(|_| stellar_xdr::curr::Hash([0u8; 32])),
-        });
-
-        // Hash the TTL key itself as the map key
-        Hash256::hash_xdr(&ttl_key)
+        // TTL key hash is the SHA-256 of the contract code key.
+        Hash256::hash_xdr(&LedgerKey::ContractCode(key.clone()))
             .map(|h| *h.as_bytes())
             .unwrap_or([0u8; 32])
     }
@@ -632,39 +618,74 @@ impl InMemorySorobanState {
         Ok(())
     }
 
-    /// Update or create TTL for an entry.
+    /// Create TTL for an entry.
     ///
-    /// If the corresponding data/code entry exists, updates its TTL inline.
-    /// Otherwise, stores in pending_ttls to be adopted later.
-    pub fn update_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) {
+    /// If the corresponding data/code entry exists and has no TTL yet, stores
+    /// the TTL inline. Otherwise, stores in pending_ttls to be adopted later.
+    pub fn create_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
         let key_hash = key.key_hash.0;
 
         // Try to update inline in contract data
         if let Some(entry) = self.contract_data_entries.get_mut(&key_hash) {
+            if entry.ttl_data.is_initialized() {
+                return Err(LedgerError::InvalidEntry(
+                    "contract data TTL already initialized".into(),
+                ));
+            }
             entry.ttl_data = ttl_data;
             trace!("Updated TTL inline for contract data");
-            return;
+            return Ok(());
         }
 
         // Try to update inline in contract code
         if let Some(entry) = self.contract_code_entries.get_mut(&key_hash) {
+            if entry.ttl_data.is_initialized() {
+                return Err(LedgerError::InvalidEntry(
+                    "contract code TTL already initialized".into(),
+                ));
+            }
             entry.ttl_data = ttl_data;
             trace!("Updated TTL inline for contract code");
-            return;
+            return Ok(());
         }
 
         // No entry found, store as pending
+        if self.pending_ttls.contains_key(&key_hash) {
+            return Err(LedgerError::InvalidEntry(
+                "pending TTL already exists".into(),
+            ));
+        }
         self.pending_ttls.insert(key_hash, ttl_data);
         trace!("Stored pending TTL");
+        Ok(())
     }
 
-    /// Process a TTL entry (extract data and update).
-    pub fn process_ttl_entry(&mut self, entry: &LedgerEntry) -> Result<()> {
+    /// Update TTL for an existing entry.
+    ///
+    /// Returns an error if the corresponding data/code entry does not exist.
+    pub fn update_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
+        let key_hash = key.key_hash.0;
+
+        if let Some(entry) = self.contract_data_entries.get_mut(&key_hash) {
+            entry.ttl_data = ttl_data;
+            trace!("Updated TTL inline for contract data");
+            return Ok(());
+        }
+
+        if let Some(entry) = self.contract_code_entries.get_mut(&key_hash) {
+            entry.ttl_data = ttl_data;
+            trace!("Updated TTL inline for contract code");
+            return Ok(());
+        }
+
+        Err(LedgerError::InvalidEntry(
+            "TTL update missing contract data/code entry".into(),
+        ))
+    }
+
+    fn ttl_from_entry(&self, entry: &LedgerEntry) -> Result<(LedgerKeyTtl, TtlData)> {
         let (key_hash, ttl_data) = match &entry.data {
             LedgerEntryData::Ttl(ttl) => {
-                let _key = LedgerKeyTtl {
-                    key_hash: ttl.key_hash.clone(),
-                };
                 (
                     ttl.key_hash.0,
                     TtlData::new(ttl.live_until_ledger_seq, entry.last_modified_ledger_seq),
@@ -676,8 +697,19 @@ impl InMemorySorobanState {
         let key = LedgerKeyTtl {
             key_hash: stellar_xdr::curr::Hash(key_hash),
         };
-        self.update_ttl(&key, ttl_data);
-        Ok(())
+        Ok((key, ttl_data))
+    }
+
+    /// Process a TTL entry for initialization (create semantics).
+    pub fn process_ttl_entry_create(&mut self, entry: &LedgerEntry) -> Result<()> {
+        let (key, ttl_data) = self.ttl_from_entry(entry)?;
+        self.create_ttl(&key, ttl_data)
+    }
+
+    /// Process a TTL entry for updates (update semantics).
+    pub fn process_ttl_entry_update(&mut self, entry: &LedgerEntry) -> Result<()> {
+        let (key, ttl_data) = self.ttl_from_entry(entry)?;
+        self.update_ttl(&key, ttl_data)
     }
 
     /// Calculate the in-memory size for a contract code entry.
@@ -749,10 +781,10 @@ impl InMemorySorobanState {
 
         // Check invariant: pending_ttls should be empty after each update
         if !self.pending_ttls.is_empty() {
-            warn!(
-                "Pending TTLs not empty after update: {} remaining",
+            return Err(LedgerError::InvalidEntry(format!(
+                "pending TTLs not empty after update: {} remaining",
                 self.pending_ttls.len()
-            );
+            )));
         }
 
         debug!(
@@ -777,7 +809,7 @@ impl InMemorySorobanState {
             LedgerEntryData::ContractCode(_) => {
                 self.create_contract_code(entry.clone(), protocol_version, rent_config)
             }
-            LedgerEntryData::Ttl(_) => self.process_ttl_entry(entry),
+            LedgerEntryData::Ttl(_) => self.process_ttl_entry_create(entry),
             _ => Ok(()), // Ignore non-Soroban entries
         }
     }
@@ -821,7 +853,7 @@ impl InMemorySorobanState {
                     self.create_contract_code(entry.clone(), protocol_version, rent_config)
                 }
             }
-            LedgerEntryData::Ttl(_) => self.process_ttl_entry(entry),
+            LedgerEntryData::Ttl(_) => self.process_ttl_entry_update(entry),
             _ => Ok(()), // Ignore non-Soroban entries
         }
     }
@@ -1108,7 +1140,7 @@ mod tests {
         let ttl_key = LedgerKeyTtl {
             key_hash: Hash(key_hash),
         };
-        state.update_ttl(&ttl_key, TtlData::new(1000, 100));
+        state.update_ttl(&ttl_key, TtlData::new(1000, 100)).unwrap();
 
         // Verify TTL is co-located
         let map_entry = state.get_contract_data(&key).unwrap();
@@ -1133,7 +1165,7 @@ mod tests {
             key_hash: Hash(key_hash),
         };
 
-        state.update_ttl(&ttl_key, TtlData::new(2000, 200));
+        state.create_ttl(&ttl_key, TtlData::new(2000, 200)).unwrap();
         assert_eq!(state.pending_ttls.len(), 1);
 
         // Now create the entry
@@ -1168,7 +1200,7 @@ mod tests {
             key_hash: Hash(key_hash),
         };
 
-        state.update_ttl(&ttl_key, TtlData::new(3000, 300));
+        state.update_ttl(&ttl_key, TtlData::new(3000, 300)).unwrap();
 
         // Get synthesized TTL entry
         let ttl_entry = state.get_ttl_entry(&ttl_key).unwrap();
