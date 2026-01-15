@@ -2125,6 +2125,21 @@ async fn cmd_replay_bucket_list(
                 all_dead,
             )?;
 
+            // Log bucket list state for diagnosis
+            if seq >= start_ledger && seq <= end_ledger {
+                println!("  [DEBUG] Ledger {} live bucket list state after add_batch:", seq);
+                let levels = bucket_list.levels();
+                for level_idx in 0..levels.len() {
+                    let level = &levels[level_idx];
+                    let curr_hash = &level.curr.hash().to_hex()[..16];
+                    let snap_hash = &level.snap.hash().to_hex()[..16];
+                    let next_hash = level.next().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string());
+                    let next_hash_trunc = if next_hash == "None" { "None" } else { &next_hash[..16] };
+                    println!("    Level {}: curr={}, snap={}, next={}",
+                        level_idx, curr_hash, snap_hash, next_hash_trunc);
+                }
+            }
+
             // Update hot archive bucket list with archived/restored entries
             if let Some(ref mut hot_archive) = hot_archive_bucket_list {
                 // Log if there are any evictions or restorations

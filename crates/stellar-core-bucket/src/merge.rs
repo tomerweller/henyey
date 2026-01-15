@@ -101,20 +101,17 @@ pub fn merge_buckets_with_options(
     max_protocol_version: u32,
     normalize_init_entries: bool,
 ) -> Result<Bucket> {
-    // Fast path: if new is empty, return old unchanged.
-    if new_bucket.is_empty() {
-        return Ok(old_bucket.clone());
+    // Note: We intentionally do NOT use fast paths for empty buckets here.
+    // C++ stellar-core always goes through the full merge process even when
+    // one input is empty. This is important because:
+    // 1. The output bucket gets new metadata (protocol version)
+    // 2. The bucket hash includes metadata
+    // 3. Returning input unchanged would preserve old metadata and potentially wrong hash
+    //
+    // The only optimization is when BOTH inputs are empty.
+    if new_bucket.is_empty() && old_bucket.is_empty() {
+        return Ok(Bucket::empty());
     }
-
-    // Fast path: if old is empty and we don't need to normalize init entries,
-    // return new unchanged. This preserves the original bucket hash.
-    if old_bucket.is_empty() && !normalize_init_entries {
-        return Ok(new_bucket.clone());
-    }
-
-    // Note: We cannot use a fast path when old is empty AND normalization is needed
-    // because we need to convert any Init entries in new to Live entries (they're
-    // crossing a merge boundary). The merge logic below handles this via normalize_entry().
 
     // Get entries from both buckets (already sorted)
     // Note: use iter() instead of entries() to support disk-backed buckets
@@ -138,8 +135,8 @@ pub fn merge_buckets_with_options(
         old_entries.len() + new_entries.len() + output_meta.as_ref().map(|_| 1).unwrap_or(0),
     );
 
-    if let Some(meta) = output_meta {
-        merged.push(meta);
+    if let Some(ref meta) = output_meta {
+        merged.push(meta.clone());
     }
 
     let mut old_idx = 0;
@@ -222,12 +219,20 @@ pub fn merge_buckets_with_options(
     }
 
     if merged.is_empty() {
+        // In C++, even a merge that results in no data entries still produces a bucket
+        // with a metadata entry (for protocol 11+). This ensures that the bucket list
+        // hash is consistent. An uninitialized bucket has hash 0, but an initialized
+        // empty bucket has the hash of its metadata.
+        if let Some(meta) = output_meta {
+            return Bucket::from_sorted_entries(vec![meta]);
+        }
         return Ok(Bucket::empty());
     }
 
     // Use from_sorted_entries since the merge algorithm maintains sorted order.
     // This avoids the overhead of re-sorting already-sorted data.
     let result = Bucket::from_sorted_entries(merged)?;
+
     tracing::trace!(
         result_hash = %result.hash(),
         result_entries = result.len(),
@@ -534,24 +539,19 @@ fn build_output_metadata(
     new_meta: Option<&BucketMetadata>,
     max_protocol_version: u32,
 ) -> Result<(u32, Option<BucketEntry>)> {
-    let mut protocol_version = 0u32;
-    if let Some(meta) = old_meta {
-        protocol_version = protocol_version.max(meta.ledger_version);
-    }
-    if let Some(meta) = new_meta {
-        protocol_version = protocol_version.max(meta.ledger_version);
-    }
-
-    if protocol_version == 0 {
-        protocol_version = max_protocol_version;
-    }
-
-    if max_protocol_version != 0 && protocol_version > max_protocol_version {
-        return Err(BucketError::Merge(format!(
-            "bucket protocol version {} exceeds maxProtocolVersion {}",
-            protocol_version, max_protocol_version
-        )));
-    }
+    let protocol_version = if max_protocol_version > 0 {
+        max_protocol_version
+    } else {
+        // Fallback for tests or legacy callers where max_protocol_version might be 0
+        let mut v = 0u32;
+        if let Some(meta) = old_meta {
+            v = v.max(meta.ledger_version);
+        }
+        if let Some(meta) = new_meta {
+            v = v.max(meta.ledger_version);
+        }
+        v
+    };
 
     let use_meta = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
     if !use_meta {
@@ -563,26 +563,10 @@ fn build_output_metadata(
         ext: BucketMetadataExt::V0,
     };
 
-    if let Some(meta) = new_meta.filter(|meta| matches!(meta.ext, BucketMetadataExt::V1(_))) {
-        if max_protocol_version != 0
-            && max_protocol_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-        {
-            return Err(BucketError::Merge(
-                "bucket metadata ext v1 requires protocol >= 23".to_string(),
-            ));
-        }
-        output.ext = meta.ext.clone();
-    } else if let Some(meta) =
-        old_meta.filter(|meta| matches!(meta.ext, BucketMetadataExt::V1(_)))
-    {
-        if max_protocol_version != 0
-            && max_protocol_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-        {
-            return Err(BucketError::Merge(
-                "bucket metadata ext v1 requires protocol >= 23".to_string(),
-            ));
-        }
-        output.ext = meta.ext.clone();
+    // For Protocol 23+, Live buckets must use V1 extension with BucketListType::LIVE.
+    // merge_buckets_with_options is specifically for the Live bucket list.
+    if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+        output.ext = BucketMetadataExt::V1(stellar_xdr::curr::BucketListType::Live);
     }
 
     Ok((protocol_version, Some(BucketEntry::Metadata(output))))

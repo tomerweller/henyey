@@ -107,6 +107,7 @@ impl BucketLevel {
         }
     }
 
+
     /// Get the hash of this level: SHA256(curr_hash || snap_hash).
     ///
     /// This matches stellar-core's BucketLevel::getHash() implementation.
@@ -598,14 +599,8 @@ impl BucketList {
                 self.levels[i].commit();
 
                 // Prepare level i: merge curr with the spilling_snap from level i-1
-                // In C++ stellar-core, INIT entries are NEVER normalized to LIVE during merges.
-                // The keepTombstoneEntries flag only controls whether DEAD entries are kept
-                // or discarded at the output iterator level - it does not affect INIT entries.
-                //
-                // Additionally, check shouldMergeWithEmptyCurr: when a level is about
-                // to snap its own curr, we use an empty bucket instead of curr.
                 let keep_dead = Self::keep_tombstone_entries(i);
-                let normalize_init = false; // C++ never normalizes INIT to LIVE during merges
+                let normalize_init = false; // EXPERIMENT: Disable normalization for 380032 verification
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
@@ -616,10 +611,10 @@ impl BucketList {
                     use_empty_curr,
                 )?;
 
-                tracing::debug!(
+                tracing::info!(
                     level = i,
-                    "Level prepared with spill from level {}",
-                    i - 1
+                    next_hash = %self.levels[i].next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string()),
+                    "Level prepared"
                 );
             }
         }
@@ -641,14 +636,19 @@ impl BucketList {
 
         self.levels[0].commit();
 
-        // Note: We do NOT commit all levels here. In C++ stellar-core, merges are
-        // asynchronous and the commit only happens when the level is about to receive
-        // a new spill (at the start of the loop iteration). The shouldMergeWithEmptyCurr
-        // logic relies on curr being preserved until the level snaps.
-        //
-        // If we committed all levels here, entries would be lost when shouldMergeWithEmptyCurr
-        // is true, because the merge result (which doesn't include curr) would overwrite
-        // the actual curr before it has a chance to be snapped.
+        if ledger_seq >= 380080 && ledger_seq <= 380088 {
+            for (i, level) in self.levels.iter().enumerate() {
+                if i > 2 { break; }
+                tracing::info!("Ledger {} Level {} curr entries: {}", ledger_seq, i, level.curr.len());
+                if ledger_seq == 380088 {
+                    for (idx, entry) in level.curr.entries().iter().enumerate() {
+                        if idx < 5 {
+                            tracing::info!("  L{} [{}]: {:?}", i, idx, entry);
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -844,14 +844,10 @@ impl BucketList {
             let normalize_init = false; // C++ never normalizes INIT to LIVE during merges
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
-            // Use the protocol version from the snap bucket's metadata if available,
-            // matching C++ behavior in restartMerges.
-            let version_to_use = prev_snap.protocol_version().unwrap_or(protocol_version);
-
             // Start the merge with the previous level's snap
             self.levels[i].prepare_with_normalization(
                 merge_start_ledger,
-                version_to_use,
+                protocol_version,
                 prev_snap,
                 keep_dead,
                 normalize_init,

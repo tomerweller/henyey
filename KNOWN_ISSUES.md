@@ -46,24 +46,23 @@ INFO  Peer reported DontHave for TxSet hash="fdd5aa743a41..."
 
 ## 2. Bucket List Hash Mismatch at P25 (Partially Resolved)
 
-**Status:** Eviction archive fix applied / Still failing at ~184 ledgers from checkpoint
-**Severity:** Critical - Prevents live sync after ~184 ledgers from checkpoint
+**Status:** Fixed up to ~180 ledgers from checkpoint / Failing at 380088
+**Severity:** Critical - Prevents live sync after ~180 ledgers from checkpoint
 **Component:** Bucket List / Hot Archive
-**Last Verified:** 2026-01-14
+**Last Verified:** 2026-01-15
 
 ### Status Update
-- **Bucket List Logic**: **Partially Resolved**. The `replay-bucket-list` command passes for short ranges (e.g., 379904..380087), confirming basic correctness. However, it **FAILS** at ledger 380088 (184 ledgers from checkpoint).
-- **Transaction Execution**: **Aligned**. `verify-execution` failure at 380088 matches the `replay-bucket-list` failure hash, confirming that transaction execution is producing the same (incorrect) state as the metadata replay. The divergence is now purely in how the bucket list handles the **Level 1 Spill** at ledger 380088.
+- **Normalization Logic Fixed:** Disabling `INIT -> LIVE` normalization in `add_batch_internal` (L0 -> L1 spills) fixed mismatches at ledgers **380034** and **380080**.
+- **Progress:** `replay-bucket-list` now passes for ledgers **380032..380087**.
+- **Failure:** Ledger **380088** fails with a hash mismatch. This ledger corresponds to a Level 1 spill (L1 snaps to L2). The mismatch persists regardless of whether normalization is enabled or disabled, suggesting a more subtle issue with merge logic (possibly `shouldMergeWithEmptyCurr` interaction or specific entry type handling).
 
 ### Investigation Summary & Fixes
-An extensive investigation has successfully identified and resolved several critical structural bugs:
 1.  **Cross-Phase Deduplication (Fixed):** Implemented `CoalescedLedgerChanges`.
 2.  **Transient Entry Annihilation (Fixed):** Corrected `Init` -> `Dead` logic.
 3.  **Eviction Iterator Parity (Fixed):** Implemented local `EvictionIterator` updates.
 4.  **Transaction Change Replay (Fixed):** Corrected `tx_changes_before` handling.
+5.  **INIT Normalization (Fixed):** Disabled `normalize_init` for level spills, aligning with observed C++ behavior (contrary to some documentation).
 
 ### Remaining Work
 **Investigate L1 Spill at Ledger 380088.**
-Ledger 380088 triggers a Level 1 spill (merging L1 Snap into L2 Curr). Since 380080 (also an L1 spill) passed, the issue likely involves a specific merge interaction (e.g., shadowing, dead entry handling) between the new keys in 380080..380087 and the existing keys in L2.
-
----
+Ledger 380088 triggers a Level 1 spill where `L1` snaps and merges into `L2`. This is the first failure encountered after the initial checkpoint restore. Further investigation is needed to determine why the merge result at this specific boundary diverges from consensus.

@@ -762,14 +762,9 @@ impl HotArchiveBucketList {
             let keep_tombstones = Self::keep_tombstone_entries(i);
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
-            // Use the protocol version from the snap bucket's metadata, matching C++ behavior.
-            // C++ stellar-core's restartMerges uses snap->getBucketVersion() for the merge.
-            let bucket_version = prev_snap.get_protocol_version();
-            let version_to_use = if bucket_version > 0 { bucket_version } else { protocol_version };
-
             // Start the merge with the previous level's snap
             self.levels[i].prepare(
-                version_to_use,
+                protocol_version,
                 prev_snap,
                 keep_tombstones,
                 use_empty_curr,
@@ -1209,9 +1204,10 @@ pub fn merge_hot_archive_buckets(
     // 2. The bucket hash includes metadata
     // 3. Returning input unchanged would preserve old metadata and wrong hash
     //
-    // The only optimization is when BOTH inputs are empty.
-    if snap.is_empty() && curr.is_empty() {
-        tracing::trace!("hot_archive merge: both empty, returning empty");
+    // The only optimization is when BOTH inputs are empty and protocol version is 0.
+    // In C++, even an empty merge produces a bucket with metadata.
+    if snap.is_empty() && curr.is_empty() && protocol_version == 0 {
+        tracing::trace!("hot_archive merge: both empty and no protocol, returning empty");
         return Ok(HotArchiveBucket::empty());
     }
 
@@ -1253,19 +1249,24 @@ pub fn merge_hot_archive_buckets(
     // This is critical for hash consistency.
     let mut result_entries = Vec::with_capacity(merged_entries.len() + 1);
 
-    // Calculate output protocol version as max of inputs, matching C++ behavior.
-    // C++ calculateMergeProtocolVersion does: max(oi.metadata.ledgerVersion, ni.metadata.ledgerVersion)
-    // The passed protocol_version acts as an upper bound (maxProtocolVersion).
-    let curr_version = curr.get_protocol_version();
-    let snap_version = snap.get_protocol_version();
-    let output_version = curr_version.max(snap_version).min(protocol_version);
+    // Calculate output protocol version, matching C++ behavior.
+    // The passed protocol_version (maxProtocolVersion) is used for the output bucket.
+    let output_version = if protocol_version > 0 {
+        protocol_version
+    } else {
+        curr.get_protocol_version().max(snap.get_protocol_version())
+    };
 
     // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
-    // Metadata is only included when there are actual entries to add
-    result_entries.push(HotArchiveBucketEntry::Metaentry(BucketMetadata {
+    // for Protocol 23+.
+    let mut meta = BucketMetadata {
         ledger_version: output_version,
-        ext: BucketMetadataExt::V1(BucketListType::HotArchive),
-    }));
+        ext: BucketMetadataExt::V0,
+    };
+    if output_version >= FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE {
+        meta.ext = BucketMetadataExt::V1(BucketListType::HotArchive);
+    }
+    result_entries.push(HotArchiveBucketEntry::Metaentry(meta));
 
     // Add merged entries
     result_entries.extend(merged_entries.into_values());
