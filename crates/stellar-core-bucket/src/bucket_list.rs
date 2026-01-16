@@ -59,7 +59,7 @@ use crate::entry::{
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
 };
-use crate::merge::merge_buckets_with_options_and_shadows;
+use crate::merge::{merge_buckets_with_options_and_shadows, merge_in_memory};
 use crate::{
     BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
@@ -263,6 +263,89 @@ impl BucketLevel {
 
         self.next = Some(merged);
         Ok(())
+    }
+
+    /// Prepare level 0 with in-memory optimization.
+    ///
+    /// This method is specifically for level 0 and uses the in-memory merge
+    /// optimization when possible. It avoids disk I/O for reading entries
+    /// and keeps entries in memory for subsequent fast merges.
+    ///
+    /// # Arguments
+    ///
+    /// * `protocol_version` - The protocol version for the output bucket
+    /// * `incoming` - The new bucket to merge with curr (must have in-memory entries)
+    ///
+    /// # Returns
+    ///
+    /// The merged bucket with in-memory entries set for the next merge.
+    fn prepare_first_level(
+        &mut self,
+        protocol_version: u32,
+        incoming: Bucket,
+    ) -> Result<()> {
+        if self.level != 0 {
+            return Err(BucketError::Merge(
+                "prepare_first_level can only be called on level 0".to_string(),
+            ));
+        }
+
+        if self.next.is_some() {
+            return Err(BucketError::Merge(
+                "bucket merge already in progress".to_string(),
+            ));
+        }
+
+        // Check if we can use in-memory merge
+        let can_use_in_memory_merge =
+            self.curr.has_in_memory_entries() && incoming.has_in_memory_entries();
+
+        let merged = if can_use_in_memory_merge {
+            tracing::debug!(
+                level = 0,
+                "prepare_first_level: using in-memory merge path"
+            );
+            merge_in_memory(&self.curr, &incoming, protocol_version)?
+        } else {
+            tracing::debug!(
+                level = 0,
+                curr_has_in_memory = self.curr.has_in_memory_entries(),
+                incoming_has_in_memory = incoming.has_in_memory_entries(),
+                "prepare_first_level: falling back to regular merge (in-memory entries not available)"
+            );
+            // Fall back to regular merge
+            // Level 0 always keeps tombstones and never normalizes INIT entries
+            merge_buckets_with_options_and_shadows(
+                &self.curr,
+                &incoming,
+                true,  // keep_dead_entries
+                protocol_version,
+                false, // normalize_init_entries
+                &[],   // no shadow buckets at level 0
+            )?
+        };
+
+        // If the merged bucket doesn't have in-memory entries but we want them
+        // for the next merge, try to enable them
+        let merged = if !merged.has_in_memory_entries() {
+            // Get entries and create bucket with in-memory optimization
+            let entries: Vec<BucketEntry> = merged.iter().collect();
+            Bucket::from_sorted_entries_with_in_memory(entries)?
+        } else {
+            merged
+        };
+
+        self.next = Some(merged);
+        Ok(())
+    }
+
+    /// Clear in-memory entries from curr and snap buckets.
+    ///
+    /// This should be called when entries from this level move to higher levels
+    /// and no longer need to participate in fast in-memory merges.
+    pub fn clear_in_memory_entries(&mut self) {
+        self.curr.clear_in_memory_entries();
+        self.snap.clear_in_memory_entries();
     }
 }
 
@@ -571,7 +654,13 @@ impl BucketList {
             .collect();
         entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
 
-        let new_bucket = Bucket::from_entries(entries)?;
+        // Create the new bucket with in-memory entries for level 0 optimization
+        // This enables fast in-memory merges at level 0
+        let new_bucket = Bucket::from_sorted_entries_with_in_memory({
+            let mut e = entries;
+            e.sort_by(crate::entry::compare_entries);
+            e
+        })?;
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;
@@ -656,21 +745,9 @@ impl BucketList {
         }
 
         // Step 2: Apply new entries to level 0
-        // Prepare level 0: merge curr with new entries
-        // Don't normalize INIT entries at level 0 - they stay as INIT
-        // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
-        let keep_dead_0 = Self::keep_tombstone_entries(0);
-
-        self.levels[0].prepare_with_normalization(
-            ledger_seq,
-            protocol_version,
-            new_bucket,
-            keep_dead_0,
-            &[],
-            false, // don't normalize at level 0
-            false, // level 0 never uses empty curr
-        )?;
-
+        // Use the in-memory optimization for level 0
+        // This avoids disk I/O for level 0 merges which happen frequently
+        self.levels[0].prepare_first_level(protocol_version, new_bucket)?;
         self.levels[0].commit();
 
         Ok(())

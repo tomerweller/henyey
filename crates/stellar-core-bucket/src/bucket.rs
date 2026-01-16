@@ -104,6 +104,17 @@ pub struct Bucket {
     hash: Hash256,
     /// The storage mode (in-memory or disk-backed).
     storage: BucketStorage,
+    /// In-memory entries for level 0 optimization.
+    ///
+    /// When set, these entries are kept in memory for fast access during
+    /// subsequent merges. This avoids disk I/O for level 0 merges which
+    /// happen frequently and block the main thread.
+    ///
+    /// This is separate from `BucketStorage::InMemory` because:
+    /// - The bucket is still written to disk for durability
+    /// - This is an optional optimization for level 0 only
+    /// - The entries are the same as in the storage, just kept in RAM
+    level_zero_entries: Option<Arc<Vec<BucketEntry>>>,
 }
 
 impl Bucket {
@@ -118,6 +129,7 @@ impl Bucket {
                 entries: Arc::new(Vec::new()),
                 key_index: Arc::new(BTreeMap::new()),
             },
+            level_zero_entries: None,
         }
     }
 
@@ -183,6 +195,7 @@ impl Bucket {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
             },
+            level_zero_entries: None,
         })
     }
 
@@ -256,6 +269,7 @@ impl Bucket {
             storage: BucketStorage::DiskBacked {
                 disk_bucket: Arc::new(disk_bucket),
             },
+            level_zero_entries: None,
         })
     }
 
@@ -289,6 +303,7 @@ impl Bucket {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
             },
+            level_zero_entries: None,
         })
     }
 
@@ -595,6 +610,78 @@ impl Bucket {
                 Ok(bytes)
             }
         }
+    }
+
+    // ========================================================================
+    // Level 0 In-Memory Optimization
+    // ========================================================================
+
+    /// Check if this bucket has in-memory entries for level 0 optimization.
+    ///
+    /// When true, the bucket can participate in fast in-memory merges
+    /// without disk I/O.
+    pub fn has_in_memory_entries(&self) -> bool {
+        self.level_zero_entries.is_some()
+    }
+
+    /// Get the in-memory entries for level 0 optimization.
+    ///
+    /// Returns None if entries are not cached in memory.
+    pub fn get_in_memory_entries(&self) -> Option<&[BucketEntry]> {
+        self.level_zero_entries.as_ref().map(|v| v.as_slice())
+    }
+
+    /// Set the in-memory entries for level 0 optimization.
+    ///
+    /// This stores entries in memory for fast access during subsequent merges.
+    /// Call this after creating a bucket to enable in-memory level 0 merges.
+    pub fn set_in_memory_entries(&mut self, entries: Vec<BucketEntry>) {
+        self.level_zero_entries = Some(Arc::new(entries));
+    }
+
+    /// Clear the in-memory entries.
+    ///
+    /// This releases the memory used for level 0 optimization.
+    /// Call this when a bucket moves beyond level 0.
+    pub fn clear_in_memory_entries(&mut self) {
+        self.level_zero_entries = None;
+    }
+
+    /// Create a bucket with only in-memory entries (no hash, no index).
+    ///
+    /// This creates a "shell" bucket for immediate in-memory merging.
+    /// It does NOT compute the hash or create an index, making creation fast.
+    /// The bucket cannot be persisted until properly finalized.
+    ///
+    /// This is the Rust equivalent of C++ `LiveBucket::freshInMemoryOnly`.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - Pre-sorted bucket entries (must be sorted by key!)
+    ///
+    /// # Returns
+    ///
+    /// A bucket suitable for in-memory merging. The hash is set to ZERO
+    /// until the bucket is finalized through merging.
+    pub fn fresh_in_memory_only(entries: Vec<BucketEntry>) -> Self {
+        Self {
+            hash: Hash256::ZERO, // Not computed yet
+            storage: BucketStorage::InMemory {
+                entries: Arc::new(Vec::new()), // Empty - use level_zero_entries instead
+                key_index: Arc::new(BTreeMap::new()),
+            },
+            level_zero_entries: Some(Arc::new(entries)),
+        }
+    }
+
+    /// Create a bucket from sorted entries with in-memory optimization enabled.
+    ///
+    /// This is like `from_sorted_entries` but also keeps entries in memory
+    /// for level 0 optimization.
+    pub fn from_sorted_entries_with_in_memory(entries: Vec<BucketEntry>) -> Result<Self> {
+        let mut bucket = Self::from_sorted_entries(entries.clone())?;
+        bucket.level_zero_entries = Some(Arc::new(entries));
+        Ok(bucket)
     }
 }
 

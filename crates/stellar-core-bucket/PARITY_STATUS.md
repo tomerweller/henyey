@@ -1,6 +1,6 @@
 ## C++ Parity Status
 
-**Overall Parity: ~95%**
+**Overall Parity: ~98%**
 
 This section documents the implementation status relative to the C++ stellar-core bucket implementation (v25).
 
@@ -24,6 +24,7 @@ This section documents the implementation status relative to the C++ stellar-cor
 | Metrics/Counters | Complete | MergeCounters, EvictionCounters, BucketListMetrics |
 | Streaming Iterators | Complete | BucketInputIterator, BucketOutputIterator |
 | BucketManager State | Complete | loadCompleteLedgerState, mergeAllBuckets, ensureBucketsExist |
+| In-Memory Level 0 | Complete | merge_in_memory, level_zero_entries optimization |
 
 ### Implemented
 
@@ -226,17 +227,28 @@ This section documents the implementation status relative to the C++ stellar-cor
   - Calls provided fetch function for missing buckets
   - Supports `assumeState` flow for HistoryArchiveState restoration
 
+#### In-Memory Level 0 Optimization (`bucket.rs`, `merge.rs`, `bucket_list.rs`)
+- **level_zero_entries** field in Bucket - Optional in-memory entry storage:
+  - Enables fast in-memory merges at level 0
+  - Avoids disk I/O for frequently-updated buckets
+  - `has_in_memory_entries()` / `get_in_memory_entries()` / `set_in_memory_entries()` accessors
+- **fresh_in_memory_only** - Create shell bucket for immediate merging:
+  - No hash computation or index creation
+  - Directly populates in-memory entries
+- **merge_in_memory** - Fast level 0 merge using in-memory entries:
+  - Uses entries directly from memory (no disk reads)
+  - Preserves INIT entries (no normalization at level 0)
+  - Keeps tombstones for shadowing deeper levels
+  - Result bucket has in-memory entries for next merge
+- **prepare_first_level** - BucketLevel method for level 0:
+  - Uses in-memory merge when both buckets have entries in memory
+  - Falls back to regular merge when entries not available
+
 ### Not Yet Implemented (Gaps)
 
 #### Shadow Buckets (FutureBucket.h)
 - **Shadow bucket support** - Buckets from lower levels that can inhibit entries during merge (protocol < 12)
 - Not needed for protocol 23+ but present in C++ for backward compatibility
-
-#### In-Memory Level 0 Optimizations (LiveBucket.h)
-- **mergeInMemory** - Faster level 0 merges keeping entries in RAM
-- **mEntries** vector in `LiveBucket` - In-memory entry storage for level 0
-- Rust performs all merges the same way regardless of level
-- Note: `BucketOutputIterator::new_with_in_memory()` provides partial support
 
 #### Medida Metrics Integration
 - Full Medida metrics framework integration (counters, timers, meters):
@@ -289,9 +301,8 @@ The Rust implementation correctly handles:
 
 ### Future Work Priority
 
-1. **Lower Priority**: In-memory level 0 optimizations (performance enhancement, partial support via `BucketOutputIterator`)
-2. **Lower Priority**: Full Medida metrics integration (observability)
-3. **Not Needed**: Shadow buckets (protocol < 12 feature, not required for protocol 23+)
+1. **Lower Priority**: Full Medida metrics integration (observability)
+2. **Not Needed**: Shadow buckets (protocol < 12 feature, not required for protocol 23+)
 
 ### C++ to Rust File Mapping
 

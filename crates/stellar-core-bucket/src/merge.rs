@@ -253,6 +253,166 @@ pub fn merge_buckets_with_options(
     Ok(result)
 }
 
+/// Merge two buckets using in-memory entries (level 0 optimization).
+///
+/// This function performs an in-memory merge of two buckets, avoiding disk I/O
+/// for reading. The result is a new bucket with entries kept in memory for
+/// subsequent fast merges.
+///
+/// This is the Rust equivalent of C++ `LiveBucket::mergeInMemory`.
+///
+/// # Requirements
+///
+/// Both input buckets MUST have in-memory entries available
+/// (i.e., `has_in_memory_entries()` returns true).
+///
+/// # Arguments
+///
+/// * `old_bucket` - The older bucket (entries may be shadowed)
+/// * `new_bucket` - The newer bucket (entries take precedence)
+/// * `max_protocol_version` - Maximum protocol version for output
+///
+/// # Returns
+///
+/// A new bucket with:
+/// - All entries merged according to CAP-0020 semantics
+/// - In-memory entries populated for the next merge
+/// - Proper hash computed
+///
+/// # Panics
+///
+/// Panics if either bucket does not have in-memory entries.
+pub fn merge_in_memory(
+    old_bucket: &Bucket,
+    new_bucket: &Bucket,
+    max_protocol_version: u32,
+) -> Result<Bucket> {
+    // Verify both buckets have in-memory entries
+    assert!(
+        old_bucket.has_in_memory_entries(),
+        "old_bucket must have in-memory entries for merge_in_memory"
+    );
+    assert!(
+        new_bucket.has_in_memory_entries(),
+        "new_bucket must have in-memory entries for merge_in_memory"
+    );
+
+    // Get in-memory entries directly (no disk I/O)
+    let old_entries = old_bucket.get_in_memory_entries().unwrap();
+    let new_entries = new_bucket.get_in_memory_entries().unwrap();
+
+    // Build output metadata
+    let old_meta = extract_metadata(old_entries);
+    let new_meta = extract_metadata(new_entries);
+    let (_, output_meta) =
+        build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
+
+    // Pre-allocate output vector
+    let mut merged = Vec::with_capacity(
+        old_entries.len() + new_entries.len() + output_meta.as_ref().map(|_| 1).unwrap_or(0),
+    );
+
+    // Add metadata first if present
+    if let Some(ref meta) = output_meta {
+        merged.push(meta.clone());
+    }
+
+    // Set up indices, skipping metadata entries
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+
+    while old_idx < old_entries.len() && old_entries[old_idx].is_metadata() {
+        old_idx += 1;
+    }
+    while new_idx < new_entries.len() && new_entries[new_idx].is_metadata() {
+        new_idx += 1;
+    }
+
+    // Level 0 always keeps tombstones (they may shadow entries in deeper levels)
+    let keep_dead_entries = true;
+    // Level 0 does NOT normalize INIT entries (they stay INIT within the merge window)
+    let normalize_init_entries = false;
+
+    // Merge entries using the same algorithm as merge_buckets_with_options
+    while old_idx < old_entries.len() && new_idx < new_entries.len() {
+        let old_entry = &old_entries[old_idx];
+        let new_entry = &new_entries[new_idx];
+
+        let old_key = old_entry.key();
+        let new_key = new_entry.key();
+
+        match (old_key, new_key) {
+            (Some(ref ok), Some(ref nk)) => {
+                use crate::entry::compare_keys;
+                match compare_keys(ok, nk) {
+                    std::cmp::Ordering::Less => {
+                        if should_keep_entry(old_entry, keep_dead_entries) {
+                            merged.push(old_entry.clone());
+                        }
+                        old_idx += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if should_keep_entry(new_entry, keep_dead_entries) {
+                            merged.push(maybe_normalize_entry(
+                                new_entry.clone(),
+                                normalize_init_entries,
+                            ));
+                        }
+                        new_idx += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if let Some(merged_entry) = merge_entries(
+                            old_entry,
+                            new_entry,
+                            keep_dead_entries,
+                            normalize_init_entries,
+                        ) {
+                            merged.push(merged_entry);
+                        }
+                        old_idx += 1;
+                        new_idx += 1;
+                    }
+                }
+            }
+            (None, Some(_)) => old_idx += 1,
+            (Some(_), None) => new_idx += 1,
+            (None, None) => {
+                old_idx += 1;
+                new_idx += 1;
+            }
+        }
+    }
+
+    // Add remaining old entries
+    while old_idx < old_entries.len() {
+        let entry = &old_entries[old_idx];
+        if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
+            merged.push(entry.clone());
+        }
+        old_idx += 1;
+    }
+
+    // Add remaining new entries
+    while new_idx < new_entries.len() {
+        let entry = &new_entries[new_idx];
+        if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
+            merged.push(maybe_normalize_entry(entry.clone(), normalize_init_entries));
+        }
+        new_idx += 1;
+    }
+
+    // Handle empty result
+    if merged.is_empty() {
+        if let Some(meta) = output_meta {
+            return Bucket::from_sorted_entries_with_in_memory(vec![meta]);
+        }
+        return Ok(Bucket::empty());
+    }
+
+    // Create bucket with in-memory entries preserved
+    Bucket::from_sorted_entries_with_in_memory(merged)
+}
+
 /// Merge two buckets with shadow elimination for pre-shadow-removal protocols.
 ///
 /// Shadows are only used before protocol 12 to avoid reintroducing entries
@@ -1036,5 +1196,132 @@ mod tests {
         let key4 = make_account_key([4u8; 32]);
         let entry4 = merged.get(&key4).unwrap().unwrap();
         assert!(entry4.is_dead(), "Entry 4 should be DEAD");
+    }
+
+    // ============ In-Memory Level 0 Optimization Tests ============
+
+    #[test]
+    fn test_merge_in_memory_basic() {
+        // Create buckets with in-memory entries enabled
+        let old_entries = vec![
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+        ];
+        let new_entries = vec![
+            BucketEntry::Live(make_account_entry([2u8; 32], 250)), // Update entry 2
+            BucketEntry::Live(make_account_entry([3u8; 32], 300)), // Add new entry
+        ];
+
+        let old_bucket = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
+        let new_bucket = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
+
+        // Verify both have in-memory entries
+        assert!(old_bucket.has_in_memory_entries());
+        assert!(new_bucket.has_in_memory_entries());
+
+        // Perform in-memory merge
+        let merged = merge_in_memory(&old_bucket, &new_bucket, 25).unwrap();
+
+        // Result should have in-memory entries
+        assert!(merged.has_in_memory_entries());
+
+        // Verify entries
+        let key1 = make_account_key([1u8; 32]);
+        let key2 = make_account_key([2u8; 32]);
+        let key3 = make_account_key([3u8; 32]);
+
+        let entry1 = merged.get_entry(&key1).unwrap().unwrap();
+        let entry2 = merged.get_entry(&key2).unwrap().unwrap();
+        let entry3 = merged.get_entry(&key3).unwrap().unwrap();
+
+        if let LedgerEntryData::Account(a) = &entry1.data {
+            assert_eq!(a.balance, 100);
+        }
+        if let LedgerEntryData::Account(a) = &entry2.data {
+            assert_eq!(a.balance, 250); // Updated
+        }
+        if let LedgerEntryData::Account(a) = &entry3.data {
+            assert_eq!(a.balance, 300);
+        }
+    }
+
+    #[test]
+    fn test_merge_in_memory_preserves_init_entries() {
+        // INIT entries should NOT be normalized to LIVE in level 0 merges
+        let old_entries = vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 200))];
+
+        let old_bucket = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
+        let new_bucket = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
+
+        let merged = merge_in_memory(&old_bucket, &new_bucket, 25).unwrap();
+
+        // INIT + LIVE should become INIT with new value
+        let key = make_account_key([1u8; 32]);
+        let entry = merged.get(&key).unwrap().unwrap();
+        assert!(entry.is_init(), "Level 0 merge should preserve INIT status");
+
+        if let BucketEntry::Init(le) = entry {
+            if let LedgerEntryData::Account(a) = &le.data {
+                assert_eq!(a.balance, 200, "Should have updated value");
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_in_memory_keeps_tombstones() {
+        // Level 0 merges should always keep tombstones
+        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Dead(make_account_key([1u8; 32]))];
+
+        let old_bucket = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
+        let new_bucket = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
+
+        let merged = merge_in_memory(&old_bucket, &new_bucket, 25).unwrap();
+
+        // Should have the dead entry
+        let key = make_account_key([1u8; 32]);
+        let entry = merged.get(&key).unwrap().unwrap();
+        assert!(entry.is_dead(), "Level 0 merge should keep tombstones");
+    }
+
+    #[test]
+    fn test_merge_in_memory_annihilation() {
+        // INIT + DEAD should annihilate even in in-memory merge
+        let old_entries = vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Dead(make_account_key([1u8; 32]))];
+
+        let old_bucket = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
+        let new_bucket = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
+
+        let merged = merge_in_memory(&old_bucket, &new_bucket, 25).unwrap();
+
+        // Entry should be annihilated
+        let key = make_account_key([1u8; 32]);
+        assert!(
+            merged.get(&key).unwrap().is_none(),
+            "INIT + DEAD should annihilate"
+        );
+    }
+
+    #[test]
+    fn test_fresh_in_memory_only() {
+        // Test creating a shell bucket for immediate merging
+        let entries = vec![
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+        ];
+
+        let bucket = Bucket::fresh_in_memory_only(entries.clone());
+
+        // Should have in-memory entries
+        assert!(bucket.has_in_memory_entries());
+
+        // Hash should be ZERO (not computed)
+        assert!(bucket.hash().is_zero());
+
+        // Should be able to get in-memory entries
+        let in_mem = bucket.get_in_memory_entries().unwrap();
+        assert_eq!(in_mem.len(), 2);
     }
 }
