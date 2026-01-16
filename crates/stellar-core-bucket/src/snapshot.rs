@@ -40,11 +40,16 @@
 //! manager.update_current_snapshot(new_live_snapshot, new_hot_archive_snapshot);
 //! ```
 
-use crate::{Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel, HotArchiveBucketList};
+use crate::{
+    Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel,
+    HotArchiveBucketList,
+};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use stellar_xdr::curr::{AccountId, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerHeader, LedgerKey};
+use stellar_xdr::curr::{
+    AccountId, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerHeader, LedgerKey,
+};
 
 /// A read-only snapshot of a single bucket.
 ///
@@ -849,12 +854,7 @@ mod tests {
             base_fee: 100,
             base_reserve: 5000000,
             max_tx_set_size: 100,
-            skip_list: [
-                Hash([0; 32]),
-                Hash([0; 32]),
-                Hash([0; 32]),
-                Hash([0; 32]),
-            ],
+            skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
             ext: LedgerHeaderExt::V0,
         }
     }
@@ -1030,7 +1030,14 @@ mod tests {
                 ext: LedgerEntryExt::V0,
             };
             bucket_list
-                .add_batch(1 + i as u32, 25, BucketListType::Live, vec![entry], vec![], vec![])
+                .add_batch(
+                    1 + i as u32,
+                    25,
+                    BucketListType::Live,
+                    vec![entry],
+                    vec![],
+                    vec![],
+                )
                 .unwrap();
         }
 
@@ -1083,7 +1090,14 @@ mod tests {
                 ext: LedgerEntryExt::V0,
             };
             bucket_list
-                .add_batch(i as u32, 25, BucketListType::Live, vec![entry], vec![], vec![])
+                .add_batch(
+                    i as u32,
+                    25,
+                    BucketListType::Live,
+                    vec![entry],
+                    vec![],
+                    vec![],
+                )
                 .unwrap();
         }
 
@@ -1166,7 +1180,14 @@ mod tests {
         };
 
         bucket_list
-            .add_batch(1, 25, BucketListType::Live, vec![entry1, entry2], vec![], vec![])
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![entry1, entry2],
+                vec![],
+                vec![],
+            )
             .unwrap();
 
         let snapshot = BucketListSnapshot::new(&bucket_list, header);

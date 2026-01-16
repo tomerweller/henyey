@@ -135,29 +135,34 @@ pub use persistence::{
 };
 
 // HerderUtils
-pub use herder_utils::{get_stellar_values, get_tx_set_hashes_from_envelope, to_short_string, to_short_strkey};
+pub use herder_utils::{
+    get_stellar_values, get_tx_set_hashes_from_envelope, to_short_string, to_short_strkey,
+};
 
 // LedgerCloseData
-pub use ledger_close_data::{LedgerCloseData, LedgerCloseDataError, stellar_value_to_string};
+pub use ledger_close_data::{stellar_value_to_string, LedgerCloseData, LedgerCloseDataError};
 
 // TxQueueLimiter and surge pricing
 pub use surge_pricing::VisitTxResult;
 pub use tx_queue_limiter::TxQueueLimiter;
 
 // Timer management
-pub use timer_manager::{TimerCallback, TimerCommand, TimerManager, TimerManagerHandle, TimerManagerWithStats, TimerStats, TimerType};
+pub use timer_manager::{
+    TimerCallback, TimerCommand, TimerManager, TimerManagerHandle, TimerManagerWithStats,
+    TimerStats, TimerType,
+};
 
 // Sync recovery
 pub use sync_recovery::{
     SyncRecoveryCallback, SyncRecoveryCommand, SyncRecoveryHandle, SyncRecoveryManager,
-    SyncRecoveryStats, SyncRecoveryStatsTracker, CONSENSUS_STUCK_TIMEOUT,
-    LEDGER_VALIDITY_BRACKET, OUT_OF_SYNC_RECOVERY_INTERVAL,
+    SyncRecoveryStats, SyncRecoveryStatsTracker, CONSENSUS_STUCK_TIMEOUT, LEDGER_VALIDITY_BRACKET,
+    OUT_OF_SYNC_RECOVERY_INTERVAL,
 };
 
 // Transaction broadcast
 pub use tx_broadcast::{
-    BroadcastCommand, TxBroadcastCallback, TxBroadcastHandle, TxBroadcastManager,
-    TxBroadcastStats, DEFAULT_FLOOD_PERIOD_MS,
+    BroadcastCommand, TxBroadcastCallback, TxBroadcastHandle, TxBroadcastManager, TxBroadcastStats,
+    DEFAULT_FLOOD_PERIOD_MS,
 };
 
 // Dead node detection

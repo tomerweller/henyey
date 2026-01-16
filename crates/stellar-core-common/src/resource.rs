@@ -251,20 +251,14 @@ impl PartialOrd for Resource {
 ///
 /// This is useful for detecting when a resource vector has any dimension below a threshold.
 pub fn any_less_than(lhs: &Resource, rhs: &Resource) -> bool {
-    lhs.values
-        .iter()
-        .zip(rhs.values.iter())
-        .any(|(a, b)| a < b)
+    lhs.values.iter().zip(rhs.values.iter()).any(|(a, b)| a < b)
 }
 
 /// Returns `true` if any dimension of `lhs` is greater than the corresponding dimension of `rhs`.
 ///
 /// This is useful for detecting when a resource vector exceeds a limit in any dimension.
 pub fn any_greater(lhs: &Resource, rhs: &Resource) -> bool {
-    lhs.values
-        .iter()
-        .zip(rhs.values.iter())
-        .any(|(a, b)| a > b)
+    lhs.values.iter().zip(rhs.values.iter()).any(|(a, b)| a > b)
 }
 
 /// Subtracts `rhs` from `lhs`, clamping each dimension to a minimum of 0.
@@ -402,7 +396,10 @@ pub fn saturated_multiply_by_double(res: &Resource, m: f64) -> Resource {
         .iter()
         .map(|&v| {
             let result = (v as f64) * m;
-            assert!(result >= 0.0, "saturated_multiply_by_double: negative result");
+            assert!(
+                result >= 0.0,
+                "saturated_multiply_by_double: negative result"
+            );
             if is_representable_as_i64(result) {
                 result as i64
             } else {
@@ -479,7 +476,10 @@ mod tests {
     #[test]
     fn test_resource_type_as_str() {
         assert_eq!(ResourceType::Operations.as_str(), "Operations");
-        assert_eq!(ResourceType::WriteLedgerEntries.as_str(), "WriteLedgerEntries");
+        assert_eq!(
+            ResourceType::WriteLedgerEntries.as_str(),
+            "WriteLedgerEntries"
+        );
     }
 
     #[test]

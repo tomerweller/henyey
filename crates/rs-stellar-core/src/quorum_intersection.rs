@@ -42,8 +42,8 @@ use std::fs;
 use std::path::Path;
 
 use serde::Deserialize;
-use stellar_core_scp::{is_quorum, is_quorum_slice};
 use stellar_core_scp::quorum_config::parse_node_id;
+use stellar_core_scp::{is_quorum, is_quorum_slice};
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
 /// JSON representation of the network configuration for quorum intersection analysis.
@@ -293,6 +293,9 @@ mod tests {
         let path = testdata_path("no-file.json");
         let err = check_quorum_intersection_from_json(&path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("No such file") || msg.contains("read"), "{msg}");
+        assert!(
+            msg.contains("No such file") || msg.contains("read"),
+            "{msg}"
+        );
     }
 }

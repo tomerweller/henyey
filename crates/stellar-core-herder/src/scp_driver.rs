@@ -439,15 +439,12 @@ impl ScpDriver {
 
     /// Find the slot for a given tx set hash in recent externalized values.
     pub fn find_externalized_slot_by_tx_set_hash(&self, hash: &Hash256) -> Option<SlotIndex> {
-        self.externalized
-            .read()
-            .iter()
-            .find_map(|(slot, ext)| {
-                ext.tx_set_hash
-                    .as_ref()
-                    .filter(|tx_hash| *tx_hash == hash)
-                    .map(|_| *slot)
-            })
+        self.externalized.read().iter().find_map(|(slot, ext)| {
+            ext.tx_set_hash
+                .as_ref()
+                .filter(|tx_hash| *tx_hash == hash)
+                .map(|_| *slot)
+        })
     }
 
     /// Validate an SCP value.
@@ -471,10 +468,7 @@ impl ScpDriver {
 
         let close_time = stellar_value.close_time.0;
         if close_time > now + self.config.max_time_drift {
-            debug!(
-                "Close time {} too far in future (now: {})",
-                close_time, now
-            );
+            debug!("Close time {} too far in future (now: {})", close_time, now);
             return ValueValidation::Invalid;
         }
         if let Some(latest) = *self.latest_externalized.read() {
@@ -700,7 +694,11 @@ impl ScpDriver {
     pub fn purge_slots_below(&self, slot: SlotIndex) {
         // Remove externalized slots below the threshold
         let mut externalized = self.externalized.write();
-        let slots_to_remove: Vec<_> = externalized.keys().filter(|&s| *s < slot).cloned().collect();
+        let slots_to_remove: Vec<_> = externalized
+            .keys()
+            .filter(|&s| *s < slot)
+            .cloned()
+            .collect();
         for s in slots_to_remove {
             externalized.remove(&s);
         }
@@ -734,7 +732,8 @@ impl ScpDriver {
             self.quorum_sets_by_hash.insert(hash.0, local.clone());
             self.quorum_sets
                 .insert(*self.config.node_id.as_bytes(), local);
-            self.pending_quorum_sets.remove(&Hash256::from_bytes(hash.0));
+            self.pending_quorum_sets
+                .remove(&Hash256::from_bytes(hash.0));
         }
     }
 
@@ -746,7 +745,8 @@ impl ScpDriver {
         let hash = hash_quorum_set(&quorum_set);
         self.quorum_sets.insert(key, quorum_set.clone());
         self.quorum_sets_by_hash.insert(hash.0, quorum_set);
-        self.pending_quorum_sets.remove(&Hash256::from_bytes(hash.0));
+        self.pending_quorum_sets
+            .remove(&Hash256::from_bytes(hash.0));
     }
 
     /// Get a quorum set for a node.
@@ -874,11 +874,11 @@ mod cache_tests {
         let node_id = PublicKey::from_bytes(&[9u8; 32]).expect("node id");
         let quorum_set = ScpQuorumSet {
             threshold: 1,
-            validators: vec![
-                stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    stellar_xdr::curr::Uint256([1u8; 32]),
+            validators: vec![stellar_xdr::curr::NodeId(
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                    [1u8; 32],
                 )),
-            ]
+            )]
             .try_into()
             .unwrap(),
             inner_sets: Vec::new().try_into().unwrap(),
@@ -891,11 +891,10 @@ mod cache_tests {
         let driver = ScpDriver::new(config, Hash256::hash(b"network"));
 
         // Create a test node_id for the request
-        let sender_node_id = stellar_xdr::curr::NodeId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                [2u8; 32],
-            )),
-        );
+        let sender_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256([2u8; 32]),
+            ));
 
         let known_hash = hash_quorum_set(&quorum_set);
         assert!(!driver.request_quorum_set(known_hash, sender_node_id.clone()));
@@ -946,17 +945,14 @@ impl HerderScpCallback {
     }
 
     fn xdr_bytes<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Vec<u8> {
-        value.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default()
+        value
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default()
     }
 }
 
 impl SCPDriver for HerderScpCallback {
-    fn validate_value(
-        &self,
-        slot_index: u64,
-        value: &Value,
-        _nomination: bool,
-    ) -> ValidationLevel {
+    fn validate_value(&self, slot_index: u64, value: &Value, _nomination: bool) -> ValidationLevel {
         match self.driver.validate_value_impl(slot_index, value) {
             ValueValidation::Valid => ValidationLevel::FullyValidated,
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
@@ -964,11 +960,7 @@ impl SCPDriver for HerderScpCallback {
         }
     }
 
-    fn combine_candidates(
-        &self,
-        slot_index: u64,
-        candidates: &[Value],
-    ) -> Option<Value> {
+    fn combine_candidates(&self, slot_index: u64, candidates: &[Value]) -> Option<Value> {
         let result = self.driver.combine_candidates_impl(slot_index, candidates);
         if result.0.is_empty() {
             None
@@ -977,11 +969,7 @@ impl SCPDriver for HerderScpCallback {
         }
     }
 
-    fn extract_valid_value(
-        &self,
-        slot_index: u64,
-        value: &Value,
-    ) -> Option<Value> {
+    fn extract_valid_value(&self, slot_index: u64, value: &Value) -> Option<Value> {
         if value.0.is_empty() {
             return None;
         }
@@ -1078,7 +1066,8 @@ impl SCPDriver for HerderScpCallback {
 
     fn sign_envelope(&self, envelope: &mut ScpEnvelope) {
         if let Some(sig) = self.driver.sign_envelope(&envelope.statement) {
-            envelope.signature = stellar_xdr::curr::Signature(sig.0.to_vec().try_into().unwrap_or_default());
+            envelope.signature =
+                stellar_xdr::curr::Signature(sig.0.to_vec().try_into().unwrap_or_default());
         }
     }
 
@@ -1194,7 +1183,10 @@ mod tests {
                 .unwrap(),
         );
 
-        assert_eq!(driver.validate_value_impl(1, &value), ValueValidation::Invalid);
+        assert_eq!(
+            driver.validate_value_impl(1, &value),
+            ValueValidation::Invalid
+        );
     }
 
     #[test]
@@ -1225,7 +1217,10 @@ mod tests {
                 .unwrap(),
         );
 
-        assert_eq!(driver.validate_value_impl(1, &value), ValueValidation::Invalid);
+        assert_eq!(
+            driver.validate_value_impl(1, &value),
+            ValueValidation::Invalid
+        );
     }
 
     #[test]
@@ -1266,7 +1261,10 @@ mod tests {
                 .unwrap(),
         );
 
-        assert_eq!(driver.validate_value_impl(2, &value), ValueValidation::Invalid);
+        assert_eq!(
+            driver.validate_value_impl(2, &value),
+            ValueValidation::Invalid
+        );
     }
 
     #[test]
@@ -1308,6 +1306,9 @@ mod tests {
                 .unwrap(),
         );
 
-        assert_eq!(driver.validate_value_impl(1, &value), ValueValidation::Invalid);
+        assert_eq!(
+            driver.validate_value_impl(1, &value),
+            ValueValidation::Invalid
+        );
     }
 }

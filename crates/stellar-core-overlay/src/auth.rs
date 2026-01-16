@@ -42,9 +42,9 @@ use sha2::Sha256;
 use stellar_core_common::Hash256;
 use stellar_core_crypto::PublicKey;
 use stellar_xdr::curr::{
-    self as xdr, AuthCert as XdrAuthCert, AuthenticatedMessage, AuthenticatedMessageV0, Curve25519Public,
-    EnvelopeType, Hello, HmacSha256Key, HmacSha256Mac, StellarMessage,
-    Uint256, WriteXdr,
+    self as xdr, AuthCert as XdrAuthCert, AuthenticatedMessage, AuthenticatedMessageV0,
+    Curve25519Public, EnvelopeType, Hello, HmacSha256Key, HmacSha256Mac, StellarMessage, Uint256,
+    WriteXdr,
 };
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret};
 
@@ -346,7 +346,12 @@ impl AuthContext {
             overlay_version: self.local_node.overlay_version,
             overlay_min_version: self.local_node.overlay_min_version,
             network_id: self.local_node.network_id.into(),
-            version_str: self.local_node.version_string.clone().try_into().unwrap_or_default(),
+            version_str: self
+                .local_node
+                .version_string
+                .clone()
+                .try_into()
+                .unwrap_or_default(),
             listening_port: self.local_node.listening_port as i32,
             peer_id: xdr::NodeId(public_key),
             cert: self.our_auth_cert.as_ref().unwrap().to_xdr(),
@@ -389,8 +394,9 @@ impl AuthContext {
         let peer_pk_bytes = match &hello.peer_id.0 {
             xdr::PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => *bytes,
         };
-        let peer_public_key = PublicKey::from_bytes(&peer_pk_bytes)
-            .map_err(|e| OverlayError::AuthenticationFailed(format!("invalid peer public key: {}", e)))?;
+        let peer_public_key = PublicKey::from_bytes(&peer_pk_bytes).map_err(|e| {
+            OverlayError::AuthenticationFailed(format!("invalid peer public key: {}", e))
+        })?;
 
         // Verify auth cert
         let peer_auth_cert = AuthCert::from_xdr(&hello.cert);
@@ -400,8 +406,9 @@ impl AuthContext {
         self.peer_nonce = Some(hello.nonce.0);
 
         // Perform X25519 key exchange
-        let our_secret = self.our_ephemeral_secret.take()
-            .ok_or_else(|| OverlayError::AuthenticationFailed("ephemeral secret already used".to_string()))?;
+        let our_secret = self.our_ephemeral_secret.take().ok_or_else(|| {
+            OverlayError::AuthenticationFailed("ephemeral secret already used".to_string())
+        })?;
         let peer_ephemeral_public = X25519PublicKey::from(peer_auth_cert.pubkey);
         let shared_secret = our_secret.diffie_hellman(&peer_ephemeral_public);
 
@@ -438,9 +445,12 @@ impl AuthContext {
         shared_secret: &SharedSecret,
         peer_auth_cert: &AuthCert,
     ) -> Result<(HmacSha256Key, HmacSha256Key)> {
-        let our_public = self.our_ephemeral_public.as_ref()
-            .ok_or_else(|| OverlayError::AuthenticationFailed("ephemeral public key missing".to_string()))?;
-        let peer_nonce = self.peer_nonce.as_ref()
+        let our_public = self.our_ephemeral_public.as_ref().ok_or_else(|| {
+            OverlayError::AuthenticationFailed("ephemeral public key missing".to_string())
+        })?;
+        let peer_nonce = self
+            .peer_nonce
+            .as_ref()
             .ok_or_else(|| OverlayError::AuthenticationFailed("peer nonce missing".to_string()))?;
 
         // Step 1: HKDF-Extract to create shared key K
@@ -552,8 +562,9 @@ impl AuthContext {
     ///
     /// Returns an error if the send MAC key is not established.
     pub fn wrap_message(&mut self, message: StellarMessage) -> Result<AuthenticatedMessage> {
-        let send_key = self.send_mac_key.as_ref()
-            .ok_or_else(|| OverlayError::AuthenticationFailed("send key not established".to_string()))?;
+        let send_key = self.send_mac_key.as_ref().ok_or_else(|| {
+            OverlayError::AuthenticationFailed("send key not established".to_string())
+        })?;
 
         let sequence = self.send_sequence;
         self.send_sequence += 1;
@@ -630,8 +641,9 @@ impl AuthContext {
                     self.recv_sequence += 1;
 
                     // Verify MAC
-                    let recv_key = self.recv_mac_key.as_ref()
-                        .ok_or_else(|| OverlayError::AuthenticationFailed("recv key not established".to_string()))?;
+                    let recv_key = self.recv_mac_key.as_ref().ok_or_else(|| {
+                        OverlayError::AuthenticationFailed("recv key not established".to_string())
+                    })?;
 
                     let expected_mac = self.compute_mac(recv_key, v0.sequence, &v0.message)?;
                     tracing::debug!(
@@ -694,8 +706,9 @@ impl AuthContext {
     /// a valid MAC to prove we derived the correct keys. This proves to the peer
     /// that we successfully completed the key exchange.
     pub fn wrap_auth_message(&self, message: StellarMessage) -> Result<AuthenticatedMessage> {
-        let send_key = self.send_mac_key.as_ref()
-            .ok_or_else(|| OverlayError::AuthenticationFailed("send key not established".to_string()))?;
+        let send_key = self.send_mac_key.as_ref().ok_or_else(|| {
+            OverlayError::AuthenticationFailed("send key not established".to_string())
+        })?;
 
         // Auth message uses sequence 0
         let sequence = 0u64;

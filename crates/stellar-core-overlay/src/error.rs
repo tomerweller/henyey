@@ -18,7 +18,6 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum OverlayError {
     // ===== Connection Errors =====
-
     /// TCP connection could not be established.
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
@@ -32,7 +31,6 @@ pub enum OverlayError {
     PeerDisconnected(String),
 
     // ===== Authentication Errors =====
-
     /// Authentication handshake failed (invalid cert, bad signature, etc.).
     #[error("authentication failed: {0}")]
     AuthenticationFailed(String),
@@ -48,7 +46,6 @@ pub enum OverlayError {
     MacVerificationFailed,
 
     // ===== Protocol Errors =====
-
     /// Message encoding or decoding failed.
     #[error("message error: {0}")]
     Message(String),
@@ -66,7 +63,6 @@ pub enum OverlayError {
     NetworkMismatch,
 
     // ===== Peer Management Errors =====
-
     /// Cannot accept more connections (limit reached).
     #[error("peer limit reached")]
     PeerLimitReached,
@@ -84,7 +80,6 @@ pub enum OverlayError {
     AlreadyConnected,
 
     // ===== State Errors =====
-
     /// Operation requires the overlay to be running.
     #[error("overlay not started")]
     NotStarted,
@@ -98,19 +93,16 @@ pub enum OverlayError {
     ShuttingDown,
 
     // ===== Address Errors =====
-
     /// Invalid peer address format.
     #[error("invalid peer address: {0}")]
     InvalidPeerAddress(String),
 
     // ===== Database Errors =====
-
     /// Database operation failed.
     #[error("database error: {0}")]
     DatabaseError(String),
 
     // ===== Wrapped Errors =====
-
     /// XDR serialization/deserialization error.
     #[error("XDR error: {0}")]
     Xdr(#[from] stellar_xdr::curr::Error),
@@ -124,7 +116,6 @@ pub enum OverlayError {
     Io(#[from] std::io::Error),
 
     // ===== Internal Errors =====
-
     /// Internal channel send failed (receiver dropped).
     #[error("channel send error")]
     ChannelSend,

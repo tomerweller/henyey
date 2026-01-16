@@ -75,7 +75,10 @@ async fn test_overlay_scp_message_roundtrip() {
 
     let mut rx_b = manager_b.subscribe();
     let message = StellarMessage::ScpMessage(make_test_envelope(1));
-    manager_a.broadcast(message.clone()).await.expect("broadcast");
+    manager_a
+        .broadcast(message.clone())
+        .await
+        .expect("broadcast");
 
     let received = timeout(Duration::from_secs(5), async {
         loop {

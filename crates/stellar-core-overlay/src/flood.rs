@@ -203,11 +203,7 @@ impl FloodGate {
     ///
     /// Excludes any peers that have already sent us this message (tracked
     /// via [`record_seen`](FloodGate::record_seen)).
-    pub fn get_forward_peers(
-        &self,
-        message_hash: &Hash256,
-        all_peers: &[PeerId],
-    ) -> Vec<PeerId> {
+    pub fn get_forward_peers(&self, message_hash: &Hash256, all_peers: &[PeerId]) -> Vec<PeerId> {
         let exclude: HashSet<PeerId> = self
             .seen
             .get(message_hash)

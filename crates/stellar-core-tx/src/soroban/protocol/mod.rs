@@ -13,12 +13,14 @@ mod types;
 
 pub use types::*;
 
-use stellar_core_common::{protocol_version_is_before, ProtocolVersion};
 use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use stellar_xdr::curr::{AccountId, HostFunction, SorobanAuthorizationEntry, SorobanTransactionData};
 use soroban_env_host_p25::HostError as HostErrorP25;
+use stellar_core_common::{protocol_version_is_before, ProtocolVersion};
+use stellar_xdr::curr::{
+    AccountId, HostFunction, SorobanAuthorizationEntry, SorobanTransactionData,
+};
 
 /// Execute a host function using the appropriate protocol-versioned host.
 ///

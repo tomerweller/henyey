@@ -52,10 +52,10 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
+use stellar_core_common::NUM_CLASSIC_TX_RESOURCES;
 use stellar_core_common::{
     any_greater, subtract_non_negative, Resource, NUM_CLASSIC_TX_BYTES_RESOURCES,
 };
-use stellar_core_common::NUM_CLASSIC_TX_RESOURCES;
 use stellar_core_tx::TransactionFrame;
 
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
@@ -240,7 +240,12 @@ impl PartialOrd for QueueEntry {
 
 impl Ord for QueueEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        let ord = fee_rate_cmp(self.total_fee, self.op_count, other.total_fee, other.op_count);
+        let ord = fee_rate_cmp(
+            self.total_fee,
+            self.op_count,
+            other.total_fee,
+            other.op_count,
+        );
         if ord != Ordering::Equal {
             return ord;
         }
@@ -293,10 +298,7 @@ pub(crate) struct SurgePricingPriorityQueue {
 }
 
 impl SurgePricingPriorityQueue {
-    pub(crate) fn new(
-        lane_config: Box<dyn SurgePricingLaneConfig>,
-        seed: u64,
-    ) -> Self {
+    pub(crate) fn new(lane_config: Box<dyn SurgePricingLaneConfig>, seed: u64) -> Self {
         let lane_limits = lane_config.lane_limits().to_vec();
         let resource_len = lane_limits
             .get(0)
@@ -325,9 +327,10 @@ impl SurgePricingPriorityQueue {
     }
 
     pub(crate) fn total_resources(&self) -> Resource {
-        self.lane_current_count
-            .iter()
-            .fold(Resource::make_empty(self.lane_limits[0].size()), |acc, r| acc + r.clone())
+        self.lane_current_count.iter().fold(
+            Resource::make_empty(self.lane_limits[0].size()),
+            |acc, r| acc + r.clone(),
+        )
     }
 
     pub(crate) fn lane_resources(&self, lane: usize) -> Resource {
@@ -341,10 +344,8 @@ impl SurgePricingPriorityQueue {
         network_id: &stellar_core_common::NetworkId,
         ledger_version: u32,
     ) -> Vec<Resource> {
-        let mut lane_resources = vec![
-            Resource::make_empty(self.lane_limits[0].size());
-            self.lane_limits.len()
-        ];
+        let mut lane_resources =
+            vec![Resource::make_empty(self.lane_limits[0].size()); self.lane_limits.len()];
         for tx in txs {
             let frame = TransactionFrame::with_network(tx.envelope.clone(), *network_id);
             let lane = self.lane_config.get_lane(&frame);
@@ -372,15 +373,17 @@ impl SurgePricingPriorityQueue {
         }
     }
 
-    pub(crate) fn tx_resources(
-        &self,
-        frame: &TransactionFrame,
-        ledger_version: u32,
-    ) -> Resource {
+    pub(crate) fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
         self.lane_config.tx_resources(frame, ledger_version)
     }
 
-    fn erase(&mut self, lane: usize, entry: &QueueEntry, ledger_version: u32, network_id: &stellar_core_common::NetworkId) {
+    fn erase(
+        &mut self,
+        lane: usize,
+        entry: &QueueEntry,
+        ledger_version: u32,
+        network_id: &stellar_core_common::NetworkId,
+    ) {
         if self.lanes[lane].remove(entry) {
             let frame = TransactionFrame::with_network(entry.tx.envelope.clone(), *network_id);
             let resources = self.lane_config.tx_resources(&frame, ledger_version);
@@ -573,8 +576,7 @@ impl SurgePricingPriorityQueue {
             return Some(Vec::new());
         }
 
-        let mut needed_total =
-            subtract_non_negative(&new_total, &self.lane_limits[GENERIC_LANE]);
+        let mut needed_total = subtract_non_negative(&new_total, &self.lane_limits[GENERIC_LANE]);
         let mut needed_lane = subtract_non_negative(&new_lane, &self.lane_limits[lane]);
 
         #[derive(Clone)]
@@ -654,12 +656,8 @@ impl SurgePricingPriorityQueue {
                 break (evict_lane, entry);
             };
 
-            if fee_rate_cmp(
-                entry.total_fee,
-                entry.op_count,
-                tx.total_fee,
-                tx.op_count,
-            ) != Ordering::Less
+            if fee_rate_cmp(entry.total_fee, entry.op_count, tx.total_fee, tx.op_count)
+                != Ordering::Less
             {
                 return None;
             }

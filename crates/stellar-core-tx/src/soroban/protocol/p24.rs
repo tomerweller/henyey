@@ -8,27 +8,25 @@ use std::rc::Rc;
 
 use sha2::{Digest, Sha256};
 
-use soroban_env_host_p24::{
-    budget::Budget,
-    e2e_invoke,
-    storage::SnapshotSource,
-    xdr::DiagnosticEvent as DiagnosticEventP24,
-    HostError as HostErrorP24, LedgerInfo as LedgerInfoP24,
-};
 use soroban_env_host_p24::xdr::{ReadXdr as ReadXdrP24, WriteXdr as WriteXdrP24};
+use soroban_env_host_p24::{
+    budget::Budget, e2e_invoke, storage::SnapshotSource,
+    xdr::DiagnosticEvent as DiagnosticEventP24, HostError as HostErrorP24,
+    LedgerInfo as LedgerInfoP24,
+};
 use soroban_env_host_p25::HostError as HostErrorP25;
 
 use stellar_xdr::curr::{
     AccountId, ContractEvent, ContractEventType, Hash, HostFunction, LedgerEntry, LedgerEntryData,
-    LedgerEntryExt, LedgerKey, Limits, ReadXdr, ScVal,
-    SorobanAuthorizationEntry, SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
+    LedgerEntryExt, LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry,
+    SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
 };
 
+use super::{EncodedContractEvent, InvokeHostFunctionOutput, LedgerEntryChange, TtlChange};
+use crate::soroban::error::convert_host_error_p24_to_p25;
 use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use super::{InvokeHostFunctionOutput, LedgerEntryChange, TtlChange, EncodedContractEvent};
-use crate::soroban::error::convert_host_error_p24_to_p25;
 
 // Type alias for entry with TTL from the snapshot source
 type EntryWithLiveUntil = (Rc<soroban_env_host_p24::xdr::LedgerEntry>, Option<u32>);
@@ -69,23 +67,22 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 
         let entry = match &current_key {
             LedgerKey::Account(account_key) => {
-                self.state.get_account(&account_key.account_id).map(|acc| {
-                    LedgerEntry {
+                self.state
+                    .get_account(&account_key.account_id)
+                    .map(|acc| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::Account(acc.clone()),
                         ext: LedgerEntryExt::V0,
-                    }
-                })
-            }
-            LedgerKey::Trustline(tl_key) => {
-                self.state
-                    .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                    .map(|tl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Trustline(tl.clone()),
-                        ext: LedgerEntryExt::V0,
                     })
             }
+            LedgerKey::Trustline(tl_key) => self
+                .state
+                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
+                .map(|tl| LedgerEntry {
+                    last_modified_ledger_seq: self.current_ledger,
+                    data: LedgerEntryData::Trustline(tl.clone()),
+                    ext: LedgerEntryExt::V0,
+                }),
             LedgerKey::ContractData(cd_key) => {
                 // Check if entry has expired TTL - if so, it's archived and not accessible
                 if let Some(ttl) = live_until {
@@ -110,22 +107,22 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                         return Ok(None);
                     }
                 }
-                self.state.get_contract_code(&cc_key.hash).map(|code| {
-                    LedgerEntry {
+                self.state
+                    .get_contract_code(&cc_key.hash)
+                    .map(|code| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::ContractCode(code.clone()),
                         ext: LedgerEntryExt::V0,
-                    }
-                })
+                    })
             }
             LedgerKey::Ttl(ttl_key) => {
-                self.state.get_ttl(&ttl_key.key_hash).map(|ttl| {
-                    LedgerEntry {
+                self.state
+                    .get_ttl(&ttl_key.key_hash)
+                    .map(|ttl| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::Ttl(ttl.clone()),
                         ext: LedgerEntryExt::V0,
-                    }
-                })
+                    })
             }
             _ => None,
         };
@@ -150,19 +147,29 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             let key_hash = compute_key_hash(key);
-            let ttl = state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq);
+            let ttl = state
+                .get_ttl(&key_hash)
+                .map(|ttl| ttl.live_until_ledger_seq);
             if let Some(live_until) = ttl {
                 if live_until < current_ledger {
                     tracing::warn!(
                         current_ledger,
                         live_until,
-                        key_type = if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                        key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                            "ContractCode"
+                        } else {
+                            "ContractData"
+                        },
                         "Soroban entry TTL is EXPIRED"
                     );
                 }
             } else {
                 tracing::warn!(
-                    key_type = if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                    key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                        "ContractCode"
+                    } else {
+                        "ContractData"
+                    },
                     "Soroban entry has NO TTL record"
                 );
             }
@@ -181,9 +188,7 @@ fn compute_key_hash(key: &LedgerKey) -> Hash {
     Hash(hasher.finalize().into())
 }
 
-fn convert_ledger_key_to_p24(
-    key: &LedgerKey,
-) -> Option<soroban_env_host_p24::xdr::LedgerKey> {
+fn convert_ledger_key_to_p24(key: &LedgerKey) -> Option<soroban_env_host_p24::xdr::LedgerKey> {
     let bytes = key.to_xdr(Limits::none()).ok()?;
     soroban_env_host_p24::xdr::LedgerKey::from_xdr(
         &bytes,
@@ -192,14 +197,10 @@ fn convert_ledger_key_to_p24(
     .ok()
 }
 
-fn convert_ledger_key_from_p24(
-    key: &soroban_env_host_p24::xdr::LedgerKey,
-) -> Option<LedgerKey> {
-    let bytes = soroban_env_host_p24::xdr::WriteXdr::to_xdr(
-        key,
-        soroban_env_host_p24::xdr::Limits::none(),
-    )
-    .ok()?;
+fn convert_ledger_key_from_p24(key: &soroban_env_host_p24::xdr::LedgerKey) -> Option<LedgerKey> {
+    let bytes =
+        soroban_env_host_p24::xdr::WriteXdr::to_xdr(key, soroban_env_host_p24::xdr::Limits::none())
+            .ok()?;
     LedgerKey::from_xdr(&bytes, Limits::none()).ok()
 }
 
@@ -262,9 +263,7 @@ pub fn invoke_host_function(
         )
         .map_err(convert_host_error_p24_to_p25)?
     } else {
-        tracing::warn!(
-            "Using default Soroban budget - cost parameters not loaded from network."
-        );
+        tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
         Budget::default()
     };
 
@@ -273,7 +272,7 @@ pub fn invoke_host_function(
         protocol_version: context.protocol_version,
         sequence_number: context.sequence,
         timestamp: context.close_time,
-        network_id: context.network_id.0.0,
+        network_id: context.network_id.0 .0,
         base_reserve: context.base_reserve,
         min_temp_entry_ttl: soroban_config.min_temp_entry_ttl,
         min_persistent_entry_ttl: soroban_config.min_persistent_entry_ttl,
@@ -294,35 +293,28 @@ pub fn invoke_host_function(
     let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed.to_vec()
     } else {
-        tracing::warn!(
-            "P24: Using fallback PRNG seed - results may differ from C++ stellar-core"
-        );
+        tracing::warn!("P24: Using fallback PRNG seed - results may differ from C++ stellar-core");
         let mut hasher = Sha256::new();
-        hasher.update(&context.network_id.0.0);
+        hasher.update(&context.network_id.0 .0);
         hasher.update(&context.sequence.to_le_bytes());
         hasher.update(&context.close_time.to_le_bytes());
         hasher.finalize().to_vec()
     };
 
     // Encode all data to XDR bytes for e2e_invoke
-    let encoded_host_fn = host_function
-        .to_xdr(Limits::none())
-        .map_err(|_| {
-            HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
-                soroban_env_host_p25::xdr::ScErrorType::Context,
-                soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-            ))
-        })?;
+    let encoded_host_fn = host_function.to_xdr(Limits::none()).map_err(|_| {
+        HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
+            soroban_env_host_p25::xdr::ScErrorType::Context,
+            soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+        ))
+    })?;
 
-    let encoded_resources = soroban_data
-        .resources
-        .to_xdr(Limits::none())
-        .map_err(|_| {
-            HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
-                soroban_env_host_p25::xdr::ScErrorType::Context,
-                soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-            ))
-        })?;
+    let encoded_resources = soroban_data.resources.to_xdr(Limits::none()).map_err(|_| {
+        HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
+            soroban_env_host_p25::xdr::ScErrorType::Context,
+            soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+        ))
+    })?;
 
     let encoded_source = source.to_xdr(Limits::none()).map_err(|_| {
         HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
@@ -350,11 +342,10 @@ pub fn invoke_host_function(
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
 
-    let mut add_entry =
-        |key: &LedgerKey,
-         entry: &soroban_env_host_p24::xdr::LedgerEntry,
-         live_until: Option<u32>|
-         -> Result<(), HostErrorP25> {
+    let mut add_entry = |key: &LedgerKey,
+                         entry: &soroban_env_host_p24::xdr::LedgerEntry,
+                         live_until: Option<u32>|
+     -> Result<(), HostErrorP25> {
         encoded_ledger_entries.push(
             entry
                 .to_xdr(soroban_env_host_p24::xdr::Limits::none())
@@ -374,10 +365,12 @@ pub fn invoke_host_function(
             };
             ttl_entry
                 .to_xdr(soroban_env_host_p24::xdr::Limits::none())
-                .map_err(|_| HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
-                    soroban_env_host_p25::xdr::ScErrorType::Context,
-                    soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-                )))?
+                .map_err(|_| {
+                    HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
+                        soroban_env_host_p25::xdr::ScErrorType::Context,
+                        soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                    ))
+                })?
         } else {
             Vec::new()
         };
@@ -392,8 +385,9 @@ pub fn invoke_host_function(
                 soroban_env_host_p25::xdr::ScErrorCode::InternalError,
             ))
         })?;
-        if let Some((entry, live_until)) =
-            snapshot.get(&Rc::new(key_p24)).map_err(convert_host_error_p24_to_p25)?
+        if let Some((entry, live_until)) = snapshot
+            .get(&Rc::new(key_p24))
+            .map_err(convert_host_error_p24_to_p25)?
         {
             add_entry(key, &entry, live_until)?;
         }
@@ -406,8 +400,9 @@ pub fn invoke_host_function(
                 soroban_env_host_p25::xdr::ScErrorCode::InternalError,
             ))
         })?;
-        if let Some((entry, live_until)) =
-            snapshot.get(&Rc::new(key_p24)).map_err(convert_host_error_p24_to_p25)?
+        if let Some((entry, live_until)) = snapshot
+            .get(&Rc::new(key_p24))
+            .map_err(convert_host_error_p24_to_p25)?
         {
             add_entry(key, &entry, live_until)?;
         }
@@ -452,9 +447,7 @@ pub fn invoke_host_function(
 
     // Parse the return value
     let return_value = match result.encoded_invoke_result {
-        Ok(ref bytes) => {
-            ScVal::from_xdr(bytes, Limits::none()).unwrap_or(ScVal::Void)
-        }
+        Ok(ref bytes) => ScVal::from_xdr(bytes, Limits::none()).unwrap_or(ScVal::Void),
         Err(ref e) => {
             return Err(convert_host_error_p24_to_p25(e.clone()));
         }
@@ -465,14 +458,18 @@ pub fn invoke_host_function(
     // - Had their content modified (encoded_new_value.is_some())
     // - Are involved in rent calculations (old_entry_size_bytes_for_rent > 0)
     // - Had their TTL extended (ttl_change.is_some())
-    let ledger_changes = result.ledger_changes
+    let ledger_changes = result
+        .ledger_changes
         .into_iter()
         .filter_map(|change| {
-            if change.encoded_new_value.is_some() || change.old_entry_size_bytes_for_rent > 0 || change.ttl_change.is_some() {
+            if change.encoded_new_value.is_some()
+                || change.old_entry_size_bytes_for_rent > 0
+                || change.ttl_change.is_some()
+            {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
-                let new_entry = change.encoded_new_value.and_then(|bytes| {
-                    LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
-                });
+                let new_entry = change
+                    .encoded_new_value
+                    .and_then(|bytes| LedgerEntry::from_xdr(&bytes, Limits::none()).ok());
                 let ttl_change = change.ttl_change.map(|ttl| TtlChange {
                     new_live_until_ledger: ttl.new_live_until_ledger,
                 });
@@ -503,7 +500,10 @@ pub fn invoke_host_function(
         // Decode and filter for hash computation
         if let Ok(event) = ContractEvent::from_xdr(&encoded_event, Limits::none()) {
             // Only include Contract and System events (not Diagnostic)
-            if matches!(event.type_, ContractEventType::Contract | ContractEventType::System) {
+            if matches!(
+                event.type_,
+                ContractEventType::Contract | ContractEventType::System
+            ) {
                 contract_events.push(event);
             }
         }

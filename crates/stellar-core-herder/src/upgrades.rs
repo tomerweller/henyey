@@ -364,9 +364,10 @@ impl Upgrades {
         }
 
         // Only propose Soroban upgrades if we have Soroban enabled (protocol 20+)
-        if let (Some(target_size), Some(current_size)) =
-            (self.params.max_soroban_tx_set_size, current_max_soroban_tx_set_size)
-        {
+        if let (Some(target_size), Some(current_size)) = (
+            self.params.max_soroban_tx_set_size,
+            current_max_soroban_tx_set_size,
+        ) {
             if current_size != target_size {
                 result.push(LedgerUpgrade::MaxSorobanTxSetSize(target_size));
             }
@@ -416,7 +417,9 @@ impl Upgrades {
 
         // Remove individual applied upgrades
         for upgrade_bytes in applied_upgrades {
-            let Ok(upgrade) = LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::curr::Limits::none()) else {
+            let Ok(upgrade) =
+                LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::curr::Limits::none())
+            else {
                 continue;
             };
 
@@ -492,7 +495,8 @@ pub fn is_valid_for_apply(
     current_version: u32,
     max_protocol_version: u32,
 ) -> (UpgradeValidity, Option<LedgerUpgrade>) {
-    let upgrade = match LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::curr::Limits::none()) {
+    let upgrade = match LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::curr::Limits::none())
+    {
         Ok(u) => u,
         Err(_) => return (UpgradeValidity::XdrInvalid, None),
     };
@@ -650,7 +654,13 @@ mod tests {
         use stellar_xdr::curr::WriteXdr;
 
         let upgrade = LedgerUpgrade::Version(24);
-        let bytes = UpgradeType(upgrade.to_xdr(stellar_xdr::curr::Limits::none()).unwrap().try_into().unwrap());
+        let bytes = UpgradeType(
+            upgrade
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
 
         // Valid: upgrading from 23 to 24, max supported is 25
         let (validity, _) = is_valid_for_apply(&bytes, 23, 25);
@@ -671,13 +681,25 @@ mod tests {
 
         // Valid fee
         let upgrade = LedgerUpgrade::BaseFee(100);
-        let bytes = UpgradeType(upgrade.to_xdr(stellar_xdr::curr::Limits::none()).unwrap().try_into().unwrap());
+        let bytes = UpgradeType(
+            upgrade
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         let (validity, _) = is_valid_for_apply(&bytes, 23, 25);
         assert_eq!(validity, UpgradeValidity::Valid);
 
         // Invalid: zero fee
         let upgrade = LedgerUpgrade::BaseFee(0);
-        let bytes = UpgradeType(upgrade.to_xdr(stellar_xdr::curr::Limits::none()).unwrap().try_into().unwrap());
+        let bytes = UpgradeType(
+            upgrade
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         let (validity, _) = is_valid_for_apply(&bytes, 23, 25);
         assert_eq!(validity, UpgradeValidity::Invalid);
     }
@@ -688,7 +710,13 @@ mod tests {
 
         // Valid flags on protocol 18+
         let upgrade = LedgerUpgrade::Flags(0x3);
-        let bytes = UpgradeType(upgrade.to_xdr(stellar_xdr::curr::Limits::none()).unwrap().try_into().unwrap());
+        let bytes = UpgradeType(
+            upgrade
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         let (validity, _) = is_valid_for_apply(&bytes, 18, 25);
         assert_eq!(validity, UpgradeValidity::Valid);
 
@@ -698,7 +726,13 @@ mod tests {
 
         // Invalid: flags out of range
         let upgrade = LedgerUpgrade::Flags(0x100);
-        let bytes = UpgradeType(upgrade.to_xdr(stellar_xdr::curr::Limits::none()).unwrap().try_into().unwrap());
+        let bytes = UpgradeType(
+            upgrade
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         let (validity, _) = is_valid_for_apply(&bytes, 18, 25);
         assert_eq!(validity, UpgradeValidity::Invalid);
     }
@@ -708,7 +742,13 @@ mod tests {
         use stellar_xdr::curr::WriteXdr;
 
         let upgrade = LedgerUpgrade::MaxSorobanTxSetSize(100);
-        let bytes = UpgradeType(upgrade.to_xdr(stellar_xdr::curr::Limits::none()).unwrap().try_into().unwrap());
+        let bytes = UpgradeType(
+            upgrade
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
 
         // Valid on protocol 20+
         let (validity, _) = is_valid_for_apply(&bytes, 20, 25);
@@ -780,7 +820,13 @@ mod tests {
         use stellar_xdr::curr::WriteXdr;
 
         let upgrade = LedgerUpgrade::Version(24);
-        let bytes = UpgradeType(upgrade.to_xdr(stellar_xdr::curr::Limits::none()).unwrap().try_into().unwrap());
+        let bytes = UpgradeType(
+            upgrade
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
 
         let parsed = parse_upgrade(&bytes);
         assert!(matches!(parsed, Some(LedgerUpgrade::Version(24))));

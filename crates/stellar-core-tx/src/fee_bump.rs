@@ -60,10 +60,7 @@ pub enum FeeBumpError {
     /// Not a fee bump transaction.
     NotFeeBump,
     /// Outer fee is less than inner fee.
-    InsufficientOuterFee {
-        outer_fee: i64,
-        required_min: i64,
-    },
+    InsufficientOuterFee { outer_fee: i64, required_min: i64 },
     /// Inner transaction has too many operations.
     TooManyOperations(usize),
     /// Inner transaction is not V1.
@@ -152,10 +149,8 @@ impl FeeBumpFrame {
             },
             _ => unreachable!("FeeBumpFrame always contains a fee bump transaction"),
         };
-        let inner_frame = TransactionFrame::with_network(
-            TransactionEnvelope::Tx(inner_envelope),
-            *network_id,
-        );
+        let inner_frame =
+            TransactionFrame::with_network(TransactionEnvelope::Tx(inner_envelope), *network_id);
 
         Ok(Self {
             frame: TransactionFrame::with_network(envelope, *network_id),
@@ -182,10 +177,8 @@ impl FeeBumpFrame {
             },
             _ => unreachable!("FeeBumpFrame always contains a fee bump transaction"),
         };
-        let inner_frame = TransactionFrame::with_network(
-            TransactionEnvelope::Tx(inner_envelope),
-            *network_id,
-        );
+        let inner_frame =
+            TransactionFrame::with_network(TransactionEnvelope::Tx(inner_envelope), *network_id);
 
         Ok(Self {
             frame,
@@ -523,9 +516,11 @@ impl FeeBumpMutableTransactionResult {
             inner_fee_charged,
             inner_success: true,
             inner_op_results: vec![
-                OperationResult::OpInner(stellar_xdr::curr::OperationResultTr::Payment(
-                    stellar_xdr::curr::PaymentResult::Success,
-                ));
+                OperationResult::OpInner(
+                    stellar_xdr::curr::OperationResultTr::Payment(
+                        stellar_xdr::curr::PaymentResult::Success,
+                    )
+                );
                 op_count
             ],
             inner_result_code: None,
@@ -696,10 +691,7 @@ impl FeeBumpMutableTransactionResult {
 /// - Protocol >= 25: Inner fee is 0, outer pays everything
 ///
 /// This matches C++ `FeeBumpTransactionFrame::getInnerFullFee`.
-pub fn calculate_inner_fee_charged(
-    inner_declared_fee: u32,
-    protocol_version: u32,
-) -> i64 {
+pub fn calculate_inner_fee_charged(inner_declared_fee: u32, protocol_version: u32) -> i64 {
     if protocol_version >= 25 {
         // In protocol 25+, inner fee is always 0
         0
@@ -717,10 +709,7 @@ pub fn wrap_inner_result_in_fee_bump(
     inner_result: &TransactionResult,
     outer_fee_charged: i64,
 ) -> TransactionResult {
-    let inner_success = matches!(
-        inner_result.result,
-        TransactionResultResult::TxSuccess(_)
-    );
+    let inner_success = matches!(inner_result.result, TransactionResultResult::TxSuccess(_));
 
     let inner_result_result = match &inner_result.result {
         TransactionResultResult::TxSuccess(ops) => {
@@ -1176,6 +1165,9 @@ mod tests {
             result.refundable_fee_tracker().unwrap().consumed_rent_fee(),
             0
         );
-        assert_eq!(result.refundable_fee_tracker().unwrap().get_fee_refund(), 400);
+        assert_eq!(
+            result.refundable_fee_tracker().unwrap().get_fee_refund(),
+            400
+        );
     }
 }

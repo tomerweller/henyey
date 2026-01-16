@@ -135,17 +135,15 @@ pub use events::{
 };
 
 // Re-export lumen reconciler types
-pub use lumen_reconciler::{
-    reconcile_events, LumenEventReconciler, ReconcilerConfig,
-};
+pub use lumen_reconciler::{reconcile_events, LumenEventReconciler, ReconcilerConfig};
 
 // Re-export frame types
 pub use frame::{muxed_to_account_id, muxed_to_ed25519, TransactionFrame};
 
 // Re-export apply types and functions
 pub use apply::{
-    apply_fee_only, apply_from_history, apply_transaction_set_from_history,
-    account_id_to_key, entry_to_key, ApplyContext, AssetKey, ChangeRef, LedgerDelta,
+    account_id_to_key, apply_fee_only, apply_from_history, apply_transaction_set_from_history,
+    entry_to_key, ApplyContext, AssetKey, ChangeRef, LedgerDelta,
 };
 
 // Re-export result types
@@ -350,10 +348,7 @@ impl TransactionValidator {
     }
 
     /// Check if all required signatures are present.
-    pub fn check_signatures(
-        &self,
-        tx: &stellar_xdr::curr::TransactionEnvelope,
-    ) -> bool {
+    pub fn check_signatures(&self, tx: &stellar_xdr::curr::TransactionEnvelope) -> bool {
         let frame = TransactionFrame::new(tx.clone());
         validate_signatures(&frame, &self.context).is_ok()
     }
@@ -396,7 +391,9 @@ impl TransactionExecutor {
     ) -> Result<TxApplyResult> {
         // Full execution requires a state reader - use execute_with_state for live execution
         // or apply_from_history for catchup mode
-        Err(TxError::OperationFailed("use execute_with_state or apply_from_history".into()))
+        Err(TxError::OperationFailed(
+            "use execute_with_state or apply_from_history".into(),
+        ))
     }
 
     /// Apply a transaction from history (for catchup).
@@ -489,8 +486,8 @@ pub enum OperationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    use crate::operations::OperationType; // Re-import to shadow XDR's OperationType
+    use crate::operations::OperationType;
+    use stellar_xdr::curr::*; // Re-import to shadow XDR's OperationType
 
     fn create_test_envelope() -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));

@@ -95,10 +95,7 @@ impl SlotQuorumTracker {
 
     /// Record that we've heard from a node for a slot.
     pub fn record_envelope(&mut self, slot: SlotIndex, node_id: NodeId) {
-        self.slot_nodes
-            .entry(slot)
-            .or_default()
-            .insert(node_id);
+        self.slot_nodes.entry(slot).or_default().insert(node_id);
         self.prune();
     }
 
@@ -246,11 +243,14 @@ impl QuorumTracker {
                 return;
             }
             let existed = self.quorum.contains_key(qnode);
-            let qnode_info = self.quorum.entry(qnode.clone()).or_insert_with(|| NodeInfo {
-                quorum_set: None,
-                distance: new_dist,
-                closest_validators: BTreeSet::new(),
-            });
+            let qnode_info = self
+                .quorum
+                .entry(qnode.clone())
+                .or_insert_with(|| NodeInfo {
+                    quorum_set: None,
+                    distance: new_dist,
+                    closest_validators: BTreeSet::new(),
+                });
 
             if existed {
                 if qnode_info.distance < new_dist {
@@ -327,7 +327,9 @@ impl QuorumTracker {
 
     /// Return the closest validators in the local quorum set for a node.
     pub fn find_closest_validators(&self, node_id: &NodeId) -> Option<&BTreeSet<NodeId>> {
-        self.quorum.get(node_id).map(|info| &info.closest_validators)
+        self.quorum
+            .get(node_id)
+            .map(|info| &info.closest_validators)
     }
 }
 

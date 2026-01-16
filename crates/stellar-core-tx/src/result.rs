@@ -180,7 +180,9 @@ impl TxResultWrapper {
     /// Get the result code.
     pub fn result_code(&self) -> TxResultCode {
         match &self.inner.result {
-            TransactionResultResult::TxFeeBumpInnerSuccess(_) => TxResultCode::TxFeeBumpInnerSuccess,
+            TransactionResultResult::TxFeeBumpInnerSuccess(_) => {
+                TxResultCode::TxFeeBumpInnerSuccess
+            }
             TransactionResultResult::TxFeeBumpInnerFailed(_) => TxResultCode::TxFeeBumpInnerFailed,
             TransactionResultResult::TxSuccess(_) => TxResultCode::TxSuccess,
             TransactionResultResult::TxFailed(_) => TxResultCode::TxFailed,
@@ -213,18 +215,16 @@ impl TxResultWrapper {
                     .collect(),
             ),
             TransactionResultResult::TxFeeBumpInnerSuccess(inner)
-            | TransactionResultResult::TxFeeBumpInnerFailed(inner) => {
-                match &inner.result.result {
-                    InnerTransactionResultResult::TxSuccess(results)
-                    | InnerTransactionResultResult::TxFailed(results) => Some(
-                        results
-                            .iter()
-                            .map(|r| OpResultWrapper::from_xdr(r.clone()))
-                            .collect(),
-                    ),
-                    _ => None,
-                }
-            }
+            | TransactionResultResult::TxFeeBumpInnerFailed(inner) => match &inner.result.result {
+                InnerTransactionResultResult::TxSuccess(results)
+                | InnerTransactionResultResult::TxFailed(results) => Some(
+                    results
+                        .iter()
+                        .map(|r| OpResultWrapper::from_xdr(r.clone()))
+                        .collect(),
+                ),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -271,7 +271,10 @@ pub enum TxResultCode {
 impl TxResultCode {
     /// Check if this is a success code.
     pub fn is_success(&self) -> bool {
-        matches!(self, TxResultCode::TxSuccess | TxResultCode::TxFeeBumpInnerSuccess)
+        matches!(
+            self,
+            TxResultCode::TxSuccess | TxResultCode::TxFeeBumpInnerSuccess
+        )
     }
 
     /// Get a human-readable name.
@@ -352,16 +355,10 @@ impl OpResultWrapper {
                 )
             }
             OperationResultTr::ManageSellOffer(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::ManageSellOfferResult::Success(_)
-                )
+                matches!(r, stellar_xdr::curr::ManageSellOfferResult::Success(_))
             }
             OperationResultTr::CreatePassiveSellOffer(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::ManageSellOfferResult::Success(_)
-                )
+                matches!(r, stellar_xdr::curr::ManageSellOfferResult::Success(_))
             }
             OperationResultTr::SetOptions(r) => {
                 matches!(r, stellar_xdr::curr::SetOptionsResult::Success)
@@ -373,10 +370,7 @@ impl OpResultWrapper {
                 matches!(r, stellar_xdr::curr::AllowTrustResult::Success)
             }
             OperationResultTr::AccountMerge(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::AccountMergeResult::Success(_)
-                )
+                matches!(r, stellar_xdr::curr::AccountMergeResult::Success(_))
             }
             OperationResultTr::Inflation(r) => {
                 matches!(r, stellar_xdr::curr::InflationResult::Success(_))
@@ -388,10 +382,7 @@ impl OpResultWrapper {
                 matches!(r, stellar_xdr::curr::BumpSequenceResult::Success)
             }
             OperationResultTr::ManageBuyOffer(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::ManageBuyOfferResult::Success(_)
-                )
+                matches!(r, stellar_xdr::curr::ManageBuyOfferResult::Success(_))
             }
             OperationResultTr::PathPaymentStrictSend(r) => {
                 matches!(
@@ -406,10 +397,7 @@ impl OpResultWrapper {
                 )
             }
             OperationResultTr::ClaimClaimableBalance(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::ClaimClaimableBalanceResult::Success
-                )
+                matches!(r, stellar_xdr::curr::ClaimClaimableBalanceResult::Success)
             }
             OperationResultTr::BeginSponsoringFutureReserves(r) => {
                 matches!(
@@ -424,10 +412,7 @@ impl OpResultWrapper {
                 )
             }
             OperationResultTr::RevokeSponsorship(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::RevokeSponsorshipResult::Success
-                )
+                matches!(r, stellar_xdr::curr::RevokeSponsorshipResult::Success)
             }
             OperationResultTr::Clawback(r) => {
                 matches!(r, stellar_xdr::curr::ClawbackResult::Success)
@@ -439,40 +424,22 @@ impl OpResultWrapper {
                 )
             }
             OperationResultTr::SetTrustLineFlags(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::SetTrustLineFlagsResult::Success
-                )
+                matches!(r, stellar_xdr::curr::SetTrustLineFlagsResult::Success)
             }
             OperationResultTr::LiquidityPoolDeposit(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::LiquidityPoolDepositResult::Success
-                )
+                matches!(r, stellar_xdr::curr::LiquidityPoolDepositResult::Success)
             }
             OperationResultTr::LiquidityPoolWithdraw(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::LiquidityPoolWithdrawResult::Success
-                )
+                matches!(r, stellar_xdr::curr::LiquidityPoolWithdrawResult::Success)
             }
             OperationResultTr::InvokeHostFunction(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::InvokeHostFunctionResult::Success(_)
-                )
+                matches!(r, stellar_xdr::curr::InvokeHostFunctionResult::Success(_))
             }
             OperationResultTr::ExtendFootprintTtl(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::ExtendFootprintTtlResult::Success
-                )
+                matches!(r, stellar_xdr::curr::ExtendFootprintTtlResult::Success)
             }
             OperationResultTr::RestoreFootprint(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::RestoreFootprintResult::Success
-                )
+                matches!(r, stellar_xdr::curr::RestoreFootprintResult::Success)
             }
         }
     }
@@ -599,7 +566,10 @@ impl RefundableFeeTracker {
     /// This is called after computing the actual resource fee based on consumption.
     ///
     /// Returns `Ok(())` if within budget, `Err` if total exceeds maximum.
-    pub fn update_consumed_refundable_fee(&mut self, refundable_fee: i64) -> Result<(), RefundableFeeError> {
+    pub fn update_consumed_refundable_fee(
+        &mut self,
+        refundable_fee: i64,
+    ) -> Result<(), RefundableFeeError> {
         self.consumed_refundable_fee = self.consumed_rent_fee + refundable_fee;
 
         if self.max_refundable_fee < self.consumed_refundable_fee {
@@ -654,15 +624,9 @@ impl RefundableFeeTracker {
 #[derive(Debug, Clone)]
 pub enum RefundableFeeError {
     /// Rent fee consumption exceeded the available refundable limit.
-    RentFeeExceeded {
-        consumed: i64,
-        max: i64,
-    },
+    RentFeeExceeded { consumed: i64, max: i64 },
     /// Total refundable fee consumption exceeded the available limit.
-    RefundableFeeExceeded {
-        consumed: i64,
-        max: i64,
-    },
+    RefundableFeeExceeded { consumed: i64, max: i64 },
 }
 
 impl std::fmt::Display for RefundableFeeError {
@@ -1125,12 +1089,21 @@ mod tests {
         if let Some(tracker) = result.refundable_fee_tracker_mut() {
             tracker.consume_rent_fee(200).unwrap();
         }
-        assert_eq!(result.refundable_fee_tracker().unwrap().consumed_rent_fee(), 200);
+        assert_eq!(
+            result.refundable_fee_tracker().unwrap().consumed_rent_fee(),
+            200
+        );
 
         // Set error should reset consumed fees
         result.set_error(stellar_xdr::curr::TransactionResultCode::TxFailed);
-        assert_eq!(result.refundable_fee_tracker().unwrap().consumed_rent_fee(), 0);
-        assert_eq!(result.refundable_fee_tracker().unwrap().get_fee_refund(), 500);
+        assert_eq!(
+            result.refundable_fee_tracker().unwrap().consumed_rent_fee(),
+            0
+        );
+        assert_eq!(
+            result.refundable_fee_tracker().unwrap().get_fee_refund(),
+            500
+        );
     }
 
     #[test]

@@ -367,7 +367,8 @@ impl CatchupManager {
                 "Catching up to checkpoint {} (no ledgers to replay)",
                 checkpoint_seq
             );
-            let (checkpoint_header, header_hash) = self.download_checkpoint_header(checkpoint_seq).await?;
+            let (checkpoint_header, header_hash) =
+                self.download_checkpoint_header(checkpoint_seq).await?;
             (checkpoint_header, header_hash, 0)
         } else {
             // Replay ledgers to reach target
@@ -528,7 +529,8 @@ impl CatchupManager {
                 verify::verify_tx_result_set(header, &xdr)?;
             }
         }
-        let (checkpoint_header, checkpoint_hash) = checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
+        let (checkpoint_header, checkpoint_hash) =
+            checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
         let ledger_data = if target == checkpoint_seq {
             Vec::new()
         } else {
@@ -1773,10 +1775,10 @@ fn create_header_from_replay_state(
     bucket_list: &BucketList,
     hot_archive_bucket_list: Option<&BucketList>,
 ) -> LedgerHeader {
+    use sha2::{Digest, Sha256};
     use stellar_xdr::curr::{
         Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
     };
-    use sha2::{Digest, Sha256};
 
     let bucket_list_hash = if let Some(hot_archive) = hot_archive_bucket_list {
         let mut hasher = Sha256::new();
@@ -1825,7 +1827,9 @@ fn create_header_from_replay_state(
 fn load_eviction_iterator_from_bucket_list(
     bucket_list: &BucketList,
 ) -> Option<stellar_core_bucket::EvictionIterator> {
-    use stellar_xdr::curr::{ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting};
+    use stellar_xdr::curr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting,
+    };
 
     let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::EvictionIterator,
@@ -1833,7 +1837,9 @@ fn load_eviction_iterator_from_bucket_list(
 
     match bucket_list.get(&key) {
         Ok(Some(entry)) => {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(xdr_iter)) = entry.data {
+            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(xdr_iter)) =
+                entry.data
+            {
                 let iter = stellar_core_bucket::EvictionIterator {
                     bucket_file_offset: xdr_iter.bucket_file_offset,
                     bucket_list_level: xdr_iter.bucket_list_level,

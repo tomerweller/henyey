@@ -52,17 +52,16 @@ use stellar_core_common::{
     any_greater, Hash256, NetworkId, Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES,
 };
 use stellar_core_crypto::Sha256Hasher;
-use stellar_xdr::curr::{
-    AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet,
-    Limits, OperationType, Preconditions, SignerKey, TransactionEnvelope,
-    TransactionPhase, TxSetComponent,
-};
 use stellar_xdr::curr::WriteXdr;
+use stellar_xdr::curr::{
+    AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Limits,
+    OperationType, Preconditions, SignerKey, TransactionEnvelope, TransactionPhase, TxSetComponent,
+};
 
 use crate::error::HerderError;
 use crate::surge_pricing::{
-    DexLimitingLaneConfig, OpsOnlyLaneConfig, SorobanGenericLaneConfig,
-    SurgePricingLaneConfig, SurgePricingPriorityQueue, GENERIC_LANE,
+    DexLimitingLaneConfig, OpsOnlyLaneConfig, SorobanGenericLaneConfig, SurgePricingLaneConfig,
+    SurgePricingPriorityQueue, GENERIC_LANE,
 };
 use crate::Result;
 use rand::Rng;
@@ -248,12 +247,8 @@ impl QueuedTransaction {
     /// Extract fee and operation count from the envelope.
     fn extract_fee_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, u32)> {
         match envelope {
-            TransactionEnvelope::TxV0(tx) => {
-                Ok((tx.tx.fee as u64, tx.tx.operations.len() as u32))
-            }
-            TransactionEnvelope::Tx(tx) => {
-                Ok((tx.tx.fee as u64, tx.tx.operations.len() as u32))
-            }
+            TransactionEnvelope::TxV0(tx) => Ok((tx.tx.fee as u64, tx.tx.operations.len() as u32)),
+            TransactionEnvelope::Tx(tx) => Ok((tx.tx.fee as u64, tx.tx.operations.len() as u32)),
             TransactionEnvelope::TxFeeBump(tx) => {
                 // For fee bump, use the outer fee
                 let inner_ops = match &tx.tx.inner_tx {
@@ -355,7 +350,12 @@ pub(crate) fn fee_rate_cmp(a_fee: u64, a_ops: u32, b_fee: u64, b_ops: u32) -> Or
 }
 
 fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> bool {
-    match fee_rate_cmp(new_tx.total_fee, new_tx.op_count, old_tx.total_fee, old_tx.op_count) {
+    match fee_rate_cmp(
+        new_tx.total_fee,
+        new_tx.op_count,
+        old_tx.total_fee,
+        old_tx.op_count,
+    ) {
         Ordering::Greater => true,
         Ordering::Less => false,
         Ordering::Equal => new_tx.hash.0 < old_tx.hash.0,
@@ -410,7 +410,11 @@ fn can_replace_by_fee(
             let denominator = old_ops as u128;
             let quotient = numerator / denominator;
             let remainder = numerator % denominator;
-            let rounded = if remainder > 0 { quotient + 1 } else { quotient };
+            let rounded = if remainder > 0 {
+                quotient + 1
+            } else {
+                quotient
+            };
             u64::try_from(rounded).unwrap_or(u64::MAX)
         } else {
             0
@@ -444,7 +448,9 @@ fn account_key(envelope: &TransactionEnvelope) -> Vec<u8> {
         }
         TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account.clone(),
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                inner.tx.source_account.clone()
+            }
         },
     };
     let account_id = stellar_core_tx::muxed_to_account_id(&source);
@@ -466,7 +472,9 @@ fn account_id_from_envelope(envelope: &TransactionEnvelope) -> AccountId {
         }
         TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account.clone(),
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                inner.tx.source_account.clone()
+            }
         },
     };
     stellar_core_tx::muxed_to_account_id(&source)
@@ -616,11 +624,7 @@ impl TransactionSet {
         }
 
         let tx_count = self.transactions.len();
-        let op_count: i64 = self
-            .transactions
-            .iter()
-            .map(tx_operation_count)
-            .sum();
+        let op_count: i64 = self.transactions.iter().map(tx_operation_count).sum();
         let base_fee = self
             .transactions
             .iter()
@@ -668,9 +672,8 @@ impl TransactionSet {
                 let transactions: Vec<TransactionEnvelope> = legacy.txs.to_vec();
 
                 // Compute hash
-                let hash =
-                    Self::compute_non_generalized_hash(previous_ledger_hash, &transactions)
-                        .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
+                let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions)
+                    .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
 
                 Ok(Self {
                     hash,
@@ -681,7 +684,9 @@ impl TransactionSet {
             }
             StoredTransactionSet::V1(gen) => {
                 let previous_ledger_hash = match gen {
-                    GeneralizedTransactionSet::V1(v1) => Hash256::from_bytes(v1.previous_ledger_hash.0),
+                    GeneralizedTransactionSet::V1(v1) => {
+                        Hash256::from_bytes(v1.previous_ledger_hash.0)
+                    }
                 };
 
                 // Extract transactions from phases
@@ -705,7 +710,9 @@ impl TransactionSet {
 }
 
 /// Extract all transactions from a GeneralizedTransactionSet.
-fn extract_transactions_from_generalized(gen: &GeneralizedTransactionSet) -> Vec<TransactionEnvelope> {
+fn extract_transactions_from_generalized(
+    gen: &GeneralizedTransactionSet,
+) -> Vec<TransactionEnvelope> {
     let GeneralizedTransactionSet::V1(v1) = gen;
     let mut transactions = Vec::new();
 
@@ -956,7 +963,10 @@ impl TransactionQueue {
     }
 
     /// Validate a transaction before queueing.
-    fn validate_transaction(&self, envelope: &TransactionEnvelope) -> std::result::Result<(), &'static str> {
+    fn validate_transaction(
+        &self,
+        envelope: &TransactionEnvelope,
+    ) -> std::result::Result<(), &'static str> {
         use stellar_core_tx::{
             validate_ledger_bounds, validate_signatures, validate_time_bounds, LedgerContext,
             TransactionFrame,
@@ -1010,7 +1020,8 @@ impl TransactionQueue {
         // Validate preconditions (extra signers / min seq age+gap)
         if let Preconditions::V2(cond) = frame.preconditions() {
             if !cond.extra_signers.is_empty() {
-                if !extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)? {
+                if !extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)?
+                {
                     return Err("extra signer validation failed");
                 }
             }
@@ -1150,7 +1161,11 @@ impl TransactionQueue {
 
         let mut pending_evictions: HashSet<Hash256> = HashSet::new();
         let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
-        let seed = if cfg!(test) { 0 } else { rand::thread_rng().gen() };
+        let seed = if cfg!(test) {
+            0
+        } else {
+            rand::thread_rng().gen()
+        };
 
         if !queued_is_soroban
             && (self.config.max_queue_classic_bytes.is_some()
@@ -1202,7 +1217,8 @@ impl TransactionQueue {
                     }
                     let global_fee = *self.global_evicted_inclusion_fee.read();
                     let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], &queued);
-                    min_fee = min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], &queued));
+                    min_fee =
+                        min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], &queued));
                     if self.config.max_queue_ops.is_some() {
                         min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, &queued));
                     }
@@ -1440,8 +1456,9 @@ impl TransactionQueue {
             if old_fee_source_key != new_fee_source_key {
                 let mut account_states = self.account_states.write();
                 if let Some(old_fee_state) = account_states.get_mut(&old_fee_source_key) {
-                    old_fee_state.total_fees =
-                        old_fee_state.total_fees.saturating_sub(old_tx.total_fee as i64);
+                    old_fee_state.total_fees = old_fee_state
+                        .total_fees
+                        .saturating_sub(old_tx.total_fee as i64);
                     // Remove the account state if it's empty
                     if old_fee_state.is_empty() {
                         account_states.remove(&old_fee_source_key);
@@ -1478,9 +1495,7 @@ impl TransactionQueue {
                 new_fee as i64
             };
 
-            seq_state.transaction = Some(TimestampedTx {
-                tx: queued.clone(),
-            });
+            seq_state.transaction = Some(TimestampedTx { tx: queued.clone() });
 
             // Update the fee-source account state (tracks total_fees)
             // Note: seq_source and fee_source may be the same account
@@ -1505,7 +1520,11 @@ impl TransactionQueue {
     /// Get a transaction set for the next ledger.
     ///
     /// Returns the highest-fee transactions up to the specified limit.
-    pub fn get_transaction_set(&self, previous_ledger_hash: Hash256, max_ops: usize) -> TransactionSet {
+    pub fn get_transaction_set(
+        &self,
+        previous_ledger_hash: Hash256,
+        max_ops: usize,
+    ) -> TransactionSet {
         let SelectedTxs { transactions, .. } =
             self.select_transactions_with_starting_seq(max_ops, None);
         TransactionSet::new(previous_ledger_hash, transactions)
@@ -1525,7 +1544,11 @@ impl TransactionQueue {
     /// Build a GeneralizedTransactionSet (protocol 20+) and return it with the correct hash.
     ///
     /// The hash is SHA-256 of the XDR-encoded GeneralizedTransactionSet.
-    pub fn build_generalized_tx_set(&self, previous_ledger_hash: Hash256, max_ops: usize) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
+    pub fn build_generalized_tx_set(
+        &self,
+        previous_ledger_hash: Hash256,
+        max_ops: usize,
+    ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
         self.build_generalized_tx_set_with_starting_seq(previous_ledger_hash, max_ops, None)
     }
 
@@ -1551,10 +1574,8 @@ impl TransactionQueue {
         let mut classic_txs = Vec::new();
         let mut soroban_txs = Vec::new();
         for tx in &transactions {
-            let frame = stellar_core_tx::TransactionFrame::with_network(
-                tx.clone(),
-                self.config.network_id,
-            );
+            let frame =
+                stellar_core_tx::TransactionFrame::with_network(tx.clone(), self.config.network_id);
             if frame.is_soroban() {
                 soroban_txs.push(tx.clone());
             } else {
@@ -1618,19 +1639,15 @@ impl TransactionQueue {
 
             for (fee, mut txs) in components_by_fee {
                 sort_txs_by_hash(&mut txs);
-                classic_components.push(
-                    TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                        TxSetComponentTxsMaybeDiscountedFee {
-                            base_fee: Some(fee),
-                            txs: txs.try_into().unwrap_or_default(),
-                        },
-                    ),
-                );
+                classic_components.push(TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                    TxSetComponentTxsMaybeDiscountedFee {
+                        base_fee: Some(fee),
+                        txs: txs.try_into().unwrap_or_default(),
+                    },
+                ));
             }
         }
-        let classic_phase = TransactionPhase::V0(
-            classic_components.try_into().unwrap_or_default(),
-        );
+        let classic_phase = TransactionPhase::V0(classic_components.try_into().unwrap_or_default());
 
         let soroban_base_fee = if soroban_limited {
             soroban_txs
@@ -1650,26 +1667,20 @@ impl TransactionQueue {
                 execution_stages: VecM::default(),
             })
         } else {
-            let cluster = DependentTxCluster(
-                soroban_txs.try_into().unwrap_or_default()
-            );
-            let stage = ParallelTxExecutionStage(
-                vec![cluster].try_into().unwrap_or_default()
-            );
+            let cluster = DependentTxCluster(soroban_txs.try_into().unwrap_or_default());
+            let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());
             TransactionPhase::V1(ParallelTxsComponent {
                 base_fee: soroban_base_fee,
                 execution_stages: vec![stage].try_into().unwrap_or_default(),
             })
         };
 
-        let gen_tx_set = GeneralizedTransactionSet::V1(
-            stellar_xdr::curr::TransactionSetV1 {
-                previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
-                phases: vec![classic_phase, soroban_phase]
-                    .try_into()
-                    .unwrap_or_default(),
-            }
-        );
+        let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
+            previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
+            phases: vec![classic_phase, soroban_phase]
+                .try_into()
+                .unwrap_or_default(),
+        });
 
         // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
         let hash = if let Ok(xdr_bytes) = gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
@@ -1718,9 +1729,7 @@ impl TransactionQueue {
             txs.sort_by(|a, b| {
                 a.sequence_number()
                     .cmp(&b.sequence_number())
-                    .then_with(|| {
-                        fee_rate_cmp(b.total_fee, b.op_count, a.total_fee, a.op_count)
-                    })
+                    .then_with(|| fee_rate_cmp(b.total_fee, b.op_count, a.total_fee, a.op_count))
                     .then_with(|| a.hash.0.cmp(&b.hash.0))
             });
 
@@ -1768,8 +1777,8 @@ impl TransactionQueue {
         }
 
         let max_ops = u32::try_from(max_ops).unwrap_or(u32::MAX);
-        let use_classic_bytes = self.config.max_classic_bytes.is_some()
-            || self.config.max_dex_bytes.is_some();
+        let use_classic_bytes =
+            self.config.max_classic_bytes.is_some() || self.config.max_dex_bytes.is_some();
         let ledger_version = self.validation_context.read().protocol_version;
 
         let mut classic_accounts: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
@@ -1860,12 +1869,7 @@ impl TransactionQueue {
                 } else {
                     classic_had_not_fitting[GENERIC_LANE] = true;
                 }
-                classic_queue.remove_entry(
-                    lane,
-                    &entry,
-                    ledger_version,
-                    &self.config.network_id,
-                );
+                classic_queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
                 continue;
             }
 
@@ -1875,12 +1879,7 @@ impl TransactionQueue {
                 classic_lane_left[lane] -= resources;
             }
 
-            classic_queue.remove_entry(
-                lane,
-                &entry,
-                ledger_version,
-                &self.config.network_id,
-            );
+            classic_queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
             let account = account_key(&entry.tx.envelope);
             if let Some(txs) = classic_accounts.get(&account) {
                 let next_index = classic_positions
@@ -1890,7 +1889,11 @@ impl TransactionQueue {
                     .saturating_add(1);
                 if next_index < txs.len() {
                     classic_positions.insert(account.clone(), next_index);
-                    classic_queue.add(txs[next_index].clone(), &self.config.network_id, ledger_version);
+                    classic_queue.add(
+                        txs[next_index].clone(),
+                        &self.config.network_id,
+                        ledger_version,
+                    );
                 }
             }
         }
@@ -1941,22 +1944,12 @@ impl TransactionQueue {
                 let exceeds = any_greater(&resources, &lane_left[GENERIC_LANE]);
                 if exceeds {
                     had_not_fitting[GENERIC_LANE] = true;
-                    queue.remove_entry(
-                        lane,
-                        &entry,
-                        ledger_version,
-                        &self.config.network_id,
-                    );
+                    queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
                     continue;
                 }
                 selected.push(entry.tx.clone());
                 lane_left[GENERIC_LANE] -= resources;
-                queue.remove_entry(
-                    lane,
-                    &entry,
-                    ledger_version,
-                    &self.config.network_id,
-                );
+                queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
                 let account = account_key(&entry.tx.envelope);
                 if let Some(txs) = soroban_accounts.get(&account) {
                     let next_index = positions
@@ -1966,7 +1959,11 @@ impl TransactionQueue {
                         .saturating_add(1);
                     if next_index < txs.len() {
                         positions.insert(account.clone(), next_index);
-                        queue.add(txs[next_index].clone(), &self.config.network_id, ledger_version);
+                        queue.add(
+                            txs[next_index].clone(),
+                            &self.config.network_id,
+                            ledger_version,
+                        );
                     }
                 }
             }
@@ -2116,11 +2113,9 @@ impl TransactionQueue {
         let ops = match envelope {
             TransactionEnvelope::TxV0(env) => &env.tx.operations,
             TransactionEnvelope::Tx(env) => &env.tx.operations,
-            TransactionEnvelope::TxFeeBump(env) => {
-                match &env.tx.inner_tx {
-                    FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
-                }
-            }
+            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
+            },
         };
 
         ops.iter().any(|op| {
@@ -2425,12 +2420,14 @@ fn precondition_hash_and_signatures<'a>(
 ) -> std::result::Result<(Hash256, &'a [DecoratedSignature]), &'static str> {
     match envelope {
         TransactionEnvelope::TxV0(env) => {
-            let frame = stellar_core_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+            let frame =
+                stellar_core_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
             let hash = frame.hash(network_id).map_err(|_| "tx hash error")?;
             Ok((hash, env.signatures.as_slice()))
         }
         TransactionEnvelope::Tx(env) => {
-            let frame = stellar_core_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+            let frame =
+                stellar_core_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
             let hash = frame.hash(network_id).map_err(|_| "tx hash error")?;
             Ok((hash, env.signatures.as_slice()))
         }
@@ -2442,7 +2439,9 @@ fn precondition_hash_and_signatures<'a>(
                 TransactionEnvelope::Tx(inner_env),
                 *network_id,
             );
-            let hash = inner_frame.hash(network_id).map_err(|_| "inner tx hash error")?;
+            let hash = inner_frame
+                .hash(network_id)
+                .map_err(|_| "inner tx hash error")?;
             let signatures = match &env.tx.inner_tx {
                 FeeBumpTransactionInnerTx::Tx(inner) => inner.signatures.as_slice(),
             };
@@ -2508,16 +2507,16 @@ impl Default for TransactionQueue {
 mod tests {
     use super::*;
     use stellar_core_common::NetworkId;
-    use stellar_core_crypto::{sign_hash, SecretKey};
     use stellar_core_common::{Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES};
+    use stellar_core_crypto::{sign_hash, SecretKey};
     use stellar_xdr::curr::{
         AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, DecoratedSignature, Duration,
         HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp,
         Memo, MuxedAccount, Operation, OperationBody, Preconditions, PreconditionsV2, Price,
         PublicKey, ScAddress, ScSymbol, ScVal, SequenceNumber, Signature as XdrSignature,
-        SignatureHint, SignerKey, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
-        StringM, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256,
-        VecM,
+        SignatureHint, SignerKey, SorobanResources, SorobanTransactionData,
+        SorobanTransactionDataExt, StringM, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256, VecM,
     };
 
     fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
@@ -2548,15 +2547,15 @@ mod tests {
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
                 signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
-            }].try_into().unwrap(),
+            }]
+            .try_into()
+            .unwrap(),
         })
     }
 
     fn make_soroban_envelope(fee: u32) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([9u8; 32]));
-        let function_name = ScSymbol(
-            StringM::<32>::try_from("test".to_string()).expect("symbol")
-        );
+        let function_name = ScSymbol(StringM::<32>::try_from("test".to_string()).expect("symbol"));
         let host_function = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address: ScAddress::default(),
             function_name,
@@ -2864,11 +2863,7 @@ mod tests {
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 3);
 
-        let mut fees: Vec<u64> = set
-            .transactions
-            .iter()
-            .map(envelope_fee)
-            .collect();
+        let mut fees: Vec<u64> = set.transactions.iter().map(envelope_fee).collect();
         fees.sort_by(|a, b| b.cmp(a));
         assert_eq!(fees, vec![300, 200, 100]);
     }
@@ -3302,13 +3297,11 @@ mod tests {
         let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[0] {
-            stellar_xdr::curr::TransactionPhase::V0(components) => {
-                match &components[0] {
-                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
-                        comp.base_fee
-                    }
+            stellar_xdr::curr::TransactionPhase::V0(components) => match &components[0] {
+                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                    comp.base_fee
                 }
-            }
+            },
             _ => None,
         };
 
@@ -3414,10 +3407,8 @@ mod tests {
 
         let mut dex_count = 0;
         for tx in &set.transactions {
-            let frame = stellar_core_tx::TransactionFrame::with_network(
-                tx.clone(),
-                NetworkId::testnet(),
-            );
+            let frame =
+                stellar_core_tx::TransactionFrame::with_network(tx.clone(), NetworkId::testnet());
             if frame.has_dex_operations() {
                 dex_count += 1;
             }
@@ -3678,8 +3669,7 @@ mod tests {
         set_source(&mut classic_high, 162);
         set_source(&mut classic_low, 163);
 
-        let byte_limit =
-            (envelope_size(&dex_a) + envelope_size(&classic_high)) as u32;
+        let byte_limit = (envelope_size(&dex_a) + envelope_size(&classic_high)) as u32;
         let config = TxQueueConfig {
             max_dex_ops: Some(1),
             max_classic_bytes: Some(byte_limit),
@@ -4558,7 +4548,9 @@ mod tests {
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
                 signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
-            }].try_into().unwrap(),
+            }]
+            .try_into()
+            .unwrap(),
         });
 
         // Should be filtered because one operation is ManageSellOffer

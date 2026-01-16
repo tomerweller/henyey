@@ -570,11 +570,7 @@ impl ItemFetcher {
             }
         }
 
-        debug!(
-            "Processed {} pending {:?} requests",
-            sent,
-            self.item_type
-        );
+        debug!("Processed {} pending {:?} requests", sent, self.item_type);
         sent
     }
 

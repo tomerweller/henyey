@@ -32,10 +32,9 @@ use stellar_core_common::NetworkId;
 use stellar_xdr::curr::{
     ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
     ExtensionPoint, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, Memo, OperationMeta,
-    OperationMetaV2, ScError, ScMap, ScMapEntry, ScString, ScSymbol, ScVal,
-    SorobanTransactionMeta, SorobanTransactionMetaExt, SorobanTransactionMetaExtV1,
-    SorobanTransactionMetaV2, StringM, TransactionMeta, TransactionMetaV2, TransactionMetaV3,
-    TransactionMetaV4,
+    OperationMetaV2, ScError, ScMap, ScMapEntry, ScString, ScSymbol, ScVal, SorobanTransactionMeta,
+    SorobanTransactionMetaExt, SorobanTransactionMetaExtV1, SorobanTransactionMetaV2, StringM,
+    TransactionMeta, TransactionMetaV2, TransactionMetaV3, TransactionMetaV4,
 };
 
 use crate::events::{ClassicEventConfig, OpEventManager, TxEventManager};
@@ -1197,9 +1196,7 @@ mod tests {
         );
 
         let entry = create_test_account_entry();
-        builder
-            .operation_meta_builder_mut(0)
-            .record_create(entry);
+        builder.operation_meta_builder_mut(0).record_create(entry);
 
         let meta = builder.finalize(true);
         match meta {

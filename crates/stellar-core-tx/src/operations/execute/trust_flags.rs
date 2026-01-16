@@ -41,11 +41,15 @@ pub fn execute_allow_trust(
     // Check if issuer has AUTH_REQUIRED flag (only for protocol versions before 16)
     // In protocol 16+, this check was removed as part of CAP-0035.
     if context.protocol_version < 16 && issuer.flags & AUTH_REQUIRED_FLAG == 0 {
-        return Ok(make_allow_trust_result(AllowTrustResultCode::TrustNotRequired));
+        return Ok(make_allow_trust_result(
+            AllowTrustResultCode::TrustNotRequired,
+        ));
     }
 
     if &op.trustor == source {
-        return Ok(make_allow_trust_result(AllowTrustResultCode::SelfNotAllowed));
+        return Ok(make_allow_trust_result(
+            AllowTrustResultCode::SelfNotAllowed,
+        ));
     }
 
     // Convert the asset code to a full Asset
@@ -127,28 +131,36 @@ pub fn execute_set_trust_line_flags(
     let source_account = match state.get_account(source) {
         Some(a) => a.clone(),
         None => {
-            return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Malformed));
+            return Ok(make_set_flags_result(
+                SetTrustLineFlagsResultCode::Malformed,
+            ));
         }
     };
 
     // The source must be the issuer of the asset
     let issuer = match &op.asset {
         Asset::Native => {
-            return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Malformed));
+            return Ok(make_set_flags_result(
+                SetTrustLineFlagsResultCode::Malformed,
+            ));
         }
         Asset::CreditAlphanum4(a) => &a.issuer,
         Asset::CreditAlphanum12(a) => &a.issuer,
     };
 
     if issuer != source {
-        return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Malformed));
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
     }
 
     // Get the trustline
     let trustline = match state.get_trustline(&op.trustor, &op.asset) {
         Some(tl) => tl.clone(),
         None => {
-            return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::NoTrustLine));
+            return Ok(make_set_flags_result(
+                SetTrustLineFlagsResultCode::NoTrustLine,
+            ));
         }
     };
 
@@ -164,7 +176,9 @@ pub fn execute_set_trust_line_flags(
         let clearing_any_auth = (op.clear_flags & TRUSTLINE_AUTH_FLAGS) != 0;
         let setting_authorized = (op.set_flags & AUTHORIZED_FLAG) != 0;
         if clearing_any_auth && !setting_authorized {
-            return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::CantRevoke));
+            return Ok(make_set_flags_result(
+                SetTrustLineFlagsResultCode::CantRevoke,
+            ));
         }
     }
 
@@ -172,12 +186,16 @@ pub fn execute_set_trust_line_flags(
     if (op.set_flags & AUTHORIZED_FLAG != 0)
         && (op.set_flags & AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG != 0)
     {
-        return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Malformed));
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
     }
 
     // Cannot clear and set the same flag
     if (op.set_flags & op.clear_flags) != 0 {
-        return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Malformed));
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
     }
 
     // Calculate new flags
@@ -196,7 +214,9 @@ pub fn execute_set_trust_line_flags(
     }
 
     if !is_authorized_to_maintain_liabilities(new_flags) && has_liabilities(&trustline) {
-        return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::CantRevoke));
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::CantRevoke,
+        ));
     }
 
     // Update the trustline
@@ -354,7 +374,11 @@ mod tests {
 
         let issuer_id = create_test_account_id(0);
         let trustor_id = create_test_account_id(1);
-        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, AUTH_REQUIRED_FLAG));
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG,
+        ));
         state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
 
         let _asset = Asset::CreditAlphanum4(AlphaNum4 {
@@ -377,7 +401,9 @@ mod tests {
 
         let op = AllowTrustOp {
             trustor: trustor_id.clone(),
-            asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
+            asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(AssetCode4([
+                b'U', b'S', b'D', b'C',
+            ])),
             authorize: 0,
         };
 
@@ -408,8 +434,8 @@ mod tests {
             authorize: 1,
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context)
-            .expect("allow trust");
+        let result =
+            execute_allow_trust(&op, &issuer_id, &mut state, &context).expect("allow trust");
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(matches!(r, AllowTrustResult::SelfNotAllowed));

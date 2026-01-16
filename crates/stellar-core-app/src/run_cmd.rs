@@ -44,6 +44,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::Query;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -51,13 +52,12 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use axum::extract::Query;
 use serde::{Deserialize, Serialize};
-use stellar_core_crypto::{self, PublicKey as CryptoPublicKey};
-use stellar_core_scp::hash_quorum_set;
 use stellar_core_common::NetworkId;
-use stellar_core_tx::TransactionFrame;
+use stellar_core_crypto::{self, PublicKey as CryptoPublicKey};
 use stellar_core_overlay::{PeerAddress, PeerId};
+use stellar_core_scp::hash_quorum_set;
+use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::LedgerUpgrade;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -221,9 +221,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
 fn validate_run_options(config: &AppConfig, options: &RunOptions) -> anyhow::Result<()> {
     if options.mode == RunMode::Validator {
         if !config.node.is_validator {
-            anyhow::bail!(
-                "Cannot run in validator mode: node is not configured as a validator"
-            );
+            anyhow::bail!("Cannot run in validator mode: node is not configured as a validator");
         }
         if config.node.node_seed.is_none() {
             anyhow::bail!("Validators must have a node_seed configured");
@@ -516,7 +514,11 @@ impl StatusServer {
     }
 
     /// Create a new status server with a log level handle for dynamic log changes.
-    pub fn with_log_handle(port: u16, app: Arc<App>, log_handle: crate::logging::LogLevelHandle) -> Self {
+    pub fn with_log_handle(
+        port: u16,
+        app: Arc<App>,
+        log_handle: crate::logging::LogLevelHandle,
+    ) -> Self {
         Self {
             port,
             app,
@@ -554,7 +556,10 @@ impl StatusServer {
             .route("/survey/start", post(start_survey_collecting_handler))
             .route("/survey/stop", post(stop_survey_collecting_handler))
             .route("/survey/topology", post(survey_topology_handler))
-            .route("/survey/reporting/stop", post(stop_survey_reporting_handler))
+            .route(
+                "/survey/reporting/stop",
+                post(stop_survey_reporting_handler),
+            )
             .route("/tx", post(submit_tx_handler))
             .route("/shutdown", post(shutdown_handler))
             .route("/health", get(health_handler))
@@ -1111,7 +1116,8 @@ async fn ledger_handler(State(state): State<Arc<ServerState>>) -> Json<LedgerRes
 }
 
 async fn upgrades_handler(State(state): State<Arc<ServerState>>) -> Json<UpgradesResponse> {
-    let (protocol_version, base_fee, base_reserve, max_tx_set_size) = state.app.current_upgrade_state();
+    let (protocol_version, base_fee, base_reserve, max_tx_set_size) =
+        state.app.current_upgrade_state();
     let proposed = state
         .app
         .proposed_upgrades()
@@ -1246,7 +1252,9 @@ fn quorum_set_response(quorum_set: &stellar_xdr::curr::ScpQuorumSet) -> QuorumSe
 fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<String> {
     match &node_id.0 {
         stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
-            CryptoPublicKey::from_bytes(&key.0).ok().map(|pk| pk.to_strkey())
+            CryptoPublicKey::from_bytes(&key.0)
+                .ok()
+                .map(|pk| pk.to_strkey())
         }
     }
 }
@@ -1291,17 +1299,17 @@ fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, String> {
     let Some(peer) = params.peer.as_ref() else {
         return Err("addr or peer/port must be provided".to_string());
     };
-    let port = params.port.ok_or_else(|| "port must be provided".to_string())?;
+    let port = params
+        .port
+        .ok_or_else(|| "port must be provided".to_string())?;
     Ok(PeerAddress::new(peer.to_string(), port))
 }
 
-fn parse_peer_id_params(
-    peer_id: &Option<String>,
-    node: &Option<String>,
-) -> Result<PeerId, String> {
-    let value = peer_id.as_ref().or(node.as_ref()).ok_or_else(|| {
-        "peer_id or node must be provided".to_string()
-    })?;
+fn parse_peer_id_params(peer_id: &Option<String>, node: &Option<String>) -> Result<PeerId, String> {
+    let value = peer_id
+        .as_ref()
+        .or(node.as_ref())
+        .ok_or_else(|| "peer_id or node must be provided".to_string())?;
     parse_peer_id(value)
 }
 
@@ -1372,7 +1380,13 @@ async fn start_survey_collecting_handler(
     } else {
         "Failed to start survey collecting."
     };
-    (StatusCode::OK, Json(SurveyCommandResponse { success: ok, message: message.to_string() }))
+    (
+        StatusCode::OK,
+        Json(SurveyCommandResponse {
+            success: ok,
+            message: message.to_string(),
+        }),
+    )
 }
 
 async fn stop_survey_collecting_handler(
@@ -1393,7 +1407,13 @@ async fn stop_survey_collecting_handler(
     } else {
         "Failed to stop survey collecting."
     };
-    (StatusCode::OK, Json(SurveyCommandResponse { success: ok, message: message.to_string() }))
+    (
+        StatusCode::OK,
+        Json(SurveyCommandResponse {
+            success: ok,
+            message: message.to_string(),
+        }),
+    )
 }
 
 async fn survey_topology_handler(
@@ -1441,7 +1461,13 @@ async fn survey_topology_handler(
     } else {
         "Survey request rejected."
     };
-    (StatusCode::OK, Json(SurveyCommandResponse { success: ok, message: message.to_string() }))
+    (
+        StatusCode::OK,
+        Json(SurveyCommandResponse {
+            success: ok,
+            message: message.to_string(),
+        }),
+    )
 }
 
 async fn survey_booted(state: &ServerState) -> bool {
@@ -1466,8 +1492,8 @@ async fn submit_tx_handler(
     State(state): State<Arc<ServerState>>,
     Json(request): Json<SubmitTxRequest>,
 ) -> impl IntoResponse {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    use stellar_xdr::curr::{ReadXdr, TransactionEnvelope, Limits};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
 
     // Decode and validate the transaction
     let tx_bytes = match STANDARD.decode(&request.tx) {
@@ -1521,12 +1547,14 @@ async fn submit_tx_handler(
         stellar_core_herder::TxQueueResult::Banned => {
             (false, Some("Transaction from banned source".to_string()))
         }
-        stellar_core_herder::TxQueueResult::Filtered => {
-            (false, Some("Transaction filtered by operation type".to_string()))
-        }
-        stellar_core_herder::TxQueueResult::TryAgainLater => {
-            (false, Some("Account already has pending transaction".to_string()))
-        }
+        stellar_core_herder::TxQueueResult::Filtered => (
+            false,
+            Some("Transaction filtered by operation type".to_string()),
+        ),
+        stellar_core_herder::TxQueueResult::TryAgainLater => (
+            false,
+            Some("Account already has pending transaction".to_string()),
+        ),
     };
 
     (
@@ -1595,7 +1623,8 @@ async fn ll_handler(
         if params.level.is_some() {
             levels.insert(
                 "warning".to_string(),
-                "Log level handle not available. Logging initialized without dynamic support.".to_string(),
+                "Log level handle not available. Logging initialized without dynamic support."
+                    .to_string(),
             );
         }
 
@@ -1673,26 +1702,22 @@ async fn manualclose_handler(
 
     // Try to trigger manual close
     match state.app.manual_close_ledger().await {
-        Ok(new_ledger) => {
-            (
-                StatusCode::OK,
-                Json(ManualCloseResponse {
-                    success: true,
-                    ledger_seq: Some(new_ledger),
-                    message: Some(format!("Triggered manual close for ledger {}", new_ledger)),
-                }),
-            )
-        }
-        Err(e) => {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ManualCloseResponse {
-                    success: false,
-                    ledger_seq: None,
-                    message: Some(e.to_string()),
-                }),
-            )
-        }
+        Ok(new_ledger) => (
+            StatusCode::OK,
+            Json(ManualCloseResponse {
+                success: true,
+                ledger_seq: Some(new_ledger),
+                message: Some(format!("Triggered manual close for ledger {}", new_ledger)),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ManualCloseResponse {
+                success: false,
+                ledger_seq: None,
+                message: Some(e.to_string()),
+            }),
+        ),
     }
 }
 
@@ -1771,7 +1796,10 @@ async fn sorobaninfo_handler(
                     starting_eviction_scan_level: info.starting_eviction_scan_level,
                 },
             };
-            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap()),
+            )
         }
         "detailed" | "upgrade_xdr" => {
             // These formats require reading actual config entries from ledger

@@ -413,10 +413,7 @@ pub fn replay_ledger_with_execution(
     // the header was computed using the original fee_charged values, so we need to
     // use those values for the invariant check to pass.
     let fee_pool_delta = if let Some(expected_results) = expected_tx_results {
-        expected_results
-            .iter()
-            .map(|r| r.result.fee_charged)
-            .sum()
+        expected_results.iter().map(|r| r.result.fee_charged).sum()
     } else {
         delta.fee_pool_delta()
     };

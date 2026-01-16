@@ -31,8 +31,8 @@
 
 use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
-    Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet,
-    ScpStatementPledges, StellarValue, Value, WriteXdr,
+    Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatementPledges, StellarValue, Value,
+    WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -139,9 +139,7 @@ impl PersistedSlotState {
     /// Decode from base64.
     pub fn from_base64(encoded: &str) -> Result<Self> {
         let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-            .map_err(|e| {
-                HerderError::InvalidEnvelope(format!("failed to decode base64: {}", e))
-            })?;
+            .map_err(|e| HerderError::InvalidEnvelope(format!("failed to decode base64: {}", e)))?;
         let json = String::from_utf8(bytes).map_err(|e| {
             HerderError::InvalidEnvelope(format!("invalid UTF-8 in persisted state: {}", e))
         })?;
@@ -438,10 +436,7 @@ impl ScpPersistenceManager {
                         restored.quorum_sets.push((hash, qs));
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to restore quorum set for slot {}: {}",
-                            slot, e
-                        );
+                        warn!("Failed to restore quorum set for slot {}: {}", slot, e);
                     }
                 }
             }
@@ -458,10 +453,7 @@ impl ScpPersistenceManager {
                         *last_saved = (*last_saved).max(env_slot);
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to restore envelope for slot {}: {}",
-                            slot, e
-                        );
+                        warn!("Failed to restore envelope for slot {}: {}", slot, e);
                     }
                 }
             }
@@ -786,8 +778,8 @@ impl ScpStatePersistence for SqliteScpPersistence {
 
 #[cfg(test)]
 mod sqlite_tests {
-    use super::*;
     use super::tests::make_test_envelope;
+    use super::*;
 
     #[test]
     fn test_sqlite_persistence_roundtrip() {

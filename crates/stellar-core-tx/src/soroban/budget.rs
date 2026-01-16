@@ -41,11 +41,11 @@ impl Default for SorobanConfig {
         Self {
             cpu_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),
             mem_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),
-            tx_max_instructions: 100_000_000,       // 100M instructions
-            tx_max_memory_bytes: 40 * 1024 * 1024,  // 40 MB
+            tx_max_instructions: 100_000_000, // 100M instructions
+            tx_max_memory_bytes: 40 * 1024 * 1024, // 40 MB
             min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 120960,       // ~7 days at 5s ledger close
-            max_entry_ttl: 6312000,                 // ~1 year
+            min_persistent_entry_ttl: 120960, // ~7 days at 5s ledger close
+            max_entry_ttl: 6312000,           // ~1 year
             fee_config: FeeConfiguration::default(),
             rent_fee_config: RentFeeConfiguration::default(),
             tx_max_contract_events_size_bytes: 0,
@@ -82,7 +82,7 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            cpu_instructions: 100_000_000, // 100M instructions
+            cpu_instructions: 100_000_000,  // 100M instructions
             memory_bytes: 64 * 1024 * 1024, // 64 MB
             read_bytes: 200 * 1024,         // 200 KB
             write_bytes: 65 * 1024,         // 65 KB

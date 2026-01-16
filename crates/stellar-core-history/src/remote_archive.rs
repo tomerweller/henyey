@@ -381,7 +381,10 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
 
         let result = archive.put_file(temp.path(), "/remote/path").await;
-        assert!(matches!(result, Err(HistoryError::RemoteCommandFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(HistoryError::RemoteCommandFailed { .. })
+        ));
     }
 
     #[tokio::test]

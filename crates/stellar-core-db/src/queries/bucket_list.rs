@@ -37,10 +37,8 @@ pub trait BucketListQueries {
     /// Returns `None` if no snapshot exists for the given ledger.
     /// The returned vector contains (curr_hash, snap_hash) pairs
     /// indexed by level number.
-    fn load_bucket_list(
-        &self,
-        ledger_seq: u32,
-    ) -> Result<Option<Vec<(Hash256, Hash256)>>, DbError>;
+    fn load_bucket_list(&self, ledger_seq: u32)
+        -> Result<Option<Vec<(Hash256, Hash256)>>, DbError>;
 }
 
 impl BucketListQueries for Connection {
@@ -59,12 +57,7 @@ impl BucketListQueries for Connection {
                 INSERT INTO bucketlist (ledgerseq, level, currhash, snaphash)
                 VALUES (?1, ?2, ?3, ?4)
                 "#,
-                params![
-                    ledger_seq,
-                    idx as u32,
-                    curr.to_hex(),
-                    snap.to_hex(),
-                ],
+                params![ledger_seq, idx as u32, curr.to_hex(), snap.to_hex(),],
             )?;
         }
         Ok(())

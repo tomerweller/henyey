@@ -374,7 +374,9 @@ impl ConnectionPool {
 
     /// Returns true if there's room for another connection.
     pub fn can_accept(&self) -> bool {
-        self.current_count.load(std::sync::atomic::Ordering::Relaxed) < self.max_connections
+        self.current_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < self.max_connections
     }
 
     /// Attempts to reserve a connection slot.
@@ -382,7 +384,9 @@ impl ConnectionPool {
     /// Returns true if a slot was reserved, false if the limit is reached.
     /// Uses atomic compare-and-swap for thread safety.
     pub fn try_reserve(&self) -> bool {
-        let mut current = self.current_count.load(std::sync::atomic::Ordering::Relaxed);
+        let mut current = self
+            .current_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         loop {
             if current >= self.max_connections {
                 return false;
@@ -409,7 +413,8 @@ impl ConnectionPool {
 
     /// Returns the current number of connections.
     pub fn count(&self) -> usize {
-        self.current_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.current_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

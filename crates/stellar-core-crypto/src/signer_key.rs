@@ -137,8 +137,7 @@ pub fn hash_x_key_from_hash(hash: &Hash256) -> SignerKey {
 pub fn ed25519_payload_key(ed25519_pubkey: &[u8; 32], payload: &[u8]) -> SignerKey {
     SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
         ed25519: Uint256(*ed25519_pubkey),
-        payload: BytesM::try_from(payload.to_vec())
-            .expect("payload must be <= 64 bytes"),
+        payload: BytesM::try_from(payload.to_vec()).expect("payload must be <= 64 bytes"),
     })
 }
 

@@ -238,7 +238,10 @@ pub fn big_multiply_unsigned(a: u64, b: u64) -> u128 {
 /// Panics if either input is negative.
 #[inline]
 pub fn big_multiply(a: i64, b: i64) -> u128 {
-    assert!(a >= 0 && b >= 0, "big_multiply requires non-negative inputs");
+    assert!(
+        a >= 0 && b >= 0,
+        "big_multiply requires non-negative inputs"
+    );
     big_multiply_unsigned(a as u64, b as u64)
 }
 
@@ -268,7 +271,10 @@ pub fn big_multiply(a: i64, b: i64) -> u128 {
 /// assert_eq!(saturating_multiply(i64::MAX, 2), i64::MAX); // Saturates
 /// ```
 pub fn saturating_multiply(a: i64, b: i64) -> i64 {
-    assert!(a >= 0 && b >= 0, "saturating_multiply requires non-negative inputs");
+    assert!(
+        a >= 0 && b >= 0,
+        "saturating_multiply requires non-negative inputs"
+    );
 
     if a == 0 || b == 0 {
         return 0;
@@ -433,7 +439,10 @@ mod tests {
         let b = 1_000_000_000i64;
         let c = 1_000_000i64;
         // a * b = 10^21, / c = 10^15
-        assert_eq!(big_divide(a, b, c, Rounding::Down), Ok(1_000_000_000_000_000));
+        assert_eq!(
+            big_divide(a, b, c, Rounding::Down),
+            Ok(1_000_000_000_000_000)
+        );
     }
 
     #[test]
@@ -442,19 +451,34 @@ mod tests {
         let a = i64::MAX;
         let b = 2;
         let c = 1;
-        assert_eq!(big_divide(a, b, c, Rounding::Down), Err(MathError::Overflow));
+        assert_eq!(
+            big_divide(a, b, c, Rounding::Down),
+            Err(MathError::Overflow)
+        );
     }
 
     #[test]
     fn test_big_divide_negative_inputs() {
-        assert_eq!(big_divide(-1, 1, 1, Rounding::Down), Err(MathError::NegativeInput));
-        assert_eq!(big_divide(1, -1, 1, Rounding::Down), Err(MathError::NegativeInput));
+        assert_eq!(
+            big_divide(-1, 1, 1, Rounding::Down),
+            Err(MathError::NegativeInput)
+        );
+        assert_eq!(
+            big_divide(1, -1, 1, Rounding::Down),
+            Err(MathError::NegativeInput)
+        );
     }
 
     #[test]
     fn test_big_divide_zero_divisor() {
-        assert_eq!(big_divide(1, 1, 0, Rounding::Down), Err(MathError::DivisionByZero));
-        assert_eq!(big_divide(1, 1, -1, Rounding::Down), Err(MathError::DivisionByZero));
+        assert_eq!(
+            big_divide(1, 1, 0, Rounding::Down),
+            Err(MathError::DivisionByZero)
+        );
+        assert_eq!(
+            big_divide(1, 1, -1, Rounding::Down),
+            Err(MathError::DivisionByZero)
+        );
     }
 
     #[test]
@@ -503,7 +527,10 @@ mod tests {
     #[test]
     fn test_big_multiply() {
         assert_eq!(big_multiply_unsigned(1000, 1000), 1_000_000u128);
-        assert_eq!(big_multiply_unsigned(u64::MAX, u64::MAX), (u64::MAX as u128) * (u64::MAX as u128));
+        assert_eq!(
+            big_multiply_unsigned(u64::MAX, u64::MAX),
+            (u64::MAX as u128) * (u64::MAX as u128)
+        );
     }
 
     #[test]
@@ -543,12 +570,18 @@ mod tests {
     #[test]
     fn test_big_divide_unsigned() {
         assert_eq!(big_divide_unsigned(10, 20, 5, Rounding::Down), Ok(40));
-        assert_eq!(big_divide_unsigned(u64::MAX, 2, 2, Rounding::Down), Ok(u64::MAX));
+        assert_eq!(
+            big_divide_unsigned(u64::MAX, 2, 2, Rounding::Down),
+            Ok(u64::MAX)
+        );
     }
 
     #[test]
     fn test_big_divide_128() {
         let product = big_multiply_unsigned(1_000_000, 1_000_000);
-        assert_eq!(big_divide_128(product, 1000, Rounding::Down), Ok(1_000_000_000));
+        assert_eq!(
+            big_divide_128(product, 1000, Rounding::Down),
+            Ok(1_000_000_000)
+        );
     }
 }

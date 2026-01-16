@@ -75,14 +75,13 @@ impl PublishQueue {
 
     /// Get the number of checkpoints in the queue.
     pub fn len(&self) -> Result<usize> {
-        self.db.with_connection(|conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM publishqueue",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(count as usize)
-        }).map_err(Into::into)
+        self.db
+            .with_connection(|conn| {
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM publishqueue", [], |row| row.get(0))?;
+                Ok(count as usize)
+            })
+            .map_err(Into::into)
     }
 
     /// Check if the queue is empty.
@@ -94,28 +93,32 @@ impl PublishQueue {
     ///
     /// Returns `None` if the queue is empty.
     pub fn min_ledger(&self) -> Result<Option<u32>> {
-        self.db.with_connection(|conn| {
-            let result: Option<i64> = conn.query_row(
-                "SELECT MIN(ledgerseq) FROM publishqueue",
-                [],
-                |row| row.get(0),
-            ).ok();
-            Ok(result.map(|v| v as u32))
-        }).map_err(Into::into)
+        self.db
+            .with_connection(|conn| {
+                let result: Option<i64> = conn
+                    .query_row("SELECT MIN(ledgerseq) FROM publishqueue", [], |row| {
+                        row.get(0)
+                    })
+                    .ok();
+                Ok(result.map(|v| v as u32))
+            })
+            .map_err(Into::into)
     }
 
     /// Get the maximum (newest) ledger sequence in the queue.
     ///
     /// Returns `None` if the queue is empty.
     pub fn max_ledger(&self) -> Result<Option<u32>> {
-        self.db.with_connection(|conn| {
-            let result: Option<i64> = conn.query_row(
-                "SELECT MAX(ledgerseq) FROM publishqueue",
-                [],
-                |row| row.get(0),
-            ).ok();
-            Ok(result.map(|v| v as u32))
-        }).map_err(Into::into)
+        self.db
+            .with_connection(|conn| {
+                let result: Option<i64> = conn
+                    .query_row("SELECT MAX(ledgerseq) FROM publishqueue", [], |row| {
+                        row.get(0)
+                    })
+                    .ok();
+                Ok(result.map(|v| v as u32))
+            })
+            .map_err(Into::into)
     }
 
     /// Get the ledger range in the queue as (min, max).
@@ -145,8 +148,9 @@ impl PublishQueue {
             return Err(HistoryError::NotCheckpointLedger(ledger_seq));
         }
 
-        let state_json = serde_json::to_string(has)
-            .map_err(|e| HistoryError::VerificationFailed(format!("JSON serialization failed: {e}")))?;
+        let state_json = serde_json::to_string(has).map_err(|e| {
+            HistoryError::VerificationFailed(format!("JSON serialization failed: {e}"))
+        })?;
 
         self.db.with_connection(|conn| {
             conn.execute(
@@ -176,73 +180,80 @@ impl PublishQueue {
             Ok(())
         })?;
 
-        debug!(
-            ledger_seq = ledger_seq,
-            "Dequeued published checkpoint"
-        );
+        debug!(ledger_seq = ledger_seq, "Dequeued published checkpoint");
         Ok(())
     }
 
     /// Check if a checkpoint is in the queue.
     pub fn contains(&self, ledger_seq: u32) -> Result<bool> {
-        self.db.with_connection(|conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM publishqueue WHERE ledgerseq = ?1",
-                rusqlite::params![ledger_seq as i64],
-                |row| row.get(0),
-            )?;
-            Ok(count > 0)
-        }).map_err(Into::into)
+        self.db
+            .with_connection(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM publishqueue WHERE ledgerseq = ?1",
+                    rusqlite::params![ledger_seq as i64],
+                    |row| row.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .map_err(Into::into)
     }
 
     /// Get the HistoryArchiveState for a queued checkpoint.
     ///
     /// Returns `None` if the checkpoint is not in the queue.
     pub fn get_state(&self, ledger_seq: u32) -> Result<Option<HistoryArchiveState>> {
-        self.db.with_connection(|conn| {
-            let result: std::result::Result<String, _> = conn.query_row(
-                "SELECT state FROM publishqueue WHERE ledgerseq = ?1",
-                rusqlite::params![ledger_seq as i64],
-                |row| row.get(0),
-            );
+        self.db
+            .with_connection(|conn| {
+                let result: std::result::Result<String, _> = conn.query_row(
+                    "SELECT state FROM publishqueue WHERE ledgerseq = ?1",
+                    rusqlite::params![ledger_seq as i64],
+                    |row| row.get(0),
+                );
 
-            match result {
-                Ok(json) => {
-                    let has: HistoryArchiveState = serde_json::from_str(&json)
-                        .map_err(|e| stellar_core_db::DbError::Integrity(format!("JSON parse failed: {e}")))?;
-                    Ok(Some(has))
+                match result {
+                    Ok(json) => {
+                        let has: HistoryArchiveState =
+                            serde_json::from_str(&json).map_err(|e| {
+                                stellar_core_db::DbError::Integrity(format!(
+                                    "JSON parse failed: {e}"
+                                ))
+                            })?;
+                        Ok(Some(has))
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
                 }
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
-        }).map_err(Into::into)
+            })
+            .map_err(Into::into)
     }
 
     /// Get all queued checkpoints in ascending ledger order.
     ///
     /// Returns a list of (ledger_seq, HistoryArchiveState) pairs.
     pub fn get_all(&self) -> Result<Vec<(u32, HistoryArchiveState)>> {
-        self.db.with_connection(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT ledgerseq, state FROM publishqueue ORDER BY ledgerseq ASC"
-            )?;
+        self.db
+            .with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT ledgerseq, state FROM publishqueue ORDER BY ledgerseq ASC")?;
 
-            let rows = stmt.query_map([], |row| {
-                let ledger_seq: i64 = row.get(0)?;
-                let state_json: String = row.get(1)?;
-                Ok((ledger_seq as u32, state_json))
-            })?;
+                let rows = stmt.query_map([], |row| {
+                    let ledger_seq: i64 = row.get(0)?;
+                    let state_json: String = row.get(1)?;
+                    Ok((ledger_seq as u32, state_json))
+                })?;
 
-            let mut results = Vec::new();
-            for row in rows {
-                let (ledger_seq, json) = row?;
-                let has: HistoryArchiveState = serde_json::from_str(&json)
-                    .map_err(|e| stellar_core_db::DbError::Integrity(format!("JSON parse failed: {e}")))?;
-                results.push((ledger_seq, has));
-            }
+                let mut results = Vec::new();
+                for row in rows {
+                    let (ledger_seq, json) = row?;
+                    let has: HistoryArchiveState = serde_json::from_str(&json).map_err(|e| {
+                        stellar_core_db::DbError::Integrity(format!("JSON parse failed: {e}"))
+                    })?;
+                    results.push((ledger_seq, has));
+                }
 
-            Ok(results)
-        }).map_err(Into::into)
+                Ok(results)
+            })
+            .map_err(Into::into)
     }
 
     /// Get all bucket hashes referenced by queued checkpoints.
@@ -343,13 +354,11 @@ mod tests {
             server: Some("test".to_string()),
             current_ledger: ledger_seq,
             network_passphrase: Some("Test Network".to_string()),
-            current_buckets: vec![
-                HASBucketLevel {
-                    curr: curr_hash,
-                    snap: snap_hash,
-                    next: HASBucketNext::default(),
-                },
-            ],
+            current_buckets: vec![HASBucketLevel {
+                curr: curr_hash,
+                snap: snap_hash,
+                next: HASBucketNext::default(),
+            }],
             hot_archive_buckets: None,
         }
     }

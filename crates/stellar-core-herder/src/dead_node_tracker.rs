@@ -94,9 +94,13 @@ impl DeadNodeTracker {
     /// Reset the missing nodes set with all transitive quorum members.
     ///
     /// Call this when starting tracking or when the quorum configuration changes.
-    pub fn reset_missing_nodes<'a>(&mut self, transitive_quorum: impl IntoIterator<Item = &'a NodeId>) {
+    pub fn reset_missing_nodes<'a>(
+        &mut self,
+        transitive_quorum: impl IntoIterator<Item = &'a NodeId>,
+    ) {
         self.missing_nodes.clear();
-        self.missing_nodes.extend(transitive_quorum.into_iter().cloned());
+        self.missing_nodes
+            .extend(transitive_quorum.into_iter().cloned());
     }
 
     /// Record that a node has participated in SCP.
@@ -127,7 +131,8 @@ impl DeadNodeTracker {
         self.dead_nodes = std::mem::take(&mut self.missing_nodes);
 
         // Reset missing nodes to all transitive quorum members
-        self.missing_nodes.extend(transitive_quorum.into_iter().cloned());
+        self.missing_nodes
+            .extend(transitive_quorum.into_iter().cloned());
 
         self.last_check = Instant::now();
 
@@ -201,7 +206,9 @@ mod tests {
     fn make_node_id(n: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = n;
-        NodeId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)))
+        NodeId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+            bytes,
+        )))
     }
 
     #[test]

@@ -247,9 +247,9 @@ impl CloseTimeDriftTracker {
             .window
             .values()
             .filter_map(|entry| {
-                entry.externalized_close_time.map(|network| {
-                    network as i64 - entry.local_close_time as i64
-                })
+                entry
+                    .externalized_close_time
+                    .map(|network| network as i64 - entry.local_close_time as i64)
             })
             .collect();
 

@@ -40,9 +40,7 @@ pub const LIQUIDITY_POOL_FEE_V18: i32 = 30;
 #[inline]
 pub fn is_ascii_alphanumeric(c: char) -> bool {
     let uc = c as u8;
-    uc.is_ascii_lowercase()
-        || uc.is_ascii_uppercase()
-        || uc.is_ascii_digit()
+    uc.is_ascii_lowercase() || uc.is_ascii_uppercase() || uc.is_ascii_digit()
 }
 
 /// Check if a character is a printable ASCII non-control character.
@@ -560,7 +558,11 @@ pub fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
 #[inline]
 pub fn round_down<T>(v: T, m: T) -> T
 where
-    T: std::ops::BitAnd<Output = T> + std::ops::Not<Output = T> + std::ops::Sub<Output = T> + Copy + From<u8>,
+    T: std::ops::BitAnd<Output = T>
+        + std::ops::Not<Output = T>
+        + std::ops::Sub<Output = T>
+        + Copy
+        + From<u8>,
 {
     v & !(m - T::from(1u8))
 }

@@ -27,18 +27,17 @@
 //! let hash = frame.hash(&NetworkId::testnet())?;
 //! ```
 
+use soroban_env_host_p25::fees::TransactionResources;
 use stellar_core_common::{Hash256, NetworkId, Resource};
 use stellar_core_crypto::sha256;
-use soroban_env_host_p25::fees::TransactionResources;
+use stellar_xdr::curr::Limits;
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, EnvelopeType, FeeBumpTransactionInnerTx, Hash,
-    InvokeHostFunctionOp, LedgerKey, Memo,
-    MuxedAccount, Operation, OperationBody, Preconditions, SorobanTransactionData,
-    SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
-    TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction, Uint256, VecM,
-    WriteXdr,
+    InvokeHostFunctionOp, LedgerKey, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+    SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
+    TransactionExt, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+    Uint256, VecM, WriteXdr,
 };
-use stellar_xdr::curr::Limits;
 
 use crate::{Result, TxError};
 
@@ -154,10 +153,7 @@ impl TransactionFrame {
     }
 
     /// Convert a V0 transaction to V1 (needed for signature payload).
-    fn v0_to_v1_transaction(
-        &self,
-        v0: &stellar_xdr::curr::TransactionV0,
-    ) -> Result<Transaction> {
+    fn v0_to_v1_transaction(&self, v0: &stellar_xdr::curr::TransactionV0) -> Result<Transaction> {
         // V0 stores raw public key bytes, V1 uses MuxedAccount
         let source_account = MuxedAccount::Ed25519(v0.source_account_ed25519.clone());
 
@@ -432,9 +428,9 @@ impl TransactionFrame {
     }
 
     fn is_restore_footprint_tx(&self) -> bool {
-        self.operations().iter().any(|op| {
-            matches!(op.body, OperationBody::RestoreFootprint(_))
-        })
+        self.operations()
+            .iter()
+            .any(|op| matches!(op.body, OperationBody::RestoreFootprint(_)))
     }
 
     /// Return the resource footprint used for surge pricing and limits.
@@ -452,9 +448,7 @@ impl TransactionFrame {
                 disk_read_bytes: 0,
                 write_bytes: 0,
             };
-            let resources = data
-                .map(|d| &d.resources)
-                .unwrap_or(&fallback_resources);
+            let resources = data.map(|d| &d.resources).unwrap_or(&fallback_resources);
 
             let op_count = 1i64;
             let disk_read_entries = soroban_disk_read_entries(
@@ -590,14 +584,12 @@ impl TransactionFrame {
 /// Convert a MuxedAccount to AccountId.
 pub fn muxed_to_account_id(muxed: &MuxedAccount) -> AccountId {
     match muxed {
-        MuxedAccount::Ed25519(key) => {
-            AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key.clone()))
-        }
-        MuxedAccount::MuxedEd25519(m) => {
-            AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                m.ed25519.clone(),
-            ))
-        }
+        MuxedAccount::Ed25519(key) => AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key.clone()),
+        ),
+        MuxedAccount::MuxedEd25519(m) => AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(m.ed25519.clone()),
+        ),
     }
 }
 
@@ -688,11 +680,12 @@ mod tests {
         create_soroban_transaction_with_fees(0, 100)
     }
 
-    fn create_soroban_transaction_with_fees(resource_fee: i64, total_fee: u32) -> TransactionEnvelope {
+    fn create_soroban_transaction_with_fees(
+        resource_fee: i64,
+        total_fee: u32,
+    ) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
-        let function_name = ScSymbol(
-            StringM::<32>::try_from("test".to_string()).expect("symbol")
-        );
+        let function_name = ScSymbol(StringM::<32>::try_from("test".to_string()).expect("symbol"));
         let host_function = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
                 Uint256([3u8; 32]),
@@ -713,9 +706,9 @@ mod tests {
                 account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32]))),
             }),
             LedgerKey::ContractData(LedgerKeyContractData {
-                contract: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
-                    Uint256([5u8; 32]),
-                ))),
+                contract: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [5u8; 32],
+                )))),
                 key: ScVal::I32(0),
                 durability: ContractDataDurability::Persistent,
             }),

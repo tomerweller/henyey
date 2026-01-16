@@ -29,14 +29,14 @@ cargo build --release -p rs-stellar-core
 
 | Metric | Value |
 |--------|-------|
-| Ledgers verified | 4068 (933-5000) |
-| Transactions verified | 5108 |
-| Phase 1 (fees) matched | 5108 (100%) |
-| Phase 2 (execution) matched | 5108 (100%) |
-| Phase 2 mismatched | 0 |
-| Ledgers with mismatches | 0 |
+| Ledgers verified | 5001 (5000-10000) |
+| Transactions verified | 6552 |
+| Phase 1 (fees) matched | 6552 (100%) |
+| Phase 2 (execution) matched | 6535 (99.7%) |
+| Phase 2 mismatched | 17 |
+| Ledgers with mismatches | 16 |
 
-**Status: All transactions in range 933-5000 now match!**
+**Status: Fixed RevokeSponsorship DoesNotExist issue at ledger 7512. Remaining mismatches are metadata tracking issues (not functional failures).**
 
 ## Issue Categories
 

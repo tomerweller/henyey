@@ -9,12 +9,12 @@ use std::collections::HashSet;
 
 use stellar_xdr::curr::{
     AllowTrustOp, BeginSponsoringFutureReservesOp, BumpSequenceOp, ChangeTrustOp,
-    ClaimClaimableBalanceOp, ClawbackClaimableBalanceOp, ClawbackOp, CreateAccountOp,
-    CreateClaimableBalanceOp, CreatePassiveSellOfferOp, ExtendFootprintTtlOp,
+    ClaimClaimableBalanceOp, ClaimPredicate, Claimant, ClawbackClaimableBalanceOp, ClawbackOp,
+    CreateAccountOp, CreateClaimableBalanceOp, CreatePassiveSellOfferOp, ExtendFootprintTtlOp,
     InvokeHostFunctionOp, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
     ManageDataOp, ManageSellOfferOp, MuxedAccount, Operation, OperationBody,
     PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp,
-    SetOptionsOp, SetTrustLineFlagsOp, ClaimPredicate, Claimant,
+    SetOptionsOp, SetTrustLineFlagsOp,
 };
 
 /// Enumeration of all operation types in Stellar.
@@ -197,9 +197,7 @@ impl std::fmt::Display for OperationValidationError {
 }
 
 /// Validate an operation.
-pub fn validate_operation(
-    op: &Operation,
-) -> std::result::Result<(), OperationValidationError> {
+pub fn validate_operation(op: &Operation) -> std::result::Result<(), OperationValidationError> {
     match &op.body {
         OperationBody::CreateAccount(op) => validate_create_account(op),
         OperationBody::Payment(op) => validate_payment(op),
@@ -668,8 +666,8 @@ pub fn get_needed_threshold(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    use crate::operations::OperationType; // Re-import to shadow XDR's OperationType
+    use crate::operations::OperationType;
+    use stellar_xdr::curr::*; // Re-import to shadow XDR's OperationType
 
     #[test]
     fn test_operation_type_from_body() {
@@ -897,7 +895,10 @@ mod tests {
                 starting_balance: 10_000_000,
             }),
         };
-        assert_eq!(get_threshold_level(&create_account_op), ThresholdLevel::Medium);
+        assert_eq!(
+            get_threshold_level(&create_account_op),
+            ThresholdLevel::Medium
+        );
 
         // ChangeTrust
         let change_trust_op = Operation {
@@ -907,7 +908,10 @@ mod tests {
                 limit: 1000,
             }),
         };
-        assert_eq!(get_threshold_level(&change_trust_op), ThresholdLevel::Medium);
+        assert_eq!(
+            get_threshold_level(&change_trust_op),
+            ThresholdLevel::Medium
+        );
 
         // ManageData
         let manage_data_op = Operation {
@@ -944,7 +948,10 @@ mod tests {
                 signer: None,
             }),
         };
-        assert_eq!(get_threshold_level(&set_options_threshold_op), ThresholdLevel::High);
+        assert_eq!(
+            get_threshold_level(&set_options_threshold_op),
+            ThresholdLevel::High
+        );
 
         // SetOptions with signer change
         let set_options_signer_op = Operation {
@@ -964,7 +971,10 @@ mod tests {
                 }),
             }),
         };
-        assert_eq!(get_threshold_level(&set_options_signer_op), ThresholdLevel::High);
+        assert_eq!(
+            get_threshold_level(&set_options_signer_op),
+            ThresholdLevel::High
+        );
 
         // SetOptions with master weight change
         let set_options_master_op = Operation {
@@ -981,7 +991,10 @@ mod tests {
                 signer: None,
             }),
         };
-        assert_eq!(get_threshold_level(&set_options_master_op), ThresholdLevel::High);
+        assert_eq!(
+            get_threshold_level(&set_options_master_op),
+            ThresholdLevel::High
+        );
     }
 
     #[test]
@@ -990,7 +1003,9 @@ mod tests {
         let set_options_basic_op = Operation {
             source_account: None,
             body: OperationBody::SetOptions(SetOptionsOp {
-                inflation_dest: Some(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])))),
+                inflation_dest: Some(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [0u8; 32],
+                )))),
                 clear_flags: None,
                 set_flags: None,
                 master_weight: None,
@@ -1001,7 +1016,10 @@ mod tests {
                 signer: None,
             }),
         };
-        assert_eq!(get_threshold_level(&set_options_basic_op), ThresholdLevel::Medium);
+        assert_eq!(
+            get_threshold_level(&set_options_basic_op),
+            ThresholdLevel::Medium
+        );
 
         // SetOptions with only home domain change
         let set_options_domain_op = Operation {
@@ -1014,16 +1032,23 @@ mod tests {
                 low_threshold: None,
                 med_threshold: None,
                 high_threshold: None,
-                home_domain: Some(stellar_xdr::curr::String32::try_from(b"example.com".to_vec()).unwrap()),
+                home_domain: Some(
+                    stellar_xdr::curr::String32::try_from(b"example.com".to_vec()).unwrap(),
+                ),
                 signer: None,
             }),
         };
-        assert_eq!(get_threshold_level(&set_options_domain_op), ThresholdLevel::Medium);
+        assert_eq!(
+            get_threshold_level(&set_options_domain_op),
+            ThresholdLevel::Medium
+        );
     }
 
     #[test]
     fn test_get_needed_threshold() {
-        use stellar_xdr::curr::{AccountEntry, AccountEntryExt, SequenceNumber, String32, Thresholds, VecM};
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, SequenceNumber, String32, Thresholds, VecM,
+        };
 
         let account = AccountEntry {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),

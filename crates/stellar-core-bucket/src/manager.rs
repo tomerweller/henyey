@@ -169,10 +169,8 @@ impl BucketManager {
         live_entries: Vec<LedgerEntry>,
         dead_entries: Vec<LedgerKey>,
     ) -> Result<Arc<Bucket>> {
-        let mut entries: Vec<BucketEntry> = live_entries
-            .into_iter()
-            .map(BucketEntry::Live)
-            .collect();
+        let mut entries: Vec<BucketEntry> =
+            live_entries.into_iter().map(BucketEntry::Live).collect();
 
         entries.extend(dead_entries.into_iter().map(BucketEntry::Dead));
 
@@ -225,7 +223,10 @@ impl BucketManager {
     /// This method loads and parses the bucket file with the correct entry type.
     ///
     /// Note: Hot archive buckets are not cached (they use a different entry type).
-    pub fn load_hot_archive_bucket(&self, hash: &Hash256) -> Result<crate::hot_archive::HotArchiveBucket> {
+    pub fn load_hot_archive_bucket(
+        &self,
+        hash: &Hash256,
+    ) -> Result<crate::hot_archive::HotArchiveBucket> {
         // Check if it's the empty bucket
         if hash.is_zero() {
             return Ok(crate::hot_archive::HotArchiveBucket::empty());
@@ -467,8 +468,8 @@ pub struct BucketManagerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
     use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
+    use stellar_xdr::curr::*;
     use tempfile::TempDir;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {

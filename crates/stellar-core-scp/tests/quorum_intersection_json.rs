@@ -3,8 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use stellar_core_scp::{is_quorum, is_quorum_slice};
 use stellar_core_scp::quorum_config::parse_node_id;
+use stellar_core_scp::{is_quorum, is_quorum_slice};
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
 #[derive(Debug, Deserialize)]
@@ -120,7 +120,10 @@ fn test_no_quorum_intersection() {
 #[test]
 fn test_bad_key() {
     let err = load_quorum_map("bad-key.json").unwrap_err();
-    assert!(err.contains("invalid public key") || err.contains("Invalid public key"), "{err}");
+    assert!(
+        err.contains("invalid public key") || err.contains("Invalid public key"),
+        "{err}"
+    );
 }
 
 #[test]

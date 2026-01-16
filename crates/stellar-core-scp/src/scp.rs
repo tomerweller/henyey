@@ -46,7 +46,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use stellar_xdr::curr::{NodeId, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value};
+use stellar_xdr::curr::{
+    NodeId, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value,
+};
 
 use crate::driver::SCPDriver;
 use crate::slot::Slot;
@@ -775,16 +777,18 @@ impl<D: SCPDriver> SCP<D> {
 
         // Check ballot protocol
         let ballot_state = slot.ballot().get_node_state(node_id);
-        let ballot_counter = slot
-            .ballot()
-            .latest_envelopes()
-            .get(node_id)
-            .and_then(|env| match &env.statement.pledges {
-                stellar_xdr::curr::ScpStatementPledges::Prepare(p) => Some(p.ballot.counter),
-                stellar_xdr::curr::ScpStatementPledges::Confirm(c) => Some(c.ballot.counter),
-                stellar_xdr::curr::ScpStatementPledges::Externalize(e) => Some(e.commit.counter),
-                _ => None,
-            });
+        let ballot_counter =
+            slot.ballot()
+                .latest_envelopes()
+                .get(node_id)
+                .and_then(|env| match &env.statement.pledges {
+                    stellar_xdr::curr::ScpStatementPledges::Prepare(p) => Some(p.ballot.counter),
+                    stellar_xdr::curr::ScpStatementPledges::Confirm(c) => Some(c.ballot.counter),
+                    stellar_xdr::curr::ScpStatementPledges::Externalize(e) => {
+                        Some(e.commit.counter)
+                    }
+                    _ => None,
+                });
 
         Some(crate::NodeInfo {
             state: format!("{:?}", ballot_state),

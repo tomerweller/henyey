@@ -92,11 +92,9 @@ impl LedgerQueries for Connection {
     fn get_latest_ledger_seq(&self) -> Result<Option<u32>, DbError> {
         // MAX() returns NULL when the table is empty, so we get the value optionally
         let result: Option<Option<u32>> = self
-            .query_row(
-                "SELECT MAX(ledgerseq) FROM ledgerheaders",
-                [],
-                |row| row.get::<_, Option<u32>>(0),
-            )
+            .query_row("SELECT MAX(ledgerseq) FROM ledgerheaders", [], |row| {
+                row.get::<_, Option<u32>>(0)
+            })
             .optional()?;
         Ok(result.flatten())
     }
@@ -112,9 +110,8 @@ impl LedgerQueries for Connection {
 
         match result {
             Some(hex) => {
-                let hash = Hash256::from_hex(&hex).map_err(|e| {
-                    DbError::Integrity(format!("Invalid ledger hash: {}", e))
-                })?;
+                let hash = Hash256::from_hex(&hex)
+                    .map_err(|e| DbError::Integrity(format!("Invalid ledger hash: {}", e)))?;
                 Ok(Some(hash))
             }
             None => Ok(None),

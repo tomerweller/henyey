@@ -28,8 +28,8 @@
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use stellar_xdr::curr::{
-    BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry,
-    LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr,
+    BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry, LedgerEntry,
+    LedgerKey, Limits, ReadXdr, WriteXdr,
 };
 
 use stellar_core_common::Hash256;
@@ -217,8 +217,8 @@ impl HotArchiveBucket {
     ///
     /// This parses a bucket file containing `HotArchiveBucketEntry` values.
     pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        use std::io::{BufReader, Read};
         use flate2::read::GzDecoder;
+        use std::io::{BufReader, Read};
 
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
@@ -413,7 +413,12 @@ impl HotArchiveBucketLevel {
             self.curr.clone()
         };
 
-        let merged = merge_hot_archive_buckets(&curr_for_merge, &incoming, protocol_version, keep_tombstones)?;
+        let merged = merge_hot_archive_buckets(
+            &curr_for_merge,
+            &incoming,
+            protocol_version,
+            keep_tombstones,
+        )?;
         self.next = Some(merged);
         Ok(())
     }
@@ -514,7 +519,8 @@ impl HotArchiveBucketList {
         //
         // We match this behavior by always calling fresh(), which creates a bucket
         // with at least a metaentry.
-        let new_bucket = HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
+        let new_bucket =
+            HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
         tracing::info!(
             ledger_seq = ledger_seq,
             new_bucket_hash = %new_bucket.hash().to_hex(),
@@ -535,7 +541,9 @@ impl HotArchiveBucketList {
         new_bucket: HotArchiveBucket,
     ) -> Result<()> {
         if ledger_seq == 0 {
-            return Err(BucketError::Merge("ledger sequence must be > 0".to_string()));
+            return Err(BucketError::Merge(
+                "ledger sequence must be > 0".to_string(),
+            ));
         }
 
         // Process spills from highest level down
@@ -546,7 +554,12 @@ impl HotArchiveBucketList {
 
                 let keep_tombstones = Self::keep_tombstone_entries(i);
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
-                self.levels[i].prepare(protocol_version, spilling_snap, keep_tombstones, use_empty_curr)?;
+                self.levels[i].prepare(
+                    protocol_version,
+                    spilling_snap,
+                    keep_tombstones,
+                    use_empty_curr,
+                )?;
             }
         }
 
@@ -674,8 +687,18 @@ impl HotArchiveBucketList {
         for (i, level) in self.levels.iter().enumerate() {
             let curr_hash = level.curr.hash();
             let snap_hash = level.snap.hash();
-            let next_hash = level.next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string());
-            eprintln!("  HA_L{}: curr={}, snap={}, next={}", i, curr_hash.to_hex(), snap_hash.to_hex(), next_hash);
+            let next_hash = level
+                .next
+                .as_ref()
+                .map(|b| b.hash().to_hex())
+                .unwrap_or_else(|| "None".to_string());
+            eprintln!(
+                "  HA_L{}: curr={}, snap={}, next={}",
+                i,
+                curr_hash.to_hex(),
+                snap_hash.to_hex(),
+                next_hash
+            );
         }
     }
 
@@ -723,7 +746,10 @@ impl HotArchiveBucketList {
             levels.push(level);
         }
 
-        Ok(Self { levels, ledger_seq: 0 })
+        Ok(Self {
+            levels,
+            ledger_seq: 0,
+        })
     }
 
     /// Restore a hot archive bucket list from History Archive State with full FutureBucket support.
@@ -799,7 +825,10 @@ impl HotArchiveBucketList {
             levels.push(level);
         }
 
-        Ok(Self { levels, ledger_seq: 0 })
+        Ok(Self {
+            levels,
+            ledger_seq: 0,
+        })
     }
 
     /// Restart any pending merges after restoring from a History Archive State (HAS).
@@ -911,13 +940,12 @@ fn hot_archive_entry_to_key(entry: &HotArchiveBucketEntry) -> Result<Vec<u8>> {
             let key = ledger_entry_to_key(e).ok_or_else(|| {
                 BucketError::Serialization("failed to extract key from entry".to_string())
             })?;
-            key.to_xdr(Limits::none()).map_err(|e| {
-                BucketError::Serialization(format!("failed to serialize key: {}", e))
-            })
+            key.to_xdr(Limits::none())
+                .map_err(|e| BucketError::Serialization(format!("failed to serialize key: {}", e)))
         }
-        HotArchiveBucketEntry::Live(key) => key.to_xdr(Limits::none()).map_err(|e| {
-            BucketError::Serialization(format!("failed to serialize key: {}", e))
-        }),
+        HotArchiveBucketEntry::Live(key) => key
+            .to_xdr(Limits::none())
+            .map_err(|e| BucketError::Serialization(format!("failed to serialize key: {}", e))),
         HotArchiveBucketEntry::Metaentry(_) => {
             // Metadata uses a special key (empty)
             Ok(Vec::new())
@@ -989,30 +1017,22 @@ fn compare_ledger_keys(a: &LedgerKey, b: &LedgerKey) -> std::cmp::Ordering {
     // Same type, compare by type-specific fields
     match (a, b) {
         (Account(a), Account(b)) => a.account_id.cmp(&b.account_id),
-        (Trustline(a), Trustline(b)) => {
-            match a.account_id.cmp(&b.account_id) {
-                Ordering::Equal => compare_trust_line_asset(&a.asset, &b.asset),
-                other => other,
-            }
-        }
-        (Offer(a), Offer(b)) => {
-            match a.seller_id.cmp(&b.seller_id) {
-                Ordering::Equal => a.offer_id.cmp(&b.offer_id),
-                other => other,
-            }
-        }
-        (Data(a), Data(b)) => {
-            match a.account_id.cmp(&b.account_id) {
-                Ordering::Equal => a.data_name.as_slice().cmp(b.data_name.as_slice()),
-                other => other,
-            }
-        }
+        (Trustline(a), Trustline(b)) => match a.account_id.cmp(&b.account_id) {
+            Ordering::Equal => compare_trust_line_asset(&a.asset, &b.asset),
+            other => other,
+        },
+        (Offer(a), Offer(b)) => match a.seller_id.cmp(&b.seller_id) {
+            Ordering::Equal => a.offer_id.cmp(&b.offer_id),
+            other => other,
+        },
+        (Data(a), Data(b)) => match a.account_id.cmp(&b.account_id) {
+            Ordering::Equal => a.data_name.as_slice().cmp(b.data_name.as_slice()),
+            other => other,
+        },
         (ClaimableBalance(a), ClaimableBalance(b)) => {
             compare_claimable_balance_id(&a.balance_id, &b.balance_id)
         }
-        (LiquidityPool(a), LiquidityPool(b)) => {
-            a.liquidity_pool_id.0.cmp(&b.liquidity_pool_id.0)
-        }
+        (LiquidityPool(a), LiquidityPool(b)) => a.liquidity_pool_id.0.cmp(&b.liquidity_pool_id.0),
         (ContractData(a), ContractData(b)) => {
             let addr_cmp = compare_sc_address(&a.contract, &b.contract);
             if addr_cmp != Ordering::Equal {
@@ -1053,8 +1073,8 @@ fn compare_trust_line_asset(
     a: &stellar_xdr::curr::TrustLineAsset,
     b: &stellar_xdr::curr::TrustLineAsset,
 ) -> std::cmp::Ordering {
-    use stellar_xdr::curr::TrustLineAsset::*;
     use std::cmp::Ordering;
+    use stellar_xdr::curr::TrustLineAsset::*;
 
     let type_a = match a {
         Native => 0,
@@ -1075,18 +1095,14 @@ fn compare_trust_line_asset(
 
     match (a, b) {
         (Native, Native) => Ordering::Equal,
-        (CreditAlphanum4(a), CreditAlphanum4(b)) => {
-            match a.asset_code.cmp(&b.asset_code) {
-                Ordering::Equal => a.issuer.cmp(&b.issuer),
-                other => other,
-            }
-        }
-        (CreditAlphanum12(a), CreditAlphanum12(b)) => {
-            match a.asset_code.cmp(&b.asset_code) {
-                Ordering::Equal => a.issuer.cmp(&b.issuer),
-                other => other,
-            }
-        }
+        (CreditAlphanum4(a), CreditAlphanum4(b)) => match a.asset_code.cmp(&b.asset_code) {
+            Ordering::Equal => a.issuer.cmp(&b.issuer),
+            other => other,
+        },
+        (CreditAlphanum12(a), CreditAlphanum12(b)) => match a.asset_code.cmp(&b.asset_code) {
+            Ordering::Equal => a.issuer.cmp(&b.issuer),
+            other => other,
+        },
         (PoolShare(a), PoolShare(b)) => a.0.cmp(&b.0),
         _ => Ordering::Equal,
     }
@@ -1117,9 +1133,12 @@ fn compare_sc_address(
 ///
 /// This uses XDR byte comparison as a fallback for complex types,
 /// which should be correct for most practical cases.
-fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) -> std::cmp::Ordering {
-    use stellar_xdr::curr::ScVal::*;
+fn compare_sc_val(
+    a: &stellar_xdr::curr::ScVal,
+    b: &stellar_xdr::curr::ScVal,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    use stellar_xdr::curr::ScVal::*;
 
     // Compare by type discriminant first
     let type_a = sc_val_type_discriminant(a);
@@ -1144,18 +1163,14 @@ fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) ->
         (I64(a), I64(b)) => a.cmp(b),
         (Timepoint(a), Timepoint(b)) => a.cmp(b),
         (Duration(a), Duration(b)) => a.cmp(b),
-        (U128(a), U128(b)) => {
-            match a.hi.cmp(&b.hi) {
-                Ordering::Equal => a.lo.cmp(&b.lo),
-                other => other,
-            }
-        }
-        (I128(a), I128(b)) => {
-            match a.hi.cmp(&b.hi) {
-                Ordering::Equal => a.lo.cmp(&b.lo),
-                other => other,
-            }
-        }
+        (U128(a), U128(b)) => match a.hi.cmp(&b.hi) {
+            Ordering::Equal => a.lo.cmp(&b.lo),
+            other => other,
+        },
+        (I128(a), I128(b)) => match a.hi.cmp(&b.hi) {
+            Ordering::Equal => a.lo.cmp(&b.lo),
+            other => other,
+        },
         (U256(a), U256(b)) => {
             for (a_part, b_part) in [
                 (a.hi_hi, b.hi_hi),
@@ -1179,43 +1194,37 @@ fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) ->
         (Bytes(a), Bytes(b)) => a.as_slice().cmp(b.as_slice()),
         (String(a), String(b)) => a.as_slice().cmp(b.as_slice()),
         (Symbol(a), Symbol(b)) => a.as_slice().cmp(b.as_slice()),
-        (Vec(a_opt), Vec(b_opt)) => {
-            match (a_opt, b_opt) {
-                (Some(a), Some(b)) => {
-                    for (a_elem, b_elem) in a.iter().zip(b.iter()) {
-                        match compare_sc_val(a_elem, b_elem) {
+        (Vec(a_opt), Vec(b_opt)) => match (a_opt, b_opt) {
+            (Some(a), Some(b)) => {
+                for (a_elem, b_elem) in a.iter().zip(b.iter()) {
+                    match compare_sc_val(a_elem, b_elem) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        },
+        (Map(a_opt), Map(b_opt)) => match (a_opt, b_opt) {
+            (Some(a), Some(b)) => {
+                for (a_entry, b_entry) in a.iter().zip(b.iter()) {
+                    match compare_sc_val(&a_entry.key, &b_entry.key) {
+                        Ordering::Equal => match compare_sc_val(&a_entry.val, &b_entry.val) {
                             Ordering::Equal => continue,
                             other => return other,
-                        }
+                        },
+                        other => return other,
                     }
-                    a.len().cmp(&b.len())
                 }
-                (Some(_), None) => Ordering::Greater,
-                (None, Some(_)) => Ordering::Less,
-                (None, None) => Ordering::Equal,
+                a.len().cmp(&b.len())
             }
-        }
-        (Map(a_opt), Map(b_opt)) => {
-            match (a_opt, b_opt) {
-                (Some(a), Some(b)) => {
-                    for (a_entry, b_entry) in a.iter().zip(b.iter()) {
-                        match compare_sc_val(&a_entry.key, &b_entry.key) {
-                            Ordering::Equal => {
-                                match compare_sc_val(&a_entry.val, &b_entry.val) {
-                                    Ordering::Equal => continue,
-                                    other => return other,
-                                }
-                            }
-                            other => return other,
-                        }
-                    }
-                    a.len().cmp(&b.len())
-                }
-                (Some(_), None) => Ordering::Greater,
-                (None, Some(_)) => Ordering::Less,
-                (None, None) => Ordering::Equal,
-            }
-        }
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        },
         (Address(a), Address(b)) => compare_sc_address(a, b),
         (LedgerKeyContractInstance, LedgerKeyContractInstance) => Ordering::Equal,
         (LedgerKeyNonce(a), LedgerKeyNonce(b)) => a.nonce.cmp(&b.nonce),
@@ -1391,7 +1400,11 @@ mod tests {
         })
     }
 
-    fn make_contract_data_entry(contract_id: [u8; 32], key_bytes: &[u8], value: i64) -> LedgerEntry {
+    fn make_contract_data_entry(
+        contract_id: [u8; 32],
+        key_bytes: &[u8],
+        value: i64,
+    ) -> LedgerEntry {
         LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractData(ContractDataEntry {
@@ -1563,7 +1576,10 @@ mod tests {
         // Live from snap (newer) wins - entry exists but is a tombstone
         let entry_result = merged.get(&key).unwrap();
         assert!(entry_result.is_some());
-        assert!(matches!(entry_result.unwrap(), HotArchiveBucketEntry::Live(_)));
+        assert!(matches!(
+            entry_result.unwrap(),
+            HotArchiveBucketEntry::Live(_)
+        ));
     }
 
     #[test]
@@ -1618,7 +1634,8 @@ mod tests {
         .unwrap();
 
         // keep_tombstones = false (bottom level)
-        let merged = merge_hot_archive_buckets(&bucket, &HotArchiveBucket::empty(), 25, false).unwrap();
+        let merged =
+            merge_hot_archive_buckets(&bucket, &HotArchiveBucket::empty(), 25, false).unwrap();
 
         // Live entry should be dropped
         assert!(merged.get(&key).unwrap().is_none());

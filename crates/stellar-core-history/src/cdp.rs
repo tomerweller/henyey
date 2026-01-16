@@ -377,7 +377,9 @@ impl CachedCdpDataLake {
         let url = self.inner.url_for_ledger(ledger_seq);
         tracing::debug!(ledger_seq, url = %url, "Fetching LedgerCloseMeta from CDP");
 
-        let response = self.inner.client
+        let response = self
+            .inner
+            .client
             .get(&url)
             .send()
             .await
@@ -401,7 +403,8 @@ impl CachedCdpDataLake {
             tracing::warn!(ledger_seq, error = %e, "Failed to cache CDP data");
         }
 
-        self.inner.decompress_and_parse(&compressed_data, ledger_seq)
+        self.inner
+            .decompress_and_parse(&compressed_data, ledger_seq)
     }
 
     /// Prefetch multiple ledgers in parallel.
@@ -411,9 +414,7 @@ impl CachedCdpDataLake {
     pub async fn prefetch(&self, start: u32, end: u32) -> usize {
         use futures::stream::{self, StreamExt};
 
-        let to_fetch: Vec<u32> = (start..=end)
-            .filter(|seq| !self.is_cached(*seq))
-            .collect();
+        let to_fetch: Vec<u32> = (start..=end).filter(|seq| !self.is_cached(*seq)).collect();
 
         if to_fetch.is_empty() {
             return 0;
@@ -445,9 +446,7 @@ impl CachedCdpDataLake {
         use futures::stream::{self, StreamExt};
 
         // Prefetch all uncached ledgers in parallel first
-        let uncached: Vec<u32> = (start..=end)
-            .filter(|seq| !self.is_cached(*seq))
-            .collect();
+        let uncached: Vec<u32> = (start..=end).filter(|seq| !self.is_cached(*seq)).collect();
 
         if !uncached.is_empty() {
             let total = uncached.len();
@@ -463,7 +462,8 @@ impl CachedCdpDataLake {
                     let downloaded = &downloaded;
                     async move {
                         self.fetch_and_cache(seq).await?;
-                        let count = downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let count =
+                            downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if count % 10 == 0 || count == total as u32 {
                             tracing::info!("  Prefetched {}/{} ledgers", count, total);
                         }
@@ -858,12 +858,17 @@ pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::Le
 ///     restoredHotArchiveKeys.push_back(key);
 /// }
 /// ```
-pub fn extract_restored_keys(tx_metas: &[stellar_xdr::curr::TransactionMeta]) -> Vec<stellar_xdr::curr::LedgerKey> {
+pub fn extract_restored_keys(
+    tx_metas: &[stellar_xdr::curr::TransactionMeta],
+) -> Vec<stellar_xdr::curr::LedgerKey> {
     use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, TransactionMeta};
 
     let mut restored_keys = Vec::new();
 
-    fn process_change(change: &LedgerEntryChange, restored_keys: &mut Vec<stellar_xdr::curr::LedgerKey>) {
+    fn process_change(
+        change: &LedgerEntryChange,
+        restored_keys: &mut Vec<stellar_xdr::curr::LedgerKey>,
+    ) {
         if let LedgerEntryChange::Restored(entry) = change {
             if let Some(key) = stellar_core_bucket::ledger_entry_to_key(entry) {
                 // Only CONTRACT_DATA and CONTRACT_CODE keys go to hot archive.

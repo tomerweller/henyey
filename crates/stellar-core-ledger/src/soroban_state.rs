@@ -45,16 +45,16 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use stellar_core_common::Hash256;
 use soroban_env_host_p25::budget::Budget;
 use soroban_env_host_p25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
 use soroban_env_host_p25::xdr as soroban_xdr_p25;
 use soroban_xdr_p25::ReadXdr;
+use stellar_core_common::Hash256;
+use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
 use stellar_xdr::curr::{
     ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
     LedgerKeyContractData, LedgerKeyTtl, Limits, TtlEntry, WriteXdr,
 };
-use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
 use tracing::{debug, trace};
 
 use crate::{LedgerError, Result};
@@ -141,8 +141,13 @@ fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
 
     let instruction_limit = config.tx_max_instructions.saturating_mul(2);
     let memory_limit = config.tx_max_memory_bytes.saturating_mul(2);
-    Budget::try_from_configs(instruction_limit, memory_limit, cpu_cost_params, mem_cost_params)
-        .unwrap_or_else(|_| Budget::default())
+    Budget::try_from_configs(
+        instruction_limit,
+        memory_limit,
+        cpu_cost_params,
+        mem_cost_params,
+    )
+    .unwrap_or_else(|_| Budget::default())
 }
 
 /// A contract data entry with co-located TTL.
@@ -685,12 +690,10 @@ impl InMemorySorobanState {
 
     fn ttl_from_entry(&self, entry: &LedgerEntry) -> Result<(LedgerKeyTtl, TtlData)> {
         let (key_hash, ttl_data) = match &entry.data {
-            LedgerEntryData::Ttl(ttl) => {
-                (
-                    ttl.key_hash.0,
-                    TtlData::new(ttl.live_until_ledger_seq, entry.last_modified_ledger_seq),
-                )
-            }
+            LedgerEntryData::Ttl(ttl) => (
+                ttl.key_hash.0,
+                TtlData::new(ttl.live_until_ledger_seq, entry.last_modified_ledger_seq),
+            ),
             _ => return Err(LedgerError::InvalidEntry("not a TTL entry".into())),
         };
 
@@ -1110,7 +1113,14 @@ mod tests {
         let code_entry = make_contract_code_entry([2u8; 32]);
 
         state
-            .update_state(1, &[data_entry.clone(), code_entry.clone()], &[], &[], 25, None)
+            .update_state(
+                1,
+                &[data_entry.clone(), code_entry.clone()],
+                &[],
+                &[],
+                25,
+                None,
+            )
             .unwrap();
 
         assert_eq!(state.ledger_seq(), 1);

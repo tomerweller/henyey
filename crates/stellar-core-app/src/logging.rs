@@ -155,20 +155,20 @@ impl LogConfig {
 ///
 /// These map to Rust module targets for filtering purposes.
 pub const LOG_PARTITIONS: &[(&str, &str)] = &[
-    ("Fs", "stellar_core"),           // Filesystem operations
-    ("SCP", "stellar_core_scp"),      // SCP consensus
-    ("Bucket", "stellar_core_bucket"), // Bucket list
-    ("Database", "stellar_core_db"),  // Database operations
-    ("History", "stellar_core_history"), // History archives
-    ("Process", "stellar_core_app"),  // Application process
-    ("Ledger", "stellar_core_ledger"), // Ledger operations
-    ("Overlay", "stellar_core_overlay"), // P2P overlay
-    ("Herder", "stellar_core_herder"), // Herder consensus coordination
-    ("Tx", "stellar_core_tx"),        // Transaction processing
+    ("Fs", "stellar_core"),                   // Filesystem operations
+    ("SCP", "stellar_core_scp"),              // SCP consensus
+    ("Bucket", "stellar_core_bucket"),        // Bucket list
+    ("Database", "stellar_core_db"),          // Database operations
+    ("History", "stellar_core_history"),      // History archives
+    ("Process", "stellar_core_app"),          // Application process
+    ("Ledger", "stellar_core_ledger"),        // Ledger operations
+    ("Overlay", "stellar_core_overlay"),      // P2P overlay
+    ("Herder", "stellar_core_herder"),        // Herder consensus coordination
+    ("Tx", "stellar_core_tx"),                // Transaction processing
     ("LoadGen", "stellar_core_app::loadgen"), // Load generation
-    ("Work", "stellar_core_work"),    // Work scheduler
-    ("Invariant", "stellar_core_invariant"), // Invariants
-    ("Perf", "stellar_core_app::perf"), // Performance metrics
+    ("Work", "stellar_core_work"),            // Work scheduler
+    ("Invariant", "stellar_core_invariant"),  // Invariants
+    ("Perf", "stellar_core_app::perf"),       // Performance metrics
 ];
 
 /// Handle for dynamically changing log levels at runtime.
@@ -237,12 +237,19 @@ impl LogLevelHandle {
     pub fn get_levels(&self) -> HashMap<String, String> {
         let levels = self.levels.read().unwrap();
         let mut result = levels.clone();
-        result.insert("Global".to_string(), self.global_level.read().unwrap().clone());
+        result.insert(
+            "Global".to_string(),
+            self.global_level.read().unwrap().clone(),
+        );
         result
     }
 
     /// Build an EnvFilter from the current level configuration.
-    fn build_filter(&self, global_level: &str, partition_override: Option<(&str, &str)>) -> anyhow::Result<EnvFilter> {
+    fn build_filter(
+        &self,
+        global_level: &str,
+        partition_override: Option<(&str, &str)>,
+    ) -> anyhow::Result<EnvFilter> {
         let mut filter = EnvFilter::new(global_level)
             .add_directive("hyper=warn".parse()?)
             .add_directive("reqwest=warn".parse()?)
@@ -638,11 +645,7 @@ impl CatchupProgress {
         let applied = self.ledgers_applied.fetch_add(1, Ordering::Relaxed) + 1;
         if applied % 100 == 0 {
             let target = self.target_ledger.load(Ordering::Relaxed);
-            tracing::info!(
-                applied = applied,
-                target = target,
-                "Applied ledgers"
-            );
+            tracing::info!(applied = applied, target = target, "Applied ledgers");
         }
     }
 
@@ -694,8 +697,8 @@ mod tests {
 
     #[test]
     fn test_progress_tracker() {
-        let tracker = ProgressTracker::with_total("test", 100)
-            .with_report_interval(Duration::from_millis(1));
+        let tracker =
+            ProgressTracker::with_total("test", 100).with_report_interval(Duration::from_millis(1));
 
         assert_eq!(tracker.processed(), 0);
 
@@ -743,8 +746,20 @@ mod tests {
     fn test_log_partitions_complete() {
         // Verify all expected partitions are defined
         let expected = [
-            "Fs", "SCP", "Bucket", "Database", "History", "Process",
-            "Ledger", "Overlay", "Herder", "Tx", "LoadGen", "Work", "Invariant", "Perf",
+            "Fs",
+            "SCP",
+            "Bucket",
+            "Database",
+            "History",
+            "Process",
+            "Ledger",
+            "Overlay",
+            "Herder",
+            "Tx",
+            "LoadGen",
+            "Work",
+            "Invariant",
+            "Perf",
         ];
         for partition in expected {
             assert!(

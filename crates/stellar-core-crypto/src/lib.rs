@@ -55,8 +55,8 @@ mod keys;
 mod random;
 mod sealed_box;
 mod short_hash;
-mod signer_key;
 mod signature;
+mod signer_key;
 mod strkey;
 
 pub use curve25519::*;
@@ -66,8 +66,8 @@ pub use keys::*;
 pub use random::*;
 pub use sealed_box::*;
 pub use short_hash::*;
-pub use signer_key::*;
 pub use signature::*;
+pub use signer_key::*;
 pub use strkey::*;
 
 // Re-export Hash256 from common for convenience

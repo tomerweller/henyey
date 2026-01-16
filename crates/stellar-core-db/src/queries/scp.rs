@@ -90,9 +90,8 @@ impl ScpQueries for Connection {
     }
 
     fn load_scp_history(&self, ledger_seq: u32) -> Result<Vec<ScpEnvelope>, DbError> {
-        let mut stmt = self.prepare(
-            "SELECT envelope FROM scphistory WHERE ledgerseq = ?1 ORDER BY nodeid",
-        )?;
+        let mut stmt =
+            self.prepare("SELECT envelope FROM scphistory WHERE ledgerseq = ?1 ORDER BY nodeid")?;
         let rows = stmt.query_map(params![ledger_seq], |row| row.get::<_, Vec<u8>>(0))?;
         let mut envelopes = Vec::new();
         for row in rows {
@@ -147,7 +146,10 @@ impl ScpQueries for Connection {
             )
             .optional()?;
         match result {
-            Some(data) => Ok(Some(ScpQuorumSet::from_xdr(data.as_slice(), Limits::none())?)),
+            Some(data) => Ok(Some(ScpQuorumSet::from_xdr(
+                data.as_slice(),
+                Limits::none(),
+            )?)),
             None => Ok(None),
         }
     }
@@ -296,10 +298,7 @@ impl ScpStatePersistenceQueries for Connection {
         }
 
         for key in keys_to_delete {
-            self.execute(
-                "DELETE FROM storestate WHERE statename = ?1",
-                params![key],
-            )?;
+            self.execute("DELETE FROM storestate WHERE statename = ?1", params![key])?;
         }
         Ok(())
     }
@@ -327,8 +326,11 @@ impl ScpStatePersistenceQueries for Connection {
             .optional()?;
         match result {
             Some(encoded) => {
-                let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
-                    .map_err(|e| DbError::Integrity(format!("Invalid base64 tx set data: {}", e)))?;
+                let data =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
+                        .map_err(|e| {
+                            DbError::Integrity(format!("Invalid base64 tx set data: {}", e))
+                        })?;
                 Ok(Some(data))
             }
             None => Ok(None),
@@ -337,9 +339,8 @@ impl ScpStatePersistenceQueries for Connection {
 
     fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {
         let prefix = "txset:";
-        let mut stmt = self.prepare(
-            "SELECT statename, state FROM storestate WHERE statename LIKE ?1",
-        )?;
+        let mut stmt =
+            self.prepare("SELECT statename, state FROM storestate WHERE statename LIKE ?1")?;
         let pattern = format!("{}%", prefix);
         let rows = stmt.query_map(params![pattern], |row| {
             let key: String = row.get(0)?;
@@ -541,7 +542,12 @@ mod tests {
         // Verify recent entries remain (6-10)
         for seq in 6..=10 {
             let history = conn.load_scp_history(seq).unwrap();
-            assert_eq!(history.len(), 1, "ledger {} should have 1 history entry", seq);
+            assert_eq!(
+                history.len(),
+                1,
+                "ledger {} should have 1 history entry",
+                seq
+            );
         }
     }
 }

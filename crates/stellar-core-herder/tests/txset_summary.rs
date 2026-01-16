@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::{
-    AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, InvokeContractArgs, InvokeHostFunctionOp,
-    LedgerFootprint, ManageSellOfferOp, MuxedAccount, Operation, OperationBody, Price, PublicKey,
-    ScAddress, ScSymbol, ScVal, SequenceNumber, SorobanResources, SorobanTransactionData,
-    SorobanTransactionDataExt, StringM, Transaction, TransactionEnvelope, TransactionExt,
-    TransactionV1Envelope, TxSetComponent, Uint256, VecM, WriteXdr,
+    AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, InvokeContractArgs,
+    InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp, MuxedAccount, Operation,
+    OperationBody, Price, PublicKey, ScAddress, ScSymbol, ScVal, SequenceNumber, SorobanResources,
+    SorobanTransactionData, SorobanTransactionDataExt, StringM, Transaction, TransactionEnvelope,
+    TransactionExt, TransactionV1Envelope, TxSetComponent, Uint256, VecM, WriteXdr,
 };
 
 use stellar_core_herder::TransactionQueue;
@@ -97,7 +97,9 @@ fn make_soroban_tx(total_fee: u32, resource_fee: i64) -> TransactionEnvelope {
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
             host_function: stellar_xdr::curr::HostFunction::InvokeContract(InvokeContractArgs {
                 contract_address: ScAddress::default(),
-                function_name: ScSymbol(StringM::<32>::try_from("test".to_string()).expect("symbol")),
+                function_name: ScSymbol(
+                    StringM::<32>::try_from("test".to_string()).expect("symbol"),
+                ),
                 args: VecM::<ScVal>::default(),
             }),
             auth: VecM::default(),
@@ -229,9 +231,14 @@ fn summary_for_set(
             insns += resources.get_val(stellar_core_common::ResourceType::Instructions);
             disk_read_bytes += resources.get_val(stellar_core_common::ResourceType::DiskReadBytes);
             write_bytes += resources.get_val(stellar_core_common::ResourceType::WriteBytes);
-            disk_read_entries += resources.get_val(stellar_core_common::ResourceType::ReadLedgerEntries);
-            write_entries += resources.get_val(stellar_core_common::ResourceType::WriteLedgerEntries);
-            tx_size_bytes += tx.to_xdr(stellar_xdr::curr::Limits::none()).map(|b| b.len() as i64).unwrap_or(0);
+            disk_read_entries +=
+                resources.get_val(stellar_core_common::ResourceType::ReadLedgerEntries);
+            write_entries +=
+                resources.get_val(stellar_core_common::ResourceType::WriteLedgerEntries);
+            tx_size_bytes += tx
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map(|b| b.len() as i64)
+                .unwrap_or(0);
         } else {
             classic_ops += frame.operation_count() as i64;
             if frame.has_dex_operations() {
@@ -326,10 +333,7 @@ fn test_txset_summary_string() {
 fn test_txset_summary_classic() {
     let classic = make_classic_payment(200);
     let dex = make_classic_dex(400);
-    let tx_set = stellar_core_herder::TransactionSet::new(
-        Hash256::ZERO,
-        vec![classic, dex],
-    );
+    let tx_set = stellar_core_herder::TransactionSet::new(Hash256::ZERO, vec![classic, dex]);
 
     let summary = tx_set.summary();
     assert_eq!(summary, "txs:2, ops:2, base_fee:200");

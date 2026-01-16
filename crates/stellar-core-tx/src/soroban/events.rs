@@ -49,7 +49,9 @@ impl ContractEvent {
         Self {
             event_type: EventType::System,
             contract_id: Some(contract_id.clone()),
-            topics: vec![ScVal::Symbol("entry_created".try_into().unwrap_or_default())],
+            topics: vec![ScVal::Symbol(
+                "entry_created".try_into().unwrap_or_default(),
+            )],
             data: key.clone(),
         }
     }
@@ -59,7 +61,9 @@ impl ContractEvent {
         Self {
             event_type: EventType::System,
             contract_id: Some(contract_id.clone()),
-            topics: vec![ScVal::Symbol("entry_deleted".try_into().unwrap_or_default())],
+            topics: vec![ScVal::Symbol(
+                "entry_deleted".try_into().unwrap_or_default(),
+            )],
             data: key.clone(),
         }
     }
@@ -75,7 +79,7 @@ impl ContractEvent {
 
         // Hash contract ID if present
         if let Some(ref id) = self.contract_id {
-            hasher.update(&id.0.0);
+            hasher.update(&id.0 .0);
         }
 
         // Hash topics
@@ -216,12 +220,7 @@ mod tests {
         let mut events = ContractEvents::new();
         assert!(events.is_empty());
 
-        let event = ContractEvent::new(
-            EventType::Contract,
-            None,
-            vec![],
-            ScVal::Void,
-        );
+        let event = ContractEvent::new(EventType::Contract, None, vec![], ScVal::Void);
         events.push(event);
 
         assert_eq!(events.len(), 1);

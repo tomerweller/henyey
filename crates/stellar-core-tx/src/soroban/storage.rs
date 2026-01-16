@@ -314,11 +314,10 @@ mod tests {
         let key = make_storage_key(1);
 
         // Record initial read
-        storage.record_read(key.clone(), Some(StorageEntry::new(
+        storage.record_read(
             key.clone(),
-            ScVal::I64(100),
-            1000,
-        )));
+            Some(StorageEntry::new(key.clone(), ScVal::I64(100), 1000)),
+        );
 
         // Delete it
         storage.del(&key);

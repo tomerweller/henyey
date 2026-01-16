@@ -9,23 +9,23 @@ use std::rc::Rc;
 use sha2::{Digest, Sha256};
 
 use soroban_env_host_p25::{
-    budget::Budget,
-    e2e_invoke,
-    storage::SnapshotSource,
-    xdr::DiagnosticEvent,
-    HostError, LedgerInfo,
+    budget::Budget, e2e_invoke, storage::SnapshotSource, xdr::DiagnosticEvent, HostError,
+    LedgerInfo,
 };
 
 use stellar_xdr::curr::{
     AccountId, ContractEvent, ContractEventType, Hash, HostFunction, LedgerEntry, LedgerEntryData,
-    LedgerEntryExt, LedgerKey, Limits, ReadXdr, ScVal,
-    SorobanAuthorizationEntry, SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
+    LedgerEntryExt, LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry,
+    SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
 };
 
+use super::{
+    EncodedContractEvent, InvokeHostFunctionOutput, LedgerEntryChange, LiveBucketListRestore,
+    TtlChange,
+};
 use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use super::{InvokeHostFunctionOutput, LedgerEntryChange, TtlChange, EncodedContractEvent, LiveBucketListRestore};
 
 // Type alias for entry with TTL from the snapshot source
 type EntryWithLiveUntil = (Rc<LedgerEntry>, Option<u32>);
@@ -56,23 +56,22 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 
         let entry = match key.as_ref() {
             LedgerKey::Account(account_key) => {
-                self.state.get_account(&account_key.account_id).map(|acc| {
-                    LedgerEntry {
+                self.state
+                    .get_account(&account_key.account_id)
+                    .map(|acc| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::Account(acc.clone()),
                         ext: LedgerEntryExt::V0,
-                    }
-                })
-            }
-            LedgerKey::Trustline(tl_key) => {
-                self.state
-                    .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                    .map(|tl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Trustline(tl.clone()),
-                        ext: LedgerEntryExt::V0,
                     })
             }
+            LedgerKey::Trustline(tl_key) => self
+                .state
+                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
+                .map(|tl| LedgerEntry {
+                    last_modified_ledger_seq: self.current_ledger,
+                    data: LedgerEntryData::Trustline(tl.clone()),
+                    ext: LedgerEntryExt::V0,
+                }),
             LedgerKey::ContractData(cd_key) => {
                 // NOTE: In production, entries with expired TTL would be evicted to
                 // hot archive. But in verification mode we don't run eviction, so
@@ -88,30 +87,28 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
             }
             LedgerKey::ContractCode(cc_key) => {
                 // NOTE: Same as ContractData - let Soroban handle TTL checking.
-                self.state.get_contract_code(&cc_key.hash).map(|code| {
-                    LedgerEntry {
+                self.state
+                    .get_contract_code(&cc_key.hash)
+                    .map(|code| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::ContractCode(code.clone()),
                         ext: LedgerEntryExt::V0,
-                    }
-                })
+                    })
             }
             LedgerKey::Ttl(ttl_key) => {
-                self.state.get_ttl(&ttl_key.key_hash).map(|ttl| {
-                    LedgerEntry {
+                self.state
+                    .get_ttl(&ttl_key.key_hash)
+                    .map(|ttl| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::Ttl(ttl.clone()),
                         ext: LedgerEntryExt::V0,
-                    }
-                })
+                    })
             }
             _ => None,
         };
 
         match entry {
-            Some(e) => {
-                Ok(Some((Rc::new(e), live_until)))
-            }
+            Some(e) => Ok(Some((Rc::new(e), live_until))),
             None => Ok(None),
         }
     }
@@ -122,19 +119,29 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             let key_hash = compute_key_hash(key);
-            let ttl = state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq);
+            let ttl = state
+                .get_ttl(&key_hash)
+                .map(|ttl| ttl.live_until_ledger_seq);
             if let Some(live_until) = ttl {
                 if live_until < current_ledger {
                     tracing::warn!(
                         current_ledger,
                         live_until,
-                        key_type = if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                        key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                            "ContractCode"
+                        } else {
+                            "ContractData"
+                        },
                         "Soroban entry TTL is EXPIRED"
                     );
                 }
             } else {
                 tracing::warn!(
-                    key_type = if matches!(key, LedgerKey::ContractCode(_)) { "ContractCode" } else { "ContractData" },
+                    key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                        "ContractCode"
+                    } else {
+                        "ContractData"
+                    },
                     "Soroban entry has NO TTL record"
                 );
             }
@@ -200,21 +207,21 @@ fn get_entry_for_restoration(
 
     // Fetch entry from state WITHOUT filtering by TTL
     let entry = match key {
-        LedgerKey::ContractData(cd_key) => {
+        LedgerKey::ContractData(cd_key) => state
+            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+            .map(|cd| LedgerEntry {
+                last_modified_ledger_seq: current_ledger,
+                data: LedgerEntryData::ContractData(cd.clone()),
+                ext: LedgerEntryExt::V0,
+            }),
+        LedgerKey::ContractCode(cc_key) => {
             state
-                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
-                .map(|cd| LedgerEntry {
+                .get_contract_code(&cc_key.hash)
+                .map(|code| LedgerEntry {
                     last_modified_ledger_seq: current_ledger,
-                    data: LedgerEntryData::ContractData(cd.clone()),
+                    data: LedgerEntryData::ContractCode(code.clone()),
                     ext: LedgerEntryExt::V0,
                 })
-        }
-        LedgerKey::ContractCode(cc_key) => {
-            state.get_contract_code(&cc_key.hash).map(|code| LedgerEntry {
-                last_modified_ledger_seq: current_ledger,
-                data: LedgerEntryData::ContractCode(code.clone()),
-                ext: LedgerEntryExt::V0,
-            })
         }
         _ => {
             // Restoration only applies to ContractData and ContractCode
@@ -225,26 +232,27 @@ fn get_entry_for_restoration(
     match entry {
         Some(e) => {
             // Check if this is a live BL restore: entry exists AND TTL is expired
-            let live_bl_restore = if let (Some(lu), Some((ttl_key, ttl_entry))) = (live_until, ttl_entry_opt) {
-                if lu < current_ledger {
-                    // TTL is expired, this is a live BL restore
-                    tracing::debug!(
-                        live_until = lu,
-                        current_ledger,
-                        "Entry is being restored from live BucketList (expired TTL)"
-                    );
-                    Some(LiveBucketListRestore {
-                        key: key.clone(),
-                        entry: e.clone(),
-                        ttl_key,
-                        ttl_entry,
-                    })
+            let live_bl_restore =
+                if let (Some(lu), Some((ttl_key, ttl_entry))) = (live_until, ttl_entry_opt) {
+                    if lu < current_ledger {
+                        // TTL is expired, this is a live BL restore
+                        tracing::debug!(
+                            live_until = lu,
+                            current_ledger,
+                            "Entry is being restored from live BucketList (expired TTL)"
+                        );
+                        Some(LiveBucketListRestore {
+                            key: key.clone(),
+                            entry: e.clone(),
+                            ttl_key,
+                            ttl_entry,
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             Ok(Some(RestorationInfo {
                 entry: e,
@@ -278,9 +286,7 @@ pub fn invoke_host_function(
             soroban_config.mem_cost_params.clone(),
         )?
     } else {
-        tracing::warn!(
-            "Using default Soroban budget - cost parameters not loaded from network."
-        );
+        tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
         Budget::default()
     };
 
@@ -289,7 +295,7 @@ pub fn invoke_host_function(
         protocol_version: context.protocol_version,
         sequence_number: context.sequence,
         timestamp: context.close_time,
-        network_id: context.network_id.0.0,
+        network_id: context.network_id.0 .0,
         base_reserve: context.base_reserve,
         min_temp_entry_ttl: soroban_config.min_temp_entry_ttl,
         min_persistent_entry_ttl: soroban_config.min_persistent_entry_ttl,
@@ -310,44 +316,47 @@ pub fn invoke_host_function(
     let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed.to_vec()
     } else {
-        tracing::warn!(
-            "P25: Using fallback PRNG seed - results may differ from C++ stellar-core"
-        );
+        tracing::warn!("P25: Using fallback PRNG seed - results may differ from C++ stellar-core");
         let mut hasher = Sha256::new();
-        hasher.update(&context.network_id.0.0);
+        hasher.update(&context.network_id.0 .0);
         hasher.update(&context.sequence.to_le_bytes());
         hasher.update(&context.close_time.to_le_bytes());
         hasher.finalize().to_vec()
     };
 
     // Encode all data to XDR bytes for e2e_invoke
-    let encoded_host_fn = host_function.to_xdr(Limits::none())
-        .map_err(|_| HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+    let encoded_host_fn = host_function.to_xdr(Limits::none()).map_err(|_| {
+        HostError::from(soroban_env_host_p25::Error::from_type_and_code(
             soroban_env_host_p25::xdr::ScErrorType::Context,
             soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-        )))?;
+        ))
+    })?;
 
-    let encoded_resources = soroban_data.resources.to_xdr(Limits::none())
-        .map_err(|_| HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+    let encoded_resources = soroban_data.resources.to_xdr(Limits::none()).map_err(|_| {
+        HostError::from(soroban_env_host_p25::Error::from_type_and_code(
             soroban_env_host_p25::xdr::ScErrorType::Context,
             soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-        )))?;
+        ))
+    })?;
 
-    let encoded_source = source.to_xdr(Limits::none())
-        .map_err(|_| HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+    let encoded_source = source.to_xdr(Limits::none()).map_err(|_| {
+        HostError::from(soroban_env_host_p25::Error::from_type_and_code(
             soroban_env_host_p25::xdr::ScErrorType::Context,
             soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-        )))?;
+        ))
+    })?;
 
     // Encode auth entries
     let encoded_auth_entries: Vec<Vec<u8>> = auth_entries
         .iter()
         .map(|e| e.to_xdr(Limits::none()))
         .collect::<Result<_, _>>()
-        .map_err(|_| HostError::from(soroban_env_host_p25::Error::from_type_and_code(
-            soroban_env_host_p25::xdr::ScErrorType::Context,
-            soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-        )))?;
+        .map_err(|_| {
+            HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+                soroban_env_host_p25::xdr::ScErrorType::Context,
+                soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+            ))
+        })?;
 
     // Create snapshot adapter
     let snapshot = LedgerSnapshotAdapter::new(state, context.sequence);
@@ -375,30 +384,33 @@ pub fn invoke_host_function(
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
 
-    let mut add_entry = |key: &LedgerKey, entry: &LedgerEntry, live_until: Option<u32>| -> Result<(), HostError> {
-        encoded_ledger_entries.push(entry.to_xdr(Limits::none())
-            .map_err(|_| HostError::from(soroban_env_host_p25::Error::from_type_and_code(
-                soroban_env_host_p25::xdr::ScErrorType::Context,
-                soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-            )))?);
-
-        let ttl_bytes = if let Some(lu) = live_until {
-            let key_hash = compute_key_hash(key);
-            let ttl_entry = stellar_xdr::curr::TtlEntry {
-                key_hash,
-                live_until_ledger_seq: lu,
-            };
-            ttl_entry.to_xdr(Limits::none())
-                .map_err(|_| HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+    let mut add_entry =
+        |key: &LedgerKey, entry: &LedgerEntry, live_until: Option<u32>| -> Result<(), HostError> {
+            encoded_ledger_entries.push(entry.to_xdr(Limits::none()).map_err(|_| {
+                HostError::from(soroban_env_host_p25::Error::from_type_and_code(
                     soroban_env_host_p25::xdr::ScErrorType::Context,
                     soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-                )))?
-        } else {
-            Vec::new()
+                ))
+            })?);
+
+            let ttl_bytes = if let Some(lu) = live_until {
+                let key_hash = compute_key_hash(key);
+                let ttl_entry = stellar_xdr::curr::TtlEntry {
+                    key_hash,
+                    live_until_ledger_seq: lu,
+                };
+                ttl_entry.to_xdr(Limits::none()).map_err(|_| {
+                    HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+                        soroban_env_host_p25::xdr::ScErrorType::Context,
+                        soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                    ))
+                })?
+            } else {
+                Vec::new()
+            };
+            encoded_ttl_entries.push(ttl_bytes);
+            Ok(())
         };
-        encoded_ttl_entries.push(ttl_bytes);
-        Ok(())
-    };
 
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
@@ -410,7 +422,13 @@ pub fn invoke_host_function(
     let mut live_bl_restores: Vec<LiveBucketListRestore> = Vec::new();
 
     // For read_write entries, check if they're being restored from archive
-    for (idx, key) in soroban_data.resources.footprint.read_write.iter().enumerate() {
+    for (idx, key) in soroban_data
+        .resources
+        .footprint
+        .read_write
+        .iter()
+        .enumerate()
+    {
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
 
         if is_being_restored {
@@ -468,9 +486,7 @@ pub fn invoke_host_function(
 
     // Parse the return value
     let return_value = match result.encoded_invoke_result {
-        Ok(ref bytes) => {
-            ScVal::from_xdr(bytes, Limits::none()).unwrap_or(ScVal::Void)
-        }
+        Ok(ref bytes) => ScVal::from_xdr(bytes, Limits::none()).unwrap_or(ScVal::Void),
         Err(ref e) => {
             return Err(e.clone());
         }
@@ -481,14 +497,18 @@ pub fn invoke_host_function(
     // - Had their content modified (encoded_new_value.is_some())
     // - Are involved in rent calculations (old_entry_size_bytes_for_rent > 0)
     // - Had their TTL extended (ttl_change.is_some())
-    let ledger_changes = result.ledger_changes
+    let ledger_changes = result
+        .ledger_changes
         .into_iter()
         .filter_map(|change| {
-            if change.encoded_new_value.is_some() || change.old_entry_size_bytes_for_rent > 0 || change.ttl_change.is_some() {
+            if change.encoded_new_value.is_some()
+                || change.old_entry_size_bytes_for_rent > 0
+                || change.ttl_change.is_some()
+            {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
-                let new_entry = change.encoded_new_value.and_then(|bytes| {
-                    LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
-                });
+                let new_entry = change
+                    .encoded_new_value
+                    .and_then(|bytes| LedgerEntry::from_xdr(&bytes, Limits::none()).ok());
                 let ttl_change = change.ttl_change.map(|ttl| TtlChange {
                     new_live_until_ledger: ttl.new_live_until_ledger,
                 });
@@ -519,7 +539,10 @@ pub fn invoke_host_function(
         // Decode and filter for hash computation
         if let Ok(event) = ContractEvent::from_xdr(&encoded_event, Limits::none()) {
             // Only include Contract and System events (not Diagnostic)
-            if matches!(event.type_, ContractEventType::Contract | ContractEventType::System) {
+            if matches!(
+                event.type_,
+                ContractEventType::Contract | ContractEventType::System
+            ) {
                 contract_events.push(event);
             }
         }

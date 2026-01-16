@@ -114,14 +114,7 @@ impl HistoryQueries for Connection {
             (txid, ledgerseq, txindex, txbody, txresult, txmeta)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
-            params![
-                tx_id,
-                ledger_seq,
-                tx_index,
-                body,
-                result,
-                meta,
-            ],
+            params![tx_id, ledger_seq, tx_index, body, result, meta,],
         )?;
         Ok(())
     }

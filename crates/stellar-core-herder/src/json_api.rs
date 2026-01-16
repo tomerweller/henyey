@@ -361,7 +361,8 @@ impl QuorumJsonInfoBuilder {
 
     /// Add a maybe-dead node.
     pub fn add_maybe_dead_node(mut self, node_id: &NodeId, full_keys: bool) -> Self {
-        self.maybe_dead_nodes.push(format_node_id(node_id, full_keys));
+        self.maybe_dead_nodes
+            .push(format_node_id(node_id, full_keys));
         self
     }
 
@@ -384,7 +385,9 @@ mod tests {
     fn make_test_node_id(seed: u8) -> NodeId {
         let mut key = [0u8; 32];
         key[0] = seed;
-        NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(key)))
+        NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            key,
+        )))
     }
 
     #[test]

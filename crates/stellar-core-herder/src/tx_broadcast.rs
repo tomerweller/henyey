@@ -59,17 +59,11 @@ pub enum BroadcastCommand {
         envelope: TransactionEnvelope,
     },
     /// Remove a transaction (e.g., after inclusion in ledger).
-    RemoveTransaction {
-        tx_hash: Hash,
-    },
+    RemoveTransaction { tx_hash: Hash },
     /// Mark a transaction as already broadcast (don't rebroadcast).
-    MarkBroadcast {
-        tx_hash: Hash,
-    },
+    MarkBroadcast { tx_hash: Hash },
     /// Set the flood period.
-    SetFloodPeriod {
-        period_ms: u64,
-    },
+    SetFloodPeriod { period_ms: u64 },
     /// Shutdown the broadcast manager.
     Shutdown,
 }
@@ -260,7 +254,10 @@ impl<C: TxBroadcastCallback> TxBroadcastManager<C> {
         // Schedule the first broadcast
         self.state = BroadcastState::Waiting;
         self.next_broadcast = Some(Instant::now() + self.flood_period);
-        debug!("Started broadcast cycle with {}ms period", self.flood_period.as_millis());
+        debug!(
+            "Started broadcast cycle with {}ms period",
+            self.flood_period.as_millis()
+        );
     }
 
     /// Force rebroadcast of all transactions.
@@ -321,7 +318,10 @@ impl<C: TxBroadcastCallback> TxBroadcastManager<C> {
             }
         }
 
-        debug!("Broadcast {} transactions (capacity: {})", broadcast_count, capacity);
+        debug!(
+            "Broadcast {} transactions (capacity: {})",
+            broadcast_count, capacity
+        );
 
         // Check if we need to continue broadcasting
         let more_to_broadcast = transactions

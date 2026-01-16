@@ -295,7 +295,9 @@ impl Peer {
             .ok_or_else(|| OverlayError::PeerDisconnected("no Hello received".to_string()))?;
         debug!("Received frame with {} bytes", frame.raw_len);
 
-        let message = self.auth.unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self
+            .auth
+            .unwrap_message(frame.message, frame.is_authenticated)?;
 
         match message {
             StellarMessage::Hello(peer_hello) => {
@@ -322,7 +324,9 @@ impl Peer {
             .await?
             .ok_or_else(|| OverlayError::PeerDisconnected("no Auth received".to_string()))?;
 
-        let message = self.auth.unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self
+            .auth
+            .unwrap_message(frame.message, frame.is_authenticated)?;
 
         match message {
             StellarMessage::Auth(_) => {
@@ -355,8 +359,8 @@ impl Peer {
         // num_bytes: how many bytes we can buffer (0 to disable bytes-based flow control)
         // Use generous capacity to avoid early disconnects
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
-            num_messages: 500,       // We can handle many messages
-            num_bytes: 50_000_000,   // 50 MB of data
+            num_messages: 500,     // We can handle many messages
+            num_bytes: 50_000_000, // 50 MB of data
         });
         self.send(send_more).await?;
         debug!("Sent SEND_MORE_EXTENDED to {}", self.info.peer_id);
@@ -402,7 +406,9 @@ impl Peer {
         let auth_msg = self.auth.wrap_unauthenticated(message);
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes_sent.fetch_add(size as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_sent
+            .fetch_add(size as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -412,14 +418,18 @@ impl Peer {
         let auth_msg = self.auth.wrap_auth_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes_sent.fetch_add(size as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_sent
+            .fetch_add(size as u64, Ordering::Relaxed);
         Ok(())
     }
 
     /// Send a message to this peer.
     pub async fn send(&mut self, message: StellarMessage) -> Result<()> {
         if self.state != PeerState::Authenticated {
-            return Err(OverlayError::PeerDisconnected("not authenticated".to_string()));
+            return Err(OverlayError::PeerDisconnected(
+                "not authenticated".to_string(),
+            ));
         }
 
         let msg_type = helpers::message_type_name(&message);
@@ -429,7 +439,9 @@ impl Peer {
         let auth_msg = self.auth.wrap_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes_sent.fetch_add(size as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_sent
+            .fetch_add(size as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -453,7 +465,9 @@ impl Peer {
             .bytes_received
             .fetch_add(frame.raw_len as u64, Ordering::Relaxed);
 
-        let message = self.auth.unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self
+            .auth
+            .unwrap_message(frame.message, frame.is_authenticated)?;
         let msg_type = helpers::message_type_name(&message);
         trace!("Received {} from {}", msg_type, self.info.peer_id);
 
@@ -479,7 +493,9 @@ impl Peer {
             .bytes_received
             .fetch_add(frame.raw_len as u64, Ordering::Relaxed);
 
-        let message = self.auth.unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self
+            .auth
+            .unwrap_message(frame.message, frame.is_authenticated)?;
 
         Ok(Some(message))
     }
@@ -575,9 +591,7 @@ impl Peer {
 
     /// Send flow control message.
     pub async fn send_more(&mut self, num_messages: u32) -> Result<()> {
-        let message = StellarMessage::SendMore(stellar_xdr::curr::SendMore {
-            num_messages,
-        });
+        let message = StellarMessage::SendMore(stellar_xdr::curr::SendMore { num_messages });
         self.send(message).await
     }
 

@@ -178,9 +178,15 @@ impl Decoder for MessageCodec {
                     // Reserve space for message body
                     src.reserve(len);
 
-                    self.decode_state = DecodeState::ReadingBody { len, is_authenticated };
+                    self.decode_state = DecodeState::ReadingBody {
+                        len,
+                        is_authenticated,
+                    };
                 }
-                DecodeState::ReadingBody { len, is_authenticated } => {
+                DecodeState::ReadingBody {
+                    len,
+                    is_authenticated,
+                } => {
                     if src.len() < len {
                         // Need more data for message body
                         return Ok(None);
@@ -300,8 +306,12 @@ pub mod helpers {
             StellarMessage::Transaction(_) => "TRANSACTION",
             StellarMessage::TimeSlicedSurveyRequest(_) => "TIME_SLICED_SURVEY_REQUEST",
             StellarMessage::TimeSlicedSurveyResponse(_) => "TIME_SLICED_SURVEY_RESPONSE",
-            StellarMessage::TimeSlicedSurveyStartCollecting(_) => "TIME_SLICED_SURVEY_START_COLLECTING",
-            StellarMessage::TimeSlicedSurveyStopCollecting(_) => "TIME_SLICED_SURVEY_STOP_COLLECTING",
+            StellarMessage::TimeSlicedSurveyStartCollecting(_) => {
+                "TIME_SLICED_SURVEY_START_COLLECTING"
+            }
+            StellarMessage::TimeSlicedSurveyStopCollecting(_) => {
+                "TIME_SLICED_SURVEY_STOP_COLLECTING"
+            }
             StellarMessage::GetScpQuorumset(_) => "GET_SCP_QUORUMSET",
             StellarMessage::ScpQuorumset(_) => "SCP_QUORUMSET",
             StellarMessage::ScpMessage(_) => "SCP_MESSAGE",
@@ -341,7 +351,10 @@ mod tests {
         assert_eq!(len, encoded.len() - 4);
 
         // Non-Hello messages should have auth bit set
-        assert!(raw_len & 0x80000000 != 0, "auth bit should be set for non-Hello messages");
+        assert!(
+            raw_len & 0x80000000 != 0,
+            "auth bit should be set for non-Hello messages"
+        );
 
         // Should decode
         let decoded = MessageCodec::decode_message(&encoded[4..]).unwrap();
@@ -379,7 +392,10 @@ mod tests {
         let encoded = MessageCodec::encode_message(&msg).unwrap();
         let raw_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
 
-        assert!(raw_len & 0x80000000 == 0, "auth bit should NOT be set for Hello");
+        assert!(
+            raw_len & 0x80000000 == 0,
+            "auth bit should NOT be set for Hello"
+        );
         assert_eq!(raw_len as usize, encoded.len() - 4);
     }
 
@@ -397,7 +413,10 @@ mod tests {
         });
         codec.encode(auth_msg, &mut buf).unwrap();
         let frame = codec.decode(&mut buf).unwrap().unwrap();
-        assert!(frame.is_authenticated, "decoded frame should be marked as authenticated");
+        assert!(
+            frame.is_authenticated,
+            "decoded frame should be marked as authenticated"
+        );
 
         // Hello message (unauthenticated)
         let hello_msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
@@ -407,7 +426,10 @@ mod tests {
         });
         codec.encode(hello_msg, &mut buf).unwrap();
         let frame = codec.decode(&mut buf).unwrap().unwrap();
-        assert!(!frame.is_authenticated, "Hello message should NOT be marked as authenticated");
+        assert!(
+            !frame.is_authenticated,
+            "Hello message should NOT be marked as authenticated"
+        );
     }
 
     #[test]
@@ -441,7 +463,13 @@ mod tests {
 
     #[test]
     fn test_message_type_names() {
-        assert_eq!(helpers::message_type_name(&StellarMessage::Peers(VecM::default())), "PEERS");
-        assert_eq!(helpers::message_type_name(&StellarMessage::Hello(Default::default())), "HELLO");
+        assert_eq!(
+            helpers::message_type_name(&StellarMessage::Peers(VecM::default())),
+            "PEERS"
+        );
+        assert_eq!(
+            helpers::message_type_name(&StellarMessage::Hello(Default::default())),
+            "HELLO"
+        );
     }
 }

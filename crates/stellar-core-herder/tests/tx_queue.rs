@@ -3,11 +3,11 @@ use stellar_core_herder::{TransactionQueue, TxQueueConfig};
 use stellar_core_tx::muxed_to_account_id;
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, DecoratedSignature, HostFunction,
-    InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp, Memo,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, Limits, ManageSellOfferOp, Memo,
     MuxedAccount, Operation, OperationBody, Preconditions, Price, PublicKey, ScAddress, ScSymbol,
     ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint, SorobanResources,
     SorobanTransactionData, SorobanTransactionDataExt, StringM, Transaction, TransactionEnvelope,
-    TransactionExt, TransactionV1Envelope, Uint256, VecM, Limits, WriteXdr,
+    TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
 fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
@@ -177,13 +177,13 @@ fn account_key_from_envelope(envelope: &TransactionEnvelope) -> Vec<u8> {
         }
         TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account.clone(),
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                inner.tx.source_account.clone()
+            }
         },
     };
     let account_id = muxed_to_account_id(&source);
-    account_id
-        .to_xdr(Limits::none())
-        .unwrap_or_default()
+    account_id.to_xdr(Limits::none()).unwrap_or_default()
 }
 
 fn full_hash(envelope: &TransactionEnvelope) -> Hash256 {
@@ -215,11 +215,7 @@ fn test_dex_lane_limit_deterministic_selection() {
     let hash_dex_a = full_hash(&dex_a);
     let hash_dex_b = full_hash(&dex_b);
     let hash_classic = full_hash(&classic);
-    let hashes: Vec<_> = set
-        .transactions
-        .iter()
-        .map(full_hash)
-        .collect();
+    let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
     assert!(hashes.contains(&hash_classic));
     assert!(hashes.contains(&hash_dex_a) || hashes.contains(&hash_dex_b));
 }
@@ -242,8 +238,14 @@ fn test_classic_queue_limit_eviction() {
     let low_hash = full_hash(&low);
     let high_hash = full_hash(&high);
 
-    assert_eq!(queue.try_add(low), stellar_core_herder::TxQueueResult::Added);
-    assert_eq!(queue.try_add(high), stellar_core_herder::TxQueueResult::Added);
+    assert_eq!(
+        queue.try_add(low),
+        stellar_core_herder::TxQueueResult::Added
+    );
+    assert_eq!(
+        queue.try_add(high),
+        stellar_core_herder::TxQueueResult::Added
+    );
     assert!(!queue.contains(&low_hash));
     assert!(queue.contains(&high_hash));
 }
@@ -266,8 +268,14 @@ fn test_dex_queue_limit_eviction() {
     let low_hash = full_hash(&dex_low);
     let high_hash = full_hash(&dex_high);
 
-    assert_eq!(queue.try_add(dex_low), stellar_core_herder::TxQueueResult::Added);
-    assert_eq!(queue.try_add(dex_high), stellar_core_herder::TxQueueResult::Added);
+    assert_eq!(
+        queue.try_add(dex_low),
+        stellar_core_herder::TxQueueResult::Added
+    );
+    assert_eq!(
+        queue.try_add(dex_high),
+        stellar_core_herder::TxQueueResult::Added
+    );
     assert!(!queue.contains(&low_hash));
     assert!(queue.contains(&high_hash));
 }
@@ -292,8 +300,14 @@ fn test_soroban_queue_limit_eviction() {
     let low_hash = full_hash(&low_fee);
     let high_hash = full_hash(&high_fee);
 
-    assert_eq!(queue.try_add(low_fee), stellar_core_herder::TxQueueResult::Added);
-    assert_eq!(queue.try_add(high_fee), stellar_core_herder::TxQueueResult::Added);
+    assert_eq!(
+        queue.try_add(low_fee),
+        stellar_core_herder::TxQueueResult::Added
+    );
+    assert_eq!(
+        queue.try_add(high_fee),
+        stellar_core_herder::TxQueueResult::Added
+    );
     assert!(!queue.contains(&low_hash));
     assert!(queue.contains(&high_hash));
 }
@@ -345,11 +359,7 @@ fn test_duplicate_sequence_prefers_higher_fee() {
 
     // Both transactions should be in the set now (different accounts)
     let set = queue.get_transaction_set(Hash256::ZERO, 10);
-    let hashes: Vec<_> = set
-        .transactions
-        .iter()
-        .map(full_hash)
-        .collect();
+    let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
     assert!(hashes.contains(&low_hash));
     assert!(hashes.contains(&high_hash));
 }

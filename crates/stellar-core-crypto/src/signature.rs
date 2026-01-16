@@ -29,7 +29,11 @@ pub fn sign(secret_key: &SecretKey, data: &[u8]) -> Signature {
 /// # Errors
 ///
 /// Returns [`CryptoError::InvalidSignature`] if verification fails.
-pub fn verify(public_key: &PublicKey, data: &[u8], signature: &Signature) -> Result<(), CryptoError> {
+pub fn verify(
+    public_key: &PublicKey,
+    data: &[u8],
+    signature: &Signature,
+) -> Result<(), CryptoError> {
     public_key.verify(data, signature)
 }
 
@@ -168,7 +172,10 @@ mod tests {
         let hint = signature_hint(&public);
         let key_bytes = public.as_bytes();
 
-        assert_eq!(hint, [key_bytes[28], key_bytes[29], key_bytes[30], key_bytes[31]]);
+        assert_eq!(
+            hint,
+            [key_bytes[28], key_bytes[29], key_bytes[30], key_bytes[31]]
+        );
     }
 
     #[test]

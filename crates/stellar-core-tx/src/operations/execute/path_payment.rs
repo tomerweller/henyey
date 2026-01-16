@@ -6,24 +6,24 @@
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
-    Asset, ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, Hash, Liabilities,
-    LiquidityPoolEntryBody, LiquidityPoolParameters, OperationResult,
+    Asset, ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, Hash, LedgerKey, LedgerKeyOffer,
+    Liabilities, Limits, LiquidityPoolEntryBody, LiquidityPoolParameters, OperationResult,
     OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
     PathPaymentStrictReceiveResultCode, PathPaymentStrictReceiveResultSuccess,
     PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultCode,
     PathPaymentStrictSendResultSuccess, PoolId, Price, SimplePaymentResult, TrustLineEntry,
-    TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, WriteXdr, Limits,
-    LIQUIDITY_POOL_FEE_V18, LedgerKey, LedgerKeyOffer,
+    TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
+    LIQUIDITY_POOL_FEE_V18,
 };
 
-use crate::frame::muxed_to_account_id;
-use crate::state::LedgerStateManager;
-use crate::validation::LedgerContext;
-use crate::{Result, TxError};
 use super::offer_exchange::{
     adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError,
     RoundingType,
 };
+use crate::frame::muxed_to_account_id;
+use crate::state::LedgerStateManager;
+use crate::validation::LedgerContext;
+use crate::{Result, TxError};
 
 /// Execute a PathPaymentStrictReceive operation.
 ///
@@ -306,7 +306,10 @@ struct TransferError {
     no_issuer_asset: Option<Asset>,
 }
 
-fn check_issuer(asset: &Asset, state: &LedgerStateManager) -> std::result::Result<(), TransferError> {
+fn check_issuer(
+    asset: &Asset,
+    state: &LedgerStateManager,
+) -> std::result::Result<(), TransferError> {
     if let Some(issuer) = issuer_for_asset(asset) {
         if state.get_account(issuer).is_none() {
             return Err(TransferError {
@@ -386,8 +389,7 @@ fn update_source_balance(
             no_issuer_asset: None,
         });
     }
-    let available =
-        source_trustline.balance - trustline_liabilities(source_trustline).selling;
+    let available = source_trustline.balance - trustline_liabilities(source_trustline).selling;
     if available < amount {
         return Err(TransferError {
             code: PathPaymentStrictReceiveResultCode::Underfunded,
@@ -395,8 +397,9 @@ fn update_source_balance(
         });
     }
 
-    let source_trustline_mut =
-        state.get_trustline_mut(source, asset).ok_or(TransferError {
+    let source_trustline_mut = state
+        .get_trustline_mut(source, asset)
+        .ok_or(TransferError {
             code: PathPaymentStrictReceiveResultCode::SrcNoTrust,
             no_issuer_asset: None,
         })?;
@@ -451,8 +454,9 @@ fn update_dest_balance(
             no_issuer_asset: None,
         });
     }
-    let available =
-        dest_trustline.limit - dest_trustline.balance - trustline_liabilities(dest_trustline).buying;
+    let available = dest_trustline.limit
+        - dest_trustline.balance
+        - trustline_liabilities(dest_trustline).buying;
     if available < amount {
         return Err(TransferError {
             code: PathPaymentStrictReceiveResultCode::LineFull,
@@ -486,7 +490,6 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
         Asset::CreditAlphanum12(a) => Some(&a.issuer),
     }
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConvertResult {
@@ -524,14 +527,8 @@ fn convert_with_offers_and_pools(
         );
     }
 
-    let pool_exchange = compute_pool_exchange(
-        send_asset,
-        max_send,
-        recv_asset,
-        max_recv,
-        round,
-        state,
-    )?;
+    let pool_exchange =
+        compute_pool_exchange(send_asset, max_send, recv_asset, max_recv, round, state)?;
 
     if pool_exchange.is_none() {
         return convert_with_offers(
@@ -708,8 +705,9 @@ fn cross_offer_v10(
         state,
     )?;
 
-    let max_wheat_send =
-        offer.amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
+    let max_wheat_send = offer
+        .amount
+        .min(can_sell_at_most(&seller, &wheat, state, context)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
     let adjusted_offer_amount =
         adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
@@ -740,8 +738,7 @@ fn cross_offer_v10(
     if wheat_stays {
         new_amount = new_amount.saturating_sub(num_wheat_received);
         if new_amount > 0 {
-            let max_wheat_send =
-                new_amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
+            let max_wheat_send = new_amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
             let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
             new_amount =
                 adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
@@ -833,8 +830,7 @@ fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager
         let Some(account) = state.get_account(source) else {
             return 0;
         };
-        let available =
-            i64::MAX - account.balance - account_liabilities(account).buying;
+        let available = i64::MAX - account.balance - account_liabilities(account).buying;
         return available.max(0);
     }
 
@@ -848,8 +844,7 @@ fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager
     if !is_authorized_to_maintain_liabilities(trustline.flags) {
         return 0;
     }
-    let available =
-        trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
+    let available = trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
     available.max(0)
 }
 
@@ -861,7 +856,9 @@ fn apply_balance_delta(
 ) -> Result<()> {
     if matches!(asset, Asset::Native) {
         let Some(account) = state.get_account_mut(account_id) else {
-            return Err(TxError::Internal("missing account for balance update".into()));
+            return Err(TxError::Internal(
+                "missing account for balance update".into(),
+            ));
         };
         let new_balance = account
             .balance
@@ -879,7 +876,9 @@ fn apply_balance_delta(
     }
 
     let Some(tl) = state.get_trustline_mut(account_id, asset) else {
-        return Err(TxError::Internal("missing trustline for balance update".into()));
+        return Err(TxError::Internal(
+            "missing trustline for balance update".into(),
+        ));
     };
     let new_balance = tl
         .balance
@@ -921,7 +920,9 @@ fn apply_liabilities_delta(
         update_liabilities(liab, 0, selling_delta)?;
     } else if issuer_for_asset(selling) != Some(account_id) {
         let Some(trustline) = state.get_trustline_mut(account_id, selling) else {
-            return Err(TxError::Internal("missing trustline for liabilities".into()));
+            return Err(TxError::Internal(
+                "missing trustline for liabilities".into(),
+            ));
         };
         let liab = ensure_trustline_liabilities(trustline);
         update_liabilities(liab, 0, selling_delta)?;
@@ -935,7 +936,9 @@ fn apply_liabilities_delta(
         update_liabilities(liab, buying_delta, 0)?;
     } else if issuer_for_asset(buying) != Some(account_id) {
         let Some(trustline) = state.get_trustline_mut(account_id, buying) else {
-            return Err(TxError::Internal("missing trustline for liabilities".into()));
+            return Err(TxError::Internal(
+                "missing trustline for liabilities".into(),
+            ));
         };
         let liab = ensure_trustline_liabilities(trustline);
         update_liabilities(liab, buying_delta, 0)?;
@@ -1064,19 +1067,23 @@ fn apply_pool_exchange(
     let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
 
     if send_asset == &cp.params.asset_a && recv_asset == &cp.params.asset_b {
-        cp.reserve_a = cp.reserve_a.checked_add(to_pool).ok_or_else(|| {
-            TxError::Internal("pool reserve overflow".into())
-        })?;
-        cp.reserve_b = cp.reserve_b.checked_sub(from_pool).ok_or_else(|| {
-            TxError::Internal("pool reserve underflow".into())
-        })?;
+        cp.reserve_a = cp
+            .reserve_a
+            .checked_add(to_pool)
+            .ok_or_else(|| TxError::Internal("pool reserve overflow".into()))?;
+        cp.reserve_b = cp
+            .reserve_b
+            .checked_sub(from_pool)
+            .ok_or_else(|| TxError::Internal("pool reserve underflow".into()))?;
     } else if send_asset == &cp.params.asset_b && recv_asset == &cp.params.asset_a {
-        cp.reserve_b = cp.reserve_b.checked_add(to_pool).ok_or_else(|| {
-            TxError::Internal("pool reserve overflow".into())
-        })?;
-        cp.reserve_a = cp.reserve_a.checked_sub(from_pool).ok_or_else(|| {
-            TxError::Internal("pool reserve underflow".into())
-        })?;
+        cp.reserve_b = cp
+            .reserve_b
+            .checked_add(to_pool)
+            .ok_or_else(|| TxError::Internal("pool reserve overflow".into()))?;
+        cp.reserve_a = cp
+            .reserve_a
+            .checked_sub(from_pool)
+            .ok_or_else(|| TxError::Internal("pool reserve underflow".into()))?;
     } else {
         return Ok(false);
     }
@@ -1544,7 +1551,8 @@ mod tests {
             path: vec![].try_into().unwrap(),
         };
 
-        let result = execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
                 if let PathPaymentStrictReceiveResult::NoIssuer(asset) = r {
@@ -1568,10 +1576,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1604,10 +1609,14 @@ mod tests {
             path: vec![].try_into().unwrap(),
         };
 
-        let result = execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
-                assert!(matches!(r, PathPaymentStrictReceiveResult::SrcNotAuthorized));
+                assert!(matches!(
+                    r,
+                    PathPaymentStrictReceiveResult::SrcNotAuthorized
+                ));
             }
             _ => panic!("Unexpected result type"),
         }
@@ -1624,10 +1633,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1660,7 +1666,8 @@ mod tests {
             path: vec![].try_into().unwrap(),
         };
 
-        let result = execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
                 assert!(matches!(r, PathPaymentStrictReceiveResult::NotAuthorized));
@@ -1770,7 +1777,8 @@ mod tests {
             path: vec![].try_into().unwrap(),
         };
 
-        let result = execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
                 assert!(matches!(r, PathPaymentStrictReceiveResult::LineFull));

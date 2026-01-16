@@ -155,8 +155,9 @@ fn execute_credit_payment(
         }
 
         // Check destination trustline has room (limit check)
-        let dest_available =
-            dest_trustline.limit - dest_trustline.balance - trustline_liabilities(dest_trustline).buying;
+        let dest_available = dest_trustline.limit
+            - dest_trustline.balance
+            - trustline_liabilities(dest_trustline).buying;
         if dest_available < amount {
             return Ok(make_result(PaymentResultCode::LineFull));
         }
@@ -536,10 +537,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -592,10 +590,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),

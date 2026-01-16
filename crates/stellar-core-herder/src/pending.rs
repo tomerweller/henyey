@@ -20,11 +20,11 @@
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 use stellar_core_common::Hash256;
 use stellar_core_scp::SlotIndex;
 use stellar_xdr::curr::ScpEnvelope;
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
 
 /// Configuration for pending envelope management.
 #[derive(Debug, Clone)]
@@ -322,7 +322,10 @@ impl PendingEnvelopes {
 
     /// Check if there are pending envelopes for a slot.
     pub fn has_pending(&self, slot: SlotIndex) -> bool {
-        self.slots.get(&slot).map(|e| !e.is_empty()).unwrap_or(false)
+        self.slots
+            .get(&slot)
+            .map(|e| !e.is_empty())
+            .unwrap_or(false)
     }
 
     /// Get the count of pending envelopes for a slot.
@@ -347,8 +350,8 @@ impl Default for PendingEnvelopes {
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
-        ScpEnvelope, ScpStatement, ScpNomination, ScpStatementPledges, NodeId as XdrNodeId,
-        PublicKey, Uint256, Hash,
+        Hash, NodeId as XdrNodeId, PublicKey, ScpEnvelope, ScpNomination, ScpStatement,
+        ScpStatementPledges, Uint256,
     };
 
     fn make_test_envelope(slot: SlotIndex) -> ScpEnvelope {

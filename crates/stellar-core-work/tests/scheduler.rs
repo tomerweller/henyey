@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use stellar_core_work::{
-    Work, WorkContext, WorkOutcome, WorkScheduler, WorkSchedulerConfig, WorkSequence,
-    WorkState, WorkWithCallback,
+    Work, WorkContext, WorkOutcome, WorkScheduler, WorkSchedulerConfig, WorkSequence, WorkState,
+    WorkWithCallback,
 };
 
 // ============================================================================

@@ -37,7 +37,7 @@ use std::sync::Arc;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, ReadXdr, WriteXdr, Limits};
+use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use stellar_core_common::Hash256;
 
@@ -167,9 +167,9 @@ impl Bucket {
         let mut key_index = BTreeMap::new();
         for (idx, entry) in entries.iter().enumerate() {
             if let Some(key) = entry.key() {
-                let key_bytes = key
-                    .to_xdr(Limits::none())
-                    .map_err(|e| BucketError::Serialization(format!("Failed to serialize key: {}", e)))?;
+                let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to serialize key: {}", e))
+                })?;
                 key_index.insert(key_bytes, idx);
             }
         }
@@ -268,9 +268,9 @@ impl Bucket {
             let mut index = BTreeMap::new();
             for (idx, entry) in entries.iter().enumerate() {
                 if let Some(key) = entry.key() {
-                    let key_bytes = key
-                        .to_xdr(Limits::none())
-                        .map_err(|e| BucketError::Serialization(format!("Failed to serialize key: {}", e)))?;
+                    let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                        BucketError::Serialization(format!("Failed to serialize key: {}", e))
+                    })?;
                     index.insert(key_bytes, idx);
                 }
             }
@@ -414,9 +414,9 @@ impl Bucket {
             // First serialize the entry to get its size
             let mut entry_bytes = Vec::new();
             let mut limited = Limited::new(&mut entry_bytes, Limits::none());
-            xdr_entry
-                .write_xdr(&mut limited)
-                .map_err(|e| BucketError::Serialization(format!("Failed to serialize entry: {}", e)))?;
+            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+                BucketError::Serialization(format!("Failed to serialize entry: {}", e))
+            })?;
 
             // Write 4-byte record mark: high bit set + size (big-endian)
             let size = entry_bytes.len() as u32;
@@ -493,9 +493,7 @@ impl Bucket {
     /// this reads entries from disk sequentially.
     pub fn iter(&self) -> BucketIter<'_> {
         match &self.storage {
-            BucketStorage::InMemory { entries, .. } => {
-                BucketIter::InMemory(entries.iter())
-            }
+            BucketStorage::InMemory { entries, .. } => BucketIter::InMemory(entries.iter()),
             BucketStorage::DiskBacked { disk_bucket } => {
                 // For disk-backed, we create an iterator that reads from disk
                 match disk_bucket.iter() {
@@ -530,9 +528,9 @@ impl Bucket {
     pub fn get(&self, key: &LedgerKey) -> Result<Option<BucketEntry>> {
         match &self.storage {
             BucketStorage::InMemory { entries, key_index } => {
-                let key_bytes = key
-                    .to_xdr(Limits::none())
-                    .map_err(|e| BucketError::Serialization(format!("Failed to serialize key: {}", e)))?;
+                let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to serialize key: {}", e))
+                })?;
 
                 if let Some(&idx) = key_index.get(&key_bytes) {
                     Ok(entries.get(idx).cloned())
@@ -540,9 +538,7 @@ impl Bucket {
                     Ok(None)
                 }
             }
-            BucketStorage::DiskBacked { disk_bucket } => {
-                disk_bucket.get(key)
-            }
+            BucketStorage::DiskBacked { disk_bucket } => disk_bucket.get(key),
         }
     }
 
@@ -665,8 +661,8 @@ impl Eq for Bucket {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
+    use crate::BucketEntry;
+    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
@@ -809,7 +805,11 @@ mod tests {
         let parsed = Bucket::from_xdr_bytes(&xdr_bytes).unwrap();
 
         // Hashes should match
-        assert_eq!(parsed.hash(), original_hash, "Hash mismatch after round-trip");
+        assert_eq!(
+            parsed.hash(),
+            original_hash,
+            "Hash mismatch after round-trip"
+        );
         assert_eq!(parsed.len(), entries.len(), "Entry count mismatch");
     }
 
@@ -827,7 +827,11 @@ mod tests {
         let bucket2 = Bucket::from_entries(extracted).unwrap();
 
         // Hashes should match
-        assert_eq!(bucket2.hash(), bucket1.hash(), "Hash mismatch after entries roundtrip");
+        assert_eq!(
+            bucket2.hash(),
+            bucket1.hash(),
+            "Hash mismatch after entries roundtrip"
+        );
     }
 
     #[test]
@@ -852,7 +856,11 @@ mod tests {
         let disk_bucket = Bucket::from_xdr_bytes_disk_backed(&xdr_bytes, &disk_path).unwrap();
 
         // Hash should match
-        assert_eq!(disk_bucket.hash(), original_hash, "Disk bucket hash mismatch");
+        assert_eq!(
+            disk_bucket.hash(),
+            original_hash,
+            "Disk bucket hash mismatch"
+        );
         assert!(disk_bucket.is_disk_backed());
 
         // Extract entries via iter() and create a new bucket
@@ -860,7 +868,11 @@ mod tests {
         let recreated = Bucket::from_entries(extracted).unwrap();
 
         // Hashes should match after roundtrip
-        assert_eq!(recreated.hash(), original_hash, "Hash mismatch after disk bucket roundtrip");
+        assert_eq!(
+            recreated.hash(),
+            original_hash,
+            "Hash mismatch after disk bucket roundtrip"
+        );
     }
 
     #[test]
@@ -896,7 +908,11 @@ mod tests {
         assert!(extracted[0].is_metadata(), "Metadata should be first entry");
 
         let recreated = Bucket::from_entries(extracted).unwrap();
-        assert_eq!(recreated.hash(), original_hash, "Hash mismatch after metadata bucket roundtrip");
+        assert_eq!(
+            recreated.hash(),
+            original_hash,
+            "Hash mismatch after metadata bucket roundtrip"
+        );
     }
 
     #[test]
@@ -916,8 +932,15 @@ mod tests {
         let reserialized_xdr = parsed.to_xdr_bytes().unwrap();
 
         // Bytes should be identical
-        assert_eq!(reserialized_xdr.len(), original_xdr.len(), "XDR length differs");
-        assert_eq!(reserialized_xdr, original_xdr, "XDR bytes differ after roundtrip");
+        assert_eq!(
+            reserialized_xdr.len(),
+            original_xdr.len(),
+            "XDR length differs"
+        );
+        assert_eq!(
+            reserialized_xdr, original_xdr,
+            "XDR bytes differ after roundtrip"
+        );
     }
 
     #[test]
@@ -941,7 +964,10 @@ mod tests {
 
         // Get XDR from disk-backed bucket (reads from file)
         let disk_xdr = disk_bucket.to_xdr_bytes().unwrap();
-        assert_eq!(disk_xdr, original_xdr, "Disk bucket XDR differs from original");
+        assert_eq!(
+            disk_xdr, original_xdr,
+            "Disk bucket XDR differs from original"
+        );
 
         // Extract entries and create new in-memory bucket
         let extracted: Vec<_> = disk_bucket.iter().collect();
@@ -951,7 +977,10 @@ mod tests {
         let inmemory_xdr = inmemory.to_xdr_bytes().unwrap();
 
         // These should be identical
-        assert_eq!(inmemory_xdr, disk_xdr, "In-memory XDR differs from disk XDR");
+        assert_eq!(
+            inmemory_xdr, disk_xdr,
+            "In-memory XDR differs from disk XDR"
+        );
         assert_eq!(inmemory.hash(), original_hash);
     }
 
@@ -1003,14 +1032,18 @@ mod tests {
         let recreated = Bucket::from_sorted_entries(extracted).unwrap();
 
         // Hash should match!
-        assert_eq!(recreated.hash(), original_hash,
-            "from_sorted_entries should preserve disk bucket hash");
+        assert_eq!(
+            recreated.hash(),
+            original_hash,
+            "from_sorted_entries should preserve disk bucket hash"
+        );
     }
 
     #[test]
     fn test_bucket_mixed_entry_types_ordering() {
-        use stellar_xdr::curr::{OfferEntry, TrustLineEntry,
-            TrustLineAsset, AlphaNum4, AssetCode4};
+        use stellar_xdr::curr::{
+            AlphaNum4, AssetCode4, OfferEntry, TrustLineAsset, TrustLineEntry,
+        };
 
         // Create helper functions for different entry types
         let make_offer_entry = |seller: [u8; 32], offer_id: i64| -> LedgerEntry {
@@ -1066,17 +1099,30 @@ mod tests {
 
         // Verify ordering: Account (type 0) < Trustline (type 1) < Offer (type 2)
         assert!(sorted_entries[0].is_live());
-        assert!(matches!(sorted_entries[0].as_ledger_entry().unwrap().data, LedgerEntryData::Account(_)));
+        assert!(matches!(
+            sorted_entries[0].as_ledger_entry().unwrap().data,
+            LedgerEntryData::Account(_)
+        ));
         assert!(sorted_entries[1].is_live());
-        assert!(matches!(sorted_entries[1].as_ledger_entry().unwrap().data, LedgerEntryData::Account(_)));
+        assert!(matches!(
+            sorted_entries[1].as_ledger_entry().unwrap().data,
+            LedgerEntryData::Account(_)
+        ));
         assert!(sorted_entries[2].is_live());
-        assert!(matches!(sorted_entries[2].as_ledger_entry().unwrap().data, LedgerEntryData::Trustline(_)));
+        assert!(matches!(
+            sorted_entries[2].as_ledger_entry().unwrap().data,
+            LedgerEntryData::Trustline(_)
+        ));
         assert!(sorted_entries[3].is_live());
-        assert!(matches!(sorted_entries[3].as_ledger_entry().unwrap().data, LedgerEntryData::Offer(_)));
+        assert!(matches!(
+            sorted_entries[3].as_ledger_entry().unwrap().data,
+            LedgerEntryData::Offer(_)
+        ));
 
         // Verify accounts are sorted by account ID
         if let LedgerEntryData::Account(a1) = &sorted_entries[0].as_ledger_entry().unwrap().data {
-            if let LedgerEntryData::Account(a2) = &sorted_entries[1].as_ledger_entry().unwrap().data {
+            if let LedgerEntryData::Account(a2) = &sorted_entries[1].as_ledger_entry().unwrap().data
+            {
                 assert_eq!(a1.balance, 100); // [1u8; 32] comes first
                 assert_eq!(a2.balance, 200); // [128u8; 32] comes second
             }
@@ -1085,6 +1131,10 @@ mod tests {
         // Roundtrip test
         let extracted: Vec<_> = bucket.iter().collect();
         let recreated = Bucket::from_entries(extracted).unwrap();
-        assert_eq!(recreated.hash(), bucket.hash(), "Hash mismatch after mixed type roundtrip");
+        assert_eq!(
+            recreated.hash(),
+            bucket.hash(),
+            "Hash mismatch after mixed type roundtrip"
+        );
     }
 }

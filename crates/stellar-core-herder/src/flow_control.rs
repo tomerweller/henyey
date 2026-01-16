@@ -179,8 +179,10 @@ impl FlowControlConfig {
         configured_batch_size: u32,
     ) -> Self {
         let max_tx_size = compute_max_tx_size(protocol_version, soroban_tx_max_size_bytes);
-        let reading_capacity = compute_reading_capacity(configured_reading_capacity, max_tx_size, 300);
-        let send_more_batch_size = compute_send_more_batch_size(configured_batch_size, max_tx_size, 40);
+        let reading_capacity =
+            compute_reading_capacity(configured_reading_capacity, max_tx_size, 300);
+        let send_more_batch_size =
+            compute_send_more_batch_size(configured_batch_size, max_tx_size, 40);
 
         Self {
             max_tx_size,
@@ -227,7 +229,10 @@ mod tests {
     fn test_compute_max_tx_size_pre_soroban() {
         // Protocol 19 (pre-Soroban)
         assert_eq!(compute_max_tx_size(19, None), MAX_CLASSIC_TX_SIZE_BYTES);
-        assert_eq!(compute_max_tx_size(19, Some(500_000)), MAX_CLASSIC_TX_SIZE_BYTES);
+        assert_eq!(
+            compute_max_tx_size(19, Some(500_000)),
+            MAX_CLASSIC_TX_SIZE_BYTES
+        );
     }
 
     #[test]
@@ -241,7 +246,10 @@ mod tests {
 
         // When classic limit is larger (small Soroban config)
         let small_soroban = 10_000;
-        assert_eq!(compute_max_tx_size(20, Some(small_soroban)), MAX_CLASSIC_TX_SIZE_BYTES);
+        assert_eq!(
+            compute_max_tx_size(20, Some(small_soroban)),
+            MAX_CLASSIC_TX_SIZE_BYTES
+        );
     }
 
     #[test]
@@ -274,7 +282,10 @@ mod tests {
         let max_tx = 100_000;
 
         // Configured value takes precedence
-        assert_eq!(compute_send_more_batch_size(2_000_000, max_tx, 40), 2_000_000);
+        assert_eq!(
+            compute_send_more_batch_size(2_000_000, max_tx, 40),
+            2_000_000
+        );
 
         // Default calculation
         assert_eq!(compute_send_more_batch_size(0, max_tx, 40), 100_000 * 40);
@@ -296,7 +307,10 @@ mod tests {
 
         // Soroban with larger limit
         let config = FlowControlConfig::new(25, Some(500_000), 0, 0);
-        assert_eq!(config.max_tx_size, 500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER);
+        assert_eq!(
+            config.max_tx_size,
+            500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+        );
     }
 
     #[test]
@@ -306,13 +320,19 @@ mod tests {
         // Increase
         let diff = config.update_for_soroban(500_000);
         assert!(diff > 0);
-        assert_eq!(config.max_tx_size, 500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER);
+        assert_eq!(
+            config.max_tx_size,
+            500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+        );
 
         // No change (decrease is clamped)
         let diff = config.update_for_soroban(10_000);
         assert_eq!(diff, 0);
         // Max stays at the higher value
-        assert_eq!(config.max_tx_size, 500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER);
+        assert_eq!(
+            config.max_tx_size,
+            500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+        );
     }
 
     #[test]

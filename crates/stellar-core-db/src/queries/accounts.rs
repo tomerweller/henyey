@@ -51,9 +51,8 @@ fn account_id_to_string(id: &AccountId) -> String {
 ///
 /// Thresholds are 4 bytes: [master weight, low, medium, high].
 fn parse_thresholds(s: &str) -> Result<Thresholds, DbError> {
-    let bytes = hex::decode(s).map_err(|e| {
-        DbError::Integrity(format!("Invalid thresholds hex: {}", e))
-    })?;
+    let bytes =
+        hex::decode(s).map_err(|e| DbError::Integrity(format!("Invalid thresholds hex: {}", e)))?;
     if bytes.len() != 4 {
         return Err(DbError::Integrity("Thresholds must be 4 bytes".into()));
     }
@@ -72,9 +71,8 @@ fn thresholds_to_string(t: &Thresholds) -> String {
 fn parse_signers(s: Option<String>) -> Result<Vec<Signer>, DbError> {
     match s {
         Some(json) if !json.is_empty() => {
-            let data: Vec<u8> = serde_json::from_str(&json).map_err(|e| {
-                DbError::Integrity(format!("Invalid signers JSON: {}", e))
-            })?;
+            let data: Vec<u8> = serde_json::from_str(&json)
+                .map_err(|e| DbError::Integrity(format!("Invalid signers JSON: {}", e)))?;
             if data.is_empty() {
                 return Ok(vec![]);
             }
@@ -94,7 +92,8 @@ fn signers_to_string(signers: &[Signer]) -> Option<String> {
         None
     } else {
         // Encode signers as XDR bytes in JSON
-        let bytes: Vec<u8> = signers.iter()
+        let bytes: Vec<u8> = signers
+            .iter()
             .flat_map(|s| s.to_xdr(Limits::none()).unwrap_or_default())
             .collect();
         Some(serde_json::to_string(&bytes).unwrap_or_default())
@@ -106,16 +105,16 @@ impl AccountQueries for Connection {
         let account_id_str = account_id_to_string(id);
 
         let result: Option<(
-            i64,      // balance
-            i64,      // seqnum
-            i32,      // numsubentries
-            Option<String>, // inflationdest
-            Option<String>, // homedomain
-            String,   // thresholds
-            i32,      // flags
-            i64,      // buyingliabilities
-            i64,      // sellingliabilities
-            Option<String>, // signers
+            i64,             // balance
+            i64,             // seqnum
+            i32,             // numsubentries
+            Option<String>,  // inflationdest
+            Option<String>,  // homedomain
+            String,          // thresholds
+            i32,             // flags
+            i64,             // buyingliabilities
+            i64,             // sellingliabilities
+            Option<String>,  // signers
             Option<Vec<u8>>, // extension
         )> = self
             .query_row(
@@ -236,7 +235,11 @@ impl AccountQueries for Connection {
                 entry.seq_num.0,
                 entry.num_sub_entries as i32,
                 None::<String>, // inflationdest
-                if home_domain.is_empty() { None } else { Some(home_domain) },
+                if home_domain.is_empty() {
+                    None
+                } else {
+                    Some(home_domain)
+                },
                 thresholds_str,
                 entry.flags as i32,
                 last_modified as i32,

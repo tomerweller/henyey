@@ -47,7 +47,10 @@ pub fn execute_inflation(
 }
 
 /// Create an Inflation result.
-fn make_inflation_result(code: InflationResultCode, payouts: Vec<InflationPayout>) -> OperationResult {
+fn make_inflation_result(
+    code: InflationResultCode,
+    payouts: Vec<InflationPayout>,
+) -> OperationResult {
     let result = match code {
         InflationResultCode::Success => {
             InflationResult::Success(payouts.try_into().unwrap_or_default())

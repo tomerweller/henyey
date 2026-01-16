@@ -7,12 +7,12 @@ use std::collections::HashSet;
 
 use stellar_xdr::curr::{
     AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp, ClaimClaimableBalanceResult,
-    ClaimClaimableBalanceResultCode, ClaimableBalanceEntry, ClaimableBalanceEntryExt,
-    ClaimableBalanceEntryExtensionV1, ClaimableBalanceEntryExtensionV1Ext, ClaimableBalanceFlags,
-    ClaimableBalanceId, Claimant, ClaimPredicate, CreateClaimableBalanceOp,
-    CreateClaimableBalanceResult, CreateClaimableBalanceResultCode, Hash, HashIdPreimage,
-    HashIdPreimageOperationId, LedgerKey, LedgerKeyClaimableBalance, OperationResult,
-    OperationResultTr, SequenceNumber,
+    ClaimClaimableBalanceResultCode, ClaimPredicate, ClaimableBalanceEntry,
+    ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
+    ClaimableBalanceEntryExtensionV1Ext, ClaimableBalanceFlags, ClaimableBalanceId, Claimant,
+    CreateClaimableBalanceOp, CreateClaimableBalanceResult, CreateClaimableBalanceResultCode, Hash,
+    HashIdPreimage, HashIdPreimageOperationId, LedgerKey, LedgerKeyClaimableBalance,
+    OperationResult, OperationResultTr, SequenceNumber,
 };
 
 use crate::state::LedgerStateManager;
@@ -197,8 +197,8 @@ pub fn execute_create_claimable_balance(
                     .unwrap_or(false)
             };
             if clawback_enabled {
-                claimable_flags |= ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag
-                    as u32;
+                claimable_flags |=
+                    ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32;
             }
         }
     }
@@ -285,12 +285,16 @@ pub fn execute_claim_claimable_balance(
     });
 
     if !is_valid_claimant {
-        return Ok(make_claim_result(ClaimClaimableBalanceResultCode::CannotClaim));
+        return Ok(make_claim_result(
+            ClaimClaimableBalanceResultCode::CannotClaim,
+        ));
     }
 
     // Check source account exists (use mutable access to mirror C++ loadSourceAccount)
     if state.get_account_mut(source).is_none() {
-        return Ok(make_claim_result(ClaimClaimableBalanceResultCode::CannotClaim));
+        return Ok(make_claim_result(
+            ClaimClaimableBalanceResultCode::CannotClaim,
+        ));
     }
 
     // Transfer the balance
@@ -382,11 +386,10 @@ fn check_predicate(predicate: &stellar_xdr::curr::ClaimPredicate, context: &Ledg
         ClaimPredicate::Or(predicates) => {
             predicates.len() == 2 && predicates.iter().any(|p| check_predicate(p, context))
         }
-        ClaimPredicate::Not(p) => {
-            p.as_ref()
-                .map(|inner| !check_predicate(inner, context))
-                .unwrap_or(false)
-        }
+        ClaimPredicate::Not(p) => p
+            .as_ref()
+            .map(|inner| !check_predicate(inner, context))
+            .unwrap_or(false),
         ClaimPredicate::BeforeAbsoluteTime(time) => (context.close_time as i64) < *time,
         ClaimPredicate::BeforeRelativeTime(_) => false,
     }
@@ -565,8 +568,9 @@ mod tests {
             claimants: vec![].try_into().unwrap(), // No claimants
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context);
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -598,8 +602,9 @@ mod tests {
             claimants: vec![claimant].try_into().unwrap(),
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context);
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -639,9 +644,10 @@ mod tests {
             claimants: vec![claimant.clone(), claimant].try_into().unwrap(),
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context)
-                .expect("create claimable balance");
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
 
         match result {
             OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
@@ -672,9 +678,10 @@ mod tests {
             claimants: vec![claimant].try_into().unwrap(),
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context)
-                .expect("create claimable balance");
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
 
         match result {
             OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
@@ -706,9 +713,10 @@ mod tests {
             claimants: vec![claimant].try_into().unwrap(),
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context)
-                .expect("create claimable balance");
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
 
         let balance_id = match result {
             OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(
@@ -757,9 +765,10 @@ mod tests {
             claimants: vec![claimant].try_into().unwrap(),
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context)
-                .expect("create claimable balance");
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
 
         match result {
             OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
@@ -779,8 +788,13 @@ mod tests {
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
 
-        let trustline =
-            create_test_trustline(source_id.clone(), issuer_id.clone(), false, false, 50_000_000);
+        let trustline = create_test_trustline(
+            source_id.clone(),
+            issuer_id.clone(),
+            false,
+            false,
+            50_000_000,
+        );
         state.create_trustline(trustline);
 
         let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
@@ -799,9 +813,10 @@ mod tests {
             claimants: vec![claimant].try_into().unwrap(),
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context)
-                .expect("create claimable balance");
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
 
         match result {
             OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
@@ -839,13 +854,7 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op,
-            &issuer_id,
-            &issuer_id,
-            123,
-            0,
-            &mut state,
-            &context,
+            &op, &issuer_id, &issuer_id, 123, 0, &mut state, &context,
         )
         .expect("create claimable balance");
 
@@ -901,9 +910,10 @@ mod tests {
             claimants: vec![claimant].try_into().unwrap(),
         };
 
-        let result =
-            execute_create_claimable_balance(&op, &source_id, &source_id, 123, 0, &mut state, &context)
-                .expect("create claimable balance");
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
 
         match result {
             OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(
@@ -995,10 +1005,7 @@ mod tests {
         let context = create_test_context();
 
         let claimant_id = create_test_account_id(1);
-        state.create_account(create_test_account(
-            claimant_id.clone(),
-            i64::MAX - 50,
-        ));
+        state.create_account(create_test_account(claimant_id.clone(), i64::MAX - 50));
 
         let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
             destination: claimant_id.clone(),

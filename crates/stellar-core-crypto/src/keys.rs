@@ -55,8 +55,7 @@ impl PublicKey {
     /// Returns [`CryptoError::InvalidPublicKey`] if the bytes do not represent
     /// a valid point on the Ed25519 curve.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, CryptoError> {
-        let key =
-            VerifyingKey::from_bytes(bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let key = VerifyingKey::from_bytes(bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
         Ok(Self(key))
     }
 
@@ -124,9 +123,9 @@ impl TryFrom<&stellar_xdr::curr::PublicKey> for PublicKey {
 
     fn try_from(xdr: &stellar_xdr::curr::PublicKey) -> Result<Self, Self::Error> {
         match xdr {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(bytes),
-            ) => Self::from_bytes(bytes),
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                bytes,
+            )) => Self::from_bytes(bytes),
         }
     }
 }
@@ -313,10 +312,14 @@ impl TryFrom<&stellar_xdr::curr::Signature> for Signature {
     type Error = CryptoError;
 
     fn try_from(xdr: &stellar_xdr::curr::Signature) -> Result<Self, Self::Error> {
-        let bytes: [u8; 64] = xdr.0.as_slice().try_into().map_err(|_| CryptoError::InvalidLength {
-            expected: 64,
-            got: xdr.0.len(),
-        })?;
+        let bytes: [u8; 64] =
+            xdr.0
+                .as_slice()
+                .try_into()
+                .map_err(|_| CryptoError::InvalidLength {
+                    expected: 64,
+                    got: xdr.0.len(),
+                })?;
         Ok(Self(bytes))
     }
 }

@@ -283,11 +283,8 @@ pub fn decode_signed_payload(s: &str) -> Result<([u8; 32], Vec<u8>), CryptoError
     let mut key = [0u8; 32];
     key.copy_from_slice(&data[..32]);
 
-    let payload_len = u32::from_be_bytes(
-        data[32..36]
-            .try_into()
-            .expect("slice is exactly 4 bytes"),
-    ) as usize;
+    let payload_len =
+        u32::from_be_bytes(data[32..36].try_into().expect("slice is exactly 4 bytes")) as usize;
 
     // Validate payload length
     if payload_len > 64 {
@@ -327,7 +324,11 @@ fn encode_check(version: u8, data: &[u8]) -> String {
 /// Decodes a fixed-length StrKey with version verification.
 ///
 /// Verifies the version byte matches and the checksum is valid.
-fn decode_check<const N: usize>(expected_version: u8, s: &str, expected_len: usize) -> Result<[u8; N], CryptoError> {
+fn decode_check<const N: usize>(
+    expected_version: u8,
+    s: &str,
+    expected_len: usize,
+) -> Result<[u8; N], CryptoError> {
     let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, s)
         .ok_or_else(|| CryptoError::InvalidStrKey("invalid base32".to_string()))?;
 

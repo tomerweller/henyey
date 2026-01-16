@@ -116,7 +116,8 @@ fn change_type_order(change: &LedgerEntryChange) -> u8 {
 /// Changes are sorted by (key_bytes, change_type, change_hash) to ensure
 /// deterministic ordering regardless of the original order.
 fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::curr::Error> {
-    let mut entries: Vec<(Vec<u8>, u8, [u8; 32], LedgerEntryChange)> = Vec::with_capacity(changes.0.len());
+    let mut entries: Vec<(Vec<u8>, u8, [u8; 32], LedgerEntryChange)> =
+        Vec::with_capacity(changes.0.len());
 
     for change in changes.0.iter().cloned() {
         let key = change_key(&change);
@@ -133,7 +134,9 @@ fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::cur
     });
 
     let sorted: Vec<LedgerEntryChange> = entries.into_iter().map(|(_, _, _, c)| c).collect();
-    changes.0 = sorted.try_into().map_err(|_| stellar_xdr::curr::Error::Invalid)?;
+    changes.0 = sorted
+        .try_into()
+        .map_err(|_| stellar_xdr::curr::Error::Invalid)?;
     Ok(())
 }
 

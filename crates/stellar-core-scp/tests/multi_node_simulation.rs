@@ -58,7 +58,12 @@ impl SimulationDriver {
 }
 
 impl SCPDriver for SimulationDriver {
-    fn validate_value(&self, _slot_index: u64, _value: &Value, _nomination: bool) -> ValidationLevel {
+    fn validate_value(
+        &self,
+        _slot_index: u64,
+        _value: &Value,
+        _nomination: bool,
+    ) -> ValidationLevel {
         self.validation_level
     }
 
@@ -72,7 +77,10 @@ impl SCPDriver for SimulationDriver {
     }
 
     fn emit_envelope(&self, envelope: &ScpEnvelope) {
-        self.emitted_envelopes.write().unwrap().push(envelope.clone());
+        self.emitted_envelopes
+            .write()
+            .unwrap()
+            .push(envelope.clone());
         self.emit_count.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -374,7 +382,9 @@ fn test_three_node_basic_consensus() {
     let prev_value = make_value(&[0]);
 
     // Node 1 nominates - result depends on whether it's a leader for this round
-    let _ = sim.get_node(&node1).nominate(slot_index, value.clone(), &prev_value);
+    let _ = sim
+        .get_node(&node1)
+        .nominate(slot_index, value.clone(), &prev_value);
 
     // Node 1 should have the slot created after nomination attempt
     assert!(!sim.get_node(&node1).empty());
@@ -392,9 +402,12 @@ fn test_all_nodes_nominate_same_value() {
     let prev_value = make_value(&[0]);
 
     // All nodes nominate the same value
-    sim.get_node(&node1).nominate(slot_index, value.clone(), &prev_value);
-    sim.get_node(&node2).nominate(slot_index, value.clone(), &prev_value);
-    sim.get_node(&node3).nominate(slot_index, value.clone(), &prev_value);
+    sim.get_node(&node1)
+        .nominate(slot_index, value.clone(), &prev_value);
+    sim.get_node(&node2)
+        .nominate(slot_index, value.clone(), &prev_value);
+    sim.get_node(&node3)
+        .nominate(slot_index, value.clone(), &prev_value);
 
     // Run until stable
     sim.run_until_stable();
@@ -416,9 +429,12 @@ fn test_force_externalize_all_nodes() {
     let value = make_value(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
     // Force externalize on all nodes (simulates catchup)
-    sim.get_node(&node1).force_externalize(slot_index, value.clone());
-    sim.get_node(&node2).force_externalize(slot_index, value.clone());
-    sim.get_node(&node3).force_externalize(slot_index, value.clone());
+    sim.get_node(&node1)
+        .force_externalize(slot_index, value.clone());
+    sim.get_node(&node2)
+        .force_externalize(slot_index, value.clone());
+    sim.get_node(&node3)
+        .force_externalize(slot_index, value.clone());
 
     // All should be externalized with the same value
     assert_eq!(sim.all_externalized(slot_index), Some(value));
@@ -439,20 +455,41 @@ fn test_receive_externalize_envelope() {
     };
 
     // Create externalize envelopes from node2 and node3
-    let ext2 = make_externalize_envelope(node2.clone(), slot_index, &sim.quorum_set, ballot.clone(), 1);
-    let ext3 = make_externalize_envelope(node3.clone(), slot_index, &sim.quorum_set, ballot.clone(), 1);
+    let ext2 = make_externalize_envelope(
+        node2.clone(),
+        slot_index,
+        &sim.quorum_set,
+        ballot.clone(),
+        1,
+    );
+    let ext3 = make_externalize_envelope(
+        node3.clone(),
+        slot_index,
+        &sim.quorum_set,
+        ballot.clone(),
+        1,
+    );
 
     // Node 1 receives externalize messages
     let state2 = sim.get_node(&node1).receive_envelope(ext2);
     let state3 = sim.get_node(&node1).receive_envelope(ext3);
 
     // Both should be valid
-    assert!(matches!(state2, EnvelopeState::Valid | EnvelopeState::ValidNew));
-    assert!(matches!(state3, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state2,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
+    assert!(matches!(
+        state3,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
 
     // Node 1 should now be externalized
     assert!(sim.get_node(&node1).is_slot_externalized(slot_index));
-    assert_eq!(sim.get_node(&node1).get_externalized_value(slot_index), Some(value));
+    assert_eq!(
+        sim.get_node(&node1).get_externalized_value(slot_index),
+        Some(value)
+    );
 }
 
 #[test]
@@ -496,7 +533,10 @@ fn test_nomination_envelope_processing() {
 
     // Node 1 receives it
     let state = sim.get_node(&node1).receive_envelope(nom);
-    assert!(matches!(state, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
 }
 
 #[test]
@@ -513,11 +553,22 @@ fn test_prepare_envelope_processing() {
     };
 
     // Create prepare envelope from node2
-    let prep = make_prepare_envelope(node2.clone(), slot_index, &sim.quorum_set, ballot, None, 0, 0);
+    let prep = make_prepare_envelope(
+        node2.clone(),
+        slot_index,
+        &sim.quorum_set,
+        ballot,
+        None,
+        0,
+        0,
+    );
 
     // Node 1 receives it
     let state = sim.get_node(&node1).receive_envelope(prep);
-    assert!(matches!(state, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
 }
 
 #[test]
@@ -538,7 +589,10 @@ fn test_confirm_envelope_processing() {
 
     // Node 1 receives it
     let state = sim.get_node(&node1).receive_envelope(conf);
-    assert!(matches!(state, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
 }
 
 #[test]
@@ -743,10 +797,11 @@ fn test_process_slots_ascending() {
 
     // Process ascending from 5
     let mut visited = Vec::new();
-    sim.get_node(&node1).process_slots_ascending_from(5, |slot_index| {
-        visited.push(slot_index);
-        true
-    });
+    sim.get_node(&node1)
+        .process_slots_ascending_from(5, |slot_index| {
+            visited.push(slot_index);
+            true
+        });
 
     assert_eq!(visited, vec![5, 7, 9]);
 }
@@ -764,10 +819,11 @@ fn test_process_slots_descending() {
 
     // Process descending from 7
     let mut visited = Vec::new();
-    sim.get_node(&node1).process_slots_descending_from(7, |slot_index| {
-        visited.push(slot_index);
-        true
-    });
+    sim.get_node(&node1)
+        .process_slots_descending_from(7, |slot_index| {
+            visited.push(slot_index);
+            true
+        });
 
     assert_eq!(visited, vec![7, 5, 3, 1]);
 }
@@ -797,7 +853,8 @@ fn test_cumulative_statement_count() {
 
     // Create slots
     for i in 1..=3 {
-        sim.get_node(&node1).force_externalize(i, make_value(&[i as u8]));
+        sim.get_node(&node1)
+            .force_externalize(i, make_value(&[i as u8]));
     }
 
     // Count should still be valid (might be 0 if no statements recorded)
@@ -813,7 +870,8 @@ fn test_quorum_slice_check() {
     let quorum_set = make_quorum_set(vec![node1.clone(), node2.clone(), node3.clone()], 2);
 
     // 2 of 3 nodes satisfy the slice
-    let nodes: std::collections::HashSet<_> = vec![node1.clone(), node2.clone()].into_iter().collect();
+    let nodes: std::collections::HashSet<_> =
+        vec![node1.clone(), node2.clone()].into_iter().collect();
     assert!(is_quorum_slice(&quorum_set, &nodes, &|_| None));
 
     // 1 of 3 nodes doesn't satisfy
@@ -852,7 +910,10 @@ fn test_full_consensus_flow_via_externalize_messages() {
 
     let slot_index = 1u64;
     let value = make_value(&[0xCA, 0xFE]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Simulate externalize messages from node2 and node3 being received by all nodes
     let ext2 = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
@@ -892,23 +953,42 @@ fn test_ballot_prepare_phase_progression() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Node receives PREPARE messages from quorum
     let prep2 = make_prepare_envelope(
-        node2.clone(), slot_index, &quorum_set,
-        ballot.clone(), Some(ballot.clone()), 0, 0
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        Some(ballot.clone()),
+        0,
+        0,
     );
     let prep3 = make_prepare_envelope(
-        node3.clone(), slot_index, &quorum_set,
-        ballot.clone(), Some(ballot.clone()), 0, 0
+        node3.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        Some(ballot.clone()),
+        0,
+        0,
     );
 
     let state2 = scp.receive_envelope(prep2);
     let state3 = scp.receive_envelope(prep3);
 
-    assert!(matches!(state2, EnvelopeState::Valid | EnvelopeState::ValidNew));
-    assert!(matches!(state3, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state2,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
+    assert!(matches!(
+        state3,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
 
     // Slot should exist and be in ballot phase
     let slot_state = scp.get_slot_state(slot_index);
@@ -931,16 +1011,29 @@ fn test_ballot_confirm_phase() {
 
     let slot_index = 1u64;
     let value = make_value(&[4, 5, 6]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Node receives CONFIRM messages from quorum
     let conf2 = make_confirm_envelope(
-        node2.clone(), slot_index, &quorum_set,
-        ballot.clone(), 1, 1, 1
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        1,
+        1,
+        1,
     );
     let conf3 = make_confirm_envelope(
-        node3.clone(), slot_index, &quorum_set,
-        ballot.clone(), 1, 1, 1
+        node3.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        1,
+        1,
+        1,
     );
 
     scp.receive_envelope(conf2);
@@ -973,8 +1066,11 @@ fn test_nodes_heard_from_tracking() {
 
     // Receive nomination from node2
     let nom2 = make_nomination_envelope(
-        node2.clone(), slot_index, &quorum_set,
-        vec![value.clone()], vec![]
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        vec![value.clone()],
+        vec![],
     );
     scp.receive_envelope(nom2);
 
@@ -998,11 +1094,16 @@ fn test_multiple_slots_consensus() {
     // Externalize 5 different slots with different values
     for slot_index in 1..=5u64 {
         let value = make_value(&[slot_index as u8, (slot_index * 2) as u8]);
-        let ballot = ScpBallot { counter: 1, value: value.clone() };
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
 
         // Create externalize from both nodes
-        let ext1 = make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot.clone(), 1);
-        let ext2 = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
+        let ext1 =
+            make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot.clone(), 1);
+        let ext2 =
+            make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
 
         scp.receive_envelope(ext1);
         scp.receive_envelope(ext2);
@@ -1031,7 +1132,10 @@ fn test_out_of_order_externalization() {
 
     // Externalize slot 5 first
     let value5 = make_value(&[5]);
-    let ballot5 = ScpBallot { counter: 1, value: value5.clone() };
+    let ballot5 = ScpBallot {
+        counter: 1,
+        value: value5.clone(),
+    };
     let ext5_1 = make_externalize_envelope(node1.clone(), 5, &quorum_set, ballot5.clone(), 1);
     let ext5_2 = make_externalize_envelope(node2.clone(), 5, &quorum_set, ballot5.clone(), 1);
     scp.receive_envelope(ext5_1);
@@ -1039,7 +1143,10 @@ fn test_out_of_order_externalization() {
 
     // Then externalize slot 3
     let value3 = make_value(&[3]);
-    let ballot3 = ScpBallot { counter: 1, value: value3.clone() };
+    let ballot3 = ScpBallot {
+        counter: 1,
+        value: value3.clone(),
+    };
     let ext3_1 = make_externalize_envelope(node1.clone(), 3, &quorum_set, ballot3.clone(), 1);
     let ext3_2 = make_externalize_envelope(node2.clone(), 3, &quorum_set, ballot3.clone(), 1);
     scp.receive_envelope(ext3_1);
@@ -1093,8 +1200,11 @@ fn test_crash_recovery_from_nomination() {
 
     // Create a nomination envelope to recover from
     let nom = make_nomination_envelope(
-        node1.clone(), slot_index, &quorum_set,
-        vec![value.clone()], vec![value.clone()]
+        node1.clone(),
+        slot_index,
+        &quorum_set,
+        vec![value.clone()],
+        vec![value.clone()],
     );
 
     // Recover state
@@ -1116,12 +1226,20 @@ fn test_crash_recovery_from_prepare() {
 
     let slot_index = 1u64;
     let value = make_value(&[4, 5, 6]);
-    let ballot = ScpBallot { counter: 3, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 3,
+        value: value.clone(),
+    };
 
     // Create a prepare envelope to recover from
     let prep = make_prepare_envelope(
-        node1.clone(), slot_index, &quorum_set,
-        ballot.clone(), Some(ballot.clone()), 1, 3
+        node1.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        Some(ballot.clone()),
+        1,
+        3,
     );
 
     // Recover state
@@ -1146,12 +1264,20 @@ fn test_crash_recovery_from_confirm() {
 
     let slot_index = 1u64;
     let value = make_value(&[7, 8, 9]);
-    let ballot = ScpBallot { counter: 2, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 2,
+        value: value.clone(),
+    };
 
     // Create a confirm envelope to recover from
     let conf = make_confirm_envelope(
-        node1.clone(), slot_index, &quorum_set,
-        ballot.clone(), 2, 1, 2
+        node1.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        2,
+        1,
+        2,
     );
 
     // Recover state
@@ -1204,7 +1330,10 @@ fn test_watcher_node_tracks_externalization() {
 
     let slot_index = 1u64;
     let value = make_value(&[0xDE, 0xAD]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Receive externalize from quorum
     let ext2 = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
@@ -1232,7 +1361,10 @@ fn test_get_externalizing_state() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Externalize via envelopes
     let ext1 = make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot.clone(), 1);
@@ -1290,7 +1422,10 @@ fn test_get_scp_state_for_sync() {
     // Create some slots
     for i in 1..=5u64 {
         let value = make_value(&[i as u8]);
-        let ballot = ScpBallot { counter: 1, value: value.clone() };
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
         let ext = make_externalize_envelope(node2.clone(), i, &quorum_set, ballot, 1);
         scp.receive_envelope(ext);
     }
@@ -1320,10 +1455,15 @@ fn test_stress_many_slots() {
     // Externalize 100 slots rapidly
     for slot_index in 1..=100u64 {
         let value = make_value(&[(slot_index % 256) as u8, ((slot_index / 256) % 256) as u8]);
-        let ballot = ScpBallot { counter: 1, value: value.clone() };
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
 
-        let ext1 = make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot.clone(), 1);
-        let ext2 = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
+        let ext1 =
+            make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot.clone(), 1);
+        let ext2 =
+            make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
 
         scp.receive_envelope(ext1);
         scp.receive_envelope(ext2);
@@ -1350,13 +1490,19 @@ fn test_stress_many_envelopes_same_slot() {
 
     let slot_index = 1u64;
     let value = make_value(&[0xAB, 0xCD]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Send nomination from all 10 nodes
     for node in &nodes {
         let nom = make_nomination_envelope(
-            node.clone(), slot_index, &quorum_set,
-            vec![value.clone()], vec![]
+            node.clone(),
+            slot_index,
+            &quorum_set,
+            vec![value.clone()],
+            vec![],
         );
         scp.receive_envelope(nom);
     }
@@ -1364,18 +1510,21 @@ fn test_stress_many_envelopes_same_slot() {
     // Send prepare from all 10 nodes
     for node in &nodes {
         let prep = make_prepare_envelope(
-            node.clone(), slot_index, &quorum_set,
-            ballot.clone(), Some(ballot.clone()), 0, 0
+            node.clone(),
+            slot_index,
+            &quorum_set,
+            ballot.clone(),
+            Some(ballot.clone()),
+            0,
+            0,
         );
         scp.receive_envelope(prep);
     }
 
     // Send externalize from 6 nodes (quorum)
     for node in nodes.iter().take(6) {
-        let ext = make_externalize_envelope(
-            node.clone(), slot_index, &quorum_set,
-            ballot.clone(), 1
-        );
+        let ext =
+            make_externalize_envelope(node.clone(), slot_index, &quorum_set, ballot.clone(), 1);
         scp.receive_envelope(ext);
     }
 
@@ -1403,10 +1552,25 @@ fn test_stress_slot_churn() {
         // Create 20 slots
         for slot_index in start..end {
             let value = make_value(&[slot_index as u8]);
-            let ballot = ScpBallot { counter: 1, value: value.clone() };
+            let ballot = ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            };
 
-            let ext1 = make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot.clone(), 1);
-            let ext2 = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
+            let ext1 = make_externalize_envelope(
+                node1.clone(),
+                slot_index,
+                &quorum_set,
+                ballot.clone(),
+                1,
+            );
+            let ext2 = make_externalize_envelope(
+                node2.clone(),
+                slot_index,
+                &quorum_set,
+                ballot.clone(),
+                1,
+            );
 
             scp.receive_envelope(ext1);
             scp.receive_envelope(ext2);
@@ -1437,14 +1601,15 @@ fn test_stress_large_quorum_set() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3, 4]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Need 14 nodes to externalize
     for node in nodes.iter().take(14) {
-        let ext = make_externalize_envelope(
-            node.clone(), slot_index, &quorum_set,
-            ballot.clone(), 1
-        );
+        let ext =
+            make_externalize_envelope(node.clone(), slot_index, &quorum_set, ballot.clone(), 1);
         scp.receive_envelope(ext);
     }
 
@@ -1471,23 +1636,36 @@ fn test_stress_interleaved_slot_operations() {
         // Start nomination on slot_a
         let value_a = make_value(&[slot_a as u8]);
         let nom_a = make_nomination_envelope(
-            node2.clone(), slot_a, &quorum_set,
-            vec![value_a.clone()], vec![]
+            node2.clone(),
+            slot_a,
+            &quorum_set,
+            vec![value_a.clone()],
+            vec![],
         );
         scp.receive_envelope(nom_a);
 
         // Externalize slot_b
         let value_b = make_value(&[slot_b as u8]);
-        let ballot_b = ScpBallot { counter: 1, value: value_b.clone() };
-        let ext_b1 = make_externalize_envelope(node1.clone(), slot_b, &quorum_set, ballot_b.clone(), 1);
-        let ext_b2 = make_externalize_envelope(node2.clone(), slot_b, &quorum_set, ballot_b.clone(), 1);
+        let ballot_b = ScpBallot {
+            counter: 1,
+            value: value_b.clone(),
+        };
+        let ext_b1 =
+            make_externalize_envelope(node1.clone(), slot_b, &quorum_set, ballot_b.clone(), 1);
+        let ext_b2 =
+            make_externalize_envelope(node2.clone(), slot_b, &quorum_set, ballot_b.clone(), 1);
         scp.receive_envelope(ext_b1);
         scp.receive_envelope(ext_b2);
 
         // Externalize slot_a
-        let ballot_a = ScpBallot { counter: 1, value: value_a.clone() };
-        let ext_a1 = make_externalize_envelope(node1.clone(), slot_a, &quorum_set, ballot_a.clone(), 1);
-        let ext_a2 = make_externalize_envelope(node2.clone(), slot_a, &quorum_set, ballot_a.clone(), 1);
+        let ballot_a = ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        };
+        let ext_a1 =
+            make_externalize_envelope(node1.clone(), slot_a, &quorum_set, ballot_a.clone(), 1);
+        let ext_a2 =
+            make_externalize_envelope(node2.clone(), slot_a, &quorum_set, ballot_a.clone(), 1);
         scp.receive_envelope(ext_a1);
         scp.receive_envelope(ext_a2);
 
@@ -1513,7 +1691,10 @@ fn test_byzantine_duplicate_envelopes() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     let ext = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
 
@@ -1524,10 +1705,19 @@ fn test_byzantine_duplicate_envelopes() {
 
     // First should be valid, subsequent may be Invalid (not newer statement)
     // This is correct behavior - duplicate envelopes are rejected as "not newer"
-    assert!(matches!(state1, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state1,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
     // Duplicates are rejected as invalid (not newer than what we have)
-    assert!(matches!(state2, EnvelopeState::Invalid | EnvelopeState::Valid));
-    assert!(matches!(state3, EnvelopeState::Invalid | EnvelopeState::Valid));
+    assert!(matches!(
+        state2,
+        EnvelopeState::Invalid | EnvelopeState::Valid
+    ));
+    assert!(matches!(
+        state3,
+        EnvelopeState::Invalid | EnvelopeState::Valid
+    ));
 }
 
 /// Test: Conflicting values from same node (equivocation detection)
@@ -1550,15 +1740,21 @@ fn test_byzantine_conflicting_values() {
 
     // Node2 sends nomination for value_a
     let nom_a = make_nomination_envelope(
-        node2.clone(), slot_index, &quorum_set,
-        vec![value_a.clone()], vec![]
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        vec![value_a.clone()],
+        vec![],
     );
     scp.receive_envelope(nom_a);
 
     // Node2 sends nomination for value_b (conflicting)
     let nom_b = make_nomination_envelope(
-        node2.clone(), slot_index, &quorum_set,
-        vec![value_b.clone()], vec![]
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        vec![value_b.clone()],
+        vec![],
     );
     let state = scp.receive_envelope(nom_b);
 
@@ -1583,18 +1779,27 @@ fn test_byzantine_unknown_node() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Unknown node sends externalize
     let ext_unknown = make_externalize_envelope(
-        node_unknown.clone(), slot_index, &quorum_set,
-        ballot.clone(), 1
+        node_unknown.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        1,
     );
     let state = scp.receive_envelope(ext_unknown);
 
     // Should handle gracefully - the message is syntactically valid
     // but won't contribute to quorum
-    assert!(matches!(state, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
 
     // Should NOT be externalized (unknown node doesn't help reach quorum)
     assert!(!scp.is_slot_externalized(slot_index));
@@ -1618,22 +1823,49 @@ fn test_byzantine_minority_different_value() {
     let value_majority = make_value(&[0xAA]);
     let value_minority = make_value(&[0xBB]);
 
-    let ballot_majority = ScpBallot { counter: 1, value: value_majority.clone() };
-    let ballot_minority = ScpBallot { counter: 1, value: value_minority.clone() };
+    let ballot_majority = ScpBallot {
+        counter: 1,
+        value: value_majority.clone(),
+    };
+    let ballot_minority = ScpBallot {
+        counter: 1,
+        value: value_minority.clone(),
+    };
 
     // Node2 and Node3 externalize with majority value (quorum)
-    let ext2 = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot_majority.clone(), 1);
-    let ext3 = make_externalize_envelope(node3.clone(), slot_index, &quorum_set, ballot_majority.clone(), 1);
+    let ext2 = make_externalize_envelope(
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        ballot_majority.clone(),
+        1,
+    );
+    let ext3 = make_externalize_envelope(
+        node3.clone(),
+        slot_index,
+        &quorum_set,
+        ballot_majority.clone(),
+        1,
+    );
 
     scp.receive_envelope(ext2);
     scp.receive_envelope(ext3);
 
     // Should externalize with majority value
     assert!(scp.is_slot_externalized(slot_index));
-    assert_eq!(scp.get_externalized_value(slot_index), Some(value_majority.clone()));
+    assert_eq!(
+        scp.get_externalized_value(slot_index),
+        Some(value_majority.clone())
+    );
 
     // Late message from node1 with minority value should not change outcome
-    let ext1_minority = make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot_minority.clone(), 1);
+    let ext1_minority = make_externalize_envelope(
+        node1.clone(),
+        slot_index,
+        &quorum_set,
+        ballot_minority.clone(),
+        1,
+    );
     scp.receive_envelope(ext1_minority);
 
     // Should still have majority value
@@ -1656,18 +1888,43 @@ fn test_byzantine_stale_ballot_counter() {
     let value = make_value(&[1, 2, 3]);
 
     // Receive prepare with counter 5
-    let ballot_high = ScpBallot { counter: 5, value: value.clone() };
-    let prep_high = make_prepare_envelope(node2.clone(), slot_index, &quorum_set, ballot_high, None, 0, 0);
+    let ballot_high = ScpBallot {
+        counter: 5,
+        value: value.clone(),
+    };
+    let prep_high = make_prepare_envelope(
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        ballot_high,
+        None,
+        0,
+        0,
+    );
     scp.receive_envelope(prep_high);
 
     // Receive prepare with counter 1 (stale)
-    let ballot_low = ScpBallot { counter: 1, value: value.clone() };
-    let prep_low = make_prepare_envelope(node2.clone(), slot_index, &quorum_set, ballot_low, None, 0, 0);
+    let ballot_low = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
+    let prep_low = make_prepare_envelope(
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        ballot_low,
+        None,
+        0,
+        0,
+    );
     let state = scp.receive_envelope(prep_low);
 
     // Should handle gracefully - stale ballot is correctly rejected as "not newer"
     // This is the correct SCP behavior: statements must be strictly newer
-    assert!(matches!(state, EnvelopeState::Invalid | EnvelopeState::Valid));
+    assert!(matches!(
+        state,
+        EnvelopeState::Invalid | EnvelopeState::Valid
+    ));
 }
 
 /// Test: Partial quorum doesn't externalize
@@ -1685,11 +1942,15 @@ fn test_byzantine_partial_quorum_no_externalize() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Only 3 nodes externalize (not enough for 4-of-5 quorum)
     for node in nodes.iter().take(3) {
-        let ext = make_externalize_envelope(node.clone(), slot_index, &quorum_set, ballot.clone(), 1);
+        let ext =
+            make_externalize_envelope(node.clone(), slot_index, &quorum_set, ballot.clone(), 1);
         scp.receive_envelope(ext);
     }
 
@@ -1697,7 +1958,8 @@ fn test_byzantine_partial_quorum_no_externalize() {
     assert!(!scp.is_slot_externalized(slot_index));
 
     // Add 4th node
-    let ext4 = make_externalize_envelope(nodes[3].clone(), slot_index, &quorum_set, ballot.clone(), 1);
+    let ext4 =
+        make_externalize_envelope(nodes[3].clone(), slot_index, &quorum_set, ballot.clone(), 1);
     scp.receive_envelope(ext4);
 
     // NOW should be externalized
@@ -1718,21 +1980,38 @@ fn test_byzantine_out_of_order_messages() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3]);
-    let ballot = ScpBallot { counter: 1, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 1,
+        value: value.clone(),
+    };
 
     // Receive EXTERNALIZE before PREPARE (out of order)
     let ext = make_externalize_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), 1);
     let state_ext = scp.receive_envelope(ext);
 
     // Then receive PREPARE
-    let prep = make_prepare_envelope(node2.clone(), slot_index, &quorum_set, ballot.clone(), None, 0, 0);
+    let prep = make_prepare_envelope(
+        node2.clone(),
+        slot_index,
+        &quorum_set,
+        ballot.clone(),
+        None,
+        0,
+        0,
+    );
     let state_prep = scp.receive_envelope(prep);
 
     // EXTERNALIZE should be valid
-    assert!(matches!(state_ext, EnvelopeState::Valid | EnvelopeState::ValidNew));
+    assert!(matches!(
+        state_ext,
+        EnvelopeState::Valid | EnvelopeState::ValidNew
+    ));
     // PREPARE after EXTERNALIZE is correctly rejected (externalize supersedes prepare)
     // This is correct SCP behavior: can't go backwards in protocol phases
-    assert!(matches!(state_prep, EnvelopeState::Invalid | EnvelopeState::Valid));
+    assert!(matches!(
+        state_prep,
+        EnvelopeState::Invalid | EnvelopeState::Valid
+    ));
 }
 
 /// Test: Recovery after simulated node restart
@@ -1750,7 +2029,10 @@ fn test_byzantine_node_restart_recovery() {
 
     let slot_index = 1u64;
     let value = make_value(&[1, 2, 3]);
-    let ballot = ScpBallot { counter: 3, value: value.clone() };
+    let ballot = ScpBallot {
+        counter: 3,
+        value: value.clone(),
+    };
 
     // Reach externalized state
     let ext1 = make_externalize_envelope(node1.clone(), slot_index, &quorum_set, ballot.clone(), 3);

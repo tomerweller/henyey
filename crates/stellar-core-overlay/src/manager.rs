@@ -40,6 +40,8 @@ use crate::{
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
 use dashmap::DashMap;
+use parking_lot::RwLock;
+use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,9 +50,7 @@ use std::time::{Duration, Instant};
 use stellar_xdr::curr::{PeerAddress as XdrPeerAddress, PeerAddressIp, StellarMessage, VecM};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use parking_lot::RwLock;
 use tracing::{debug, error, info, trace, warn};
-use rand::seq::SliceRandom;
 
 fn message_len(message: &StellarMessage) -> u64 {
     stellar_xdr::curr::WriteXdr::to_xdr(message, stellar_xdr::curr::Limits::none())
@@ -173,7 +173,9 @@ impl OverlayManager {
             config: config.clone(),
             local_node,
             peers: Arc::new(DashMap::new()),
-            flood_gate: Arc::new(FloodGate::with_ttl(Duration::from_secs(config.flood_ttl_secs))),
+            flood_gate: Arc::new(FloodGate::with_ttl(Duration::from_secs(
+                config.flood_ttl_secs,
+            ))),
             inbound_pool: Arc::new(ConnectionPool::new(config.max_inbound_peers)),
             outbound_pool: Arc::new(ConnectionPool::new(config.max_outbound_peers)),
             running: Arc::new(AtomicBool::new(false)),
@@ -603,7 +605,10 @@ impl OverlayManager {
                     if let Err(e) = peer_lock.send_more_extended(500, 50_000_000).await {
                         debug!("Failed to send periodic flow control to {}: {}", peer_id, e);
                     } else {
-                        trace!("Sent periodic flow control (SendMoreExtended 500/50MB) to {}", peer_id);
+                        trace!(
+                            "Sent periodic flow control (SendMoreExtended 500/50MB) to {}",
+                            peer_id
+                        );
                     }
                 }
                 last_send_more = std::time::Instant::now();
@@ -663,7 +668,10 @@ impl OverlayManager {
             }
 
             if helpers::is_handshake_message(&message) {
-                debug!("Ignoring handshake message from authenticated peer {}", peer_id);
+                debug!(
+                    "Ignoring handshake message from authenticated peer {}",
+                    peer_id
+                );
                 continue;
             }
 
@@ -705,7 +713,10 @@ impl OverlayManager {
                     if let Err(e) = peer_lock.send_more_extended(500, 50_000_000).await {
                         debug!("Failed to send flow control to {}: {}", peer_id, e);
                     } else {
-                        trace!("Sent batch flow control (SendMoreExtended 500/50MB) to {}", peer_id);
+                        trace!(
+                            "Sent batch flow control (SendMoreExtended 500/50MB) to {}",
+                            peer_id
+                        );
                     }
                 }
                 messages_since_send_more = 0;
@@ -729,7 +740,10 @@ impl OverlayManager {
             return Err(OverlayError::PeerLimitReached);
         }
 
-        let timeout = self.config.connect_timeout_secs.max(self.config.auth_timeout_secs);
+        let timeout = self
+            .config
+            .connect_timeout_secs
+            .max(self.config.auth_timeout_secs);
         Self::connect_outbound_inner(
             addr,
             self.local_node.clone(),
@@ -767,7 +781,11 @@ impl OverlayManager {
         }
 
         // Collect peers to send to
-        let peers: Vec<_> = self.peers.iter().map(|e| (e.key().clone(), Arc::clone(e.value()))).collect();
+        let peers: Vec<_> = self
+            .peers
+            .iter()
+            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .collect();
 
         let mut sent = 0;
         for (peer_id, peer) in peers {
@@ -839,7 +857,10 @@ impl OverlayManager {
     /// Get a list of connected peer IDs.
     /// Uses the peer info cache for lock-free access.
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.peer_info_cache.iter().map(|entry| entry.key().clone()).collect()
+        self.peer_info_cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     fn count_outbound_peers(peers: &DashMap<PeerId, Arc<TokioMutex<Peer>>>) -> usize {
@@ -903,7 +924,9 @@ impl OverlayManager {
             Err(e) => {
                 pool.release();
                 if let Some(tx) = peer_event_tx {
-                    let _ = tx.send(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
+                    let _ = tx
+                        .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                        .await;
                 }
                 return Err(e);
             }
@@ -928,7 +951,9 @@ impl OverlayManager {
         peer_info_cache.insert(peer_id.clone(), peer_info);
         added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
         if let Some(tx) = peer_event_tx {
-            let _ = tx.send(PeerEvent::Connected(addr.clone(), PeerType::Outbound)).await;
+            let _ = tx
+                .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
+                .await;
         }
 
         let outbound_snapshot = advertised_outbound_peers.read().clone();
@@ -1097,7 +1122,10 @@ impl OverlayManager {
     /// Get info for all connected peers.
     /// Uses the peer info cache for lock-free access.
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
-        self.peer_info_cache.iter().map(|entry| entry.value().clone()).collect()
+        self.peer_info_cache
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// Get snapshots for all connected peers.
@@ -1110,11 +1138,9 @@ impl OverlayManager {
                 let info = entry.value().clone();
                 // Try to get stats from the locked peer
                 self.peers.get(peer_id).and_then(|peer_entry| {
-                    peer_entry.value().try_lock().ok().map(|p| {
-                        PeerSnapshot {
-                            info,
-                            stats: p.stats().snapshot(),
-                        }
+                    peer_entry.value().try_lock().ok().map(|p| PeerSnapshot {
+                        info,
+                        stats: p.stats().snapshot(),
                     })
                 })
             })
@@ -1188,7 +1214,10 @@ impl OverlayManager {
     /// Request a transaction set by hash from all peers.
     pub async fn request_tx_set(&self, hash: &[u8; 32]) -> Result<usize> {
         let message = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(*hash));
-        tracing::info!(hash = hex::encode(hash), "Requesting transaction set from peers");
+        tracing::info!(
+            hash = hex::encode(hash),
+            "Requesting transaction set from peers"
+        );
         self.broadcast(message).await
     }
 
@@ -1270,7 +1299,10 @@ impl OverlayManager {
         let message_tx = self.message_tx.clone();
         let flood_gate = Arc::clone(&self.flood_gate);
         let running = Arc::clone(&self.running);
-        let connect_timeout = self.config.connect_timeout_secs.max(self.config.auth_timeout_secs);
+        let connect_timeout = self
+            .config
+            .connect_timeout_secs
+            .max(self.config.auth_timeout_secs);
         let peer_handles = Arc::clone(&self.peer_handles);
         let advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
         let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
@@ -1296,32 +1328,22 @@ impl OverlayManager {
 
                     let outbound_snapshot = advertised_outbound_peers.read().clone();
                     let inbound_snapshot = advertised_inbound_peers.read().clone();
-                    if let Some(message) =
-                        OverlayManager::build_peers_message(
-                            &outbound_snapshot,
-                            &inbound_snapshot,
-                            Some(&addr),
-                        )
-                    {
+                    if let Some(message) = OverlayManager::build_peers_message(
+                        &outbound_snapshot,
+                        &inbound_snapshot,
+                        Some(&addr),
+                    ) {
                         let mut peer_lock = peer.lock().await;
                         if peer_lock.is_ready() {
                             if let Err(e) = peer_lock.send(message).await {
-                                debug!(
-                                    "Failed to send peers to {}: {}",
-                                    peer_id, e
-                                );
+                                debug!("Failed to send peers to {}: {}", peer_id, e);
                             }
                         }
                     }
 
                     // Run peer loop
-                    Self::run_peer_loop(
-                        peer_id.clone(),
-                        peer,
-                        message_tx,
-                        flood_gate,
-                        running,
-                    ).await;
+                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, flood_gate, running)
+                        .await;
 
                     // Cleanup
                     peers.remove(&peer_id);

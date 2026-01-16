@@ -106,8 +106,7 @@ pub fn execute_manage_data(
                     return Ok(OperationResult::OpTooManySubentries);
                 }
                 if context.protocol_version >= 18 {
-                    let total =
-                        source_account.num_sub_entries as u64 + num_sponsoring as u64 + 1;
+                    let total = source_account.num_sub_entries as u64 + num_sponsoring as u64 + 1;
                     if total > u32::MAX as u64 {
                         return Ok(OperationResult::OpTooManySubentries);
                     }
@@ -141,7 +140,8 @@ pub fn execute_manage_data(
                     )?;
                     let mut available = source_account.balance;
                     if context.protocol_version >= 10 {
-                        available = available.saturating_sub(account_liabilities(source_account).selling);
+                        available =
+                            available.saturating_sub(account_liabilities(source_account).selling);
                     }
                     if available < new_min_balance {
                         return Ok(make_result(ManageDataResultCode::LowReserve));
@@ -168,6 +168,11 @@ pub fn execute_manage_data(
                         1,
                     )?;
                 }
+                tracing::debug!(
+                    "ManageData: creating data entry, account={:?}, name={:?}",
+                    source,
+                    data_name
+                );
                 state.create_data(new_entry);
 
                 // Increase sub-entry count
@@ -183,7 +188,10 @@ pub fn execute_manage_data(
 
 fn account_liabilities(account: &AccountEntry) -> Liabilities {
     match &account.ext {
-        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
         stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
     }
 }
@@ -237,10 +245,7 @@ mod tests {
 
     fn with_selling_liabilities(mut account: AccountEntry, selling: i64) -> AccountEntry {
         account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: Liabilities {
-                buying: 0,
-                selling,
-            },
+            liabilities: Liabilities { buying: 0, selling },
             ext: AccountEntryExtensionV1Ext::V0,
         });
         account
@@ -289,8 +294,8 @@ mod tests {
             data_value: Some(vec![1, 2, 3].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data result");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data result");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -321,11 +326,13 @@ mod tests {
             data_value: Some(vec![1, 2, 3, 4].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data result");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data result");
 
         match result {
-            OperationResult::OpInner(OperationResultTr::ManageData(ManageDataResult::LowReserve)) => {}
+            OperationResult::OpInner(OperationResultTr::ManageData(
+                ManageDataResult::LowReserve,
+            )) => {}
             other => panic!("unexpected result: {:?}", other),
         }
     }
@@ -343,8 +350,8 @@ mod tests {
             data_value: Some(vec![1, 2].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data result");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data result");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -367,8 +374,8 @@ mod tests {
             data_value: Some(vec![1, 2].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data result");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data result");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -426,8 +433,8 @@ mod tests {
             data_value: None,
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -475,8 +482,8 @@ mod tests {
             data_value: Some(vec![1u8; MAX_DATA_VALUE_LENGTH].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -499,8 +506,8 @@ mod tests {
             data_value: Some(vec![1, 2, 3].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -523,8 +530,8 @@ mod tests {
             data_value: Some(vec![1, 2, 3].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -540,8 +547,8 @@ mod tests {
             data_value: Some(vec![9, 9, 9].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&update_op, &source_id, &mut state, &context)
-            .expect("manage data");
+        let result =
+            execute_manage_data(&update_op, &source_id, &mut state, &context).expect("manage data");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -575,8 +582,8 @@ mod tests {
             data_value: Some(vec![1, 2, 3, 4].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
@@ -614,8 +621,8 @@ mod tests {
             data_value: Some(vec![1, 2, 3, 4].try_into().unwrap()),
         };
 
-        let result = execute_manage_data(&op, &source_id, &mut state, &context)
-            .expect("manage data");
+        let result =
+            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data");
 
         match result {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {

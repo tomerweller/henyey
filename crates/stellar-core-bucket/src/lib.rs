@@ -129,7 +129,9 @@ pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 // Entry types and comparison
 // ============================================================================
 
-pub use entry::{compare_entries, compare_keys, is_persistent_entry, ledger_entry_to_key, BucketEntry};
+pub use entry::{
+    compare_entries, compare_keys, is_persistent_entry, ledger_entry_to_key, BucketEntry,
+};
 
 // ============================================================================
 // Error handling
@@ -205,8 +207,8 @@ pub type Result<T> = std::result::Result<T, BucketError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
+    use crate::BucketEntry;
+    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
 
     const TEST_PROTOCOL: u32 = 25;
 
@@ -274,7 +276,14 @@ mod tests {
             id[0..4].copy_from_slice(&i.to_be_bytes());
             let entry = make_account_entry(id, i as i64 * 100);
             bucket_list
-                .add_batch(i, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
+                .add_batch(
+                    i,
+                    TEST_PROTOCOL,
+                    BucketListType::Live,
+                    vec![entry],
+                    vec![],
+                    vec![],
+                )
                 .unwrap();
         }
 

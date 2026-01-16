@@ -66,9 +66,7 @@ impl PublishQueueQueries for Connection {
                 results.push(row?);
             }
         } else {
-            let rows = stmt.query_map([], |row| {
-                row.get::<_, i64>(0).map(|value| value as u32)
-            })?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0).map(|value| value as u32))?;
             for row in rows {
                 results.push(row?);
             }

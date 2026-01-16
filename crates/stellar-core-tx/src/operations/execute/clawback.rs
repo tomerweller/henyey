@@ -6,8 +6,8 @@
 
 use stellar_xdr::curr::{
     AccountId, Asset, ClawbackClaimableBalanceOp, ClawbackClaimableBalanceResult,
-    ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult, ClawbackResultCode,
-    LedgerKey, LedgerKeyClaimableBalance, OperationResult, OperationResultTr,
+    ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult, ClawbackResultCode, LedgerKey,
+    LedgerKeyClaimableBalance, OperationResult, OperationResultTr,
 };
 
 use crate::frame::muxed_to_account_id;

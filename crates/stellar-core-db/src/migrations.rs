@@ -135,11 +135,9 @@ pub fn get_schema_version(conn: &Connection) -> Result<i32> {
     );
 
     match result {
-        Ok(version_str) => {
-            version_str.parse().map_err(|_| {
-                DbError::Migration(format!("Invalid schema version: {}", version_str))
-            })
-        }
+        Ok(version_str) => version_str
+            .parse()
+            .map_err(|_| DbError::Migration(format!("Invalid schema version: {}", version_str))),
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             // No schema version recorded - assume version 1 (initial)
             Ok(1)
@@ -224,7 +222,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         info!("Migration complete, now at version {}", current_version);
     }
 
-    info!("All migrations complete, database at version {}", CURRENT_VERSION);
+    info!(
+        "All migrations complete, database at version {}",
+        CURRENT_VERSION
+    );
     Ok(())
 }
 
@@ -271,7 +272,10 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Set the schema version
     set_schema_version(conn, CURRENT_VERSION)?;
 
-    info!("Initialized database with schema version {}", CURRENT_VERSION);
+    info!(
+        "Initialized database with schema version {}",
+        CURRENT_VERSION
+    );
     Ok(())
 }
 

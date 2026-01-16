@@ -39,15 +39,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 use stellar_core_common::Hash256;
 use stellar_core_crypto::{PublicKey, SecretKey};
 use stellar_core_ledger::LedgerManager;
-use stellar_core_scp::{BallotPhase, SCP, SlotIndex};
+use stellar_core_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
-    NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, StellarValue, TimePoint, TransactionEnvelope,
-    UpgradeType, Value, WriteXdr, Limits,
+    Limits, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, StellarValue, TimePoint,
+    TransactionEnvelope, UpgradeType, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -237,10 +237,10 @@ impl Herder {
         let mut pending_config = config.pending_config.clone();
         let max_slots = config.max_externalized_slots.max(1);
         pending_config.max_slots = pending_config.max_slots.min(max_slots);
-        pending_config.max_slot_distance =
-            pending_config.max_slot_distance.min(max_slots as u64);
+        pending_config.max_slot_distance = pending_config.max_slot_distance.min(max_slots as u64);
 
-        let max_time_drift = (max_slots as u64).saturating_add(2)
+        let max_time_drift = (max_slots as u64)
+            .saturating_add(2)
             .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key,
@@ -303,10 +303,10 @@ impl Herder {
         let mut pending_config = config.pending_config.clone();
         let max_slots = config.max_externalized_slots.max(1);
         pending_config.max_slots = pending_config.max_slots.min(max_slots);
-        pending_config.max_slot_distance =
-            pending_config.max_slot_distance.min(max_slots as u64);
+        pending_config.max_slot_distance = pending_config.max_slot_distance.min(max_slots as u64);
 
-        let max_time_drift = (max_slots as u64).saturating_add(2)
+        let max_time_drift = (max_slots as u64)
+            .saturating_add(2)
             .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key,
@@ -513,9 +513,9 @@ impl Herder {
 
     /// Check whether we've heard from quorum for a slot.
     pub fn heard_from_quorum(&self, slot: SlotIndex) -> bool {
-        self.slot_quorum_tracker.read().has_quorum(slot, |node_id| {
-            self.scp_driver.get_quorum_set(node_id)
-        })
+        self.slot_quorum_tracker
+            .read()
+            .has_quorum(slot, |node_id| self.scp_driver.get_quorum_set(node_id))
     }
 
     /// Check whether we have a v-blocking set for a slot.
@@ -597,7 +597,9 @@ impl Herder {
 
         // Special handling for EXTERNALIZE messages - they can fast-forward our state
         // even if from future slots, as they represent network consensus
-        if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) = &envelope.statement.pledges {
+        if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
+            &envelope.statement.pledges
+        {
             // Only request tx sets for slots we haven't already closed via catchup
             if lcl.map_or(true, |l| slot > l) {
                 // Extract tx set hash from the externalized value and request it immediately
@@ -615,7 +617,10 @@ impl Herder {
                 // Security check 1: Validate sender is in our transitive quorum
                 // This prevents accepting EXTERNALIZE messages from nodes we don't trust
                 let sender = &envelope.statement.node_id;
-                let in_quorum = self.quorum_tracker.read().is_node_definitely_in_quorum(sender);
+                let in_quorum = self
+                    .quorum_tracker
+                    .read()
+                    .is_node_definitely_in_quorum(sender);
                 if !in_quorum {
                     warn!(
                         slot,
@@ -643,8 +648,7 @@ impl Herder {
                 // Fast-forward to this slot using the externalized value
                 info!(
                     slot,
-                    current_slot,
-                    "Fast-forwarding using EXTERNALIZE from network"
+                    current_slot, "Fast-forwarding using EXTERNALIZE from network"
                 );
 
                 let value = ext.commit.value.clone();
@@ -713,9 +717,7 @@ impl Herder {
                 PendingResult::SlotTooFar => {
                     debug!(
                         slot,
-                        current_slot,
-                        pending_slot,
-                        "Envelope rejected: slot too far ahead"
+                        current_slot, pending_slot, "Envelope rejected: slot too far ahead"
                     );
                     return EnvelopeState::Invalid;
                 }
@@ -815,7 +817,8 @@ impl Herder {
         let mut tracking = self.tracking_slot.write();
         if externalized_slot >= *tracking {
             *tracking = externalized_slot + 1;
-            self.pending_envelopes.set_current_slot(externalized_slot + 1);
+            self.pending_envelopes
+                .set_current_slot(externalized_slot + 1);
 
             // Release any pending envelopes for the new slot
             drop(tracking);
@@ -840,10 +843,7 @@ impl Herder {
 
         match result {
             TxQueueResult::Added => {
-                debug!(
-                    "Added transaction to queue, size: {}",
-                    self.tx_queue.len()
-                );
+                debug!("Added transaction to queue, size: {}", self.tx_queue.len());
             }
             TxQueueResult::Duplicate => {
                 debug!("Duplicate transaction ignored");
@@ -950,9 +950,11 @@ impl Herder {
         let value_bytes = stellar_value
             .to_xdr(Limits::none())
             .map_err(|e| HerderError::Internal(format!("Failed to encode value: {}", e)))?;
-        let value = Value(value_bytes.try_into().map_err(|_| {
-            HerderError::Internal("Value too large".to_string())
-        })?);
+        let value = Value(
+            value_bytes
+                .try_into()
+                .map_err(|_| HerderError::Internal("Value too large".to_string()))?,
+        );
 
         // Get previous value for priority calculation
         let prev_value = self.prev_value.read().clone();
@@ -961,7 +963,10 @@ impl Herder {
         if scp.nominate(slot, value, &prev_value) {
             info!(slot, "Started SCP nomination for ledger");
         } else {
-            debug!(slot, "Nomination already in progress or slot already externalized");
+            debug!(
+                slot,
+                "Nomination already in progress or slot already externalized"
+            );
         }
 
         Ok(())
@@ -1032,7 +1037,9 @@ impl Herder {
         self.tx_queue.remove_applied_by_hash(applied_tx_hashes);
 
         // Drop pending tx set requests for slots older than the next slot.
-        let _ = self.scp_driver.cleanup_old_pending_slots(slot.saturating_add(1));
+        let _ = self
+            .scp_driver
+            .cleanup_old_pending_slots(slot.saturating_add(1));
 
         // Clean up old SCP state
         if let Some(ref scp) = self.scp {
@@ -1089,7 +1096,9 @@ impl Herder {
         if let Some(ref scp) = self.scp {
             if let Some(state) = scp.get_slot_state(slot) {
                 if let Some(round) = state.ballot_round {
-                    if state.heard_from_quorum && !matches!(state.ballot_phase, BallotPhase::Externalize) {
+                    if state.heard_from_quorum
+                        && !matches!(state.ballot_phase, BallotPhase::Externalize)
+                    {
                         return Some(scp.get_ballot_timeout(round));
                     }
                 }
@@ -1103,22 +1112,20 @@ impl Herder {
         // Get the previous ledger hash from our current ledger state
         let (previous_hash, max_txs, starting_seq) =
             if let Some(manager) = self.ledger_manager.read().as_ref() {
-            let header = manager.current_header();
-            let max = header.max_tx_set_size as usize;
-            let starting_seq = self.build_starting_seq_map(manager);
-            (manager.current_header_hash(), max, starting_seq)
-        } else {
-            (Hash256::ZERO, self.config.max_tx_set_size, None)
-        };
+                let header = manager.current_header();
+                let max = header.max_tx_set_size as usize;
+                let starting_seq = self.build_starting_seq_map(manager);
+                (manager.current_header_hash(), max, starting_seq)
+            } else {
+                (Hash256::ZERO, self.config.max_tx_set_size, None)
+            };
 
         // Build GeneralizedTransactionSet with proper hash computation
-        let (tx_set, _gen_tx_set) = self
-            .tx_queue
-            .build_generalized_tx_set_with_starting_seq(
-                previous_hash,
-                max_txs,
-                starting_seq.as_ref(),
-            );
+        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_starting_seq(
+            previous_hash,
+            max_txs,
+            starting_seq.as_ref(),
+        );
 
         info!(
             hash = %tx_set.hash,
@@ -1400,7 +1407,8 @@ impl Herder {
 
     /// Erase fetching data for old slots.
     pub fn erase_fetching_below(&self, slot_index: u64, slot_to_keep: u64) {
-        self.fetching_envelopes.erase_below(slot_index, slot_to_keep);
+        self.fetching_envelopes
+            .erase_below(slot_index, slot_to_keep);
     }
 
     /// Check if we have a cached TxSet in the fetching envelopes cache.
@@ -1459,14 +1467,14 @@ fn node_id_from_public_key(pk: &PublicKey) -> NodeId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
-        ScpStatement, ScpStatementPledges, ScpNomination, ScpBallot,
-        ScpStatementExternalize, NodeId as XdrNodeId, Value, StellarValue, TimePoint,
-        Signature as XdrSignature, WriteXdr, Limits,
-    };
+    use crate::tx_queue::TransactionSet;
     use stellar_core_crypto::SecretKey;
     use stellar_core_scp::hash_quorum_set;
-    use crate::tx_queue::TransactionSet;
+    use stellar_xdr::curr::{
+        Limits, NodeId as XdrNodeId, ScpBallot, ScpNomination, ScpStatement,
+        ScpStatementExternalize, ScpStatementPledges, Signature as XdrSignature, StellarValue,
+        TimePoint, Value, WriteXdr,
+    };
 
     fn make_test_herder() -> Herder {
         let config = HerderConfig::default();
@@ -1513,7 +1521,11 @@ mod tests {
         Value(value_bytes.try_into().unwrap())
     }
 
-    fn sign_statement(statement: &ScpStatement, herder: &Herder, secret: &SecretKey) -> ScpEnvelope {
+    fn sign_statement(
+        statement: &ScpStatement,
+        herder: &Herder,
+        secret: &SecretKey,
+    ) -> ScpEnvelope {
         let statement_bytes = statement.to_xdr(Limits::none()).unwrap();
         let mut data = herder.scp_driver.network_id().0.to_vec();
         data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP = 1

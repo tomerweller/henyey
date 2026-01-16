@@ -110,7 +110,10 @@ impl MergeHandle {
     /// Check if the merge is complete without blocking.
     pub fn is_complete(&mut self) -> bool {
         // Try to receive without blocking
-        matches!(self.receiver.try_recv(), Ok(_) | Err(oneshot::error::TryRecvError::Closed))
+        matches!(
+            self.receiver.try_recv(),
+            Ok(_) | Err(oneshot::error::TryRecvError::Closed)
+        )
     }
 
     /// Wait for the merge to complete and return the result.
@@ -270,12 +273,10 @@ impl FutureBucket {
                 let snap_hash = snapshot
                     .snap
                     .ok_or_else(|| BucketError::Serialization("missing snap hash".to_string()))?;
-                let curr = Hash256::from_hex(&curr_hash).map_err(|e| {
-                    BucketError::Serialization(format!("invalid curr hash: {}", e))
-                })?;
-                let snap = Hash256::from_hex(&snap_hash).map_err(|e| {
-                    BucketError::Serialization(format!("invalid snap hash: {}", e))
-                })?;
+                let curr = Hash256::from_hex(&curr_hash)
+                    .map_err(|e| BucketError::Serialization(format!("invalid curr hash: {}", e)))?;
+                let snap = Hash256::from_hex(&snap_hash)
+                    .map_err(|e| BucketError::Serialization(format!("invalid snap hash: {}", e)))?;
                 Ok(Self {
                     state: FutureBucketState::HashInputs,
                     input_curr: None,
@@ -361,14 +362,11 @@ impl FutureBucket {
     /// After calling this, the FutureBucket will be in LiveOutput state.
     pub async fn resolve(&mut self) -> Result<Arc<Bucket>> {
         match self.state {
-            FutureBucketState::LiveOutput => {
-                Ok(self.output.clone().expect("output should be set"))
-            }
+            FutureBucketState::LiveOutput => Ok(self.output.clone().expect("output should be set")),
             FutureBucketState::LiveInputs => {
-                let handle = self
-                    .merge_handle
-                    .take()
-                    .ok_or_else(|| BucketError::Merge("merge handle already consumed".to_string()))?;
+                let handle = self.merge_handle.take().ok_or_else(|| {
+                    BucketError::Merge("merge handle already consumed".to_string())
+                })?;
 
                 let bucket = handle.resolve().await?;
                 let bucket = Arc::new(bucket);
@@ -399,9 +397,7 @@ impl FutureBucket {
     /// This is useful when you need the result immediately and are not in an async context.
     pub fn resolve_blocking(&mut self) -> Result<Arc<Bucket>> {
         match self.state {
-            FutureBucketState::LiveOutput => {
-                Ok(self.output.clone().expect("output should be set"))
-            }
+            FutureBucketState::LiveOutput => Ok(self.output.clone().expect("output should be set")),
             FutureBucketState::LiveInputs => {
                 // Do synchronous merge
                 let curr = self
@@ -562,13 +558,11 @@ impl FutureBucket {
     /// Get the merge key for this FutureBucket (for deduplication).
     pub fn merge_key(&self) -> Option<MergeKey> {
         match self.state {
-            FutureBucketState::LiveInputs | FutureBucketState::HashInputs => {
-                Some(MergeKey::new(
-                    self.keep_tombstones,
-                    self.input_curr_hash.clone()?,
-                    self.input_snap_hash.clone()?,
-                ))
-            }
+            FutureBucketState::LiveInputs | FutureBucketState::HashInputs => Some(MergeKey::new(
+                self.keep_tombstones,
+                self.input_curr_hash.clone()?,
+                self.input_snap_hash.clone()?,
+            )),
             _ => None,
         }
     }
@@ -584,9 +578,18 @@ impl std::fmt::Debug for FutureBucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FutureBucket")
             .field("state", &self.state)
-            .field("input_curr_hash", &self.input_curr_hash.as_ref().map(|h| h.to_hex()))
-            .field("input_snap_hash", &self.input_snap_hash.as_ref().map(|h| h.to_hex()))
-            .field("output_hash", &self.output_hash.as_ref().map(|h| h.to_hex()))
+            .field(
+                "input_curr_hash",
+                &self.input_curr_hash.as_ref().map(|h| h.to_hex()),
+            )
+            .field(
+                "input_snap_hash",
+                &self.input_snap_hash.as_ref().map(|h| h.to_hex()),
+            )
+            .field(
+                "output_hash",
+                &self.output_hash.as_ref().map(|h| h.to_hex()),
+            )
             .finish()
     }
 }
@@ -594,8 +597,8 @@ impl std::fmt::Debug for FutureBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
     use crate::entry::BucketEntry;
+    use stellar_xdr::curr::*;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))

@@ -26,12 +26,12 @@
 //! sets to identify individual transaction execution differences.
 
 use clap::Parser;
+use std::path::PathBuf;
 use stellar_core_app::config::AppConfig;
 use stellar_core_common::Hash256;
 use stellar_core_history::HistoryArchive;
 use stellar_core_ledger::compute_header_hash;
 use stellar_xdr::curr::{LedgerHeader, TransactionHistoryResultEntry, WriteXdr};
-use std::path::PathBuf;
 
 /// CLI arguments for the header comparison tool.
 #[derive(Parser)]
@@ -109,13 +109,25 @@ async fn main() -> anyhow::Result<()> {
 fn print_header(label: &str, header: &LedgerHeader, hash: &Hash256) {
     println!("{}:", label);
     println!("  hash: {}", hash.to_hex());
-    println!("  prev_hash: {}", Hash256::from(header.previous_ledger_hash.0).to_hex());
+    println!(
+        "  prev_hash: {}",
+        Hash256::from(header.previous_ledger_hash.0).to_hex()
+    );
     println!("  ledger_version: {}", header.ledger_version);
     println!("  ledger_seq: {}", header.ledger_seq);
     println!("  close_time: {}", header.scp_value.close_time.0);
-    println!("  tx_set_hash: {}", Hash256::from(header.scp_value.tx_set_hash.0).to_hex());
-    println!("  tx_result_hash: {}", Hash256::from(header.tx_set_result_hash.0).to_hex());
-    println!("  bucket_list_hash: {}", Hash256::from(header.bucket_list_hash.0).to_hex());
+    println!(
+        "  tx_set_hash: {}",
+        Hash256::from(header.scp_value.tx_set_hash.0).to_hex()
+    );
+    println!(
+        "  tx_result_hash: {}",
+        Hash256::from(header.tx_set_result_hash.0).to_hex()
+    );
+    println!(
+        "  bucket_list_hash: {}",
+        Hash256::from(header.bucket_list_hash.0).to_hex()
+    );
     println!("  total_coins: {}", header.total_coins);
     println!("  fee_pool: {}", header.fee_pool);
     println!("  inflation_seq: {}", header.inflation_seq);

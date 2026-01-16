@@ -90,7 +90,10 @@ pub fn seal_to_curve25519_public_key(
 /// - The ciphertext was tampered with
 /// - The wrong key was used
 /// - The ciphertext is malformed
-pub fn open_from_secret_key(recipient: &SecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn open_from_secret_key(
+    recipient: &SecretKey,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     let curve_sk = CurveSecretKey::from(recipient.to_curve25519_bytes());
     curve_sk
         .unseal(ciphertext)

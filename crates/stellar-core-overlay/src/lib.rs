@@ -405,9 +405,9 @@ impl PeerId {
     /// Returns a reference to the raw 32-byte public key.
     pub fn as_bytes(&self) -> &[u8; 32] {
         match &self.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(bytes),
-            ) => bytes,
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                bytes,
+            )) => bytes,
         }
     }
 

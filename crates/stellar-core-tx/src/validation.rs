@@ -44,7 +44,7 @@ use stellar_xdr::curr::{
     AccountEntry, DecoratedSignature, Preconditions, SignerKey, TransactionEnvelope,
 };
 
-use crate::fee_bump::{FeeBumpError, FeeBumpFrame, validate_fee_bump};
+use crate::fee_bump::{validate_fee_bump, FeeBumpError, FeeBumpFrame};
 use crate::frame::TransactionFrame;
 
 /// Ledger context for transaction validation and execution.
@@ -221,10 +221,7 @@ pub enum ValidationError {
     /// Required extra signers not present.
     ExtraSignersNotMet,
     /// Fee bump outer fee is insufficient.
-    FeeBumpInsufficientFee {
-        outer_fee: i64,
-        required_min: i64,
-    },
+    FeeBumpInsufficientFee { outer_fee: i64, required_min: i64 },
     /// Fee bump inner transaction has invalid structure.
     FeeBumpInvalidInner(String),
 }
@@ -239,18 +236,40 @@ impl std::fmt::Display for ValidationError {
                 write!(f, "bad sequence: expected {}, got {}", expected, actual)
             }
             Self::InsufficientFee { required, provided } => {
-                write!(f, "insufficient fee: required {}, provided {}", required, provided)
+                write!(
+                    f,
+                    "insufficient fee: required {}, provided {}",
+                    required, provided
+                )
             }
             Self::SourceAccountNotFound => write!(f, "source account not found"),
             Self::InsufficientBalance => write!(f, "insufficient balance"),
-            Self::TooLate { max_time, ledger_time } => {
-                write!(f, "too late: max_time {}, ledger_time {}", max_time, ledger_time)
+            Self::TooLate {
+                max_time,
+                ledger_time,
+            } => {
+                write!(
+                    f,
+                    "too late: max_time {}, ledger_time {}",
+                    max_time, ledger_time
+                )
             }
-            Self::TooEarly { min_time, ledger_time } => {
-                write!(f, "too early: min_time {}, ledger_time {}", min_time, ledger_time)
+            Self::TooEarly {
+                min_time,
+                ledger_time,
+            } => {
+                write!(
+                    f,
+                    "too early: min_time {}, ledger_time {}",
+                    min_time, ledger_time
+                )
             }
             Self::BadLedgerBounds { min, max, current } => {
-                write!(f, "bad ledger bounds: [{}, {}], current {}", min, max, current)
+                write!(
+                    f,
+                    "bad ledger bounds: [{}, {}], current {}",
+                    min, max, current
+                )
             }
             Self::BadMinAccountSequence => write!(f, "min account sequence not met"),
             Self::BadMinAccountSequenceAge => write!(f, "min account sequence age not met"),
@@ -766,10 +785,7 @@ fn has_signed_payload_signature(
 ///
 /// Note: This only checks the signature format/validity, not whether
 /// the signer has authority over the account.
-fn is_valid_signature(
-    _tx_hash: &stellar_core_common::Hash256,
-    sig: &DecoratedSignature,
-) -> bool {
+fn is_valid_signature(_tx_hash: &stellar_core_common::Hash256, sig: &DecoratedSignature) -> bool {
     // The signature should be 64 bytes for Ed25519
     if sig.signature.0.len() != 64 {
         return false;
@@ -812,10 +828,10 @@ mod tests {
         DecoratedSignature, Duration, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
         LedgerFootprint, LedgerKey, LedgerKeyContractData, ManageDataOp, Memo, MuxedAccount,
         Operation, OperationBody, PaymentOp, Preconditions, PreconditionsV2, ScAddress, ScSymbol,
-        ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint,
-        SorobanResources, SorobanResourcesExtV0, SorobanTransactionData, SorobanTransactionDataExt,
-        String32, String64, StringM, Thresholds, Transaction,
-        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint, SorobanResources,
+        SorobanResourcesExtV0, SorobanTransactionData, SorobanTransactionDataExt, String32,
+        String64, StringM, Thresholds, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256, VecM,
     };
 
     fn create_test_frame() -> TransactionFrame {
@@ -1174,9 +1190,11 @@ mod tests {
             min_seq_num: None,
             min_seq_age: Duration(0),
             min_seq_ledger_gap: 0,
-            extra_signers: vec![SignerKey::Ed25519(Uint256(*extra_secret.public_key().as_bytes()))]
-                .try_into()
-                .unwrap(),
+            extra_signers: vec![SignerKey::Ed25519(Uint256(
+                *extra_secret.public_key().as_bytes(),
+            ))]
+            .try_into()
+            .unwrap(),
         });
 
         let tx = Transaction {

@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, ReadXdr, Limits};
+use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr};
 
 use stellar_core_common::Hash256;
 
@@ -172,7 +172,11 @@ impl DiskBucket {
     }
 
     /// Create a disk bucket from raw XDR bytes with a custom bloom filter seed.
-    pub fn from_xdr_bytes_with_seed(bytes: &[u8], save_path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
+    pub fn from_xdr_bytes_with_seed(
+        bytes: &[u8],
+        save_path: impl AsRef<Path>,
+        bloom_seed: HashSeed,
+    ) -> Result<Self> {
         use std::io::Write;
 
         let save_path = save_path.as_ref();
@@ -214,7 +218,10 @@ impl DiskBucket {
     /// Build an index from XDR bytes.
     ///
     /// Returns (index, bloom_key_hashes, entry_count).
-    fn build_index(bytes: &[u8], bloom_seed: &HashSeed) -> Result<(BTreeMap<u64, IndexEntry>, Vec<u64>, usize)> {
+    fn build_index(
+        bytes: &[u8],
+        bloom_seed: &HashSeed,
+    ) -> Result<(BTreeMap<u64, IndexEntry>, Vec<u64>, usize)> {
         use tracing::debug;
 
         if bytes.is_empty() {
@@ -252,14 +259,19 @@ impl DiskBucket {
 
                 // Parse just enough to get the key
                 let record_data = &bytes[offset as usize..(offset as usize) + record_len];
-                if let Ok(xdr_entry) = stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none()) {
+                if let Ok(xdr_entry) =
+                    stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none())
+                {
                     if let Some(key) = Self::extract_key(&xdr_entry) {
                         // Use first 8 bytes of key hash as index key
                         let key_hash = Self::hash_key(&key);
-                        index.insert(key_hash, IndexEntry {
-                            offset: record_start,
-                            length: record_len as u32,
-                        });
+                        index.insert(
+                            key_hash,
+                            IndexEntry {
+                                offset: record_start,
+                                length: record_len as u32,
+                            },
+                        );
                         // Also compute bloom filter hash
                         bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, bloom_seed));
                     }
@@ -284,10 +296,13 @@ impl DiskBucket {
                         let entry_end = limited.inner.position();
                         if let Some(key) = Self::extract_key(&xdr_entry) {
                             let key_hash = Self::hash_key(&key);
-                            index.insert(key_hash, IndexEntry {
-                                offset: entry_start,
-                                length: (entry_end - entry_start) as u32,
-                            });
+                            index.insert(
+                                key_hash,
+                                IndexEntry {
+                                    offset: entry_start,
+                                    length: (entry_end - entry_start) as u32,
+                                },
+                            );
                             // Also compute bloom filter hash
                             bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, bloom_seed));
                         }
@@ -298,14 +313,18 @@ impl DiskBucket {
             }
         }
 
-        debug!("Built index with {} entries, {} keys for bloom filter", entry_count, bloom_key_hashes.len());
+        debug!(
+            "Built index with {} entries, {} keys for bloom filter",
+            entry_count,
+            bloom_key_hashes.len()
+        );
         Ok((index, bloom_key_hashes, entry_count))
     }
 
     /// Extract the key from a bucket entry.
     fn extract_key(entry: &stellar_xdr::curr::BucketEntry) -> Option<LedgerKey> {
-        use stellar_xdr::curr::BucketEntry as XdrBucketEntry;
         use crate::entry::ledger_entry_to_key;
+        use stellar_xdr::curr::BucketEntry as XdrBucketEntry;
 
         match entry {
             XdrBucketEntry::Liveentry(e) | XdrBucketEntry::Initentry(e) => ledger_entry_to_key(e),
@@ -519,7 +538,10 @@ impl Iterator for DiskBucketIter {
 
             match stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none()) {
                 Ok(xdr_entry) => Some(BucketEntry::from_xdr_entry(xdr_entry)),
-                Err(e) => Some(Err(BucketError::Serialization(format!("Failed to parse: {}", e)))),
+                Err(e) => Some(Err(BucketError::Serialization(format!(
+                    "Failed to parse: {}",
+                    e
+                )))),
             }
         } else {
             use stellar_xdr::curr::Limited;
@@ -729,8 +751,8 @@ mod tests {
         let path = dir.path().join("test.bucket");
 
         let custom_seed: HashSeed = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
         ];
 
         let bytes = make_multi_entry_bucket_bytes(10);

@@ -410,8 +410,7 @@ pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNet
     if let ConfigSettingEntry::ContractComputeV0(compute) = compute_v0 {
         info.tx_max_instructions = compute.tx_max_instructions as i64;
         info.ledger_max_instructions = compute.ledger_max_instructions as i64;
-        info.fee_rate_per_instructions_increment =
-            compute.fee_rate_per_instructions_increment;
+        info.fee_rate_per_instructions_increment = compute.fee_rate_per_instructions_increment;
         info.tx_memory_limit = compute.tx_memory_limit;
     }
 
@@ -480,7 +479,8 @@ pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNet
         info.persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator;
         info.temp_rent_rate_denominator = archival.temp_rent_rate_denominator;
         info.max_entries_to_archive = archival.max_entries_to_archive;
-        info.bucketlist_size_window_sample_size = archival.live_soroban_state_size_window_sample_size;
+        info.bucketlist_size_window_sample_size =
+            archival.live_soroban_state_size_window_sample_size;
         info.eviction_scan_size = archival.eviction_scan_size as i64;
         info.starting_eviction_scan_level = archival.starting_eviction_scan_level;
     }
@@ -1515,8 +1515,7 @@ impl TransactionExecutor {
                     });
                 }
             } else {
-                let allow_negative_inner =
-                    self.protocol_version >= 23 && inner_is_soroban;
+                let allow_negative_inner = self.protocol_version >= 23 && inner_is_soroban;
                 if !allow_negative_inner {
                     return Ok(TransactionExecutionResult {
                         success: false,
@@ -2008,8 +2007,11 @@ impl TransactionExecutor {
                 );
                 self.state.flush_modified_entries();
                 let delta_after_signers = delta_snapshot(&self.state);
-                let delta_changes =
-                    delta_changes_between(self.state.delta(), delta_before_signers, delta_after_signers);
+                let delta_changes = delta_changes_between(
+                    self.state.delta(),
+                    delta_before_signers,
+                    delta_after_signers,
+                );
                 signer_created = delta_changes.created;
                 signer_updated = delta_changes.updated;
                 signer_deleted = delta_changes.deleted;
@@ -2064,8 +2066,9 @@ impl TransactionExecutor {
             // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
             // This matches C++ stellar-core where FeeBumpFrame captures fee source state,
             // then inner tx does seq bump.
-            let mut combined =
-                Vec::with_capacity(fee_bump_wrapper_changes.len() + signer_changes.len() + seq_changes.len());
+            let mut combined = Vec::with_capacity(
+                fee_bump_wrapper_changes.len() + signer_changes.len() + seq_changes.len(),
+            );
             combined.extend(fee_bump_wrapper_changes);
             combined.extend(signer_changes.iter().cloned());
             combined.extend(seq_changes.iter().cloned());
@@ -2246,13 +2249,17 @@ impl TransactionExecutor {
                             // Get live BL restorations from the Soroban execution result
                             if let Some(meta) = &op_exec.soroban_meta {
                                 for live_bl_restore in &meta.live_bucket_list_restores {
-                                    restored.live_bucket_list.insert(live_bl_restore.key.clone());
+                                    restored
+                                        .live_bucket_list
+                                        .insert(live_bl_restore.key.clone());
                                     restored.live_bucket_list_entries.insert(
                                         live_bl_restore.key.clone(),
                                         live_bl_restore.entry.clone(),
                                     );
                                     // Also track the TTL entry
-                                    restored.live_bucket_list.insert(live_bl_restore.ttl_key.clone());
+                                    restored
+                                        .live_bucket_list
+                                        .insert(live_bl_restore.ttl_key.clone());
                                     restored.live_bucket_list_entries.insert(
                                         live_bl_restore.ttl_key.clone(),
                                         live_bl_restore.ttl_entry.clone(),
@@ -2261,7 +2268,8 @@ impl TransactionExecutor {
                             }
 
                             // Also get hot archive keys for InvokeHostFunction
-                            let hot_archive = extract_hot_archive_restored_keys(soroban_data, op_type);
+                            let hot_archive =
+                                extract_hot_archive_restored_keys(soroban_data, op_type);
                             restored.hot_archive.extend(hot_archive);
                             (restored, soroban_data.map(|d| &d.resources.footprint))
                         } else {
@@ -2671,6 +2679,40 @@ impl TransactionExecutor {
             OperationBody::ManageData(op_data) => {
                 // Load existing data entry if any (needed for updates and deletes)
                 self.load_data_raw(snapshot, &op_source, &op_data.data_name)?;
+            }
+            OperationBody::RevokeSponsorship(op_data) => {
+                // Load the target entry that sponsorship is being revoked from
+                use stellar_xdr::curr::RevokeSponsorshipOp;
+                match op_data {
+                    RevokeSponsorshipOp::LedgerEntry(ledger_key) => {
+                        // Load the entry directly by its key
+                        self.load_entry(snapshot, ledger_key)?;
+                        // Also load owner/sponsor accounts that may be modified
+                        match ledger_key {
+                            LedgerKey::Account(k) => {
+                                self.load_account(snapshot, &k.account_id)?;
+                            }
+                            LedgerKey::Trustline(k) => {
+                                self.load_account(snapshot, &k.account_id)?;
+                            }
+                            LedgerKey::Offer(k) => {
+                                self.load_account(snapshot, &k.seller_id)?;
+                            }
+                            LedgerKey::Data(k) => {
+                                self.load_account(snapshot, &k.account_id)?;
+                            }
+                            LedgerKey::ClaimableBalance(k) => {
+                                // Load the claimable balance and its sponsor
+                                self.load_claimable_balance(snapshot, &k.balance_id)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    RevokeSponsorshipOp::Signer(signer_key) => {
+                        // Load the account that has the signer
+                        self.load_account(snapshot, &signer_key.account_id)?;
+                    }
+                }
             }
             _ => {
                 // Other operations typically work on source account
@@ -3562,11 +3604,7 @@ fn build_entry_changes_with_hot_archive(
                         let key_bytes = entry_key_bytes(entry);
                         if !created_keys.contains(&key_bytes) {
                             created_keys.insert(key_bytes);
-                            push_created_or_restored(
-                                &mut changes,
-                                entry,
-                                restored,
-                            );
+                            push_created_or_restored(&mut changes, entry, restored);
                         }
                     }
                 }
@@ -3582,7 +3620,9 @@ fn build_entry_changes_with_hot_archive(
                     if idx < updated.len() {
                         let post_state = &updated[idx];
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
+                            if restored.hot_archive.contains(&key)
+                                || restored.live_bucket_list.contains(&key)
+                            {
                                 changes.push(LedgerEntryChange::Restored(post_state.clone()));
                             } else {
                                 // Get pre-state from update_states or snapshot
@@ -3605,7 +3645,9 @@ fn build_entry_changes_with_hot_archive(
                 ChangeGroup::SingleDelete { idx } => {
                     if idx < deleted.len() {
                         let key = &deleted[idx];
-                        if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
+                        if restored.hot_archive.contains(key)
+                            || restored.live_bucket_list.contains(key)
+                        {
                             let pre_state = if idx < delete_states.len() {
                                 Some(delete_states[idx].clone())
                             } else {
@@ -3654,11 +3696,7 @@ fn build_entry_changes_with_hot_archive(
                         // Only emit create once per key
                         if !created_keys.contains(&key_bytes) {
                             created_keys.insert(key_bytes);
-                            push_created_or_restored(
-                                &mut changes,
-                                entry,
-                                restored,
-                            );
+                            push_created_or_restored(&mut changes, entry, restored);
                         }
                     }
                 }
@@ -3667,7 +3705,9 @@ fn build_entry_changes_with_hot_archive(
                         let post_state = &updated[*idx];
 
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
+                            if restored.hot_archive.contains(&key)
+                                || restored.live_bucket_list.contains(&key)
+                            {
                                 // Use entry value for hot archive restored entries
                                 changes.push(LedgerEntryChange::Restored(post_state.clone()));
                             } else {
@@ -3693,7 +3733,9 @@ fn build_entry_changes_with_hot_archive(
                 stellar_core_tx::ChangeRef::Deleted(idx) => {
                     if *idx < deleted.len() {
                         let key = &deleted[*idx];
-                        if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
+                        if restored.hot_archive.contains(key)
+                            || restored.live_bucket_list.contains(key)
+                        {
                             // Use the pre-state stored in the delta at the same index
                             let pre_state = if *idx < delete_states.len() {
                                 Some(delete_states[*idx].clone())
@@ -3760,7 +3802,9 @@ fn build_entry_changes_with_hot_archive(
                 seen_keys.insert(key_bytes.clone());
                 if let Some(final_entry) = final_updated.get(&key_bytes) {
                     if let Ok(key) = crate::delta::entry_to_key(final_entry) {
-                        if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
+                        if restored.hot_archive.contains(&key)
+                            || restored.live_bucket_list.contains(&key)
+                        {
                             changes.push(LedgerEntryChange::Restored(final_entry.clone()));
                         } else {
                             if let Some(state_entry) = state_overrides
@@ -4482,8 +4526,7 @@ pub fn execute_transaction_set_with_fee_mode(
         for (idx, (tx, _)) in transactions.iter().enumerate() {
             let refund = results[idx].fee_refund;
             if refund > 0 {
-                let frame =
-                    TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
+                let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
                 let fee_source_id =
                     stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
 

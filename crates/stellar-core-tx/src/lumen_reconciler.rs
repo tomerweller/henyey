@@ -88,7 +88,11 @@ pub fn reconcile_events(
 
     if balance_delta > 0 {
         // XLM was created - emit mint event at beginning
-        op_event_manager.new_mint_event_at_beginning(&Asset::Native, &source_address, balance_delta);
+        op_event_manager.new_mint_event_at_beginning(
+            &Asset::Native,
+            &source_address,
+            balance_delta,
+        );
     } else {
         // XLM was destroyed - emit burn event
         op_event_manager.new_burn_event(&Asset::Native, &source_address, -balance_delta);

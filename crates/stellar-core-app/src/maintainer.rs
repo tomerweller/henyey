@@ -201,7 +201,10 @@ impl Maintainer {
         );
 
         // Delete old SCP history
-        match self.database.delete_old_scp_entries(lmin, self.config.count) {
+        match self
+            .database
+            .delete_old_scp_entries(lmin, self.config.count)
+        {
             Ok(deleted) => {
                 if deleted > 0 {
                     debug!(deleted = deleted, "Deleted old SCP entries");
@@ -213,7 +216,10 @@ impl Maintainer {
         }
 
         // Delete old ledger headers
-        match self.database.delete_old_ledger_headers(lmin, self.config.count) {
+        match self
+            .database
+            .delete_old_ledger_headers(lmin, self.config.count)
+        {
             Ok(deleted) => {
                 if deleted > 0 {
                     debug!(deleted = deleted, "Deleted old ledger headers");
@@ -290,11 +296,7 @@ mod tests {
         let db = stellar_core_db::Database::open_in_memory().unwrap();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let _maintainer = Maintainer::new(
-            Arc::new(db),
-            shutdown_rx,
-            || (100, Some(64)),
-        );
+        let _maintainer = Maintainer::new(Arc::new(db), shutdown_rx, || (100, Some(64)));
     }
 
     #[tokio::test]
@@ -318,11 +320,7 @@ mod tests {
         let db = stellar_core_db::Database::open_in_memory().unwrap();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let maintainer = Maintainer::new(
-            Arc::new(db),
-            shutdown_rx,
-            || (100, Some(64)),
-        );
+        let maintainer = Maintainer::new(Arc::new(db), shutdown_rx, || (100, Some(64)));
 
         // Should not panic on empty database
         maintainer.perform_maintenance();

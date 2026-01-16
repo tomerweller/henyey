@@ -61,10 +61,7 @@ impl StateQueries for Connection {
     }
 
     fn delete_state(&self, key: &str) -> Result<(), DbError> {
-        self.execute(
-            "DELETE FROM storestate WHERE statename = ?1",
-            params![key],
-        )?;
+        self.execute("DELETE FROM storestate WHERE statename = ?1", params![key])?;
         Ok(())
     }
 

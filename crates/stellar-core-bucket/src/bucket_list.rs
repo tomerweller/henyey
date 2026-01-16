@@ -44,10 +44,10 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits, WriteXdr,
 };
-use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 
 use stellar_core_common::Hash256;
 
@@ -61,9 +61,8 @@ use crate::eviction::{
 };
 use crate::merge::merge_buckets_with_options_and_shadows;
 use crate::{
-    BucketError, Result,
+    BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
-    FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
 };
 
@@ -126,7 +125,6 @@ impl BucketLevel {
             level,
         }
     }
-
 
     /// Get the hash of this level: SHA256(curr_hash || snap_hash).
     ///
@@ -213,7 +211,9 @@ impl BucketLevel {
         use_empty_curr: bool,
     ) -> Result<()> {
         if self.next.is_some() {
-            return Err(BucketError::Merge("bucket merge already in progress".to_string()));
+            return Err(BucketError::Merge(
+                "bucket merge already in progress".to_string(),
+            ));
         }
 
         // Choose curr or empty based on shouldMergeWithEmptyCurr
@@ -346,9 +346,7 @@ impl BucketList {
 
     /// Create a new empty BucketList.
     pub fn new() -> Self {
-        let levels = (0..BUCKET_LIST_LEVELS)
-            .map(BucketLevel::new)
-            .collect();
+        let levels = (0..BUCKET_LIST_LEVELS).map(BucketLevel::new).collect();
 
         Self {
             levels,
@@ -449,7 +447,10 @@ impl BucketList {
     /// Debug method to find ALL occurrences of a key across all buckets.
     /// Returns a list of (level, bucket_type, entry) for each occurrence.
     /// Order: curr (newest) → snap (oldest) within each level.
-    pub fn find_all_occurrences(&self, key: &LedgerKey) -> Result<Vec<(usize, &'static str, BucketEntry)>> {
+    pub fn find_all_occurrences(
+        &self,
+        key: &LedgerKey,
+    ) -> Result<Vec<(usize, &'static str, BucketEntry)>> {
         let mut results = Vec::new();
 
         for (level_idx, level) in self.levels.iter().enumerate() {
@@ -584,7 +585,9 @@ impl BucketList {
         new_bucket: Bucket,
     ) -> Result<()> {
         if ledger_seq == 0 {
-            return Err(BucketError::Merge("ledger sequence must be > 0".to_string()));
+            return Err(BucketError::Merge(
+                "ledger sequence must be > 0".to_string(),
+            ));
         }
 
         tracing::debug!(
@@ -812,7 +815,10 @@ impl BucketList {
             levels.push(level);
         }
 
-        Ok(Self { levels, ledger_seq: 0 })
+        Ok(Self {
+            levels,
+            ledger_seq: 0,
+        })
     }
 
     /// Restore a bucket list from History Archive State with full FutureBucket support.
@@ -888,7 +894,10 @@ impl BucketList {
             levels.push(level);
         }
 
-        Ok(Self { levels, ledger_seq: 0 })
+        Ok(Self {
+            levels,
+            ledger_seq: 0,
+        })
     }
 
     /// Restart any pending merges after restoring from a History Archive State (HAS).
@@ -941,9 +950,7 @@ impl BucketList {
             );
 
             // Determine merge parameters
-            let merge_protocol_version = prev_snap
-                .protocol_version()
-                .unwrap_or(protocol_version);
+            let merge_protocol_version = prev_snap.protocol_version().unwrap_or(protocol_version);
             // Note: C++ never normalizes INIT to LIVE during merges - the keepTombstoneEntries
             // flag only affects DEAD entry filtering, not INIT entry transformation.
             let keep_dead = Self::keep_tombstone_entries(i);
@@ -961,10 +968,7 @@ impl BucketList {
                 use_empty_curr,
             )?;
 
-            tracing::debug!(
-                level = i,
-                "restart_merges: merge restarted successfully"
-            );
+            tracing::debug!(level = i, "restart_merges: merge restarted successfully");
         }
 
         // Update the ledger sequence to the restored ledger
@@ -1001,8 +1005,18 @@ impl BucketList {
         for (i, level) in self.levels.iter().enumerate() {
             let curr_hash = level.curr.hash();
             let snap_hash = level.snap.hash();
-            let next_hash = level.next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string());
-            eprintln!("  L{}: curr={}, snap={}, next={}", i, curr_hash.to_hex(), snap_hash.to_hex(), next_hash);
+            let next_hash = level
+                .next
+                .as_ref()
+                .map(|b| b.hash().to_hex())
+                .unwrap_or_else(|| "None".to_string());
+            eprintln!(
+                "  L{}: curr={}, snap={}, next={}",
+                i,
+                curr_hash.to_hex(),
+                snap_hash.to_hex(),
+                next_hash
+            );
         }
     }
 
@@ -1060,10 +1074,7 @@ impl BucketList {
 
                     // Check if we've already processed this key
                     let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
-                        BucketError::Serialization(format!(
-                            "failed to serialize ledger key: {}",
-                            e
-                        ))
+                        BucketError::Serialization(format!("failed to serialize ledger key: {}", e))
                     })?;
                     if !seen_keys.insert(key_bytes) {
                         // Already processed this key from a newer level
@@ -1079,10 +1090,7 @@ impl BucketList {
                     let Some(ttl_entry) = self.get(&ttl_key)? else {
                         // No TTL entry found - this shouldn't happen for valid Soroban entries
                         // but we skip rather than error
-                        tracing::warn!(
-                            ?key,
-                            "Soroban entry has no TTL entry during eviction scan"
-                        );
+                        tracing::warn!(?key, "Soroban entry has no TTL entry during eviction scan");
                         continue;
                     };
 
@@ -1477,8 +1485,15 @@ mod tests {
         let mut bl = BucketList::new();
 
         let entry = make_account_entry([1u8; 32], 100);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let key = make_account_key([1u8; 32]);
         let found = bl.get(&key).unwrap().unwrap();
@@ -1496,13 +1511,27 @@ mod tests {
 
         // Add initial entry
         let entry1 = make_account_entry([1u8; 32], 100);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![entry1], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry1],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         // Update entry
         let entry2 = make_account_entry([1u8; 32], 200);
-        bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![entry2], vec![])
-            .unwrap();
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![entry2],
+            vec![],
+        )
+        .unwrap();
 
         let key = make_account_key([1u8; 32]);
         let found = bl.get(&key).unwrap().unwrap();
@@ -1519,12 +1548,26 @@ mod tests {
         let mut bl = BucketList::new();
 
         let entry = make_account_entry([1u8; 32], 100);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let dead = make_account_key([1u8; 32]);
-        bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![dead])
-            .unwrap();
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![dead],
+        )
+        .unwrap();
 
         let entries = bl.live_entries().unwrap();
         assert!(entries.is_empty());
@@ -1536,8 +1579,15 @@ mod tests {
 
         // Add entry
         let entry = make_account_entry([1u8; 32], 100);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         // Delete entry
         let key = make_account_key([1u8; 32]);
@@ -1632,14 +1682,9 @@ mod tests {
     fn test_merge_drops_dead_when_keep_dead_false() {
         let key = make_account_key([1u8; 32]);
         let bucket = Bucket::from_entries(vec![BucketListEntry::Dead(key)]).unwrap();
-        let merged = merge_buckets_with_options(
-            &Bucket::empty(),
-            &bucket,
-            false,
-            TEST_PROTOCOL,
-            true,
-        )
-        .unwrap();
+        let merged =
+            merge_buckets_with_options(&Bucket::empty(), &bucket, false, TEST_PROTOCOL, true)
+                .unwrap();
         let mut has_non_meta = false;
         for entry in merged.iter() {
             if !entry.is_metadata() {
@@ -1656,8 +1701,15 @@ mod tests {
         let hash1 = bl.hash();
 
         let entry = make_account_entry([1u8; 32], 100);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
         let hash2 = bl.hash();
 
         assert_ne!(hash1, hash2);
@@ -1671,8 +1723,15 @@ mod tests {
         assert!(!bl.contains(&key).unwrap());
 
         let entry = make_account_entry([1u8; 32], 100);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         assert!(bl.contains(&key).unwrap());
     }

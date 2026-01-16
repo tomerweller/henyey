@@ -310,19 +310,11 @@ mod tests {
         let bob_public = bob_secret.derive_public();
 
         // Same local_first value should produce different keys for different parties
-        let alice_key_first = Curve25519Secret::derive_shared_key(
-            &alice_secret,
-            &alice_public,
-            &bob_public,
-            true,
-        );
+        let alice_key_first =
+            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, true);
 
-        let alice_key_second = Curve25519Secret::derive_shared_key(
-            &alice_secret,
-            &alice_public,
-            &bob_public,
-            false,
-        );
+        let alice_key_second =
+            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, false);
 
         // Different ordering should produce different keys
         assert_ne!(alice_key_first, alice_key_second);

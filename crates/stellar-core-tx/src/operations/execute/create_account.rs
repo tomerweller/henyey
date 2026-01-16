@@ -22,12 +22,7 @@ pub fn execute_create_account(
 
     // Check starting balance meets minimum
     let min_balance = if sponsor.is_some() {
-        state.minimum_balance_with_counts(
-            context.protocol_version,
-            0,
-            0,
-            account_multiplier,
-        )?
+        state.minimum_balance_with_counts(context.protocol_version, 0, 0, account_multiplier)?
     } else {
         state.minimum_balance_with_counts(context.protocol_version, 0, 0, 0)?
     };

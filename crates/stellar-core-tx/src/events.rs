@@ -388,7 +388,12 @@ impl OpEventManager {
     /// - `asset`: The asset for which authorization is changing
     /// - `account`: Account whose authorization is changing
     /// - `authorize`: New authorization status (true = authorized, false = not authorized)
-    pub fn new_set_authorized_event(&mut self, asset: &Asset, account: &AccountId, authorize: bool) {
+    pub fn new_set_authorized_event(
+        &mut self,
+        asset: &Asset,
+        account: &AccountId,
+        authorize: bool,
+    ) {
         if !self.enabled || self.finalized {
             return;
         }
@@ -594,14 +599,24 @@ impl TxEventManager {
     /// Emit a fee charge event (negative amount).
     ///
     /// Convenience method for charging fees.
-    pub fn charge_fee(&mut self, fee_source: &AccountId, amount: i64, stage: TransactionEventStage) {
+    pub fn charge_fee(
+        &mut self,
+        fee_source: &AccountId,
+        amount: i64,
+        stage: TransactionEventStage,
+    ) {
         self.new_fee_event(fee_source, -amount.abs(), stage);
     }
 
     /// Emit a fee refund event (positive amount).
     ///
     /// Convenience method for refunding fees.
-    pub fn refund_fee(&mut self, fee_source: &AccountId, amount: i64, stage: TransactionEventStage) {
+    pub fn refund_fee(
+        &mut self,
+        fee_source: &AccountId,
+        amount: i64,
+        stage: TransactionEventStage,
+    ) {
         self.new_fee_event(fee_source, amount.abs(), stage);
     }
 
@@ -750,11 +765,8 @@ impl EventManagerHierarchy {
     /// - Vector of operation event vectors (one per operation)
     /// - Vector of transaction events
     pub fn finalize(&mut self) -> (Vec<Vec<ContractEvent>>, Vec<TransactionEvent>) {
-        let op_events: Vec<Vec<ContractEvent>> = self
-            .op_managers
-            .iter_mut()
-            .map(|m| m.finalize())
-            .collect();
+        let op_events: Vec<Vec<ContractEvent>> =
+            self.op_managers.iter_mut().map(|m| m.finalize()).collect();
         let tx_events = self.tx_manager.finalize();
         (op_events, tx_events)
     }

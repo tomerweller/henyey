@@ -37,7 +37,10 @@ fn scale_resource(resource: &Resource, multiplier: i64) -> Resource {
                 6 => ResourceType::WriteLedgerEntries,
                 _ => ResourceType::Operations,
             };
-            resource.try_get_val(ty).unwrap_or(0).saturating_mul(multiplier)
+            resource
+                .try_get_val(ty)
+                .unwrap_or(0)
+                .saturating_mul(multiplier)
         })
         .collect();
     Resource::new(values)
@@ -46,12 +49,7 @@ fn scale_resource(resource: &Resource, multiplier: i64) -> Resource {
 /// Computes the minimum fee needed to beat a previously evicted transaction.
 ///
 /// Returns 0 if the new transaction already has a better fee rate than the evicted one.
-fn compute_better_fee(
-    evicted_fee: i64,
-    evicted_ops: u32,
-    new_fee: i64,
-    new_ops: u32,
-) -> i64 {
+fn compute_better_fee(evicted_fee: i64, evicted_ops: u32, new_fee: i64, new_ops: u32) -> i64 {
     if evicted_ops == 0 {
         return 0;
     }
@@ -66,8 +64,7 @@ fn compute_better_fee(
     // Need to beat evicted fee rate: new_fee / new_ops > evicted_fee / evicted_ops
     // Rearranging: new_fee > evicted_fee * new_ops / evicted_ops
     // Add 1 to ensure strictly greater
-    let required_fee =
-        (evicted_fee as i128 * new_ops as i128 / evicted_ops as i128) + 1;
+    let required_fee = (evicted_fee as i128 * new_ops as i128 / evicted_ops as i128) + 1;
     required_fee.min(i64::MAX as i128) as i64
 }
 
@@ -416,12 +413,10 @@ impl TxQueueLimiter {
 
             if *evicted_due_to_lane_limit {
                 // Record in the specific lane
-                self.lane_evicted_inclusion_fee[evict_lane] =
-                    (tx.total_fee as i64, tx.op_count);
+                self.lane_evicted_inclusion_fee[evict_lane] = (tx.total_fee as i64, tx.op_count);
             } else {
                 // Record in generic lane
-                self.lane_evicted_inclusion_fee[GENERIC_LANE] =
-                    (tx.total_fee as i64, tx.op_count);
+                self.lane_evicted_inclusion_fee[GENERIC_LANE] = (tx.total_fee as i64, tx.op_count);
             }
 
             evict(tx);
@@ -459,7 +454,11 @@ impl TxQueueLimiter {
         use stellar_core_common::ResourceType;
         self.txs
             .as_ref()
-            .map(|q| q.total_resources().try_get_val(ResourceType::Operations).unwrap_or(0) as usize)
+            .map(|q| {
+                q.total_resources()
+                    .try_get_val(ResourceType::Operations)
+                    .unwrap_or(0) as usize
+            })
             .unwrap_or(0)
     }
 

@@ -64,7 +64,9 @@ pub fn execute_restore_footprint(
     // (RestoreFootprint only restores entries that are in read-write)
     for key in footprint.read_write.iter() {
         if let Err(_) = restore_entry(key, new_ttl, state, current_ledger) {
-            return Ok(make_result(RestoreFootprintResultCode::ResourceLimitExceeded));
+            return Ok(make_result(
+                RestoreFootprintResultCode::ResourceLimitExceeded,
+            ));
         }
     }
 
@@ -74,7 +76,10 @@ pub fn execute_restore_footprint(
 fn is_persistent_entry(key: &LedgerKey) -> bool {
     match key {
         LedgerKey::ContractCode(_) => true,
-        LedgerKey::ContractData(cd) => matches!(cd.durability, stellar_xdr::curr::ContractDataDurability::Persistent),
+        LedgerKey::ContractData(cd) => matches!(
+            cd.durability,
+            stellar_xdr::curr::ContractDataDurability::Persistent
+        ),
         _ => false,
     }
 }

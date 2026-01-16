@@ -10,18 +10,18 @@ use axum::{
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use stellar_core_common::Hash256;
 use stellar_core_history::verify;
-use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_history::{
     archive::HistoryArchive,
     archive_state::{HASBucketLevel, HistoryArchiveState},
     paths::{bucket_path, checkpoint_path},
 };
 use stellar_core_historywork::{HistoryWorkBuilder, HistoryWorkState, LocalArchiveWriter};
+use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_work::{WorkScheduler, WorkSchedulerConfig};
 use stellar_xdr::curr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
-    LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0, StellarValue, StellarValueExt, TimePoint,
-    TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
+    LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0, StellarValue, StellarValueExt,
+    TimePoint, TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
     TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, VecM, WriteXdr,
 };
 use tokio::net::TcpListener;
@@ -97,9 +97,8 @@ async fn test_history_work_chain() {
         previous_ledger_hash: Hash([0u8; 32]),
         txs: VecM::default(),
     };
-    let tx_set_hash =
-        verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
-            .expect("tx set hash");
+    let tx_set_hash = verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
+        .expect("tx set hash");
 
     let tx_result_set = TransactionResultSet {
         results: VecM::default(),
@@ -189,15 +188,22 @@ async fn test_history_work_chain() {
     );
 
     let fixtures = Arc::new(fixtures);
-    let app = Router::new()
-        .route("/*path", get(|Path(path): Path<String>, State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
-            if let Some(body) = state.get(&path) {
-                (StatusCode::OK, body.clone())
-            } else {
-                (StatusCode::NOT_FOUND, Vec::new())
-            }
-        }))
-        .with_state(Arc::clone(&fixtures));
+    let app =
+        Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        if let Some(body) = state.get(&path) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
 
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -239,14 +245,17 @@ async fn test_history_work_chain() {
     assert!(guard.progress.stage.is_some());
     assert!(!guard.progress.message.is_empty());
 
-    let has_path = publish_dir.path().join(checkpoint_path("history", checkpoint, "json"));
+    let has_path = publish_dir
+        .path()
+        .join(checkpoint_path("history", checkpoint, "json"));
     let bucket_file = publish_dir.path().join(bucket_path(&bucket_hash));
     let headers_file = publish_dir
         .path()
         .join(checkpoint_path("ledger", checkpoint, "xdr.gz"));
-    let transactions_file = publish_dir
-        .path()
-        .join(checkpoint_path("transactions", checkpoint, "xdr.gz"));
+    let transactions_file =
+        publish_dir
+            .path()
+            .join(checkpoint_path("transactions", checkpoint, "xdr.gz"));
     let results_file = publish_dir
         .path()
         .join(checkpoint_path("results", checkpoint, "xdr.gz"));

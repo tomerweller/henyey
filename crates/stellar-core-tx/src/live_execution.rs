@@ -88,7 +88,6 @@ const FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY: u32 = 10;
 /// Protocol version where refund timing changed to post-tx-set.
 const PROTOCOL_VERSION_23: u32 = 23;
 
-
 // ============================================================================
 // Live Execution Context
 // ============================================================================
@@ -262,12 +261,12 @@ pub fn process_fee_seq_num(
 
     // Load source account and get balance
     let available_balance = {
-        let state = ctx.state().ok_or_else(|| {
-            TxError::Internal("state manager not available".into())
-        })?;
-        let source_account = state.get_account(&source_account_id).ok_or_else(|| {
-            TxError::AccountNotFound(format!("{:?}", source_account_id))
-        })?;
+        let state = ctx
+            .state()
+            .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
+        let source_account = state
+            .get_account(&source_account_id)
+            .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", source_account_id)))?;
         source_account.balance
     };
 
@@ -293,9 +292,9 @@ pub fn process_fee_seq_num(
 
     // Now get mutable state for modifications
     {
-        let state = ctx.state_mut().ok_or_else(|| {
-            TxError::Internal("state manager not available".into())
-        })?;
+        let state = ctx
+            .state_mut()
+            .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
 
         // Charge the fee (or whatever is available)
         charge_fee_to_account(state, &source_account_id, fee_charged)?;
@@ -347,12 +346,12 @@ pub fn process_fee_seq_num_fee_bump(
 
     // Load fee source account and get balance
     let available_balance = {
-        let state = ctx.state().ok_or_else(|| {
-            TxError::Internal("state manager not available".into())
-        })?;
-        let fee_source_account = state.get_account(&fee_source_id).ok_or_else(|| {
-            TxError::AccountNotFound(format!("{:?}", fee_source_id))
-        })?;
+        let state = ctx
+            .state()
+            .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
+        let fee_source_account = state
+            .get_account(&fee_source_id)
+            .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", fee_source_id)))?;
         fee_source_account.balance
     };
 
@@ -377,9 +376,9 @@ pub fn process_fee_seq_num_fee_bump(
 
     // Charge the fee
     {
-        let state = ctx.state_mut().ok_or_else(|| {
-            TxError::Internal("state manager not available".into())
-        })?;
+        let state = ctx
+            .state_mut()
+            .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
         charge_fee_to_account(state, &fee_source_id, fee_charged)?;
     }
 
@@ -418,9 +417,9 @@ fn charge_fee_to_account(
     account_id: &AccountId,
     fee: i64,
 ) -> Result<()> {
-    let account = state.get_account_mut(account_id).ok_or_else(|| {
-        TxError::AccountNotFound(format!("{:?}", account_id))
-    })?;
+    let account = state
+        .get_account_mut(account_id)
+        .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", account_id)))?;
 
     if account.balance < fee {
         return Err(TxError::InsufficientBalance {
@@ -434,13 +433,10 @@ fn charge_fee_to_account(
 }
 
 /// Update sequence number for an account.
-fn update_sequence_number(
-    state: &mut LedgerStateManager,
-    account_id: &AccountId,
-) -> Result<()> {
-    let account = state.get_account_mut(account_id).ok_or_else(|| {
-        TxError::AccountNotFound(format!("{:?}", account_id))
-    })?;
+fn update_sequence_number(state: &mut LedgerStateManager, account_id: &AccountId) -> Result<()> {
+    let account = state
+        .get_account_mut(account_id)
+        .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", account_id)))?;
 
     account.seq_num.0 += 1;
     Ok(())
@@ -661,7 +657,11 @@ pub fn refund_soroban_fee(
     // Emit fee refund event if event manager provided
     if let Some(event_manager) = tx_event_manager {
         // Negative fee represents a refund (recorded with AfterAllTxs stage)
-        event_manager.refund_fee(fee_source_id, actual_refund, TransactionEventStage::AfterAllTxs);
+        event_manager.refund_fee(
+            fee_source_id,
+            actual_refund,
+            TransactionEventStage::AfterAllTxs,
+        );
     }
 
     Ok(actual_refund)
@@ -688,10 +688,7 @@ pub fn refund_soroban_fee(
 /// # Returns
 ///
 /// `Ok(())` on success, or an error if the account doesn't exist.
-pub fn process_seq_num(
-    frame: &TransactionFrame,
-    ctx: &mut LiveExecutionContext,
-) -> Result<()> {
+pub fn process_seq_num(frame: &TransactionFrame, ctx: &mut LiveExecutionContext) -> Result<()> {
     // Only for protocol 10+
     if ctx.protocol_version() < FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY {
         return Ok(()); // Sequence was already updated in process_fee_seq_num
@@ -699,9 +696,9 @@ pub fn process_seq_num(
 
     let source_account_id = muxed_to_account_id(&frame.source_account());
 
-    let state = ctx.state_mut().ok_or_else(|| {
-        TxError::Internal("state manager not available".into())
-    })?;
+    let state = ctx
+        .state_mut()
+        .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
 
     update_sequence_number(state, &source_account_id)
 }
@@ -754,9 +751,9 @@ pub fn remove_one_time_signers(
     source_accounts.dedup_by(|a, b| a.0 == b.0);
 
     // Remove the pre-auth signer from each account
-    let state = ctx.state_mut().ok_or_else(|| {
-        TxError::Internal("state manager not available".into())
-    })?;
+    let state = ctx
+        .state_mut()
+        .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
 
     for account_id in source_accounts {
         state.remove_one_time_signers_from_all_sources(tx_hash, &[account_id], protocol_version);
@@ -892,10 +889,10 @@ mod tests {
 
     fn make_test_context(protocol_version: u32) -> LiveExecutionContext {
         let ledger_context = LedgerContext::new(
-            1000,           // sequence
-            1700000000,     // close_time
-            100,            // base_fee
-            5_000_000,      // base_reserve
+            1000,       // sequence
+            1700000000, // close_time
+            100,        // base_fee
+            5_000_000,  // base_reserve
             protocol_version,
             stellar_core_common::NetworkId::testnet(),
         );
@@ -1139,7 +1136,13 @@ mod tests {
 
     #[test]
     fn test_transaction_event_stage() {
-        assert_eq!(TransactionEventStage::BeforeAllTxs, TransactionEventStage::BeforeAllTxs);
-        assert_ne!(TransactionEventStage::BeforeAllTxs, TransactionEventStage::AfterAllTxs);
+        assert_eq!(
+            TransactionEventStage::BeforeAllTxs,
+            TransactionEventStage::BeforeAllTxs
+        );
+        assert_ne!(
+            TransactionEventStage::BeforeAllTxs,
+            TransactionEventStage::AfterAllTxs
+        );
     }
 }

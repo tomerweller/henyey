@@ -35,11 +35,11 @@
 
 use std::cmp::Ordering;
 
-use stellar_xdr::curr::{
-    BucketEntry as XdrBucketEntry, BucketEntryType, BucketMetadata, ContractDataDurability,
-    Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl, ReadXdr, WriteXdr, Limits,
-};
 use sha2::{Digest, Sha256};
+use stellar_xdr::curr::{
+    BucketEntry as XdrBucketEntry, BucketEntryType, BucketMetadata, ContractDataDurability, Hash,
+    LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl, Limits, ReadXdr, WriteXdr,
+};
 
 use crate::{BucketError, Result};
 
@@ -127,9 +127,7 @@ impl BucketEntry {
     /// Returns None for metadata entries since they don't have a key.
     pub fn key(&self) -> Option<LedgerKey> {
         match self {
-            BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
-                ledger_entry_to_key(entry)
-            }
+            BucketEntry::Live(entry) | BucketEntry::Init(entry) => ledger_entry_to_key(entry),
             BucketEntry::Dead(key) => Some(key.clone()),
             BucketEntry::Metadata(_) => None,
         }
@@ -179,39 +177,29 @@ pub fn ledger_entry_to_key(entry: &LedgerEntry) -> Option<LedgerKey> {
     use stellar_xdr::curr::*;
 
     let key = match &entry.data {
-        LedgerEntryData::Account(account) => {
-            LedgerKey::Account(LedgerKeyAccount {
-                account_id: account.account_id.clone(),
-            })
-        }
-        LedgerEntryData::Trustline(trustline) => {
-            LedgerKey::Trustline(LedgerKeyTrustLine {
-                account_id: trustline.account_id.clone(),
-                asset: trustline.asset.clone(),
-            })
-        }
-        LedgerEntryData::Offer(offer) => {
-            LedgerKey::Offer(LedgerKeyOffer {
-                seller_id: offer.seller_id.clone(),
-                offer_id: offer.offer_id,
-            })
-        }
-        LedgerEntryData::Data(data) => {
-            LedgerKey::Data(LedgerKeyData {
-                account_id: data.account_id.clone(),
-                data_name: data.data_name.clone(),
-            })
-        }
+        LedgerEntryData::Account(account) => LedgerKey::Account(LedgerKeyAccount {
+            account_id: account.account_id.clone(),
+        }),
+        LedgerEntryData::Trustline(trustline) => LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: trustline.account_id.clone(),
+            asset: trustline.asset.clone(),
+        }),
+        LedgerEntryData::Offer(offer) => LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: offer.seller_id.clone(),
+            offer_id: offer.offer_id,
+        }),
+        LedgerEntryData::Data(data) => LedgerKey::Data(LedgerKeyData {
+            account_id: data.account_id.clone(),
+            data_name: data.data_name.clone(),
+        }),
         LedgerEntryData::ClaimableBalance(cb) => {
             LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
                 balance_id: cb.balance_id.clone(),
             })
         }
-        LedgerEntryData::LiquidityPool(pool) => {
-            LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
-                liquidity_pool_id: pool.liquidity_pool_id.clone(),
-            })
-        }
+        LedgerEntryData::LiquidityPool(pool) => LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: pool.liquidity_pool_id.clone(),
+        }),
         LedgerEntryData::ContractData(contract_data) => {
             LedgerKey::ContractData(LedgerKeyContractData {
                 contract: contract_data.contract.clone(),
@@ -229,11 +217,9 @@ pub fn ledger_entry_to_key(entry: &LedgerEntry) -> Option<LedgerKey> {
                 config_setting_id: config.discriminant(),
             })
         }
-        LedgerEntryData::Ttl(ttl) => {
-            LedgerKey::Ttl(LedgerKeyTtl {
-                key_hash: ttl.key_hash.clone(),
-            })
-        }
+        LedgerEntryData::Ttl(ttl) => LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: ttl.key_hash.clone(),
+        }),
     };
 
     Some(key)
@@ -288,11 +274,10 @@ fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
 fn compare_keys_same_type(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     match (a, b) {
         (LedgerKey::Account(a), LedgerKey::Account(b)) => a.account_id.cmp(&b.account_id),
-        (LedgerKey::Trustline(a), LedgerKey::Trustline(b)) => {
-            a.account_id
-                .cmp(&b.account_id)
-                .then_with(|| a.asset.cmp(&b.asset))
-        }
+        (LedgerKey::Trustline(a), LedgerKey::Trustline(b)) => a
+            .account_id
+            .cmp(&b.account_id)
+            .then_with(|| a.asset.cmp(&b.asset)),
         (LedgerKey::Offer(a), LedgerKey::Offer(b)) => a
             .seller_id
             .cmp(&b.seller_id)
@@ -328,10 +313,7 @@ fn compare_sc_address(
     a.cmp(b)
 }
 
-fn compare_sc_val(
-    a: &stellar_xdr::curr::ScVal,
-    b: &stellar_xdr::curr::ScVal,
-) -> Ordering {
+fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) -> Ordering {
     a.cmp(b)
 }
 
@@ -342,9 +324,9 @@ fn compare_sc_val(
 pub fn compare_entries(a: &BucketEntry, b: &BucketEntry) -> Ordering {
     match (a.key(), b.key()) {
         (Some(key_a), Some(key_b)) => compare_keys(&key_a, &key_b),
-        (None, Some(_)) => Ordering::Less,  // Metadata comes first
+        (None, Some(_)) => Ordering::Less, // Metadata comes first
         (Some(_), None) => Ordering::Greater,
-        (None, None) => Ordering::Equal,    // Both metadata
+        (None, None) => Ordering::Equal, // Both metadata
     }
 }
 
@@ -469,8 +451,8 @@ pub fn get_ttl_live_until(ttl_entry: &LedgerEntry) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
+    use crate::BucketEntry;
+    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
@@ -584,6 +566,9 @@ mod tests {
 
         // Account (type 0) should sort before Trustline (type 1), regardless of account bytes
         assert_eq!(compare_keys(&account_key, &trustline_key), Ordering::Less);
-        assert_eq!(compare_keys(&trustline_key, &account_key), Ordering::Greater);
+        assert_eq!(
+            compare_keys(&trustline_key, &account_key),
+            Ordering::Greater
+        );
     }
 }

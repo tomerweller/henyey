@@ -66,14 +66,14 @@ pub mod schema;
 pub mod scp_persistence;
 
 pub use error::DbError;
-pub use migrations::{run_migrations, verify_schema, needs_migration, CURRENT_VERSION};
+pub use migrations::{needs_migration, run_migrations, verify_schema, CURRENT_VERSION};
 pub use pool::{Database, PooledConnection};
 pub use queries::*;
 pub use scp_persistence::SqliteScpPersistence;
 
 use std::path::Path;
-use tracing::info;
 use stellar_xdr::curr::{TransactionHistoryEntry, TransactionHistoryResultEntry};
+use tracing::info;
 
 /// Result type for database operations.
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -103,12 +103,11 @@ impl Database {
             }
         }
 
-        let manager = r2d2_sqlite::SqliteConnectionManager::file(path)
-            .with_init(|conn| {
-                // Set busy_timeout on every new connection for lock contention handling
-                conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
-                Ok(())
-            });
+        let manager = r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|conn| {
+            // Set busy_timeout on every new connection for lock contention handling
+            conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
+            Ok(())
+        });
         let pool = r2d2::Pool::builder()
             .max_size(10)
             .connection_timeout(std::time::Duration::from_secs(30))
@@ -126,9 +125,7 @@ impl Database {
     /// since in-memory databases are connection-specific.
     pub fn open_in_memory() -> Result<Self> {
         let manager = r2d2_sqlite::SqliteConnectionManager::memory();
-        let pool = r2d2::Pool::builder()
-            .max_size(1)
-            .build(manager)?;
+        let pool = r2d2::Pool::builder().max_size(1).build(manager)?;
 
         let db = Self { pool };
         db.initialize()?;
@@ -334,10 +331,7 @@ impl Database {
     /// Loads SCP envelopes for a ledger.
     ///
     /// Returns the consensus messages that were recorded for the specified ledger.
-    pub fn load_scp_history(
-        &self,
-        seq: u32,
-    ) -> Result<Vec<stellar_xdr::curr::ScpEnvelope>> {
+    pub fn load_scp_history(&self, seq: u32) -> Result<Vec<stellar_xdr::curr::ScpEnvelope>> {
         self.with_connection(|conn| {
             use queries::ScpQueries;
             conn.load_scp_history(seq)
@@ -508,12 +502,7 @@ impl Database {
     ///
     /// The peer record tracks connection metadata including failure count,
     /// next retry time, and peer type (inbound/outbound).
-    pub fn store_peer(
-        &self,
-        host: &str,
-        port: u16,
-        record: queries::PeerRecord,
-    ) -> Result<()> {
+    pub fn store_peer(&self, host: &str, port: u16, record: queries::PeerRecord) -> Result<()> {
         self.with_connection(|conn| {
             use queries::PeerQueries;
             conn.store_peer(host, port, record)
@@ -523,11 +512,7 @@ impl Database {
     /// Loads a peer record by host and port.
     ///
     /// Returns `None` if the peer is not in the database.
-    pub fn load_peer(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> Result<Option<queries::PeerRecord>> {
+    pub fn load_peer(&self, host: &str, port: u16) -> Result<Option<queries::PeerRecord>> {
         self.with_connection(|conn| {
             use queries::PeerQueries;
             conn.load_peer(host, port)

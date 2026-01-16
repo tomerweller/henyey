@@ -8,10 +8,10 @@
 use stellar_xdr::curr::{
     AccountId, BeginSponsoringFutureReservesOp, BeginSponsoringFutureReservesResult,
     BeginSponsoringFutureReservesResultCode, EndSponsoringFutureReservesResult,
-    EndSponsoringFutureReservesResultCode, OperationResult, OperationResultTr,
-    RevokeSponsorshipOp, RevokeSponsorshipResult, RevokeSponsorshipResultCode,
-    LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyData,
-    LedgerKeyOffer, LedgerKeyTrustLine, TrustLineAsset, SponsorshipDescriptor,
+    EndSponsoringFutureReservesResultCode, LedgerEntryData, LedgerKey, LedgerKeyAccount,
+    LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer, LedgerKeyTrustLine, OperationResult,
+    OperationResultTr, RevokeSponsorshipOp, RevokeSponsorshipResult, RevokeSponsorshipResultCode,
+    SponsorshipDescriptor, TrustLineAsset,
 };
 
 use crate::state::LedgerStateManager;
@@ -92,7 +92,9 @@ pub fn execute_end_sponsoring_future_reserves(
         ));
     }
 
-    Ok(make_end_result(EndSponsoringFutureReservesResultCode::Success))
+    Ok(make_end_result(
+        EndSponsoringFutureReservesResultCode::Success,
+    ))
 }
 
 /// Execute a RevokeSponsorship operation.
@@ -116,7 +118,13 @@ pub fn execute_revoke_sponsorship(
         RSO::LedgerEntry(ledger_key) => {
             // Check if the entry exists
             let Some(entry) = state.get_entry(ledger_key) else {
-                return Ok(make_revoke_result(RevokeSponsorshipResultCode::DoesNotExist));
+                tracing::debug!(
+                    "RevokeSponsorship: entry does not exist, key={:?}",
+                    ledger_key
+                );
+                return Ok(make_revoke_result(
+                    RevokeSponsorshipResultCode::DoesNotExist,
+                ));
             };
             let entry = entry.clone();
 
@@ -203,15 +211,11 @@ pub fn execute_revoke_sponsorship(
 
                 if matches!(entry.data, LedgerEntryData::ClaimableBalance(_)) {
                     state.remove_entry_sponsorship_with_sponsor_counts(
-                        ledger_key,
-                        None,
-                        multiplier,
+                        ledger_key, None, multiplier,
                     )?;
                 } else {
                     state.remove_entry_sponsorship_and_update_counts(
-                        ledger_key,
-                        &owner_id,
-                        multiplier,
+                        ledger_key, &owner_id, multiplier,
                     )?;
                 }
                 sponsorship_changed = true;
@@ -249,7 +253,9 @@ pub fn execute_revoke_sponsorship(
         RSO::Signer(signer_key) => {
             // Check if the account exists
             let Some(account) = state.get_account(&signer_key.account_id) else {
-                return Ok(make_revoke_result(RevokeSponsorshipResultCode::DoesNotExist));
+                return Ok(make_revoke_result(
+                    RevokeSponsorshipResultCode::DoesNotExist,
+                ));
             };
 
             let signer_pos = account
@@ -257,7 +263,9 @@ pub fn execute_revoke_sponsorship(
                 .iter()
                 .position(|s| s.key == signer_key.signer_key);
             let Some(pos) = signer_pos else {
-                return Ok(make_revoke_result(RevokeSponsorshipResultCode::DoesNotExist));
+                return Ok(make_revoke_result(
+                    RevokeSponsorshipResultCode::DoesNotExist,
+                ));
             };
 
             let owner_id = signer_key.account_id.clone();
@@ -365,7 +373,9 @@ fn make_begin_result(code: BeginSponsoringFutureReservesResultCode) -> Operation
 /// Create an EndSponsoringFutureReserves result.
 fn make_end_result(code: EndSponsoringFutureReservesResultCode) -> OperationResult {
     let result = match code {
-        EndSponsoringFutureReservesResultCode::Success => EndSponsoringFutureReservesResult::Success,
+        EndSponsoringFutureReservesResultCode::Success => {
+            EndSponsoringFutureReservesResult::Success
+        }
         EndSponsoringFutureReservesResultCode::NotSponsored => {
             EndSponsoringFutureReservesResult::NotSponsored
         }
@@ -399,10 +409,16 @@ fn update_entry_after_sponsorship(
         LedgerKey::Trustline(LedgerKeyTrustLine { account_id, asset }) => {
             let _ = state.get_trustline_by_trustline_asset_mut(account_id, asset);
         }
-        LedgerKey::Offer(LedgerKeyOffer { seller_id, offer_id }) => {
+        LedgerKey::Offer(LedgerKeyOffer {
+            seller_id,
+            offer_id,
+        }) => {
             let _ = state.get_offer_mut(seller_id, *offer_id);
         }
-        LedgerKey::Data(LedgerKeyData { account_id, data_name }) => {
+        LedgerKey::Data(LedgerKeyData {
+            account_id,
+            data_name,
+        }) => {
             let name = String::from_utf8_lossy(data_name.as_vec()).to_string();
             let _ = state.get_data_mut(account_id, &name);
         }
@@ -414,18 +430,20 @@ fn update_entry_after_sponsorship(
     Ok(())
 }
 
-fn current_signer_sponsor(account: &stellar_xdr::curr::AccountEntry, pos: usize) -> Option<AccountId> {
+fn current_signer_sponsor(
+    account: &stellar_xdr::curr::AccountEntry,
+    pos: usize,
+) -> Option<AccountId> {
     match &account.ext {
         stellar_xdr::curr::AccountEntryExt::V0 => None,
         stellar_xdr::curr::AccountEntryExt::V1(v1) => match &v1.ext {
             stellar_xdr::curr::AccountEntryExtensionV1Ext::V0 => None,
-            stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => v2
-                .signer_sponsoring_i_ds
-                .get(pos)
-                .and_then(|id| match id {
+            stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => {
+                v2.signer_sponsoring_i_ds.get(pos).and_then(|id| match id {
                     SponsorshipDescriptor(Some(s)) => Some(s.clone()),
                     _ => None,
-                }),
+                })
+            }
         },
     }
 }
@@ -607,8 +625,7 @@ mod tests {
         execute_begin_sponsoring_future_reserves(&begin, &sponsor_id, &mut state, &context)
             .unwrap();
 
-        let result =
-            execute_end_sponsoring_future_reserves(&sponsored_id, &mut state, &context);
+        let result = execute_end_sponsoring_future_reserves(&sponsored_id, &mut state, &context);
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -681,7 +698,12 @@ mod tests {
             data_name: String64::try_from("test".as_bytes().to_vec()).unwrap(),
         });
         state
-            .apply_entry_sponsorship_with_sponsor(ledger_key.clone(), &sponsor_id, Some(&owner_id), 1)
+            .apply_entry_sponsorship_with_sponsor(
+                ledger_key.clone(),
+                &sponsor_id,
+                Some(&owner_id),
+                1,
+            )
             .unwrap();
 
         let op = RevokeSponsorshipOp::LedgerEntry(ledger_key.clone());
@@ -744,13 +766,19 @@ mod tests {
             data_name: String64::try_from("test".as_bytes().to_vec()).unwrap(),
         });
         state
-            .apply_entry_sponsorship_with_sponsor(ledger_key.clone(), &old_sponsor, Some(&owner_id), 1)
+            .apply_entry_sponsorship_with_sponsor(
+                ledger_key.clone(),
+                &old_sponsor,
+                Some(&owner_id),
+                1,
+            )
             .unwrap();
 
         let begin = BeginSponsoringFutureReservesOp {
             sponsored_id: old_sponsor.clone(),
         };
-        execute_begin_sponsoring_future_reserves(&begin, &new_sponsor, &mut state, &context).unwrap();
+        execute_begin_sponsoring_future_reserves(&begin, &new_sponsor, &mut state, &context)
+            .unwrap();
 
         let op = RevokeSponsorshipOp::LedgerEntry(ledger_key.clone());
         let result = execute_revoke_sponsorship(&op, &old_sponsor, &mut state, &context);
@@ -773,8 +801,7 @@ mod tests {
         let sponsor_id = create_test_account_id(1);
         state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
 
-        let balance_id =
-            ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([1u8; 32]));
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([1u8; 32]));
         let entry = create_claimable_balance_entry(&sponsor_id, balance_id.clone());
         state.create_claimable_balance(entry);
 
@@ -853,7 +880,8 @@ mod tests {
         let begin = BeginSponsoringFutureReservesOp {
             sponsored_id: old_sponsor.clone(),
         };
-        execute_begin_sponsoring_future_reserves(&begin, &new_sponsor, &mut state, &context).unwrap();
+        execute_begin_sponsoring_future_reserves(&begin, &new_sponsor, &mut state, &context)
+            .unwrap();
 
         let op = RevokeSponsorshipOp::Signer(RevokeSponsorshipOpSigner {
             account_id: owner_id.clone(),

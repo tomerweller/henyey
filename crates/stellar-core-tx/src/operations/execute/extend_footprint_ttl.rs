@@ -4,8 +4,8 @@
 //! which extends the time-to-live for Soroban contract data entries.
 
 use stellar_xdr::curr::{
-    AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode,
-    Hash, LedgerKey, OperationResult, OperationResultTr, SorobanTransactionData,
+    AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode, Hash,
+    LedgerKey, OperationResult, OperationResultTr, SorobanTransactionData,
 };
 
 use crate::state::LedgerStateManager;
@@ -73,14 +73,18 @@ pub fn execute_extend_footprint_ttl(
     for key in footprint.read_only.iter() {
         if extend_entry_ttl(key, target_ttl, state).is_err() {
             // Entry not found or cannot extend - this is a resource issue
-            return Ok(make_result(ExtendFootprintTtlResultCode::ResourceLimitExceeded));
+            return Ok(make_result(
+                ExtendFootprintTtlResultCode::ResourceLimitExceeded,
+            ));
         }
     }
 
     // Extend TTL for all entries in the read-write footprint
     for key in footprint.read_write.iter() {
         if extend_entry_ttl(key, target_ttl, state).is_err() {
-            return Ok(make_result(ExtendFootprintTtlResultCode::ResourceLimitExceeded));
+            return Ok(make_result(
+                ExtendFootprintTtlResultCode::ResourceLimitExceeded,
+            ));
         }
     }
 
@@ -112,7 +116,7 @@ fn extend_entry_ttl(
 
 /// Compute the hash of a ledger key for TTL lookup.
 fn compute_ledger_key_hash(key: &LedgerKey) -> Hash {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     use stellar_xdr::curr::WriteXdr;
 
     let mut hasher = Sha256::new();

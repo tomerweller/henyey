@@ -44,9 +44,9 @@ use serde::Serialize;
 use stellar_core_overlay::{PeerId, PeerSnapshot};
 use stellar_xdr::curr::{
     NodeId, PeerStats, SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseMessage,
-    TimeSlicedNodeData, TimeSlicedPeerData, TimeSlicedPeerDataList,
-    TimeSlicedSurveyRequestMessage, TimeSlicedSurveyStartCollectingMessage,
-    TimeSlicedSurveyStopCollectingMessage, TopologyResponseBodyV2,
+    TimeSlicedNodeData, TimeSlicedPeerData, TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage,
+    TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
+    TopologyResponseBodyV2,
 };
 
 const COLLECTING_PHASE_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
@@ -568,9 +568,7 @@ impl SurveyDataManager {
         &self.final_outbound
     }
 
-    fn initialize_collecting_peers(
-        peers: &[PeerSnapshot],
-    ) -> HashMap<PeerId, CollectingPeerData> {
+    fn initialize_collecting_peers(peers: &[PeerSnapshot]) -> HashMap<PeerId, CollectingPeerData> {
         let mut result = HashMap::new();
         for snapshot in peers {
             result.insert(
@@ -584,10 +582,7 @@ impl SurveyDataManager {
         result
     }
 
-    fn slice_peer_data(
-        peers: &[TimeSlicedPeerData],
-        index: u32,
-    ) -> TimeSlicedPeerDataList {
+    fn slice_peer_data(peers: &[TimeSlicedPeerData], index: u32) -> TimeSlicedPeerDataList {
         let idx = index as usize;
         if idx >= peers.len() {
             return TimeSlicedPeerDataList(Vec::new().try_into().unwrap_or_default());
@@ -708,16 +703,18 @@ impl SurveyDataManager {
         lost_sync_count_total: u64,
     ) -> Option<TimeSlicedNodeData> {
         let node = self.collecting_node.as_ref()?;
-        let mut lost_sync_count = lost_sync_count_total.saturating_sub(node.initial_lost_sync_count);
+        let mut lost_sync_count =
+            lost_sync_count_total.saturating_sub(node.initial_lost_sync_count);
         if node.initially_out_of_sync {
             lost_sync_count = lost_sync_count.saturating_add(1);
         }
 
         Some(TimeSlicedNodeData {
-            added_authenticated_peers: added_peers_total
-                .saturating_sub(node.initial_added_peers) as u32,
+            added_authenticated_peers: added_peers_total.saturating_sub(node.initial_added_peers)
+                as u32,
             dropped_authenticated_peers: dropped_peers_total
-                .saturating_sub(node.initial_dropped_peers) as u32,
+                .saturating_sub(node.initial_dropped_peers)
+                as u32,
             total_inbound_peer_count: self.final_inbound.len() as u32,
             total_outbound_peer_count: self.final_outbound.len() as u32,
             p75_scp_first_to_self_latency_ms: node.scp_first_to_self_latency.p75(),

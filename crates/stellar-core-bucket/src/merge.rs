@@ -46,9 +46,8 @@ use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey};
 use crate::bucket::{Bucket, BucketIter};
 use crate::entry::{compare_keys, BucketEntry};
 use crate::{
-    BucketError, Result,
+    BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
-    FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
 };
 
@@ -76,7 +75,13 @@ pub fn merge_buckets(
     keep_dead_entries: bool,
     max_protocol_version: u32,
 ) -> Result<Bucket> {
-    merge_buckets_with_options(old_bucket, new_bucket, keep_dead_entries, max_protocol_version, true)
+    merge_buckets_with_options(
+        old_bucket,
+        new_bucket,
+        keep_dead_entries,
+        max_protocol_version,
+        true,
+    )
 }
 
 /// Merge two buckets into a new bucket with explicit normalization control.
@@ -175,16 +180,22 @@ pub fn merge_buckets_with_options(
                     Ordering::Greater => {
                         // New entry comes first
                         if should_keep_entry(new_entry, keep_dead_entries) {
-                            merged.push(maybe_normalize_entry(new_entry.clone(), normalize_init_entries));
+                            merged.push(maybe_normalize_entry(
+                                new_entry.clone(),
+                                normalize_init_entries,
+                            ));
                         }
                         new_idx += 1;
                     }
                     Ordering::Equal => {
                         // Keys match - new entry shadows old entry
                         // Apply merge semantics (per CAP-0020)
-                        if let Some(merged_entry) =
-                            merge_entries(old_entry, new_entry, keep_dead_entries, normalize_init_entries)
-                        {
+                        if let Some(merged_entry) = merge_entries(
+                            old_entry,
+                            new_entry,
+                            keep_dead_entries,
+                            normalize_init_entries,
+                        ) {
                             merged.push(merged_entry);
                         }
                         old_idx += 1;
@@ -332,10 +343,7 @@ fn filter_shadowed_entries(
     shadow_buckets: &[Bucket],
     keep_shadowed_lifecycle_entries: bool,
 ) -> Result<Bucket> {
-    let mut cursors: Vec<ShadowCursor<'_>> = shadow_buckets
-        .iter()
-        .map(ShadowCursor::new)
-        .collect();
+    let mut cursors: Vec<ShadowCursor<'_>> = shadow_buckets.iter().map(ShadowCursor::new).collect();
 
     let mut filtered = Vec::with_capacity(merged.len());
     for entry in merged.iter() {
@@ -408,25 +416,17 @@ fn merge_entries(
 
         // CAP-0020: DEADENTRY + INITENTRY=x → Output as LIVEENTRY=x
         // The old tombstone is cancelled by the new creation
-        (BucketEntry::Dead(_), BucketEntry::Init(entry)) => {
-            Some(BucketEntry::Live(entry.clone()))
-        }
+        (BucketEntry::Dead(_), BucketEntry::Init(entry)) => Some(BucketEntry::Live(entry.clone())),
 
         // CAP-0020: INITENTRY=x + LIVEENTRY=y → Output as INITENTRY=y
         // Preserve the INIT status (entry was created in this merge range)
-        (BucketEntry::Init(_), BucketEntry::Live(entry)) => {
-            Some(BucketEntry::Init(entry.clone()))
-        }
+        (BucketEntry::Init(_), BucketEntry::Live(entry)) => Some(BucketEntry::Init(entry.clone())),
 
         // New Live shadows old Live - new wins
-        (BucketEntry::Live(_), BucketEntry::Live(entry)) => {
-            Some(BucketEntry::Live(entry.clone()))
-        }
+        (BucketEntry::Live(_), BucketEntry::Live(entry)) => Some(BucketEntry::Live(entry.clone())),
 
         // New Live shadows old Dead - live wins
-        (BucketEntry::Dead(_), BucketEntry::Live(entry)) => {
-            Some(BucketEntry::Live(entry.clone()))
-        }
+        (BucketEntry::Dead(_), BucketEntry::Live(entry)) => Some(BucketEntry::Live(entry.clone())),
 
         // Any old + new Init (not covered above) → convert to Live only if crossing levels
         (_, BucketEntry::Init(entry)) => {
@@ -510,12 +510,9 @@ impl MergeIterator {
         let new_entries: Vec<BucketEntry> = new_bucket.iter().collect();
         let old_meta = extract_metadata(&old_entries);
         let new_meta = extract_metadata(&new_entries);
-        let (_, output_metadata) = build_output_metadata(
-            old_meta.as_ref(),
-            new_meta.as_ref(),
-            max_protocol_version,
-        )
-        .unwrap_or((0, None));
+        let (_, output_metadata) =
+            build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)
+                .unwrap_or((0, None));
 
         Self {
             old_entries,
@@ -698,8 +695,8 @@ fn build_output_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
+    use crate::BucketEntry;
+    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
@@ -826,9 +823,9 @@ mod tests {
         ];
 
         let new_entries = vec![
-            BucketEntry::Dead(make_account_key([1u8; 32])),            // Delete first
-            BucketEntry::Live(make_account_entry([2u8; 32], 250)),     // Update second
-            BucketEntry::Live(make_account_entry([4u8; 32], 400)),     // Add new
+            BucketEntry::Dead(make_account_key([1u8; 32])), // Delete first
+            BucketEntry::Live(make_account_entry([2u8; 32], 250)), // Update second
+            BucketEntry::Live(make_account_entry([4u8; 32], 400)), // Add new
         ];
 
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
@@ -869,9 +866,7 @@ mod tests {
             BucketEntry::Live(make_account_entry([3u8; 32], 300)),
         ];
 
-        let new_entries = vec![
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
-        ];
+        let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
 
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
@@ -884,20 +879,17 @@ mod tests {
 
     #[test]
     fn test_merge_multiple() {
-        let bucket1 = Bucket::from_entries(vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-        ])
-        .unwrap();
+        let bucket1 =
+            Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+                .unwrap();
 
-        let bucket2 = Bucket::from_entries(vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 200)),
-        ])
-        .unwrap();
+        let bucket2 =
+            Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 200))])
+                .unwrap();
 
-        let bucket3 = Bucket::from_entries(vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 300)),
-        ])
-        .unwrap();
+        let bucket3 =
+            Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 300))])
+                .unwrap();
 
         let buckets = vec![&bucket1, &bucket2, &bucket3];
         let merged = merge_multiple(&buckets, true, 0).unwrap();
@@ -938,7 +930,10 @@ mod tests {
 
         let merged = merge_buckets(&old_bucket, &new_bucket, true, 0).unwrap();
         assert_eq!(merged.len(), 1);
-        assert!(merged.entries()[0].is_live(), "DEAD + INIT should become LIVE");
+        assert!(
+            merged.entries()[0].is_live(),
+            "DEAD + INIT should become LIVE"
+        );
 
         let key = make_account_key([1u8; 32]);
         let entry = merged.get_entry(&key).unwrap().unwrap();
@@ -986,7 +981,10 @@ mod tests {
 
         // New entry wins and becomes LIVE (via catch-all)
         let entry = &merged.entries()[0];
-        assert!(entry.is_live(), "INIT + INIT should become LIVE (undefined case)");
+        assert!(
+            entry.is_live(),
+            "INIT + INIT should become LIVE (undefined case)"
+        );
 
         let key = make_account_key([1u8; 32]);
         let ledger_entry = merged.get_entry(&key).unwrap().unwrap();
@@ -999,17 +997,17 @@ mod tests {
     fn test_cap0020_complex_scenario() {
         // Complex scenario testing multiple CAP-0020 rules
         let old_entries = vec![
-            BucketEntry::Init(make_account_entry([1u8; 32], 100)),   // Will be deleted (annihilated)
-            BucketEntry::Dead(make_account_key([2u8; 32])),          // Will be recreated
-            BucketEntry::Init(make_account_entry([3u8; 32], 300)),   // Will be updated (preserve INIT)
-            BucketEntry::Live(make_account_entry([4u8; 32], 400)),   // Will be deleted
+            BucketEntry::Init(make_account_entry([1u8; 32], 100)), // Will be deleted (annihilated)
+            BucketEntry::Dead(make_account_key([2u8; 32])),        // Will be recreated
+            BucketEntry::Init(make_account_entry([3u8; 32], 300)), // Will be updated (preserve INIT)
+            BucketEntry::Live(make_account_entry([4u8; 32], 400)), // Will be deleted
         ];
 
         let new_entries = vec![
-            BucketEntry::Dead(make_account_key([1u8; 32])),          // Annihilates with old INIT
-            BucketEntry::Init(make_account_entry([2u8; 32], 200)),   // Recreates, becomes LIVE
-            BucketEntry::Live(make_account_entry([3u8; 32], 350)),   // Updates, preserves INIT
-            BucketEntry::Dead(make_account_key([4u8; 32])),          // Deletes LIVE
+            BucketEntry::Dead(make_account_key([1u8; 32])), // Annihilates with old INIT
+            BucketEntry::Init(make_account_entry([2u8; 32], 200)), // Recreates, becomes LIVE
+            BucketEntry::Live(make_account_entry([3u8; 32], 350)), // Updates, preserves INIT
+            BucketEntry::Dead(make_account_key([4u8; 32])), // Deletes LIVE
         ];
 
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
@@ -1019,7 +1017,10 @@ mod tests {
 
         // Entry 1: INIT + DEAD = nothing (annihilated)
         let key1 = make_account_key([1u8; 32]);
-        assert!(merged.get(&key1).unwrap().is_none(), "Entry 1 should be annihilated");
+        assert!(
+            merged.get(&key1).unwrap().is_none(),
+            "Entry 1 should be annihilated"
+        );
 
         // Entry 2: DEAD + INIT = LIVE
         let key2 = make_account_key([2u8; 32]);

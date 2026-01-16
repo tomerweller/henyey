@@ -60,23 +60,14 @@ mod quorum_intersection;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use stellar_xdr::curr::WriteXdr;
-use stellar_core_history::ReplayConfig;
 use stellar_core_bucket::StateArchivalSettings;
 use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
+use stellar_core_history::ReplayConfig;
+use stellar_xdr::curr::WriteXdr;
 
 use stellar_core_app::{
-    App,
-    AppConfig,
-    CatchupMode as CatchupModeInternal,
-    CatchupOptions,
-    LogConfig,
-    LogFormat,
-    RunMode,
-    RunOptions,
-    run_catchup,
-    run_node,
-    logging,
+    logging, run_catchup, run_node, App, AppConfig, CatchupMode as CatchupModeInternal,
+    CatchupOptions, LogConfig, LogFormat, RunMode, RunOptions,
 };
 
 /// Pure Rust implementation of Stellar Core
@@ -308,7 +299,10 @@ enum OfflineCommands {
         live_only: bool,
 
         /// CDP data lake URL (default: AWS public testnet)
-        #[arg(long, default_value = "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet")]
+        #[arg(
+            long,
+            default_value = "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet"
+        )]
         cdp_url: String,
 
         /// CDP date partition (default: 2025-12-18)
@@ -339,7 +333,10 @@ enum OfflineCommands {
         show_diff: bool,
 
         /// CDP data lake URL (default: AWS public testnet)
-        #[arg(long, default_value = "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet")]
+        #[arg(
+            long,
+            default_value = "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet"
+        )]
         cdp_url: String,
 
         /// CDP date partition (default: 2025-12-18)
@@ -506,8 +503,7 @@ fn init_logging(cli: &Cli) -> anyhow::Result<()> {
         "info"
     };
 
-    let config = LogConfig::default()
-        .with_level(level);
+    let config = LogConfig::default().with_level(level);
 
     let config = match cli.log_format {
         CliLogFormat::Text => config,
@@ -702,23 +698,23 @@ async fn cmd_verify_history(
     from: Option<u32>,
     to: Option<u32>,
 ) -> anyhow::Result<()> {
-    use stellar_core_history::{HistoryArchive, verify};
+    use stellar_core_history::{verify, HistoryArchive};
     use stellar_core_ledger::TransactionSetVariant;
 
     println!("Verifying history archives...");
     println!();
 
     // Create archive clients from config
-    let archives: Vec<HistoryArchive> = config.history.archives
+    let archives: Vec<HistoryArchive> = config
+        .history
+        .archives
         .iter()
         .filter(|a| a.get_enabled)
-        .filter_map(|a| {
-            match HistoryArchive::new(&a.url) {
-                Ok(archive) => Some(archive),
-                Err(e) => {
-                    println!("Warning: Failed to create archive {}: {}", a.url, e);
-                    None
-                }
+        .filter_map(|a| match HistoryArchive::new(&a.url) {
+            Ok(archive) => Some(archive),
+            Err(e) => {
+                println!("Warning: Failed to create archive {}: {}", a.url, e);
+                None
             }
         })
         .collect();
@@ -769,7 +765,10 @@ async fn cmd_verify_history(
                         }
                     }
                     Err(e) => {
-                        println!("  Checkpoint {}: FAIL (invalid structure) - {}", checkpoint, e);
+                        println!(
+                            "  Checkpoint {}: FAIL (invalid structure) - {}",
+                            checkpoint, e
+                        );
                         error_count += 1;
                     }
                 }
@@ -801,7 +800,8 @@ async fn cmd_verify_history(
                                             .collect::<std::collections::HashMap<_, _>>();
 
                                         for header in &headers {
-                                            let Some(tx_entry) = tx_map.get(&header.ledger_seq) else {
+                                            let Some(tx_entry) = tx_map.get(&header.ledger_seq)
+                                            else {
                                                 println!(
                                                     "    Missing transaction history entry for ledger {}",
                                                     header.ledger_seq
@@ -809,7 +809,9 @@ async fn cmd_verify_history(
                                                 error_count += 1;
                                                 continue;
                                             };
-                                            let Some(result_entry) = result_map.get(&header.ledger_seq) else {
+                                            let Some(result_entry) =
+                                                result_map.get(&header.ledger_seq)
+                                            else {
                                                 println!(
                                                     "    Missing transaction result entry for ledger {}",
                                                     header.ledger_seq
@@ -839,7 +841,9 @@ async fn cmd_verify_history(
                                                 .to_xdr(stellar_xdr::curr::Limits::none());
                                             match result_xdr {
                                                 Ok(bytes) => {
-                                                    if let Err(e) = verify::verify_tx_result_set(header, &bytes) {
+                                                    if let Err(e) =
+                                                        verify::verify_tx_result_set(header, &bytes)
+                                                    {
                                                         println!(
                                                             "    Tx result hash verification FAILED (ledger {}): {}",
                                                             header.ledger_seq, e
@@ -908,20 +912,22 @@ async fn cmd_verify_history(
 
 /// Publish history command handler.
 async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<()> {
+    use std::fs;
+    use std::path::PathBuf;
     use stellar_core_bucket::{BucketList, BucketManager};
+    use stellar_core_common::Hash256;
     use stellar_core_history::archive_state::HistoryArchiveState;
     use stellar_core_history::checkpoint::{checkpoint_containing, next_checkpoint};
     use stellar_core_history::paths::root_has_path;
-    use stellar_core_history::publish::{build_history_archive_state, PublishConfig, PublishManager};
+    use stellar_core_history::publish::{
+        build_history_archive_state, PublishConfig, PublishManager,
+    };
     use stellar_core_history::verify;
     use stellar_core_history::CHECKPOINT_FREQUENCY;
     use stellar_core_ledger::compute_header_hash;
     use stellar_core_ledger::TransactionSetVariant;
-    use stellar_core_common::Hash256;
-    use std::fs;
-    use std::path::PathBuf;
-    use url::Url;
     use stellar_xdr::curr::TransactionHistoryEntryExt;
+    use url::Url;
 
     if !config.node.is_validator {
         anyhow::bail!("Only validators can publish history");
@@ -939,7 +945,9 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
         .collect();
 
     if writable_archives.is_empty() {
-        anyhow::bail!("No writable history archives configured. Add 'put = true' to an archive config.");
+        anyhow::bail!(
+            "No writable history archives configured. Add 'put = true' to an archive config."
+        );
     }
 
     let mut local_targets = Vec::new();
@@ -971,7 +979,10 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
         anyhow::bail!("No publish archives configured (local paths or put commands required).");
     }
 
-    println!("Writable archives: {}", local_targets.len() + command_targets.len());
+    println!(
+        "Writable archives: {}",
+        local_targets.len() + command_targets.len()
+    );
     for (url, _) in &local_targets {
         println!("  - {}", url);
     }
@@ -984,14 +995,18 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     let db = stellar_core_db::Database::open(&config.database.path)?;
 
     // Get current ledger from database
-    let current_ledger = db.get_latest_ledger_seq()?
+    let current_ledger = db
+        .get_latest_ledger_seq()?
         .ok_or_else(|| anyhow::anyhow!("No ledger data in database. Run the node first."))?;
 
     println!("Current ledger in database: {}", current_ledger);
 
     // Calculate checkpoints to publish
-    let latest_checkpoint = stellar_core_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
-        .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger))?;
+    let latest_checkpoint =
+        stellar_core_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger)
+            })?;
 
     println!("Latest publishable checkpoint: {}", latest_checkpoint);
 
@@ -1054,8 +1069,12 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     }
 
     println!();
-    let first_checkpoint = *checkpoints_to_publish.first().expect("checked non-empty above");
-    let last_checkpoint = *checkpoints_to_publish.last().expect("checked non-empty above");
+    let first_checkpoint = *checkpoints_to_publish
+        .first()
+        .expect("checked non-empty above");
+    let last_checkpoint = *checkpoints_to_publish
+        .last()
+        .expect("checked non-empty above");
     println!(
         "Publishing checkpoints {} to {}...",
         first_checkpoint, last_checkpoint
@@ -1109,7 +1128,9 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
                 TransactionHistoryEntryExt::V1(generalized) => {
                     TransactionSetVariant::Generalized(generalized.clone())
                 }
-                TransactionHistoryEntryExt::V0 => TransactionSetVariant::Classic(tx_entry.tx_set.clone()),
+                TransactionHistoryEntryExt::V0 => {
+                    TransactionSetVariant::Classic(tx_entry.tx_set.clone())
+                }
             };
             let tx_set_hash = verify::compute_tx_set_hash(&tx_set).unwrap_or(Hash256::ZERO);
             let expected_tx_set = Hash256::from(header.scp_value.tx_set_hash.0);
@@ -1357,17 +1378,13 @@ fn write_scp_history_file(
 /// Extracts the quorum set hash from an SCP statement.
 ///
 /// Different SCP pledge types store the quorum set hash in different fields.
-fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> Option<stellar_xdr::curr::Hash> {
+fn scp_quorum_set_hash(
+    statement: &stellar_xdr::curr::ScpStatement,
+) -> Option<stellar_xdr::curr::Hash> {
     match &statement.pledges {
-        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => {
-            Some(nom.quorum_set_hash.clone())
-        }
-        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => {
-            Some(prep.quorum_set_hash.clone())
-        }
-        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => {
-            Some(conf.quorum_set_hash.clone())
-        }
+        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => Some(nom.quorum_set_hash.clone()),
+        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => Some(prep.quorum_set_hash.clone()),
+        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => Some(conf.quorum_set_hash.clone()),
         stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
             Some(ext.commit_quorum_set_hash.clone())
         }
@@ -1521,16 +1538,21 @@ async fn download_buckets_parallel(
     let download_count = to_download.len();
     let downloaded = AtomicU32::new(0);
 
-    println!("  {} cached, {} to download...", cached_count, download_count);
+    println!(
+        "  {} cached, {} to download...",
+        cached_count, download_count
+    );
 
     let results: Vec<anyhow::Result<()>> = stream::iter(to_download.into_iter())
         .map(|hash| {
             let downloaded = &downloaded;
             async move {
-                let bucket_data = archive.get_bucket(hash).await
-                    .map_err(|e| anyhow::anyhow!("Failed to download bucket {}: {}", hash.to_hex(), e))?;
-                bucket_manager.import_bucket(&bucket_data)
-                    .map_err(|e| anyhow::anyhow!("Failed to import bucket {}: {}", hash.to_hex(), e))?;
+                let bucket_data = archive.get_bucket(hash).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to download bucket {}: {}", hash.to_hex(), e)
+                })?;
+                bucket_manager.import_bucket(&bucket_data).map_err(|e| {
+                    anyhow::anyhow!("Failed to import bucket {}: {}", hash.to_hex(), e)
+                })?;
 
                 let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
                 if count % 5 == 0 || count == download_count as u32 {
@@ -1583,11 +1605,16 @@ async fn cmd_replay_bucket_list(
     cdp_url: &str,
     cdp_date: &str,
 ) -> anyhow::Result<()> {
-    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList, is_persistent_entry};
-    use stellar_core_common::{Hash256, NetworkId};
+    use stellar_core_bucket::{
+        is_persistent_entry, BucketList, BucketManager, HotArchiveBucketList,
+    };
     use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
-    use stellar_core_history::{HistoryArchive, checkpoint};
-    use stellar_core_history::cdp::{CdpDataLake, extract_transaction_processing, extract_evicted_keys, extract_upgrade_metas, extract_restored_keys};
+    use stellar_core_common::{Hash256, NetworkId};
+    use stellar_core_history::cdp::{
+        extract_evicted_keys, extract_restored_keys, extract_transaction_processing,
+        extract_upgrade_metas, CdpDataLake,
+    };
+    use stellar_core_history::{checkpoint, HistoryArchive};
     use stellar_core_ledger::{InMemorySorobanState, SorobanRentConfig};
     use stellar_xdr::curr::{
         ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting,
@@ -1600,8 +1627,9 @@ async fn cmd_replay_bucket_list(
             config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
         });
         if let Ok(Some(entry)) = bucket_list.get(&cpu_key) {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractCostParamsCpuInstructions(params)) =
-                entry.data
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+            ) = entry.data
             {
                 config.cpu_cost_params = params;
             }
@@ -1611,8 +1639,9 @@ async fn cmd_replay_bucket_list(
             config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
         });
         if let Ok(Some(entry)) = bucket_list.get(&mem_key) {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractCostParamsMemoryBytes(params)) =
-                entry.data
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+            ) = entry.data
             {
                 config.mem_cost_params = params;
             }
@@ -1650,7 +1679,9 @@ async fn cmd_replay_bucket_list(
     println!();
 
     // Create archive client
-    let archive = config.history.archives
+    let archive = config
+        .history
+        .archives
         .iter()
         .filter(|a| a.get_enabled)
         .find_map(|a| HistoryArchive::new(&a.url).ok())
@@ -1669,7 +1700,9 @@ async fn cmd_replay_bucket_list(
     });
     let start_ledger = from.unwrap_or_else(|| {
         let freq = stellar_core_history::CHECKPOINT_FREQUENCY;
-        checkpoint::checkpoint_containing(end_ledger).saturating_sub(16 * freq).max(freq)
+        checkpoint::checkpoint_containing(end_ledger)
+            .saturating_sub(16 * freq)
+            .max(freq)
     });
 
     // Determine network ID (used for tx hash matching when extracting processing info)
@@ -1682,8 +1715,9 @@ async fn cmd_replay_bucket_list(
     // For bucket list testing, we need to restore from the checkpoint BEFORE our start ledger
     // because the checkpoint at start_ledger already includes changes up to that checkpoint
     let freq = stellar_core_history::CHECKPOINT_FREQUENCY;
-    let init_checkpoint = checkpoint::latest_checkpoint_before_or_at(start_ledger.saturating_sub(1))
-        .unwrap_or(freq - 1); // If no previous checkpoint, start from 63
+    let init_checkpoint =
+        checkpoint::latest_checkpoint_before_or_at(start_ledger.saturating_sub(1))
+            .unwrap_or(freq - 1); // If no previous checkpoint, start from 63
 
     // Calculate checkpoint range that covers our ledger range (for header downloads)
     let end_checkpoint = checkpoint::checkpoint_containing(end_ledger);
@@ -1691,7 +1725,10 @@ async fn cmd_replay_bucket_list(
 
     println!("Ledger range: {} to {}", start_ledger, end_ledger);
     println!("Initial state: checkpoint {}", init_checkpoint);
-    println!("Checkpoint range: {} to {}", start_checkpoint, end_checkpoint);
+    println!(
+        "Checkpoint range: {} to {}",
+        start_checkpoint, end_checkpoint
+    );
     println!();
 
     // Create CDP client
@@ -1701,34 +1738,51 @@ async fn cmd_replay_bucket_list(
     let bucket_dir = tempfile::tempdir()?;
     let bucket_manager = BucketManager::new(bucket_dir.path().to_path_buf())?;
 
-    println!("Downloading initial state at checkpoint {}...", init_checkpoint);
+    println!(
+        "Downloading initial state at checkpoint {}...",
+        init_checkpoint
+    );
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
     // Download buckets
-    let bucket_hashes: Vec<Hash256> = init_has.current_buckets
+    let bucket_hashes: Vec<Hash256> = init_has
+        .current_buckets
         .iter()
-        .flat_map(|level| vec![
-            Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
-            Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-        ])
-        .collect();
-
-    let hot_archive_hashes: Option<Vec<Hash256>> = init_has.hot_archive_buckets.as_ref().map(|levels| {
-        levels.iter()
-            .flat_map(|level| vec![
+        .flat_map(|level| {
+            vec![
                 Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
                 Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-            ])
-            .collect()
-    });
+            ]
+        })
+        .collect();
 
-    let all_hashes: Vec<&Hash256> = bucket_hashes.iter()
-        .chain(hot_archive_hashes.as_ref().map(|v| v.iter()).unwrap_or_default())
+    let hot_archive_hashes: Option<Vec<Hash256>> =
+        init_has.hot_archive_buckets.as_ref().map(|levels| {
+            levels
+                .iter()
+                .flat_map(|level| {
+                    vec![
+                        Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+                        Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+                    ]
+                })
+                .collect()
+        });
+
+    let all_hashes: Vec<&Hash256> = bucket_hashes
+        .iter()
+        .chain(
+            hot_archive_hashes
+                .as_ref()
+                .map(|v| v.iter())
+                .unwrap_or_default(),
+        )
         .filter(|h| !h.is_zero())
         .collect();
 
     print!("Buckets ({} required):", all_hashes.len());
-    let (cached, downloaded) = download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+    let (cached, downloaded) =
+        download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
     if downloaded == 0 {
         println!(" {} cached", cached);
     }
@@ -1740,11 +1794,14 @@ async fn cmd_replay_bucket_list(
 
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
     // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
-    let mut hot_archive_bucket_list: Option<HotArchiveBucketList> = hot_archive_hashes.as_ref().map(|hashes| {
-        HotArchiveBucketList::restore_from_hashes(hashes, |hash| {
-            bucket_manager.load_hot_archive_bucket(hash)
+    let mut hot_archive_bucket_list: Option<HotArchiveBucketList> = hot_archive_hashes
+        .as_ref()
+        .map(|hashes| {
+            HotArchiveBucketList::restore_from_hashes(hashes, |hash| {
+                bucket_manager.load_hot_archive_bucket(hash)
+            })
         })
-    }).transpose()?;
+        .transpose()?;
 
     let init_cp_headers = archive.get_ledger_headers(init_checkpoint).await?;
     let init_header_entry = init_cp_headers
@@ -1776,23 +1833,24 @@ async fn cmd_replay_bucket_list(
         println!("Initial hot archive hash: {}", hot_hash.to_hex());
 
         // Compute combined hash for verification
-        let combined = stellar_core_crypto::sha256_multi(&[
-            initial_live_hash.as_bytes(),
-            hot_hash.as_bytes(),
-        ]);
+        let combined =
+            stellar_core_crypto::sha256_multi(&[initial_live_hash.as_bytes(), hot_hash.as_bytes()]);
         println!("Initial combined hash: {}", combined.to_hex());
     }
 
     // Verify initial hash against checkpoint header
     println!();
-    println!("Verifying initial state at checkpoint {}...", init_checkpoint);
-    if let Some(init_header) = init_cp_headers.iter().find(|h| h.header.ledger_seq == init_checkpoint) {
+    println!(
+        "Verifying initial state at checkpoint {}...",
+        init_checkpoint
+    );
+    if let Some(init_header) = init_cp_headers
+        .iter()
+        .find(|h| h.header.ledger_seq == init_checkpoint)
+    {
         let expected_hash = Hash256::from(init_header.header.bucket_list_hash.0);
         let our_hash = if let Some(ref hot_hash) = initial_hot_hash {
-            stellar_core_crypto::sha256_multi(&[
-                initial_live_hash.as_bytes(),
-                hot_hash.as_bytes(),
-            ])
+            stellar_core_crypto::sha256_multi(&[initial_live_hash.as_bytes(), hot_hash.as_bytes()])
         } else {
             initial_live_hash
         };
@@ -1985,7 +2043,11 @@ async fn cmd_replay_bucket_list(
 
                 // 5. Eviction changes (from CDP)
                 for key in &evicted_keys {
-                    apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Removed(key.clone()));
+                    apply_change_with_prestate(
+                        &mut aggregator,
+                        &bl,
+                        &LedgerEntryChange::Removed(key.clone()),
+                    );
                 }
 
                 let archival_override = {
@@ -2022,7 +2084,8 @@ async fn cmd_replay_bucket_list(
                     let settings = if let Some(override_settings) = archival_override.clone() {
                         StateArchivalSettings {
                             eviction_scan_size: override_settings.eviction_scan_size as u64,
-                            starting_eviction_scan_level: override_settings.starting_eviction_scan_level,
+                            starting_eviction_scan_level: override_settings
+                                .starting_eviction_scan_level,
                         }
                     } else {
                         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
@@ -2129,8 +2192,10 @@ async fn cmd_replay_bucket_list(
             // post-transaction state when entries were updated in this ledger.
             let mut archived_entries = Vec::new();
             if !live_only && hot_archive_bucket_list.is_some() {
-                let mut changed_entries: std::collections::HashMap<stellar_xdr::curr::LedgerKey, stellar_xdr::curr::LedgerEntry> =
-                    std::collections::HashMap::new();
+                let mut changed_entries: std::collections::HashMap<
+                    stellar_xdr::curr::LedgerKey,
+                    stellar_xdr::curr::LedgerEntry,
+                > = std::collections::HashMap::new();
                 for entry in all_init.iter().chain(all_live.iter()) {
                     if let Some(key) = stellar_core_bucket::ledger_entry_to_key(entry) {
                         changed_entries.insert(key, entry.clone());
@@ -2163,7 +2228,8 @@ async fn cmd_replay_bucket_list(
             }
 
             // Extract restored keys from transaction meta (entries restored from hot archive)
-            let tx_metas_for_restore: Vec<_> = tx_processing.iter().map(|tp| tp.meta.clone()).collect();
+            let tx_metas_for_restore: Vec<_> =
+                tx_processing.iter().map(|tp| tp.meta.clone()).collect();
             let restored_keys = if !live_only && hot_archive_bucket_list.is_some() {
                 extract_restored_keys(&tx_metas_for_restore)
             } else {
@@ -2174,8 +2240,12 @@ async fn cmd_replay_bucket_list(
             if let Some(ref mut hot_archive) = hot_archive_bucket_list {
                 // Log if there are any evictions or restorations
                 if !archived_entries.is_empty() || !restored_keys.is_empty() {
-                    println!("  Ledger {}: hot archive update - {} archived, {} restored",
-                        seq, archived_entries.len(), restored_keys.len());
+                    println!(
+                        "  Ledger {}: hot archive update - {} archived, {} restored",
+                        seq,
+                        archived_entries.len(),
+                        restored_keys.len()
+                    );
                 }
                 hot_archive.add_batch(
                     seq,
@@ -2199,7 +2269,7 @@ async fn cmd_replay_bucket_list(
             // If live_only, we just compare the live bucket list hash
             // Otherwise, we compute combined hash: SHA256(live || hot_archive)
             let our_live_hash = bucket_list.hash();
-            
+
             let our_hash = if live_only || hot_archive_bucket_list.is_none() {
                 our_live_hash
             } else {
@@ -2218,13 +2288,24 @@ async fn cmd_replay_bucket_list(
             if in_test_range {
                 if live_only {
                     // In live_only mode, we can only show our hash (no expected to compare)
-                    println!("  Ledger {}: live hash = {} ({} txs)",
-                        seq, &our_live_hash.to_hex()[..16], tx_processing.len());
-                } else if our_hash == expected_hash {
-                    let hot_hash = hot_archive_bucket_list.as_ref().map(|h| h.hash().to_hex()).unwrap_or_default();
-                    println!("  Ledger {}: OK ({} txs) [live={}, hot={}]", seq, tx_processing.len(),
+                    println!(
+                        "  Ledger {}: live hash = {} ({} txs)",
+                        seq,
                         &our_live_hash.to_hex()[..16],
-                        &hot_hash[..16.min(hot_hash.len())]);
+                        tx_processing.len()
+                    );
+                } else if our_hash == expected_hash {
+                    let hot_hash = hot_archive_bucket_list
+                        .as_ref()
+                        .map(|h| h.hash().to_hex())
+                        .unwrap_or_default();
+                    println!(
+                        "  Ledger {}: OK ({} txs) [live={}, hot={}]",
+                        seq,
+                        tx_processing.len(),
+                        &our_live_hash.to_hex()[..16],
+                        &hot_hash[..16.min(hot_hash.len())]
+                    );
                     // Debug: print bucket state for ledger 380087
                     if seq == 380087 {
                         println!("    Live bucket list full state at 380087:");
@@ -2268,7 +2349,10 @@ async fn cmd_replay_bucket_list(
     println!("  Mismatches: {}", mismatches);
 
     if mismatches > 0 {
-        anyhow::bail!("Test failed with {} bucket list hash mismatches", mismatches);
+        anyhow::bail!(
+            "Test failed with {} bucket list hash mismatches",
+            mismatches
+        );
     }
 
     Ok(())
@@ -2318,14 +2402,21 @@ async fn cmd_verify_execution(
     quiet: bool,
 ) -> anyhow::Result<()> {
     use std::sync::{Arc, RwLock};
-    use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList, is_persistent_entry, HasNextState};
+    use stellar_core_bucket::{
+        is_persistent_entry, BucketList, BucketManager, HasNextState, HotArchiveBucketList,
+    };
     use stellar_core_common::{Hash256, NetworkId};
-    use stellar_core_history::{HistoryArchive, checkpoint};
-    use stellar_core_history::cdp::{CachedCdpDataLake, extract_ledger_header, extract_upgrade_metas, extract_evicted_keys, extract_restored_keys};
-    use stellar_core_ledger::{LedgerSnapshot, SnapshotHandle, LedgerError, InMemorySorobanState, SorobanRentConfig};
-    use stellar_core_ledger::execution::{TransactionExecutor, load_soroban_config};
+    use stellar_core_history::cdp::{
+        extract_evicted_keys, extract_ledger_header, extract_restored_keys, extract_upgrade_metas,
+        CachedCdpDataLake,
+    };
+    use stellar_core_history::{checkpoint, HistoryArchive};
+    use stellar_core_ledger::execution::{load_soroban_config, TransactionExecutor};
+    use stellar_core_ledger::{
+        InMemorySorobanState, LedgerError, LedgerSnapshot, SnapshotHandle, SorobanRentConfig,
+    };
     use stellar_core_tx::ClassicEventConfig;
-    use stellar_xdr::curr::{LedgerKey, LedgerEntry, BucketListType};
+    use stellar_xdr::curr::{BucketListType, LedgerEntry, LedgerKey};
 
     if !quiet {
         println!("Transaction Execution Verification");
@@ -2345,13 +2436,13 @@ async fn cmd_verify_execution(
     let cache_base = if no_cache {
         None
     } else {
-        cache_dir.or_else(|| {
-            dirs::cache_dir().map(|p| p.join("rs-stellar-core"))
-        })
+        cache_dir.or_else(|| dirs::cache_dir().map(|p| p.join("rs-stellar-core")))
     };
 
     // Create archive client
-    let archive = config.history.archives
+    let archive = config
+        .history
+        .archives
         .iter()
         .filter(|a| a.get_enabled)
         .find_map(|a| HistoryArchive::new(&a.url).ok())
@@ -2377,13 +2468,16 @@ async fn cmd_verify_execution(
     });
     let start_ledger = from.unwrap_or_else(|| {
         let freq = stellar_core_history::CHECKPOINT_FREQUENCY;
-        checkpoint::checkpoint_containing(end_ledger).saturating_sub(4 * freq).max(freq)
+        checkpoint::checkpoint_containing(end_ledger)
+            .saturating_sub(4 * freq)
+            .max(freq)
     });
 
     // For execution, we need to restore from the checkpoint BEFORE our start ledger
     let freq = stellar_core_history::CHECKPOINT_FREQUENCY;
-    let init_checkpoint = checkpoint::latest_checkpoint_before_or_at(start_ledger.saturating_sub(1))
-        .unwrap_or(freq - 1);
+    let init_checkpoint =
+        checkpoint::latest_checkpoint_before_or_at(start_ledger.saturating_sub(1))
+            .unwrap_or(freq - 1);
 
     // Calculate checkpoint range needed for headers
     let end_checkpoint = checkpoint::checkpoint_containing(end_ledger);
@@ -2409,7 +2503,11 @@ async fn cmd_verify_execution(
     let total = (prefetch_end - prefetch_start + 1) as usize;
     if cached < total {
         if !quiet {
-            println!("Prefetching CDP metadata: {} cached, {} to download", cached, total - cached);
+            println!(
+                "Prefetching CDP metadata: {} cached, {} to download",
+                cached,
+                total - cached
+            );
         }
         cdp.prefetch(prefetch_start, prefetch_end).await;
         if !quiet {
@@ -2437,47 +2535,66 @@ async fn cmd_verify_execution(
     let bucket_manager = Arc::new(BucketManager::new(bucket_path.clone())?);
 
     if !quiet {
-        println!("Downloading initial state at checkpoint {}...", init_checkpoint);
+        println!(
+            "Downloading initial state at checkpoint {}...",
+            init_checkpoint
+        );
     }
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
     // Extract bucket hashes and FutureBucket states for live bucket list
-    let bucket_hashes: Vec<(Hash256, Hash256)> = init_has.current_buckets
+    let bucket_hashes: Vec<(Hash256, Hash256)> = init_has
+        .current_buckets
         .iter()
-        .map(|level| (
-            Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
-            Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-        ))
+        .map(|level| {
+            (
+                Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+                Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+            )
+        })
         .collect();
 
-    let live_next_states: Vec<HasNextState> = init_has.current_buckets
+    let live_next_states: Vec<HasNextState> = init_has
+        .current_buckets
         .iter()
         .map(|level| HasNextState {
             state: level.next.state,
-            output: level.next.output.as_ref()
+            output: level
+                .next
+                .output
+                .as_ref()
                 .and_then(|h| Hash256::from_hex(h).ok()),
         })
         .collect();
 
     // Extract bucket hashes and FutureBucket states for hot archive (protocol 23+)
-    let hot_archive_hashes: Option<Vec<(Hash256, Hash256)>> = init_has.hot_archive_buckets.as_ref().map(|levels| {
-        levels.iter()
-            .map(|level| (
-                Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
-                Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-            ))
-            .collect()
-    });
+    let hot_archive_hashes: Option<Vec<(Hash256, Hash256)>> =
+        init_has.hot_archive_buckets.as_ref().map(|levels| {
+            levels
+                .iter()
+                .map(|level| {
+                    (
+                        Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+                        Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+                    )
+                })
+                .collect()
+        });
 
-    let hot_archive_next_states: Option<Vec<HasNextState>> = init_has.hot_archive_buckets.as_ref().map(|levels| {
-        levels.iter()
-            .map(|level| HasNextState {
-                state: level.next.state,
-                output: level.next.output.as_ref()
-                    .and_then(|h| Hash256::from_hex(h).ok()),
-            })
-            .collect()
-    });
+    let hot_archive_next_states: Option<Vec<HasNextState>> =
+        init_has.hot_archive_buckets.as_ref().map(|levels| {
+            levels
+                .iter()
+                .map(|level| HasNextState {
+                    state: level.next.state,
+                    output: level
+                        .next
+                        .output
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                })
+                .collect()
+        });
 
     // Collect all hashes to download (curr, snap, and completed merge outputs)
     let mut all_hashes: Vec<Hash256> = Vec::new();
@@ -2508,30 +2625,34 @@ async fn cmd_verify_execution(
     if !quiet {
         print!("Buckets ({} required):", all_hashes.len());
     }
-    let (cached, downloaded) = download_buckets_parallel(&archive, bucket_manager.as_ref(), all_hashes).await?;
+    let (cached, downloaded) =
+        download_buckets_parallel(&archive, bucket_manager.as_ref(), all_hashes).await?;
     if !quiet && downloaded == 0 {
         println!(" {} cached", cached);
     }
 
     // Restore live bucket list for state lookups (with FutureBucket states for pending merges)
-    let bucket_list = Arc::new(RwLock::new(
-        BucketList::restore_from_has(&bucket_hashes, &live_next_states, |hash| {
-            bucket_manager.load_bucket(hash).map(|b| (*b).clone())
-        })?
-    ));
+    let bucket_list = Arc::new(RwLock::new(BucketList::restore_from_has(
+        &bucket_hashes,
+        &live_next_states,
+        |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
+    )?));
 
     // Restore hot archive bucket list if present (protocol 23+)
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
     // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
-    let hot_archive_bucket_list: Option<Arc<RwLock<HotArchiveBucketList>>> = if let (Some(ref hashes), Some(ref next_states)) = (&hot_archive_hashes, &hot_archive_next_states) {
-        Some(Arc::new(RwLock::new(
-            HotArchiveBucketList::restore_from_has(hashes, next_states, |hash| {
-                bucket_manager.load_hot_archive_bucket(hash)
-            })?
-        )))
-    } else {
-        None
-    };
+    let hot_archive_bucket_list: Option<Arc<RwLock<HotArchiveBucketList>>> =
+        if let (Some(ref hashes), Some(ref next_states)) =
+            (&hot_archive_hashes, &hot_archive_next_states)
+        {
+            Some(Arc::new(RwLock::new(
+                HotArchiveBucketList::restore_from_has(hashes, next_states, |hash| {
+                    bucket_manager.load_hot_archive_bucket(hash)
+                })?,
+            )))
+        } else {
+            None
+        };
 
     let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
     let init_header_entry = init_headers
@@ -2544,24 +2665,41 @@ async fn cmd_verify_execution(
     // Restart any pending merges that should have been in progress at the checkpoint.
     // This is critical for correct bucket list hash computation after catchup.
     // In C++ stellar-core, this is done by BucketListBase::restartMerges().
-    bucket_list.write().unwrap().restart_merges(init_checkpoint, init_protocol_version)?;
+    bucket_list
+        .write()
+        .unwrap()
+        .restart_merges(init_checkpoint, init_protocol_version)?;
     if let Some(ref hot) = hot_archive_bucket_list {
-        hot.write().unwrap().restart_merges(init_checkpoint, init_protocol_version)?;
+        hot.write()
+            .unwrap()
+            .restart_merges(init_checkpoint, init_protocol_version)?;
     }
 
     if !quiet {
-        println!("Initial live bucket list hash: {}", bucket_list.read().unwrap().hash().to_hex());
-        println!("Live bucket list stats: {:?}", bucket_list.read().unwrap().stats());
+        println!(
+            "Initial live bucket list hash: {}",
+            bucket_list.read().unwrap().hash().to_hex()
+        );
+        println!(
+            "Live bucket list stats: {:?}",
+            bucket_list.read().unwrap().stats()
+        );
         if let Some(ref hot) = hot_archive_bucket_list {
-            println!("Initial hot archive hash: {}", hot.read().unwrap().hash().to_hex());
+            println!(
+                "Initial hot archive hash: {}",
+                hot.read().unwrap().hash().to_hex()
+            );
             println!("Hot archive stats: {:?}", hot.read().unwrap().stats());
         }
         println!();
     }
     let init_rent_config = if let Some(init_header_entry) = init_header_entry {
         let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
-        let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> = hot_archive_bucket_list.clone();
-        let lookup_fn: Arc<dyn Fn(&LedgerKey) -> stellar_core_ledger::Result<Option<LedgerEntry>> + Send + Sync> =
+        let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> =
+            hot_archive_bucket_list.clone();
+        let lookup_fn: Arc<
+            dyn Fn(&LedgerKey) -> stellar_core_ledger::Result<Option<LedgerEntry>> + Send + Sync,
+        > =
             Arc::new(move |key: &LedgerKey| {
                 if let Some(entry) = bucket_list_clone.read().unwrap().get(key).map_err(|e| {
                     LedgerError::Internal(format!("Live bucket lookup failed: {}", e))
@@ -2636,23 +2774,17 @@ async fn cmd_verify_execution(
     //
     // For the first ledger we process (init_checkpoint + 1), we need the id_pool
     // from init_checkpoint's header.
-    let init_id_pool = init_header_entry
-        .map(|h| h.header.id_pool)
-        .unwrap_or(0);
+    let init_id_pool = init_header_entry.map(|h| h.header.id_pool).unwrap_or(0);
     let mut prev_id_pool: Option<u64> = Some(init_id_pool);
 
     // Track header fields for verification
-    let mut tracked_fee_pool: i64 = init_header_entry
-        .map(|h| h.header.fee_pool)
-        .unwrap_or(0);
-    let mut tracked_total_coins: i64 = init_header_entry
-        .map(|h| h.header.total_coins)
-        .unwrap_or(0);
+    let mut tracked_fee_pool: i64 = init_header_entry.map(|h| h.header.fee_pool).unwrap_or(0);
+    let mut tracked_total_coins: i64 = init_header_entry.map(|h| h.header.total_coins).unwrap_or(0);
     let mut prev_header_hash: Hash256 = init_header_entry
         .map(|h| Hash256::from(h.hash.0))
         .unwrap_or(Hash256::ZERO);
-    let mut prev_header: Option<stellar_xdr::curr::LedgerHeader> = init_header_entry
-        .map(|h| h.header.clone());
+    let mut prev_header: Option<stellar_xdr::curr::LedgerHeader> =
+        init_header_entry.map(|h| h.header.clone());
 
     // Track header verification mismatches
     let mut header_mismatches: u32 = 0;
@@ -2716,45 +2848,64 @@ async fn cmd_verify_execution(
             );
 
             // Check both close time AND previous ledger hash - either can indicate epoch mismatch
-            let prev_hash_matches = header.previous_ledger_hash.0 == cdp_header.previous_ledger_hash.0;
+            let prev_hash_matches =
+                header.previous_ledger_hash.0 == cdp_header.previous_ledger_hash.0;
             if archive_close_time != cdp_close_time || !prev_hash_matches {
                 if in_test_range {
-                    println!("  Ledger {}: EPOCH MISMATCH - archive close_time={} vs CDP close_time={}",
-                        seq, archive_close_time, cdp_close_time);
+                    println!(
+                        "  Ledger {}: EPOCH MISMATCH - archive close_time={} vs CDP close_time={}",
+                        seq, archive_close_time, cdp_close_time
+                    );
                     println!("    This indicates CDP data is from a different network epoch (e.g., testnet was reset)");
-                    println!("    Archive previous_ledger_hash: {}", hex::encode(header.previous_ledger_hash.0));
-                    println!("    CDP previous_ledger_hash: {}", hex::encode(cdp_header.previous_ledger_hash.0));
+                    println!(
+                        "    Archive previous_ledger_hash: {}",
+                        hex::encode(header.previous_ledger_hash.0)
+                    );
+                    println!(
+                        "    CDP previous_ledger_hash: {}",
+                        hex::encode(cdp_header.previous_ledger_hash.0)
+                    );
                 }
                 if stop_on_error {
-                    anyhow::bail!("CDP data is from a different network epoch than the history archive. \
+                    anyhow::bail!(
+                        "CDP data is from a different network epoch than the history archive. \
                         The network (likely testnet) was reset after the CDP date {}. \
-                        Use a more recent CDP date partition or switch to mainnet.", cdp_date);
+                        Use a more recent CDP date partition or switch to mainnet.",
+                        cdp_date
+                    );
                 }
                 continue;
             }
 
             // Create snapshot handle with bucket list lookup (checks both live and hot archive)
             let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
-            let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> = hot_archive_bucket_list.clone();
-            let lookup_fn: Arc<dyn Fn(&LedgerKey) -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> + Send + Sync> =
-                Arc::new(move |key: &LedgerKey| {
-                    // First try the live bucket list
-                    if let Some(entry) = bucket_list_clone.read().unwrap().get(key).map_err(|e| {
-                        LedgerError::Internal(format!("Live bucket lookup failed: {}", e))
+            let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> =
+                hot_archive_bucket_list.clone();
+            let lookup_fn: Arc<
+                dyn Fn(
+                        &LedgerKey,
+                    )
+                        -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>>
+                    + Send
+                    + Sync,
+            > = Arc::new(move |key: &LedgerKey| {
+                // First try the live bucket list
+                if let Some(entry) = bucket_list_clone.read().unwrap().get(key).map_err(|e| {
+                    LedgerError::Internal(format!("Live bucket lookup failed: {}", e))
+                })? {
+                    return Ok(Some(entry));
+                }
+                // Then try the hot archive bucket list (for archived/evicted entries)
+                // HotArchiveBucketList::get returns Option<&LedgerEntry>, so we clone
+                if let Some(ref hot_archive) = hot_archive_clone {
+                    if let Some(entry) = hot_archive.read().unwrap().get(key).map_err(|e| {
+                        LedgerError::Internal(format!("Hot archive bucket lookup failed: {}", e))
                     })? {
-                        return Ok(Some(entry));
+                        return Ok(Some(entry.clone()));
                     }
-                    // Then try the hot archive bucket list (for archived/evicted entries)
-                    // HotArchiveBucketList::get returns Option<&LedgerEntry>, so we clone
-                    if let Some(ref hot_archive) = hot_archive_clone {
-                        if let Some(entry) = hot_archive.read().unwrap().get(key).map_err(|e| {
-                            LedgerError::Internal(format!("Hot archive bucket lookup failed: {}", e))
-                        })? {
-                            return Ok(Some(entry.clone()));
-                        }
-                    }
-                    Ok(None)
-                });
+                }
+                Ok(None)
+            });
 
             let snapshot = LedgerSnapshot::new(
                 header.clone(),
@@ -2762,10 +2913,11 @@ async fn cmd_verify_execution(
                 std::collections::HashMap::new(),
             );
             let mut snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
-            let header_map: std::collections::HashMap<u32, stellar_xdr::curr::LedgerHeader> = headers
-                .iter()
-                .map(|entry| (entry.header.ledger_seq, entry.header.clone()))
-                .collect();
+            let header_map: std::collections::HashMap<u32, stellar_xdr::curr::LedgerHeader> =
+                headers
+                    .iter()
+                    .map(|entry| (entry.header.ledger_seq, entry.header.clone()))
+                    .collect();
             let header_map = std::sync::Arc::new(header_map);
             let header_lookup: std::sync::Arc<
                 dyn Fn(u32) -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerHeader>>
@@ -2776,12 +2928,19 @@ async fn cmd_verify_execution(
 
             // Add entries_fn to enable orderbook loading for path payments
             let bucket_list_for_entries: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
-            let entries_fn: Arc<dyn Fn() -> stellar_core_ledger::Result<Vec<stellar_xdr::curr::LedgerEntry>> + Send + Sync> =
-                Arc::new(move || {
-                    bucket_list_for_entries.read().unwrap().live_entries().map_err(|e| {
+            let entries_fn: Arc<
+                dyn Fn() -> stellar_core_ledger::Result<Vec<stellar_xdr::curr::LedgerEntry>>
+                    + Send
+                    + Sync,
+            > = Arc::new(move || {
+                bucket_list_for_entries
+                    .read()
+                    .unwrap()
+                    .live_entries()
+                    .map_err(|e| {
                         LedgerError::Internal(format!("Failed to get live entries: {}", e))
                     })
-                });
+            });
             snapshot_handle.set_entries_lookup(entries_fn);
 
             // Load Soroban config from ledger state
@@ -2838,30 +2997,44 @@ async fn cmd_verify_execution(
             // This is needed because when multiple transactions access the same entry,
             // C++ produces STATE (ledger-start) / UPDATED (current) pairs for each tx,
             // even if that specific tx didn't change the TTL.
-            let mut ledger_start_ttls: std::collections::HashMap<stellar_xdr::curr::Hash, stellar_xdr::curr::LedgerEntry> = std::collections::HashMap::new();
+            let mut ledger_start_ttls: std::collections::HashMap<
+                stellar_xdr::curr::Hash,
+                stellar_xdr::curr::LedgerEntry,
+            > = std::collections::HashMap::new();
             for tx_info in tx_processing.iter() {
                 let frame = stellar_core_tx::TransactionFrame::with_network(
                     tx_info.envelope.clone(),
                     stellar_core_common::NetworkId(config.network_id()),
                 );
                 if let Some(soroban_data) = frame.soroban_data() {
-                    for key in soroban_data.resources.footprint.read_only.iter()
+                    for key in soroban_data
+                        .resources
+                        .footprint
+                        .read_only
+                        .iter()
                         .chain(soroban_data.resources.footprint.read_write.iter())
                     {
                         // Compute key_hash for TTL lookup
                         match key {
-                            stellar_xdr::curr::LedgerKey::ContractData(_) | stellar_xdr::curr::LedgerKey::ContractCode(_) => {
-                                use stellar_xdr::curr::{WriteXdr, Limits};
+                            stellar_xdr::curr::LedgerKey::ContractData(_)
+                            | stellar_xdr::curr::LedgerKey::ContractCode(_) => {
+                                use stellar_xdr::curr::{Limits, WriteXdr};
                                 if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
                                     let hash_bytes = stellar_core_crypto::sha256(&key_bytes);
                                     let key_hash = stellar_xdr::curr::Hash(*hash_bytes.as_bytes());
                                     if !ledger_start_ttls.contains_key(&key_hash) {
                                         // Look up TTL from snapshot (ledger-start value)
                                         let ttl_key = stellar_xdr::curr::LedgerKey::Ttl(
-                                            stellar_xdr::curr::LedgerKeyTtl { key_hash: key_hash.clone() }
+                                            stellar_xdr::curr::LedgerKeyTtl {
+                                                key_hash: key_hash.clone(),
+                                            },
                                         );
-                                        if let Ok(Some(entry)) = snapshot_handle.get_entry(&ttl_key) {
-                                            if matches!(&entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
+                                        if let Ok(Some(entry)) = snapshot_handle.get_entry(&ttl_key)
+                                        {
+                                            if matches!(
+                                                &entry.data,
+                                                stellar_xdr::curr::LedgerEntryData::Ttl(_)
+                                            ) {
                                                 ledger_start_ttls.insert(key_hash, entry);
                                             }
                                         }
@@ -2889,13 +3062,15 @@ async fn cmd_verify_execution(
                     tx_info.envelope.clone(),
                     stellar_core_common::NetworkId(config.network_id()),
                 );
-                let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
-                let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
+                let fee_source_id =
+                    stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+                let inner_source_id =
+                    stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
                 let pre_fee_state = if frame.is_fee_bump() && fee_source_id != inner_source_id {
                     let fee_source_key = stellar_xdr::curr::LedgerKey::Account(
                         stellar_xdr::curr::LedgerKeyAccount {
                             account_id: fee_source_id.clone(),
-                        }
+                        },
                     );
                     executor.get_entry(&fee_source_key)
                 } else {
@@ -2917,12 +3092,17 @@ async fn cmd_verify_execution(
                     };
                     let cdp_fee_changes: Vec<_> = tx_info.fee_meta.iter().cloned().collect();
 
-                    let (fee_matches, fee_diffs) = compare_entry_changes(&our_fee_changes, &cdp_fee_changes);
+                    let (fee_matches, fee_diffs) =
+                        compare_entry_changes(&our_fee_changes, &cdp_fee_changes);
                     if !fee_matches {
                         phase1_mismatches += 1;
                         if show_diff {
                             println!("    TX {} Phase 1 FEE MISMATCH:", tx_idx);
-                            println!("      Our fee changes: {}, CDP fee changes: {}", our_fee_changes.len(), cdp_fee_changes.len());
+                            println!(
+                                "      Our fee changes: {}, CDP fee changes: {}",
+                                our_fee_changes.len(),
+                                cdp_fee_changes.len()
+                            );
                             for diff in fee_diffs.iter().take(5) {
                                 println!("      - {}", diff);
                             }
@@ -2944,7 +3124,8 @@ async fn cmd_verify_execution(
             // these refunds are applied after all transactions in the ledger.
 
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
-            let mut deferred_post_fee_changes: Vec<stellar_xdr::curr::LedgerEntryChanges> = Vec::new();
+            let mut deferred_post_fee_changes: Vec<stellar_xdr::curr::LedgerEntryChanges> =
+                Vec::new();
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
                 let prng_seed = {
@@ -3039,10 +3220,16 @@ async fn cmd_verify_execution(
                             // For fee bump transactions with separate fee source, fee changes are
                             // already in the CDP meta, so we don't need to prepend them
                             let (meta_matches, meta_diffs) = match &result.tx_meta {
-                                Some(our_meta) => {
-                                    compare_transaction_meta(our_meta, &tx_info.meta, None, show_diff)
-                                }
-                                None => (false, vec!["We produced no meta but CDP has some".to_string()]),
+                                Some(our_meta) => compare_transaction_meta(
+                                    our_meta,
+                                    &tx_info.meta,
+                                    None,
+                                    show_diff,
+                                ),
+                                None => (
+                                    false,
+                                    vec!["We produced no meta but CDP has some".to_string()],
+                                ),
                             };
 
                             // Check that success status matches
@@ -3051,11 +3238,13 @@ async fn cmd_verify_execution(
                             if success_matches && (!result.success || meta_matches) {
                                 transactions_matched += 1;
                                 if show_diff && !quiet {
-                                    let change_count = result.tx_meta
+                                    let change_count = result
+                                        .tx_meta
                                         .as_ref()
                                         .map(|m| extract_changes_from_meta(m).len())
                                         .unwrap_or(0);
-                                    println!("    TX {}: {} (ops: {}, changes: {})",
+                                    println!(
+                                        "    TX {}: {} (ops: {}, changes: {})",
                                         tx_idx,
                                         if result.success { "OK" } else { "FAILED" },
                                         result.operation_results.len(),
@@ -3067,7 +3256,8 @@ async fn cmd_verify_execution(
                                 ledger_matched = false;
                                 ledger_tx_mismatch = true;
                                 let cdp_result_code = format!("{:?}", tx_info.result.result.result);
-                                println!("    TX {}: MISMATCH - our: {} vs CDP: {} (cdp_succeeded: {})",
+                                println!(
+                                    "    TX {}: MISMATCH - our: {} vs CDP: {} (cdp_succeeded: {})",
                                     tx_idx,
                                     if result.success { "success" } else { "failed" },
                                     cdp_result_code,
@@ -3105,7 +3295,10 @@ async fn cmd_verify_execution(
             {
                 use stellar_core_bucket::ledger_entry_to_key;
                 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
-                use stellar_xdr::curr::{ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerEntryExt, LedgerEntryChange};
+                use stellar_xdr::curr::{
+                    ConfigSettingEntry, ConfigSettingId, LedgerEntryChange, LedgerEntryData,
+                    LedgerEntryExt,
+                };
 
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = bucket_list.read().unwrap();
@@ -3122,15 +3315,21 @@ async fn cmd_verify_execution(
                         stellar_xdr::curr::TransactionMeta::V0(operations) => {
                             if succeeded {
                                 for op_meta in operations.iter() {
-                                    for change in op_meta.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                                    for change in op_meta.changes.iter() {
+                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                    }
                                 }
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V1(v1) => {
                             if succeeded {
-                                for change in v1.tx_changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                                for change in v1.tx_changes.iter() {
+                                    apply_change_with_prestate(&mut aggregator, &bl, change);
+                                }
                                 for op_changes in v1.operations.iter() {
-                                    for change in op_changes.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                                    for change in op_changes.changes.iter() {
+                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                    }
                                 }
                             }
                         }
@@ -3140,7 +3339,9 @@ async fn cmd_verify_execution(
                             }
                             if succeeded {
                                 for op_changes in v2.operations.iter() {
-                                    for change in op_changes.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                                    for change in op_changes.changes.iter() {
+                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                    }
                                 }
                             }
                             for change in v2.tx_changes_after.iter() {
@@ -3153,7 +3354,9 @@ async fn cmd_verify_execution(
                             }
                             if succeeded {
                                 for op_changes in v3.operations.iter() {
-                                    for change in op_changes.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                                    for change in op_changes.changes.iter() {
+                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                    }
                                 }
                             }
                             for change in v3.tx_changes_after.iter() {
@@ -3166,7 +3369,9 @@ async fn cmd_verify_execution(
                             }
                             if succeeded {
                                 for op_changes in v4.operations.iter() {
-                                    for change in op_changes.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                                    for change in op_changes.changes.iter() {
+                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                    }
                                 }
                             }
                             for change in v4.tx_changes_after.iter() {
@@ -3201,7 +3406,11 @@ async fn cmd_verify_execution(
                 // 5. Evicted keys (Protocol 23+)
                 let evicted_keys = extract_evicted_keys(&lcm);
                 for key in &evicted_keys {
-                    apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Removed(key.clone()));
+                    apply_change_with_prestate(
+                        &mut aggregator,
+                        &bl,
+                        &LedgerEntryChange::Removed(key.clone()),
+                    );
                 }
 
                 // Extract restored keys from transaction meta
@@ -3218,9 +3427,10 @@ async fn cmd_verify_execution(
 
                 // Convert to vectors
                 let archival_override = {
-                    let archival_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                        config_setting_id: ConfigSettingId::StateArchival,
-                    });
+                    let archival_key =
+                        LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                            config_setting_id: ConfigSettingId::StateArchival,
+                        });
                     match aggregator.changes.get(&archival_key) {
                         Some(FinalChange::Init(entry)) | Some(FinalChange::Live(entry)) => {
                             if let LedgerEntryData::ConfigSetting(
@@ -3236,23 +3446,29 @@ async fn cmd_verify_execution(
                     }
                 };
 
-                let eviction_iter_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                    config_setting_id: ConfigSettingId::EvictionIterator,
-                });
+                let eviction_iter_key =
+                    LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                        config_setting_id: ConfigSettingId::EvictionIterator,
+                    });
                 let has_eviction_iter_change = aggregator.changes.contains_key(&eviction_iter_key);
 
                 if cdp_header.ledger_version >= 23 && !has_eviction_iter_change {
                     let settings = if let Some(override_settings) = archival_override.clone() {
                         StateArchivalSettings {
                             eviction_scan_size: override_settings.eviction_scan_size as u64,
-                            starting_eviction_scan_level: override_settings.starting_eviction_scan_level,
+                            starting_eviction_scan_level: override_settings
+                                .starting_eviction_scan_level,
                         }
                     } else {
-                        let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                            config_setting_id: ConfigSettingId::StateArchival,
-                        });
+                        let key =
+                            LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                                config_setting_id: ConfigSettingId::StateArchival,
+                            });
                         if let Ok(Some(entry)) = bl.get(&key) {
-                            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(s)) = entry.data {
+                            if let LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::StateArchival(s),
+                            ) = entry.data
+                            {
                                 StateArchivalSettings {
                                     eviction_scan_size: s.eviction_scan_size as u64,
                                     starting_eviction_scan_level: s.starting_eviction_scan_level,
@@ -3265,11 +3481,15 @@ async fn cmd_verify_execution(
                         }
                     };
                     let iter = {
-                        let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                            config_setting_id: ConfigSettingId::EvictionIterator,
-                        });
+                        let key =
+                            LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                                config_setting_id: ConfigSettingId::EvictionIterator,
+                            });
                         if let Ok(Some(entry)) = bl.get(&key) {
-                            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(it)) = entry.data {
+                            if let LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::EvictionIterator(it),
+                            ) = entry.data
+                            {
                                 EvictionIterator {
                                     bucket_file_offset: it.bucket_file_offset,
                                     bucket_list_level: it.bucket_list_level,
@@ -3283,7 +3503,9 @@ async fn cmd_verify_execution(
                         }
                     };
 
-                    let scan_result = bl.scan_for_eviction_incremental(iter, seq, &settings).unwrap();
+                    let scan_result = bl
+                        .scan_for_eviction_incremental(iter, seq, &settings)
+                        .unwrap();
                     let updated_iter = scan_result.end_iterator;
 
                     let iter_entry = LedgerEntry {
@@ -3293,16 +3515,21 @@ async fn cmd_verify_execution(
                                 bucket_file_offset: updated_iter.bucket_file_offset,
                                 bucket_list_level: updated_iter.bucket_list_level,
                                 is_curr_bucket: updated_iter.is_curr_bucket,
-                            }
+                            },
                         )),
                         ext: LedgerEntryExt::V0,
                     };
-                    apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Updated(iter_entry));
+                    apply_change_with_prestate(
+                        &mut aggregator,
+                        &bl,
+                        &LedgerEntryChange::Updated(iter_entry),
+                    );
                 }
 
-                let window_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                    config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
-                });
+                let window_key =
+                    LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                        config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+                    });
                 let has_window_change = aggregator.changes.contains_key(&window_key);
 
                 if !has_window_change {
@@ -3337,8 +3564,10 @@ async fn cmd_verify_execution(
                 // post-transaction state when entries were updated in this ledger.
                 let mut archived_entries = Vec::new();
                 if hot_archive_bucket_list.is_some() {
-                    let mut changed_entries: std::collections::HashMap<stellar_xdr::curr::LedgerKey, stellar_xdr::curr::LedgerEntry> =
-                        std::collections::HashMap::new();
+                    let mut changed_entries: std::collections::HashMap<
+                        stellar_xdr::curr::LedgerKey,
+                        stellar_xdr::curr::LedgerEntry,
+                    > = std::collections::HashMap::new();
                     for entry in all_init.iter().chain(all_live.iter()) {
                         if let Some(key) = ledger_entry_to_key(entry) {
                             changed_entries.insert(key, entry.clone());
@@ -3402,7 +3631,8 @@ async fn cmd_verify_execution(
                 let our_live_hash = bl.hash();
                 drop(bl);
 
-                let our_hot_hash = hot_archive_bucket_list.as_ref()
+                let our_hot_hash = hot_archive_bucket_list
+                    .as_ref()
                     .map(|hot| hot.read().unwrap().hash());
 
                 let our_bucket_list_hash = {
@@ -3428,7 +3658,8 @@ async fn cmd_verify_execution(
                 let bucket_list_matches = our_bucket_list_hash == expected_bucket_list_hash;
 
                 // 2. Compute fee pool: previous fee_pool + fees charged this ledger
-                let fees_this_ledger: i64 = tx_processing.iter()
+                let fees_this_ledger: i64 = tx_processing
+                    .iter()
                     .map(|tp| tp.result.result.fee_charged)
                     .sum();
                 let our_fee_pool = tracked_fee_pool + fees_this_ledger;
@@ -3437,7 +3668,8 @@ async fn cmd_verify_execution(
 
                 // 3. Compute tx_set_result_hash from results
                 let result_set = stellar_xdr::curr::TransactionResultSet {
-                    results: tx_processing.iter()
+                    results: tx_processing
+                        .iter()
                         .map(|tp| tp.result.clone())
                         .collect::<Vec<_>>()
                         .try_into()
@@ -3453,7 +3685,7 @@ async fn cmd_verify_execution(
                 let expected_header_hash = Hash256::from(header_entry.hash.0);
 
                 if let Some(ref prev_hdr) = prev_header {
-                    use stellar_core_ledger::{create_next_header, compute_header_hash};
+                    use stellar_core_ledger::{compute_header_hash, create_next_header};
 
                     // Create the header as the live node would
                     let mut computed_header = create_next_header(
@@ -3484,24 +3716,35 @@ async fn cmd_verify_execution(
                 }
 
                 // Report mismatches
-                let all_header_fields_match = bucket_list_matches && fee_pool_matches && tx_result_hash_matches && header_hash_matches;
+                let all_header_fields_match = bucket_list_matches
+                    && fee_pool_matches
+                    && tx_result_hash_matches
+                    && header_hash_matches;
                 if !all_header_fields_match {
                     header_mismatches += 1;
                     ledger_header_mismatch = true;
                     println!("  Ledger {}: HEADER MISMATCH", seq);
                     if !bucket_list_matches {
-                        println!("    bucket_list_hash: ours={} expected={}",
-                            our_bucket_list_hash.to_hex(), expected_bucket_list_hash.to_hex());
+                        println!(
+                            "    bucket_list_hash: ours={} expected={}",
+                            our_bucket_list_hash.to_hex(),
+                            expected_bucket_list_hash.to_hex()
+                        );
                         println!("    live_hash:        {}", our_live_hash.to_hex());
                         if let Some(hot_hash) = our_hot_hash {
                             println!("    hot_archive_hash: {}", hot_hash.to_hex());
                         }
                         // Print which levels should have spilled at this ledger
                         let spilling_levels: Vec<usize> = (0..10)
-                            .filter(|&lvl| stellar_core_bucket::BucketList::level_should_spill(seq, lvl))
+                            .filter(|&lvl| {
+                                stellar_core_bucket::BucketList::level_should_spill(seq, lvl)
+                            })
                             .collect();
                         if !spilling_levels.is_empty() {
-                            println!("    Levels that spilled at ledger {}: {:?}", seq, spilling_levels);
+                            println!(
+                                "    Levels that spilled at ledger {}: {:?}",
+                                seq, spilling_levels
+                            );
                         }
                         // Print level-by-level hashes for debugging
                         let bl = bucket_list.read().unwrap();
@@ -3518,22 +3761,35 @@ async fn cmd_verify_execution(
                                     let result = hasher.finalize();
                                     hex::encode(&result[..8])
                                 };
-                                println!("      L{}: curr={}... snap={}... (level_hash={}...)",
-                                    i, &curr_hash.to_hex()[..16], &snap_hash.to_hex()[..16], level_hash);
+                                println!(
+                                    "      L{}: curr={}... snap={}... (level_hash={}...)",
+                                    i,
+                                    &curr_hash.to_hex()[..16],
+                                    &snap_hash.to_hex()[..16],
+                                    level_hash
+                                );
                             }
                         }
                     }
                     if !fee_pool_matches {
-                        println!("    fee_pool: ours={} expected={} (prev={} + fees={})",
-                            our_fee_pool, expected_fee_pool, tracked_fee_pool, fees_this_ledger);
+                        println!(
+                            "    fee_pool: ours={} expected={} (prev={} + fees={})",
+                            our_fee_pool, expected_fee_pool, tracked_fee_pool, fees_this_ledger
+                        );
                     }
                     if !tx_result_hash_matches {
-                        println!("    tx_result_hash: ours={} expected={}",
-                            our_tx_result_hash.to_hex(), expected_tx_result_hash.to_hex());
+                        println!(
+                            "    tx_result_hash: ours={} expected={}",
+                            our_tx_result_hash.to_hex(),
+                            expected_tx_result_hash.to_hex()
+                        );
                     }
                     if !header_hash_matches {
-                        println!("    header_hash: ours={} expected={}",
-                            our_header_hash.to_hex(), expected_header_hash.to_hex());
+                        println!(
+                            "    header_hash: ours={} expected={}",
+                            our_header_hash.to_hex(),
+                            expected_header_hash.to_hex()
+                        );
                     }
                     if stop_on_error {
                         anyhow::bail!("Header mismatch at ledger {}", seq);
@@ -3554,14 +3810,24 @@ async fn cmd_verify_execution(
             if in_test_range {
                 if ledger_matched || tx_processing.is_empty() {
                     if !quiet {
-                        println!("  Ledger {}: {} transactions - {}",
-                            seq, tx_processing.len(),
-                            if tx_processing.is_empty() { "no txs" } else { "all matched" }
+                        println!(
+                            "  Ledger {}: {} transactions - {}",
+                            seq,
+                            tx_processing.len(),
+                            if tx_processing.is_empty() {
+                                "no txs"
+                            } else {
+                                "all matched"
+                            }
                         );
                     }
                 } else {
                     // Always print mismatches, even in quiet mode
-                    println!("  Ledger {}: {} transactions - SOME MISMATCHES", seq, tx_processing.len());
+                    println!(
+                        "  Ledger {}: {} transactions - SOME MISMATCHES",
+                        seq,
+                        tx_processing.len()
+                    );
                     if stop_on_error {
                         anyhow::bail!("Stopping on first error");
                     }
@@ -3586,35 +3852,66 @@ async fn cmd_verify_execution(
     println!("Transaction Execution Verification Complete");
     println!("  Ledgers verified: {}", ledgers_verified);
     println!("  Transactions verified: {}", transactions_verified);
-    println!("  Phase 1 fee calculations matched: {}", transactions_verified - phase1_fee_mismatches);
-    println!("  Phase 1 fee calculations mismatched: {}", phase1_fee_mismatches);
+    println!(
+        "  Phase 1 fee calculations matched: {}",
+        transactions_verified - phase1_fee_mismatches
+    );
+    println!(
+        "  Phase 1 fee calculations mismatched: {}",
+        phase1_fee_mismatches
+    );
     println!("  Phase 2 execution matched: {}", transactions_matched);
-    println!("  Phase 2 execution mismatched: {}", transactions_mismatched);
-    println!("  Ledgers with tx mismatches: {}", ledgers_with_tx_mismatches);
-    println!("  Ledgers with header mismatches: {}", ledgers_with_header_mismatches);
-    println!("  Ledgers with tx+header mismatches: {}", ledgers_with_both_mismatches);
-    let bucketlist_only = ledgers_with_header_mismatches.saturating_sub(ledgers_with_both_mismatches);
+    println!(
+        "  Phase 2 execution mismatched: {}",
+        transactions_mismatched
+    );
+    println!(
+        "  Ledgers with tx mismatches: {}",
+        ledgers_with_tx_mismatches
+    );
+    println!(
+        "  Ledgers with header mismatches: {}",
+        ledgers_with_header_mismatches
+    );
+    println!(
+        "  Ledgers with tx+header mismatches: {}",
+        ledgers_with_both_mismatches
+    );
+    let bucketlist_only =
+        ledgers_with_header_mismatches.saturating_sub(ledgers_with_both_mismatches);
     let tx_only = ledgers_with_tx_mismatches.saturating_sub(ledgers_with_both_mismatches);
     println!(
         "  Ledger mismatch breakdown: bucketlist-only={}, tx-only={}, both={}",
         bucketlist_only, tx_only, ledgers_with_both_mismatches
     );
-    println!("  Header verifications: {} passed, {} failed",
-        ledgers_verified.saturating_sub(header_mismatches), header_mismatches);
+    println!(
+        "  Header verifications: {} passed, {} failed",
+        ledgers_verified.saturating_sub(header_mismatches),
+        header_mismatches
+    );
 
     if phase1_fee_mismatches > 0 {
         println!();
-        println!("WARNING: {} transactions had Phase 1 fee calculation differences!", phase1_fee_mismatches);
+        println!(
+            "WARNING: {} transactions had Phase 1 fee calculation differences!",
+            phase1_fee_mismatches
+        );
     }
 
     if transactions_mismatched > 0 {
         println!();
-        println!("WARNING: {} transactions had Phase 2 execution differences!", transactions_mismatched);
+        println!(
+            "WARNING: {} transactions had Phase 2 execution differences!",
+            transactions_mismatched
+        );
     }
 
     if header_mismatches > 0 {
         println!();
-        println!("WARNING: {} ledgers had header hash mismatches!", header_mismatches);
+        println!(
+            "WARNING: {} ledgers had header hash mismatches!",
+            header_mismatches
+        );
         println!("This indicates divergence in bucket list state, fee pool calculation, or header computation.");
     }
 
@@ -3638,19 +3935,21 @@ async fn cmd_debug_bucket_entry(
     account_hex: &str,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
-    use stellar_xdr::curr::{AccountId, PublicKey, Uint256, LedgerKey, LedgerKeyAccount, LedgerEntryData};
-    use stellar_core_bucket::{BucketList, BucketManager, BucketEntry};
+    use stellar_core_bucket::{BucketEntry, BucketList, BucketManager};
     use stellar_core_common::Hash256;
-    use stellar_core_history::{HistoryArchive, is_checkpoint_ledger};
+    use stellar_core_history::{is_checkpoint_ledger, HistoryArchive};
+    use stellar_xdr::curr::{
+        AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, PublicKey, Uint256,
+    };
 
     // Parse account hex to AccountId
     let account_bytes = hex::decode(account_hex)?;
     if account_bytes.len() != 32 {
         anyhow::bail!("Account hex must be 32 bytes (64 hex chars)");
     }
-    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(
-        Uint256(account_bytes.try_into().unwrap())
-    ));
+    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        account_bytes.try_into().unwrap(),
+    )));
     let account_key = LedgerKey::Account(LedgerKeyAccount {
         account_id: account_id.clone(),
     });
@@ -3667,7 +3966,9 @@ async fn cmd_debug_bucket_entry(
     }
 
     // Create archive client from config
-    let archive = config.history.archives
+    let archive = config
+        .history
+        .archives
         .iter()
         .filter(|a| a.get_enabled)
         .find_map(|a| HistoryArchive::new(&a.url).ok())
@@ -3677,12 +3978,15 @@ async fn cmd_debug_bucket_entry(
 
     // Get bucket list hashes at this checkpoint
     let has_entry = archive.get_checkpoint_has(checkpoint_seq).await?;
-    let bucket_hashes: Vec<Hash256> = has_entry.current_buckets
+    let bucket_hashes: Vec<Hash256> = has_entry
+        .current_buckets
         .iter()
-        .flat_map(|level| vec![
-            Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
-            Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-        ])
+        .flat_map(|level| {
+            vec![
+                Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
+                Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
+            ]
+        })
         .collect();
 
     println!("Loading bucket list...");
@@ -3692,12 +3996,14 @@ async fn cmd_debug_bucket_entry(
     let bucket_manager = Arc::new(BucketManager::new(bucket_dir.path().to_path_buf())?);
 
     // Download all required buckets
-    let all_hashes: Vec<&Hash256> = bucket_hashes.iter()
+    let all_hashes: Vec<&Hash256> = bucket_hashes
+        .iter()
         .filter(|h: &&Hash256| !h.is_zero())
         .collect();
 
     print!("Buckets ({} required):", all_hashes.len());
-    let (cached, downloaded) = download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+    let (cached, downloaded) =
+        download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
     if downloaded == 0 {
         println!(" {} cached", cached);
     }
@@ -3743,8 +4049,7 @@ async fn cmd_debug_bucket_entry(
         for (level, bucket_type, entry) in &occurrences {
             println!("  Level {} {}: ", level, bucket_type);
             match entry {
-                BucketEntry::Live(e) |
-                BucketEntry::Init(e) => {
+                BucketEntry::Live(e) | BucketEntry::Init(e) => {
                     if let LedgerEntryData::Account(acc) = &e.data {
                         println!("    Type: Live/Init");
                         println!("    Balance: {}", acc.balance);
@@ -3776,7 +4081,10 @@ fn tx_succeeded(result: &stellar_xdr::curr::TransactionResultPair) -> bool {
     match &result.result.result {
         TransactionResultResult::TxSuccess(_) => true,
         TransactionResultResult::TxFeeBumpInnerSuccess(inner) => {
-            matches!(inner.result.result, InnerTransactionResultResult::TxSuccess(_))
+            matches!(
+                inner.result.result,
+                InnerTransactionResultResult::TxSuccess(_)
+            )
         }
         _ => false,
     }
@@ -3794,8 +4102,8 @@ fn tx_succeeded(result: &stellar_xdr::curr::TransactionResultPair) -> bool {
 /// This enables consistent sorting since C++ stellar-core uses UnorderedMap with
 /// a random hash mixer, producing non-deterministic ordering across runs.
 fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (Vec<u8>, u8, [u8; 32]) {
-    use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, WriteXdr, Limits};
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, Limits, WriteXdr};
 
     fn entry_to_key_xdr(entry: &stellar_xdr::curr::LedgerEntry) -> Vec<u8> {
         // Extract the key from the entry and serialize it
@@ -3903,7 +4211,7 @@ fn compare_entry_changes(
     our_changes: &[stellar_xdr::curr::LedgerEntryChange],
     cdp_changes: &[stellar_xdr::curr::LedgerEntryChange],
 ) -> (bool, Vec<String>) {
-    use stellar_xdr::curr::{WriteXdr, Limits};
+    use stellar_xdr::curr::{Limits, WriteXdr};
 
     let mut diffs = Vec::new();
 
@@ -3940,12 +4248,20 @@ fn compare_entry_changes(
     // Report any extra changes on either side
     if our_sorted.len() > cdp_sorted.len() {
         for (i, change) in our_sorted.iter().skip(cdp_sorted.len()).enumerate() {
-            diffs.push(format!("Extra our change {}: {}", cdp_sorted.len() + i, describe_change(change)));
+            diffs.push(format!(
+                "Extra our change {}: {}",
+                cdp_sorted.len() + i,
+                describe_change(change)
+            ));
         }
     }
     if cdp_sorted.len() > our_sorted.len() {
         for (i, change) in cdp_sorted.iter().skip(our_sorted.len()).enumerate() {
-            diffs.push(format!("Extra CDP change {}: {}", our_sorted.len() + i, describe_change(change)));
+            diffs.push(format!(
+                "Extra CDP change {}: {}",
+                our_sorted.len() + i,
+                describe_change(change)
+            ));
         }
     }
 
@@ -3960,29 +4276,47 @@ fn compare_entry_changes(
 fn augment_soroban_ttl_metadata(
     meta: &mut stellar_xdr::curr::TransactionMeta,
     footprint: &stellar_xdr::curr::LedgerFootprint,
-    ledger_start_ttls: &std::collections::HashMap<stellar_xdr::curr::Hash, stellar_xdr::curr::LedgerEntry>,
+    ledger_start_ttls: &std::collections::HashMap<
+        stellar_xdr::curr::Hash,
+        stellar_xdr::curr::LedgerEntry,
+    >,
     executor: &stellar_core_ledger::execution::TransactionExecutor,
     ledger_seq: u32,
 ) {
-    use stellar_xdr::curr::{LedgerEntry, LedgerEntryChange, LedgerEntryData, LedgerKey, Limits, WriteXdr};
+    use stellar_xdr::curr::{
+        LedgerEntry, LedgerEntryChange, LedgerEntryData, LedgerKey, Limits, WriteXdr,
+    };
 
     // Get the operation changes from metadata - we need to convert to Vec to extend
     let (existing_changes, rebuild_meta) = match meta {
         stellar_xdr::curr::TransactionMeta::V3(v3) => {
-            if v3.operations.is_empty() { return; }
-            (v3.operations[0].changes.iter().cloned().collect::<Vec<_>>(), true)
+            if v3.operations.is_empty() {
+                return;
+            }
+            (
+                v3.operations[0].changes.iter().cloned().collect::<Vec<_>>(),
+                true,
+            )
         }
         stellar_xdr::curr::TransactionMeta::V4(v4) => {
-            if v4.operations.is_empty() { return; }
-            (v4.operations[0].changes.iter().cloned().collect::<Vec<_>>(), true)
+            if v4.operations.is_empty() {
+                return;
+            }
+            (
+                v4.operations[0].changes.iter().cloned().collect::<Vec<_>>(),
+                true,
+            )
         }
         _ => return,
     };
 
-    if !rebuild_meta { return; }
+    if !rebuild_meta {
+        return;
+    }
 
     // Collect existing TTL key_hashes from our metadata
-    let mut existing_ttl_hashes: std::collections::HashSet<stellar_xdr::curr::Hash> = std::collections::HashSet::new();
+    let mut existing_ttl_hashes: std::collections::HashSet<stellar_xdr::curr::Hash> =
+        std::collections::HashSet::new();
     for change in existing_changes.iter() {
         match change {
             LedgerEntryChange::State(entry)
@@ -3999,7 +4333,11 @@ fn augment_soroban_ttl_metadata(
 
     // For each entry in the footprint, check if we need to add TTL STATE/UPDATED
     let mut additional_changes: Vec<LedgerEntryChange> = Vec::new();
-    for key in footprint.read_only.iter().chain(footprint.read_write.iter()) {
+    for key in footprint
+        .read_only
+        .iter()
+        .chain(footprint.read_write.iter())
+    {
         match key {
             LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
                 if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
@@ -4064,7 +4402,8 @@ fn augment_soroban_ttl_metadata(
             stellar_xdr::curr::TransactionMeta::V3(v3) => {
                 if !v3.operations.is_empty() {
                     // Clone the operations and update the first one's changes
-                    let mut ops: Vec<stellar_xdr::curr::OperationMeta> = v3.operations.iter().cloned().collect();
+                    let mut ops: Vec<stellar_xdr::curr::OperationMeta> =
+                        v3.operations.iter().cloned().collect();
                     ops[0].changes = new_changes;
                     if let Ok(new_ops) = ops.try_into() {
                         v3.operations = new_ops;
@@ -4074,7 +4413,8 @@ fn augment_soroban_ttl_metadata(
             stellar_xdr::curr::TransactionMeta::V4(v4) => {
                 if !v4.operations.is_empty() {
                     // Clone the operations and update the first one's changes
-                    let mut ops: Vec<stellar_xdr::curr::OperationMetaV2> = v4.operations.iter().cloned().collect();
+                    let mut ops: Vec<stellar_xdr::curr::OperationMetaV2> =
+                        v4.operations.iter().cloned().collect();
                     ops[0].changes = new_changes;
                     if let Ok(new_ops) = ops.try_into() {
                         v4.operations = new_ops;
@@ -4131,9 +4471,7 @@ fn compare_transaction_meta(
     ) -> HashMap<[u8; 32], (usize, Vec<u8>)> {
         let mut multiset = HashMap::new();
         for change in changes {
-            let xdr = change
-                .to_xdr(Limits::none())
-                .unwrap_or_default();
+            let xdr = change.to_xdr(Limits::none()).unwrap_or_default();
             let mut hasher = Sha256::new();
             hasher.update(&xdr);
             let hash: [u8; 32] = hasher.finalize().into();
@@ -4160,21 +4498,25 @@ fn compare_transaction_meta(
                         "Change count differs: ours={} vs expected={} for change: {}",
                         our_count,
                         cdp_count,
-                        describe_change(&stellar_xdr::curr::LedgerEntryChange::from_xdr(
-                            our_xdr,
-                            Limits::none()
-                        )
-                        .unwrap_or(stellar_xdr::curr::LedgerEntryChange::Removed(
-                            stellar_xdr::curr::LedgerKey::Account(
-                                stellar_xdr::curr::LedgerKeyAccount {
-                                    account_id: stellar_xdr::curr::AccountId(
-                                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                                            stellar_xdr::curr::Uint256([0u8; 32])
-                                        )
-                                    ),
-                                }
+                        describe_change(
+                            &stellar_xdr::curr::LedgerEntryChange::from_xdr(
+                                our_xdr,
+                                Limits::none()
                             )
-                        )))
+                            .unwrap_or(
+                                stellar_xdr::curr::LedgerEntryChange::Removed(
+                                    stellar_xdr::curr::LedgerKey::Account(
+                                        stellar_xdr::curr::LedgerKeyAccount {
+                                            account_id: stellar_xdr::curr::AccountId(
+                                                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                                                    stellar_xdr::curr::Uint256([0u8; 32])
+                                                )
+                                            ),
+                                        }
+                                    )
+                                )
+                            )
+                        )
                     ));
                 } else {
                     diffs.push("Count mismatch".to_string());
@@ -4186,21 +4528,25 @@ fn compare_transaction_meta(
                     diffs.push(format!(
                         "Extra change in ours (count={}): {}",
                         our_count,
-                        describe_change(&stellar_xdr::curr::LedgerEntryChange::from_xdr(
-                            our_xdr,
-                            Limits::none()
-                        )
-                        .unwrap_or(stellar_xdr::curr::LedgerEntryChange::Removed(
-                            stellar_xdr::curr::LedgerKey::Account(
-                                stellar_xdr::curr::LedgerKeyAccount {
-                                    account_id: stellar_xdr::curr::AccountId(
-                                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                                            stellar_xdr::curr::Uint256([0u8; 32])
-                                        )
-                                    ),
-                                }
+                        describe_change(
+                            &stellar_xdr::curr::LedgerEntryChange::from_xdr(
+                                our_xdr,
+                                Limits::none()
                             )
-                        )))
+                            .unwrap_or(
+                                stellar_xdr::curr::LedgerEntryChange::Removed(
+                                    stellar_xdr::curr::LedgerKey::Account(
+                                        stellar_xdr::curr::LedgerKeyAccount {
+                                            account_id: stellar_xdr::curr::AccountId(
+                                                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                                                    stellar_xdr::curr::Uint256([0u8; 32])
+                                                )
+                                            ),
+                                        }
+                                    )
+                                )
+                            )
+                        )
                     ));
                 } else {
                     diffs.push("Extra change in ours".to_string());
@@ -4216,21 +4562,20 @@ fn compare_transaction_meta(
                 diffs.push(format!(
                     "Missing change from CDP (count={}): {}",
                     cdp_count,
-                    describe_change(&stellar_xdr::curr::LedgerEntryChange::from_xdr(
-                        cdp_xdr,
-                        Limits::none()
+                    describe_change(
+                        &stellar_xdr::curr::LedgerEntryChange::from_xdr(cdp_xdr, Limits::none())
+                            .unwrap_or(stellar_xdr::curr::LedgerEntryChange::Removed(
+                                stellar_xdr::curr::LedgerKey::Account(
+                                    stellar_xdr::curr::LedgerKeyAccount {
+                                        account_id: stellar_xdr::curr::AccountId(
+                                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                                                stellar_xdr::curr::Uint256([0u8; 32])
+                                            )
+                                        ),
+                                    }
+                                )
+                            ))
                     )
-                    .unwrap_or(stellar_xdr::curr::LedgerEntryChange::Removed(
-                        stellar_xdr::curr::LedgerKey::Account(
-                            stellar_xdr::curr::LedgerKeyAccount {
-                                account_id: stellar_xdr::curr::AccountId(
-                                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                                        stellar_xdr::curr::Uint256([0u8; 32])
-                                    )
-                                ),
-                            }
-                        )
-                    )))
                 ));
             } else {
                 diffs.push("Missing change from CDP".to_string());
@@ -4259,7 +4604,9 @@ fn describe_change(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
             }
             LedgerEntryData::Trustline(t) => format!("Trustline({:?})", t.asset),
             LedgerEntryData::Offer(o) => format!("Offer({})", o.offer_id),
-            LedgerEntryData::Data(d) => format!("Data({})", String::from_utf8_lossy(&d.data_name.0)),
+            LedgerEntryData::Data(d) => {
+                format!("Data({})", String::from_utf8_lossy(&d.data_name.0))
+            }
             LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance".to_string(),
             LedgerEntryData::LiquidityPool(_) => "LiquidityPool".to_string(),
             LedgerEntryData::ContractData(_) => "ContractData".to_string(),
@@ -4324,9 +4671,7 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                     match key {
                         stellar_xdr::curr::SignerKey::Ed25519(pk) => hex::encode(&pk.0[0..4]),
                         stellar_xdr::curr::SignerKey::HashX(hash) => hex::encode(&hash.0[0..4]),
-                        stellar_xdr::curr::SignerKey::PreAuthTx(hash) => {
-                            hex::encode(&hash.0[0..4])
-                        }
+                        stellar_xdr::curr::SignerKey::PreAuthTx(hash) => hex::encode(&hash.0[0..4]),
                         stellar_xdr::curr::SignerKey::Ed25519SignedPayload(payload) => {
                             hex::encode(&payload.ed25519.0[0..4])
                         }
@@ -4355,14 +4700,11 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                         hex::encode(&pk.0[0..4])
                     }
                 };
-                let inflation_dest = a
-                    .inflation_dest
-                    .as_ref()
-                    .map(|id| match &id.0 {
-                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
-                            hex::encode(&pk.0[0..4])
-                        }
-                    });
+                let inflation_dest = a.inflation_dest.as_ref().map(|id| match &id.0 {
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                        hex::encode(&pk.0[0..4])
+                    }
+                });
                 let inflation_info = inflation_dest
                     .as_ref()
                     .map(|id| format!(" infdest={}...", id))
@@ -4375,10 +4717,7 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                 };
                 let thresholds = format!(
                     "{}-{}-{}-{}",
-                    a.thresholds.0[0],
-                    a.thresholds.0[1],
-                    a.thresholds.0[2],
-                    a.thresholds.0[3]
+                    a.thresholds.0[0], a.thresholds.0[1], a.thresholds.0[2], a.thresholds.0[3]
                 );
                 format!(
                     "Account({}...) bal={} seq={} lm={} ns={} nsp={} sub={} flags=0x{:x} thresh={}{}{} aext={} v1ext={} ssid={} {}{}",
@@ -4422,16 +4761,12 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                         format!("{}:{}...", code, issuer_hex)
                     }
                     stellar_xdr::curr::TrustLineAsset::PoolShare(pool_id) => {
-                        format!("PoolShare({}...)", hex::encode(&pool_id.0.0[0..4]))
+                        format!("PoolShare({}...)", hex::encode(&pool_id.0 .0[0..4]))
                     }
                 };
                 format!(
                     "Trustline({}) bal={} lim={} lm={}{}",
-                    asset_info,
-                    t.balance,
-                    t.limit,
-                    entry.last_modified_ledger_seq,
-                    entry_suffix
+                    asset_info, t.balance, t.limit, entry.last_modified_ledger_seq, entry_suffix
                 )
             }
             LedgerEntryData::Offer(o) => {
@@ -4461,16 +4796,13 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
             LedgerEntryData::ContractData(cd) => {
                 let contract_hex = match &cd.contract {
                     stellar_xdr::curr::ScAddress::Contract(contract_id) => {
-                        hex::encode(&contract_id.0.0[0..4])
+                        hex::encode(&contract_id.0 .0[0..4])
                     }
                     _ => "other".to_string(),
                 };
                 format!(
                     "ContractData({}...) dur={:?} lm={}{}",
-                    contract_hex,
-                    cd.durability,
-                    entry.last_modified_ledger_seq,
-                    entry_suffix
+                    contract_hex, cd.durability, entry.last_modified_ledger_seq, entry_suffix
                 )
             }
             LedgerEntryData::ContractCode(cc) => {
@@ -4551,7 +4883,9 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
         LedgerEntryChange::Updated(entry) => format!("UPDATED {}", describe_entry_detailed(entry)),
         LedgerEntryChange::Removed(_) => describe_change(change),
         LedgerEntryChange::State(entry) => format!("STATE {}", describe_entry_detailed(entry)),
-        LedgerEntryChange::Restored(entry) => format!("RESTORED {}", describe_entry_detailed(entry)),
+        LedgerEntryChange::Restored(entry) => {
+            format!("RESTORED {}", describe_entry_detailed(entry))
+        }
     }
 }
 
@@ -4842,18 +5176,10 @@ fn maybe_snapshot_soroban_state_size_window(
 /// Offline commands handler.
 async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<()> {
     match cmd {
-        OfflineCommands::ConvertKey { key } => {
-            convert_key(&key)
-        }
-        OfflineCommands::DecodeXdr { r#type, value } => {
-            decode_xdr(&r#type, &value)
-        }
-        OfflineCommands::EncodeXdr { r#type, value } => {
-            encode_xdr(&r#type, &value)
-        }
-        OfflineCommands::BucketInfo { path } => {
-            bucket_info(&path)
-        }
+        OfflineCommands::ConvertKey { key } => convert_key(&key),
+        OfflineCommands::DecodeXdr { r#type, value } => decode_xdr(&r#type, &value),
+        OfflineCommands::EncodeXdr { r#type, value } => encode_xdr(&r#type, &value),
+        OfflineCommands::BucketInfo { path } => bucket_info(&path),
         OfflineCommands::ReplayBucketList {
             from,
             to,
@@ -4862,7 +5188,16 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
             cdp_url,
             cdp_date,
         } => {
-            cmd_replay_bucket_list(config, from, to, stop_on_error, live_only, &cdp_url, &cdp_date).await
+            cmd_replay_bucket_list(
+                config,
+                from,
+                to,
+                stop_on_error,
+                live_only,
+                &cdp_url,
+                &cdp_date,
+            )
+            .await
         }
         OfflineCommands::VerifyExecution {
             from,
@@ -4875,31 +5210,46 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
             no_cache,
             quiet,
         } => {
-            cmd_verify_execution(config, from, to, stop_on_error, show_diff, &cdp_url, &cdp_date, cache_dir, no_cache, quiet).await
+            cmd_verify_execution(
+                config,
+                from,
+                to,
+                stop_on_error,
+                show_diff,
+                &cdp_url,
+                &cdp_date,
+                cache_dir,
+                no_cache,
+                quiet,
+            )
+            .await
         }
         OfflineCommands::DebugBucketEntry {
             checkpoint,
             account,
-        } => {
-            cmd_debug_bucket_entry(config, checkpoint, &account).await
-        }
-        OfflineCommands::SignTransaction { netid, input, base64 } => {
-            sign_transaction(&netid, &input, base64)
-        }
-        OfflineCommands::SecToPub => {
-            sec_to_pub()
-        }
+        } => cmd_debug_bucket_entry(config, checkpoint, &account).await,
+        OfflineCommands::SignTransaction {
+            netid,
+            input,
+            base64,
+        } => sign_transaction(&netid, &input, base64),
+        OfflineCommands::SecToPub => sec_to_pub(),
         OfflineCommands::DumpLedger {
             output,
             entry_type,
             limit,
             last_modified_ledger_count,
         } => {
-            cmd_dump_ledger(config, output, entry_type, limit, last_modified_ledger_count).await
+            cmd_dump_ledger(
+                config,
+                output,
+                entry_type,
+                limit,
+                last_modified_ledger_count,
+            )
+            .await
         }
-        OfflineCommands::SelfCheck => {
-            cmd_self_check(config).await
-        }
+        OfflineCommands::SelfCheck => cmd_self_check(config).await,
         OfflineCommands::VerifyCheckpoints { output, from, to } => {
             cmd_verify_checkpoints(config, output, from, to).await
         }
@@ -4919,10 +5269,9 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
 /// - 64 hex chars - 32-byte hex -> displays all possible interpretations
 fn convert_key(key: &str) -> anyhow::Result<()> {
     use stellar_core_crypto::{
-        decode_pre_auth_tx, decode_sha256_hash, decode_muxed_account,
-        decode_contract, decode_signed_payload,
-        encode_account_id, encode_pre_auth_tx, encode_sha256_hash,
-        encode_muxed_account, encode_contract,
+        decode_contract, decode_muxed_account, decode_pre_auth_tx, decode_sha256_hash,
+        decode_signed_payload, encode_account_id, encode_contract, encode_muxed_account,
+        encode_pre_auth_tx, encode_sha256_hash,
     };
 
     let key = key.trim();
@@ -5036,7 +5385,7 @@ fn convert_key(key: &str) -> anyhow::Result<()> {
 ///
 /// Supports: LedgerHeader, TransactionEnvelope, TransactionResult
 fn decode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
-    use base64::{Engine, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::ReadXdr;
 
     let bytes = STANDARD.decode(value)?;
@@ -5044,15 +5393,24 @@ fn decode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
     // This is a simplified version - a full implementation would handle all XDR types
     match type_name.to_lowercase().as_str() {
         "ledgerheader" => {
-            let header = stellar_xdr::curr::LedgerHeader::from_xdr(&bytes, stellar_xdr::curr::Limits::none())?;
+            let header = stellar_xdr::curr::LedgerHeader::from_xdr(
+                &bytes,
+                stellar_xdr::curr::Limits::none(),
+            )?;
             println!("{:#?}", header);
         }
         "transactionenvelope" => {
-            let env = stellar_xdr::curr::TransactionEnvelope::from_xdr(&bytes, stellar_xdr::curr::Limits::none())?;
+            let env = stellar_xdr::curr::TransactionEnvelope::from_xdr(
+                &bytes,
+                stellar_xdr::curr::Limits::none(),
+            )?;
             println!("{:#?}", env);
         }
         "transactionresult" => {
-            let result = stellar_xdr::curr::TransactionResult::from_xdr(&bytes, stellar_xdr::curr::Limits::none())?;
+            let result = stellar_xdr::curr::TransactionResult::from_xdr(
+                &bytes,
+                stellar_xdr::curr::Limits::none(),
+            )?;
             println!("{:#?}", result);
         }
         _ => {
@@ -5068,8 +5426,8 @@ fn decode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
 /// Supports: LedgerHeader, TransactionEnvelope, TransactionResult,
 /// AccountId, MuxedAccount, Asset, Hash, Uint256
 fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    use stellar_xdr::curr::{WriteXdr, Limits};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use stellar_xdr::curr::{Limits, WriteXdr};
 
     // Parse JSON and encode to XDR based on type
     match type_name.to_lowercase().as_str() {
@@ -5094,11 +5452,10 @@ fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
         "accountid" => {
             // Parse from strkey (G...) format
             let pk = stellar_core_crypto::PublicKey::from_strkey(value.trim())?;
-            let account_id = stellar_xdr::curr::AccountId(
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    stellar_xdr::curr::Uint256(*pk.as_bytes())
-                )
-            );
+            let account_id =
+                stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::curr::Uint256(*pk.as_bytes()),
+                ));
             let xdr_bytes = account_id.to_xdr(Limits::none())?;
             println!("{}", STANDARD.encode(&xdr_bytes));
         }
@@ -5107,9 +5464,7 @@ fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
             let value = value.trim();
             let muxed = if value.starts_with('G') {
                 let pk = stellar_core_crypto::PublicKey::from_strkey(value)?;
-                stellar_xdr::curr::MuxedAccount::Ed25519(
-                    stellar_xdr::curr::Uint256(*pk.as_bytes())
-                )
+                stellar_xdr::curr::MuxedAccount::Ed25519(stellar_xdr::curr::Uint256(*pk.as_bytes()))
             } else {
                 // For M... addresses, parse the muxed account
                 anyhow::bail!("Muxed account (M...) parsing not yet supported");
@@ -5125,9 +5480,9 @@ fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
             } else if let Some((code, issuer)) = value.split_once(':') {
                 let issuer_pk = stellar_core_crypto::PublicKey::from_strkey(issuer)?;
                 let issuer_id = stellar_xdr::curr::AccountId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                        stellar_xdr::curr::Uint256(*issuer_pk.as_bytes())
-                    )
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        *issuer_pk.as_bytes(),
+                    )),
                 );
 
                 if code.len() <= 4 {
@@ -5156,8 +5511,7 @@ fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
         "hash" | "uint256" => {
             // Parse from hex
             let value = value.trim();
-            let bytes = hex::decode(value)
-                .map_err(|e| anyhow::anyhow!("Invalid hex: {}", e))?;
+            let bytes = hex::decode(value).map_err(|e| anyhow::anyhow!("Invalid hex: {}", e))?;
             if bytes.len() != 32 {
                 anyhow::bail!("Hash must be exactly 32 bytes (64 hex characters)");
             }
@@ -5243,11 +5597,11 @@ fn cmd_check_quorum_intersection(path: &std::path::Path) -> anyhow::Result<()> {
 ///
 /// Equivalent to C++ stellar-core sign-transaction command.
 fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Result<()> {
+    use stellar_core_crypto::{sha256, SecretKey};
     use stellar_xdr::curr::{
         DecoratedSignature, ReadXdr, SignatureHint, TransactionEnvelope,
         TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
     };
-    use stellar_core_crypto::{sha256, SecretKey};
 
     // Read the transaction envelope
     let envelope_bytes = if input == "-" {
@@ -5261,7 +5615,8 @@ fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Re
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, input)?
     };
 
-    let mut tx_env = TransactionEnvelope::from_xdr(envelope_bytes, stellar_xdr::curr::Limits::none())?;
+    let mut tx_env =
+        TransactionEnvelope::from_xdr(envelope_bytes, stellar_xdr::curr::Limits::none())?;
 
     // Prompt for secret key
     eprint!("Secret key seed [network id: '{}']: ", netid);
@@ -5280,11 +5635,16 @@ fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Re
         TransactionEnvelope::TxV0(v0) => {
             // Convert V0 to V1 for signing (same signature semantics)
             let tx = stellar_xdr::curr::Transaction {
-                source_account: stellar_xdr::curr::MuxedAccount::Ed25519(v0.tx.source_account_ed25519.clone()),
+                source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
+                    v0.tx.source_account_ed25519.clone(),
+                ),
                 fee: v0.tx.fee,
                 seq_num: v0.tx.seq_num.clone(),
                 cond: stellar_xdr::curr::Preconditions::Time(v0.tx.time_bounds.clone().unwrap_or(
-                    stellar_xdr::curr::TimeBounds { min_time: 0.into(), max_time: 0.into() }
+                    stellar_xdr::curr::TimeBounds {
+                        min_time: 0.into(),
+                        max_time: 0.into(),
+                    },
                 )),
                 memo: v0.tx.memo.clone(),
                 operations: v0.tx.operations.clone(),
@@ -5295,18 +5655,16 @@ fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Re
                 tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx),
             }
         }
-        TransactionEnvelope::Tx(v1) => {
-            TransactionSignaturePayload {
-                network_id: stellar_xdr::curr::Hash(network_id_hash.0),
-                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
-            }
-        }
-        TransactionEnvelope::TxFeeBump(fee_bump) => {
-            TransactionSignaturePayload {
-                network_id: stellar_xdr::curr::Hash(network_id_hash.0),
-                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fee_bump.tx.clone()),
-            }
-        }
+        TransactionEnvelope::Tx(v1) => TransactionSignaturePayload {
+            network_id: stellar_xdr::curr::Hash(network_id_hash.0),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
+        },
+        TransactionEnvelope::TxFeeBump(fee_bump) => TransactionSignaturePayload {
+            network_id: stellar_xdr::curr::Hash(network_id_hash.0),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
+                fee_bump.tx.clone(),
+            ),
+        },
     };
 
     // Serialize and hash the payload
@@ -5362,7 +5720,10 @@ fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Re
     // Output the signed envelope
     let out_bytes = tx_env.to_xdr(stellar_xdr::curr::Limits::none())?;
     if output_base64 {
-        println!("{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &out_bytes));
+        println!(
+            "{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &out_bytes)
+        );
     } else {
         use std::io::Write;
         std::io::stdout().write_all(&out_bytes)?;
@@ -5376,7 +5737,7 @@ fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Re
 /// Reads a secret key seed (S...) from stdin and prints the public key.
 /// Equivalent to C++ stellar-core sec-to-pub command.
 fn sec_to_pub() -> anyhow::Result<()> {
-    use stellar_core_crypto::{SecretKey, encode_account_id};
+    use stellar_core_crypto::{encode_account_id, SecretKey};
 
     eprint!("Secret key seed: ");
     let mut line = String::new();
@@ -5403,9 +5764,9 @@ async fn cmd_dump_ledger(
     limit: Option<u64>,
     last_modified_ledger_count: Option<u32>,
 ) -> anyhow::Result<()> {
+    use std::io::Write;
     use stellar_core_bucket::BucketManager;
     use stellar_xdr::curr::LedgerEntryType;
-    use std::io::Write;
 
     // Parse entry type filter if provided
     let type_filter: Option<LedgerEntryType> = if let Some(ref type_str) = entry_type {
@@ -5439,23 +5800,27 @@ async fn cmd_dump_ledger(
     )?;
 
     // Get current ledger
-    let current_ledger = db.get_latest_ledger_seq()?
+    let current_ledger = db
+        .get_latest_ledger_seq()?
         .ok_or_else(|| anyhow::anyhow!("No ledger data in database. Run catchup first."))?;
 
     println!("Current ledger: {}", current_ledger);
 
     // Calculate minimum last modified ledger if filter is set
-    let min_last_modified: Option<u32> = last_modified_ledger_count.map(|count| {
-        current_ledger.saturating_sub(count)
-    });
+    let min_last_modified: Option<u32> =
+        last_modified_ledger_count.map(|count| current_ledger.saturating_sub(count));
 
     // Load bucket list snapshot for the current checkpoint
-    let checkpoint = stellar_core_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
-        .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger))?;
+    let checkpoint =
+        stellar_core_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger)
+            })?;
 
     println!("Using checkpoint: {}", checkpoint);
 
-    let levels = db.load_bucket_list(checkpoint)?
+    let levels = db
+        .load_bucket_list(checkpoint)?
         .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot at {}", checkpoint))?;
 
     // Open output file
@@ -5486,10 +5851,10 @@ async fn cmd_dump_ledger(
 
                 // Skip dead entries and metadata
                 let live_entry = match entry {
-                    stellar_core_bucket::BucketEntry::Live(e) |
-                    stellar_core_bucket::BucketEntry::Init(e) => e,
-                    stellar_core_bucket::BucketEntry::Dead(_) |
-                    stellar_core_bucket::BucketEntry::Metadata(_) => continue,
+                    stellar_core_bucket::BucketEntry::Live(e)
+                    | stellar_core_bucket::BucketEntry::Init(e) => e,
+                    stellar_core_bucket::BucketEntry::Dead(_)
+                    | stellar_core_bucket::BucketEntry::Metadata(_) => continue,
                 };
 
                 // Apply type filter
@@ -5514,7 +5879,10 @@ async fn cmd_dump_ledger(
 
                 // Progress reporting
                 if entry_count % 10000 == 0 {
-                    print!("\rProcessed {} entries (level {})...", entry_count, level_idx);
+                    print!(
+                        "\rProcessed {} entries (level {})...",
+                        entry_count, level_idx
+                    );
                     std::io::stdout().flush()?;
                 }
             }
@@ -5534,9 +5902,9 @@ async fn cmd_dump_ledger(
 /// 2. Bucket hash verification - verifies all bucket files have correct hashes
 /// 3. Crypto benchmarking - measures Ed25519 sign/verify performance
 async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
+    use std::time::Instant;
     use stellar_core_bucket::BucketManager;
     use stellar_core_crypto::SecretKey;
-    use std::time::Instant;
 
     let mut all_ok = true;
 
@@ -5559,17 +5927,22 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
         let mut verified = 0u32;
 
         while current_seq > 0 && verified < depth {
-            let current = db.get_ledger_header(current_seq)?
+            let current = db
+                .get_ledger_header(current_seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", current_seq))?;
             let prev_seq = current_seq - 1;
-            let prev = db.get_ledger_header(prev_seq)?
+            let prev = db
+                .get_ledger_header(prev_seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header at {}", prev_seq))?;
 
             let prev_hash = stellar_core_ledger::compute_header_hash(&prev)?;
 
             if current.previous_ledger_hash != prev_hash.into() {
                 println!("  ERROR: Header chain broken at ledger {}", current_seq);
-                println!("    Previous hash in header: {:?}", current.previous_ledger_hash);
+                println!(
+                    "    Previous hash in header: {:?}",
+                    current.previous_ledger_hash
+                );
                 println!("    Computed hash of previous: {:?}", prev_hash);
                 all_ok = false;
                 break;
@@ -5580,7 +5953,12 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
         }
 
         if verified == depth {
-            println!("  Verified {} ledger headers (from {} to {})", verified, latest_seq, latest_seq - verified + 1);
+            println!(
+                "  Verified {} ledger headers (from {} to {})",
+                verified,
+                latest_seq,
+                latest_seq - verified + 1
+            );
         }
     }
 
@@ -5594,17 +5972,20 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     )?;
 
     // Get the checkpoint for the current ledger
-    let checkpoint = stellar_core_history::checkpoint::latest_checkpoint_before_or_at(latest_seq)
-        .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", latest_seq))?;
+    let checkpoint =
+        stellar_core_history::checkpoint::latest_checkpoint_before_or_at(latest_seq)
+            .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", latest_seq))?;
 
-    let levels = db.load_bucket_list(checkpoint)?
+    let levels = db
+        .load_bucket_list(checkpoint)?
         .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot at {}", checkpoint))?;
 
     let mut buckets_verified = 0;
     let mut buckets_failed = 0;
 
     // Collect all unique bucket hashes using a set for deduplication
-    let hashes_to_verify: std::collections::HashSet<_> = levels.iter()
+    let hashes_to_verify: std::collections::HashSet<_> = levels
+        .iter()
         .flat_map(|(curr, snap)| [*curr, *snap])
         .filter(|h| !h.is_zero())
         .collect();
@@ -5634,7 +6015,10 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
         }
     }
 
-    println!("  Verified {} buckets, {} failures", buckets_verified, buckets_failed);
+    println!(
+        "  Verified {} buckets, {} failures",
+        buckets_verified, buckets_failed
+    );
 
     // Phase 3: Crypto benchmarking
     println!();
@@ -5692,24 +6076,24 @@ async fn cmd_verify_checkpoints(
     from: Option<u32>,
     to: Option<u32>,
 ) -> anyhow::Result<()> {
-    use stellar_core_history::{HistoryArchive, verify, checkpoint};
-    use stellar_core_ledger::compute_header_hash;
     use std::io::Write;
+    use stellar_core_history::{checkpoint, verify, HistoryArchive};
+    use stellar_core_ledger::compute_header_hash;
 
     println!("Verifying checkpoint hashes...");
     println!();
 
     // Create archive clients from config
-    let archives: Vec<HistoryArchive> = config.history.archives
+    let archives: Vec<HistoryArchive> = config
+        .history
+        .archives
         .iter()
         .filter(|a| a.get_enabled)
-        .filter_map(|a| {
-            match HistoryArchive::new(&a.url) {
-                Ok(archive) => Some(archive),
-                Err(e) => {
-                    println!("Warning: Failed to create archive {}: {}", a.url, e);
-                    None
-                }
+        .filter_map(|a| match HistoryArchive::new(&a.url) {
+            Ok(archive) => Some(archive),
+            Err(e) => {
+                println!("Warning: Failed to create archive {}: {}", a.url, e);
+                None
             }
         })
         .collect();
@@ -5791,7 +6175,10 @@ async fn cmd_verify_checkpoints(
                     "hash": hex::encode(checkpoint_hash.as_bytes())
                 }));
 
-                println!("OK (hash: {})", hex::encode(&checkpoint_hash.as_bytes()[..8]));
+                println!(
+                    "OK (hash: {})",
+                    hex::encode(&checkpoint_hash.as_bytes()[..8])
+                );
                 verified_count += 1;
 
                 // Update previous header for next iteration
@@ -5807,7 +6194,10 @@ async fn cmd_verify_checkpoints(
     }
 
     println!();
-    println!("Verified {} checkpoints, {} errors", verified_count, error_count);
+    println!(
+        "Verified {} checkpoints, {} errors",
+        verified_count, error_count
+    );
 
     // Write output file
     let output_json = serde_json::json!({
@@ -5902,7 +6292,9 @@ mod tests {
     fn test_cli_run_command() {
         let cli = Cli::parse_from(["rs-stellar-core", "run", "--validator"]);
         match cli.command {
-            Commands::Run { validator, watcher, .. } => {
+            Commands::Run {
+                validator, watcher, ..
+            } => {
                 assert!(validator);
                 assert!(!watcher);
             }
@@ -5912,7 +6304,13 @@ mod tests {
 
     #[test]
     fn test_cli_catchup_command() {
-        let cli = Cli::parse_from(["rs-stellar-core", "catchup", "1000000", "--mode", "complete"]);
+        let cli = Cli::parse_from([
+            "rs-stellar-core",
+            "catchup",
+            "1000000",
+            "--mode",
+            "complete",
+        ]);
         match cli.command {
             Commands::Catchup { target, .. } => {
                 assert_eq!(target, "1000000");

@@ -53,31 +53,17 @@ use stellar_core_scp::SlotIndex;
 #[derive(Debug)]
 pub enum TimerCommand {
     /// Schedule a nomination timeout for a slot.
-    ScheduleNominationTimeout {
-        slot: SlotIndex,
-        duration: Duration,
-    },
+    ScheduleNominationTimeout { slot: SlotIndex, duration: Duration },
     /// Schedule a ballot timeout for a slot.
-    ScheduleBallotTimeout {
-        slot: SlotIndex,
-        duration: Duration,
-    },
+    ScheduleBallotTimeout { slot: SlotIndex, duration: Duration },
     /// Cancel all timers for a slot.
-    CancelSlotTimers {
-        slot: SlotIndex,
-    },
+    CancelSlotTimers { slot: SlotIndex },
     /// Cancel the nomination timer for a slot (but keep ballot timer).
-    CancelNominationTimer {
-        slot: SlotIndex,
-    },
+    CancelNominationTimer { slot: SlotIndex },
     /// Cancel the ballot timer for a slot (but keep nomination timer).
-    CancelBallotTimer {
-        slot: SlotIndex,
-    },
+    CancelBallotTimer { slot: SlotIndex },
     /// Purge timers for slots older than the given slot.
-    PurgeOldSlots {
-        min_slot: SlotIndex,
-    },
+    PurgeOldSlots { min_slot: SlotIndex },
     /// Shutdown the timer manager.
     Shutdown,
 }
@@ -323,10 +309,7 @@ impl<C: TimerCallback> TimerManager<C> {
 
     /// Get the next timeout instant, if any.
     fn next_timeout(&self) -> Option<Instant> {
-        self.timers
-            .values()
-            .map(|t| t.expires_at)
-            .min()
+        self.timers.values().map(|t| t.expires_at).min()
     }
 
     /// Sleep until the given instant, or forever if None.

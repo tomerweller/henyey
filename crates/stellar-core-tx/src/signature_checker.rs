@@ -35,10 +35,10 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use stellar_core_common::Hash256;
 use stellar_core_crypto::{verify_hash, PublicKey, Signature};
 use stellar_xdr::curr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
-use std::collections::HashMap;
 
 /// Signature checker that tracks which signatures have been used and
 /// accumulates weights when checking against account signers.
@@ -117,9 +117,12 @@ impl<'a> SignatureChecker<'a> {
 
         // 2. Check HASH_X signers
         if let Some(hash_x_signers) = signers_by_type.get_mut(&SignerKeyType::HashX) {
-            if self.verify_all_of_type(hash_x_signers, needed_weight, &mut total_weight, |sig, signer| {
-                verify_hash_x(sig, signer)
-            }) {
+            if self.verify_all_of_type(
+                hash_x_signers,
+                needed_weight,
+                &mut total_weight,
+                |sig, signer| verify_hash_x(sig, signer),
+            ) {
                 return true;
             }
         }
@@ -127,18 +130,25 @@ impl<'a> SignatureChecker<'a> {
         // 3. Check ED25519 signers
         if let Some(ed25519_signers) = signers_by_type.get_mut(&SignerKeyType::Ed25519) {
             let contents_hash = self.contents_hash.clone();
-            if self.verify_all_of_type(ed25519_signers, needed_weight, &mut total_weight, |sig, signer| {
-                verify_ed25519(sig, signer, &contents_hash)
-            }) {
+            if self.verify_all_of_type(
+                ed25519_signers,
+                needed_weight,
+                &mut total_weight,
+                |sig, signer| verify_ed25519(sig, signer, &contents_hash),
+            ) {
                 return true;
             }
         }
 
         // 4. Check ED25519_SIGNED_PAYLOAD signers
-        if let Some(payload_signers) = signers_by_type.get_mut(&SignerKeyType::Ed25519SignedPayload) {
-            if self.verify_all_of_type(payload_signers, needed_weight, &mut total_weight, |sig, signer| {
-                verify_ed25519_signed_payload(sig, signer)
-            }) {
+        if let Some(payload_signers) = signers_by_type.get_mut(&SignerKeyType::Ed25519SignedPayload)
+        {
+            if self.verify_all_of_type(
+                payload_signers,
+                needed_weight,
+                &mut total_weight,
+                |sig, signer| verify_ed25519_signed_payload(sig, signer),
+            ) {
                 return true;
             }
         }
@@ -282,7 +292,12 @@ fn verify_ed25519(sig: &DecoratedSignature, signer: &Signer, contents_hash: &Has
     };
 
     // Check hint matches last 4 bytes of public key
-    let expected_hint = [key_bytes.0[28], key_bytes.0[29], key_bytes.0[30], key_bytes.0[31]];
+    let expected_hint = [
+        key_bytes.0[28],
+        key_bytes.0[29],
+        key_bytes.0[30],
+        key_bytes.0[31],
+    ];
     if sig.hint.0 != expected_hint {
         return false;
     }
@@ -370,8 +385,8 @@ mod tests {
     use super::*;
     use stellar_core_crypto::{sign_hash, SecretKey};
     use stellar_xdr::curr::{
-        AccountEntry, AccountEntryExt, AccountId, PublicKey as XdrPublicKey, Signature as XdrSignature,
-        SignatureHint, Thresholds, Uint256, VecM,
+        AccountEntry, AccountEntryExt, AccountId, PublicKey as XdrPublicKey,
+        Signature as XdrSignature, SignatureHint, Thresholds, Uint256, VecM,
     };
 
     fn create_test_hash() -> Hash256 {

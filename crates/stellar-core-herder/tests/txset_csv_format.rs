@@ -13,8 +13,8 @@ fn testdata_path(name: &str) -> PathBuf {
 
 fn load_lines(name: &str) -> Vec<String> {
     let path = testdata_path(name);
-    let payload = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    let payload =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
     payload
         .lines()
         .map(|line| line.trim().to_string())
@@ -31,12 +31,7 @@ fn test_txset_csv_headers_and_columns() {
         let lines = load_lines(name);
         assert!(!lines.is_empty(), "missing csv data in {}", name);
         assert_eq!(lines[0], expected_header, "header mismatch in {}", name);
-        assert_eq!(
-            lines.len(),
-            50,
-            "unexpected row count in {}",
-            name
-        );
+        assert_eq!(lines.len(), 50, "unexpected row count in {}", name);
         for (idx, line) in lines.iter().enumerate().skip(1) {
             let parts: Vec<&str> = line.split(',').collect();
             assert_eq!(
@@ -47,8 +42,19 @@ fn test_txset_csv_headers_and_columns() {
                 name
             );
             let hash = parts[0];
-            assert_eq!(hash.len(), 64, "row {} hash length mismatch in {}", idx, name);
-            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "row {} hash not hex in {}", idx, name);
+            assert_eq!(
+                hash.len(),
+                64,
+                "row {} hash length mismatch in {}",
+                idx,
+                name
+            );
+            assert!(
+                hash.chars().all(|c| c.is_ascii_hexdigit()),
+                "row {} hash not hex in {}",
+                idx,
+                name
+            );
         }
     }
 }

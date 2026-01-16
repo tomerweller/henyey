@@ -2,10 +2,10 @@
 
 use stellar_xdr::curr::{
     AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult, ChangeTrustResultCode,
-    Liabilities, LiquidityPoolEntry, LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
-    LiquidityPoolParameters, OperationResult, OperationResultTr, TrustLineAsset, TrustLineEntry,
-    TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags, LedgerKey, LedgerKeyTrustLine,
+    LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry, LiquidityPoolEntryBody,
+    LiquidityPoolEntryConstantProduct, LiquidityPoolParameters, OperationResult, OperationResultTr,
+    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2,
+    TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use crate::apply::account_id_to_key;
@@ -92,11 +92,7 @@ pub fn execute_change_trust(
             asset: tl_asset.clone(),
         });
         if state.entry_sponsor(&ledger_key).is_some() {
-            state.remove_entry_sponsorship_and_update_counts(
-                &ledger_key,
-                source,
-                multiplier,
-            )?;
+            state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, multiplier)?;
         }
 
         // Decrease sub-entries BEFORE deleting trustline.
@@ -119,7 +115,10 @@ pub fn execute_change_trust(
     } else if existing.is_some() {
         // Updating existing trustline
         let existing_balance = existing.map(|tl| tl.balance).unwrap_or(0);
-        let existing_buying_liab = existing.map(trustline_liabilities).map(|l| l.buying).unwrap_or(0);
+        let existing_buying_liab = existing
+            .map(trustline_liabilities)
+            .map(|l| l.buying)
+            .unwrap_or(0);
         if op.limit < existing_balance.saturating_add(existing_buying_liab) {
             return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
         }
@@ -223,7 +222,7 @@ fn change_trust_asset_to_trust_line_asset(
     asset: &ChangeTrustAsset,
 ) -> stellar_xdr::curr::TrustLineAsset {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{Limits, PoolId, Hash, WriteXdr};
+    use stellar_xdr::curr::{Hash, Limits, PoolId, WriteXdr};
 
     match asset {
         ChangeTrustAsset::Native => stellar_xdr::curr::TrustLineAsset::Native,
@@ -520,9 +519,9 @@ fn make_result(code: ChangeTrustResultCode) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    use sha2::{Digest, Sha256};
     use crate::operations::execute::manage_offer::execute_manage_sell_offer;
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
@@ -1011,12 +1010,13 @@ mod tests {
         state.create_trustline(trustline_b);
         state.get_account_mut(&source_id).unwrap().num_sub_entries += 2;
 
-        let params =
-            LiquidityPoolParameters::LiquidityPoolConstantProduct(LiquidityPoolConstantProductParameters {
+        let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
                 asset_a: asset_a.clone(),
                 asset_b: asset_b.clone(),
                 fee: 30,
-            });
+            },
+        );
         let pool_id = pool_id_from_params(&params);
         let op = ChangeTrustOp {
             line: ChangeTrustAsset::PoolShare(params),

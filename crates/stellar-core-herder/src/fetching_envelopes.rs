@@ -9,13 +9,13 @@
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
 use stellar_core_common::Hash256;
 use stellar_core_overlay::{ItemFetcher, ItemFetcherConfig, ItemType, PeerId};
 use stellar_core_scp::SlotIndex;
 use stellar_xdr::curr::{Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
 use tracing::{debug, trace};
 
 /// Result of receiving an SCP envelope.
@@ -106,10 +106,7 @@ impl FetchingEnvelopes {
     /// Create a new fetching envelopes manager.
     pub fn new(config: FetchingConfig) -> Self {
         Self {
-            tx_set_fetcher: ItemFetcher::new(
-                ItemType::TxSet,
-                config.tx_set_fetcher_config.clone(),
-            ),
+            tx_set_fetcher: ItemFetcher::new(ItemType::TxSet, config.tx_set_fetcher_config.clone()),
             quorum_set_fetcher: ItemFetcher::new(
                 ItemType::QuorumSet,
                 config.quorum_set_fetcher_config.clone(),
@@ -127,10 +124,7 @@ impl FetchingEnvelopes {
     }
 
     /// Set the callback for requesting TxSets from peers.
-    pub fn set_tx_set_ask_peer(
-        &mut self,
-        f: Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>,
-    ) {
+    pub fn set_tx_set_ask_peer(&mut self, f: Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>) {
         self.tx_set_fetcher.set_ask_peer(f);
     }
 
@@ -159,7 +153,10 @@ impl FetchingEnvelopes {
         self.stats.write().envelopes_received += 1;
 
         // Get or create slot state
-        let mut slot_state = self.slots.entry(slot).or_insert_with(SlotEnvelopes::default);
+        let mut slot_state = self
+            .slots
+            .entry(slot)
+            .or_insert_with(SlotEnvelopes::default);
 
         // Check if already processed or discarded
         if slot_state.processed.contains(&env_hash) || slot_state.discarded.contains(&env_hash) {
@@ -212,10 +209,7 @@ impl FetchingEnvelopes {
     pub fn recv_tx_set(&self, hash: Hash256, slot: SlotIndex, data: Vec<u8>) -> bool {
         // Check if we're fetching this TxSet
         if !self.tx_set_fetcher.is_tracking(&Hash(hash.0)) {
-            trace!(
-                "Received unrequested TxSet {}",
-                hex::encode(&hash.0)
-            );
+            trace!("Received unrequested TxSet {}", hex::encode(&hash.0));
             return false;
         }
 
@@ -247,10 +241,7 @@ impl FetchingEnvelopes {
     pub fn recv_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) -> bool {
         // Check if we're fetching this QuorumSet
         if !self.quorum_set_fetcher.is_tracking(&Hash(hash.0)) {
-            trace!(
-                "Received unrequested QuorumSet {}",
-                hex::encode(&hash.0)
-            );
+            trace!("Received unrequested QuorumSet {}", hex::encode(&hash.0));
             return false;
         }
 
@@ -324,7 +315,8 @@ impl FetchingEnvelopes {
         }
 
         // Tell fetchers to stop fetching for old slots
-        self.tx_set_fetcher.stop_fetching_below(slot_index, slot_to_keep);
+        self.tx_set_fetcher
+            .stop_fetching_below(slot_index, slot_to_keep);
         self.quorum_set_fetcher
             .stop_fetching_below(slot_index, slot_to_keep);
     }
@@ -418,10 +410,7 @@ impl FetchingEnvelopes {
             if let Some(mut slot_state) = self.slots.get_mut(&slot) {
                 if slot_state.fetching.remove(&env_hash).is_some() {
                     slot_state.ready.push(envelope);
-                    debug!(
-                        slot,
-                        "Envelope ready after receiving dependencies"
-                    );
+                    debug!(slot, "Envelope ready after receiving dependencies");
                 }
             }
         }

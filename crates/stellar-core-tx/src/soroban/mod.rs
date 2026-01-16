@@ -83,13 +83,17 @@
 //! snapshot, matching C++ stellar-core behavior.
 
 mod budget;
-mod events;
 mod error;
+mod events;
 mod host;
 pub mod protocol;
 mod storage;
 
-pub use budget::{SorobanBudget, SorobanConfig, ResourceLimits, FeeConfiguration, RentFeeConfiguration};
+pub use budget::{
+    FeeConfiguration, RentFeeConfiguration, ResourceLimits, SorobanBudget, SorobanConfig,
+};
 pub use events::{ContractEvent, ContractEvents, EventType};
-pub use host::{execute_host_function, SorobanExecutionError, SorobanExecutionResult, StorageChange};
+pub use host::{
+    execute_host_function, SorobanExecutionError, SorobanExecutionResult, StorageChange,
+};
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};

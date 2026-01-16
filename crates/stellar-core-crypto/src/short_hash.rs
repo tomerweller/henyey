@@ -171,7 +171,10 @@ mod tests {
 
     fn test_guard() -> MutexGuard<'static, ()> {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(())).lock().expect("test guard poisoned")
+        GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test guard poisoned")
     }
 
     fn reset_state() {
@@ -190,8 +193,8 @@ mod tests {
         let _guard = test_guard();
         reset_state();
         let key: [u8; KEY_BYTES] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
-            0x0c, 0x0d, 0x0e, 0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
         let msg = [0u8; 0];
         let got = compute_hash_with_key(key, &msg);
@@ -231,7 +234,10 @@ mod tests {
         let _ = compute_hash(b"warmup");
         let err = seed(1).expect_err("seed should fail");
         match err {
-            CryptoError::ShortHashSeedConflict { existing, requested } => {
+            CryptoError::ShortHashSeedConflict {
+                existing,
+                requested,
+            } => {
                 assert_eq!(existing, 0);
                 assert_eq!(requested, 1);
             }

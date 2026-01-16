@@ -43,21 +43,25 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::{seq::SliceRandom, Rng};
 use serde::Serialize;
-use tokio::sync::RwLock;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::RwLock;
 
 use stellar_core_bucket::BucketManager;
+use stellar_core_common::{Hash256, NetworkId};
+use stellar_core_db::{
+    BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
+};
 use stellar_core_herder::{
-    EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
     drift_tracker::CloseTimeDriftTracker,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
+    EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
 };
 use stellar_core_history::{
     is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupOutput,
@@ -73,26 +77,22 @@ use stellar_core_overlay::{
     ConnectionDirection, LocalNode, OverlayConfig as OverlayManagerConfig, OverlayManager,
     OverlayMessage, PeerAddress, PeerEvent, PeerId, PeerSnapshot, PeerType,
 };
-use stellar_core_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
-use stellar_core_common::{Hash256, NetworkId};
-use stellar_core_db::{
-    BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
-};
 use stellar_core_scp::hash_quorum_set;
-use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
-use stellar_xdr::curr::{
-    Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand,
-    Hash, LedgerCloseMeta, LedgerScpMessages, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope,
-    ScpHistoryEntry, ScpHistoryEntryV0, SignedTimeSlicedSurveyResponseMessage, StellarMessage,
-    StellarValue, SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody,
-    SurveyResponseMessage, TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
-    TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
-    TimeSlicedPeerDataList, TopologyResponseBodyV2, TransactionHistoryEntry,
-    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-    TransactionMeta, TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector,
-    TxDemandVector, UpgradeType, VecM, WriteXdr,
-};
 use stellar_core_tx::TransactionFrame;
+use stellar_core_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
+use stellar_xdr::curr::{
+    Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,
+    LedgerScpMessages, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope, ScpHistoryEntry,
+    ScpHistoryEntryV0, SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue,
+    SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody, SurveyResponseMessage,
+    TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
+    TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
+    TopologyResponseBodyV2, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionMeta,
+    TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector, TxDemandVector,
+    UpgradeType, VecM, WriteXdr,
+};
+use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 
 use crate::config::AppConfig;
 use crate::logging::CatchupProgress;
@@ -130,12 +130,11 @@ fn build_generalized_tx_set(
         TxSetComponentTxsMaybeDiscountedFee,
     };
 
-    let component = TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-        TxSetComponentTxsMaybeDiscountedFee {
+    let component =
+        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
             base_fee: None,
             txs: tx_set.transactions.clone().try_into().ok()?,
-        },
-    );
+        });
     let phase = TransactionPhase::V0(vec![component].try_into().ok()?);
     Some(GeneralizedTransactionSet::V1(TransactionSetV1 {
         previous_ledger_hash: Hash(tx_set.previous_ledger_hash.0),
@@ -345,7 +344,8 @@ pub struct App {
     /// Ephemeral survey encryption secrets keyed by nonce.
     survey_secrets: RwLock<HashMap<u32, [u8; 32]>>,
     /// Survey responses keyed by nonce.
-    survey_results: RwLock<HashMap<u32, HashMap<stellar_core_overlay::PeerId, TopologyResponseBodyV2>>>,
+    survey_results:
+        RwLock<HashMap<u32, HashMap<stellar_core_overlay::PeerId, TopologyResponseBodyV2>>>,
     /// Survey message limiter for rate limiting and deduplication.
     survey_limiter: RwLock<SurveyMessageLimiter>,
     /// Survey throttle timeout between survey runs.
@@ -410,7 +410,8 @@ impl TxAdvertHistory {
 
     fn clear_below(&mut self, ledger_seq: u32) {
         self.entries.retain(|_, seq| *seq >= ledger_seq);
-        self.order.retain(|(hash, seq)| *seq >= ledger_seq && self.entries.get(hash) == Some(seq));
+        self.order
+            .retain(|(hash, seq)| *seq >= ledger_seq && self.entries.get(hash) == Some(seq));
     }
 }
 
@@ -614,7 +615,6 @@ impl ScpLatencyTracker {
             samples.pop_front();
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,7 +711,10 @@ impl App {
         }
 
         // Initialize bucket manager for ledger state persistence
-        let bucket_dir = config.database.path.parent()
+        let bucket_dir = config
+            .database
+            .path
+            .parent()
             .unwrap_or(&config.database.path)
             .join("buckets");
         std::fs::create_dir_all(&bucket_dir)?;
@@ -927,10 +930,7 @@ impl App {
     fn acquire_db_lock(config: &AppConfig) -> anyhow::Result<File> {
         use fs2::FileExt;
 
-        let lock_path = config
-            .database
-            .path
-            .with_extension("lock");
+        let lock_path = config.database.path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -939,8 +939,9 @@ impl App {
             .write(true)
             .create(true)
             .open(&lock_path)?;
-        file.try_lock_exclusive()
-            .map_err(|_| anyhow::anyhow!("database is locked (lockfile: {})", lock_path.display()))?;
+        file.try_lock_exclusive().map_err(|_| {
+            anyhow::anyhow!("database is locked (lockfile: {})", lock_path.display())
+        })?;
         Ok(file)
     }
 
@@ -1103,7 +1104,9 @@ impl App {
     pub async fn manual_close_ledger(&self) -> anyhow::Result<u32> {
         // Check if node is a validator
         if !self.config.node.is_validator {
-            anyhow::bail!("Issuing a manual ledger close requires NODE_IS_VALIDATOR to be set to true.");
+            anyhow::bail!(
+                "Issuing a manual ledger close requires NODE_IS_VALIDATOR to be set to true."
+            );
         }
 
         // Check if manual close mode is enabled
@@ -1116,7 +1119,9 @@ impl App {
         let next_ledger = current_ledger + 1;
 
         // Trigger the herder to close the next ledger
-        self.herder.trigger_next_ledger(next_ledger).await
+        self.herder
+            .trigger_next_ledger(next_ledger)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to trigger next ledger: {}", e))?;
 
         Ok(next_ledger)
@@ -1453,9 +1458,8 @@ impl App {
             }
         }
 
-        let self_peer = stellar_core_overlay::PeerId::from_bytes(
-            *self.keypair.public_key().as_bytes(),
-        );
+        let self_peer =
+            stellar_core_overlay::PeerId::from_bytes(*self.keypair.public_key().as_bytes());
         let mut reporting = self.survey_reporting.write().await;
         if reporting.peers.contains(&peer_id) || peer_id == self_peer {
             return false;
@@ -1463,8 +1467,12 @@ impl App {
         reporting.bad_response_nodes.remove(&peer_id);
         reporting.peers.insert(peer_id.clone());
         reporting.queue.push_back(peer_id.clone());
-        reporting.inbound_indices.insert(peer_id.clone(), inbound_index);
-        reporting.outbound_indices.insert(peer_id.clone(), outbound_index);
+        reporting
+            .inbound_indices
+            .insert(peer_id.clone(), inbound_index);
+        reporting
+            .outbound_indices
+            .insert(peer_id.clone(), outbound_index);
         true
     }
 
@@ -1492,9 +1500,8 @@ impl App {
         self.survey_results.write().await.clear();
         self.ensure_survey_secret(nonce).await;
         if let Some(response) = self.local_topology_response().await {
-            let self_peer = stellar_core_overlay::PeerId::from_bytes(
-                *self.keypair.public_key().as_bytes(),
-            );
+            let self_peer =
+                stellar_core_overlay::PeerId::from_bytes(*self.keypair.public_key().as_bytes());
             self.survey_results
                 .write()
                 .await
@@ -1575,7 +1582,13 @@ impl App {
 
         for (peer_id, inbound_index, outbound_index) in to_send {
             let ok = self
-                .send_survey_request(peer_id.clone(), nonce, ledger_num, inbound_index, outbound_index)
+                .send_survey_request(
+                    peer_id.clone(),
+                    nonce,
+                    ledger_num,
+                    inbound_index,
+                    outbound_index,
+                )
                 .await;
             if !ok {
                 tracing::debug!(peer = %peer_id, "Survey request failed to send");
@@ -1782,7 +1795,9 @@ impl App {
         }
 
         // Run catchup work
-        let output = self.run_catchup_work(target_ledger, progress.clone()).await?;
+        let output = self
+            .run_catchup_work(target_ledger, progress.clone())
+            .await?;
 
         // Initialize ledger manager with catchup results.
         // This validates that the bucket list hash matches the ledger header.
@@ -1816,7 +1831,8 @@ impl App {
         progress.summary();
 
         // Reset the tx set exhausted flag after catchup - fresh start
-        self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
+        self.tx_set_all_peers_exhausted
+            .store(false, Ordering::SeqCst);
 
         Ok(CatchupResult {
             ledger_seq: output.result.ledger_seq,
@@ -1842,8 +1858,13 @@ impl App {
                                 "Got current ledger from archive"
                             );
                             // Round down to the latest completed checkpoint
-                            let checkpoint = stellar_core_history::checkpoint::latest_checkpoint_before_or_at(ledger)
-                                .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", ledger))?;
+                            let checkpoint =
+                                stellar_core_history::checkpoint::latest_checkpoint_before_or_at(
+                                    ledger,
+                                )
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("No checkpoint available for ledger {}", ledger)
+                                })?;
                             return Ok(checkpoint);
                         }
                         Err(e) => {
@@ -1867,7 +1888,9 @@ impl App {
             }
         }
 
-        Err(anyhow::anyhow!("Failed to get current ledger from any archive"))
+        Err(anyhow::anyhow!(
+            "Failed to get current ledger from any archive"
+        ))
     }
 
     /// Run the catchup work using the real CatchupManager.
@@ -1882,16 +1905,17 @@ impl App {
         progress.set_phase(CatchupPhase::DownloadingState);
         tracing::info!(target_ledger, "Downloading history archive state");
 
-        let archives: Vec<HistoryArchive> = self.config.history.archives
+        let archives: Vec<HistoryArchive> = self
+            .config
+            .history
+            .archives
             .iter()
             .filter(|a| a.get_enabled)
-            .filter_map(|a| {
-                match HistoryArchive::new(&a.url) {
-                    Ok(archive) => Some(archive),
-                    Err(e) => {
-                        tracing::warn!(url = %a.url, error = %e, "Failed to create archive");
-                        None
-                    }
+            .filter_map(|a| match HistoryArchive::new(&a.url) {
+                Ok(archive) => Some(archive),
+                Err(e) => {
+                    tracing::warn!(url = %a.url, error = %e, "Failed to create archive");
+                    None
                 }
             })
             .collect();
@@ -1900,7 +1924,10 @@ impl App {
             return Err(anyhow::anyhow!("No history archives available"));
         }
 
-        tracing::info!(archive_count = archives.len(), "Created history archive clients");
+        tracing::info!(
+            archive_count = archives.len(),
+            "Created history archive clients"
+        );
 
         let checkpoint_seq = latest_checkpoint_before_or_at(target_ledger).ok_or_else(|| {
             anyhow::anyhow!("target ledger {} is before first checkpoint", target_ledger)
@@ -1939,9 +1966,11 @@ impl App {
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
         let output = match checkpoint_data {
-            Some(data) => catchup_manager
-                .catchup_to_ledger_with_checkpoint_data(target_ledger, data)
-                .await,
+            Some(data) => {
+                catchup_manager
+                    .catchup_to_ledger_with_checkpoint_data(target_ledger, data)
+                    .await
+            }
             None => catchup_manager.catchup_to_ledger(target_ledger).await,
         }
         .map_err(|e| anyhow::anyhow!("Catchup failed: {}", e))?;
@@ -2377,13 +2406,19 @@ impl App {
 
         // Convert preferred peers
         if !self.config.overlay.preferred_peers.is_empty() {
-            overlay_config.preferred_peers = self.config.overlay.preferred_peers
+            overlay_config.preferred_peers = self
+                .config
+                .overlay
+                .preferred_peers
                 .iter()
                 .filter_map(|s| {
                     let parts: Vec<&str> = s.split(':').collect();
                     match parts.len() {
                         1 => Some(PeerAddress::new(parts[0], 11625)),
-                        2 => parts[1].parse().ok().map(|port| PeerAddress::new(parts[0], port)),
+                        2 => parts[1]
+                            .parse()
+                            .ok()
+                            .map(|port| PeerAddress::new(parts[0], port)),
                         _ => None,
                     }
                 })
@@ -2450,8 +2485,13 @@ impl App {
                 );
                 let tx_set_hash = match &envelope.statement.pledges {
                     stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-                        match StellarValue::from_xdr(&ext.commit.value.0, stellar_xdr::curr::Limits::none()) {
-                            Ok(stellar_value) => Some(Hash256::from_bytes(stellar_value.tx_set_hash.0)),
+                        match StellarValue::from_xdr(
+                            &ext.commit.value.0,
+                            stellar_xdr::curr::Limits::none(),
+                        ) {
+                            Ok(stellar_value) => {
+                                Some(Hash256::from_bytes(stellar_value.tx_set_hash.0))
+                            }
                             Err(err) => {
                                 tracing::warn!(slot, error = %err, "Failed to parse externalized StellarValue");
                                 None
@@ -2472,7 +2512,8 @@ impl App {
                         let peer = msg.from_peer.clone();
                         let overlay = self.overlay.lock().await;
                         if let Some(ref overlay) = *overlay {
-                            let request = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+                            let request =
+                                StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
                             if let Err(e) = overlay.send_to(&peer, request).await {
                                 tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
                             }
@@ -2563,7 +2604,9 @@ impl App {
                         tracing::debug!("Transaction filtered by operation type");
                     }
                     stellar_core_herder::TxQueueResult::TryAgainLater => {
-                        tracing::debug!("Transaction rejected: account already has pending transaction");
+                        tracing::debug!(
+                            "Transaction rejected: account already has pending transaction"
+                        );
                     }
                 }
             }
@@ -2582,7 +2625,10 @@ impl App {
                     stellar_xdr::curr::MessageType::TxSet
                         | stellar_xdr::curr::MessageType::GeneralizedTxSet
                 );
-                let is_ping = matches!(dont_have.type_, stellar_xdr::curr::MessageType::ScpQuorumset);
+                let is_ping = matches!(
+                    dont_have.type_,
+                    stellar_xdr::curr::MessageType::ScpQuorumset
+                );
                 if is_tx_set {
                     tracing::info!(
                         peer = %msg.from_peer,
@@ -2638,8 +2684,7 @@ impl App {
             }
 
             StellarMessage::TimeSlicedSurveyResponse(response) => {
-                self.handle_survey_response(&msg.from_peer, response)
-                    .await;
+                self.handle_survey_response(&msg.from_peer, response).await;
             }
 
             StellarMessage::Peers(peer_list) => {
@@ -2681,7 +2726,8 @@ impl App {
             }
         };
 
-        self.update_buffered_tx_set(slot as u32, close_info.tx_set).await;
+        self.update_buffered_tx_set(slot as u32, close_info.tx_set)
+            .await;
         self.try_apply_buffered_ledgers().await;
     }
 
@@ -2808,10 +2854,7 @@ impl App {
         }
     }
 
-    async fn attach_tx_set_by_hash(
-        &self,
-        tx_set: &stellar_core_herder::TransactionSet,
-    ) -> bool {
+    async fn attach_tx_set_by_hash(&self, tx_set: &stellar_core_herder::TransactionSet) -> bool {
         let mut buffer = self.syncing_ledgers.write().await;
         for (slot, entry) in buffer.iter_mut() {
             if entry.tx_set.is_none() && entry.tx_set_hash == tx_set.hash {
@@ -2958,7 +3001,10 @@ impl App {
         let (first_buffered, last_buffered) = {
             let mut buffer = self.syncing_ledgers.write().await;
             Self::trim_syncing_ledgers(&mut buffer, current_ledger);
-            match (buffer.keys().next().copied(), buffer.keys().next_back().copied()) {
+            match (
+                buffer.keys().next().copied(),
+                buffer.keys().next_back().copied(),
+            ) {
                 (Some(first), Some(last)) => (first, last),
                 _ => return,
             }
@@ -2974,7 +3020,9 @@ impl App {
         // Check if sequential ledger has tx set available
         let sequential_with_tx_set = if first_buffered == current_ledger + 1 {
             let buffer = self.syncing_ledgers.read().await;
-            buffer.get(&first_buffered).map_or(false, |info| info.tx_set.is_some())
+            buffer
+                .get(&first_buffered)
+                .map_or(false, |info| info.tx_set.is_some())
         } else {
             false
         };
@@ -2998,7 +3046,9 @@ impl App {
         let can_trigger_immediate = if large_gap {
             // Large gap - trigger immediately to first_buffered - 1
             true
-        } else if Self::is_first_ledger_in_checkpoint(first_buffered) && first_buffered < last_buffered {
+        } else if Self::is_first_ledger_in_checkpoint(first_buffered)
+            && first_buffered < last_buffered
+        {
             // First buffered is checkpoint boundary AND we have multiple buffered ledgers
             // This matches upstream: catchup to first_buffered - 1
             true
@@ -3012,8 +3062,8 @@ impl App {
             let (required_first, trigger) = if Self::is_first_ledger_in_checkpoint(first_buffered) {
                 (first_buffered, first_buffered.saturating_add(1))
             } else {
-                let required_first =
-                    Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY);
+                let required_first = Self::first_ledger_in_checkpoint(first_buffered)
+                    .saturating_add(CHECKPOINT_FREQUENCY);
                 (required_first, required_first.saturating_add(1))
             };
 
@@ -3027,8 +3077,10 @@ impl App {
                 let action = {
                     let mut stuck_state = self.consensus_stuck_state.write().await;
                     match stuck_state.as_mut() {
-                        Some(state) if state.current_ledger == current_ledger
-                                    && state.first_buffered == first_buffered => {
+                        Some(state)
+                            if state.current_ledger == current_ledger
+                                && state.first_buffered == first_buffered =>
+                        {
                             let elapsed = state.stuck_start.elapsed().as_secs();
                             let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
 
@@ -3039,17 +3091,24 @@ impl App {
                             //    This handles the case where peers don't have SCP envelopes for gap slots
                             // BUT: if we just completed catchup, use normal timeout to avoid
                             // catching up repeatedly to the same checkpoint.
-                            let all_peers_exhausted = self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
-                            let has_stale_requests = self.herder.has_stale_pending_tx_set(TX_SET_UNAVAILABLE_TIMEOUT_SECS);
+                            let all_peers_exhausted =
+                                self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
+                            let has_stale_requests = self
+                                .herder
+                                .has_stale_pending_tx_set(TX_SET_UNAVAILABLE_TIMEOUT_SECS);
                             let recovery_failed = state.recovery_attempts >= 2;
 
                             // Cooldown: don't use fast timeout if we just completed catchup
                             // This prevents catching up to the same checkpoint repeatedly
                             const CATCHUP_COOLDOWN_SECS: u64 = 15;
-                            let recently_caught_up = self.last_catchup_completed_at.read().await
+                            let recently_caught_up = self
+                                .last_catchup_completed_at
+                                .read()
+                                .await
                                 .map_or(false, |t| t.elapsed().as_secs() < CATCHUP_COOLDOWN_SECS);
 
-                            let use_fast_timeout = !recently_caught_up && (all_peers_exhausted || has_stale_requests || recovery_failed);
+                            let use_fast_timeout = !recently_caught_up
+                                && (all_peers_exhausted || has_stale_requests || recovery_failed);
                             let effective_timeout = if use_fast_timeout {
                                 TX_SET_UNAVAILABLE_TIMEOUT_SECS
                             } else {
@@ -3074,7 +3133,8 @@ impl App {
                                 );
                                 *stuck_state = None;
                                 // Reset the exhausted flag since we're triggering catchup
-                                self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
+                                self.tx_set_all_peers_exhausted
+                                    .store(false, Ordering::SeqCst);
                                 ConsensusStuckAction::TriggerCatchup
                             } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
                                 state.last_recovery_attempt = now;
@@ -3142,7 +3202,11 @@ impl App {
             None => {
                 // Fallback: use timeout-based target if buffered_catchup_target returns None
                 // but we've decided to catchup due to timeout
-                Self::compute_catchup_target_for_timeout(last_buffered, first_buffered, current_ledger)
+                Self::compute_catchup_target_for_timeout(
+                    last_buffered,
+                    first_buffered,
+                    current_ledger,
+                )
             }
         };
 
@@ -3226,7 +3290,6 @@ impl App {
             }
         }
 
-
         tracing::info!(
             current_ledger,
             target,
@@ -3256,7 +3319,10 @@ impl App {
                     .herder
                     .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
                 if cleaned > 0 {
-                    tracing::info!(cleaned, "Dropped stale pending tx set requests after catchup");
+                    tracing::info!(
+                        cleaned,
+                        "Dropped stale pending tx set requests after catchup"
+                    );
                 }
                 // Reset tx_set tracking to give pending requests a fresh chance
                 self.reset_tx_set_tracking_after_catchup().await;
@@ -3267,10 +3333,7 @@ impl App {
                 }
                 // Record catchup completion time for cooldown
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
-                tracing::info!(
-                    ledger_seq = result.ledger_seq,
-                    "Buffered catchup complete"
-                );
+                tracing::info!(ledger_seq = result.ledger_seq, "Buffered catchup complete");
                 self.try_apply_buffered_ledgers().await;
             }
             Err(err) => {
@@ -3325,7 +3388,10 @@ impl App {
                     .herder
                     .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
                 if cleaned > 0 {
-                    tracing::info!(cleaned, "Dropped stale pending tx set requests after catchup");
+                    tracing::info!(
+                        cleaned,
+                        "Dropped stale pending tx set requests after catchup"
+                    );
                 }
                 // Reset tx_set tracking to give pending requests a fresh chance
                 self.reset_tx_set_tracking_after_catchup().await;
@@ -3363,8 +3429,8 @@ impl App {
             // ledgers past a checkpoint. Replaying without TransactionMeta can produce
             // different bucket list state due to transaction re-execution parity issues.
             // By stopping at a checkpoint, we restore state directly from the archive.
-            let target = latest_checkpoint_before_or_at(first_buffered.saturating_sub(1))
-                .unwrap_or(0);
+            let target =
+                latest_checkpoint_before_or_at(first_buffered.saturating_sub(1)).unwrap_or(0);
             return if target == 0 { None } else { Some(target) };
         }
 
@@ -3387,7 +3453,11 @@ impl App {
 
     /// Compute a catchup target when we're stuck waiting for buffered ledgers.
     /// This targets the checkpoint boundary that will allow us to apply buffered ledgers.
-    fn compute_catchup_target_for_timeout(last_buffered: u32, first_buffered: u32, current_ledger: u32) -> Option<u32> {
+    fn compute_catchup_target_for_timeout(
+        last_buffered: u32,
+        first_buffered: u32,
+        current_ledger: u32,
+    ) -> Option<u32> {
         // We need to catch up to a point that lets us make progress.
         // The best target is just before first_buffered, so we can then apply the buffered ledgers.
 
@@ -3517,7 +3587,10 @@ impl App {
                 let parts: Vec<&str> = addr_str.split(':').collect();
                 let peer_addr = match parts.len() {
                     1 => Some(PeerAddress::new(parts[0], 11625)),
-                    2 => parts[1].parse().ok().map(|port| PeerAddress::new(parts[0], port)),
+                    2 => parts[1]
+                        .parse()
+                        .ok()
+                        .map(|port| PeerAddress::new(parts[0], port)),
                     _ => None,
                 };
                 if let Some(addr) = peer_addr {
@@ -3600,7 +3673,10 @@ impl App {
         let from_slot = current_ledger.saturating_sub(5) as u64;
         tracing::debug!(from_slot, "Getting SCP state for recovery");
         let (envelopes, _quorum_set) = self.herder.get_scp_state(from_slot);
-        tracing::debug!(envelope_count = envelopes.len(), "Got SCP state for recovery");
+        tracing::debug!(
+            envelope_count = envelopes.len(),
+            "Got SCP state for recovery"
+        );
 
         tracing::debug!("Acquiring overlay lock for recovery");
         let overlay = self.overlay.lock().await;
@@ -3703,7 +3779,10 @@ impl App {
 
         let req = requested_hash.0;
         if let Some(qs) = self.herder.get_quorum_set_by_hash(&req) {
-            if let Err(e) = overlay.send_to(peer_id, StellarMessage::ScpQuorumset(qs)).await {
+            if let Err(e) = overlay
+                .send_to(peer_id, StellarMessage::ScpQuorumset(qs))
+                .await
+            {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
             }
         } else {
@@ -3728,7 +3807,11 @@ impl App {
         // Get the node_ids that were waiting for this quorum set
         let node_ids = self.herder.get_pending_quorum_set_node_ids(&hash);
 
-        if let Err(err) = self.db.store_scp_quorum_set(&hash, self.ledger_manager.current_ledger_seq(), &quorum_set) {
+        if let Err(err) = self.db.store_scp_quorum_set(
+            &hash,
+            self.ledger_manager.current_ledger_seq(),
+            &quorum_set,
+        ) {
             tracing::warn!(error = %err, "Failed to store quorum set");
         }
 
@@ -3764,12 +3847,14 @@ impl App {
         let local_ledger = self.survey_local_ledger().await;
         let survey_active = { self.survey_data.read().await.survey_is_active() };
         let limiter = self.survey_limiter.read().await;
-        let is_valid = limiter.validate_start_collecting(
-            message,
-            local_ledger,
-            survey_active,
-            || self.verify_survey_signature(&message.surveyor_id, &message_bytes, &signed.signature),
-        );
+        let is_valid =
+            limiter.validate_start_collecting(message, local_ledger, survey_active, || {
+                self.verify_survey_signature(
+                    &message.surveyor_id,
+                    &message_bytes,
+                    &signed.signature,
+                )
+            });
         if !is_valid {
             tracing::debug!(peer = %peer_id, "Survey start rejected by limiter");
             return;
@@ -3826,11 +3911,9 @@ impl App {
         }
         let local_ledger = self.survey_local_ledger().await;
         let limiter = self.survey_limiter.read().await;
-        let is_valid = limiter.validate_stop_collecting(
-            message,
-            local_ledger,
-            || self.verify_survey_signature(&message.surveyor_id, &message_bytes, &signed.signature),
-        );
+        let is_valid = limiter.validate_stop_collecting(message, local_ledger, || {
+            self.verify_survey_signature(&message.surveyor_id, &message_bytes, &signed.signature)
+        });
         if !is_valid {
             tracing::debug!(peer = %peer_id, "Survey stop rejected by limiter");
             return;
@@ -3879,7 +3962,11 @@ impl App {
 
         let local_node_id = self.local_node_id();
         let local_ledger = self.survey_local_ledger().await;
-        let nonce_is_reporting = self.survey_data.read().await.nonce_is_reporting(request.nonce);
+        let nonce_is_reporting = self
+            .survey_data
+            .read()
+            .await
+            .nonce_is_reporting(request.nonce);
         let mut limiter = self.survey_limiter.write().await;
         let is_valid = limiter.add_and_validate_request(
             &request.request,
@@ -3975,7 +4062,10 @@ impl App {
         let overlay = self.overlay.lock().await;
         if let Some(ref overlay) = *overlay {
             if let Err(e) = overlay
-                .send_to(peer_id, StellarMessage::TimeSlicedSurveyResponse(signed_response))
+                .send_to(
+                    peer_id,
+                    StellarMessage::TimeSlicedSurveyResponse(signed_response),
+                )
                 .await
             {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send survey response");
@@ -3998,21 +4088,21 @@ impl App {
         };
 
         let local_ledger = self.survey_local_ledger().await;
-        let nonce_is_reporting =
-            self.survey_data.read().await.nonce_is_reporting(response_message.nonce);
+        let nonce_is_reporting = self
+            .survey_data
+            .read()
+            .await
+            .nonce_is_reporting(response_message.nonce);
         let mut limiter = self.survey_limiter.write().await;
-        let is_valid = limiter.record_and_validate_response(
-            &response_message.response,
-            local_ledger,
-            || {
+        let is_valid =
+            limiter.record_and_validate_response(&response_message.response, local_ledger, || {
                 nonce_is_reporting
                     && self.verify_survey_signature(
                         &response_message.response.surveyed_peer_id,
                         &response_bytes,
                         &signed.response_signature,
                     )
-            },
-        );
+            });
         if !is_valid {
             tracing::debug!(peer = %peer_id, "Survey response rejected by limiter");
             return;
@@ -4025,7 +4115,13 @@ impl App {
             return;
         }
 
-        let secret = { self.survey_secrets.read().await.get(&response_message.nonce).copied() };
+        let secret = {
+            self.survey_secrets
+                .read()
+                .await
+                .get(&response_message.nonce)
+                .copied()
+        };
 
         let secret = match secret {
             Some(secret) => secret,
@@ -4174,12 +4270,7 @@ impl App {
     ) {
         existing.node_data = incoming.node_data.clone();
 
-        let mut inbound = existing
-            .inbound_peers
-            .0
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut inbound = existing.inbound_peers.0.iter().cloned().collect::<Vec<_>>();
         inbound.extend(incoming.inbound_peers.0.iter().cloned());
         existing.inbound_peers.0 = inbound.try_into().unwrap_or_default();
 
@@ -4383,7 +4474,10 @@ impl App {
         for (peer_id, hashes) in per_peer {
             for chunk in hashes.chunks(max_advert_size) {
                 let tx_hashes = match TxAdvertVector::try_from(
-                    chunk.iter().map(|hash| Hash::from(*hash)).collect::<Vec<_>>(),
+                    chunk
+                        .iter()
+                        .map(|hash| Hash::from(*hash))
+                        .collect::<Vec<_>>(),
                 ) {
                     Ok(vec) => vec,
                     Err(_) => {
@@ -4422,10 +4516,9 @@ impl App {
         const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
         let ledger_close_ms = (self.herder.ledger_close_time() as u64).saturating_mul(1000);
         let ledger_close_ms = ledger_close_ms.max(1) as f64;
-        let ops_to_flood = self.config.overlay.flood_op_rate_per_ledger
-            * self.herder.max_tx_set_size() as f64;
-        let per_period = (ops_to_flood
-            * self.config.overlay.flood_advert_period_ms as f64
+        let ops_to_flood =
+            self.config.overlay.flood_op_rate_per_ledger * self.herder.max_tx_set_size() as f64;
+        let per_period = (ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
             / ledger_close_ms)
             .ceil()
             .max(1.0);
@@ -4436,10 +4529,9 @@ impl App {
         const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
         let ledger_close_ms = (self.herder.ledger_close_time() as u64).saturating_mul(1000);
         let ledger_close_ms = ledger_close_ms.max(1) as f64;
-        let ops_to_flood = self.config.overlay.flood_op_rate_per_ledger
-            * self.herder.max_queue_size_ops() as f64;
-        let per_period = (ops_to_flood
-            * self.config.overlay.flood_demand_period_ms as f64
+        let ops_to_flood =
+            self.config.overlay.flood_op_rate_per_ledger * self.herder.max_queue_size_ops() as f64;
+        let per_period = (ops_to_flood * self.config.overlay.flood_demand_period_ms as f64
             / ledger_close_ms)
             .ceil()
             .max(1.0);
@@ -4461,11 +4553,7 @@ impl App {
         }
     }
 
-    async fn record_tx_pull_latency(
-        &self,
-        hash: Hash256,
-        peer: &stellar_core_overlay::PeerId,
-    ) {
+    async fn record_tx_pull_latency(&self, hash: Hash256, peer: &stellar_core_overlay::PeerId) {
         let now = Instant::now();
         let mut history = self.tx_demand_history.write().await;
         let Some(entry) = history.get_mut(&hash) else {
@@ -4732,10 +4820,7 @@ impl App {
                     current
                 };
 
-                if !self
-                    .send_survey_start(&peers, nonce, ledger_num)
-                    .await
-                {
+                if !self.send_survey_start(&peers, nonce, ledger_num).await {
                     scheduler.next_action = now + SURVEY_INTERVAL;
                     return;
                 }
@@ -4964,11 +5049,12 @@ impl App {
             start_collecting: start.clone(),
         };
 
-        let sent = self.send_survey_message(
-            peers,
-            StellarMessage::TimeSlicedSurveyStartCollecting(signed),
-        )
-        .await;
+        let sent = self
+            .send_survey_message(
+                peers,
+                StellarMessage::TimeSlicedSurveyStartCollecting(signed),
+            )
+            .await;
         if sent {
             self.survey_results
                 .write()
@@ -4989,7 +5075,9 @@ impl App {
         let local_node_id = self.local_node_id();
         let secret = self.ensure_survey_secret(nonce).await;
         let public = CurvePublicKey::from(&secret);
-        let encryption_key = Curve25519Public { key: public.to_bytes() };
+        let encryption_key = Curve25519Public {
+            key: public.to_bytes(),
+        };
 
         let mut ok = true;
         for peer in peers {
@@ -5125,10 +5213,7 @@ impl App {
         );
     }
 
-    async fn stop_local_survey_collecting(
-        &self,
-        message: &TimeSlicedSurveyStopCollectingMessage,
-    ) {
+    async fn stop_local_survey_collecting(&self, message: &TimeSlicedSurveyStopCollectingMessage) {
         let (snapshots, added, dropped) = {
             let overlay = self.overlay.lock().await;
             let overlay = match overlay.as_ref() {
@@ -5145,7 +5230,8 @@ impl App {
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
 
         let mut survey_data = self.survey_data.write().await;
-        let _ = survey_data.stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync);
+        let _ =
+            survey_data.stop_collecting(message, &inbound, &outbound, added, dropped, lost_sync);
     }
 
     async fn handle_flood_advert(
@@ -5198,7 +5284,10 @@ impl App {
     }
 
     /// Process a peer list received from the network.
-    async fn process_peer_list(&self, peer_list: stellar_xdr::curr::VecM<stellar_xdr::curr::PeerAddress, 100>) {
+    async fn process_peer_list(
+        &self,
+        peer_list: stellar_xdr::curr::VecM<stellar_xdr::curr::PeerAddress, 100>,
+    ) {
         let overlay = self.overlay.lock().await;
         let overlay = match overlay.as_ref() {
             Some(o) => o,
@@ -5247,7 +5336,10 @@ impl App {
         let parts: Vec<&str> = value.split(':').collect();
         match parts.len() {
             1 => Some(PeerAddress::new(parts[0], 11625)),
-            2 => parts[1].parse().ok().map(|port| PeerAddress::new(parts[0], port)),
+            2 => parts[1]
+                .parse()
+                .ok()
+                .map(|port| PeerAddress::new(parts[0], port)),
             _ => None,
         }
     }
@@ -5283,21 +5375,13 @@ impl App {
         let now = current_epoch_seconds();
         for addr in &self.config.overlay.known_peers {
             if let Some(peer) = Self::parse_peer_address(addr) {
-                let record = stellar_core_db::queries::PeerRecord::new(
-                    now,
-                    0,
-                    PEER_TYPE_OUTBOUND,
-                );
+                let record = stellar_core_db::queries::PeerRecord::new(now, 0, PEER_TYPE_OUTBOUND);
                 let _ = self.db.store_peer(&peer.host, peer.port, record);
             }
         }
         for addr in &self.config.overlay.preferred_peers {
             if let Some(peer) = Self::parse_peer_address(addr) {
-                let record = stellar_core_db::queries::PeerRecord::new(
-                    now,
-                    0,
-                    PEER_TYPE_PREFERRED,
-                );
+                let record = stellar_core_db::queries::PeerRecord::new(now, 0, PEER_TYPE_PREFERRED);
                 let _ = self.db.store_peer(&peer.host, peer.port, record);
             }
         }
@@ -5510,9 +5594,14 @@ impl App {
     }
 
     /// Handle a GeneralizedTxSet message from the network.
-    async fn handle_generalized_tx_set(&self, gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet) {
-        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TxSetComponent, WriteXdr};
+    async fn handle_generalized_tx_set(
+        &self,
+        gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet,
+    ) {
         use stellar_core_herder::TransactionSet;
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, TransactionPhase, TxSetComponent, WriteXdr,
+        };
 
         // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
         // This matches how stellar-core computes it: xdrSha256(xdrTxSet)
@@ -5642,13 +5731,7 @@ impl App {
                     TransactionPhase::V1(parallel) => parallel
                         .execution_stages
                         .iter()
-                        .map(|stage| {
-                            stage
-                                .0
-                                .iter()
-                                .map(|cluster| cluster.0.len())
-                                .sum::<usize>()
-                        })
+                        .map(|stage| stage.0.iter().map(|cluster| cluster.0.len()).sum::<usize>())
                         .sum(),
                     TransactionPhase::V0(components) => components
                         .iter()
@@ -5686,7 +5769,10 @@ impl App {
 
         let received_slot = self.herder.receive_tx_set(internal_tx_set.clone());
         if let Some(slot) = received_slot {
-            tracing::info!(slot, "Received pending GeneralizedTxSet, attempting ledger close");
+            tracing::info!(
+                slot,
+                "Received pending GeneralizedTxSet, attempting ledger close"
+            );
             self.try_close_slot_directly(slot).await;
         } else if self.attach_tx_set_by_hash(&internal_tx_set).await
             || self.buffer_externalized_tx_set(&internal_tx_set).await
@@ -5849,22 +5935,19 @@ impl App {
                         return None;
                     }
                     let throttle = std::time::Duration::from_millis(200);
-                    let mut request_state = last_request.get(hash).cloned().unwrap_or(
-                        TxSetRequestState {
-                            last_request: now
-                                .checked_sub(throttle)
-                                .unwrap_or(now),
-                            next_peer_offset: 0,
-                        },
-                    );
+                    let mut request_state =
+                        last_request
+                            .get(hash)
+                            .cloned()
+                            .unwrap_or(TxSetRequestState {
+                                last_request: now.checked_sub(throttle).unwrap_or(now),
+                                next_peer_offset: 0,
+                            });
                     if now.duration_since(request_state.last_request) < throttle {
                         return None;
                     }
-                    let start_idx = Self::tx_set_start_index(
-                        hash,
-                        peers.len(),
-                        request_state.next_peer_offset,
-                    );
+                    let start_idx =
+                        Self::tx_set_start_index(hash, peers.len(), request_state.next_peer_offset);
                     let eligible_peer = match dont_have.get_mut(hash) {
                         Some(set) => {
                             let mut found = None;
@@ -5885,7 +5968,8 @@ impl App {
                                     total_peers = peers.len(),
                                     "All peers exhausted for tx set - triggering faster catchup"
                                 );
-                                self.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
+                                self.tx_set_all_peers_exhausted
+                                    .store(true, Ordering::SeqCst);
                                 // Don't clear the set or return a peer - stop requesting this tx set
                                 // until catchup or tx_set tracking is reset.
                             }
@@ -5894,15 +5978,13 @@ impl App {
                         None => peers.get(start_idx),
                     };
 
-                    eligible_peer
-                        .cloned()
-                        .map(|peer_id| {
-                            request_state.last_request = now;
-                            request_state.next_peer_offset =
-                                request_state.next_peer_offset.saturating_add(1);
-                            last_request.insert(*hash, request_state);
-                            (*hash, peer_id)
-                        })
+                    eligible_peer.cloned().map(|peer_id| {
+                        request_state.last_request = now;
+                        request_state.next_peer_offset =
+                            request_state.next_peer_offset.saturating_add(1);
+                        last_request.insert(*hash, request_state);
+                        (*hash, peer_id)
+                    })
                 })
                 .collect()
         };
@@ -6010,9 +6092,7 @@ fn update_peer_record(db: &stellar_core_db::Database, event: PeerEvent) {
     match event {
         PeerEvent::Connected(addr, peer_type) => {
             let existing = db.load_peer(&addr.host, addr.port).ok().flatten();
-            let existing_type = existing
-                .map(|r| r.peer_type)
-                .unwrap_or(PEER_TYPE_INBOUND);
+            let existing_type = existing.map(|r| r.peer_type).unwrap_or(PEER_TYPE_INBOUND);
             let mapped = match peer_type {
                 PeerType::Inbound => match existing_type {
                     PEER_TYPE_PREFERRED => PEER_TYPE_PREFERRED,
@@ -6036,9 +6116,7 @@ fn update_peer_record(db: &stellar_core_db::Database, event: PeerEvent) {
             failures = failures.saturating_add(1);
             let backoff = compute_peer_backoff_secs(failures);
             let next_attempt = now.saturating_add(backoff);
-            let existing_type = existing
-                .map(|r| r.peer_type)
-                .unwrap_or(PEER_TYPE_INBOUND);
+            let existing_type = existing.map(|r| r.peer_type).unwrap_or(PEER_TYPE_INBOUND);
             let mapped = match peer_type {
                 PeerType::Inbound => match existing_type {
                     PEER_TYPE_PREFERRED => PEER_TYPE_PREFERRED,
@@ -6250,12 +6328,8 @@ impl HerderCallback for App {
         };
 
         // Create close data
-        let mut close_data = LedgerCloseData::new(
-            ledger_seq,
-            tx_set_variant.clone(),
-            close_time,
-            prev_hash,
-        );
+        let mut close_data =
+            LedgerCloseData::new(ledger_seq, tx_set_variant.clone(), close_time, prev_hash);
         let decoded_upgrades = decode_upgrades(upgrades);
         if !decoded_upgrades.is_empty() {
             close_data = close_data.with_upgrades(decoded_upgrades);
@@ -6271,7 +6345,10 @@ impl HerderCallback for App {
 
         // Apply transactions
         let results = close_ctx.apply_transactions().map_err(|e| {
-            stellar_core_herder::HerderError::Internal(format!("Failed to apply transactions: {}", e))
+            stellar_core_herder::HerderError::Internal(format!(
+                "Failed to apply transactions: {}",
+                e
+            ))
         })?;
 
         let success_count = results.iter().filter(|r| r.success).count();
@@ -6363,7 +6440,8 @@ impl HerderCallback for App {
         self.sync_recovery_heartbeat();
 
         // Reset the tx set exhausted flag - we're making progress
-        self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
+        self.tx_set_all_peers_exhausted
+            .store(false, Ordering::SeqCst);
 
         tracing::info!(
             ledger_seq = result.ledger_seq(),
@@ -6398,7 +6476,8 @@ impl SyncRecoveryCallback for App {
         tracing::warn!("Lost sync with network - transitioning to syncing state");
         self.lost_sync_count.fetch_add(1, Ordering::Relaxed);
         // Update herder state to syncing
-        self.herder.set_state(stellar_core_herder::HerderState::Syncing);
+        self.herder
+            .set_state(stellar_core_herder::HerderState::Syncing);
     }
 
     fn on_out_of_sync_recovery(&self) {
@@ -6834,11 +6913,18 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Initially in Booting state
-        assert_eq!(app.herder.state(), stellar_core_herder::HerderState::Booting);
+        assert_eq!(
+            app.herder.state(),
+            stellar_core_herder::HerderState::Booting
+        );
 
         // Can set to Syncing
-        app.herder.set_state(stellar_core_herder::HerderState::Syncing);
-        assert_eq!(app.herder.state(), stellar_core_herder::HerderState::Syncing);
+        app.herder
+            .set_state(stellar_core_herder::HerderState::Syncing);
+        assert_eq!(
+            app.herder.state(),
+            stellar_core_herder::HerderState::Syncing
+        );
     }
 
     #[tokio::test]

@@ -61,10 +61,7 @@ pub trait PeerQueries {
     fn store_peer(&self, host: &str, port: u16, record: PeerRecord) -> Result<(), DbError>;
 
     /// Loads peer records, optionally limited to a maximum count.
-    fn load_peers(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
+    fn load_peers(&self, limit: Option<usize>) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
     /// Loads random peers matching the specified constraints.
     ///
@@ -149,10 +146,7 @@ impl PeerQueries for Connection {
         Ok(())
     }
 
-    fn load_peers(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError> {
+    fn load_peers(&self, limit: Option<usize>) -> Result<Vec<(String, u16, PeerRecord)>, DbError> {
         let mut sql = String::from("SELECT ip, port, nextattempt, numfailures, type FROM peers");
         if limit.is_some() {
             sql.push_str(" LIMIT ?1");
@@ -227,19 +221,16 @@ impl PeerQueries for Connection {
                 results.push(row?);
             }
         } else {
-            let rows = stmt.query_map(
-                params![max_failures as i64, now, limit as i64],
-                |row| {
-                    let host: String = row.get(0)?;
-                    let port: i64 = row.get(1)?;
-                    let record = PeerRecord {
-                        next_attempt: row.get(2)?,
-                        num_failures: row.get::<_, i64>(3)? as u32,
-                        peer_type: row.get(4)?,
-                    };
-                    Ok((host, port as u16, record))
-                },
-            )?;
+            let rows = stmt.query_map(params![max_failures as i64, now, limit as i64], |row| {
+                let host: String = row.get(0)?;
+                let port: i64 = row.get(1)?;
+                let record = PeerRecord {
+                    next_attempt: row.get(2)?,
+                    num_failures: row.get::<_, i64>(3)? as u32,
+                    peer_type: row.get(4)?,
+                };
+                Ok((host, port as u16, record))
+            })?;
             for row in rows {
                 results.push(row?);
             }
@@ -445,9 +436,7 @@ mod tests {
         conn.store_peer("1.2.3.5", 2, PeerRecord::new(2, 0, 2))
             .unwrap();
 
-        let peers = conn
-            .load_random_peers(1, 10, 10, Some(1))
-            .unwrap();
+        let peers = conn.load_random_peers(1, 10, 10, Some(1)).unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].0, "1.2.3.4");
     }

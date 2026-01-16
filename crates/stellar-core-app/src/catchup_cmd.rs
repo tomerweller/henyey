@@ -192,9 +192,9 @@ pub fn parse_target(target: &str) -> anyhow::Result<CatchupTarget> {
         let ledger_str = &target[..slash_pos];
         let _count_str = &target[slash_pos + 1..];
 
-        let ledger: u32 = ledger_str.parse().map_err(|_| {
-            anyhow::anyhow!("Invalid ledger number: {}", ledger_str)
-        })?;
+        let ledger: u32 = ledger_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid ledger number: {}", ledger_str))?;
 
         // For now, ignore the count and just target the ledger
         // A full implementation would use this for "recent" mode
@@ -213,7 +213,10 @@ pub fn parse_target(target: &str) -> anyhow::Result<CatchupTarget> {
 }
 
 /// Run the catchup command.
-pub async fn run_catchup(config: AppConfig, options: CatchupOptions) -> anyhow::Result<CatchupResult> {
+pub async fn run_catchup(
+    config: AppConfig,
+    options: CatchupOptions,
+) -> anyhow::Result<CatchupResult> {
     tracing::info!(
         target = %options.target,
         mode = %options.mode,
@@ -322,7 +325,12 @@ impl CatchupProgressCallback for TracingProgressCallback {
         } else {
             0.0
         };
-        tracing::info!(current, total, percent = format!("{:.1}%", percent), message);
+        tracing::info!(
+            current,
+            total,
+            percent = format!("{:.1}%", percent),
+            message
+        );
     }
 
     fn on_complete(&self, result: &CatchupResult) {

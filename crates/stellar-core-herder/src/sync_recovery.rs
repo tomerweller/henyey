@@ -95,12 +95,17 @@ impl SyncRecoveryHandle {
     /// - New SCP messages are received
     /// - Ledger application completes
     pub async fn tracking_heartbeat(&self) {
-        let _ = self.sender.send(SyncRecoveryCommand::TrackingHeartbeat).await;
+        let _ = self
+            .sender
+            .send(SyncRecoveryCommand::TrackingHeartbeat)
+            .await;
     }
 
     /// Try to send heartbeat (non-blocking).
     pub fn try_tracking_heartbeat(&self) -> bool {
-        self.sender.try_send(SyncRecoveryCommand::TrackingHeartbeat).is_ok()
+        self.sender
+            .try_send(SyncRecoveryCommand::TrackingHeartbeat)
+            .is_ok()
     }
 
     /// Stop tracking (entering syncing state).
@@ -115,7 +120,10 @@ impl SyncRecoveryHandle {
 
     /// Set whether ledger application is in progress.
     pub async fn set_applying_ledger(&self, applying: bool) {
-        let _ = self.sender.send(SyncRecoveryCommand::SetApplyingLedger(applying)).await;
+        let _ = self
+            .sender
+            .send(SyncRecoveryCommand::SetApplyingLedger(applying))
+            .await;
     }
 
     /// Try to set applying ledger (non-blocking).
@@ -274,7 +282,10 @@ impl<C: SyncRecoveryCallback> SyncRecoveryManager<C> {
         self.state = SyncState::Tracking;
         self.tracking_deadline = Some(Instant::now() + CONSENSUS_STUCK_TIMEOUT);
         self.recovery_deadline = None;
-        debug!("Started tracking with {}s timeout", CONSENSUS_STUCK_TIMEOUT.as_secs());
+        debug!(
+            "Started tracking with {}s timeout",
+            CONSENSUS_STUCK_TIMEOUT.as_secs()
+        );
     }
 
     /// Handle timer expiration.

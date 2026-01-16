@@ -213,7 +213,7 @@ impl QuorumSetConfig {
     ///
     /// Returns None if the quorum set is empty or has invalid validators.
     pub fn to_xdr(&self) -> Option<stellar_xdr::curr::ScpQuorumSet> {
-        use stellar_xdr::curr::{ScpQuorumSet, NodeId, PublicKey, Uint256};
+        use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
 
         // Parse validator public keys
         let mut validators = Vec::new();
@@ -221,7 +221,8 @@ impl QuorumSetConfig {
             // Parse G... public key to bytes
             match stellar_core_crypto::PublicKey::from_strkey(v) {
                 Ok(pubkey) => {
-                    let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(*pubkey.as_bytes())));
+                    let node_id =
+                        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(*pubkey.as_bytes())));
                     validators.push(node_id);
                 }
                 Err(e) => {
@@ -341,7 +342,9 @@ impl UpgradeConfig {
             upgrades.push(stellar_xdr::curr::LedgerUpgrade::BaseReserve(reserve));
         }
         if let Some(max_tx_set_size) = self.max_tx_set_size {
-            upgrades.push(stellar_xdr::curr::LedgerUpgrade::MaxTxSetSize(max_tx_set_size));
+            upgrades.push(stellar_xdr::curr::LedgerUpgrade::MaxTxSetSize(
+                max_tx_set_size,
+            ));
         }
         upgrades
     }
@@ -954,7 +957,9 @@ impl AppConfig {
             }
         }
 
-        let total_bytes = self.surge_pricing.classic_byte_allowance
+        let total_bytes = self
+            .surge_pricing
+            .classic_byte_allowance
             .saturating_add(self.surge_pricing.soroban_byte_allowance);
         if total_bytes > 10 * 1024 * 1024 {
             anyhow::bail!("surge_pricing byte allowances exceed 10MB total");
@@ -1154,9 +1159,8 @@ mod tests {
     fn test_validation_validator_with_unsafe_quorum() {
         let mut config = AppConfig::default();
         config.node.is_validator = true;
-        config.node.node_seed = Some(
-            "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string(),
-        );
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
         config.node.quorum_set.validators = vec![
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string(),
             "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQB4".to_string(),
@@ -1198,9 +1202,9 @@ mod tests {
         let bytes: Vec<[u8; 32]> = validators
             .iter()
             .map(|node_id| match &node_id.0 {
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    stellar_xdr::curr::Uint256(bytes),
-                ) => *bytes,
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                    bytes,
+                )) => *bytes,
             })
             .collect();
         assert!(bytes[0] <= bytes[1]);

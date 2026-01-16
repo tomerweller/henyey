@@ -1,9 +1,9 @@
 //! AccountMerge operation execution.
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId,
-    AccountMergeResult, AccountMergeResultCode, Liabilities, MuxedAccount, OperationResult,
-    OperationResultTr, LedgerKey, LedgerKeyAccount, SponsorshipDescriptor,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, AccountMergeResult,
+    AccountMergeResultCode, LedgerKey, LedgerKeyAccount, Liabilities, MuxedAccount,
+    OperationResult, OperationResultTr, SponsorshipDescriptor,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -237,7 +237,9 @@ mod tests {
         );
         let result = result.expect("account merge");
         match result {
-            OperationResult::OpInner(OperationResultTr::AccountMerge(AccountMergeResult::Success(amount))) => {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(
+                AccountMergeResult::Success(amount),
+            )) => {
                 assert_eq!(amount, 100_000_000);
             }
             other => panic!("unexpected result: {:?}", other),

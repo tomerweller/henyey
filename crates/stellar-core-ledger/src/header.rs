@@ -305,7 +305,7 @@ pub fn create_next_header(
     inflation_seq: u32,
 ) -> LedgerHeader {
     let new_seq = prev_header.ledger_seq + 1;
-    
+
     // Start with the previous header's skip_list, then update it
     let mut header = LedgerHeader {
         ledger_version: prev_header.ledger_version,
@@ -329,10 +329,10 @@ pub fn create_next_header(
         skip_list: prev_header.skip_list.clone(),
         ext: stellar_xdr::curr::LedgerHeaderExt::V0,
     };
-    
+
     // Update skip_list based on the new bucket_list_hash (only at seq % 50 == 0)
     calculate_skip_values(&mut header);
-    
+
     header
 }
 

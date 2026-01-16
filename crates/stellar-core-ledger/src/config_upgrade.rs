@@ -19,13 +19,13 @@
 //! 4. If valid, the CONFIG_SETTING entries are updated in the ledger
 
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
     ContractDataDurability, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
     LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::delta::LedgerDelta;
@@ -362,7 +362,10 @@ impl ConfigUpgradeSetFrame {
 
             // Load the current entry from the ledger
             let current_entry = snapshot.get_entry(&key).map_err(|e| {
-                LedgerError::Internal(format!("Failed to load config setting {:?}: {}", setting_id, e))
+                LedgerError::Internal(format!(
+                    "Failed to load config setting {:?}: {}",
+                    setting_id, e
+                ))
             })?;
 
             let previous = match current_entry {
@@ -460,9 +463,7 @@ impl ConfigUpgradeSetFrame {
     /// Validate a config setting entry against constraints.
     fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, ledger_version: u32) -> bool {
         match entry {
-            ConfigSettingEntry::ContractMaxSizeBytes(v) => {
-                *v >= min_config::MAX_CONTRACT_SIZE
-            }
+            ConfigSettingEntry::ContractMaxSizeBytes(v) => *v >= min_config::MAX_CONTRACT_SIZE,
             ConfigSettingEntry::ContractCostParamsCpuInstructions(_) => {
                 // Cost params validation is complex, accept for now
                 true
@@ -489,9 +490,7 @@ impl ConfigUpgradeSetFrame {
                     && compute.ledger_max_instructions >= compute.tx_max_instructions
                     && compute.tx_memory_limit >= min_config::MEMORY_LIMIT
             }
-            ConfigSettingEntry::ContractHistoricalDataV0(hist) => {
-                hist.fee_historical1_kb >= 0
-            }
+            ConfigSettingEntry::ContractHistoricalDataV0(hist) => hist.fee_historical1_kb >= 0,
             ConfigSettingEntry::ContractLedgerCostV0(cost) => {
                 cost.tx_max_disk_read_entries >= min_config::TX_MAX_READ_LEDGER_ENTRIES
                     && cost.ledger_max_disk_read_entries >= cost.tx_max_disk_read_entries
@@ -629,6 +628,9 @@ mod tests {
         let upgrade_set = ConfigUpgradeSet {
             updated_entry: vec![].try_into().unwrap(),
         };
-        assert!(!ConfigUpgradeSetFrame::is_valid_xdr_static(&upgrade_set, &key));
+        assert!(!ConfigUpgradeSetFrame::is_valid_xdr_static(
+            &upgrade_set,
+            &key
+        ));
     }
 }

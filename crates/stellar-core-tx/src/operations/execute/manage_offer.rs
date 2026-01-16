@@ -7,20 +7,20 @@ use std::cmp::Ordering;
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
-    Asset, ClaimAtom, ClaimOfferAtom, CreatePassiveSellOfferOp, Liabilities, ManageBuyOfferOp,
-    ManageOfferSuccessResult, ManageOfferSuccessResultOffer, ManageSellOfferOp,
-    ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt, OfferEntryFlags,
-    OperationResult, OperationResultTr, Price, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags, LedgerKey, LedgerKeyOffer,
+    Asset, ClaimAtom, ClaimOfferAtom, CreatePassiveSellOfferOp, LedgerKey, LedgerKeyOffer,
+    Liabilities, ManageBuyOfferOp, ManageOfferSuccessResult, ManageOfferSuccessResultOffer,
+    ManageSellOfferOp, ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt,
+    OfferEntryFlags, OperationResult, OperationResultTr, Price, TrustLineEntry, TrustLineEntryExt,
+    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
-use crate::state::LedgerStateManager;
-use crate::validation::LedgerContext;
-use crate::{Result, TxError};
 use super::offer_exchange::{
     adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError,
     RoundingType,
 };
+use crate::state::LedgerStateManager;
+use crate::validation::LedgerContext;
+use crate::{Result, TxError};
 
 /// Execute a ManageSellOffer operation.
 ///
@@ -124,22 +124,22 @@ fn execute_manage_offer(
         if issuer_for_asset(selling) == Some(source) {
             // Issuer can always sell its own asset.
         } else {
-        let trustline = match state.get_trustline(source, selling) {
-            Some(tl) => tl,
-            None => {
+            let trustline = match state.get_trustline(source, selling) {
+                Some(tl) => tl,
+                None => {
+                    return Ok(make_sell_offer_result(
+                        ManageSellOfferResultCode::SellNoTrust,
+                        None,
+                    ));
+                }
+            };
+
+            if !is_trustline_authorized(trustline.flags) {
                 return Ok(make_sell_offer_result(
-                    ManageSellOfferResultCode::SellNoTrust,
+                    ManageSellOfferResultCode::SellNotAuthorized,
                     None,
                 ));
             }
-        };
-
-        if !is_trustline_authorized(trustline.flags) {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::SellNotAuthorized,
-                None,
-            ));
-        }
         }
     } else {
         // For native asset, check account exists
@@ -162,22 +162,22 @@ fn execute_manage_offer(
         if issuer_for_asset(buying) == Some(source) {
             // Issuer can always receive its own asset.
         } else {
-        let trustline = match state.get_trustline(source, buying) {
-            Some(tl) => tl,
-            None => {
+            let trustline = match state.get_trustline(source, buying) {
+                Some(tl) => tl,
+                None => {
+                    return Ok(make_sell_offer_result(
+                        ManageSellOfferResultCode::BuyNoTrust,
+                        None,
+                    ));
+                }
+            };
+
+            if !is_trustline_authorized(trustline.flags) {
                 return Ok(make_sell_offer_result(
-                    ManageSellOfferResultCode::BuyNoTrust,
+                    ManageSellOfferResultCode::BuyNotAuthorized,
                     None,
                 ));
             }
-        };
-
-        if !is_trustline_authorized(trustline.flags) {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::BuyNotAuthorized,
-                None,
-            ));
-        }
         }
     }
 
@@ -212,11 +212,18 @@ fn execute_manage_offer(
     }
 
     let (mut offer_flags, was_passive) = if let Some(old) = &old_offer {
-        (old.flags, (old.flags & (OfferEntryFlags::PassiveFlag as u32)) != 0)
+        (
+            old.flags,
+            (old.flags & (OfferEntryFlags::PassiveFlag as u32)) != 0,
+        )
     } else {
         (0, false)
     };
-    let passive = if old_offer.is_some() { was_passive } else { passive };
+    let passive = if old_offer.is_some() {
+        was_passive
+    } else {
+        passive
+    };
 
     if passive {
         offer_flags |= OfferEntryFlags::PassiveFlag as u32;
@@ -257,8 +264,7 @@ fn execute_manage_offer(
         ));
     }
 
-    let mut max_sheep_send =
-        can_sell_at_most(source, selling, state, context, reserve_subentry)?;
+    let mut max_sheep_send = can_sell_at_most(source, selling, state, context, reserve_subentry)?;
     let mut max_wheat_receive = can_buy_at_most(source, buying, state);
     offer_kind.apply_limits(&mut max_sheep_send, 0, &mut max_wheat_receive, 0);
     if max_wheat_receive == 0 {
@@ -311,8 +317,7 @@ fn execute_manage_offer(
     }
 
     let amount = if sheep_stays {
-        let mut sheep_limit =
-            can_sell_at_most(source, selling, state, context, reserve_subentry)?;
+        let mut sheep_limit = can_sell_at_most(source, selling, state, context, reserve_subentry)?;
         let mut wheat_limit = can_buy_at_most(source, buying, state);
         offer_kind.apply_limits(
             &mut sheep_limit,
@@ -320,8 +325,7 @@ fn execute_manage_offer(
             &mut wheat_limit,
             wheat_received,
         );
-        adjust_offer_amount(price.clone(), sheep_limit, wheat_limit)
-            .map_err(map_exchange_error)?
+        adjust_offer_amount(price.clone(), sheep_limit, wheat_limit).map_err(map_exchange_error)?
     } else {
         0
     };
@@ -390,14 +394,7 @@ fn execute_manage_offer(
 
     if amount > 0 {
         let (new_selling, new_buying) = offer_liabilities_sell(amount, price)?;
-        apply_liabilities_delta(
-            source,
-            selling,
-            buying,
-            new_selling,
-            new_buying,
-            state,
-        )?;
+        apply_liabilities_delta(source, selling, buying, new_selling, new_buying, state)?;
     }
 
     let success = ManageOfferSuccessResult {
@@ -437,11 +434,11 @@ pub fn execute_manage_buy_offer(
     )?;
 
     match result {
-        OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => Ok(
-            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(convert_sell_to_buy_result(
-                r,
-            ))),
-        ),
+        OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+            Ok(OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
+                convert_sell_to_buy_result(r),
+            )))
+        }
         other => Ok(other),
     }
 }
@@ -501,7 +498,8 @@ impl OfferKind {
                 *max_sheep_send = (*max_sheep_send).min(amount.saturating_sub(sheep_sent));
             }
             OfferKind::Buy { buy_amount } => {
-                *max_wheat_receive = (*max_wheat_receive).min(buy_amount.saturating_sub(wheat_received));
+                *max_wheat_receive =
+                    (*max_wheat_receive).min(buy_amount.saturating_sub(wheat_received));
             }
         }
     }
@@ -755,8 +753,7 @@ fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager
         let Some(account) = state.get_account(source) else {
             return 0;
         };
-        let available =
-            i64::MAX - account.balance - account_liabilities(account).buying;
+        let available = i64::MAX - account.balance - account_liabilities(account).buying;
         return available.max(0);
     }
 
@@ -770,8 +767,7 @@ fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager
     if !is_authorized_to_maintain_liabilities(trustline.flags) {
         return 0;
     }
-    let available =
-        trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
+    let available = trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
     available.max(0)
 }
 
@@ -783,7 +779,9 @@ fn apply_balance_delta(
 ) -> Result<()> {
     if matches!(asset, Asset::Native) {
         let Some(account) = state.get_account_mut(account_id) else {
-            return Err(TxError::Internal("missing account for balance update".into()));
+            return Err(TxError::Internal(
+                "missing account for balance update".into(),
+            ));
         };
         let new_balance = account
             .balance
@@ -801,7 +799,9 @@ fn apply_balance_delta(
     }
 
     let Some(tl) = state.get_trustline_mut(account_id, asset) else {
-        return Err(TxError::Internal("missing trustline for balance update".into()));
+        return Err(TxError::Internal(
+            "missing trustline for balance update".into(),
+        ));
     };
     let new_balance = tl
         .balance
@@ -942,8 +942,9 @@ fn cross_offer_v10(
         state,
     )?;
 
-    let max_wheat_send =
-        offer.amount.min(can_sell_at_most(&seller, &wheat, state, context, false)?);
+    let max_wheat_send = offer
+        .amount
+        .min(can_sell_at_most(&seller, &wheat, state, context, false)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
     let adjusted_offer_amount =
         adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
@@ -1346,7 +1347,10 @@ mod tests {
         let min_balance = state
             .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
             .unwrap();
-        state.create_account(create_test_account(issuer_id.clone(), min_balance + 10_000_000));
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            min_balance + 10_000_000,
+        ));
 
         let selling = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -1379,7 +1383,10 @@ mod tests {
         let min_balance = state
             .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
             .unwrap();
-        state.create_account(create_test_account(issuer_id.clone(), min_balance + 10_000_000));
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            min_balance + 10_000_000,
+        ));
 
         let buying = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -1568,10 +1575,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1612,10 +1616,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1655,10 +1656,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1699,10 +1697,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1743,10 +1738,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1769,9 +1761,9 @@ mod tests {
         };
         let created = execute_manage_sell_offer(&create, &source_id, &mut state, &context).unwrap();
         let offer_id = match created {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
-                ManageOfferSuccessResult { offer, .. },
-            ))) => match offer {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(ManageOfferSuccessResult { offer, .. }),
+            )) => match offer {
                 ManageOfferSuccessResultOffer::Created(entry) => entry.offer_id,
                 _ => panic!("expected created offer"),
             },
@@ -1816,10 +1808,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1842,9 +1831,9 @@ mod tests {
         };
         let created = execute_manage_sell_offer(&create, &source_id, &mut state, &context).unwrap();
         let offer_id = match created {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
-                ManageOfferSuccessResult { offer, .. },
-            ))) => match offer {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(ManageOfferSuccessResult { offer, .. }),
+            )) => match offer {
                 ManageOfferSuccessResultOffer::Created(entry) => entry.offer_id,
                 _ => panic!("expected created offer"),
             },
@@ -1889,10 +1878,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state
-            .get_account_mut(&issuer_id)
-            .unwrap()
-            .flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1915,9 +1901,9 @@ mod tests {
         };
         let created = execute_manage_sell_offer(&create, &source_id, &mut state, &context).unwrap();
         let offer_id = match created {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
-                ManageOfferSuccessResult { offer, .. },
-            ))) => match offer {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(ManageOfferSuccessResult { offer, .. }),
+            )) => match offer {
                 ManageOfferSuccessResultOffer::Created(entry) => entry.offer_id,
                 _ => panic!("expected created offer"),
             },
@@ -1945,9 +1931,9 @@ mod tests {
 
         let result = execute_manage_sell_offer(&delete, &source_id, &mut state, &context).unwrap();
         match result {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
-                ManageOfferSuccessResult { offer, .. },
-            ))) => assert!(matches!(offer, ManageOfferSuccessResultOffer::Deleted)),
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(ManageOfferSuccessResult { offer, .. }),
+            )) => assert!(matches!(offer, ManageOfferSuccessResultOffer::Deleted)),
             _ => panic!("Unexpected result type"),
         }
         assert!(state.get_offer(&source_id, offer_id).is_none());
@@ -2138,9 +2124,9 @@ mod tests {
 
         let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
         match result {
-            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(ManageBuyOfferResult::Success(
-                ManageOfferSuccessResult { offer, .. },
-            ))) => match offer {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
+                ManageBuyOfferResult::Success(ManageOfferSuccessResult { offer, .. }),
+            )) => match offer {
                 ManageOfferSuccessResultOffer::Created(entry) => entry.amount,
                 _ => panic!("expected created offer"),
             },
@@ -2197,9 +2183,9 @@ mod tests {
 
         let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
         match result {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
-                ManageOfferSuccessResult { offer, .. },
-            ))) => match offer {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(ManageOfferSuccessResult { offer, .. }),
+            )) => match offer {
                 ManageOfferSuccessResultOffer::Created(entry) => entry.amount,
                 _ => panic!("expected created offer"),
             },

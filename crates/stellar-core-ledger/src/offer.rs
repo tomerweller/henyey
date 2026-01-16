@@ -325,9 +325,11 @@ mod tests {
         let native = Asset::Native;
         let credit = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
             asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
-            issuer: stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([0; 32]),
-            )),
+            issuer: stellar_xdr::curr::AccountId(
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                    [0; 32],
+                )),
+            ),
         });
 
         let pair1 = AssetPair::new(native.clone(), credit.clone());
@@ -345,9 +347,11 @@ mod tests {
         let native = Asset::Native;
         let credit = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
             asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
-            issuer: stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([0; 32]),
-            )),
+            issuer: stellar_xdr::curr::AccountId(
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                    [0; 32],
+                )),
+            ),
         });
 
         let pair = AssetPair::new(native.clone(), credit.clone());

@@ -76,10 +76,10 @@
 //! the `ledger_version` in the current header. This ensures backward compatibility as
 //! new features are introduced in newer protocol versions.
 
-use stellar_core_common::Hash256;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use stellar_core_common::Hash256;
 use stellar_xdr::curr::{
-    AccountId, AlphaNum4, AlphaNum12, Asset, AssetCode12, AssetCode4, ContractEvent,
+    AccountId, AlphaNum12, AlphaNum4, Asset, AssetCode12, AssetCode4, ContractEvent,
     ContractEventBody, ContractEventV0, ContractId, ContractIdPreimage, Hash, HashIdPreimage,
     HashIdPreimageContractId, LedgerEntry, LedgerEntryData, LedgerHeader, ScAddress, ScVal,
 };
@@ -303,7 +303,9 @@ pub struct InvariantManager {
 impl InvariantManager {
     /// Creates a new empty invariant manager.
     pub fn new() -> Self {
-        Self { invariants: Vec::new() }
+        Self {
+            invariants: Vec::new(),
+        }
     }
 
     /// Adds an invariant to the manager.
@@ -879,7 +881,9 @@ impl Invariant for LedgerEntryIsValid {
                         _ => unreachable!("entry data already matched"),
                     };
                     let cp = match &pool.body {
-                        stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => cp,
+                        stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                            cp,
+                        ) => cp,
                     };
                     if !asset_valid(&cp.params.asset_a) {
                         return Err(InvariantError::Violated {
@@ -1074,9 +1078,7 @@ impl Invariant for SponsorshipCountIsValid {
         }
 
         for change in ctx.changes {
-            let account_entry = change
-                .current_entry()
-                .or_else(|| change.previous_entry());
+            let account_entry = change.current_entry().or_else(|| change.previous_entry());
             let account = match account_entry {
                 Some(entry) => match &entry.data {
                     LedgerEntryData::Account(account) => account,
@@ -1089,8 +1091,18 @@ impl Invariant for SponsorshipCountIsValid {
             let mut delta_num_sponsoring = 0i64;
             let mut delta_num_sponsored = 0i64;
 
-            get_delta_sponsoring_and_sponsored(change.current_entry(), &mut delta_num_sponsoring, &mut delta_num_sponsored, 1)?;
-            get_delta_sponsoring_and_sponsored(change.previous_entry(), &mut delta_num_sponsoring, &mut delta_num_sponsored, -1)?;
+            get_delta_sponsoring_and_sponsored(
+                change.current_entry(),
+                &mut delta_num_sponsoring,
+                &mut delta_num_sponsored,
+                1,
+            )?;
+            get_delta_sponsoring_and_sponsored(
+                change.previous_entry(),
+                &mut delta_num_sponsoring,
+                &mut delta_num_sponsored,
+                -1,
+            )?;
 
             let expected_sponsoring = *num_sponsoring.get(&account_id).unwrap_or(&0);
             if expected_sponsoring != delta_num_sponsoring {
@@ -1202,8 +1214,7 @@ impl Invariant for AccountSubEntriesCountIsValid {
                 if let LedgerEntryData::Account(account) = &previous.data {
                     let account_id = account.account_id.clone();
                     if let Some(change) = subentry_changes.get(&account_id) {
-                        let num_signers = account.num_sub_entries as i32
-                            + change.num_sub_entries
+                        let num_signers = account.num_sub_entries as i32 + change.num_sub_entries
                             - change.signers;
                         if num_signers != account.signers.len() as i32 {
                             let other_subentries =
@@ -1270,8 +1281,10 @@ impl Invariant for LiabilitiesMatchOffers {
             return Ok(());
         }
 
-        let mut delta_liabilities: HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>> =
-            HashMap::new();
+        let mut delta_liabilities: HashMap<
+            AccountId,
+            HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>,
+        > = HashMap::new();
 
         for change in ctx.changes {
             check_trustline_authorization(change)?;
@@ -1451,8 +1464,10 @@ impl Invariant for OrderBookIsNotCrossed {
             return Ok(());
         };
 
-        let mut order_book: HashMap<(stellar_xdr::curr::Asset, stellar_xdr::curr::Asset), BTreeSet<OfferView>> =
-            HashMap::new();
+        let mut order_book: HashMap<
+            (stellar_xdr::curr::Asset, stellar_xdr::curr::Asset),
+            BTreeSet<OfferView>,
+        > = HashMap::new();
         for entry in entries {
             if let LedgerEntryData::Offer(offer) = &entry.data {
                 order_book
@@ -1620,15 +1635,12 @@ impl Invariant for EventsAreConsistentWithEntryDiffs {
         }
 
         let mut stellar_asset_contract_ids = HashMap::new();
-        let mut aggregated = aggregate_event_diffs(
-            &self.network_id,
-            &mut stellar_asset_contract_ids,
-            events,
-        )
-        .ok_or_else(|| InvariantError::Violated {
-            name: self.name().to_string(),
-            details: "received invalid events".to_string(),
-        })?;
+        let mut aggregated =
+            aggregate_event_diffs(&self.network_id, &mut stellar_asset_contract_ids, events)
+                .ok_or_else(|| InvariantError::Violated {
+                    name: self.name().to_string(),
+                    details: "received invalid events".to_string(),
+                })?;
 
         for change in ctx.changes {
             let res = verify_events_delta(
@@ -1675,12 +1687,7 @@ struct AggregatedEvents {
 }
 
 impl AggregatedEvents {
-    fn add_asset_balance(
-        &mut self,
-        addr: &ScAddress,
-        asset: &Asset,
-        amount: i128,
-    ) -> bool {
+    fn add_asset_balance(&mut self, addr: &ScAddress, asset: &Asset, amount: i128) -> bool {
         let entry = self
             .event_amounts
             .entry(addr.clone())
@@ -1695,12 +1702,7 @@ impl AggregatedEvents {
         }
     }
 
-    fn subtract_asset_balance(
-        &mut self,
-        addr: &ScAddress,
-        asset: &Asset,
-        amount: i128,
-    ) -> bool {
+    fn subtract_asset_balance(&mut self, addr: &ScAddress, asset: &Asset, amount: i128) -> bool {
         let entry = self
             .event_amounts
             .entry(addr.clone())
@@ -1936,35 +1938,43 @@ fn verify_events_delta(
             };
             let (asset_a, asset_b, reserve_a, reserve_b) = match (current_body, previous_body) {
                 (Some(body), _) => match body {
-                    stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => (
-                        cp.params.asset_a.clone(),
-                        cp.params.asset_b.clone(),
-                        cp.reserve_a,
-                        cp.reserve_b,
-                    ),
+                    stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                        (
+                            cp.params.asset_a.clone(),
+                            cp.params.asset_b.clone(),
+                            cp.reserve_a,
+                            cp.reserve_b,
+                        )
+                    }
                 },
                 (None, Some(body)) => match body {
-                    stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => (
-                        cp.params.asset_a.clone(),
-                        cp.params.asset_b.clone(),
-                        0,
-                        0,
-                    ),
+                    stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                        (cp.params.asset_a.clone(), cp.params.asset_b.clone(), 0, 0)
+                    }
                 },
                 (None, None) => return None,
             };
-            let prev_reserve_a = previous_body.map(|body| match body {
-                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => cp.reserve_a,
-            }).unwrap_or(0);
-            let prev_reserve_b = previous_body.map(|body| match body {
-                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => cp.reserve_b,
-            }).unwrap_or(0);
+            let prev_reserve_a = previous_body
+                .map(|body| match body {
+                    stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                        cp.reserve_a
+                    }
+                })
+                .unwrap_or(0);
+            let prev_reserve_b = previous_body
+                .map(|body| match body {
+                    stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                        cp.reserve_b
+                    }
+                })
+                .unwrap_or(0);
             let entry_a_diff = reserve_a - prev_reserve_a;
             let entry_b_diff = reserve_b - prev_reserve_b;
             let addr = ScAddress::LiquidityPool(pool.liquidity_pool_id.clone());
             let event_a_diff = agg.consume_amount(&addr, &asset_a);
             let event_b_diff = agg.consume_amount(&addr, &asset_b);
-            if i128::from(entry_a_diff) != event_a_diff || i128::from(entry_b_diff) != event_b_diff {
+            if i128::from(entry_a_diff) != event_a_diff || i128::from(entry_b_diff) != event_b_diff
+            {
                 return Some("LiquidityPool diff does not match events".to_string());
             }
         }
@@ -2185,7 +2195,6 @@ fn i128_from_parts(parts: &stellar_xdr::curr::Int128Parts) -> i128 {
     (i128::from(parts.hi) << 64) | i128::from(parts.lo)
 }
 
-
 /// Updates sponsorship counters based on a ledger entry change.
 ///
 /// Processes both the current and previous entry states to calculate the net
@@ -2259,11 +2268,10 @@ fn update_sponsorship_counters(
         if matches!(entry.data, LedgerEntryData::ClaimableBalance(_)) {
             *claimable_balance_reserve += mult;
         } else {
-            let account_id =
-                entry_account_id(entry).ok_or_else(|| InvariantError::Violated {
-                    name: "SponsorshipCountIsValid".to_string(),
-                    details: "sponsored entry missing account id".to_string(),
-                })?;
+            let account_id = entry_account_id(entry).ok_or_else(|| InvariantError::Violated {
+                name: "SponsorshipCountIsValid".to_string(),
+                details: "sponsored entry missing account id".to_string(),
+            })?;
             num_sponsored
                 .entry(account_id)
                 .and_modify(|value| *value += mult)
@@ -2347,9 +2355,7 @@ fn get_sponsorship_multiplier(entry: &LedgerEntry) -> Option<i64> {
             _ => Some(1),
         },
         LedgerEntryData::Offer(_) | LedgerEntryData::Data(_) => Some(1),
-        LedgerEntryData::ClaimableBalance(balance) => {
-            Some(balance.claimants.len() as i64)
-        }
+        LedgerEntryData::ClaimableBalance(balance) => Some(balance.claimants.len() as i64),
         LedgerEntryData::ContractData(_)
         | LedgerEntryData::ContractCode(_)
         | LedgerEntryData::ConfigSetting(_)
@@ -2394,10 +2400,12 @@ fn update_changed_subentries(
 ) -> Result<(), InvariantError> {
     let current = change.current_entry();
     let previous = change.previous_entry();
-    let valid = current.or(previous).ok_or_else(|| InvariantError::Violated {
-        name: "AccountSubEntriesCountIsValid".to_string(),
-        details: "missing entry for subentry accounting".to_string(),
-    })?;
+    let valid = current
+        .or(previous)
+        .ok_or_else(|| InvariantError::Violated {
+            name: "AccountSubEntriesCountIsValid".to_string(),
+            details: "missing entry for subentry accounting".to_string(),
+        })?;
 
     match &valid.data {
         LedgerEntryData::Account(_) => {
@@ -2461,10 +2469,7 @@ fn update_changed_subentries(
 /// Calculates the subentry count delta for a change.
 ///
 /// Pool share trustlines count as 2 subentries; all others count as 1.
-fn calculate_subentry_delta(
-    current: Option<&LedgerEntry>,
-    previous: Option<&LedgerEntry>,
-) -> i32 {
+fn calculate_subentry_delta(current: Option<&LedgerEntry>, previous: Option<&LedgerEntry>) -> i32 {
     let mut delta = 0;
     if let Some(entry) = current {
         delta += if is_pool_share_trustline(entry) { 2 } else { 1 };
@@ -2629,12 +2634,13 @@ fn is_trustline_authorized_to_maintain_liabilities(
 }
 
 /// Extracts liabilities from an account entry (returns zero if no v1 extension).
-fn account_liabilities(
-    entry: &stellar_xdr::curr::AccountEntry,
-) -> stellar_xdr::curr::Liabilities {
+fn account_liabilities(entry: &stellar_xdr::curr::AccountEntry) -> stellar_xdr::curr::Liabilities {
     match &entry.ext {
         stellar_xdr::curr::AccountEntryExt::V1(ext) => ext.liabilities.clone(),
-        _ => stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+        _ => stellar_xdr::curr::Liabilities {
+            buying: 0,
+            selling: 0,
+        },
     }
 }
 
@@ -2644,14 +2650,15 @@ fn trustline_liabilities(
 ) -> stellar_xdr::curr::Liabilities {
     match &entry.ext {
         stellar_xdr::curr::TrustLineEntryExt::V1(ext) => ext.liabilities.clone(),
-        _ => stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+        _ => stellar_xdr::curr::Liabilities {
+            buying: 0,
+            selling: 0,
+        },
     }
 }
 
 /// Extracts (num_sponsoring, num_sponsored) from an account entry.
-fn account_sponsorship_counts(
-    entry: &stellar_xdr::curr::AccountEntry,
-) -> (i64, i64) {
+fn account_sponsorship_counts(entry: &stellar_xdr::curr::AccountEntry) -> (i64, i64) {
     match &entry.ext {
         stellar_xdr::curr::AccountEntryExt::V1(ext) => match &ext.ext {
             stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => {
@@ -2664,9 +2671,7 @@ fn account_sponsorship_counts(
 }
 
 /// Converts an Asset to a TrustLineAsset.
-fn asset_to_trustline_asset(
-    asset: &stellar_xdr::curr::Asset,
-) -> stellar_xdr::curr::TrustLineAsset {
+fn asset_to_trustline_asset(asset: &stellar_xdr::curr::Asset) -> stellar_xdr::curr::TrustLineAsset {
     match asset {
         stellar_xdr::curr::Asset::Native => stellar_xdr::curr::TrustLineAsset::Native,
         stellar_xdr::curr::Asset::CreditAlphanum4(a) => {
@@ -2710,7 +2715,10 @@ fn check_trustline_authorization(change: &LedgerEntryChange) -> Result<(), Invar
             LedgerEntryData::Trustline(previous) => Some(trustline_liabilities(previous)),
             _ => None,
         })
-        .unwrap_or(stellar_xdr::curr::Liabilities { buying: 0, selling: 0 });
+        .unwrap_or(stellar_xdr::curr::Liabilities {
+            buying: 0,
+            selling: 0,
+        });
 
     if is_trustline_authorized_to_maintain_liabilities(trust) {
         if current_liabilities.buying > previous_liabilities.buying
@@ -2721,9 +2729,7 @@ fn check_trustline_authorization(change: &LedgerEntryChange) -> Result<(), Invar
             ));
         }
     } else if current_liabilities.buying > 0 || current_liabilities.selling > 0 {
-        return Err(liabilities_error(
-            "unauthorized trustline has liabilities",
-        ));
+        return Err(liabilities_error("unauthorized trustline has liabilities"));
     }
 
     Ok(())
@@ -2731,7 +2737,10 @@ fn check_trustline_authorization(change: &LedgerEntryChange) -> Result<(), Invar
 
 /// Accumulates liability changes from account, trustline, and offer entries.
 fn accumulate_liabilities_delta(
-    delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
+    delta: &mut HashMap<
+        AccountId,
+        HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>,
+    >,
     change: &LedgerEntryChange,
 ) -> Result<(), InvariantError> {
     add_or_subtract_liabilities(delta, change.current_entry(), true)?;
@@ -2741,7 +2750,10 @@ fn accumulate_liabilities_delta(
 
 /// Adds or subtracts liabilities from the delta map for a single entry.
 fn add_or_subtract_liabilities(
-    delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
+    delta: &mut HashMap<
+        AccountId,
+        HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>,
+    >,
     entry: Option<&LedgerEntry>,
     is_add: bool,
 ) -> Result<(), InvariantError> {
@@ -2802,7 +2814,10 @@ fn add_or_subtract_liabilities(
 
 /// Updates the liability delta for a specific account/asset pair.
 fn update_liability_delta(
-    delta: &mut HashMap<AccountId, HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>>,
+    delta: &mut HashMap<
+        AccountId,
+        HashMap<stellar_xdr::curr::TrustLineAsset, stellar_xdr::curr::Liabilities>,
+    >,
     account: &AccountId,
     asset: stellar_xdr::curr::TrustLineAsset,
     buying_delta: i64,
@@ -2812,7 +2827,10 @@ fn update_liability_delta(
         .entry(account.clone())
         .or_default()
         .entry(asset)
-        .or_insert(stellar_xdr::curr::Liabilities { buying: 0, selling: 0 });
+        .or_insert(stellar_xdr::curr::Liabilities {
+            buying: 0,
+            selling: 0,
+        });
 
     entry.buying = entry
         .buying
@@ -3035,28 +3053,17 @@ fn exchange_v10_without_price_error_thresholds(
     if price.n <= 0 || price.d <= 0 {
         return Err(liabilities_error("invalid price"));
     }
-    let wheat_value = liabilities_calculate_offer_value(
-        price.n,
-        price.d,
-        max_wheat_send,
-        max_sheep_receive,
-    );
-    let sheep_value = liabilities_calculate_offer_value(
-        price.d,
-        price.n,
-        max_sheep_send,
-        max_wheat_receive,
-    );
+    let wheat_value =
+        liabilities_calculate_offer_value(price.n, price.d, max_wheat_send, max_sheep_receive);
+    let sheep_value =
+        liabilities_calculate_offer_value(price.d, price.n, max_sheep_send, max_wheat_receive);
     let wheat_stays = wheat_value > sheep_value;
 
     let (wheat_receive, sheep_send) = if wheat_stays {
         if round == LiabilitiesRounding::Normal {
             if price.n > price.d {
-                let wheat_receive = liabilities_big_divide(
-                    sheep_value,
-                    price.n as i128,
-                    LiabilitiesRound::Down,
-                )?;
+                let wheat_receive =
+                    liabilities_big_divide(sheep_value, price.n as i128, LiabilitiesRound::Down)?;
                 let sheep_send = liabilities_big_divide(
                     (wheat_receive as i128) * (price.n as i128),
                     price.d as i128,
@@ -3064,11 +3071,8 @@ fn exchange_v10_without_price_error_thresholds(
                 )?;
                 (wheat_receive, sheep_send)
             } else {
-                let sheep_send = liabilities_big_divide(
-                    sheep_value,
-                    price.d as i128,
-                    LiabilitiesRound::Down,
-                )?;
+                let sheep_send =
+                    liabilities_big_divide(sheep_value, price.d as i128, LiabilitiesRound::Down)?;
                 let wheat_receive = liabilities_big_divide(
                     (sheep_send as i128) * (price.d as i128),
                     price.n as i128,
@@ -3085,11 +3089,8 @@ fn exchange_v10_without_price_error_thresholds(
             (wheat_receive, max_sheep_send.min(max_sheep_receive))
         }
     } else if price.n > price.d {
-        let wheat_receive = liabilities_big_divide(
-            wheat_value,
-            price.n as i128,
-            LiabilitiesRound::Down,
-        )?;
+        let wheat_receive =
+            liabilities_big_divide(wheat_value, price.n as i128, LiabilitiesRound::Down)?;
         let sheep_send = liabilities_big_divide(
             (wheat_receive as i128) * (price.n as i128),
             price.d as i128,
@@ -3097,11 +3098,8 @@ fn exchange_v10_without_price_error_thresholds(
         )?;
         (wheat_receive, sheep_send)
     } else {
-        let sheep_send = liabilities_big_divide(
-            wheat_value,
-            price.d as i128,
-            LiabilitiesRound::Down,
-        )?;
+        let sheep_send =
+            liabilities_big_divide(wheat_value, price.d as i128, LiabilitiesRound::Down)?;
         let wheat_receive = liabilities_big_divide(
             (sheep_send as i128) * (price.d as i128),
             price.n as i128,
@@ -3114,9 +3112,7 @@ fn exchange_v10_without_price_error_thresholds(
 }
 
 /// Calculates the buying liabilities incurred by an offer.
-fn offer_buying_liabilities(
-    offer: &stellar_xdr::curr::OfferEntry,
-) -> Result<i64, InvariantError> {
+fn offer_buying_liabilities(offer: &stellar_xdr::curr::OfferEntry) -> Result<i64, InvariantError> {
     let (_wheat_receive, sheep_send) = exchange_v10_without_price_error_thresholds(
         offer.price.clone(),
         offer.amount,
@@ -3129,9 +3125,7 @@ fn offer_buying_liabilities(
 }
 
 /// Calculates the selling liabilities incurred by an offer.
-fn offer_selling_liabilities(
-    offer: &stellar_xdr::curr::OfferEntry,
-) -> Result<i64, InvariantError> {
+fn offer_selling_liabilities(offer: &stellar_xdr::curr::OfferEntry) -> Result<i64, InvariantError> {
     let (wheat_receive, _sheep_send) = exchange_v10_without_price_error_thresholds(
         offer.price.clone(),
         offer.amount,
@@ -3153,9 +3147,8 @@ fn trustline_clawback_enabled(trust: &stellar_xdr::curr::TrustLineEntry) -> bool
 fn claimable_balance_clawback_enabled(entry: &stellar_xdr::curr::ClaimableBalanceEntry) -> bool {
     match &entry.ext {
         stellar_xdr::curr::ClaimableBalanceEntryExt::V1(ext) => {
-            let flag =
-                stellar_xdr::curr::ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag
-                    as u32;
+            let flag = stellar_xdr::curr::ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag
+                as u32;
             (ext.flags & flag) != 0
         }
         _ => false,
@@ -3307,19 +3300,17 @@ mod tests {
     use stellar_xdr::curr::{
         AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
         AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountId, AlphaNum4, Asset,
-        AssetCode4, BytesM,
-        ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
-        ClaimableBalanceFlags, ClaimableBalanceId, ClaimPredicate, Claimant, ClaimantV0,
-        ContractCodeEntry, ContractCodeEntryExt, ContractEvent, ContractEventBody,
+        AssetCode4, BytesM, ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt,
+        ClaimableBalanceEntryExtensionV1, ClaimableBalanceFlags, ClaimableBalanceId, Claimant,
+        ClaimantV0, ContractCodeEntry, ContractCodeEntryExt, ContractEvent, ContractEventBody,
         ContractEventType, ContractEventV0, DataEntry, DataEntryExt, ExtensionPoint, Hash,
         Int128Parts, LedgerEntryExt, LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext,
         LedgerHeaderExt, LiquidityPoolConstantProductParameters, LiquidityPoolEntry,
-        LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, OfferEntryFlags, PoolId,
-        Price, PublicKey, ScAddress, ScVal,
-        SequenceNumber, Signer, SignerKey, SponsorshipDescriptor, StellarValue, StellarValueExt,
-        Thresholds, TimePoint, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
-        TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
-        TrustLineEntryV1Ext, TtlEntry, Uint256, VecM,
+        LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, OfferEntryFlags, PoolId, Price,
+        PublicKey, ScAddress, ScVal, SequenceNumber, Signer, SignerKey, SponsorshipDescriptor,
+        StellarValue, StellarValueExt, Thresholds, TimePoint, TrustLineAsset, TrustLineEntry,
+        TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext,
+        TrustLineEntryV1, TrustLineEntryV1Ext, TtlEntry, Uint256, VecM,
     };
 
     fn make_account_id(byte: u8) -> stellar_xdr::curr::AccountId {
@@ -3380,9 +3371,7 @@ mod tests {
         let domain = if home_domain.is_empty() {
             stellar_xdr::curr::String32::default()
         } else {
-            stellar_xdr::curr::String32(
-                stellar_xdr::curr::StringM::try_from(home_domain).unwrap(),
-            )
+            stellar_xdr::curr::String32(stellar_xdr::curr::StringM::try_from(home_domain).unwrap())
         };
         LedgerEntry {
             last_modified_ledger_seq: 2,
@@ -3414,7 +3403,10 @@ mod tests {
             ext: AccountEntryExtensionV2Ext::V0,
         };
         let ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: AccountEntryExtensionV1Ext::V2(v2),
         });
         let mut entry = make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, ext);
@@ -3424,10 +3416,7 @@ mod tests {
         entry
     }
 
-    fn make_sponsored_trustline_entry(
-        account_id: AccountId,
-        sponsor_id: AccountId,
-    ) -> LedgerEntry {
+    fn make_sponsored_trustline_entry(account_id: AccountId, sponsor_id: AccountId) -> LedgerEntry {
         let mut entry = make_trustline_entry(1, 0);
         if let LedgerEntryData::Trustline(trustline) = &mut entry.data {
             trustline.account_id = account_id;
@@ -3508,14 +3497,7 @@ mod tests {
         price: Price,
         flags: u32,
     ) -> LedgerEntry {
-        make_offer_entry_with_assets(
-            offer_id,
-            amount,
-            price,
-            flags,
-            Asset::Native,
-            Asset::Native,
-        )
+        make_offer_entry_with_assets(offer_id, amount, price, flags, Asset::Native, Asset::Native)
     }
 
     fn make_offer_entry_with_assets(
@@ -3775,7 +3757,8 @@ mod tests {
         let curr = make_header(2, Hash256::ZERO);
         let network_id = stellar_core_common::NetworkId::testnet();
 
-        let previous = make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
+        let previous =
+            make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
         let mut current = previous.clone();
         if let LedgerEntryData::Account(account) = &mut current.data {
             account.balance += 10;
@@ -3872,7 +3855,10 @@ mod tests {
         if let LedgerEntryData::Account(account) = &mut entry.data {
             account.balance = 1;
             account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-                liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+                liabilities: stellar_xdr::curr::Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
                 ext: AccountEntryExtensionV1Ext::V0,
             });
         }
@@ -3893,7 +3879,10 @@ mod tests {
         if let LedgerEntryData::Trustline(trustline) = &mut entry.data {
             trustline.balance = 10;
             trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-                liabilities: stellar_xdr::curr::Liabilities { buying: 1, selling: 0 },
+                liabilities: stellar_xdr::curr::Liabilities {
+                    buying: 1,
+                    selling: 0,
+                },
                 ext: TrustLineEntryV1Ext::V0,
             });
         }
@@ -4144,7 +4133,10 @@ mod tests {
             issuer: make_account_id(3),
         });
         let ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
                 liquidity_pool_use_count: 0,
                 ext: TrustLineEntryExtensionV2Ext::V0,
@@ -4167,7 +4159,10 @@ mod tests {
             issuer: make_account_id(3),
         });
         let ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
                 liquidity_pool_use_count: -1,
                 ext: TrustLineEntryExtensionV2Ext::V0,
@@ -4212,7 +4207,10 @@ mod tests {
         let curr = make_header(2, Hash256::ZERO);
         let asset = TrustLineAsset::PoolShare(stellar_xdr::curr::PoolId(Hash([0u8; 32])));
         let ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 1, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 1,
+                selling: 0,
+            },
             ext: TrustLineEntryV1Ext::V0,
         });
         let entries = vec![make_trustline_entry_with_ext(1, 0, asset, ext)];
@@ -4283,7 +4281,12 @@ mod tests {
     fn test_ledger_entry_is_valid_rejects_account_flags_outside_mask() {
         let prev = make_header(1, Hash256::ZERO);
         let curr = make_header(2, Hash256::ZERO);
-        let entries = vec![make_account_entry_with_flags(1, Vec::new(), 0x10, Vec::new())];
+        let entries = vec![make_account_entry_with_flags(
+            1,
+            Vec::new(),
+            0x10,
+            Vec::new(),
+        )];
         let changes = make_changes(entries);
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4296,7 +4299,12 @@ mod tests {
         let prev = make_header(1, Hash256::ZERO);
         let curr = make_header(2, Hash256::ZERO);
         let clawback = stellar_xdr::curr::AccountFlags::ClawbackEnabledFlag as u32;
-        let entries = vec![make_account_entry_with_flags(1, Vec::new(), clawback, Vec::new())];
+        let entries = vec![make_account_entry_with_flags(
+            1,
+            Vec::new(),
+            clawback,
+            Vec::new(),
+        )];
         let changes = make_changes(entries);
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4322,10 +4330,20 @@ mod tests {
         let mut curr = make_header(2, Hash256::ZERO);
         curr.ledger_version = 13;
         let ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: AccountEntryExtensionV1Ext::V0,
         });
-        let entries = vec![make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, ext)];
+        let entries = vec![make_account_entry_with_ext(
+            1,
+            Vec::new(),
+            0,
+            Vec::new(),
+            0,
+            ext,
+        )];
         let changes = make_changes(entries);
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4345,10 +4363,20 @@ mod tests {
             ext: AccountEntryExtensionV2Ext::V0,
         };
         let ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: AccountEntryExtensionV1Ext::V2(v2),
         });
-        let entries = vec![make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, ext)];
+        let entries = vec![make_account_entry_with_ext(
+            1,
+            Vec::new(),
+            0,
+            Vec::new(),
+            0,
+            ext,
+        )];
         let changes = make_changes(entries);
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4371,7 +4399,10 @@ mod tests {
             ext: AccountEntryExtensionV2Ext::V0,
         };
         let ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: AccountEntryExtensionV1Ext::V2(v2),
         });
         let entries = vec![make_account_entry_with_ext(
@@ -4400,7 +4431,10 @@ mod tests {
             ext: AccountEntryExtensionV2Ext::V0,
         };
         let ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: stellar_xdr::curr::Liabilities { buying: 0, selling: 0 },
+            liabilities: stellar_xdr::curr::Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: AccountEntryExtensionV1Ext::V2(v2),
         });
         let entries = vec![make_account_entry_with_ext(
@@ -4802,8 +4836,10 @@ mod tests {
     fn test_account_subentries_count_is_valid_accepts_matching_delta() {
         let prev = make_header(1, Hash256::ZERO);
         let curr = make_header(2, Hash256::ZERO);
-        let prev_account = make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
-        let curr_account = make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 1, AccountEntryExt::V0);
+        let prev_account =
+            make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
+        let curr_account =
+            make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 1, AccountEntryExt::V0);
         let trustline = make_trustline_entry_for_account(make_account_id(1));
 
         let changes = vec![
@@ -4823,8 +4859,10 @@ mod tests {
     fn test_account_subentries_count_is_valid_rejects_mismatch() {
         let prev = make_header(1, Hash256::ZERO);
         let curr = make_header(2, Hash256::ZERO);
-        let prev_account = make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
-        let curr_account = make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
+        let prev_account =
+            make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
+        let curr_account =
+            make_account_entry_with_ext(1, Vec::new(), 0, Vec::new(), 0, AccountEntryExt::V0);
         let trustline = make_trustline_entry_for_account(make_account_id(1));
 
         let changes = vec![

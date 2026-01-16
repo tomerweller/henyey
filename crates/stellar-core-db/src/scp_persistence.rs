@@ -20,9 +20,9 @@ use std::sync::Arc;
 use stellar_xdr::curr::Hash;
 use tracing::debug;
 
-use crate::queries::ScpStatePersistenceQueries;
-use crate::pool::Database;
 use crate::error::DbError;
+use crate::pool::Database;
+use crate::queries::ScpStatePersistenceQueries;
 
 /// SQLite implementation of SCP state persistence.
 ///

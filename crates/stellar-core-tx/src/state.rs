@@ -6,12 +6,12 @@ use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, AccountId, Asset,
     ClaimableBalanceEntry, ClaimableBalanceId, ContractCodeEntry, ContractDataDurability,
-    ContractDataEntry, DataEntry, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext, LedgerKey, LedgerKeyAccount,
+    ContractDataEntry, DataEntry, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
+    LedgerEntryExt, LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext, LedgerKey, LedgerKeyAccount,
     LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyData,
     LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl, Liabilities,
-    LiquidityPoolEntry, OfferEntry, PoolId, Price, PublicKey, ScAddress, ScVal, SponsorshipDescriptor,
-    TimePoint, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
+    LiquidityPoolEntry, OfferEntry, PoolId, Price, PublicKey, ScAddress, ScVal,
+    SponsorshipDescriptor, TimePoint, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
 };
 
 use crate::apply::LedgerDelta;
@@ -86,7 +86,7 @@ impl AssetKey {
                 let issuer = account_id_to_bytes(&a.issuer);
                 AssetKey::CreditAlphanum12(a.asset_code.0, issuer)
             }
-            TrustLineAsset::PoolShare(pool_id) => AssetKey::PoolShare(pool_id.0.0),
+            TrustLineAsset::PoolShare(pool_id) => AssetKey::PoolShare(pool_id.0 .0),
         }
     }
 }
@@ -369,7 +369,6 @@ impl LedgerStateManager {
         }
         Ok((self.ledger_seq as i64) << 32)
     }
-
 
     /// Calculate the minimum balance required for an account.
     pub fn minimum_balance_for_account(
@@ -695,9 +694,7 @@ impl LedgerStateManager {
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsored as i64 + multiplier;
         if updated < 0 || updated > u32::MAX as i64 {
-            return Err(TxError::Internal(
-                "num_sponsored out of range".to_string(),
-            ));
+            return Err(TxError::Internal("num_sponsored out of range".to_string()));
         }
         ext.num_sponsored = updated as u32;
         self.update_num_sponsoring(sponsor, multiplier)?;
@@ -754,9 +751,7 @@ impl LedgerStateManager {
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsoring as i64 + delta;
         if updated < 0 || updated > u32::MAX as i64 {
-            return Err(TxError::Internal(
-                "num_sponsoring out of range".to_string(),
-            ));
+            return Err(TxError::Internal("num_sponsoring out of range".to_string()));
         }
         ext.num_sponsoring = updated as u32;
         Ok(())
@@ -770,9 +765,7 @@ impl LedgerStateManager {
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsored as i64 + delta;
         if updated < 0 || updated > u32::MAX as i64 {
-            return Err(TxError::Internal(
-                "num_sponsored out of range".to_string(),
-            ));
+            return Err(TxError::Internal("num_sponsored out of range".to_string()));
         }
         ext.num_sponsored = updated as u32;
         Ok(())
@@ -814,9 +807,8 @@ impl LedgerStateManager {
         }
 
         // Create the pre-auth TX signer key from the transaction hash
-        let signer_key = stellar_xdr::curr::SignerKey::PreAuthTx(
-            stellar_xdr::curr::Uint256(tx_hash.0),
-        );
+        let signer_key =
+            stellar_xdr::curr::SignerKey::PreAuthTx(stellar_xdr::curr::Uint256(tx_hash.0));
 
         // Remove from each source account
         for account_id in source_accounts {
@@ -845,10 +837,7 @@ impl LedgerStateManager {
         };
 
         // Find the signer index
-        let signer_idx = account
-            .signers
-            .iter()
-            .position(|s| &s.key == signer_key);
+        let signer_idx = account.signers.iter().position(|s| &s.key == signer_key);
 
         let Some(idx) = signer_idx else {
             return false; // Signer not found
@@ -905,12 +894,18 @@ impl LedgerStateManager {
             // Decrement sponsor's num_sponsoring
             if let Err(e) = self.update_num_sponsoring(&sponsor, -1) {
                 // Log error but don't fail - this is cleanup
-                tracing::warn!("Failed to update num_sponsoring during signer removal: {}", e);
+                tracing::warn!(
+                    "Failed to update num_sponsoring during signer removal: {}",
+                    e
+                );
             }
 
             // Decrement sponsored account's num_sponsored
             if let Err(e) = self.update_num_sponsored(account_id, -1) {
-                tracing::warn!("Failed to update num_sponsored during signer removal: {}", e);
+                tracing::warn!(
+                    "Failed to update num_sponsored during signer removal: {}",
+                    e
+                );
             }
 
             // Remove the sponsorship entry from signer_sponsoring_i_ds
@@ -1133,7 +1128,11 @@ impl LedgerStateManager {
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_accounts set.
-            if !self.account_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+            if !self
+                .account_snapshots
+                .get(&key)
+                .is_some_and(|s| s.is_some())
+            {
                 let snapshot = self.accounts.get(&key).cloned();
                 self.account_snapshots.insert(key, snapshot);
             }
@@ -1198,7 +1197,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE this update)
-        let pre_state = self.accounts.get(&key)
+        let pre_state = self
+            .accounts
+            .get(&key)
             .map(|acc| self.account_to_ledger_entry(acc));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -1323,11 +1324,8 @@ impl LedgerStateManager {
                 self.liquidity_pools.remove(&pool_key);
             }
             LedgerKey::ContractData(k) => {
-                let cd_key = ContractDataKey::new(
-                    k.contract.clone(),
-                    k.key.clone(),
-                    k.durability.clone(),
-                );
+                let cd_key =
+                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability.clone());
                 self.contract_data.remove(&cd_key);
             }
             LedgerKey::ContractCode(k) => {
@@ -1364,7 +1362,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE deletion)
-        let pre_state = self.accounts.get(&key)
+        let pre_state = self
+            .accounts
+            .get(&key)
             .map(|acc| self.account_to_ledger_entry(acc));
 
         // Record in delta with pre-state
@@ -1413,7 +1413,11 @@ impl LedgerStateManager {
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_trustlines set.
-            if !self.trustline_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+            if !self
+                .trustline_snapshots
+                .get(&key)
+                .is_some_and(|s| s.is_some())
+            {
                 let snapshot = self.trustlines.get(&key).cloned();
                 self.trustline_snapshots.insert(key.clone(), snapshot);
             }
@@ -1448,7 +1452,11 @@ impl LedgerStateManager {
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_trustlines set.
-            if !self.trustline_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+            if !self
+                .trustline_snapshots
+                .get(&key)
+                .is_some_and(|s| s.is_some())
+            {
                 let snapshot = self.trustlines.get(&key).cloned();
                 self.trustline_snapshots.insert(key.clone(), snapshot);
             }
@@ -1520,7 +1528,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE this update)
-        let pre_state = self.trustlines.get(&key)
+        let pre_state = self
+            .trustlines
+            .get(&key)
             .map(|tl| self.trustline_to_ledger_entry(tl));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -1558,7 +1568,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE deletion)
-        let pre_state = self.trustlines.get(&key)
+        let pre_state = self
+            .trustlines
+            .get(&key)
             .map(|tl| self.trustline_to_ledger_entry(tl));
 
         // Record in delta with pre-state
@@ -1595,7 +1607,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE deletion)
-        let pre_state = self.trustlines.get(&key)
+        let pre_state = self
+            .trustlines
+            .get(&key)
             .map(|tl| self.trustline_to_ledger_entry(tl));
 
         // Record in delta with pre-state
@@ -1618,7 +1632,11 @@ impl LedgerStateManager {
     }
 
     /// Get a mutable reference to an offer.
-    pub fn get_offer_mut(&mut self, seller_id: &AccountId, offer_id: i64) -> Option<&mut OfferEntry> {
+    pub fn get_offer_mut(
+        &mut self,
+        seller_id: &AccountId,
+        offer_id: i64,
+    ) -> Option<&mut OfferEntry> {
         let seller_key = account_id_to_bytes(seller_id);
         let key = (seller_key, offer_id);
 
@@ -1697,7 +1715,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state from current state (value BEFORE this specific update)
-        let pre_state = self.offers.get(&key)
+        let pre_state = self
+            .offers
+            .get(&key)
             .map(|offer| self.offer_to_ledger_entry(offer));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -1733,7 +1753,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE deletion)
-        let pre_state = self.offers.get(&key)
+        let pre_state = self
+            .offers
+            .get(&key)
             .map(|offer| self.offer_to_ledger_entry(offer));
 
         // Record in delta with pre-state
@@ -1818,6 +1840,12 @@ impl LedgerStateManager {
     pub fn create_data(&mut self, entry: DataEntry) {
         let account_key = account_id_to_bytes(&entry.account_id);
         let name = data_name_to_string(&entry.data_name);
+        tracing::debug!(
+            "create_data: account_key={:02x?}, name={:?}, name_bytes={:?}",
+            &account_key[..4],
+            name,
+            entry.data_name.as_vec()
+        );
         let key = (account_key, name.clone());
         let ledger_key = LedgerKey::Data(LedgerKeyData {
             account_id: entry.account_id.clone(),
@@ -1866,7 +1894,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE this update)
-        let pre_state = self.data_entries.get(&key)
+        let pre_state = self
+            .data_entries
+            .get(&key)
             .map(|data| self.data_to_ledger_entry(data));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -1943,9 +1973,14 @@ impl LedgerStateManager {
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_contract_data set.
-            if !self.contract_data_snapshots.get(&lookup_key).is_some_and(|s| s.is_some()) {
+            if !self
+                .contract_data_snapshots
+                .get(&lookup_key)
+                .is_some_and(|s| s.is_some())
+            {
                 let snapshot = self.contract_data.get(&lookup_key).cloned();
-                self.contract_data_snapshots.insert(lookup_key.clone(), snapshot);
+                self.contract_data_snapshots
+                    .insert(lookup_key.clone(), snapshot);
             }
             let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
                 contract: contract.clone(),
@@ -2022,7 +2057,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE this update)
-        let pre_state = self.contract_data.get(&key)
+        let pre_state = self
+            .contract_data
+            .get(&key)
             .map(|cd| self.contract_data_to_ledger_entry(cd));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -2057,13 +2094,16 @@ impl LedgerStateManager {
         // Save snapshot if not already saved
         if !self.contract_data_snapshots.contains_key(&lookup_key) {
             let snapshot = self.contract_data.get(&lookup_key).cloned();
-            self.contract_data_snapshots.insert(lookup_key.clone(), snapshot);
+            self.contract_data_snapshots
+                .insert(lookup_key.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE deletion)
-        let pre_state = self.contract_data.get(&lookup_key)
+        let pre_state = self
+            .contract_data
+            .get(&lookup_key)
             .map(|cd| self.contract_data_to_ledger_entry(cd));
 
         // Record in delta with pre-state
@@ -2093,7 +2133,11 @@ impl LedgerStateManager {
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_contract_code set.
-            if !self.contract_code_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+            if !self
+                .contract_code_snapshots
+                .get(&key)
+                .is_some_and(|s| s.is_some())
+            {
                 let snapshot = self.contract_code.get(&key).cloned();
                 self.contract_code_snapshots.insert(key, snapshot);
             }
@@ -2156,7 +2200,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE this update)
-        let pre_state = self.contract_code.get(&key)
+        let pre_state = self
+            .contract_code
+            .get(&key)
             .map(|cc| self.contract_code_to_ledger_entry(cc));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -2193,7 +2239,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE deletion)
-        let pre_state = self.contract_code.get(&key)
+        let pre_state = self
+            .contract_code
+            .get(&key)
             .map(|cc| self.contract_code_to_ledger_entry(cc));
 
         // Record in delta with pre-state
@@ -2288,7 +2336,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE this update)
-        let pre_state = self.ttl_entries.get(&key)
+        let pre_state = self
+            .ttl_entries
+            .get(&key)
             .map(|ttl| self.ttl_to_ledger_entry(ttl));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -2373,7 +2423,9 @@ impl LedgerStateManager {
         self.snapshot_last_modified_key(&ledger_key);
 
         // Get pre-state (current value BEFORE deletion)
-        let pre_state = self.ttl_entries.get(&key)
+        let pre_state = self
+            .ttl_entries
+            .get(&key)
             .map(|ttl| self.ttl_to_ledger_entry(ttl));
 
         // Record in delta with pre-state
@@ -2415,7 +2467,11 @@ impl LedgerStateManager {
         let key = claimable_balance_id_to_bytes(balance_id);
 
         if self.claimable_balances.contains_key(&key) {
-            if !self.claimable_balance_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+            if !self
+                .claimable_balance_snapshots
+                .get(&key)
+                .is_some_and(|s| s.is_some())
+            {
                 let snapshot = self.claimable_balances.get(&key).cloned();
                 self.claimable_balance_snapshots.insert(key, snapshot);
             }
@@ -2547,7 +2603,11 @@ impl LedgerStateManager {
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_liquidity_pools set.
-            if !self.liquidity_pool_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+            if !self
+                .liquidity_pool_snapshots
+                .get(&key)
+                .is_some_and(|s| s.is_some())
+            {
                 let snapshot = self.liquidity_pools.get(&key).cloned();
                 self.liquidity_pool_snapshots.insert(key, snapshot);
             }
@@ -2639,10 +2699,9 @@ impl LedgerStateManager {
     /// Get an entry by LedgerKey (read-only).
     pub fn get_entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
         match key {
-            LedgerKey::Account(k) => {
-                self.get_account(&k.account_id)
-                    .map(|e| self.account_to_ledger_entry(e))
-            }
+            LedgerKey::Account(k) => self
+                .get_account(&k.account_id)
+                .map(|e| self.account_to_ledger_entry(e)),
             LedgerKey::Trustline(k) => {
                 let account_key = account_id_to_bytes(&k.account_id);
                 let asset_key = AssetKey::from_trustline_asset(&k.asset);
@@ -2650,35 +2709,37 @@ impl LedgerStateManager {
                     .get(&(account_key, asset_key))
                     .map(|e| self.trustline_to_ledger_entry(e))
             }
-            LedgerKey::Offer(k) => {
-                self.get_offer(&k.seller_id, k.offer_id)
-                    .map(|e| self.offer_to_ledger_entry(e))
-            }
+            LedgerKey::Offer(k) => self
+                .get_offer(&k.seller_id, k.offer_id)
+                .map(|e| self.offer_to_ledger_entry(e)),
             LedgerKey::Data(k) => {
                 let name = data_name_to_string(&k.data_name);
-                self.get_data(&k.account_id, &name)
-                    .map(|e| self.data_to_ledger_entry(e))
+                let account_key = account_id_to_bytes(&k.account_id);
+                let result = self.get_data(&k.account_id, &name);
+                tracing::debug!(
+                    "get_entry for Data: account={:02x?}, name={:?}, name_bytes={:?}, found={}",
+                    &account_key[..4],
+                    name,
+                    k.data_name.as_vec(),
+                    result.is_some()
+                );
+                result.map(|e| self.data_to_ledger_entry(e))
             }
-            LedgerKey::ContractData(k) => {
-                self.get_contract_data(&k.contract, &k.key, k.durability.clone())
-                    .map(|e| self.contract_data_to_ledger_entry(e))
-            }
-            LedgerKey::ContractCode(k) => {
-                self.get_contract_code(&k.hash)
-                    .map(|e| self.contract_code_to_ledger_entry(e))
-            }
-            LedgerKey::Ttl(k) => {
-                self.get_ttl(&k.key_hash)
-                    .map(|e| self.ttl_to_ledger_entry(e))
-            }
-            LedgerKey::ClaimableBalance(k) => {
-                self.get_claimable_balance(&k.balance_id)
-                    .map(|e| self.claimable_balance_to_ledger_entry(e))
-            }
-            LedgerKey::LiquidityPool(k) => {
-                self.get_liquidity_pool(&k.liquidity_pool_id)
-                    .map(|e| self.liquidity_pool_to_ledger_entry(e))
-            }
+            LedgerKey::ContractData(k) => self
+                .get_contract_data(&k.contract, &k.key, k.durability.clone())
+                .map(|e| self.contract_data_to_ledger_entry(e)),
+            LedgerKey::ContractCode(k) => self
+                .get_contract_code(&k.hash)
+                .map(|e| self.contract_code_to_ledger_entry(e)),
+            LedgerKey::Ttl(k) => self
+                .get_ttl(&k.key_hash)
+                .map(|e| self.ttl_to_ledger_entry(e)),
+            LedgerKey::ClaimableBalance(k) => self
+                .get_claimable_balance(&k.balance_id)
+                .map(|e| self.claimable_balance_to_ledger_entry(e)),
+            LedgerKey::LiquidityPool(k) => self
+                .get_liquidity_pool(&k.liquidity_pool_id)
+                .map(|e| self.liquidity_pool_to_ledger_entry(e)),
             _ => None,
         }
     }
@@ -2743,11 +2804,8 @@ impl LedgerStateManager {
                     })
             }
             LedgerKey::ContractData(k) => {
-                let lookup_key = ContractDataKey::new(
-                    k.contract.clone(),
-                    k.key.clone(),
-                    k.durability.clone(),
-                );
+                let lookup_key =
+                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability.clone());
                 self.contract_data_snapshots
                     .get(&lookup_key)
                     .and_then(|entry| entry.clone())
@@ -2757,26 +2815,24 @@ impl LedgerStateManager {
                         ext,
                     })
             }
-            LedgerKey::ContractCode(k) => {
-                self.contract_code_snapshots
-                    .get(&k.hash.0)
-                    .and_then(|entry| entry.clone())
-                    .map(|entry| LedgerEntry {
-                        last_modified_ledger_seq: last_modified,
-                        data: LedgerEntryData::ContractCode(entry),
-                        ext,
-                    })
-            }
-            LedgerKey::Ttl(k) => {
-                self.ttl_snapshots
-                    .get(&k.key_hash.0)
-                    .and_then(|entry| entry.clone())
-                    .map(|entry| LedgerEntry {
-                        last_modified_ledger_seq: last_modified,
-                        data: LedgerEntryData::Ttl(entry),
-                        ext,
-                    })
-            }
+            LedgerKey::ContractCode(k) => self
+                .contract_code_snapshots
+                .get(&k.hash.0)
+                .and_then(|entry| entry.clone())
+                .map(|entry| LedgerEntry {
+                    last_modified_ledger_seq: last_modified,
+                    data: LedgerEntryData::ContractCode(entry),
+                    ext,
+                }),
+            LedgerKey::Ttl(k) => self
+                .ttl_snapshots
+                .get(&k.key_hash.0)
+                .and_then(|entry| entry.clone())
+                .map(|entry| LedgerEntry {
+                    last_modified_ledger_seq: last_modified,
+                    data: LedgerEntryData::Ttl(entry),
+                    ext,
+                }),
             LedgerKey::ClaimableBalance(k) => {
                 let key_bytes = claimable_balance_id_to_bytes(&k.balance_id);
                 self.claimable_balance_snapshots
@@ -3144,12 +3200,15 @@ impl LedgerStateManager {
                         // 2. Entry actually changed - always record real value changes
                         // Note: We use accessed_in_op for both single-op and multi-op transactions because
                         // C++ stellar-core records per-operation changes only for entries actually accessed.
-                        let accessed_in_op = self.op_snapshots_active && self.op_entry_snapshots.contains_key(&ledger_key);
+                        let accessed_in_op = self.op_snapshots_active
+                            && self.op_entry_snapshots.contains_key(&ledger_key);
                         let should_record = accessed_in_op || &entry != snapshot_entry;
                         if should_record {
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.account_to_ledger_entry(snapshot_entry)
@@ -3177,12 +3236,15 @@ impl LedgerStateManager {
                         // Record update if:
                         // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
                         // 2. Entry actually changed - always record real value changes
-                        let accessed_in_op = self.op_snapshots_active && self.op_entry_snapshots.contains_key(&ledger_key);
+                        let accessed_in_op = self.op_snapshots_active
+                            && self.op_entry_snapshots.contains_key(&ledger_key);
                         let should_record = accessed_in_op || &entry != snapshot_entry;
                         if should_record {
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.trustline_to_ledger_entry(snapshot_entry)
@@ -3210,7 +3272,9 @@ impl LedgerStateManager {
                             });
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.offer_to_ledger_entry(snapshot_entry)
@@ -3238,12 +3302,15 @@ impl LedgerStateManager {
                         // Record update if:
                         // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
                         // 2. Entry actually changed - always record real value changes
-                        let accessed_in_op = self.op_snapshots_active && self.op_entry_snapshots.contains_key(&ledger_key);
+                        let accessed_in_op = self.op_snapshots_active
+                            && self.op_entry_snapshots.contains_key(&ledger_key);
                         let should_record = accessed_in_op || &entry != snapshot_entry;
                         if should_record {
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.data_to_ledger_entry(snapshot_entry)
@@ -3272,7 +3339,9 @@ impl LedgerStateManager {
                             });
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.contract_data_to_ledger_entry(snapshot_entry)
@@ -3299,7 +3368,9 @@ impl LedgerStateManager {
                             });
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.contract_code_to_ledger_entry(snapshot_entry)
@@ -3326,7 +3397,9 @@ impl LedgerStateManager {
                             });
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.ttl_to_ledger_entry(snapshot_entry)
@@ -3354,7 +3427,9 @@ impl LedgerStateManager {
                                 });
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.claimable_balance_to_ledger_entry(snapshot_entry)
@@ -3381,7 +3456,9 @@ impl LedgerStateManager {
                             });
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                            let pre_state = if let Some(op_snapshot) =
+                                self.op_entry_snapshots.get(&ledger_key)
+                            {
                                 op_snapshot.clone()
                             } else {
                                 self.liquidity_pool_to_ledger_entry(snapshot_entry)
@@ -3554,7 +3631,7 @@ fn claimable_balance_id_to_bytes(balance_id: &ClaimableBalanceId) -> [u8; 32] {
 
 /// Convert a PoolId to its raw bytes.
 fn pool_id_to_bytes(pool_id: &PoolId) -> [u8; 32] {
-    pool_id.0.0
+    pool_id.0 .0
 }
 
 fn compare_offer(lhs: &OfferEntry, rhs: &OfferEntry) -> std::cmp::Ordering {
@@ -3589,7 +3666,10 @@ fn sponsorship_from_entry_ext(entry: &LedgerEntry) -> Option<AccountId> {
 pub(crate) fn ensure_account_ext_v2(account: &mut AccountEntry) -> &mut AccountEntryExtensionV2 {
     let liabilities = match &account.ext {
         AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-        AccountEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+        AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
     };
 
     match &account.ext {
@@ -3772,7 +3852,11 @@ mod tests {
         // Rollback first transaction (simulating failed tx)
         manager.rollback();
         // After rollback, fee should be preserved
-        assert_eq!(manager.delta().fee_charged(), 400, "Fee from first tx should be preserved after rollback");
+        assert_eq!(
+            manager.delta().fee_charged(),
+            400,
+            "Fee from first tx should be preserved after rollback"
+        );
 
         // Add fee from second transaction
         manager.delta_mut().add_fee(100);
@@ -3785,16 +3869,28 @@ mod tests {
         // Rollback second transaction
         manager.rollback();
         // After rollback, fees from both transactions should be preserved
-        assert_eq!(manager.delta().fee_charged(), 500, "Fees from both failed txs should be preserved");
+        assert_eq!(
+            manager.delta().fee_charged(),
+            500,
+            "Fees from both failed txs should be preserved"
+        );
 
         // Add fee from third transaction (successful)
         manager.delta_mut().add_fee(100);
-        assert_eq!(manager.delta().fee_charged(), 600, "Total fees should be 600");
+        assert_eq!(
+            manager.delta().fee_charged(),
+            600,
+            "Total fees should be 600"
+        );
 
         // Commit third transaction
         manager.commit();
         // Commit doesn't reset fee_charged
-        assert_eq!(manager.delta().fee_charged(), 600, "Total fees should remain after commit");
+        assert_eq!(
+            manager.delta().fee_charged(),
+            600,
+            "Total fees should remain after commit"
+        );
     }
 
     #[test]

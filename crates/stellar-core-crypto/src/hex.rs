@@ -206,7 +206,10 @@ mod tests {
         assert_eq!(hex_to_bin("00").unwrap(), vec![0x00]);
         assert_eq!(hex_to_bin("ff").unwrap(), vec![0xff]);
         assert_eq!(hex_to_bin("FF").unwrap(), vec![0xff]);
-        assert_eq!(hex_to_bin("0123456789abcdef").unwrap(), vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        assert_eq!(
+            hex_to_bin("0123456789abcdef").unwrap(),
+            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
         assert_eq!(hex_to_bin("ABCDEF").unwrap(), vec![0xab, 0xcd, 0xef]);
     }
 

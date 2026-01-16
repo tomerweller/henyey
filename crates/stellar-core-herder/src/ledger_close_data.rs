@@ -86,8 +86,7 @@ impl LedgerCloseData {
     ) -> Self {
         // Verify the tx set hash matches the value's tx_set_hash
         debug_assert_eq!(
-            tx_set.hash.0,
-            value.tx_set_hash.0,
+            tx_set.hash.0, value.tx_set_hash.0,
             "Transaction set hash mismatch"
         );
 
@@ -111,8 +110,7 @@ impl LedgerCloseData {
         expected_results: Option<TransactionResultSet>,
     ) -> Self {
         debug_assert_eq!(
-            tx_set.hash.0,
-            value.tx_set_hash.0,
+            tx_set.hash.0, value.tx_set_hash.0,
             "Transaction set hash mismatch"
         );
 

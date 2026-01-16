@@ -4,10 +4,11 @@ use soroban_env_host_p25 as soroban_env_host25;
 pub(crate) fn convert_host_error_p24_to_p25(
     err: soroban_env_host24::HostError,
 ) -> soroban_env_host25::HostError {
-    let sc_error = soroban_env_host24::xdr::ScError::try_from(&err)
-        .unwrap_or(soroban_env_host24::xdr::ScError::Context(
+    let sc_error = soroban_env_host24::xdr::ScError::try_from(&err).unwrap_or(
+        soroban_env_host24::xdr::ScError::Context(
             soroban_env_host24::xdr::ScErrorCode::InternalError,
-        ));
+        ),
+    );
     let sc_error = convert_sc_error_p24_to_p25(sc_error);
     soroban_env_host25::HostError::from(sc_error)
 }
