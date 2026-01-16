@@ -1,5 +1,7 @@
 # C++ Parity Status
 
+**Overall Parity: ~90%**
+
 This document tracks parity between `stellar-core-work` and the upstream C++ work system in `stellar-core/src/work/`.
 
 ## Upstream C++ Source Files

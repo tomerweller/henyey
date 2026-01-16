@@ -173,4 +173,4 @@ Rust has unit tests in `lib.rs` covering basic invariant validation scenarios.
 
 ## Parity Confidence
 
-**Overall: High** - All 12 core invariant types are implemented with complete validation logic matching C++. The main gaps are infrastructure features (check hooks, metrics, dynamic enable) rather than validation logic.
+**Overall Parity: ~87%** - All 12 core invariant types are implemented with complete validation logic matching C++. The main gaps are infrastructure features (check hooks, metrics, dynamic enable) rather than validation logic.

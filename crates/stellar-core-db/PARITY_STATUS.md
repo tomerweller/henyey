@@ -1,5 +1,7 @@
 # C++ Parity Status
 
+**Overall Parity: ~95%**
+
 This document tracks the parity between this Rust crate (`stellar-core-db`) and the upstream
 C++ stellar-core database implementation.
 

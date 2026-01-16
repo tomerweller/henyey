@@ -316,4 +316,4 @@ The following herder features are integrated with the main application:
 | Persistence | ~85% |
 | Quorum Intersection | 0% |
 | Parallel TxSet Builder | 0% |
-| **Overall** | **~75%** |
+| **Overall** | **~82%** |

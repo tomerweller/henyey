@@ -1,5 +1,7 @@
 ## C++ Parity Status
 
+**Overall Parity: ~78%**
+
 This section documents the implementation status relative to the C++ stellar-core bucket implementation (v25).
 
 ### Summary

@@ -261,7 +261,7 @@ Trade-offs made:
 | Eviction Processing | Full | None | 0% |
 | Metrics | Full | Minimal | 20% |
 
-**Overall Parity Estimate: ~75%**
+**Overall Parity Estimate: ~85%**
 
 The core ledger close functionality has full parity. The gaps are primarily in:
 1. Advanced concurrency features (parallel apply, nested transactions)

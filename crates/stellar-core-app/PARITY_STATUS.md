@@ -1,5 +1,7 @@
 # C++ Parity Status
 
+**Overall Parity: ~75%**
+
 This document details the parity between this Rust implementation (`stellar-core-app`) and the upstream C++ stellar-core `src/main/` directory (v25.x).
 
 ## Upstream Mapping

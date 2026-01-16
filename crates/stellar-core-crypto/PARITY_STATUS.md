@@ -1,5 +1,7 @@
 # C++ Parity Status
 
+**Overall Parity: ~95%**
+
 This document tracks the parity between the Rust `stellar-core-crypto` crate and the upstream C++ `stellar-core/src/crypto/` implementation (v25.x / p25).
 
 ## Summary

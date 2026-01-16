@@ -1,5 +1,7 @@
 ## C++ Parity Status
 
+**Overall Parity: ~82%**
+
 This document tracks the parity between this Rust crate (`stellar-core-history`) and the C++ `stellar-core/src/history/` module. The upstream reference is `.upstream-v25/src/history/`.
 
 ### Module Mapping

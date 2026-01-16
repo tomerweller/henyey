@@ -1,5 +1,7 @@
 ## C++ Parity Status
 
+**Overall Parity: ~88%**
+
 This section documents the feature parity between this Rust implementation and the C++ stellar-core (v25).
 
 ### Implemented

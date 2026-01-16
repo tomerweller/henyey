@@ -1,5 +1,7 @@
 # C++ Parity Status
 
+**Overall Parity: ~92%**
+
 This document details the parity between `stellar-core-common` and the C++ upstream utilities found in `.upstream-v25/src/util/` and related modules.
 
 ## Summary

@@ -1,5 +1,7 @@
 ## C++ Parity Status
 
+**Overall Parity: ~88%**
+
 This document tracks feature parity between this Rust crate and the C++ upstream implementation in `.upstream-v25/src/overlay/`.
 
 ### Parity Summary

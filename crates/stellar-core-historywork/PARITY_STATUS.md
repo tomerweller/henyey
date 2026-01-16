@@ -1,5 +1,7 @@
 # Parity Status: stellar-core-historywork
 
+**Overall Parity: ~72%**
+
 This document tracks the parity between this Rust crate and the upstream C++
 stellar-core `src/historywork/` directory (v25.x).
 

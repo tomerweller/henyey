@@ -1,5 +1,7 @@
 # C++ Parity Status
 
+**Overall Parity: ~98%**
+
 This document provides a detailed comparison between the Rust `stellar-core-tx` crate and the upstream C++ stellar-core v25 implementation in `.upstream-v25/src/transactions/`.
 
 ## Summary

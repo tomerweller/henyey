@@ -4,7 +4,7 @@ This document tracks the parity between the Rust `stellar-core-scp` crate and th
 
 ## Summary
 
-**Overall Parity: ~95%**
+**Overall Parity: ~90%**
 
 The Rust implementation provides full functional parity with the C++ SCP implementation for consensus operations. All core SCP protocol semantics are implemented correctly. The remaining gaps are primarily:
 
