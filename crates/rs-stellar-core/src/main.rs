@@ -2133,22 +2133,6 @@ async fn cmd_replay_bucket_list(
                     archived_entries.clone(),
                     restored_keys.clone(),
                 )?;
-
-                // Debug: print hot archive level hashes at problematic ledgers
-                if seq >= start_ledger && seq <= end_ledger {
-                    println!("  [DEBUG] Ledger {} hot archive state after add_batch:", seq);
-                    println!("    Hot archive hash: {}", hot_archive.hash().to_hex());
-                    for level_idx in 0..11 {
-                        if let Some(level) = hot_archive.level(level_idx) {
-                            let curr_hash = &level.curr.hash().to_hex()[..16];
-                            let snap_hash = &level.snap.hash().to_hex()[..16];
-                            let next_hash = level.next().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string());
-                            let next_hash_trunc = if next_hash == "None" { "None" } else { &next_hash[..16] };
-                            println!("    HA Level {}: curr={}, snap={}, next={}",
-                                level_idx, curr_hash, snap_hash, next_hash_trunc);
-                        }
-                    }
-                }
             }
 
             // Apply changes to live bucket list (always call add_batch for spill timing)
@@ -2160,21 +2144,6 @@ async fn cmd_replay_bucket_list(
                 all_live,
                 all_dead,
             )?;
-
-            // Log bucket list state for diagnosis
-            if seq >= start_ledger && seq <= end_ledger {
-                println!("  [DEBUG] Ledger {} live bucket list state after add_batch:", seq);
-                let levels = bucket_list.levels();
-                for level_idx in 0..levels.len() {
-                    let level = &levels[level_idx];
-                    let curr_hash = &level.curr.hash().to_hex()[..16];
-                    let snap_hash = &level.snap.hash().to_hex()[..16];
-                    let next_hash = level.next().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string());
-                    let next_hash_trunc = if next_hash == "None" { "None" } else { &next_hash[..16] };
-                    println!("    Level {}: curr={}, snap={}, next={}",
-                        level_idx, curr_hash, snap_hash, next_hash_trunc);
-                }
-            }
 
             // Compute hash for comparison
             // If live_only, we just compare the live bucket list hash
@@ -3169,68 +3138,10 @@ async fn cmd_verify_execution(
                 // 4. Upgrade changes
                 let upgrade_metas = extract_upgrade_metas(&lcm);
 
-                // DEBUG: Log upgrade metas at ledger 702
-                if seq == 702 {
-                    eprintln!("DEBUG 702: upgrade_metas count = {}", upgrade_metas.len());
-                    let mut config_changes = 0;
-                    let mut has_eviction_iter = false;
-                    let mut state_count = 0;
-                    for (i, upgrade) in upgrade_metas.iter().enumerate() {
-                        eprintln!("  Upgrade {}: {} changes", i, upgrade.changes.len());
-                        for change in upgrade.changes.iter() {
-                            match change {
-                                stellar_xdr::curr::LedgerEntryChange::Created(entry) => {
-                                    eprintln!("    CREATED: {:?}", entry.data.name());
-                                }
-                                stellar_xdr::curr::LedgerEntryChange::Updated(entry) => {
-                                    if let LedgerEntryData::ConfigSetting(cs) = &entry.data {
-                                        config_changes += 1;
-                                        if let ConfigSettingEntry::EvictionIterator(ei) = cs {
-                                            has_eviction_iter = true;
-                                            eprintln!("    UPDATED ConfigSetting:EvictionIterator: offset={}, level={}, is_curr={}, last_modified={}",
-                                                ei.bucket_file_offset, ei.bucket_list_level, ei.is_curr_bucket, entry.last_modified_ledger_seq);
-                                        } else {
-                                            eprintln!("    UPDATED ConfigSetting:{}", cs.name());
-                                        }
-                                    } else {
-                                        eprintln!("    UPDATED: {:?}", entry.data.name());
-                                    }
-                                }
-                                stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
-                                    eprintln!("    REMOVED: {:?}", key.name());
-                                }
-                                stellar_xdr::curr::LedgerEntryChange::State(entry) => {
-                                    state_count += 1;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    eprintln!("  Total ConfigSetting changes from upgrades: {}", config_changes);
-                    eprintln!("  State entries in upgrade: {}", state_count);
-                    eprintln!("  Upgrade has EvictionIterator: {}", has_eviction_iter);
-
-                    // Also check tx changes
-                    let (init, live, _) = aggregator.clone().to_vectors();
-                    let config_in_aggregator = init.iter().chain(live.iter())
-                        .filter(|e| matches!(e.data, LedgerEntryData::ConfigSetting(_)))
-                        .count();
-                    eprintln!("  ConfigSettings in aggregator before upgrades: {}", config_in_aggregator);
-                }
-
                 for upgrade in &upgrade_metas {
                     for change in upgrade.changes.iter() {
                         apply_change_with_prestate(&mut aggregator, &bl, change);
                     }
-                }
-
-                // DEBUG: Log aggregator state after upgrades at ledger 702
-                if seq == 702 {
-                    let (init, live, _) = aggregator.clone().to_vectors();
-                    let config_in_aggregator = init.iter().chain(live.iter())
-                        .filter(|e| matches!(e.data, LedgerEntryData::ConfigSetting(_)))
-                        .count();
-                    eprintln!("  ConfigSettings in aggregator after upgrades: {}", config_in_aggregator);
                 }
 
                 // Snapshot the aggregator state BEFORE evictions to get the
@@ -3244,24 +3155,6 @@ async fn cmd_verify_execution(
                 let evicted_keys = extract_evicted_keys(&lcm);
                 for key in &evicted_keys {
                     apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Removed(key.clone()));
-                }
-
-                // DEBUG: Check if CDP metadata already has EvictionIterator update
-                if seq == 702 {
-                    let eviction_iter_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                        config_setting_id: ConfigSettingId::EvictionIterator,
-                    });
-                    if let Some(change) = aggregator.changes.get(&eviction_iter_key) {
-                        eprintln!("DEBUG 702: CDP metadata HAS EvictionIterator update in aggregator");
-                        if let FinalChange::Live(entry) = change {
-                            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(it)) = &entry.data {
-                                eprintln!("  CDP value: offset={}, level={}, is_curr={}",
-                                    it.bucket_file_offset, it.bucket_list_level, it.is_curr_bucket);
-                            }
-                        }
-                    } else {
-                        eprintln!("DEBUG 702: CDP metadata does NOT have EvictionIterator update in aggregator");
-                    }
                 }
 
                 // 6. Run local eviction scan to get the EvictionIterator update (Protocol 23+)
@@ -3296,12 +3189,6 @@ async fn cmd_verify_execution(
                             StateArchivalSettings::default()
                         })
                     };
-
-                    // DEBUG: Log settings at ledger 702
-                    if seq == 702 {
-                        eprintln!("DEBUG 702: StateArchival settings - eviction_scan_size={}, starting_level={}",
-                            settings.eviction_scan_size, settings.starting_eviction_scan_level);
-                    }
 
                     // Load current iterator - check aggregator first (for upgraded values), then bucket list
                     let iter = {
@@ -3339,14 +3226,6 @@ async fn cmd_verify_execution(
                     // Perform scan
                     let scan_result = bl.scan_for_eviction_incremental(iter, seq, &settings).unwrap();
                     let updated_iter = scan_result.end_iterator;
-
-                    // DEBUG: Log our computed EvictionIterator at ledger 702
-                    if seq == 702 {
-                        eprintln!("DEBUG 702: Our computed EvictionIterator: offset={}, level={}, is_curr={}",
-                            updated_iter.bucket_file_offset, updated_iter.bucket_list_level, updated_iter.is_curr_bucket);
-                        eprintln!("  Starting iter was: offset={}, level={}, is_curr={}",
-                            iter.bucket_file_offset, iter.bucket_list_level, iter.is_curr_bucket);
-                    }
 
                     let iter_entry = LedgerEntry {
                         last_modified_ledger_seq: seq,
@@ -3398,19 +3277,6 @@ async fn cmd_verify_execution(
                 }
 
                 let (all_init, all_live, all_dead) = aggregator.to_vectors();
-
-                // DEBUG: Print final vectors at ledger 702
-                if seq == 702 {
-                    eprintln!("DEBUG 702: Final vectors - init={}, live={}, dead={}", all_init.len(), all_live.len(), all_dead.len());
-                    let eviction_iters: Vec<_> = all_init.iter().chain(all_live.iter())
-                        .filter_map(|e| {
-                            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(ei)) = &e.data {
-                                Some((e.last_modified_ledger_seq, ei.bucket_file_offset, ei.bucket_list_level, ei.is_curr_bucket))
-                            } else { None }
-                        })
-                        .collect();
-                    eprintln!("DEBUG 702: EvictionIterator entries in vectors: {:?}", eviction_iters);
-                }
 
                 // Before evicting entries from the live bucket list, look up full entry data
                 // for persistent entries that need to go to the hot archive. Use the

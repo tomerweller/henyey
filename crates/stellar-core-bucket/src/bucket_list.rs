@@ -589,76 +589,6 @@ impl BucketList {
             "add_batch_internal: starting spill processing"
         );
 
-        // Debug output for ledgers 701 and 702
-        let debug_702 = ledger_seq == 701 || ledger_seq == 702;
-        if debug_702 {
-            eprintln!("=== DEBUG LEDGER {} ===", ledger_seq);
-            eprintln!("Before any processing:");
-            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
-            eprintln!("  L0.snap.hash = {}", self.levels[0].snap.hash().to_hex());
-            eprintln!("  L0.curr entries = {}", self.levels[0].curr.len());
-            eprintln!("  new_bucket.hash = {}", new_bucket.hash().to_hex());
-            eprintln!("  new_bucket entries = {}", new_bucket.len());
-
-            // Print entry types in new_bucket
-            let mut meta_count = 0;
-            let mut init_count = 0;
-            let mut live_count = 0;
-            let mut dead_count = 0;
-            for entry in new_bucket.iter() {
-                match entry {
-                    BucketEntry::Metadata(_) => meta_count += 1,
-                    BucketEntry::Init(_) => init_count += 1,
-                    BucketEntry::Live(_) => live_count += 1,
-                    BucketEntry::Dead(_) => dead_count += 1,
-                }
-            }
-            eprintln!("  new_bucket entry breakdown: meta={}, init={}, live={}, dead={}",
-                meta_count, init_count, live_count, dead_count);
-
-            // Print entry keys
-            if ledger_seq == 702 {
-                eprintln!("  new_bucket entry keys:");
-                for entry in new_bucket.iter() {
-                    match entry {
-                        BucketEntry::Metadata(m) => eprintln!("    METADATA: v{}", m.ledger_version),
-                        BucketEntry::Init(ref e) | BucketEntry::Live(ref e) => {
-                            let key_type = match &e.data {
-                                stellar_xdr::curr::LedgerEntryData::Account(_) => "Account",
-                                stellar_xdr::curr::LedgerEntryData::Trustline(_) => "Trustline",
-                                stellar_xdr::curr::LedgerEntryData::Offer(_) => "Offer",
-                                stellar_xdr::curr::LedgerEntryData::Data(_) => "Data",
-                                stellar_xdr::curr::LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance",
-                                stellar_xdr::curr::LedgerEntryData::LiquidityPool(_) => "LiquidityPool",
-                                stellar_xdr::curr::LedgerEntryData::ContractData(_) => "ContractData",
-                                stellar_xdr::curr::LedgerEntryData::ContractCode(_) => "ContractCode",
-                                stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => match cs {
-                                    stellar_xdr::curr::ConfigSettingEntry::EvictionIterator(_) => "ConfigSetting:EvictionIterator",
-                                    _ => "ConfigSetting:Other",
-                                },
-                                stellar_xdr::curr::LedgerEntryData::Ttl(_) => "TTL",
-                            };
-                            let entry_type = match &entry {
-                                BucketEntry::Init(_) => "INIT",
-                                BucketEntry::Live(_) => "LIVE",
-                                _ => "?",
-                            };
-                            eprintln!("    {} {}", entry_type, key_type);
-                        }
-                        BucketEntry::Dead(k) => {
-                            let key_type = match k {
-                                stellar_xdr::curr::LedgerKey::Account(_) => "Account",
-                                stellar_xdr::curr::LedgerKey::Trustline(_) => "Trustline",
-                                stellar_xdr::curr::LedgerKey::ConfigSetting(_) => "ConfigSetting",
-                                _ => "Other",
-                            };
-                            eprintln!("    DEAD {}", key_type);
-                        }
-                    }
-                }
-            }
-        }
-
         // Step 1: Process spills from highest level down to level 1
         // This matches C++ stellar-core's BucketListBase::addBatchInternal
         //
@@ -676,13 +606,6 @@ impl BucketList {
                 // Snap level i-1: moves curr→snap, returns the NEW snap (old curr)
                 // This is the bucket that flows to level i
                 let spilling_snap = self.levels[i - 1].snap();
-
-                if debug_702 && i == 1 {
-                    eprintln!("After L0.snap():");
-                    eprintln!("  L0.curr.hash = {} (should be empty)", self.levels[0].curr.hash().to_hex());
-                    eprintln!("  L0.snap.hash = {}", self.levels[0].snap.hash().to_hex());
-                    eprintln!("  spilling_snap.hash = {}", spilling_snap.hash().to_hex());
-                }
 
                 tracing::debug!(
                     level = i - 1,
@@ -721,12 +644,6 @@ impl BucketList {
         // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_dead_0 = Self::keep_tombstone_entries(0);
 
-        if debug_702 {
-            eprintln!("Before L0.prepare_with_normalization:");
-            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
-            eprintln!("  L0.curr entries = {}", self.levels[0].curr.len());
-        }
-
         self.levels[0].prepare_with_normalization(
             ledger_seq,
             protocol_version,
@@ -736,25 +653,7 @@ impl BucketList {
             false, // level 0 never uses empty curr
         )?;
 
-        if debug_702 {
-            eprintln!("After L0.prepare_with_normalization, before commit:");
-            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
-            eprintln!("  L0.next.hash = {}", self.levels[0].next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string()));
-            if let Some(next) = &self.levels[0].next {
-                eprintln!("  L0.next entries = {}", next.len());
-            }
-        }
-
         self.levels[0].commit();
-
-        if debug_702 {
-            eprintln!("After L0.commit:");
-            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
-            eprintln!("  L0.snap.hash = {}", self.levels[0].snap.hash().to_hex());
-            eprintln!("  L0.curr entries = {}", self.levels[0].curr.len());
-            eprintln!("  Live bucket list hash = {}", self.hash().to_hex());
-            eprintln!("=== END DEBUG LEDGER {} ===", ledger_seq);
-        }
 
         Ok(())
     }
