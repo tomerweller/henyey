@@ -218,7 +218,7 @@ rs-stellar-core/
 |-------|---------|--------|
 | [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Ledger close pipeline, state snapshots, delta tracking | [~85%](crates/stellar-core-ledger/PARITY_STATUS.md) |
 | [`stellar-core-tx`](crates/stellar-core-tx/README.md) | Transaction validation and execution (classic + Soroban) | [~98%](crates/stellar-core-tx/PARITY_STATUS.md) |
-| [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | BucketList implementation, merges, on-disk state | [~92%](crates/stellar-core-bucket/PARITY_STATUS.md) |
+| [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | BucketList implementation, merges, on-disk state | [~98%](crates/stellar-core-bucket/PARITY_STATUS.md) |
 | [`stellar-core-invariant`](crates/stellar-core-invariant/README.md) | Ledger transition validation, consistency checks | [~87%](crates/stellar-core-invariant/PARITY_STATUS.md) |
 
 ### History & Sync
