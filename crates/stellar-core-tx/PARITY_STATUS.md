@@ -237,6 +237,9 @@ Corresponds to: `OperationFrame.h` enum `ThresholdLevel`
 | Rent fee calculation | Protocol-versioned | Full |
 | Archived entry restoration | V1 ext support | Full |
 | PRNG seed | Configurable seed | Full |
+| Error mapping | CPU/memory-based result codes | Full |
+| Write bytes checking | Post-execution validation | Full |
+| Event size checking | Max contract events size | Full |
 
 ## Not Implemented (By Design)
 
