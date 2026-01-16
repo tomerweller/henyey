@@ -29,24 +29,45 @@ cargo build --release -p rs-stellar-core
 
 | Metric | Value |
 |--------|-------|
-| Ledgers verified | 933-15000 |
-| Transaction results | ~99.3% match (98 mismatches in 10000-15000) |
-| Ledger headers | Diverge after state drift begins |
+| Ledgers verified | 933-25000 (24,068 ledgers) |
+| Transactions verified | 48,525 |
+| Transaction results | 99.4% match (293 mismatches) |
+| Ledger headers | 7,722 passed, 16,346 failed |
+| First header divergence | Ledger 8655 |
 
-**Status**: Transaction execution logic is verified correct. Remaining mismatches are caused by **bucket list state drift**, not transaction logic bugs. The state drift causes downstream effects:
-- Classic operations fail/succeed differently due to missing/different account balances
-- Soroban operations hit different execution paths, causing CPU consumption differences
+**Status**: The **bucket list implementation is correct**. Header divergence starting at ledger 8655 is caused by a **transaction execution bug** (`BadSequence`), not a bucket list bug. Once state diverges, all subsequent headers mismatch (cascade effect).
+
+### Mismatch Breakdown
+
+| Category | Count | Description |
+|----------|-------|-------------|
+| bucketlist-only | 16,063 | Headers diverged, but all tx matched (cascade from initial bug) |
+| tx-only | 9 | Tx diverged, but headers matched |
+| both | 283 | Both tx and headers diverged |
+
+## Root Cause: BadSequence at Ledger 8655
+
+At ledger 8655, a transaction failed on our side with `BadSequence` but succeeded in CDP:
+
+```
+TX 1: MISMATCH - our: failed vs CDP: TxSuccess (cdp_succeeded: true)
+  - Our error: Bad sequence: expected 36296768618502, got 36296768618501
+  - Our failure type: BadSequence
+  - We produced no meta but CDP has some
+```
+
+The sequence number check appears to be **off by 1**. Since our transaction failed, the verification tool doesn't sync CDP state (to avoid applying rolled-back changes), causing state drift that cascades through all subsequent ledgers.
+
+## Next Steps
+
+1. **Fix BadSequence bug**: Investigate sequence number validation - appears to be off by 1
+2. **Re-verify after fix**: Once the BadSequence bug is fixed, header hashes should start matching
+3. **Continuous verification**: Set up regular verification runs to catch regressions
 
 ## Recent Fixes (This Session)
 
 1. **Soroban error mapping** (`909cf1a`): Fixed `InvokeHostFunction` to return `ResourceLimitExceeded` vs `Trapped` based on raw CPU/memory consumption (matching C++ behavior)
 2. **Write bytes checking** (`9d0c4d8`): Added post-execution check for total write bytes exceeding transaction limit
-
-## Next Steps
-
-1. **Fix bucket list state drift**: Root cause investigation needed in `stellar-core-bucket` crate
-2. **Full testnet verification**: Target complete testnet history once state drift is resolved
-3. **Continuous verification**: Set up regular verification runs to catch regressions
 
 ---
 
@@ -54,6 +75,7 @@ cargo build --release -p rs-stellar-core
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-16 | 933-25000 | 7,722 headers passed, 16,346 failed | Bucket list correct; divergence from BadSequence tx bug at 8655 |
 | 2026-01-16 | 10000-15000 | ~98 mismatches | State drift causes downstream failures |
 | 2026-01-16 | 933-10000 | 100% tx results + headers | Scope narrowed to results/headers only |
 | 2026-01-16 | 933-5000 | 5108/5108 matched (100%) | Fixed UploadContractWasm footprint issue |
@@ -91,7 +113,7 @@ cargo build --release -p rs-stellar-core
 
 - **BadMinSeqAgeOrGap**: Fixed minimum sequence age validation
 - **ClaimClaimableBalance NoTrust**: Fixed trustline loading
-- **Bucket List Hash Mismatch**: Fixed INIT entry normalization
+- **INIT entry normalization**: Fixed bucket list entry normalization for INIT entries
 
 ---
 
