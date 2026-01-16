@@ -48,7 +48,8 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use stellar_xdr::curr::{
-    AccountId, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerHeader, LedgerKey,
+    AccountId, Asset, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerHeader, LedgerKey,
+    LedgerKeyTrustLine, PoolId, TrustLineAsset,
 };
 
 /// A read-only snapshot of a single bucket.
@@ -553,6 +554,141 @@ impl SearchableBucketListSnapshot {
         winners.truncate(max_winners);
 
         winners
+    }
+
+    /// Loads pool share trustlines for an account and asset.
+    ///
+    /// This finds all pool share trustlines that the given account has for
+    /// liquidity pools that contain the specified asset. This is useful for
+    /// determining which liquidity pools an account participates in for a
+    /// given asset.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Scan all liquidity pool entries to find pools containing the asset
+    /// 2. Build trustline keys for (account_id, pool_id) pairs
+    /// 3. Load those trustlines from the bucket list
+    ///
+    /// # Arguments
+    ///
+    /// * `account_id` - The account to query
+    /// * `asset` - The asset to find pool share trustlines for
+    ///
+    /// # Returns
+    ///
+    /// A vector of trustline entries representing pool shares for pools
+    /// containing the given asset.
+    pub fn load_pool_share_trustlines_by_account_and_asset(
+        &self,
+        account_id: &AccountId,
+        asset: &Asset,
+    ) -> Vec<LedgerEntry> {
+        // First, find all pool IDs containing the asset
+        let pool_ids = self.collect_pool_ids_for_asset(asset);
+
+        if pool_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Build trustline keys for each pool
+        let trustline_keys: Vec<LedgerKey> = pool_ids
+            .iter()
+            .map(|pool_id| {
+                LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: account_id.clone(),
+                    asset: TrustLineAsset::PoolShare(pool_id.clone()),
+                })
+            })
+            .collect();
+
+        // Load the trustlines
+        self.snapshot.load_keys(&trustline_keys)
+    }
+
+    /// Collects all pool IDs that contain a given asset.
+    ///
+    /// Scans all liquidity pool entries to find pools where either asset_a
+    /// or asset_b matches the given asset.
+    fn collect_pool_ids_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
+        let mut pool_ids = Vec::new();
+        let mut seen_pools: HashSet<PoolId> = HashSet::new();
+
+        for level in &self.snapshot.levels {
+            for bucket in [&level.curr, &level.snap] {
+                for bucket_entry in bucket.raw_bucket().iter() {
+                    match &bucket_entry {
+                        BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                            if let LedgerEntryData::LiquidityPool(pool) = &entry.data {
+                                // Skip if already seen
+                                if seen_pools.contains(&pool.liquidity_pool_id) {
+                                    continue;
+                                }
+
+                                // Check if pool contains the asset
+                                let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                                    cp,
+                                ) = &pool.body;
+                                if &cp.params.asset_a == asset || &cp.params.asset_b == asset {
+                                    seen_pools.insert(pool.liquidity_pool_id.clone());
+                                    pool_ids.push(pool.liquidity_pool_id.clone());
+                                }
+                            }
+                        }
+                        BucketEntry::Dead(key) => {
+                            // Mark pool as seen if it's deleted
+                            if let LedgerKey::LiquidityPool(k) = key {
+                                seen_pools.insert(k.liquidity_pool_id.clone());
+                            }
+                        }
+                        BucketEntry::Metadata(_) => {}
+                    }
+                }
+            }
+        }
+
+        pool_ids
+    }
+
+    /// Loads all trustline entries for an account.
+    ///
+    /// Scans the bucket list for all trustline entries belonging to the
+    /// given account.
+    pub fn load_trustlines_for_account(&self, account_id: &AccountId) -> Vec<LedgerEntry> {
+        let mut trustlines = Vec::new();
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+
+        for level in &self.snapshot.levels {
+            for bucket in [&level.curr, &level.snap] {
+                for bucket_entry in bucket.raw_bucket().iter() {
+                    match &bucket_entry {
+                        BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                            if let LedgerEntryData::Trustline(tl) = &entry.data {
+                                if &tl.account_id == account_id {
+                                    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                                        account_id: tl.account_id.clone(),
+                                        asset: tl.asset.clone(),
+                                    });
+                                    if !seen_keys.contains(&key) {
+                                        seen_keys.insert(key);
+                                        trustlines.push(entry.clone());
+                                    }
+                                }
+                            }
+                        }
+                        BucketEntry::Dead(key) => {
+                            if let LedgerKey::Trustline(k) = key {
+                                if &k.account_id == account_id {
+                                    seen_keys.insert(key.clone());
+                                }
+                            }
+                        }
+                        BucketEntry::Metadata(_) => {}
+                    }
+                }
+            }
+        }
+
+        trustlines
     }
 }
 

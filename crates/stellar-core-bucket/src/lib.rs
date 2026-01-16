@@ -90,17 +90,22 @@
 //! let hash = bucket_list.hash();
 //! ```
 
+mod applicator;
 mod bloom_filter;
 mod bucket;
 mod bucket_list;
+mod cache;
 mod disk_bucket;
 mod entry;
 mod error;
 mod eviction;
 mod future_bucket;
 mod hot_archive;
+mod index;
 mod manager;
 mod merge;
+mod merge_map;
+mod metrics;
 pub mod snapshot;
 
 // ============================================================================
@@ -185,6 +190,45 @@ pub use snapshot::{
     BucketLevelSnapshot, BucketListSnapshot, BucketSnapshot, BucketSnapshotManager,
     HotArchiveBucketLevelSnapshot, HotArchiveBucketListSnapshot, HotArchiveBucketSnapshot,
     InflationWinner, SearchableBucketListSnapshot, SearchableHotArchiveBucketListSnapshot,
+};
+
+// ============================================================================
+// Advanced indexing
+// ============================================================================
+
+pub use index::{
+    AssetPoolIdMap, BucketEntryCounters, DiskIndex, InMemoryIndex, LiveBucketIndex, RangeEntry,
+    TypeRange, DEFAULT_PAGE_SIZE, IN_MEMORY_INDEX_THRESHOLD,
+};
+
+// ============================================================================
+// Caching
+// ============================================================================
+
+pub use cache::{
+    CacheStats, RandomEvictionCache, DEFAULT_MAX_CACHE_BYTES, DEFAULT_MAX_CACHE_ENTRIES,
+    MIN_BUCKET_LIST_SIZE_FOR_CACHE,
+};
+
+// ============================================================================
+// Merge deduplication
+// ============================================================================
+
+pub use merge_map::{BucketMergeMap, LiveMergeFutures, MergeFuturesStats};
+
+// ============================================================================
+// Bucket applicator (catchup)
+// ============================================================================
+
+pub use applicator::{ApplicatorCounters, BucketApplicator, EntryToApply, DEFAULT_CHUNK_SIZE};
+
+// ============================================================================
+// Metrics and counters
+// ============================================================================
+
+pub use metrics::{
+    BucketListMetrics, BucketListMetricsSnapshot, EntryCountType, EvictionCounters,
+    EvictionCountersSnapshot, MergeCounters, MergeCountersSnapshot,
 };
 
 // ============================================================================

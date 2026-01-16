@@ -1,0 +1,885 @@
+//! Advanced bucket indexing for efficient lookups.
+//!
+//! This module provides a hybrid indexing system that matches the C++ stellar-core
+//! `LiveBucketIndex` pattern. It supports both in-memory indexes for small buckets
+//! and disk-based page indexes for large buckets.
+//!
+//! # Index Types
+//!
+//! - [`InMemoryIndex`]: Stores all entries in memory for small buckets
+//! - [`DiskIndex`]: Page-based range index for large buckets (memory efficient)
+//! - [`LiveBucketIndex`]: Facade that selects the appropriate index type
+//!
+//! # Features
+//!
+//! - **Range queries**: Efficiently find entries within key ranges
+//! - **Type ranges**: Track contiguous ranges of entry types for faster type scans
+//! - **Asset-to-PoolID mapping**: Maps assets to liquidity pool IDs for pool queries
+//! - **Entry counters**: Track counts by entry type and durability
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
+use stellar_xdr::curr::{
+    Asset, ContractDataDurability, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerKey,
+    Limits, PoolId, TrustLineAsset, WriteXdr,
+};
+
+use crate::bloom_filter::{BucketBloomFilter, HashSeed};
+use crate::entry::{compare_keys, BucketEntry};
+
+/// Threshold for switching from in-memory to disk-based indexing.
+/// Buckets with fewer entries than this will use in-memory indexing.
+pub const IN_MEMORY_INDEX_THRESHOLD: usize = 10_000;
+
+/// Default page size for disk index (number of entries per page).
+pub const DEFAULT_PAGE_SIZE: u64 = 1024;
+
+// ============================================================================
+// Range Entry
+// ============================================================================
+
+/// A range of keys covered by a page or segment in the index.
+#[derive(Debug, Clone)]
+pub struct RangeEntry {
+    /// The lower bound key (inclusive).
+    pub lower_bound: LedgerKey,
+    /// The upper bound key (inclusive).
+    pub upper_bound: LedgerKey,
+}
+
+impl RangeEntry {
+    /// Creates a new range entry.
+    pub fn new(lower_bound: LedgerKey, upper_bound: LedgerKey) -> Self {
+        Self {
+            lower_bound,
+            upper_bound,
+        }
+    }
+
+    /// Checks if a key falls within this range.
+    pub fn contains(&self, key: &LedgerKey) -> bool {
+        compare_keys(key, &self.lower_bound) != std::cmp::Ordering::Less
+            && compare_keys(key, &self.upper_bound) != std::cmp::Ordering::Greater
+    }
+}
+
+// ============================================================================
+// Entry Counters
+// ============================================================================
+
+/// Counters for bucket entries by type and durability.
+///
+/// This tracks the number of entries of each type in a bucket, useful for
+/// statistics and optimizations.
+#[derive(Debug, Clone, Default)]
+pub struct BucketEntryCounters {
+    /// Count of live entries by entry type.
+    pub live_entries: HashMap<LedgerEntryType, u64>,
+    /// Count of dead entries (tombstones) by entry type.
+    pub dead_entries: HashMap<LedgerEntryType, u64>,
+    /// Count of init entries by entry type.
+    pub init_entries: HashMap<LedgerEntryType, u64>,
+    /// Count of persistent Soroban entries.
+    pub persistent_soroban_entries: u64,
+    /// Count of temporary Soroban entries.
+    pub temporary_soroban_entries: u64,
+}
+
+impl BucketEntryCounters {
+    /// Creates a new empty counter set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a bucket entry.
+    pub fn record_entry(&mut self, entry: &BucketEntry) {
+        match entry {
+            BucketEntry::Live(e) => {
+                let entry_type = ledger_entry_type(&e.data);
+                *self.live_entries.entry(entry_type).or_insert(0) += 1;
+                self.record_soroban_durability(e);
+            }
+            BucketEntry::Init(e) => {
+                let entry_type = ledger_entry_type(&e.data);
+                *self.init_entries.entry(entry_type).or_insert(0) += 1;
+                self.record_soroban_durability(e);
+            }
+            BucketEntry::Dead(k) => {
+                let entry_type = ledger_key_type(k);
+                *self.dead_entries.entry(entry_type).or_insert(0) += 1;
+            }
+            BucketEntry::Metadata(_) => {}
+        }
+    }
+
+    /// Records Soroban durability for an entry.
+    fn record_soroban_durability(&mut self, entry: &LedgerEntry) {
+        if let LedgerEntryData::ContractData(data) = &entry.data {
+            match data.durability {
+                ContractDataDurability::Persistent => self.persistent_soroban_entries += 1,
+                ContractDataDurability::Temporary => self.temporary_soroban_entries += 1,
+            }
+        } else if matches!(entry.data, LedgerEntryData::ContractCode(_)) {
+            // ContractCode is always persistent
+            self.persistent_soroban_entries += 1;
+        }
+    }
+
+    /// Returns the total number of live and init entries.
+    pub fn total_live(&self) -> u64 {
+        self.live_entries.values().sum::<u64>() + self.init_entries.values().sum::<u64>()
+    }
+
+    /// Returns the total number of dead entries.
+    pub fn total_dead(&self) -> u64 {
+        self.dead_entries.values().sum()
+    }
+
+    /// Returns the total number of entries.
+    pub fn total(&self) -> u64 {
+        self.total_live() + self.total_dead()
+    }
+
+    /// Returns the count for a specific entry type (live + init).
+    pub fn count_for_type(&self, entry_type: LedgerEntryType) -> u64 {
+        self.live_entries.get(&entry_type).copied().unwrap_or(0)
+            + self.init_entries.get(&entry_type).copied().unwrap_or(0)
+    }
+}
+
+// ============================================================================
+// Asset to Pool ID Mapping
+// ============================================================================
+
+/// Maps assets to their associated liquidity pool IDs.
+///
+/// This allows efficient queries like "find all pool share trustlines for
+/// an account and asset" by quickly identifying which pools contain a given asset.
+#[derive(Debug, Clone, Default)]
+pub struct AssetPoolIdMap {
+    /// Maps asset hash to set of pool IDs containing that asset.
+    asset_to_pools: HashMap<[u8; 32], HashSet<PoolId>>,
+}
+
+impl AssetPoolIdMap {
+    /// Creates a new empty mapping.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a pool mapping for the given assets.
+    pub fn add_pool(&mut self, pool_id: PoolId, asset_a: &Asset, asset_b: &Asset) {
+        let hash_a = Self::hash_asset(asset_a);
+        let hash_b = Self::hash_asset(asset_b);
+
+        self.asset_to_pools
+            .entry(hash_a)
+            .or_default()
+            .insert(pool_id.clone());
+        self.asset_to_pools
+            .entry(hash_b)
+            .or_default()
+            .insert(pool_id);
+    }
+
+    /// Gets all pool IDs containing the given asset.
+    pub fn get_pools_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
+        let hash = Self::hash_asset(asset);
+        self.asset_to_pools
+            .get(&hash)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Checks if the mapping is empty.
+    pub fn is_empty(&self) -> bool {
+        self.asset_to_pools.is_empty()
+    }
+
+    /// Returns the number of assets tracked.
+    pub fn num_assets(&self) -> usize {
+        self.asset_to_pools.len()
+    }
+
+    /// Computes a hash for an asset for use as a map key.
+    fn hash_asset(asset: &Asset) -> [u8; 32] {
+        let asset_bytes = asset.to_xdr(Limits::none()).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&asset_bytes);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+}
+
+// ============================================================================
+// Type Range
+// ============================================================================
+
+/// Tracks the byte range for a specific entry type in the bucket.
+///
+/// This enables efficient type-specific scans by identifying the contiguous
+/// range of entries of a given type.
+#[derive(Debug, Clone, Copy)]
+pub struct TypeRange {
+    /// Start offset in the bucket file.
+    pub start_offset: u64,
+    /// End offset in the bucket file (exclusive).
+    pub end_offset: u64,
+}
+
+impl TypeRange {
+    /// Creates a new type range.
+    pub fn new(start_offset: u64, end_offset: u64) -> Self {
+        Self {
+            start_offset,
+            end_offset,
+        }
+    }
+
+    /// Returns the size of this range in bytes.
+    pub fn size(&self) -> u64 {
+        self.end_offset - self.start_offset
+    }
+}
+
+// ============================================================================
+// In-Memory Index
+// ============================================================================
+
+/// An in-memory index for small buckets.
+///
+/// This stores all entry keys and their offsets in memory, providing O(log n)
+/// lookup time. Suitable for buckets with fewer than [`IN_MEMORY_INDEX_THRESHOLD`]
+/// entries.
+#[derive(Debug, Clone)]
+pub struct InMemoryIndex {
+    /// Maps keys to their byte offsets in the bucket file.
+    key_to_offset: BTreeMap<Vec<u8>, u64>,
+    /// Optional bloom filter for fast negative lookups.
+    bloom_filter: Option<Arc<BucketBloomFilter>>,
+    /// Bloom filter seed.
+    bloom_seed: HashSeed,
+    /// Asset to pool ID mapping.
+    asset_to_pool_id: AssetPoolIdMap,
+    /// Entry counters.
+    counters: BucketEntryCounters,
+    /// Ranges for each entry type.
+    type_ranges: HashMap<LedgerEntryType, TypeRange>,
+}
+
+impl InMemoryIndex {
+    /// Creates a new in-memory index from bucket entries.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - Iterator over (BucketEntry, offset) pairs
+    /// * `bloom_seed` - Seed for bloom filter construction
+    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed) -> Self
+    where
+        I: Iterator<Item = (BucketEntry, u64)>,
+    {
+        let mut key_to_offset = BTreeMap::new();
+        let mut bloom_key_hashes = Vec::new();
+        let mut asset_to_pool_id = AssetPoolIdMap::new();
+        let mut counters = BucketEntryCounters::new();
+        let mut type_ranges: HashMap<LedgerEntryType, (u64, u64)> = HashMap::new();
+        let mut current_type: Option<LedgerEntryType> = None;
+        let mut type_start_offset = 0u64;
+
+        for (entry, offset) in entries {
+            // Record counters
+            counters.record_entry(&entry);
+
+            // Extract key
+            if let Some(key) = entry.key() {
+                let entry_type = ledger_key_type(&key);
+
+                // Track type ranges
+                if current_type != Some(entry_type) {
+                    // Close previous type range
+                    if let Some(prev_type) = current_type {
+                        type_ranges.insert(prev_type, (type_start_offset, offset));
+                    }
+                    current_type = Some(entry_type);
+                    type_start_offset = offset;
+                }
+
+                // Serialize key for index
+                let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+                key_to_offset.insert(key_bytes.clone(), offset);
+
+                // Compute bloom hash
+                bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, &bloom_seed));
+
+                // Extract pool mappings from liquidity pool entries
+                if let BucketEntry::Live(e) | BucketEntry::Init(e) = &entry {
+                    if let LedgerEntryData::LiquidityPool(pool) = &e.data {
+                        let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                            cp,
+                        ) = &pool.body;
+                        asset_to_pool_id.add_pool(
+                            pool.liquidity_pool_id.clone(),
+                            &cp.params.asset_a,
+                            &cp.params.asset_b,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Close final type range (use u64::MAX as sentinel for end)
+        if let Some(prev_type) = current_type {
+            type_ranges.insert(prev_type, (type_start_offset, u64::MAX));
+        }
+
+        // Build bloom filter
+        let bloom_filter = if bloom_key_hashes.len() >= 2 {
+            BucketBloomFilter::from_hashes(&bloom_key_hashes, &bloom_seed)
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
+
+        // Convert type ranges
+        let type_ranges = type_ranges
+            .into_iter()
+            .map(|(k, (start, end))| (k, TypeRange::new(start, end)))
+            .collect();
+
+        Self {
+            key_to_offset,
+            bloom_filter,
+            bloom_seed,
+            asset_to_pool_id,
+            counters,
+            type_ranges,
+        }
+    }
+
+    /// Looks up the offset for a key.
+    pub fn get_offset(&self, key: &LedgerKey) -> Option<u64> {
+        // Check bloom filter first
+        if let Some(ref filter) = self.bloom_filter {
+            if !filter.may_contain(key, &self.bloom_seed) {
+                return None;
+            }
+        }
+
+        let key_bytes = key.to_xdr(Limits::none()).ok()?;
+        self.key_to_offset.get(&key_bytes).copied()
+    }
+
+    /// Checks if a key may exist in the index (bloom filter check).
+    pub fn may_contain(&self, key: &LedgerKey) -> bool {
+        if let Some(ref filter) = self.bloom_filter {
+            filter.may_contain(key, &self.bloom_seed)
+        } else {
+            true // No bloom filter, assume it might exist
+        }
+    }
+
+    /// Returns the entry counters.
+    pub fn counters(&self) -> &BucketEntryCounters {
+        &self.counters
+    }
+
+    /// Returns the asset to pool ID mapping.
+    pub fn asset_to_pool_id(&self) -> &AssetPoolIdMap {
+        &self.asset_to_pool_id
+    }
+
+    /// Returns the type range for a specific entry type.
+    pub fn type_range(&self, entry_type: LedgerEntryType) -> Option<&TypeRange> {
+        self.type_ranges.get(&entry_type)
+    }
+
+    /// Returns the number of indexed keys.
+    pub fn len(&self) -> usize {
+        self.key_to_offset.len()
+    }
+
+    /// Checks if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.key_to_offset.is_empty()
+    }
+}
+
+// ============================================================================
+// Disk Index
+// ============================================================================
+
+/// A disk-based page index for large buckets.
+///
+/// Instead of storing every key, this stores range information for pages
+/// of entries. A lookup first finds the page that might contain the key,
+/// then reads that page from disk.
+#[derive(Debug, Clone)]
+pub struct DiskIndex {
+    /// Page size (number of entries per page).
+    page_size: u64,
+    /// Maps page ranges to file offsets.
+    /// Each entry contains (RangeEntry, page_start_offset).
+    pages: Vec<(RangeEntry, u64)>,
+    /// Optional bloom filter for fast negative lookups.
+    bloom_filter: Option<Arc<BucketBloomFilter>>,
+    /// Bloom filter seed.
+    bloom_seed: HashSeed,
+    /// Asset to pool ID mapping.
+    asset_to_pool_id: AssetPoolIdMap,
+    /// Entry counters.
+    counters: BucketEntryCounters,
+    /// Ranges for each entry type.
+    type_ranges: HashMap<LedgerEntryType, TypeRange>,
+}
+
+impl DiskIndex {
+    /// Creates a new disk index from bucket entries.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - Iterator over (BucketEntry, offset) pairs
+    /// * `bloom_seed` - Seed for bloom filter construction
+    /// * `page_size` - Number of entries per page
+    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed, page_size: u64) -> Self
+    where
+        I: Iterator<Item = (BucketEntry, u64)>,
+    {
+        let mut pages = Vec::new();
+        let mut bloom_key_hashes = Vec::new();
+        let mut asset_to_pool_id = AssetPoolIdMap::new();
+        let mut counters = BucketEntryCounters::new();
+        let mut type_ranges: HashMap<LedgerEntryType, (u64, u64)> = HashMap::new();
+        let mut current_type: Option<LedgerEntryType> = None;
+        let mut type_start_offset = 0u64;
+
+        // Page building state
+        let mut page_start_offset = 0u64;
+        let mut page_first_key: Option<LedgerKey> = None;
+        let mut page_last_key: Option<LedgerKey> = None;
+        let mut entries_in_page = 0u64;
+
+        for (entry, offset) in entries {
+            // Record counters
+            counters.record_entry(&entry);
+
+            // Extract key
+            if let Some(key) = entry.key() {
+                let entry_type = ledger_key_type(&key);
+
+                // Track type ranges
+                if current_type != Some(entry_type) {
+                    if let Some(prev_type) = current_type {
+                        type_ranges.insert(prev_type, (type_start_offset, offset));
+                    }
+                    current_type = Some(entry_type);
+                    type_start_offset = offset;
+                }
+
+                // Compute bloom hash
+                bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, &bloom_seed));
+
+                // Page handling
+                if page_first_key.is_none() {
+                    page_start_offset = offset;
+                    page_first_key = Some(key.clone());
+                }
+                page_last_key = Some(key.clone());
+                entries_in_page += 1;
+
+                // Flush page if full
+                if entries_in_page >= page_size {
+                    if let (Some(first), Some(last)) = (page_first_key.take(), page_last_key.take())
+                    {
+                        pages.push((RangeEntry::new(first, last), page_start_offset));
+                    }
+                    entries_in_page = 0;
+                }
+
+                // Extract pool mappings
+                if let BucketEntry::Live(e) | BucketEntry::Init(e) = &entry {
+                    if let LedgerEntryData::LiquidityPool(pool) = &e.data {
+                        let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                            cp,
+                        ) = &pool.body;
+                        asset_to_pool_id.add_pool(
+                            pool.liquidity_pool_id.clone(),
+                            &cp.params.asset_a,
+                            &cp.params.asset_b,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Flush final partial page
+        if let (Some(first), Some(last)) = (page_first_key, page_last_key) {
+            pages.push((RangeEntry::new(first, last), page_start_offset));
+        }
+
+        // Close final type range
+        if let Some(prev_type) = current_type {
+            type_ranges.insert(prev_type, (type_start_offset, u64::MAX));
+        }
+
+        // Build bloom filter
+        let bloom_filter = if bloom_key_hashes.len() >= 2 {
+            BucketBloomFilter::from_hashes(&bloom_key_hashes, &bloom_seed)
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
+
+        // Convert type ranges
+        let type_ranges = type_ranges
+            .into_iter()
+            .map(|(k, (start, end))| (k, TypeRange::new(start, end)))
+            .collect();
+
+        Self {
+            page_size,
+            pages,
+            bloom_filter,
+            bloom_seed,
+            asset_to_pool_id,
+            counters,
+            type_ranges,
+        }
+    }
+
+    /// Finds the page that might contain a key.
+    ///
+    /// Returns the page offset if found, or None if the key is definitely
+    /// not in any page.
+    pub fn find_page_for_key(&self, key: &LedgerKey) -> Option<u64> {
+        // Check bloom filter first
+        if let Some(ref filter) = self.bloom_filter {
+            if !filter.may_contain(key, &self.bloom_seed) {
+                return None;
+            }
+        }
+
+        // Binary search for the page containing the key
+        let idx = self.pages.partition_point(|(range, _)| {
+            compare_keys(&range.upper_bound, key) == std::cmp::Ordering::Less
+        });
+
+        if idx < self.pages.len() && self.pages[idx].0.contains(key) {
+            Some(self.pages[idx].1)
+        } else {
+            None
+        }
+    }
+
+    /// Checks if a key may exist in the index (bloom filter check).
+    pub fn may_contain(&self, key: &LedgerKey) -> bool {
+        if let Some(ref filter) = self.bloom_filter {
+            filter.may_contain(key, &self.bloom_seed)
+        } else {
+            true
+        }
+    }
+
+    /// Returns the entry counters.
+    pub fn counters(&self) -> &BucketEntryCounters {
+        &self.counters
+    }
+
+    /// Returns the asset to pool ID mapping.
+    pub fn asset_to_pool_id(&self) -> &AssetPoolIdMap {
+        &self.asset_to_pool_id
+    }
+
+    /// Returns the type range for a specific entry type.
+    pub fn type_range(&self, entry_type: LedgerEntryType) -> Option<&TypeRange> {
+        self.type_ranges.get(&entry_type)
+    }
+
+    /// Returns the number of pages.
+    pub fn num_pages(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Returns the page size.
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+}
+
+// ============================================================================
+// Live Bucket Index (Facade)
+// ============================================================================
+
+/// A hybrid index that selects between in-memory and disk-based indexing.
+///
+/// This facade automatically chooses the appropriate index type based on
+/// bucket size, matching the C++ `LiveBucketIndex` pattern.
+#[derive(Debug, Clone)]
+pub enum LiveBucketIndex {
+    /// In-memory index for small buckets.
+    InMemory(InMemoryIndex),
+    /// Disk-based page index for large buckets.
+    Disk(DiskIndex),
+}
+
+impl LiveBucketIndex {
+    /// Creates a new index from bucket entries.
+    ///
+    /// Automatically selects in-memory or disk-based indexing based on
+    /// the number of entries.
+    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed, entry_count: usize) -> Self
+    where
+        I: Iterator<Item = (BucketEntry, u64)>,
+    {
+        if entry_count < IN_MEMORY_INDEX_THRESHOLD {
+            LiveBucketIndex::InMemory(InMemoryIndex::from_entries(entries, bloom_seed))
+        } else {
+            LiveBucketIndex::Disk(DiskIndex::from_entries(
+                entries,
+                bloom_seed,
+                DEFAULT_PAGE_SIZE,
+            ))
+        }
+    }
+
+    /// Checks if this is an in-memory index.
+    pub fn is_in_memory(&self) -> bool {
+        matches!(self, LiveBucketIndex::InMemory(_))
+    }
+
+    /// Checks if a key may exist in the index (bloom filter check).
+    pub fn may_contain(&self, key: &LedgerKey) -> bool {
+        match self {
+            LiveBucketIndex::InMemory(idx) => idx.may_contain(key),
+            LiveBucketIndex::Disk(idx) => idx.may_contain(key),
+        }
+    }
+
+    /// Returns the entry counters.
+    pub fn counters(&self) -> &BucketEntryCounters {
+        match self {
+            LiveBucketIndex::InMemory(idx) => idx.counters(),
+            LiveBucketIndex::Disk(idx) => idx.counters(),
+        }
+    }
+
+    /// Returns the asset to pool ID mapping.
+    pub fn asset_to_pool_id(&self) -> &AssetPoolIdMap {
+        match self {
+            LiveBucketIndex::InMemory(idx) => idx.asset_to_pool_id(),
+            LiveBucketIndex::Disk(idx) => idx.asset_to_pool_id(),
+        }
+    }
+
+    /// Returns the type range for a specific entry type.
+    pub fn type_range(&self, entry_type: LedgerEntryType) -> Option<&TypeRange> {
+        match self {
+            LiveBucketIndex::InMemory(idx) => idx.type_range(entry_type),
+            LiveBucketIndex::Disk(idx) => idx.type_range(entry_type),
+        }
+    }
+
+    /// Gets pools containing a specific asset.
+    pub fn get_pools_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
+        self.asset_to_pool_id().get_pools_for_asset(asset)
+    }
+
+    /// Generates trustline keys for pool share lookups.
+    ///
+    /// Given an account and asset, returns the trustline keys for all pool
+    /// share trustlines that the account might have for pools containing
+    /// the asset.
+    pub fn get_pool_share_trustline_keys(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+        asset: &Asset,
+    ) -> Vec<LedgerKey> {
+        let pools = self.get_pools_for_asset(asset);
+
+        pools
+            .into_iter()
+            .map(|pool_id| {
+                LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+                    account_id: account_id.clone(),
+                    asset: TrustLineAsset::PoolShare(pool_id),
+                })
+            })
+            .collect()
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Returns the ledger entry type for a given entry data.
+fn ledger_entry_type(data: &LedgerEntryData) -> LedgerEntryType {
+    match data {
+        LedgerEntryData::Account(_) => LedgerEntryType::Account,
+        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
+        LedgerEntryData::Data(_) => LedgerEntryType::Data,
+        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
+    }
+}
+
+/// Returns the ledger entry type for a given ledger key.
+fn ledger_key_type(key: &LedgerKey) -> LedgerEntryType {
+    match key {
+        LedgerKey::Account(_) => LedgerEntryType::Account,
+        LedgerKey::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerKey::Offer(_) => LedgerEntryType::Offer,
+        LedgerKey::Data(_) => LedgerEntryType::Data,
+        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerKey::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerKey::Ttl(_) => LedgerEntryType::Ttl,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entry::BucketEntry; // Use our BucketEntry, not the XDR one
+    use stellar_xdr::curr::*;
+
+    fn make_account_id(byte: u8) -> AccountId {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])))
+    }
+
+    fn make_account_entry(byte: u8) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: make_account_id(byte),
+                balance: 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_account_key(byte: u8) -> LedgerKey {
+        LedgerKey::Account(LedgerKeyAccount {
+            account_id: make_account_id(byte),
+        })
+    }
+
+    #[test]
+    fn test_in_memory_index() {
+        let entries: Vec<(BucketEntry, u64)> = (0..10u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        assert_eq!(index.len(), 10);
+
+        // Test lookup
+        let key = make_account_key(5);
+        let offset = index.get_offset(&key);
+        assert_eq!(offset, Some(500));
+
+        // Test missing key
+        let missing_key = make_account_key(100);
+        assert!(index.get_offset(&missing_key).is_none());
+    }
+
+    #[test]
+    fn test_disk_index() {
+        let entries: Vec<(BucketEntry, u64)> = (0..100u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
+
+        assert_eq!(index.num_pages(), 10);
+
+        // Test page lookup
+        let key = make_account_key(55);
+        let page_offset = index.find_page_for_key(&key);
+        assert!(page_offset.is_some());
+    }
+
+    #[test]
+    fn test_entry_counters() {
+        let mut counters = BucketEntryCounters::new();
+
+        counters.record_entry(&BucketEntry::Live(make_account_entry(1)));
+        counters.record_entry(&BucketEntry::Live(make_account_entry(2)));
+        counters.record_entry(&BucketEntry::Dead(make_account_key(3)));
+
+        assert_eq!(counters.total_live(), 2);
+        assert_eq!(counters.total_dead(), 1);
+        assert_eq!(counters.total(), 3);
+        assert_eq!(counters.count_for_type(LedgerEntryType::Account), 2);
+    }
+
+    #[test]
+    fn test_range_entry() {
+        let lower = make_account_key(10);
+        let upper = make_account_key(20);
+        let range = RangeEntry::new(lower, upper);
+
+        assert!(range.contains(&make_account_key(10)));
+        assert!(range.contains(&make_account_key(15)));
+        assert!(range.contains(&make_account_key(20)));
+        assert!(!range.contains(&make_account_key(5)));
+        assert!(!range.contains(&make_account_key(25)));
+    }
+
+    #[test]
+    fn test_live_bucket_index_selection() {
+        // Small bucket should use in-memory
+        let entries: Vec<(BucketEntry, u64)> = (0..100u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let index = LiveBucketIndex::from_entries(entries.into_iter(), [0u8; 16], 100);
+        assert!(index.is_in_memory());
+
+        // Large bucket simulation (we can't easily test with 10k entries here)
+        // but we verify the interface works
+        assert!(index.may_contain(&make_account_key(50)));
+    }
+
+    #[test]
+    fn test_asset_pool_id_map() {
+        let mut map = AssetPoolIdMap::new();
+
+        let pool_id = PoolId(Hash([1u8; 32]));
+        let asset_a = Asset::Native;
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: make_account_id(1),
+        });
+
+        map.add_pool(pool_id.clone(), &asset_a, &asset_b);
+
+        let pools_for_native = map.get_pools_for_asset(&asset_a);
+        assert_eq!(pools_for_native.len(), 1);
+        assert_eq!(pools_for_native[0], pool_id);
+
+        let pools_for_usd = map.get_pools_for_asset(&asset_b);
+        assert_eq!(pools_for_usd.len(), 1);
+    }
+}

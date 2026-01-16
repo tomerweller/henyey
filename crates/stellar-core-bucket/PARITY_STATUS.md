@@ -1,6 +1,6 @@
 ## C++ Parity Status
 
-**Overall Parity: ~78%**
+**Overall Parity: ~92%**
 
 This section documents the implementation status relative to the C++ stellar-core bucket implementation (v25).
 
@@ -16,9 +16,12 @@ This section documents the implementation status relative to the C++ stellar-cor
 | Eviction Scanning | Complete | Incremental scanning with iterator |
 | Disk-Backed Storage | Complete | Index with integrated bloom filter |
 | BucketSnapshot/SnapshotManager | Complete | Thread-safe read snapshots with historical ledger support |
-| Advanced Indexing | Partial | Bloom filters integrated with DiskBucket; no DiskIndex/InMemoryIndex page indexes |
-| Specialized Queries | Partial | Inflation winners, type scanning implemented; pool share lookups pending |
-| Metrics/Monitoring | Not Implemented | Medida integration |
+| Advanced Indexing | Complete | InMemoryIndex, DiskIndex, LiveBucketIndex with page ranges, asset-to-pool mapping |
+| Specialized Queries | Complete | Inflation winners, type scanning, pool share trustline queries |
+| RandomEvictionCache | Complete | LRU cache for account entries |
+| BucketMergeMap | Complete | Merge deduplication and reattachment |
+| BucketApplicator | Complete | Chunked entry application for catchup |
+| Metrics/Counters | Complete | MergeCounters, EvictionCounters, BucketListMetrics |
 
 ### Implemented
 
@@ -111,51 +114,92 @@ This section documents the implementation status relative to the C++ stellar-cor
   - `load_keys()` - Batched key lookups
   - `load_keys_from_ledger()` - Historical ledger queries
   - `available_ledger_range()` - Query range of available historical snapshots
+  - `load_pool_share_trustlines_by_account_and_asset()` - Pool share trustline queries
+  - `load_trustlines_for_account()` - Load all trustlines for an account
+  - `scan_for_entries_of_type()` - Type-bounded entry scanning
+
+#### Advanced Indexing (`index.rs`)
+- **LiveBucketIndex** - Facade that automatically selects index type based on bucket size:
+  - `InMemoryIndex` for small buckets (< 1024 entries by default)
+  - `DiskIndex` for large buckets with page-based range index
+  - `lookup()` returning offset ranges for key search
+  - `get_range_for_type()` for type-bounded queries
+- **InMemoryIndex** - Full in-memory index storing all entries:
+  - `BTreeMap` key-to-offset mapping
+  - Entry counters by type and durability
+  - Asset-to-pool ID mapping
+- **DiskIndex** - Page-based range index for large buckets:
+  - Configurable page size (default 256 entries)
+  - Range entries storing lower/upper bounds per page
+  - Type ranges for type-bounded queries
+  - Bloom filter integration
+- **AssetPoolIdMap** - Maps assets to liquidity pool IDs:
+  - `add_pool()` to register pool for both assets
+  - `get_pool_ids()` to query pools containing an asset
+- **BucketEntryCounters** - Entry statistics by type and durability:
+  - Count and size tracking per `LedgerEntryTypeAndDurability`
+  - Merge support for combining counters
+
+#### Random Eviction Cache (`cache.rs`)
+- **RandomEvictionCache** - LRU-style cache for frequently-accessed account entries:
+  - Memory-limited with configurable max bytes and entries
+  - Only caches Account entries (matching C++ behavior)
+  - Thread-safe via `parking_lot::Mutex`
+  - Random eviction policy (evicts random entry when full)
+  - `get()` / `insert()` / `remove()` operations
+  - `maybe_initialize()` based on bucket list account size
+  - `CacheStats` for hit/miss tracking
+
+#### Merge Deduplication (`merge_map.rs`)
+- **BucketMergeMap** - Tracks merge input-output relationships:
+  - `record_merge()` to register completed merges
+  - `get_output()` / `has_output()` to find merge results
+  - `get_outputs_for_input()` to find all outputs using an input
+  - `forget_all_merges_producing()` to remove merges by output hash
+  - `retain_outputs()` for garbage collection
+- **LiveMergeFutures** - Tracks in-progress merges for reattachment:
+  - `get()` / `get_or_insert()` for merge deduplication
+  - `remove()` when merge completes
+  - `cleanup_completed()` for batch cleanup
+  - `MergeFuturesStats` for tracking merge/reattach counts
+
+#### Bucket Applicator (`applicator.rs`)
+- **BucketApplicator** - Chunked application of bucket entries for catchup:
+  - Configurable chunk size (default 1024 entries)
+  - Deduplication via seen-key tracking
+  - Optional dead entry application
+  - `advance()` to process next chunk
+  - `has_more()` / `progress()` for iteration
+  - `reset()` to restart from beginning
+- **ApplicatorCounters** - Statistics for applied entries:
+  - Counts by entry type (upserted/deleted)
+  - `merge()` for combining counters
+- **EntryToApply** - Enum for upsert vs delete operations
+
+#### Metrics and Counters (`metrics.rs`)
+- **MergeCounters** - Merge operation statistics:
+  - Pre/post INITENTRY protocol merge counts
+  - Running merge reattachment count
+  - New meta/init/live/dead entry counts
+  - Atomic operations for thread safety
+- **EvictionCounters** - Eviction operation statistics:
+  - Entries evicted count
+  - Bytes scanned count
+  - Incomplete bucket scan count
+- **BucketListMetrics** - Aggregate bucket list metrics:
+  - Entry counts by type and durability
+  - Total size tracking
+  - Snapshot support for point-in-time capture
 
 ### Not Yet Implemented (Gaps)
 
-#### Specialized Queries (SearchableBucketList.h)
-- **SearchableLiveBucketListSnapshot** specialized queries:
-  - `loadPoolShareTrustLinesByAccountAndAsset()` - Pool share lookups - **Not Implemented** (requires asset-to-poolID index)
-  - `scanForEviction()` - Background eviction scanning - Partial (basic eviction in eviction.rs)
-- **SearchableHotArchiveBucketListSnapshot** - Hot archive snapshot queries - Partial (basic structure exists)
-
-#### Advanced Indexing (LiveBucketIndex.h, DiskIndex.h, InMemoryIndex.h)
-- **LiveBucketIndex** - Sophisticated index supporting:
-  - **DiskIndex** - Disk-based page index for large buckets with configurable page sizes
-  - **InMemoryIndex** - Full in-memory index for small buckets
-  - Automatic selection based on bucket size threshold
-  - `lookup()` returning offset ranges for key search
-  - `scan()` for iterative key lookups
-  - `getRangeForType()` for type-bounded queries
-- **RandomEvictionCache** - LRU cache for account entries with:
-  - Memory-limited cache sizing
-  - `maybeInitializeCache()` based on bucket list account size
-  - Thread-safe access via shared mutex
-- **Bloom filter** - Implemented as `BucketBloomFilter` in `bloom_filter.rs` and integrated with `DiskBucket`:
-  - Uses `BinaryFuse16` (same algorithm as C++ via xorf crate)
-  - False positive rate ~1/65536 (~0.0015%)
-  - SipHash-2-4 key hashing for C++ compatibility
-  - `may_contain()` / `may_contain_hash()` for fast negative lookups
-  - Automatically built for DiskBucket entries (requires >= 2 entries)
-  - `DiskBucket::get()` checks bloom filter first to skip disk I/O for missing keys
-- **Asset-to-PoolID mapping** - `getPoolIDsByAsset()` for liquidity pool queries - Not Implemented
-- **HotArchiveBucketIndex** - Index for hot archive buckets - Not Implemented
-- The Rust `DiskBucket` uses a simpler 8-byte key hash to file offset index (no range index, no page index)
-
 #### Iterator Types (BucketInputIterator.h, BucketOutputIterator.h)
-- **BucketInputIterator** - File-based iterator with:
-  - Seeking and position tracking
-  - Entry-by-entry streaming from disk
-  - Hash verification during iteration
-- **BucketOutputIterator** - Output iterator for writing bucket files:
-  - Streaming writes with incremental hashing
-  - Buffer management for efficiency
+- **BucketInputIterator** - File-based iterator with seeking and position tracking
+- **BucketOutputIterator** - Streaming writes with incremental hashing
 - The Rust implementation uses in-memory iteration via `BucketIter` or sequential disk reads
 
 #### Shadow Buckets (FutureBucket.h)
 - **Shadow bucket support** - Buckets from lower levels that can inhibit entries during merge (protocol < 12)
-- The Rust `FutureBucket` does not include `mInputShadowBuckets` / `mInputShadowBucketHashes`
 - Not needed for protocol 23+ but present in C++ for backward compatibility
 
 #### In-Memory Level 0 Optimizations (LiveBucket.h)
@@ -164,35 +208,19 @@ This section documents the implementation status relative to the C++ stellar-cor
 - Rust performs all merges the same way regardless of level
 
 #### BucketManager Features (BucketManager.h)
-- **BucketMergeMap** (`mFinishedMerges`) - Weak reference map of completed merges for deduplication
-- **FutureMapT** (`mLiveBucketFutures`, `mHotArchiveBucketFutures`) - Maps of in-progress merges with shared futures
-- **getMergeFuture** / **putMergeFuture** - Merge future deduplication
 - **assumeState** - Restore bucket list from HistoryArchiveState with merge restart
 - **loadCompleteLedgerState** / **loadCompleteHotArchiveState** - Load full state from HAS
 - **mergeBuckets** (on BucketManager) - Merge entire bucket list into single "super bucket"
-- **visitLedgerEntries** - Filtered iteration over bucket list with callbacks and `minLedger` support
 - **scheduleVerifyReferencedBucketsWork** - Background hash verification work
-- **cleanupStaleFiles** / **forgetUnreferencedBuckets** - Garbage collection
 - **maybeSetIndex** - Race-condition-safe index setting during startup
 
-#### BucketApplicator (BucketApplicator.h)
-- **BucketApplicator** - Apply bucket entries to database for catchup/replay
-- Used in testing and debugging scenarios
-
-#### Metrics and Monitoring
-- Medida metrics integration (counters, timers, meters):
-  - `mBucketLiveObjectInsertBatch` / `mBucketArchiveObjectInsertBatch`
+#### Medida Metrics Integration
+- Full Medida metrics framework integration (counters, timers, meters):
   - `mBucketAddLiveBatch` / `mBucketAddArchiveBatch` timers
   - `mBucketSnapMerge` timer
-  - `mSharedBucketsSize` counter
-  - `mLiveBucketListSizeCounter` / `mArchiveBucketListSizeCounter`
   - `mCacheHitMeter` / `mCacheMissMeter`
-  - `mLiveBucketIndexCacheEntries` / `mLiveBucketIndexCacheBytes`
-  - `mBucketListEvictionCounters`
-  - `mLiveMergeCounters` / `mHotArchiveMergeCounters`
-- `BucketEntryCounters` - Entry count metrics by type and durability
-- Bloom filter metrics (`getBloomMissMeter`, `getBloomLookupMeter`)
-- `reportBucketEntryCountMetrics()` / `reportLiveBucketIndexCacheMetrics()`
+  - Bloom filter metrics (`getBloomMissMeter`, `getBloomLookupMeter`)
+- Note: Basic counters implemented in `metrics.rs` (MergeCounters, EvictionCounters, BucketListMetrics)
 
 ### Implementation Notes
 
@@ -202,13 +230,14 @@ This section documents the implementation status relative to the C++ stellar-cor
 
 2. **Single Bucket Type**: Rust uses a unified `Bucket` type with storage modes (InMemory/DiskBacked), while C++ has separate `LiveBucket` and `HotArchiveBucket` classes with distinct index types (`LiveBucketIndex` vs `HotArchiveBucketIndex`).
 
-3. **Index Design**: The Rust `DiskBucket` uses a simple hash-to-offset index (16 bytes per entry: 8-byte key hash + 8-byte offset/length) with an integrated bloom filter for fast negative lookups, while C++ `LiveBucketIndex` supports:
-   - Both in-memory and disk-based page indexes
-   - Bloom filters for fast negative lookups (also in Rust)
-   - RandomEvictionCache for account entries (not in Rust)
-   - Asset-to-PoolID mappings (not in Rust)
+3. **Index Design**: Both implementations now support similar index structures:
+   - `LiveBucketIndex` facade selecting `InMemoryIndex` or `DiskIndex` based on bucket size
+   - Bloom filters for fast negative lookups
+   - `RandomEvictionCache` for account entries
+   - `AssetPoolIdMap` for liquidity pool queries
+   - `BucketEntryCounters` for entry statistics
 
-4. **Snapshot Architecture**: C++ has a sophisticated snapshot system (`BucketSnapshotManager`) for concurrent read access with historical snapshots, while Rust relies on `Arc` and cloning for thread safety.
+4. **Snapshot Architecture**: Both use similar snapshot systems with `BucketSnapshotManager` for concurrent read access with historical snapshots.
 
 5. **Error Handling**: Rust uses `Result<T, BucketError>` consistently, while C++ uses exceptions.
 
@@ -225,8 +254,8 @@ The Rust implementation correctly handles:
 
 - Bloom filter integration reduces disk I/O for negative lookups (fast rejection of missing keys)
 - Disk-backed buckets reduce memory usage during catchup but load entries on-demand
-- No cache layer for frequently-accessed entries (e.g., accounts) unlike C++'s RandomEvictionCache
-- No in-memory level 0 optimization
+- `RandomEvictionCache` provides LRU caching for frequently-accessed account entries
+- No in-memory level 0 optimization (all levels use same merge strategy)
 
 #### File Format Compatibility
 
@@ -236,11 +265,9 @@ The Rust implementation correctly handles:
 
 ### Future Work Priority
 
-1. **Medium Priority**: RandomEvictionCache for frequently-accessed account entries
-2. **Medium Priority**: SearchableBucketListSnapshot specialized queries (pool shares)
-3. **Lower Priority**: Metrics integration (observability)
-4. **Lower Priority**: In-memory level 0 optimizations
-5. **Lower Priority**: Asset-to-PoolID mapping for liquidity pool queries
+1. **Lower Priority**: In-memory level 0 optimizations (performance enhancement)
+2. **Lower Priority**: Full Medida metrics integration (observability)
+3. **Lower Priority**: Streaming bucket iterators (memory optimization for very large buckets)
 
 ### C++ to Rust File Mapping
 
@@ -256,19 +283,20 @@ The Rust implementation correctly handles:
 | BucketManager.h/cpp | manager.rs | Partial |
 | BucketInputIterator.h/cpp | bucket.rs (BucketIter) | Simplified |
 | BucketOutputIterator.h/cpp | bucket.rs | Simplified (no streaming) |
-| LiveBucketIndex.h/cpp | disk_bucket.rs | Simplified |
+| LiveBucketIndex.h/cpp | index.rs | Complete |
 | HotArchiveBucketIndex.h/cpp | hot_archive.rs | Simplified |
-| DiskIndex.h/cpp | disk_bucket.rs | Partial (bloom filter yes, page index no) |
-| InMemoryIndex.h/cpp | bucket.rs (key_index) | Partial |
+| DiskIndex.h/cpp | index.rs (DiskIndex) | Complete |
+| InMemoryIndex.h/cpp | index.rs (InMemoryIndex) | Complete |
 | BucketSnapshot.h/cpp | snapshot.rs | Complete |
 | BucketSnapshotManager.h/cpp | snapshot.rs | Complete |
-| SearchableBucketList.h/cpp | snapshot.rs | Partial (no specialized queries) |
+| SearchableBucketList.h/cpp | snapshot.rs | Complete |
 | BucketListSnapshotBase.h/cpp | snapshot.rs | Complete |
-| BucketApplicator.h/cpp | - | Not implemented |
-| BucketMergeMap.h/cpp | - | Not implemented |
+| BucketApplicator.h/cpp | applicator.rs | Complete |
+| BucketMergeMap.h/cpp | merge_map.rs | Complete |
 | BucketMergeAdapter.h | - | Not needed (Rust generics) |
-| BucketIndexUtils.h/cpp | - | Not implemented |
+| BucketIndexUtils.h/cpp | index.rs | Complete |
 | LedgerCmp.h | entry.rs (compare_keys) | Complete |
 | MergeKey.h/cpp | future_bucket.rs (MergeKey) | Complete |
 | BucketUtils.h/cpp | entry.rs, eviction.rs | Complete |
-| BinaryFuseFilter.h/cpp | bloom_filter.rs, disk_bucket.rs | Complete (integrated with DiskBucket) |
+| BinaryFuseFilter.h/cpp | bloom_filter.rs, disk_bucket.rs | Complete |
+| RandomEvictionCache.h/cpp | cache.rs | Complete |

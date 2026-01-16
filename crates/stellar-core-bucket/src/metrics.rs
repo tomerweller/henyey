@@ -1,0 +1,505 @@
+//! Metrics and counters for bucket operations.
+//!
+//! This module provides various counters and statistics for tracking bucket
+//! operations, useful for monitoring and debugging.
+//!
+//! # Counter Types
+//!
+//! - [`MergeCounters`]: Statistics about bucket merge operations
+//! - [`EvictionCounters`]: Statistics about eviction scanning
+//! - [`BucketListMetrics`]: Overall bucket list metrics
+//!
+//! # Usage
+//!
+//! Counters are typically updated during bucket operations and can be queried
+//! for monitoring purposes.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ============================================================================
+// Merge Counters
+// ============================================================================
+
+/// Counters for bucket merge operations.
+///
+/// These counters track various aspects of bucket merging, including protocol
+/// version handling and entry type statistics.
+#[derive(Debug, Default)]
+pub struct MergeCounters {
+    /// Merges where the old bucket has pre-INITENTRY protocol entries.
+    pub pre_init_entry_protocol_merges: AtomicU64,
+    /// Merges where both buckets support INITENTRY.
+    pub post_init_entry_protocol_merges: AtomicU64,
+    /// Number of running merges that were reattached (deduplication hits).
+    pub running_merge_reattachments: AtomicU64,
+    /// New metadata entries created during merges.
+    pub new_meta_entries: AtomicU64,
+    /// New init entries created during merges.
+    pub new_init_entries: AtomicU64,
+    /// New live entries created during merges.
+    pub new_live_entries: AtomicU64,
+    /// New dead entries created during merges.
+    pub new_dead_entries: AtomicU64,
+    /// Old entries shadowed during merges.
+    pub old_entries_shadowed: AtomicU64,
+    /// Init+Dead pairs annihilated during merges.
+    pub entries_annihilated: AtomicU64,
+    /// Total merges completed.
+    pub merges_completed: AtomicU64,
+    /// Total merge time in microseconds.
+    pub merge_time_us: AtomicU64,
+}
+
+impl MergeCounters {
+    /// Creates new merge counters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a pre-INITENTRY protocol merge.
+    pub fn record_pre_init_entry_merge(&self) {
+        self.pre_init_entry_protocol_merges
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a post-INITENTRY protocol merge.
+    pub fn record_post_init_entry_merge(&self) {
+        self.post_init_entry_protocol_merges
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a merge reattachment (deduplication hit).
+    pub fn record_reattachment(&self) {
+        self.running_merge_reattachments
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records new entries by type.
+    pub fn record_new_entry(&self, entry_type: EntryCountType) {
+        match entry_type {
+            EntryCountType::Meta => self.new_meta_entries.fetch_add(1, Ordering::Relaxed),
+            EntryCountType::Init => self.new_init_entries.fetch_add(1, Ordering::Relaxed),
+            EntryCountType::Live => self.new_live_entries.fetch_add(1, Ordering::Relaxed),
+            EntryCountType::Dead => self.new_dead_entries.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    /// Records a shadowed entry.
+    pub fn record_shadowed(&self) {
+        self.old_entries_shadowed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an annihilated Init+Dead pair.
+    pub fn record_annihilated(&self) {
+        self.entries_annihilated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a completed merge.
+    pub fn record_merge_completed(&self, duration_us: u64) {
+        self.merges_completed.fetch_add(1, Ordering::Relaxed);
+        self.merge_time_us.fetch_add(duration_us, Ordering::Relaxed);
+    }
+
+    /// Returns a snapshot of the counters.
+    pub fn snapshot(&self) -> MergeCountersSnapshot {
+        MergeCountersSnapshot {
+            pre_init_entry_protocol_merges: self
+                .pre_init_entry_protocol_merges
+                .load(Ordering::Relaxed),
+            post_init_entry_protocol_merges: self
+                .post_init_entry_protocol_merges
+                .load(Ordering::Relaxed),
+            running_merge_reattachments: self.running_merge_reattachments.load(Ordering::Relaxed),
+            new_meta_entries: self.new_meta_entries.load(Ordering::Relaxed),
+            new_init_entries: self.new_init_entries.load(Ordering::Relaxed),
+            new_live_entries: self.new_live_entries.load(Ordering::Relaxed),
+            new_dead_entries: self.new_dead_entries.load(Ordering::Relaxed),
+            old_entries_shadowed: self.old_entries_shadowed.load(Ordering::Relaxed),
+            entries_annihilated: self.entries_annihilated.load(Ordering::Relaxed),
+            merges_completed: self.merges_completed.load(Ordering::Relaxed),
+            merge_time_us: self.merge_time_us.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Resets all counters to zero.
+    pub fn reset(&self) {
+        self.pre_init_entry_protocol_merges
+            .store(0, Ordering::Relaxed);
+        self.post_init_entry_protocol_merges
+            .store(0, Ordering::Relaxed);
+        self.running_merge_reattachments.store(0, Ordering::Relaxed);
+        self.new_meta_entries.store(0, Ordering::Relaxed);
+        self.new_init_entries.store(0, Ordering::Relaxed);
+        self.new_live_entries.store(0, Ordering::Relaxed);
+        self.new_dead_entries.store(0, Ordering::Relaxed);
+        self.old_entries_shadowed.store(0, Ordering::Relaxed);
+        self.entries_annihilated.store(0, Ordering::Relaxed);
+        self.merges_completed.store(0, Ordering::Relaxed);
+        self.merge_time_us.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Entry type for counting purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryCountType {
+    /// Metadata entry.
+    Meta,
+    /// Init entry (CAP-0020).
+    Init,
+    /// Live entry.
+    Live,
+    /// Dead entry (tombstone).
+    Dead,
+}
+
+/// Snapshot of merge counters (non-atomic copy).
+#[derive(Debug, Clone, Default)]
+pub struct MergeCountersSnapshot {
+    pub pre_init_entry_protocol_merges: u64,
+    pub post_init_entry_protocol_merges: u64,
+    pub running_merge_reattachments: u64,
+    pub new_meta_entries: u64,
+    pub new_init_entries: u64,
+    pub new_live_entries: u64,
+    pub new_dead_entries: u64,
+    pub old_entries_shadowed: u64,
+    pub entries_annihilated: u64,
+    pub merges_completed: u64,
+    pub merge_time_us: u64,
+}
+
+impl MergeCountersSnapshot {
+    /// Returns the total number of new entries.
+    pub fn total_new_entries(&self) -> u64 {
+        self.new_meta_entries
+            + self.new_init_entries
+            + self.new_live_entries
+            + self.new_dead_entries
+    }
+
+    /// Returns the average merge time in microseconds.
+    pub fn avg_merge_time_us(&self) -> f64 {
+        if self.merges_completed == 0 {
+            0.0
+        } else {
+            self.merge_time_us as f64 / self.merges_completed as f64
+        }
+    }
+}
+
+// ============================================================================
+// Eviction Counters
+// ============================================================================
+
+/// Counters for eviction scanning operations.
+///
+/// These counters track the eviction scanning process for Soroban state archival.
+#[derive(Debug, Default)]
+pub struct EvictionCounters {
+    /// Number of entries evicted.
+    pub entries_evicted: AtomicU64,
+    /// Number of temporary entries evicted (deleted immediately).
+    pub temp_entries_evicted: AtomicU64,
+    /// Number of persistent entries archived.
+    pub persistent_entries_archived: AtomicU64,
+    /// Total bytes scanned.
+    pub bytes_scanned: AtomicU64,
+    /// Number of incomplete bucket scans (bucket changed during scan).
+    pub incomplete_bucket_scans: AtomicU64,
+    /// Number of eviction scan cycles completed.
+    pub scan_cycles_completed: AtomicU64,
+    /// Total scan time in microseconds.
+    pub scan_time_us: AtomicU64,
+}
+
+impl EvictionCounters {
+    /// Creates new eviction counters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records evicted entries.
+    pub fn record_evicted(&self, count: u64, temp_count: u64, persistent_count: u64) {
+        self.entries_evicted.fetch_add(count, Ordering::Relaxed);
+        self.temp_entries_evicted
+            .fetch_add(temp_count, Ordering::Relaxed);
+        self.persistent_entries_archived
+            .fetch_add(persistent_count, Ordering::Relaxed);
+    }
+
+    /// Records bytes scanned.
+    pub fn record_bytes_scanned(&self, bytes: u64) {
+        self.bytes_scanned.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Records an incomplete bucket scan.
+    pub fn record_incomplete_scan(&self) {
+        self.incomplete_bucket_scans
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a completed scan cycle.
+    pub fn record_scan_cycle(&self, duration_us: u64) {
+        self.scan_cycles_completed.fetch_add(1, Ordering::Relaxed);
+        self.scan_time_us.fetch_add(duration_us, Ordering::Relaxed);
+    }
+
+    /// Returns a snapshot of the counters.
+    pub fn snapshot(&self) -> EvictionCountersSnapshot {
+        EvictionCountersSnapshot {
+            entries_evicted: self.entries_evicted.load(Ordering::Relaxed),
+            temp_entries_evicted: self.temp_entries_evicted.load(Ordering::Relaxed),
+            persistent_entries_archived: self.persistent_entries_archived.load(Ordering::Relaxed),
+            bytes_scanned: self.bytes_scanned.load(Ordering::Relaxed),
+            incomplete_bucket_scans: self.incomplete_bucket_scans.load(Ordering::Relaxed),
+            scan_cycles_completed: self.scan_cycles_completed.load(Ordering::Relaxed),
+            scan_time_us: self.scan_time_us.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Resets all counters to zero.
+    pub fn reset(&self) {
+        self.entries_evicted.store(0, Ordering::Relaxed);
+        self.temp_entries_evicted.store(0, Ordering::Relaxed);
+        self.persistent_entries_archived.store(0, Ordering::Relaxed);
+        self.bytes_scanned.store(0, Ordering::Relaxed);
+        self.incomplete_bucket_scans.store(0, Ordering::Relaxed);
+        self.scan_cycles_completed.store(0, Ordering::Relaxed);
+        self.scan_time_us.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot of eviction counters (non-atomic copy).
+#[derive(Debug, Clone, Default)]
+pub struct EvictionCountersSnapshot {
+    pub entries_evicted: u64,
+    pub temp_entries_evicted: u64,
+    pub persistent_entries_archived: u64,
+    pub bytes_scanned: u64,
+    pub incomplete_bucket_scans: u64,
+    pub scan_cycles_completed: u64,
+    pub scan_time_us: u64,
+}
+
+impl EvictionCountersSnapshot {
+    /// Returns the average scan time in microseconds.
+    pub fn avg_scan_time_us(&self) -> f64 {
+        if self.scan_cycles_completed == 0 {
+            0.0
+        } else {
+            self.scan_time_us as f64 / self.scan_cycles_completed as f64
+        }
+    }
+
+    /// Returns the eviction rate (entries per cycle).
+    pub fn eviction_rate(&self) -> f64 {
+        if self.scan_cycles_completed == 0 {
+            0.0
+        } else {
+            self.entries_evicted as f64 / self.scan_cycles_completed as f64
+        }
+    }
+}
+
+// ============================================================================
+// Bucket List Metrics
+// ============================================================================
+
+/// Overall metrics for the bucket list.
+#[derive(Debug, Default)]
+pub struct BucketListMetrics {
+    /// Total number of entries across all buckets.
+    pub total_entries: AtomicU64,
+    /// Total size of all buckets in bytes.
+    pub total_size_bytes: AtomicU64,
+    /// Number of non-empty buckets.
+    pub bucket_count: AtomicU64,
+    /// Number of entries by level.
+    pub entries_by_level: [AtomicU64; 11],
+    /// Size by level in bytes.
+    pub size_by_level: [AtomicU64; 11],
+}
+
+impl BucketListMetrics {
+    /// Creates new bucket list metrics.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Updates metrics for a specific level.
+    pub fn update_level(&self, level: usize, entry_count: u64, size_bytes: u64) {
+        if level < 11 {
+            self.entries_by_level[level].store(entry_count, Ordering::Relaxed);
+            self.size_by_level[level].store(size_bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Recalculates totals from level metrics.
+    pub fn recalculate_totals(&self) {
+        let mut total_entries = 0u64;
+        let mut total_size = 0u64;
+        let mut bucket_count = 0u64;
+
+        for level in 0..11 {
+            let entries = self.entries_by_level[level].load(Ordering::Relaxed);
+            let size = self.size_by_level[level].load(Ordering::Relaxed);
+            total_entries += entries;
+            total_size += size;
+            if entries > 0 {
+                bucket_count += 2; // curr and snap buckets
+            }
+        }
+
+        self.total_entries.store(total_entries, Ordering::Relaxed);
+        self.total_size_bytes.store(total_size, Ordering::Relaxed);
+        self.bucket_count.store(bucket_count, Ordering::Relaxed);
+    }
+
+    /// Returns a snapshot of the metrics.
+    pub fn snapshot(&self) -> BucketListMetricsSnapshot {
+        let mut entries_by_level = [0u64; 11];
+        let mut size_by_level = [0u64; 11];
+
+        for level in 0..11 {
+            entries_by_level[level] = self.entries_by_level[level].load(Ordering::Relaxed);
+            size_by_level[level] = self.size_by_level[level].load(Ordering::Relaxed);
+        }
+
+        BucketListMetricsSnapshot {
+            total_entries: self.total_entries.load(Ordering::Relaxed),
+            total_size_bytes: self.total_size_bytes.load(Ordering::Relaxed),
+            bucket_count: self.bucket_count.load(Ordering::Relaxed),
+            entries_by_level,
+            size_by_level,
+        }
+    }
+
+    /// Resets all metrics to zero.
+    pub fn reset(&self) {
+        self.total_entries.store(0, Ordering::Relaxed);
+        self.total_size_bytes.store(0, Ordering::Relaxed);
+        self.bucket_count.store(0, Ordering::Relaxed);
+        for level in 0..11 {
+            self.entries_by_level[level].store(0, Ordering::Relaxed);
+            self.size_by_level[level].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Snapshot of bucket list metrics (non-atomic copy).
+#[derive(Debug, Clone, Default)]
+pub struct BucketListMetricsSnapshot {
+    pub total_entries: u64,
+    pub total_size_bytes: u64,
+    pub bucket_count: u64,
+    pub entries_by_level: [u64; 11],
+    pub size_by_level: [u64; 11],
+}
+
+impl BucketListMetricsSnapshot {
+    /// Returns the average entries per bucket.
+    pub fn avg_entries_per_bucket(&self) -> f64 {
+        if self.bucket_count == 0 {
+            0.0
+        } else {
+            self.total_entries as f64 / self.bucket_count as f64
+        }
+    }
+
+    /// Returns the total size in MB.
+    pub fn total_size_mb(&self) -> f64 {
+        self.total_size_bytes as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Returns the size for a specific level in MB.
+    pub fn size_mb_for_level(&self, level: usize) -> f64 {
+        if level < 11 {
+            self.size_by_level[level] as f64 / (1024.0 * 1024.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_counters() {
+        let counters = MergeCounters::new();
+
+        counters.record_pre_init_entry_merge();
+        counters.record_post_init_entry_merge();
+        counters.record_post_init_entry_merge();
+        counters.record_reattachment();
+        counters.record_new_entry(EntryCountType::Live);
+        counters.record_new_entry(EntryCountType::Live);
+        counters.record_new_entry(EntryCountType::Dead);
+        counters.record_shadowed();
+        counters.record_annihilated();
+        counters.record_merge_completed(1000);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.pre_init_entry_protocol_merges, 1);
+        assert_eq!(snapshot.post_init_entry_protocol_merges, 2);
+        assert_eq!(snapshot.running_merge_reattachments, 1);
+        assert_eq!(snapshot.new_live_entries, 2);
+        assert_eq!(snapshot.new_dead_entries, 1);
+        assert_eq!(snapshot.old_entries_shadowed, 1);
+        assert_eq!(snapshot.entries_annihilated, 1);
+        assert_eq!(snapshot.merges_completed, 1);
+        assert_eq!(snapshot.merge_time_us, 1000);
+        assert_eq!(snapshot.total_new_entries(), 3);
+    }
+
+    #[test]
+    fn test_eviction_counters() {
+        let counters = EvictionCounters::new();
+
+        counters.record_evicted(10, 3, 7);
+        counters.record_bytes_scanned(1024);
+        counters.record_incomplete_scan();
+        counters.record_scan_cycle(500);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.entries_evicted, 10);
+        assert_eq!(snapshot.temp_entries_evicted, 3);
+        assert_eq!(snapshot.persistent_entries_archived, 7);
+        assert_eq!(snapshot.bytes_scanned, 1024);
+        assert_eq!(snapshot.incomplete_bucket_scans, 1);
+        assert_eq!(snapshot.scan_cycles_completed, 1);
+        assert_eq!(snapshot.eviction_rate(), 10.0);
+    }
+
+    #[test]
+    fn test_bucket_list_metrics() {
+        let metrics = BucketListMetrics::new();
+
+        metrics.update_level(0, 100, 10000);
+        metrics.update_level(1, 200, 20000);
+        metrics.recalculate_totals();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.total_entries, 300);
+        assert_eq!(snapshot.total_size_bytes, 30000);
+        assert_eq!(snapshot.bucket_count, 4); // 2 buckets per level
+        assert_eq!(snapshot.entries_by_level[0], 100);
+        assert_eq!(snapshot.entries_by_level[1], 200);
+    }
+
+    #[test]
+    fn test_counter_reset() {
+        let merge_counters = MergeCounters::new();
+        merge_counters.record_merge_completed(1000);
+        assert_eq!(merge_counters.snapshot().merges_completed, 1);
+        merge_counters.reset();
+        assert_eq!(merge_counters.snapshot().merges_completed, 0);
+
+        let eviction_counters = EvictionCounters::new();
+        eviction_counters.record_evicted(10, 5, 5);
+        assert_eq!(eviction_counters.snapshot().entries_evicted, 10);
+        eviction_counters.reset();
+        assert_eq!(eviction_counters.snapshot().entries_evicted, 0);
+    }
+}

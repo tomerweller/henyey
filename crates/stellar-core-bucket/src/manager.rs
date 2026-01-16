@@ -440,6 +440,141 @@ impl BucketManager {
         let bucket = self.load_bucket(hash)?;
         bucket.to_xdr_bytes()
     }
+
+    /// Visits all ledger entries in buckets matching the filter criteria.
+    ///
+    /// This method iterates through bucket entries, applying a filter function
+    /// to determine which entries to process, and an accept function to handle
+    /// matching entries.
+    ///
+    /// # Arguments
+    ///
+    /// * `buckets` - Iterator over buckets to scan
+    /// * `filter_entry` - Function that returns `true` for entries to consider
+    /// * `accept_entry` - Function called for each matching entry; return `false` to stop
+    /// * `min_ledger` - Optional minimum ledger sequence to filter entries
+    ///
+    /// # Returns
+    ///
+    /// `true` if iteration completed, `false` if stopped early by `accept_entry`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// manager.visit_ledger_entries(
+    ///     &bucket_hashes,
+    ///     |entry| matches!(entry.data, LedgerEntryData::Account(_)),
+    ///     |entry| {
+    ///         println!("Found account: {:?}", entry);
+    ///         true // continue
+    ///     },
+    ///     Some(1000), // only entries modified after ledger 1000
+    /// );
+    /// ```
+    pub fn visit_ledger_entries<F, A>(
+        &self,
+        bucket_hashes: &[Hash256],
+        filter_entry: F,
+        mut accept_entry: A,
+        min_ledger: Option<u32>,
+    ) -> Result<bool>
+    where
+        F: Fn(&LedgerEntry) -> bool,
+        A: FnMut(&LedgerEntry) -> bool,
+    {
+        use std::collections::HashSet;
+
+        // Track seen keys to avoid processing duplicates
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+
+        for hash in bucket_hashes {
+            if hash.is_zero() {
+                continue;
+            }
+
+            let bucket = self.load_bucket(hash)?;
+
+            for entry in bucket.iter() {
+                match entry {
+                    crate::BucketEntry::Live(ref ledger_entry)
+                    | crate::BucketEntry::Init(ref ledger_entry) => {
+                        // Check min_ledger filter
+                        if let Some(min) = min_ledger {
+                            if ledger_entry.last_modified_ledger_seq < min {
+                                continue;
+                            }
+                        }
+
+                        // Check filter
+                        if !filter_entry(ledger_entry) {
+                            continue;
+                        }
+
+                        // Check if already seen
+                        if let Some(key) = crate::entry::ledger_entry_to_key(ledger_entry) {
+                            if seen_keys.contains(&key) {
+                                continue;
+                            }
+                            seen_keys.insert(key);
+                        }
+
+                        // Accept the entry
+                        if !accept_entry(ledger_entry) {
+                            return Ok(false);
+                        }
+                    }
+                    crate::BucketEntry::Dead(ref key) => {
+                        // Mark key as seen (it's deleted)
+                        seen_keys.insert(key.clone());
+                    }
+                    crate::BucketEntry::Metadata(_) => {
+                        // Skip metadata entries
+                    }
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Visits all ledger entries of a specific type in the given buckets.
+    ///
+    /// This is a convenience wrapper around [`visit_ledger_entries`] that
+    /// filters by entry type.
+    pub fn visit_ledger_entries_of_type<A>(
+        &self,
+        bucket_hashes: &[Hash256],
+        entry_type: stellar_xdr::curr::LedgerEntryType,
+        accept_entry: A,
+        min_ledger: Option<u32>,
+    ) -> Result<bool>
+    where
+        A: FnMut(&LedgerEntry) -> bool,
+    {
+        self.visit_ledger_entries(
+            bucket_hashes,
+            |entry| ledger_entry_type(&entry.data) == entry_type,
+            accept_entry,
+            min_ledger,
+        )
+    }
+}
+
+/// Returns the ledger entry type for a given entry data.
+fn ledger_entry_type(data: &stellar_xdr::curr::LedgerEntryData) -> stellar_xdr::curr::LedgerEntryType {
+    use stellar_xdr::curr::{LedgerEntryData, LedgerEntryType};
+    match data {
+        LedgerEntryData::Account(_) => LedgerEntryType::Account,
+        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
+        LedgerEntryData::Data(_) => LedgerEntryType::Data,
+        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
+    }
 }
 
 impl std::fmt::Debug for BucketManager {
