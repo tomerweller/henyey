@@ -102,6 +102,7 @@ mod eviction;
 mod future_bucket;
 mod hot_archive;
 mod index;
+mod iterator;
 mod manager;
 mod merge;
 mod merge_map;
@@ -229,6 +230,14 @@ pub use applicator::{ApplicatorCounters, BucketApplicator, EntryToApply, DEFAULT
 pub use metrics::{
     BucketListMetrics, BucketListMetricsSnapshot, EntryCountType, EvictionCounters,
     EvictionCountersSnapshot, MergeCounters, MergeCountersSnapshot,
+};
+
+// ============================================================================
+// Streaming iterators
+// ============================================================================
+
+pub use iterator::{
+    BucketInputIterator, BucketOutputIterator, FileMergeInput, MemoryMergeInput, MergeInput,
 };
 
 // ============================================================================
