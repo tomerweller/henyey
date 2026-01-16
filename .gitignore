@@ -49,3 +49,4 @@ testnet.lock
 
 # Claude local files
 .claude/*.local.md
+.opencode/
