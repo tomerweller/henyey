@@ -50,6 +50,7 @@ use stellar_core_tx::{
     make_account_address, make_claimable_balance_address, make_muxed_account_address,
     operations::OperationType,
     soroban::SorobanConfig,
+    state::{get_account_seq_ledger, get_account_seq_time},
     validation::{self, LedgerContext as ValidationContext},
     ClassicEventConfig, LedgerContext, LedgerStateManager, OpEventManager, TransactionFrame,
     TxError, TxEventManager,
@@ -1441,28 +1442,6 @@ impl TransactionExecutor {
             }
         };
 
-        let source_last_modified_seq = {
-            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                account_id: inner_source_id.clone(),
-            });
-            match snapshot.get_entry(&key)? {
-                Some(entry) => entry.last_modified_ledger_seq,
-                None => {
-                    return Ok(TransactionExecutionResult {
-                        success: false,
-                        fee_charged: 0,
-                        fee_refund: 0,
-                        operation_results: vec![],
-                        error: Some("Source account not found".into()),
-                        failure: Some(ExecutionFailure::NoAccount),
-                        tx_meta: None,
-                        fee_changes: None,
-                        post_fee_changes: None,
-                    });
-                }
-            }
-        };
-
         // Validate fee
         if frame.is_fee_bump() {
             let op_count = frame.operation_count() as i64;
@@ -1617,26 +1596,11 @@ impl TransactionExecutor {
             }
 
             if cond.min_seq_age.0 > 0 {
-                let last_header = snapshot.get_ledger_header(source_last_modified_seq)?;
-                let last_close_time = match last_header {
-                    Some(header) => header.scp_value.close_time.0,
-                    None => {
-                        return Ok(TransactionExecutionResult {
-                            success: false,
-                            fee_charged: 0,
-                            fee_refund: 0,
-                            operation_results: vec![],
-                            error: Some("Minimum sequence age unavailable".into()),
-                            failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                            tx_meta: None,
-                            fee_changes: None,
-                            post_fee_changes: None,
-                        });
-                    }
-                };
+                // C++ logic: minSeqAge > closeTime || closeTime - minSeqAge < accSeqTime
+                let acc_seq_time = get_account_seq_time(&source_account);
+                let min_seq_age = cond.min_seq_age.0;
 
-                let age = self.close_time.saturating_sub(last_close_time);
-                if age < cond.min_seq_age.0 {
+                if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
                     return Ok(TransactionExecutionResult {
                         success: false,
                         fee_charged: 0,
@@ -1652,8 +1616,13 @@ impl TransactionExecutor {
             }
 
             if cond.min_seq_ledger_gap > 0 {
-                let gap = self.ledger_seq.saturating_sub(source_last_modified_seq);
-                if gap < cond.min_seq_ledger_gap {
+                // C++ logic: minSeqLedgerGap > ledgerSeq || ledgerSeq - minSeqLedgerGap < accSeqLedger
+                let acc_seq_ledger = get_account_seq_ledger(&source_account);
+                let min_seq_ledger_gap = cond.min_seq_ledger_gap;
+
+                if min_seq_ledger_gap > self.ledger_seq
+                    || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
+                {
                     return Ok(TransactionExecutionResult {
                         success: false,
                         fee_charged: 0,

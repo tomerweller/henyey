@@ -3749,6 +3749,36 @@ pub fn update_account_seq_info(account: &mut AccountEntry, ledger_seq: u32, clos
     }
 }
 
+/// Get the sequence time from an account's extension V3.
+/// Returns 0 if the account doesn't have extension V3.
+pub fn get_account_seq_time(account: &AccountEntry) -> u64 {
+    match &account.ext {
+        AccountEntryExt::V0 => 0,
+        AccountEntryExt::V1(ext_v1) => match &ext_v1.ext {
+            AccountEntryExtensionV1Ext::V0 => 0,
+            AccountEntryExtensionV1Ext::V2(ext_v2) => match &ext_v2.ext {
+                AccountEntryExtensionV2Ext::V0 => 0,
+                AccountEntryExtensionV2Ext::V3(ext_v3) => ext_v3.seq_time.0,
+            },
+        },
+    }
+}
+
+/// Get the sequence ledger from an account's extension V3.
+/// Returns 0 if the account doesn't have extension V3.
+pub fn get_account_seq_ledger(account: &AccountEntry) -> u32 {
+    match &account.ext {
+        AccountEntryExt::V0 => 0,
+        AccountEntryExt::V1(ext_v1) => match &ext_v1.ext {
+            AccountEntryExtensionV1Ext::V0 => 0,
+            AccountEntryExtensionV1Ext::V2(ext_v2) => match &ext_v2.ext {
+                AccountEntryExtensionV2Ext::V0 => 0,
+                AccountEntryExtensionV2Ext::V3(ext_v3) => ext_v3.seq_ledger,
+            },
+        },
+    }
+}
+
 fn build_signer_sponsoring_ids(count: usize) -> VecM<SponsorshipDescriptor, 20> {
     let ids = vec![SponsorshipDescriptor(None); count];
     ids.try_into().unwrap_or_default()

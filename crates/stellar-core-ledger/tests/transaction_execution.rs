@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use stellar_core_common::NetworkId;
 use stellar_core_crypto::{sign_hash, SecretKey};
 use stellar_core_ledger::execution::build_tx_result_pair;
@@ -6,17 +5,19 @@ use stellar_core_ledger::execution::{ExecutionFailure, TransactionExecutor};
 use stellar_core_ledger::{LedgerSnapshot, SnapshotBuilder, SnapshotHandle};
 use stellar_core_tx::{soroban::SorobanConfig, ClassicEventConfig, OpEventManager};
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, AllowTrustOp, AlphaNum4, Asset, AssetCode,
-    AssetCode4, BytesM, ClaimAtom, ClaimClaimableBalanceOp, ClaimLiquidityAtom, ClaimOfferAtom,
-    ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId, Claimant,
-    ClaimantV0, ClawbackClaimableBalanceOp, ClawbackOp, ContractCodeEntry, ContractCodeEntryExt,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
+    AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, AccountId,
+    AllowTrustOp, AlphaNum4, Asset, AssetCode, AssetCode4, BytesM, ClaimAtom,
+    ClaimClaimableBalanceOp, ClaimLiquidityAtom, ClaimOfferAtom, ClaimPredicate,
+    ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId, Claimant, ClaimantV0,
+    ClawbackClaimableBalanceOp, ClawbackOp, ContractCodeEntry, ContractCodeEntryExt,
     ContractEventBody, ContractId, ContractIdPreimage, CreateAccountOp, CreateAccountResult,
     CreateClaimableBalanceOp, CreateClaimableBalanceResult, DecoratedSignature, Duration,
-    ExtendFootprintTtlOp, FeeBumpTransaction, FeeBumpTransactionEnvelope,
+    ExtendFootprintTtlOp, ExtensionPoint, FeeBumpTransaction, FeeBumpTransactionEnvelope,
     FeeBumpTransactionInnerTx, Hash, HashIdPreimage, HashIdPreimageContractId,
     InnerTransactionResultPair, Int128Parts, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     LedgerFootprint, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyContractCode,
-    LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl,
+    LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl, Liabilities,
     LiquidityPoolConstantProductParameters, LiquidityPoolDepositOp, LiquidityPoolEntry,
     LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolWithdrawOp,
     ManageSellOfferOp, ManageSellOfferResult, Memo, MuxedAccount, MuxedAccountMed25519, OfferEntry,
@@ -53,6 +54,53 @@ fn create_account_entry_with_last_modified(
             thresholds: Thresholds([1, 0, 0, 0]),
             signers: VecM::default(),
             ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    (key, entry)
+}
+
+/// Create an account entry with seq_time and seq_ledger set (for min_seq_age/min_seq_ledger_gap tests).
+fn create_account_entry_with_seq_info(
+    account_id: AccountId,
+    seq_num: i64,
+    balance: i64,
+    seq_ledger: u32,
+    seq_time: u64,
+) -> (LedgerKey, LedgerEntry) {
+    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: seq_ledger,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(seq_num),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored: 0,
+                    num_sponsoring: 0,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
+                        ext: ExtensionPoint::V0,
+                        seq_ledger,
+                        seq_time: TimePoint(seq_time),
+                    }),
+                }),
+            }),
         }),
         ext: LedgerEntryExt::V0,
     };
@@ -559,32 +607,17 @@ fn test_execute_transaction_min_seq_num_precondition() {
 fn test_execute_transaction_min_seq_age_precondition() {
     let secret = SecretKey::from_seed(&[12u8; 32]);
     let account_id: AccountId = (&secret.public_key()).into();
-    let last_modified_seq = 5;
-    let last_close_time = 900;
+    let seq_ledger = 5;
+    let seq_time = 900;
 
-    let (key, entry) = create_account_entry_with_last_modified(
-        account_id.clone(),
-        1,
-        10_000_000,
-        last_modified_seq,
-    );
+    // Create account with seq_time set (for min_seq_age checking)
+    let (key, entry) =
+        create_account_entry_with_seq_info(account_id.clone(), 1, 10_000_000, seq_ledger, seq_time);
     let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
         .expect("add entry")
         .build_with_default_header();
-    let mut snapshot = SnapshotHandle::new(snapshot);
-
-    let mut header = snapshot.header().clone();
-    header.ledger_seq = last_modified_seq;
-    header.scp_value.close_time = TimePoint(last_close_time);
-    let header = Arc::new(header);
-    snapshot.set_header_lookup(Arc::new(move |seq| {
-        if seq == last_modified_seq {
-            Ok(Some((*header).clone()))
-        } else {
-            Ok(None)
-        }
-    }));
+    let snapshot = SnapshotHandle::new(snapshot);
 
     let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
     let operation = Operation {
@@ -595,6 +628,8 @@ fn test_execute_transaction_min_seq_age_precondition() {
         }),
     };
 
+    // min_seq_age = 200, close_time = 1000, seq_time = 900
+    // Check: closeTime - minSeqAge < accSeqTime → 1000 - 200 < 900 → 800 < 900 → TRUE → FAIL
     let preconditions = Preconditions::V2(PreconditionsV2 {
         time_bounds: None,
         ledger_bounds: None,
@@ -627,7 +662,7 @@ fn test_execute_transaction_min_seq_age_precondition() {
 
     let mut executor = TransactionExecutor::new(
         10,
-        1_000,
+        1_000, // close_time
         5_000_000,
         25,
         network_id,
@@ -647,9 +682,12 @@ fn test_execute_transaction_min_seq_age_precondition() {
 fn test_execute_transaction_min_seq_ledger_gap_precondition() {
     let secret = SecretKey::from_seed(&[13u8; 32]);
     let account_id: AccountId = (&secret.public_key()).into();
+    let seq_ledger = 8;
+    let seq_time = 0;
 
+    // Create account with seq_ledger set (for min_seq_ledger_gap checking)
     let (key, entry) =
-        create_account_entry_with_last_modified(account_id.clone(), 1, 10_000_000, 8);
+        create_account_entry_with_seq_info(account_id.clone(), 1, 10_000_000, seq_ledger, seq_time);
     let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
         .expect("add entry")
@@ -665,6 +703,8 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         }),
     };
 
+    // min_seq_ledger_gap = 5, ledger_seq = 10, seq_ledger = 8
+    // Check: ledgerSeq - minSeqLedgerGap < accSeqLedger → 10 - 5 < 8 → 5 < 8 → TRUE → FAIL
     let preconditions = Preconditions::V2(PreconditionsV2 {
         time_bounds: None,
         ledger_bounds: None,

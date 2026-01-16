@@ -66,8 +66,11 @@ The sequence number check appears to be **off by 1**. Since our transaction fail
 
 ## Recent Fixes (This Session)
 
-1. **Soroban error mapping** (`909cf1a`): Fixed `InvokeHostFunction` to return `ResourceLimitExceeded` vs `Trapped` based on raw CPU/memory consumption (matching C++ behavior)
-2. **Write bytes checking** (`9d0c4d8`): Added post-execution check for total write bytes exceeding transaction limit
+1. **min_seq_age/min_seq_ledger_gap validation**: Fixed to use account's `seq_time` and `seq_ledger` from V3 extension instead of `last_modified_ledger_seq`. Matches C++ logic:
+   - `min_seq_age > closeTime || closeTime - min_seq_age < accSeqTime`
+   - `min_seq_ledger_gap > ledgerSeq || ledgerSeq - min_seq_ledger_gap < accSeqLedger`
+2. **Soroban error mapping** (`909cf1a`): Fixed `InvokeHostFunction` to return `ResourceLimitExceeded` vs `Trapped` based on raw CPU/memory consumption (matching C++ behavior)
+3. **Write bytes checking** (`9d0c4d8`): Added post-execution check for total write bytes exceeding transaction limit
 
 ---
 
@@ -111,7 +114,7 @@ The sequence number check appears to be **off by 1**. Since our transaction fail
 
 ### Other Fixed Issues
 
-- **BadMinSeqAgeOrGap**: Fixed minimum sequence age validation
+- **BadMinSeqAgeOrGap**: Fixed min_seq_age/min_seq_ledger_gap validation to use account V3 extension fields
 - **ClaimClaimableBalance NoTrust**: Fixed trustline loading
 - **INIT entry normalization**: Fixed bucket list entry normalization for INIT entries
 
