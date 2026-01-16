@@ -108,7 +108,10 @@ pub mod snapshot;
 // ============================================================================
 
 pub use bucket::Bucket;
-pub use bucket_list::{BucketLevel, BucketList, BucketListStats, BUCKET_LIST_LEVELS};
+pub use bucket_list::{
+    BucketLevel, BucketList, BucketListStats, HasNextState, BUCKET_LIST_LEVELS,
+    HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_OUTPUT,
+};
 
 // ============================================================================
 // Disk-backed storage

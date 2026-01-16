@@ -34,6 +34,7 @@ use stellar_xdr::curr::{
 
 use stellar_core_common::Hash256;
 
+use crate::bucket_list::{HasNextState, HAS_NEXT_STATE_OUTPUT};
 use crate::entry::ledger_entry_to_key;
 use crate::{BucketError, Result};
 
@@ -370,6 +371,11 @@ impl HotArchiveBucketLevel {
         Hash256::from_bytes(bytes)
     }
 
+    /// Get reference to the staged next bucket.
+    pub fn next(&self) -> Option<&HotArchiveBucket> {
+        self.next.as_ref()
+    }
+
     /// Commit the staged merge.
     fn commit(&mut self) {
         if let Some(next) = self.next.take() {
@@ -593,16 +599,24 @@ impl HotArchiveBucketList {
         1u32 << (2 * (level + 1))
     }
 
-    /// Check if a level should spill.
+    /// Returns true if a level should spill at a given ledger.
+    /// This matches C++ stellar-core's `levelShouldSpill`:
+    ///   return (ledger == roundDown(ledger, levelHalf(level)) ||
+    ///           ledger == roundDown(ledger, levelSize(level)));
+    ///
+    /// Which simplifies to: ledger is a multiple of levelHalf(level).
+    /// For level 0 (half=2): spills at ledgers 0, 2, 4, 6, ...
+    /// For level 1 (half=8): spills at ledgers 0, 8, 16, 24, ...
+    /// For level 2 (half=32): spills at ledgers 0, 32, 64, 96, ...
     fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
         if level == HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1 {
+            // There's no level above the highest level, so it can't spill.
             return false;
         }
 
         let half = Self::level_half(level);
         let size = Self::level_size(level);
-        ledger_seq == Self::round_down(ledger_seq, half)
-            || ledger_seq == Self::round_down(ledger_seq, size)
+        ledger_seq % half == 0 || ledger_seq % size == 0
     }
 
     /// Check if tombstone entries should be kept at a level.
@@ -706,6 +720,82 @@ impl HotArchiveBucketList {
             let mut level = HotArchiveBucketLevel::new(i);
             level.curr = curr;
             level.snap = snap;
+            levels.push(level);
+        }
+
+        Ok(Self { levels, ledger_seq: 0 })
+    }
+
+    /// Restore a hot archive bucket list from History Archive State with full FutureBucket support.
+    ///
+    /// Unlike `restore_from_hashes`, this function also restores pending merge results
+    /// when the HAS indicates a completed merge (state == HAS_NEXT_STATE_OUTPUT). This is
+    /// necessary for correct bucket list hash computation at checkpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
+    /// * `next_states` - Vec of HasNextState for each level
+    /// * `load_bucket` - Function to load a HotArchiveBucket by hash
+    pub fn restore_from_has<F>(
+        hashes: &[(Hash256, Hash256)],
+        next_states: &[HasNextState],
+        mut load_bucket: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&Hash256) -> Result<HotArchiveBucket>,
+    {
+        if hashes.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} hot archive bucket level hashes, got {}",
+                HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+                hashes.len()
+            )));
+        }
+
+        let mut levels = Vec::with_capacity(HOT_ARCHIVE_BUCKET_LIST_LEVELS);
+
+        for (i, (curr_hash, snap_hash)) in hashes.iter().enumerate() {
+            let curr = if curr_hash.is_zero() {
+                HotArchiveBucket::empty()
+            } else {
+                load_bucket(curr_hash)?
+            };
+
+            let snap = if snap_hash.is_zero() {
+                HotArchiveBucket::empty()
+            } else {
+                load_bucket(snap_hash)?
+            };
+
+            // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
+            let next = if let Some(state) = next_states.get(i) {
+                if state.state == HAS_NEXT_STATE_OUTPUT {
+                    if let Some(ref output_hash) = state.output {
+                        if !output_hash.is_zero() {
+                            tracing::debug!(
+                                level = i,
+                                output_hash = %output_hash.to_hex(),
+                                "hot_archive restore_from_has: loading completed merge output"
+                            );
+                            Some(load_bucket(output_hash)?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut level = HotArchiveBucketLevel::new(i);
+            level.curr = curr;
+            level.snap = snap;
+            level.next = next;
             levels.push(level);
         }
 

@@ -69,6 +69,25 @@ use crate::{
 /// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
 pub const BUCKET_LIST_LEVELS: usize = 11;
 
+/// FutureBucket state constants (matches C++ stellar-core's FBStatus enum in HAS JSON).
+/// HAS_NEXT_STATE_CLEAR: No pending merge
+/// HAS_NEXT_STATE_OUTPUT: Merge complete, output hash is known
+pub const HAS_NEXT_STATE_CLEAR: u32 = 0;
+pub const HAS_NEXT_STATE_OUTPUT: u32 = 1;
+
+/// State of a pending bucket merge from History Archive State (HAS).
+///
+/// When restoring from a HAS, each level may have a pending merge. If state is
+/// HAS_NEXT_STATE_OUTPUT (1), the output hash contains the hash of the completed merge
+/// result that should be set as the level's `next` bucket.
+#[derive(Clone, Debug, Default)]
+pub struct HasNextState {
+    /// Merge state (0 = clear, 1 = hash output known, etc.)
+    pub state: u32,
+    /// Output bucket hash if merge is complete (state == 1)
+    pub output: Option<Hash256>,
+}
+
 /// A single level in the BucketList, containing `curr` and `snap` buckets.
 ///
 /// Each level maintains two buckets:
@@ -570,6 +589,76 @@ impl BucketList {
             "add_batch_internal: starting spill processing"
         );
 
+        // Debug output for ledgers 701 and 702
+        let debug_702 = ledger_seq == 701 || ledger_seq == 702;
+        if debug_702 {
+            eprintln!("=== DEBUG LEDGER {} ===", ledger_seq);
+            eprintln!("Before any processing:");
+            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
+            eprintln!("  L0.snap.hash = {}", self.levels[0].snap.hash().to_hex());
+            eprintln!("  L0.curr entries = {}", self.levels[0].curr.len());
+            eprintln!("  new_bucket.hash = {}", new_bucket.hash().to_hex());
+            eprintln!("  new_bucket entries = {}", new_bucket.len());
+
+            // Print entry types in new_bucket
+            let mut meta_count = 0;
+            let mut init_count = 0;
+            let mut live_count = 0;
+            let mut dead_count = 0;
+            for entry in new_bucket.iter() {
+                match entry {
+                    BucketEntry::Metadata(_) => meta_count += 1,
+                    BucketEntry::Init(_) => init_count += 1,
+                    BucketEntry::Live(_) => live_count += 1,
+                    BucketEntry::Dead(_) => dead_count += 1,
+                }
+            }
+            eprintln!("  new_bucket entry breakdown: meta={}, init={}, live={}, dead={}",
+                meta_count, init_count, live_count, dead_count);
+
+            // Print entry keys
+            if ledger_seq == 702 {
+                eprintln!("  new_bucket entry keys:");
+                for entry in new_bucket.iter() {
+                    match entry {
+                        BucketEntry::Metadata(m) => eprintln!("    METADATA: v{}", m.ledger_version),
+                        BucketEntry::Init(ref e) | BucketEntry::Live(ref e) => {
+                            let key_type = match &e.data {
+                                stellar_xdr::curr::LedgerEntryData::Account(_) => "Account",
+                                stellar_xdr::curr::LedgerEntryData::Trustline(_) => "Trustline",
+                                stellar_xdr::curr::LedgerEntryData::Offer(_) => "Offer",
+                                stellar_xdr::curr::LedgerEntryData::Data(_) => "Data",
+                                stellar_xdr::curr::LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance",
+                                stellar_xdr::curr::LedgerEntryData::LiquidityPool(_) => "LiquidityPool",
+                                stellar_xdr::curr::LedgerEntryData::ContractData(_) => "ContractData",
+                                stellar_xdr::curr::LedgerEntryData::ContractCode(_) => "ContractCode",
+                                stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => match cs {
+                                    stellar_xdr::curr::ConfigSettingEntry::EvictionIterator(_) => "ConfigSetting:EvictionIterator",
+                                    _ => "ConfigSetting:Other",
+                                },
+                                stellar_xdr::curr::LedgerEntryData::Ttl(_) => "TTL",
+                            };
+                            let entry_type = match &entry {
+                                BucketEntry::Init(_) => "INIT",
+                                BucketEntry::Live(_) => "LIVE",
+                                _ => "?",
+                            };
+                            eprintln!("    {} {}", entry_type, key_type);
+                        }
+                        BucketEntry::Dead(k) => {
+                            let key_type = match k {
+                                stellar_xdr::curr::LedgerKey::Account(_) => "Account",
+                                stellar_xdr::curr::LedgerKey::Trustline(_) => "Trustline",
+                                stellar_xdr::curr::LedgerKey::ConfigSetting(_) => "ConfigSetting",
+                                _ => "Other",
+                            };
+                            eprintln!("    DEAD {}", key_type);
+                        }
+                    }
+                }
+            }
+        }
+
         // Step 1: Process spills from highest level down to level 1
         // This matches C++ stellar-core's BucketListBase::addBatchInternal
         //
@@ -587,6 +676,13 @@ impl BucketList {
                 // Snap level i-1: moves curr→snap, returns the NEW snap (old curr)
                 // This is the bucket that flows to level i
                 let spilling_snap = self.levels[i - 1].snap();
+
+                if debug_702 && i == 1 {
+                    eprintln!("After L0.snap():");
+                    eprintln!("  L0.curr.hash = {} (should be empty)", self.levels[0].curr.hash().to_hex());
+                    eprintln!("  L0.snap.hash = {}", self.levels[0].snap.hash().to_hex());
+                    eprintln!("  spilling_snap.hash = {}", spilling_snap.hash().to_hex());
+                }
 
                 tracing::debug!(
                     level = i - 1,
@@ -625,6 +721,12 @@ impl BucketList {
         // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_dead_0 = Self::keep_tombstone_entries(0);
 
+        if debug_702 {
+            eprintln!("Before L0.prepare_with_normalization:");
+            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
+            eprintln!("  L0.curr entries = {}", self.levels[0].curr.len());
+        }
+
         self.levels[0].prepare_with_normalization(
             ledger_seq,
             protocol_version,
@@ -634,20 +736,24 @@ impl BucketList {
             false, // level 0 never uses empty curr
         )?;
 
+        if debug_702 {
+            eprintln!("After L0.prepare_with_normalization, before commit:");
+            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
+            eprintln!("  L0.next.hash = {}", self.levels[0].next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string()));
+            if let Some(next) = &self.levels[0].next {
+                eprintln!("  L0.next entries = {}", next.len());
+            }
+        }
+
         self.levels[0].commit();
 
-        if ledger_seq >= 380080 && ledger_seq <= 380088 {
-            for (i, level) in self.levels.iter().enumerate() {
-                if i > 2 { break; }
-                tracing::info!("Ledger {} Level {} curr entries: {}", ledger_seq, i, level.curr.len());
-                if ledger_seq == 380088 {
-                    for (idx, entry) in level.curr.entries().iter().enumerate() {
-                        if idx < 5 {
-                            tracing::info!("  L{} [{}]: {:?}", i, idx, entry);
-                        }
-                    }
-                }
-            }
+        if debug_702 {
+            eprintln!("After L0.commit:");
+            eprintln!("  L0.curr.hash = {}", self.levels[0].curr.hash().to_hex());
+            eprintln!("  L0.snap.hash = {}", self.levels[0].snap.hash().to_hex());
+            eprintln!("  L0.curr entries = {}", self.levels[0].curr.len());
+            eprintln!("  Live bucket list hash = {}", self.hash().to_hex());
+            eprintln!("=== END DEBUG LEDGER {} ===", ledger_seq);
         }
 
         Ok(())
@@ -674,16 +780,23 @@ impl BucketList {
     }
 
     /// Returns true if a level should spill at a given ledger.
-    /// This matches C++ stellar-core's `levelShouldSpill`.
+    /// This matches C++ stellar-core's `levelShouldSpill`:
+    ///   return (ledger == roundDown(ledger, levelHalf(level)) ||
+    ///           ledger == roundDown(ledger, levelSize(level)));
+    ///
+    /// Which simplifies to: ledger is a multiple of levelHalf(level).
+    /// For level 0 (half=2): spills at ledgers 0, 2, 4, 6, ...
+    /// For level 1 (half=8): spills at ledgers 0, 8, 16, 24, ...
+    /// For level 2 (half=32): spills at ledgers 0, 32, 64, 96, ...
     pub fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
         if level == BUCKET_LIST_LEVELS - 1 {
+            // There's no level above the highest level, so it can't spill.
             return false;
         }
 
         let half = Self::level_half(level);
         let size = Self::level_size(level);
-        ledger_seq == Self::round_down(ledger_seq, half)
-            || ledger_seq == Self::round_down(ledger_seq, size)
+        ledger_seq % half == 0 || ledger_seq % size == 0
     }
 
     fn keep_tombstone_entries(level: usize) -> bool {
@@ -782,6 +895,82 @@ impl BucketList {
             let mut level = BucketLevel::new(i);
             level.curr = curr;
             level.snap = snap;
+            levels.push(level);
+        }
+
+        Ok(Self { levels, ledger_seq: 0 })
+    }
+
+    /// Restore a bucket list from History Archive State with full FutureBucket support.
+    ///
+    /// Unlike `restore_from_hashes`, this function also restores pending merge results
+    /// when the HAS indicates a completed merge (state == HAS_NEXT_STATE_OUTPUT). This is
+    /// necessary for correct bucket list hash computation at checkpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
+    /// * `next_states` - Vec of HasNextState for each level
+    /// * `load_bucket` - Function to load a bucket from its hash
+    pub fn restore_from_has<F>(
+        hashes: &[(Hash256, Hash256)],
+        next_states: &[HasNextState],
+        mut load_bucket: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&Hash256) -> Result<Bucket>,
+    {
+        if hashes.len() != BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} bucket level hashes, got {}",
+                BUCKET_LIST_LEVELS,
+                hashes.len()
+            )));
+        }
+
+        let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+
+        for (i, (curr_hash, snap_hash)) in hashes.iter().enumerate() {
+            let curr = if curr_hash.is_zero() {
+                Bucket::empty()
+            } else {
+                load_bucket(curr_hash)?
+            };
+
+            let snap = if snap_hash.is_zero() {
+                Bucket::empty()
+            } else {
+                load_bucket(snap_hash)?
+            };
+
+            // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
+            let next = if let Some(state) = next_states.get(i) {
+                if state.state == HAS_NEXT_STATE_OUTPUT {
+                    if let Some(ref output_hash) = state.output {
+                        if !output_hash.is_zero() {
+                            tracing::debug!(
+                                level = i,
+                                output_hash = %output_hash.to_hex(),
+                                "restore_from_has: loading completed merge output"
+                            );
+                            Some(load_bucket(output_hash)?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut level = BucketLevel::new(i);
+            level.curr = curr;
+            level.snap = snap;
+            level.next = next;
             levels.push(level);
         }
 
@@ -1466,14 +1655,28 @@ mod tests {
 
     #[test]
     fn test_level_should_spill_boundaries() {
+        // Level 0 spills at even ledgers (multiples of 2)
+        assert!(BucketList::level_should_spill(0, 0));
         assert!(BucketList::level_should_spill(2, 0));
         assert!(BucketList::level_should_spill(4, 0));
+        assert!(!BucketList::level_should_spill(1, 0));
         assert!(!BucketList::level_should_spill(3, 0));
 
+        // Level 1 spills at multiples of 8
+        assert!(BucketList::level_should_spill(0, 1));
         assert!(BucketList::level_should_spill(8, 1));
         assert!(BucketList::level_should_spill(16, 1));
+        assert!(!BucketList::level_should_spill(4, 1));
         assert!(!BucketList::level_should_spill(12, 1));
 
+        // Level 2 spills at multiples of 32
+        assert!(BucketList::level_should_spill(0, 2));
+        assert!(BucketList::level_should_spill(32, 2));
+        assert!(BucketList::level_should_spill(64, 2));
+        assert!(!BucketList::level_should_spill(16, 2));
+
+        // Top level never spills
+        assert!(!BucketList::level_should_spill(0, BUCKET_LIST_LEVELS - 1));
         assert!(!BucketList::level_should_spill(64, BUCKET_LIST_LEVELS - 1));
     }
 
