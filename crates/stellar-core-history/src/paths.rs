@@ -169,6 +169,76 @@ pub fn has_path(ledger: u32) -> String {
     checkpoint_path("history", ledger, "json")
 }
 
+// ============================================================================
+// Dirty file helpers for crash-safe checkpoint building
+// ============================================================================
+
+/// Generate the dirty (temporary) path for a checkpoint file.
+///
+/// Dirty files are used during checkpoint building for crash safety.
+/// The checkpoint builder writes to `.dirty` files first, then atomically
+/// renames them to final paths on commit.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_core_history::paths::checkpoint_path_dirty;
+///
+/// assert_eq!(
+///     checkpoint_path_dirty("ledger", 63, "xdr.gz"),
+///     "ledger/00/00/00/ledger-0000003f.xdr.gz.dirty"
+/// );
+/// ```
+pub fn checkpoint_path_dirty(category: &str, ledger: u32, ext: &str) -> String {
+    format!("{}.dirty", checkpoint_path(category, ledger, ext))
+}
+
+/// Check if a path is a dirty checkpoint file.
+///
+/// A dirty path must end with `.dirty` and have a meaningful base name
+/// (i.e., not just ".dirty" by itself).
+///
+/// # Examples
+///
+/// ```
+/// use stellar_core_history::paths::is_dirty_path;
+/// use std::path::Path;
+///
+/// assert!(is_dirty_path(Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty")));
+/// assert!(!is_dirty_path(Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz")));
+/// assert!(!is_dirty_path(Path::new(".dirty"))); // Just ".dirty" is not valid
+/// ```
+pub fn is_dirty_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|name| name.ends_with(".dirty") && name.len() > 6)
+}
+
+/// Convert a dirty path to its final path by removing the `.dirty` suffix.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_core_history::paths::dirty_to_final_path;
+/// use std::path::Path;
+///
+/// let dirty = Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
+/// let final_path = dirty_to_final_path(dirty).unwrap();
+/// assert_eq!(final_path.to_str().unwrap(), "ledger/00/00/00/ledger-0000003f.xdr.gz");
+/// ```
+pub fn dirty_to_final_path(dirty_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let s = dirty_path.to_str()?;
+    s.strip_suffix(".dirty").map(std::path::PathBuf::from)
+}
+
+/// Convert a final path to its dirty path by adding the `.dirty` suffix.
+pub fn final_to_dirty_path(final_path: &std::path::Path) -> std::path::PathBuf {
+    let mut dirty = final_path.to_path_buf();
+    let file_name = dirty.file_name().unwrap().to_str().unwrap();
+    dirty.set_file_name(format!("{}.dirty", file_name));
+    dirty
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +330,56 @@ mod tests {
     #[test]
     fn test_root_has_path() {
         assert_eq!(root_has_path(), ".well-known/stellar-history.json");
+    }
+
+    #[test]
+    fn test_checkpoint_path_dirty() {
+        assert_eq!(
+            checkpoint_path_dirty("ledger", 63, "xdr.gz"),
+            "ledger/00/00/00/ledger-0000003f.xdr.gz.dirty"
+        );
+        assert_eq!(
+            checkpoint_path_dirty("transactions", 127, "xdr.gz"),
+            "transactions/00/00/00/transactions-0000007f.xdr.gz.dirty"
+        );
+    }
+
+    #[test]
+    fn test_is_dirty_path() {
+        use std::path::Path;
+
+        assert!(is_dirty_path(Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty")));
+        assert!(is_dirty_path(Path::new("foo.dirty")));
+
+        assert!(!is_dirty_path(Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz")));
+        assert!(!is_dirty_path(Path::new("foo.txt")));
+        assert!(!is_dirty_path(Path::new(".dirty")));
+    }
+
+    #[test]
+    fn test_dirty_to_final_path() {
+        use std::path::Path;
+
+        let dirty = Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
+        let final_path = dirty_to_final_path(dirty).unwrap();
+        assert_eq!(
+            final_path.to_str().unwrap(),
+            "ledger/00/00/00/ledger-0000003f.xdr.gz"
+        );
+
+        // Non-dirty path returns None
+        assert!(dirty_to_final_path(Path::new("foo.txt")).is_none());
+    }
+
+    #[test]
+    fn test_final_to_dirty_path() {
+        use std::path::Path;
+
+        let final_path = Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz");
+        let dirty = final_to_dirty_path(final_path);
+        assert_eq!(
+            dirty.to_str().unwrap(),
+            "ledger/00/00/00/ledger-0000003f.xdr.gz.dirty"
+        );
     }
 }

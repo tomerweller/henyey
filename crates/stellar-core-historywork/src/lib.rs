@@ -1296,6 +1296,133 @@ impl Work for PublishBucketsWork {
     }
 }
 
+// ============================================================================
+// Verification Work Items
+// ============================================================================
+
+/// Work item to verify a single ledger header against a history archive.
+///
+/// This work item downloads the checkpoint containing a specific ledger and
+/// verifies that the ledger header matches an expected value. It is used for
+/// self-verification during catchup to ensure local state matches archive state.
+///
+/// # Use Cases
+///
+/// - **Catchup verification**: After reconstructing state locally, verify the
+///   resulting ledger header hash matches the archive's authoritative value
+/// - **Chain validation**: Verify specific ledgers as trust anchors during
+///   multi-range catchup
+/// - **Debugging**: Compare local ledger headers against archived values
+///
+/// # Dependencies
+///
+/// None - this work item is self-contained and downloads its required data.
+///
+/// # Output
+///
+/// Returns `WorkOutcome::Success` if the header matches, or `WorkOutcome::Failed`
+/// with a descriptive error message if there's a mismatch or download error.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use stellar_core_historywork::CheckSingleLedgerHeaderWork;
+///
+/// let work = CheckSingleLedgerHeaderWork::new(
+///     archive.clone(),
+///     expected_header.clone(),
+/// );
+///
+/// let id = scheduler.add_work(Box::new(work), vec![], 3);
+/// scheduler.run_to_completion().await?;
+/// ```
+pub struct CheckSingleLedgerHeaderWork {
+    archive: Arc<HistoryArchive>,
+    expected: LedgerHeaderHistoryEntry,
+}
+
+impl CheckSingleLedgerHeaderWork {
+    /// Creates a new ledger header verification work item.
+    ///
+    /// # Arguments
+    ///
+    /// * `archive` - The history archive to fetch the header from
+    /// * `expected` - The expected ledger header entry to verify against
+    pub fn new(archive: Arc<HistoryArchive>, expected: LedgerHeaderHistoryEntry) -> Self {
+        Self { archive, expected }
+    }
+
+    /// Returns the ledger sequence being verified.
+    pub fn ledger_seq(&self) -> u32 {
+        self.expected.header.ledger_seq
+    }
+}
+
+#[async_trait]
+impl Work for CheckSingleLedgerHeaderWork {
+    fn name(&self) -> &str {
+        "check-single-ledger-header"
+    }
+
+    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+        let ledger_seq = self.expected.header.ledger_seq;
+
+        // Genesis ledger (ledger 1) has no header in the archive
+        // and is verified by the genesis hash
+        if ledger_seq == 0 {
+            return WorkOutcome::Success;
+        }
+
+        // Download the checkpoint containing this ledger
+        match self.archive.get_ledger_headers(ledger_seq).await {
+            Ok(headers) => {
+                // Find the header with the matching sequence
+                match headers
+                    .iter()
+                    .find(|h| h.header.ledger_seq == ledger_seq)
+                {
+                    Some(found) => {
+                        // Compare the headers
+                        if found.hash == self.expected.hash
+                            && found.header == self.expected.header
+                        {
+                            tracing::debug!(
+                                ledger_seq,
+                                hash = %Hash256::from(found.hash.0),
+                                "Ledger header verified against archive"
+                            );
+                            WorkOutcome::Success
+                        } else {
+                            let expected_hash = Hash256::from(self.expected.hash.0);
+                            let found_hash = Hash256::from(found.hash.0);
+                            tracing::error!(
+                                ledger_seq,
+                                expected_hash = %expected_hash,
+                                found_hash = %found_hash,
+                                "Ledger header mismatch"
+                            );
+                            WorkOutcome::Failed(format!(
+                                "ledger header mismatch at seq {}: expected hash {}, got {}",
+                                ledger_seq, expected_hash, found_hash
+                            ))
+                        }
+                    }
+                    None => {
+                        WorkOutcome::Failed(format!(
+                            "ledger header {} not found in checkpoint",
+                            ledger_seq
+                        ))
+                    }
+                }
+            }
+            Err(err) => WorkOutcome::Failed(format!(
+                "failed to download headers for ledger {}: {}",
+                ledger_seq, err
+            )),
+        }
+    }
+}
+
 /// IDs for registered download work items.
 ///
 /// Returned by [`HistoryWorkBuilder::register`] to identify the work items

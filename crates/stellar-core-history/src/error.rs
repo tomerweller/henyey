@@ -140,4 +140,16 @@ pub enum HistoryError {
         /// Standard error output.
         stderr: String,
     },
+
+    /// Archive already initialized.
+    #[error("archive already initialized: {0}")]
+    ArchiveAlreadyInitialized(String),
+
+    /// Archive not writable (no put command configured).
+    #[error("archive not writable: {0}")]
+    ArchiveNotWritable(String),
+
+    /// Archive not found by name.
+    #[error("archive not found: {0}")]
+    ArchiveNotFound(String),
 }

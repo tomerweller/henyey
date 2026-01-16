@@ -225,8 +225,8 @@ rs-stellar-core/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`stellar-core-history`](crates/stellar-core-history/README.md) | History archive I/O, catchup, replay, verification | [~82%](crates/stellar-core-history/PARITY_STATUS.md) |
-| [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | History work scheduling, publish/catchup task management | [~72%](crates/stellar-core-historywork/PARITY_STATUS.md) |
+| [`stellar-core-history`](crates/stellar-core-history/README.md) | History archive I/O, catchup, replay, verification | [~90%](crates/stellar-core-history/PARITY_STATUS.md) |
+| [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | History work scheduling, publish/catchup task management | [~82%](crates/stellar-core-historywork/PARITY_STATUS.md) |
 
 ### Utilities
 

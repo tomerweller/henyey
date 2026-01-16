@@ -129,7 +129,7 @@ impl RemoteArchive {
             .stderr(Stdio::piped())
             .output()
             .await
-            .map_err(|e| HistoryError::Io(e))?;
+            .map_err(HistoryError::Io)?;
 
         if output.status.success() {
             debug!(archive = %self.config.name, "Command succeeded");

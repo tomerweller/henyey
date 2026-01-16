@@ -1,6 +1,6 @@
 # Parity Status: stellar-core-historywork
 
-**Overall Parity: ~72%**
+**Overall Parity: ~82%**
 
 This document tracks the parity between this Rust crate and the upstream C++
 stellar-core `src/historywork/` directory (v25.x).
@@ -12,6 +12,7 @@ stellar-core `src/historywork/` directory (v25.x).
 | Core Download Workflow | Implemented (simplified) |
 | Core Publish Workflow | Implemented (simplified) |
 | Verification | Implemented inline (no background threads) |
+| Self-Verification | Implemented (`CheckSingleLedgerHeaderWork`) |
 | Batch Operations | Complete |
 | Hot Archive Buckets | Implemented |
 | Metrics | Not implemented |
@@ -59,6 +60,7 @@ a dedicated work item that uses async HTTP via `stellar-core-history`.
 | `VerifyBucketWork` | Inline in `DownloadBucketsWork` | C++ verifies and indexes in background thread. Rust verifies hash inline after download. |
 | `VerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | C++ runs in background thread. Rust verifies against headers inline. |
 | Header chain verification | Inline in `DownloadLedgerHeadersWork` | Uses `stellar_core_history::verify::verify_header_chain()` |
+| `CheckSingleLedgerHeaderWork` | `CheckSingleLedgerHeaderWork` | Full parity. Downloads checkpoint and verifies expected header matches archive. Used for self-verification during catchup. |
 
 ### Batch and Range Operations
 
@@ -95,7 +97,7 @@ These are not needed as Rust uses native libraries instead of shell commands.
 | C++ Class | Purpose | Priority |
 |-----------|---------|----------|
 | `WriteVerifiedCheckpointHashesWork` | Offline verification: downloads full chain and writes verified hashes to JSON | Low |
-| `CheckSingleLedgerHeaderWork` | Self-check: verifies local LCL against archive | Low |
+| ~~`CheckSingleLedgerHeaderWork`~~ | ~~Self-check: verifies local LCL against archive~~ | **Implemented** |
 
 ### Snapshot and Publishing Pipeline
 

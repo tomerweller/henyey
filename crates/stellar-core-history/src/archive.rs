@@ -44,7 +44,7 @@ use crate::paths::{bucket_path, checkpoint_path, root_has_path};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HistoryArchive {
     /// Base URL of the archive.
     base_url: Url,
