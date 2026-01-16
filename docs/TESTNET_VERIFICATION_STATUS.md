@@ -29,14 +29,14 @@ cargo build --release -p rs-stellar-core
 
 | Metric | Value |
 |--------|-------|
-| Ledgers verified | 168 (933-1100) |
-| Transactions verified | 544 |
-| Phase 1 (fees) matched | 544 (100%) |
-| Phase 2 (execution) matched | 544 (100%) |
+| Ledgers verified | 4068 (933-5000) |
+| Transactions verified | 5108 |
+| Phase 1 (fees) matched | 5108 (100%) |
+| Phase 2 (execution) matched | 5108 (100%) |
 | Phase 2 mismatched | 0 |
 | Ledgers with mismatches | 0 |
 
-**Status: All transactions in range 933-1100 now match!**
+**Status: All transactions in range 933-5000 now match!**
 
 ## Issue Categories
 
@@ -45,6 +45,20 @@ _No open issues - all known issues in range 933-1100 have been fixed!_
 ---
 
 ## Recently Fixed Issues
+
+### UploadContractWasm Footprint-Dependent STATE/UPDATED (FIXED 2026-01-16)
+
+**Problem**: When uploading WASM code that already exists, the behavior for recording STATE/UPDATED ledger entry changes varied between transactions. Some transactions expected STATE/UPDATED for ContractCode (e.g., ledger 2310), while others did not (e.g., ledger 967).
+
+**Root Cause**: C++ stellar-core passes all host function types (including `UploadContractWasm`) through soroban-env-host. The host returns entries in `modified_ledger_entries` based on what's in the **read-write footprint**, not based on whether they actually changed. Our code was handling `UploadContractWasm` locally and not checking the footprint.
+
+**Solution**: Modified `execute_upload_wasm` in `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` to:
+1. Check if the ContractCode key is in the read-write footprint
+2. If code exists AND is in read-write footprint → call `state.update_contract_code()` to record STATE/UPDATED
+3. If code exists but NOT in footprint → return success without recording changes
+
+**Files modified**:
+- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Added footprint check for existing code
 
 ### All Issues Fixed (2026-01-16)
 
@@ -118,10 +132,10 @@ Key sponsorship concepts:
 
 ## Next Steps
 
-All issues in range 933-1100 are now fixed. Next steps:
+All issues in range 933-5000 are now fixed. Next steps:
 
 1. **Extend verification range**: Run verification on additional ledger ranges to find any remaining issues
-2. **Test higher ledgers**: Verify more recent testnet ledgers (e.g., 1100-2000, 2000-5000, etc.)
+2. **Test higher ledgers**: Verify more recent testnet ledgers (e.g., 5000-10000, 10000-20000, etc.)
 3. **Continuous verification**: Set up regular verification runs to catch regressions
 
 ---
@@ -130,6 +144,7 @@ All issues in range 933-1100 are now fixed. Next steps:
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-16 | 933-5000 | 5108/5108 matched (100%) | Extended range, fixed UploadContractWasm footprint issue |
 | 2026-01-16 | 933-1100 | 544/544 matched (100%) | All issues fixed! |
 | 2026-01-16 | 933-1100 | 530/544 matched | 14 mismatches across 13 ledgers (before fixes) |
 

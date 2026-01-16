@@ -11,11 +11,11 @@ use stellar_xdr::curr::{
     OperationResultTr, ScVal, SorobanTransactionData, TtlEntry, WriteXdr,
 };
 
+use super::{OperationExecutionResult, SorobanOperationMeta};
 use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
-use super::{OperationExecutionResult, SorobanOperationMeta};
 
 /// Execute an InvokeHostFunction operation.
 ///
@@ -66,7 +66,7 @@ pub fn execute_invoke_host_function(
         }
         HostFunction::UploadContractWasm(wasm) => {
             // WASM upload can be handled locally without full host
-            execute_upload_wasm(wasm, source, state, context, soroban_config)
+            execute_upload_wasm(wasm, source, state, context, soroban_data, soroban_config)
         }
     }
 }
@@ -118,13 +118,15 @@ fn execute_contract_invocation(
                 )));
             }
             // Apply storage changes back to our state.
-            apply_soroban_storage_changes(state, &result.storage_changes, &soroban_data.resources.footprint);
+            apply_soroban_storage_changes(
+                state,
+                &result.storage_changes,
+                &soroban_data.resources.footprint,
+            );
 
             // Compute result hash from success preimage (return value + events)
-            let result_hash = compute_success_preimage_hash(
-                &result.return_value,
-                &result.contract_events,
-            );
+            let result_hash =
+                compute_success_preimage_hash(&result.return_value, &result.contract_events);
 
             tracing::info!(
                 cpu_insns = result.cpu_insns,
@@ -139,23 +141,6 @@ fn execute_contract_invocation(
             ))
         }
         Err(exec_error) => {
-            // Print detailed error info to help debug
-            eprintln!(
-                "=== SOROBAN EXECUTION FAILED ===\n\
-                 Error: {:?}\n\
-                 Host function: {:?}\n\
-                 Ledger: {}\n\
-                 CPU consumed: {}, CPU specified: {}\n\
-                 Mem consumed: {}, Mem limit: {}\n\
-                 =================================",
-                exec_error.host_error,
-                &op.host_function,
-                context.sequence,
-                exec_error.cpu_insns_consumed,
-                soroban_data.resources.instructions,
-                exec_error.mem_bytes_consumed,
-                soroban_config.tx_max_memory_bytes,
-            );
             tracing::warn!(
                 error = %exec_error.host_error,
                 cpu_consumed = exec_error.cpu_insns_consumed,
@@ -188,6 +173,7 @@ fn execute_upload_wasm(
     _source: &AccountId,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
+    soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
 ) -> Result<OperationExecutionResult> {
     use sha2::{Digest, Sha256};
@@ -215,9 +201,29 @@ fn execute_upload_wasm(
         .map(|bytes| bytes.len() as u32)
         .unwrap_or(0);
 
+    // Check if the ContractCode key is in the read-write footprint.
+    // This determines whether we need to "touch" the entry if it exists.
+    let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: code_hash.clone(),
+    });
+    let code_in_rw_footprint = soroban_data
+        .resources
+        .footprint
+        .read_write
+        .iter()
+        .any(|k| *k == code_key);
+
     // Check if this code already exists.
-    if state.get_contract_code(&code_hash).is_some() {
-        // Code already exists; return success without modifying state.
+    if let Some(existing_code) = state.get_contract_code(&code_hash).cloned() {
+        // Code already exists.
+        // If the key is in the read-write footprint, we need to "touch" it to
+        // record STATE/UPDATED changes. This matches C++ stellar-core behavior
+        // where entries in the read-write footprint are always returned by the
+        // host and recorded by recordStorageChanges.
+        if code_in_rw_footprint {
+            state.update_contract_code(existing_code);
+        }
+
         return Ok(OperationExecutionResult::with_soroban_meta(
             make_result(InvokeHostFunctionResultCode::Success, result_hash),
             SorobanOperationMeta {
@@ -395,7 +401,8 @@ fn build_soroban_operation_meta(
     let events = result.contract_events.clone();
 
     // Build diagnostic events from the contract events
-    let mut diagnostic_events: Vec<DiagnosticEvent> = events.iter()
+    let mut diagnostic_events: Vec<DiagnosticEvent> = events
+        .iter()
         .map(|event| DiagnosticEvent {
             in_successful_contract_call: true,
             event: event.clone(),
@@ -448,7 +455,10 @@ fn apply_soroban_storage_changes(
         // Account and Trustline entries are handled differently
         match key {
             LedgerKey::ContractData(cd_key) => {
-                if state.get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability).is_some() {
+                if state
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                    .is_some()
+                {
                     state.delete_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability);
                     // Also delete the associated TTL entry
                     let key_hash = compute_key_hash(key);
@@ -479,7 +489,10 @@ fn apply_soroban_storage_change(
         // Handle contract data and code entries.
         match &entry.data {
             stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                if state.get_contract_data(&cd.contract, &cd.key, cd.durability).is_some() {
+                if state
+                    .get_contract_data(&cd.contract, &cd.key, cd.durability)
+                    .is_some()
+                {
                     state.update_contract_data(cd.clone());
                 } else {
                     state.create_contract_data(cd.clone());
@@ -508,7 +521,10 @@ fn apply_soroban_storage_change(
                 }
             }
             stellar_xdr::curr::LedgerEntryData::Trustline(tl) => {
-                if state.get_trustline_by_trustline_asset(&tl.account_id, &tl.asset).is_some() {
+                if state
+                    .get_trustline_by_trustline_asset(&tl.account_id, &tl.asset)
+                    .is_some()
+                {
                     state.update_trustline(tl.clone());
                 } else {
                     state.create_trustline(tl.clone());
@@ -589,7 +605,9 @@ fn apply_soroban_storage_change(
                 if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(asset4) = &key.asset {
                     let asset = stellar_xdr::curr::Asset::CreditAlphanum4(asset4.clone());
                     state.delete_trustline(&key.account_id, &asset);
-                } else if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(asset12) = &key.asset {
+                } else if let stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(asset12) =
+                    &key.asset
+                {
                     let asset = stellar_xdr::curr::Asset::CreditAlphanum12(asset12.clone());
                     state.delete_trustline(&key.account_id, &asset);
                 }
@@ -716,7 +734,10 @@ fn map_host_error_to_result_code(
     // Storage errors (like write quota exceeded) should always be TRAPPED, even if CPU consumption
     // appears to exceed the specified limits (due to budget including setup overhead).
     if exec_error.host_error.error.is_type(ScErrorType::Budget)
-        && exec_error.host_error.error.is_code(ScErrorCode::ExceededLimit)
+        && exec_error
+            .host_error
+            .error
+            .is_code(ScErrorCode::ExceededLimit)
     {
         return InvokeHostFunctionResultCode::ResourceLimitExceeded;
     }
@@ -755,8 +776,9 @@ mod tests {
             auth: vec![].try_into().unwrap(),
         };
 
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, None, &config)
-            .expect("invoke host function");
+        let result =
+            execute_invoke_host_function(&op, &source, &mut state, &context, None, &config)
+                .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -798,9 +820,15 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data), &config)
-                .expect("invoke host function");
+        let result = execute_invoke_host_function(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            &config,
+        )
+        .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -867,8 +895,15 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data), &config)
-            .expect("invoke host function");
+        let result = execute_invoke_host_function(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            &config,
+        )
+        .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -937,8 +972,15 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, Some(&soroban_data), &config)
-            .expect("invoke host function");
+        let result = execute_invoke_host_function(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            &config,
+        )
+        .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
