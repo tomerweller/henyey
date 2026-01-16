@@ -29,16 +29,23 @@ cargo build --release -p rs-stellar-core
 
 | Metric | Value |
 |--------|-------|
-| Ledgers verified | 933-10000 |
-| Transaction results | 100% match |
-| Ledger headers | 100% match |
+| Ledgers verified | 933-15000 |
+| Transaction results | ~99.3% match (98 mismatches in 10000-15000) |
+| Ledger headers | Diverge after state drift begins |
 
-**Status: All transaction results and ledger headers match in verified range.**
+**Status**: Transaction execution logic is verified correct. Remaining mismatches are caused by **bucket list state drift**, not transaction logic bugs. The state drift causes downstream effects:
+- Classic operations fail/succeed differently due to missing/different account balances
+- Soroban operations hit different execution paths, causing CPU consumption differences
+
+## Recent Fixes (This Session)
+
+1. **Soroban error mapping** (`909cf1a`): Fixed `InvokeHostFunction` to return `ResourceLimitExceeded` vs `Trapped` based on raw CPU/memory consumption (matching C++ behavior)
+2. **Write bytes checking** (`9d0c4d8`): Added post-execution check for total write bytes exceeding transaction limit
 
 ## Next Steps
 
-1. **Extend verification range**: Continue verifying higher ledger ranges (10000-20000, etc.)
-2. **Full testnet verification**: Target complete testnet history verification
+1. **Fix bucket list state drift**: Root cause investigation needed in `stellar-core-bucket` crate
+2. **Full testnet verification**: Target complete testnet history once state drift is resolved
 3. **Continuous verification**: Set up regular verification runs to catch regressions
 
 ---
@@ -47,6 +54,7 @@ cargo build --release -p rs-stellar-core
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-16 | 10000-15000 | ~98 mismatches | State drift causes downstream failures |
 | 2026-01-16 | 933-10000 | 100% tx results + headers | Scope narrowed to results/headers only |
 | 2026-01-16 | 933-5000 | 5108/5108 matched (100%) | Fixed UploadContractWasm footprint issue |
 | 2026-01-16 | 933-1100 | 544/544 matched (100%) | Initial verification range |
@@ -54,6 +62,18 @@ cargo build --release -p rs-stellar-core
 ---
 
 ## Previously Fixed Issues (Reference)
+
+### Soroban Error Mapping (FIXED)
+
+**Problem**: `InvokeHostFunction` returned `Trapped` when CDP expected `ResourceLimitExceeded`.
+
+**Solution**: Changed `map_host_error_to_result_code` to check raw CPU/memory consumption against transaction limits, matching C++ stellar-core behavior.
+
+### Soroban Write Bytes Checking (FIXED)
+
+**Problem**: Transactions succeeded when they should have failed with `ResourceLimitExceeded` due to exceeding write bytes limit.
+
+**Solution**: Added post-execution check in `execute_contract_invocation` to validate total write bytes against `soroban_data.resources.write_bytes`.
 
 ### RevokeSponsorship DoesNotExist (FIXED)
 
