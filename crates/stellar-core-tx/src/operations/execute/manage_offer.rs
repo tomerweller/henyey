@@ -365,12 +365,24 @@ fn execute_manage_offer(
                 account.num_sub_entries += 1;
             }
             ManageOfferSuccessResultOffer::Created(create_offer_entry(
-                source, offer_id, selling, buying, amount, price,
+                source,
+                offer_id,
+                selling,
+                buying,
+                amount,
+                price,
+                offer_flags,
             ))
         } else {
             state.update_offer(offer);
             ManageOfferSuccessResultOffer::Updated(create_offer_entry(
-                source, offer_id, selling, buying, amount, price,
+                source,
+                offer_id,
+                selling,
+                buying,
+                amount,
+                price,
+                offer_flags,
             ))
         }
     } else {
@@ -1157,6 +1169,7 @@ fn create_offer_entry(
     buying: &Asset,
     amount: i64,
     price: &Price,
+    flags: u32,
 ) -> OfferEntry {
     OfferEntry {
         seller_id: source.clone(),
@@ -1165,7 +1178,7 @@ fn create_offer_entry(
         buying: buying.clone(),
         amount,
         price: price.clone(),
-        flags: 0,
+        flags,
         ext: OfferEntryExt::V0,
     }
 }

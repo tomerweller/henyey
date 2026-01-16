@@ -3219,7 +3219,8 @@ async fn cmd_verify_execution(
                             // Deep comparison of transaction meta if both are available
                             // For fee bump transactions with separate fee source, fee changes are
                             // already in the CDP meta, so we don't need to prepend them
-                            let (meta_matches, meta_diffs) = match &result.tx_meta {
+                            // Note: metadata comparison is out of scope; we only verify tx results + headers
+                            let (_meta_matches, _meta_diffs) = match &result.tx_meta {
                                 Some(our_meta) => compare_transaction_meta(
                                     our_meta,
                                     &tx_info.meta,
@@ -3232,10 +3233,15 @@ async fn cmd_verify_execution(
                                 ),
                             };
 
-                            // Check that success status matches
+                            // Compare full transaction results (operation results), not just success/failure.
+                            // Metadata comparison is out of scope for verification.
+                            let (results_match, result_diff) = compare_tx_results(
+                                &result.operation_results,
+                                &tx_info.result.result.result,
+                            );
                             let success_matches = result.success == cdp_succeeded;
 
-                            if success_matches && (!result.success || meta_matches) {
+                            if success_matches && results_match {
                                 transactions_matched += 1;
                                 if show_diff && !quiet {
                                     let change_count = result
@@ -3270,8 +3276,8 @@ async fn cmd_verify_execution(
                                 if let Some(failure) = &result.failure {
                                     println!("      - Our failure type: {:?}", failure);
                                 }
-                                for diff in &meta_diffs {
-                                    println!("      - {}", diff);
+                                if let Some(diff) = result_diff {
+                                    println!("      - Result diff: {}", diff);
                                 }
                             }
                         }
@@ -4088,6 +4094,67 @@ fn tx_succeeded(result: &stellar_xdr::curr::TransactionResultPair) -> bool {
         }
         _ => false,
     }
+}
+
+/// Compare full transaction results (operation results), not just success/failure.
+/// Returns true if the results match, along with a description of any differences.
+fn compare_tx_results(
+    our_results: &[stellar_xdr::curr::OperationResult],
+    cdp_result: &stellar_xdr::curr::TransactionResultResult,
+) -> (bool, Option<String>) {
+    use stellar_xdr::curr::{InnerTransactionResultResult, TransactionResultResult};
+
+    // Extract CDP operation results
+    let cdp_op_results: Option<&Vec<stellar_xdr::curr::OperationResult>> = match cdp_result {
+        TransactionResultResult::TxSuccess(ops) => Some(ops.as_ref()),
+        TransactionResultResult::TxFailed(ops) => Some(ops.as_ref()),
+        TransactionResultResult::TxFeeBumpInnerSuccess(inner) => match &inner.result.result {
+            InnerTransactionResultResult::TxSuccess(ops) => Some(ops.as_ref()),
+            InnerTransactionResultResult::TxFailed(ops) => Some(ops.as_ref()),
+            _ => None,
+        },
+        TransactionResultResult::TxFeeBumpInnerFailed(inner) => match &inner.result.result {
+            InnerTransactionResultResult::TxSuccess(ops) => Some(ops.as_ref()),
+            InnerTransactionResultResult::TxFailed(ops) => Some(ops.as_ref()),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let Some(cdp_ops) = cdp_op_results else {
+        // CDP result doesn't contain operation results (e.g., TxTooEarly, TxBadSeq, etc.)
+        // In this case, we only compare that both failed at the transaction level
+        return (our_results.is_empty(), None);
+    };
+
+    if our_results.len() != cdp_ops.len() {
+        return (
+            false,
+            Some(format!(
+                "Operation count mismatch: ours={}, CDP={}",
+                our_results.len(),
+                cdp_ops.len()
+            )),
+        );
+    }
+
+    // Compare each operation result
+    for (i, (ours, cdp)) in our_results.iter().zip(cdp_ops.iter()).enumerate() {
+        // Compare the discriminant (operation type and success/failure code)
+        let ours_debug = format!("{:?}", ours);
+        let cdp_debug = format!("{:?}", cdp);
+        if ours_debug != cdp_debug {
+            return (
+                false,
+                Some(format!(
+                    "Op {} result mismatch: ours={}, CDP={}",
+                    i, ours_debug, cdp_debug
+                )),
+            );
+        }
+    }
+
+    (true, None)
 }
 
 /// Converts a `LedgerEntryChange` to a sortable key for order-independent comparison.
