@@ -394,30 +394,20 @@ fn update_entry_after_sponsorship(
 ) -> Result<()> {
     match ledger_key {
         LedgerKey::Account(LedgerKeyAccount { account_id }) => {
-            if let Some(account) = state.get_account(account_id).cloned() {
-                state.update_account(account);
-            }
+            let _ = state.get_account_mut(account_id);
         }
         LedgerKey::Trustline(LedgerKeyTrustLine { account_id, asset }) => {
-            if let Some(tl) = state.get_trustline_by_trustline_asset(account_id, asset).cloned() {
-                state.update_trustline(tl);
-            }
+            let _ = state.get_trustline_by_trustline_asset_mut(account_id, asset);
         }
         LedgerKey::Offer(LedgerKeyOffer { seller_id, offer_id }) => {
-            if let Some(offer) = state.get_offer(seller_id, *offer_id).cloned() {
-                state.update_offer(offer);
-            }
+            let _ = state.get_offer_mut(seller_id, *offer_id);
         }
         LedgerKey::Data(LedgerKeyData { account_id, data_name }) => {
             let name = String::from_utf8_lossy(data_name.as_vec()).to_string();
-            if let Some(data) = state.get_data(account_id, &name).cloned() {
-                state.update_data(data);
-            }
+            let _ = state.get_data_mut(account_id, &name);
         }
         LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance { balance_id }) => {
-            if let Some(cb) = state.get_claimable_balance(balance_id).cloned() {
-                state.update_claimable_balance(cb);
-            }
+            let _ = state.get_claimable_balance_mut(balance_id);
         }
         _ => {}
     }
@@ -446,23 +436,19 @@ fn set_signer_sponsor(
     pos: usize,
     sponsor: Option<AccountId>,
 ) -> Result<()> {
-    let entry = {
-        let account = state
-            .get_account_mut(account_id)
-            .ok_or(TxError::SourceAccountNotFound)?;
-        let ext = crate::state::ensure_account_ext_v2(account);
-        let mut sponsoring_ids: Vec<SponsorshipDescriptor> =
-            ext.signer_sponsoring_i_ds.iter().cloned().collect();
-        if sponsoring_ids.len() <= pos {
-            return Err(TxError::Internal(
-                "signer sponsoring ids out of range".to_string(),
-            ));
-        }
-        sponsoring_ids[pos] = SponsorshipDescriptor(sponsor);
-        ext.signer_sponsoring_i_ds = sponsoring_ids.try_into().unwrap_or_default();
-        account.clone()
-    };
-    state.update_account(entry);
+    let account = state
+        .get_account_mut(account_id)
+        .ok_or(TxError::SourceAccountNotFound)?;
+    let ext = crate::state::ensure_account_ext_v2(account);
+    let mut sponsoring_ids: Vec<SponsorshipDescriptor> =
+        ext.signer_sponsoring_i_ds.iter().cloned().collect();
+    if sponsoring_ids.len() <= pos {
+        return Err(TxError::Internal(
+            "signer sponsoring ids out of range".to_string(),
+        ));
+    }
+    sponsoring_ids[pos] = SponsorshipDescriptor(sponsor);
+    ext.signer_sponsoring_i_ds = sponsoring_ids.try_into().unwrap_or_default();
     Ok(())
 }
 

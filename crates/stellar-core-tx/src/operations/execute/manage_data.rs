@@ -156,7 +156,6 @@ pub fn execute_manage_data(
                     ext: DataEntryExt::V0,
                 };
 
-                state.create_data(new_entry);
                 if let Some(sponsor) = sponsor {
                     let ledger_key = LedgerKey::Data(LedgerKeyData {
                         account_id: source.clone(),
@@ -169,6 +168,7 @@ pub fn execute_manage_data(
                         1,
                     )?;
                 }
+                state.create_data(new_entry);
 
                 // Increase sub-entry count
                 if let Some(account) = state.get_account_mut(source) {

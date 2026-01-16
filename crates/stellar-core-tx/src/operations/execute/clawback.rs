@@ -117,9 +117,10 @@ pub fn execute_clawback_claimable_balance(
         ));
     }
 
-    // Check source account exists and is the issuer
-    let issuer = match state.get_account(source) {
-        Some(a) => a.clone(),
+    // Check source account exists and is the issuer.
+    // Use a mutable load to mirror C++ loadSourceAccount access patterns.
+    let issuer_flags = match state.get_account_mut(source) {
+        Some(a) => a.flags,
         None => {
             return Ok(make_clawback_cb_result(
                 ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
@@ -145,7 +146,7 @@ pub fn execute_clawback_claimable_balance(
     }
 
     // Check issuer has AUTH_CLAWBACK_ENABLED flag
-    if issuer.flags & AUTH_CLAWBACK_ENABLED_FLAG == 0 {
+    if issuer_flags & AUTH_CLAWBACK_ENABLED_FLAG == 0 {
         return Ok(make_clawback_cb_result(
             ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
         ));
@@ -155,16 +156,12 @@ pub fn execute_clawback_claimable_balance(
     let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
         balance_id: entry.balance_id.clone(),
     });
-    if state.entry_sponsor(&ledger_key).is_some() {
-        state.remove_entry_sponsorship_with_sponsor_counts(
-            &ledger_key,
-            None,
-            sponsorship_multiplier,
-        )?;
-    }
-
+    let sponsor = state.entry_sponsor(&ledger_key).cloned();
     // Delete the claimable balance (clawed back entirely)
     state.delete_claimable_balance(&op.balance_id);
+    if let Some(sponsor) = sponsor {
+        state.update_num_sponsoring(&sponsor, -sponsorship_multiplier)?;
+    }
 
     Ok(make_clawback_cb_result(
         ClawbackClaimableBalanceResultCode::Success,

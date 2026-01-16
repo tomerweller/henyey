@@ -4,10 +4,11 @@
 //! which modifies various account settings.
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountEntryExtensionV2, AccountId,
-    MASK_ACCOUNT_FLAGS, MASK_ACCOUNT_FLAGS_V17, OperationResult, OperationResultTr, PublicKey,
-    SetOptionsOp, SetOptionsResult, SetOptionsResultCode, Signer, SignerKey,
-    SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
+    AccountEntryExtensionV2, AccountId, MASK_ACCOUNT_FLAGS, MASK_ACCOUNT_FLAGS_V17,
+    OperationResult, OperationResultTr, PublicKey, SetOptionsOp, SetOptionsResult,
+    SetOptionsResultCode, Signer, SignerKey, SignerKeyEd25519SignedPayload, SignerKeyType,
+    SponsorshipDescriptor,
 };
 
 use crate::state::{ensure_account_ext_v2, LedgerStateManager};
@@ -231,17 +232,34 @@ pub fn execute_set_options(
 
         let sponsor = sponsor_info.as_ref().map(|info| info.0.clone());
         let mut signers_vec: Vec<Signer> = source_account_mut.signers.iter().cloned().collect();
-        let mut sponsoring_ids: Vec<SponsorshipDescriptor> = {
-            let ext_v2 = ensure_account_ext_v2(source_account_mut);
-            ext_v2.signer_sponsoring_i_ds.iter().cloned().collect()
+        let has_v2 = matches!(
+            source_account_mut.ext,
+            AccountEntryExt::V1(AccountEntryExtensionV1 {
+                ext: AccountEntryExtensionV1Ext::V2(_),
+                ..
+            })
+        );
+        let needs_sponsoring_ids = has_v2 || sponsor.is_some();
+        let mut sponsoring_ids: Vec<SponsorshipDescriptor> = if let AccountEntryExt::V1(v1) =
+            &source_account_mut.ext
+        {
+            if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
+                v2.signer_sponsoring_i_ds.iter().cloned().collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
         };
-        if sponsoring_ids.len() < signers_vec.len() {
-            sponsoring_ids.extend(
-                std::iter::repeat(SponsorshipDescriptor(None))
-                    .take(signers_vec.len() - sponsoring_ids.len()),
-            );
-        } else if sponsoring_ids.len() > signers_vec.len() {
-            sponsoring_ids.truncate(signers_vec.len());
+        if needs_sponsoring_ids {
+            if sponsoring_ids.len() < signers_vec.len() {
+                sponsoring_ids.extend(
+                    std::iter::repeat(SponsorshipDescriptor(None))
+                        .take(signers_vec.len() - sponsoring_ids.len()),
+                );
+            } else if sponsoring_ids.len() > signers_vec.len() {
+                sponsoring_ids.truncate(signers_vec.len());
+            }
         }
 
         let existing_pos = signers_vec.iter().position(|s| &s.key == signer_key);
@@ -249,14 +267,18 @@ pub fn execute_set_options(
         let mut signers_changed = false;
 
         if weight == 0 {
-            if let Some(pos) = existing_pos {
-                if let Some(sponsor_id) = sponsoring_ids.get(pos).and_then(|id| id.0.clone()) {
-                    num_sponsored_delta -= 1;
-                    sponsor_delta = Some((sponsor_id, -1));
-                }
-                signers_vec.remove(pos);
-                sponsoring_ids.remove(pos);
-                signers_changed = true;
+                if let Some(pos) = existing_pos {
+                    if needs_sponsoring_ids {
+                        if let Some(sponsor_id) =
+                            sponsoring_ids.get(pos).and_then(|id| id.0.clone())
+                        {
+                            num_sponsored_delta -= 1;
+                            sponsor_delta = Some((sponsor_id, -1));
+                        }
+                        sponsoring_ids.remove(pos);
+                    }
+                    signers_vec.remove(pos);
+                    signers_changed = true;
 
                 if source_account_mut.num_sub_entries > 0 {
                     source_account_mut.num_sub_entries -= 1;
@@ -302,17 +324,20 @@ pub fn execute_set_options(
                 .unwrap_or(SponsorshipDescriptor(None));
 
             signers_vec.push(new_signer);
-            sponsoring_ids.push(new_sponsor_id);
-
-            let mut combined: Vec<(Signer, SponsorshipDescriptor)> = signers_vec
-                .into_iter()
-                .zip(sponsoring_ids.into_iter())
-                .collect();
-            combined.sort_by(|a, b| compare_signer_keys(&a.0.key, &b.0.key));
-            let (sorted_signers, sorted_sponsoring): (Vec<Signer>, Vec<SponsorshipDescriptor>) =
-                combined.into_iter().unzip();
-            signers_vec = sorted_signers;
-            sponsoring_ids = sorted_sponsoring;
+            if needs_sponsoring_ids {
+                sponsoring_ids.push(new_sponsor_id);
+                let mut combined: Vec<(Signer, SponsorshipDescriptor)> = signers_vec
+                    .into_iter()
+                    .zip(sponsoring_ids.into_iter())
+                    .collect();
+                combined.sort_by(|a, b| compare_signer_keys(&a.0.key, &b.0.key));
+                let (sorted_signers, sorted_sponsoring): (Vec<Signer>, Vec<SponsorshipDescriptor>) =
+                    combined.into_iter().unzip();
+                signers_vec = sorted_signers;
+                sponsoring_ids = sorted_sponsoring;
+            } else {
+                signers_vec.sort_by(|a, b| compare_signer_keys(&a.key, &b.key));
+            }
             signers_changed = true;
 
             if let Some(sponsor) = sponsor {
@@ -325,15 +350,19 @@ pub fn execute_set_options(
 
         if signers_changed {
             source_account_mut.signers = signers_vec.try_into().unwrap_or_default();
-            let ext_v2 = ensure_account_ext_v2(source_account_mut);
-            let updated = ext_v2.num_sponsored as i64 + num_sponsored_delta;
-            if updated < 0 || updated > u32::MAX as i64 {
-                return Err(TxError::Internal(
-                    "num_sponsored out of range".to_string(),
-                ));
+            if needs_sponsoring_ids || num_sponsored_delta != 0 {
+                let ext_v2 = ensure_account_ext_v2(source_account_mut);
+                let updated = ext_v2.num_sponsored as i64 + num_sponsored_delta;
+                if updated < 0 || updated > u32::MAX as i64 {
+                    return Err(TxError::Internal(
+                        "num_sponsored out of range".to_string(),
+                    ));
+                }
+                ext_v2.num_sponsored = updated as u32;
+                if needs_sponsoring_ids {
+                    ext_v2.signer_sponsoring_i_ds = sponsoring_ids.try_into().unwrap_or_default();
+                }
             }
-            ext_v2.num_sponsored = updated as u32;
-            ext_v2.signer_sponsoring_i_ds = sponsoring_ids.try_into().unwrap_or_default();
         }
     }
 

@@ -1875,54 +1875,12 @@ async fn cmd_replay_bucket_list(
             let upgrade_metas = extract_upgrade_metas(&lcm);
             let evicted_keys = extract_evicted_keys(&lcm);
 
-            // Run incremental eviction scan to get the EvictionIterator update locally.
-            // This is required even when replaying CDP metadata because the iterator
-            // ConfigSetting entry is updated locally every ledger in Protocol 23+.
-            let mut updated_eviction_iterator = None;
-            if hot_archive_bucket_list.is_some() && header.ledger_version >= 23 {
-                use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
-                use stellar_xdr::curr::{ConfigSettingEntry, ConfigSettingId, LedgerKey, LedgerEntryData, LedgerKeyConfigSetting};
-
-                // Load archival settings
-                let settings = {
-                    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                        config_setting_id: ConfigSettingId::StateArchival,
-                    });
-                    if let Ok(Some(entry)) = bucket_list.get(&key) {
-                        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(s)) = entry.data {
-                            StateArchivalSettings {
-                                eviction_scan_size: s.eviction_scan_size as u64,
-                                starting_eviction_scan_level: s.starting_eviction_scan_level,
-                            }
-                        } else { StateArchivalSettings::default() }
-                    } else { StateArchivalSettings::default() }
-                };
-
-                // Load current iterator
-                let iter = {
-                    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                        config_setting_id: ConfigSettingId::EvictionIterator,
-                    });
-                    if let Ok(Some(entry)) = bucket_list.get(&key) {
-                        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(it)) = entry.data {
-                            EvictionIterator {
-                                bucket_file_offset: it.bucket_file_offset,
-                                bucket_list_level: it.bucket_list_level,
-                                is_curr_bucket: it.is_curr_bucket,
-                            }
-                        } else { EvictionIterator::new(settings.starting_eviction_scan_level) }
-                    } else { EvictionIterator::new(settings.starting_eviction_scan_level) }
-                };
-
-                // Perform scan
-                let scan_result = bucket_list.scan_for_eviction_incremental(iter, seq, &settings).unwrap();
-                updated_eviction_iterator = Some(scan_result.end_iterator);
-
-            }
-
             // Deduplicate all changes for the live bucket list
             let (all_init, all_live, all_dead, tx_dead_keys) = {
-                use stellar_xdr::curr::{ConfigSettingEntry, LedgerEntryData, LedgerEntryExt, LedgerEntryChange, LedgerEntry};
+                use stellar_xdr::curr::{
+                    ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryChange,
+                    LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyConfigSetting,
+                };
 
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = &bucket_list;
@@ -1967,9 +1925,9 @@ async fn cmd_replay_bucket_list(
                                         apply_change_with_prestate(&mut aggregator, &bl, change);
                                     }
                                 }
-                                for change in v2.tx_changes_after.iter() {
-                                    apply_change_with_prestate(&mut aggregator, &bl, change);
-                                }
+                            }
+                            for change in v2.tx_changes_after.iter() {
+                                apply_change_with_prestate(&mut aggregator, &bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V3(v3) => {
@@ -1982,9 +1940,9 @@ async fn cmd_replay_bucket_list(
                                         apply_change_with_prestate(&mut aggregator, &bl, change);
                                     }
                                 }
-                                for change in v3.tx_changes_after.iter() {
-                                    apply_change_with_prestate(&mut aggregator, &bl, change);
-                                }
+                            }
+                            for change in v3.tx_changes_after.iter() {
+                                apply_change_with_prestate(&mut aggregator, &bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V4(v4) => {
@@ -1997,9 +1955,9 @@ async fn cmd_replay_bucket_list(
                                         apply_change_with_prestate(&mut aggregator, &bl, change);
                                     }
                                 }
-                                for change in v4.tx_changes_after.iter() {
-                                    apply_change_with_prestate(&mut aggregator, &bl, change);
-                                }
+                            }
+                            for change in v4.tx_changes_after.iter() {
+                                apply_change_with_prestate(&mut aggregator, &bl, change);
                             }
                         }
                     }
@@ -2030,29 +1988,121 @@ async fn cmd_replay_bucket_list(
                     apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Removed(key.clone()));
                 }
 
-                // 4. Eviction Iterator update (local)
-                if let Some(iter) = updated_eviction_iterator {
+                let archival_override = {
+                    let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                        config_setting_id: ConfigSettingId::StateArchival,
+                    });
+                    match aggregator.changes.get(&archival_key) {
+                        Some(FinalChange::Init(entry)) | Some(FinalChange::Live(entry)) => {
+                            if let LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::StateArchival(settings),
+                            ) = &entry.data
+                            {
+                                Some(settings.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+
+                let eviction_iter_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                    config_setting_id: ConfigSettingId::EvictionIterator,
+                });
+                let has_eviction_iter_change = aggregator.changes.contains_key(&eviction_iter_key);
+
+                // Eviction Iterator update (local fallback if CDP doesn't include it)
+                if hot_archive_bucket_list.is_some()
+                    && header.ledger_version >= 23
+                    && !has_eviction_iter_change
+                {
+                    use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
+
+                    let settings = if let Some(override_settings) = archival_override.clone() {
+                        StateArchivalSettings {
+                            eviction_scan_size: override_settings.eviction_scan_size as u64,
+                            starting_eviction_scan_level: override_settings.starting_eviction_scan_level,
+                        }
+                    } else {
+                        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                            config_setting_id: ConfigSettingId::StateArchival,
+                        });
+                        if let Ok(Some(entry)) = bucket_list.get(&key) {
+                            if let LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::StateArchival(s),
+                            ) = entry.data
+                            {
+                                StateArchivalSettings {
+                                    eviction_scan_size: s.eviction_scan_size as u64,
+                                    starting_eviction_scan_level: s.starting_eviction_scan_level,
+                                }
+                            } else {
+                                StateArchivalSettings::default()
+                            }
+                        } else {
+                            StateArchivalSettings::default()
+                        }
+                    };
+
+                    let iter = {
+                        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                            config_setting_id: ConfigSettingId::EvictionIterator,
+                        });
+                        if let Ok(Some(entry)) = bucket_list.get(&key) {
+                            if let LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::EvictionIterator(it),
+                            ) = entry.data
+                            {
+                                EvictionIterator {
+                                    bucket_file_offset: it.bucket_file_offset,
+                                    bucket_list_level: it.bucket_list_level,
+                                    is_curr_bucket: it.is_curr_bucket,
+                                }
+                            } else {
+                                EvictionIterator::new(settings.starting_eviction_scan_level)
+                            }
+                        } else {
+                            EvictionIterator::new(settings.starting_eviction_scan_level)
+                        }
+                    };
+
+                    let scan_result = bucket_list
+                        .scan_for_eviction_incremental(iter, seq, &settings)
+                        .unwrap();
                     let iter_entry = LedgerEntry {
                         last_modified_ledger_seq: seq,
                         data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
                             stellar_xdr::curr::EvictionIterator {
-                                bucket_file_offset: iter.bucket_file_offset,
-                                bucket_list_level: iter.bucket_list_level,
-                                is_curr_bucket: iter.is_curr_bucket,
-                            }
+                                bucket_file_offset: scan_result.end_iterator.bucket_file_offset,
+                                bucket_list_level: scan_result.end_iterator.bucket_list_level,
+                                is_curr_bucket: scan_result.end_iterator.is_curr_bucket,
+                            },
                         )),
                         ext: LedgerEntryExt::V0,
                     };
-                    apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Updated(iter_entry));
+                    apply_change_with_prestate(
+                        &mut aggregator,
+                        &bl,
+                        &LedgerEntryChange::Updated(iter_entry),
+                    );
                 }
 
-                maybe_snapshot_soroban_state_size_window(
-                    seq,
-                    header.ledger_version,
-                    &bl,
-                    soroban_state.total_size(),
-                    &mut aggregator,
-                );
+                let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                    config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+                });
+                let has_window_change = aggregator.changes.contains_key(&window_key);
+
+                if !has_window_change {
+                    maybe_snapshot_soroban_state_size_window(
+                        seq,
+                        header.ledger_version,
+                        &bl,
+                        soroban_state.total_size(),
+                        &mut aggregator,
+                        archival_override,
+                    );
+                }
 
                 let (init, live, dead) = aggregator.clone().to_vectors();
                 if header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
@@ -2712,6 +2762,17 @@ async fn cmd_verify_execution(
                 std::collections::HashMap::new(),
             );
             let mut snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+            let header_map: std::collections::HashMap<u32, stellar_xdr::curr::LedgerHeader> = headers
+                .iter()
+                .map(|entry| (entry.header.ledger_seq, entry.header.clone()))
+                .collect();
+            let header_map = std::sync::Arc::new(header_map);
+            let header_lookup: std::sync::Arc<
+                dyn Fn(u32) -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerHeader>>
+                    + Send
+                    + Sync,
+            > = std::sync::Arc::new(move |seq| Ok(header_map.get(&seq).cloned()));
+            snapshot_handle.set_header_lookup(header_lookup);
 
             // Add entries_fn to enable orderbook loading for path payments
             let bucket_list_for_entries: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
@@ -2879,10 +2940,11 @@ async fn cmd_verify_execution(
             }
 
             // Post-transaction fee processing (e.g., Soroban refunds) is recorded
-            // separately in CDP's post_tx_apply_fee_processing and must be applied
-            // after each transaction to keep state aligned.
+            // separately in CDP's post_tx_apply_fee_processing. For protocol 23+,
+            // these refunds are applied after all transactions in the ledger.
 
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
+            let mut deferred_post_fee_changes: Vec<stellar_xdr::curr::LedgerEntryChanges> = Vec::new();
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
                 let prng_seed = {
@@ -2937,7 +2999,11 @@ async fn cmd_verify_execution(
                     executor.apply_ledger_entry_changes(&cdp_changes_vec);
 
                     if !tx_info.post_fee_meta.is_empty() {
-                        executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
+                        if cdp_header.ledger_version >= 23 {
+                            deferred_post_fee_changes.push(tx_info.post_fee_meta.clone());
+                        } else {
+                            executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
+                        }
                     }
                 }
 
@@ -2995,12 +3061,6 @@ async fn cmd_verify_execution(
                                         result.operation_results.len(),
                                         change_count
                                     );
-                                    // Show all changes for OK transactions too
-                                    if let Some(our_meta) = &result.tx_meta {
-                                        for (i, c) in extract_changes_from_meta(our_meta).iter().enumerate() {
-                                            println!("        {}: {}", i, describe_change_detailed(c));
-                                        }
-                                    }
                                 }
                             } else {
                                 transactions_mismatched += 1;
@@ -3023,30 +3083,6 @@ async fn cmd_verify_execution(
                                 for diff in &meta_diffs {
                                     println!("      - {}", diff);
                                 }
-                                // Print detailed changes for diagnosis
-                                let our_changes = result.tx_meta
-                                    .as_ref()
-                                    .map(extract_changes_from_meta)
-                                    .unwrap_or_default();
-                                let cdp_changes = extract_changes_from_meta(&tx_info.meta);
-                                let max_len = our_changes.len().max(cdp_changes.len());
-
-                                // Show side-by-side comparison with detailed values for differing entries
-                                println!("      Changes comparison (ours={}, cdp={}):", our_changes.len(), cdp_changes.len());
-                                for i in 0..max_len {
-                                    let our_str = our_changes.get(i).map(describe_change).unwrap_or_else(|| "-".to_string());
-                                    let _cdp_str = cdp_changes.get(i).map(describe_change).unwrap_or_else(|| "-".to_string());
-                                    let differs = our_changes.get(i) != cdp_changes.get(i);
-                                    if differs {
-                                        println!("        {} DIFFERS:", i);
-                                        let our_detail = our_changes.get(i).map(describe_change_detailed).unwrap_or_else(|| "-".to_string());
-                                        let cdp_detail = cdp_changes.get(i).map(describe_change_detailed).unwrap_or_else(|| "-".to_string());
-                                        println!("          ours: {}", our_detail);
-                                        println!("          cdp:  {}", cdp_detail);
-                                    } else {
-                                        println!("        {} OK: {}", i, our_str);
-                                    }
-                                }
                             }
                         }
                         Err(e) => {
@@ -3056,6 +3092,11 @@ async fn cmd_verify_execution(
                             println!("    TX {}: EXECUTION ERROR: {}", tx_idx, e);
                         }
                     }
+                }
+            }
+            if cdp_header.ledger_version >= 23 {
+                for changes in deferred_post_fee_changes {
+                    executor.apply_ledger_entry_changes(&changes);
                 }
             }
 
@@ -3101,7 +3142,9 @@ async fn cmd_verify_execution(
                                 for op_changes in v2.operations.iter() {
                                     for change in op_changes.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
                                 }
-                                for change in v2.tx_changes_after.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                            }
+                            for change in v2.tx_changes_after.iter() {
+                                apply_change_with_prestate(&mut aggregator, &bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V3(v3) => {
@@ -3112,7 +3155,9 @@ async fn cmd_verify_execution(
                                 for op_changes in v3.operations.iter() {
                                     for change in op_changes.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
                                 }
-                                for change in v3.tx_changes_after.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                            }
+                            for change in v3.tx_changes_after.iter() {
+                                apply_change_with_prestate(&mut aggregator, &bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V4(v4) => {
@@ -3123,7 +3168,9 @@ async fn cmd_verify_execution(
                                 for op_changes in v4.operations.iter() {
                                     for change in op_changes.changes.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
                                 }
-                                for change in v4.tx_changes_after.iter() { apply_change_with_prestate(&mut aggregator, &bl, change); }
+                            }
+                            for change in v4.tx_changes_after.iter() {
+                                apply_change_with_prestate(&mut aggregator, &bl, change);
                             }
                         }
                     }
@@ -3157,73 +3204,85 @@ async fn cmd_verify_execution(
                     apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Removed(key.clone()));
                 }
 
-                // 6. Run local eviction scan to get the EvictionIterator update (Protocol 23+)
-                if cdp_header.ledger_version >= 23 {
-                    // Load archival settings - check aggregator first (for upgraded values), then bucket list
-                    let settings = {
+                // Extract restored keys from transaction meta
+                let tx_metas_for_restore: Vec<_> = tx_processing
+                    .iter()
+                    .filter(|tp| tx_succeeded(&tp.result))
+                    .map(|tp| tp.meta.clone())
+                    .collect();
+                let restored_keys = if hot_archive_bucket_list.is_some() {
+                    extract_restored_keys(&tx_metas_for_restore)
+                } else {
+                    Vec::new()
+                };
+
+                // Convert to vectors
+                let archival_override = {
+                    let archival_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                        config_setting_id: ConfigSettingId::StateArchival,
+                    });
+                    match aggregator.changes.get(&archival_key) {
+                        Some(FinalChange::Init(entry)) | Some(FinalChange::Live(entry)) => {
+                            if let LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::StateArchival(settings),
+                            ) = &entry.data
+                            {
+                                Some(settings.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+
+                let eviction_iter_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                    config_setting_id: ConfigSettingId::EvictionIterator,
+                });
+                let has_eviction_iter_change = aggregator.changes.contains_key(&eviction_iter_key);
+
+                if cdp_header.ledger_version >= 23 && !has_eviction_iter_change {
+                    let settings = if let Some(override_settings) = archival_override.clone() {
+                        StateArchivalSettings {
+                            eviction_scan_size: override_settings.eviction_scan_size as u64,
+                            starting_eviction_scan_level: override_settings.starting_eviction_scan_level,
+                        }
+                    } else {
                         let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
                             config_setting_id: ConfigSettingId::StateArchival,
                         });
-                        // First check if StateArchival was updated in this ledger (e.g., by an upgrade)
-                        let from_aggregator = aggregator.changes.get(&key).and_then(|change| {
-                            if let FinalChange::Live(entry) = change {
-                                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(s)) = &entry.data {
-                                    return Some(StateArchivalSettings {
-                                        eviction_scan_size: s.eviction_scan_size as u64,
-                                        starting_eviction_scan_level: s.starting_eviction_scan_level,
-                                    });
+                        if let Ok(Some(entry)) = bl.get(&key) {
+                            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(s)) = entry.data {
+                                StateArchivalSettings {
+                                    eviction_scan_size: s.eviction_scan_size as u64,
+                                    starting_eviction_scan_level: s.starting_eviction_scan_level,
                                 }
+                            } else {
+                                StateArchivalSettings::default()
                             }
-                            None
-                        });
-                        // Fall back to bucket list if not in aggregator
-                        from_aggregator.unwrap_or_else(|| {
-                            if let Ok(Some(entry)) = bl.get(&key) {
-                                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(s)) = entry.data {
-                                    return StateArchivalSettings {
-                                        eviction_scan_size: s.eviction_scan_size as u64,
-                                        starting_eviction_scan_level: s.starting_eviction_scan_level,
-                                    };
-                                }
-                            }
+                        } else {
                             StateArchivalSettings::default()
-                        })
+                        }
                     };
-
-                    // Load current iterator - check aggregator first (for upgraded values), then bucket list
                     let iter = {
                         let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
                             config_setting_id: ConfigSettingId::EvictionIterator,
                         });
-                        // First check if EvictionIterator was updated in this ledger
-                        let from_aggregator = aggregator.changes.get(&key).and_then(|change| {
-                            if let FinalChange::Live(entry) = change {
-                                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(it)) = &entry.data {
-                                    return Some(EvictionIterator {
-                                        bucket_file_offset: it.bucket_file_offset,
-                                        bucket_list_level: it.bucket_list_level,
-                                        is_curr_bucket: it.is_curr_bucket,
-                                    });
+                        if let Ok(Some(entry)) = bl.get(&key) {
+                            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(it)) = entry.data {
+                                EvictionIterator {
+                                    bucket_file_offset: it.bucket_file_offset,
+                                    bucket_list_level: it.bucket_list_level,
+                                    is_curr_bucket: it.is_curr_bucket,
                                 }
+                            } else {
+                                EvictionIterator::new(settings.starting_eviction_scan_level)
                             }
-                            None
-                        });
-                        // Fall back to bucket list if not in aggregator
-                        from_aggregator.unwrap_or_else(|| {
-                            if let Ok(Some(entry)) = bl.get(&key) {
-                                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(it)) = entry.data {
-                                    return EvictionIterator {
-                                        bucket_file_offset: it.bucket_file_offset,
-                                        bucket_list_level: it.bucket_list_level,
-                                        is_curr_bucket: it.is_curr_bucket,
-                                    };
-                                }
-                            }
+                        } else {
                             EvictionIterator::new(settings.starting_eviction_scan_level)
-                        })
+                        }
                     };
 
-                    // Perform scan
                     let scan_result = bl.scan_for_eviction_incremental(iter, seq, &settings).unwrap();
                     let updated_iter = scan_result.end_iterator;
 
@@ -3241,26 +3300,21 @@ async fn cmd_verify_execution(
                     apply_change_with_prestate(&mut aggregator, &bl, &LedgerEntryChange::Updated(iter_entry));
                 }
 
-                // Extract restored keys from transaction meta
-                let tx_metas_for_restore: Vec<_> = tx_processing
-                    .iter()
-                    .filter(|tp| tx_succeeded(&tp.result))
-                    .map(|tp| tp.meta.clone())
-                    .collect();
-                let restored_keys = if hot_archive_bucket_list.is_some() {
-                    extract_restored_keys(&tx_metas_for_restore)
-                } else {
-                    Vec::new()
-                };
+                let window_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+                    config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+                });
+                let has_window_change = aggregator.changes.contains_key(&window_key);
 
-                // Convert to vectors
-                maybe_snapshot_soroban_state_size_window(
-                    seq,
-                    cdp_header.ledger_version,
-                    &bl,
-                    soroban_state.total_size(),
-                    &mut aggregator,
-                );
+                if !has_window_change {
+                    maybe_snapshot_soroban_state_size_window(
+                        seq,
+                        cdp_header.ledger_version,
+                        &bl,
+                        soroban_state.total_size(),
+                        &mut aggregator,
+                        archival_override,
+                    );
+                }
 
                 let (all_init, all_live, all_dead) = aggregator.clone().to_vectors();
                 if cdp_header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
@@ -4229,29 +4283,179 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
     use stellar_xdr::curr::{LedgerEntry, LedgerEntryChange, LedgerEntryData};
 
     fn describe_entry_detailed(entry: &LedgerEntry) -> String {
+        let (ext_label, sponsor_hex) = match &entry.ext {
+            stellar_xdr::curr::LedgerEntryExt::V0 => ("V0", None),
+            stellar_xdr::curr::LedgerEntryExt::V1(v1) => {
+                let sponsor_hex = v1.sponsoring_id.0.as_ref().map(|sponsor| match &sponsor.0 {
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                        hex::encode(&pk.0[0..4])
+                    }
+                });
+                ("V1", sponsor_hex)
+            }
+        };
+        let sponsor_suffix = sponsor_hex
+            .as_ref()
+            .map(|s| format!(" sponsor={}", s))
+            .unwrap_or_default();
+        let ext_suffix = format!(" ext={}", ext_label);
+        let entry_suffix = format!("{}{}", ext_suffix, sponsor_suffix);
         match &entry.data {
             LedgerEntryData::Account(a) => {
+                let (num_sponsored, num_sponsoring) = match &a.ext {
+                    stellar_xdr::curr::AccountEntryExt::V1(v1) => match &v1.ext {
+                        stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => {
+                            (v2.num_sponsored, v2.num_sponsoring)
+                        }
+                        _ => (0, 0),
+                    },
+                    _ => (0, 0),
+                };
+                let (account_ext, v1_ext, signer_sponsoring_len) = match &a.ext {
+                    stellar_xdr::curr::AccountEntryExt::V0 => ("V0", "V0", 0),
+                    stellar_xdr::curr::AccountEntryExt::V1(v1) => match &v1.ext {
+                        stellar_xdr::curr::AccountEntryExtensionV1Ext::V0 => ("V1", "V0", 0),
+                        stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => {
+                            ("V1", "V2", v2.signer_sponsoring_i_ds.len())
+                        }
+                    },
+                };
+                let describe_signer_key = |key: &stellar_xdr::curr::SignerKey| -> String {
+                    match key {
+                        stellar_xdr::curr::SignerKey::Ed25519(pk) => hex::encode(&pk.0[0..4]),
+                        stellar_xdr::curr::SignerKey::HashX(hash) => hex::encode(&hash.0[0..4]),
+                        stellar_xdr::curr::SignerKey::PreAuthTx(hash) => {
+                            hex::encode(&hash.0[0..4])
+                        }
+                        stellar_xdr::curr::SignerKey::Ed25519SignedPayload(payload) => {
+                            hex::encode(&payload.ed25519.0[0..4])
+                        }
+                    }
+                };
+                let signer_samples: Vec<String> = a
+                    .signers
+                    .iter()
+                    .take(3)
+                    .map(|s| format!("{}:{}", describe_signer_key(&s.key), s.weight))
+                    .collect();
+                let signer_info = if a.signers.is_empty() {
+                    "signers=0".to_string()
+                } else if a.signers.len() > 3 {
+                    format!(
+                        "signers={} [{}...]",
+                        a.signers.len(),
+                        signer_samples.join(",")
+                    )
+                } else {
+                    format!("signers={} [{}]", a.signers.len(), signer_samples.join(","))
+                };
                 let id = &a.account_id.0;
                 let id_hex = match id {
                     stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
                         hex::encode(&pk.0[0..4])
                     }
                 };
+                let inflation_dest = a
+                    .inflation_dest
+                    .as_ref()
+                    .map(|id| match &id.0 {
+                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                            hex::encode(&pk.0[0..4])
+                        }
+                    });
+                let inflation_info = inflation_dest
+                    .as_ref()
+                    .map(|id| format!(" infdest={}...", id))
+                    .unwrap_or_default();
+                let home_domain = String::from_utf8_lossy(&a.home_domain.0);
+                let home_domain_info = if home_domain.is_empty() {
+                    String::new()
+                } else {
+                    format!(" domain=\"{}\"", home_domain)
+                };
+                let thresholds = format!(
+                    "{}-{}-{}-{}",
+                    a.thresholds.0[0],
+                    a.thresholds.0[1],
+                    a.thresholds.0[2],
+                    a.thresholds.0[3]
+                );
                 format!(
-                    "Account({}...) bal={} seq={} lm={}",
-                    id_hex, a.balance, a.seq_num.0, entry.last_modified_ledger_seq
+                    "Account({}...) bal={} seq={} lm={} ns={} nsp={} sub={} flags=0x{:x} thresh={}{}{} aext={} v1ext={} ssid={} {}{}",
+                    id_hex,
+                    a.balance,
+                    a.seq_num.0,
+                    entry.last_modified_ledger_seq,
+                    num_sponsored,
+                    num_sponsoring,
+                    a.num_sub_entries,
+                    a.flags,
+                    thresholds,
+                    inflation_info,
+                    home_domain_info,
+                    account_ext,
+                    v1_ext,
+                    signer_sponsoring_len,
+                    signer_info,
+                    entry_suffix
                 )
             }
             LedgerEntryData::Trustline(t) => {
+                let asset_info = match &t.asset {
+                    stellar_xdr::curr::TrustLineAsset::Native => "Native".to_string(),
+                    stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(a) => {
+                        let issuer_hex = match &a.issuer.0 {
+                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                                hex::encode(&pk.0[0..4])
+                            }
+                        };
+                        let code = String::from_utf8_lossy(&a.asset_code.0);
+                        format!("{}:{}...", code, issuer_hex)
+                    }
+                    stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a) => {
+                        let issuer_hex = match &a.issuer.0 {
+                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                                hex::encode(&pk.0[0..4])
+                            }
+                        };
+                        let code = String::from_utf8_lossy(&a.asset_code.0);
+                        format!("{}:{}...", code, issuer_hex)
+                    }
+                    stellar_xdr::curr::TrustLineAsset::PoolShare(pool_id) => {
+                        format!("PoolShare({}...)", hex::encode(&pool_id.0.0[0..4]))
+                    }
+                };
                 format!(
-                    "Trustline bal={} lm={}",
-                    t.balance, entry.last_modified_ledger_seq
+                    "Trustline({}) bal={} lim={} lm={}{}",
+                    asset_info,
+                    t.balance,
+                    t.limit,
+                    entry.last_modified_ledger_seq,
+                    entry_suffix
                 )
             }
             LedgerEntryData::Offer(o) => {
                 format!(
-                    "Offer({}) amount={} lm={}",
-                    o.offer_id, o.amount, entry.last_modified_ledger_seq
+                    "Offer({}) amount={} price={}/{} sell={:?} buy={:?} flags={} lm={}{}",
+                    o.offer_id,
+                    o.amount,
+                    o.price.n,
+                    o.price.d,
+                    o.selling,
+                    o.buying,
+                    o.flags,
+                    entry.last_modified_ledger_seq,
+                    entry_suffix
+                )
+            }
+            LedgerEntryData::Data(d) => {
+                let name = String::from_utf8_lossy(&d.data_name.0);
+                format!(
+                    "Data({}) len={} lm={}{}",
+                    name,
+                    d.data_value.len(),
+                    entry.last_modified_ledger_seq,
+                    entry_suffix
                 )
             }
             LedgerEntryData::ContractData(cd) => {
@@ -4262,8 +4466,11 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                     _ => "other".to_string(),
                 };
                 format!(
-                    "ContractData({}...) dur={:?} lm={}",
-                    contract_hex, cd.durability, entry.last_modified_ledger_seq
+                    "ContractData({}...) dur={:?} lm={}{}",
+                    contract_hex,
+                    cd.durability,
+                    entry.last_modified_ledger_seq,
+                    entry_suffix
                 )
             }
             LedgerEntryData::ContractCode(cc) => {
@@ -4287,15 +4494,52 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
                     }
                 };
                 format!(
-                    "ContractCode({}...) {} lm={}",
-                    hash_hex, ext_info, entry.last_modified_ledger_seq
+                    "ContractCode({}...) {} lm={}{}",
+                    hash_hex, ext_info, entry.last_modified_ledger_seq, entry_suffix
                 )
             }
             LedgerEntryData::Ttl(ttl) => {
                 let key_hex = hex::encode(&ttl.key_hash.0[0..4]);
                 format!(
-                    "Ttl({}...) live_until={} lm={}",
-                    key_hex, ttl.live_until_ledger_seq, entry.last_modified_ledger_seq
+                    "Ttl({}...) live_until={} lm={}{}",
+                    key_hex,
+                    ttl.live_until_ledger_seq,
+                    entry.last_modified_ledger_seq,
+                    entry_suffix
+                )
+            }
+            LedgerEntryData::ClaimableBalance(cb) => {
+                let id_hex = match &cb.balance_id {
+                    stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(hash) => {
+                        hex::encode(&hash.0[0..4])
+                    }
+                };
+                let asset = stellar_core_common::asset::asset_to_string(&cb.asset);
+                let (ext_label, flags) = match &cb.ext {
+                    stellar_xdr::curr::ClaimableBalanceEntryExt::V0 => ("V0", 0),
+                    stellar_xdr::curr::ClaimableBalanceEntryExt::V1(v1) => ("V1", v1.flags),
+                };
+                let sponsor = match &entry.ext {
+                    stellar_xdr::curr::LedgerEntryExt::V0 => "none".to_string(),
+                    stellar_xdr::curr::LedgerEntryExt::V1(v1) => match &v1.sponsoring_id.0 {
+                        Some(id) => match &id.0 {
+                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => {
+                                hex::encode(&pk.0[0..4])
+                            }
+                        },
+                        None => "none".to_string(),
+                    },
+                };
+                format!(
+                    "ClaimableBalance({}...) asset={} amt={} claimants={} ext={} flags={} sponsor={} lm={}",
+                    id_hex,
+                    asset,
+                    cb.amount,
+                    cb.claimants.len(),
+                    ext_label,
+                    flags,
+                    sponsor,
+                    entry.last_modified_ledger_seq
                 )
             }
             _ => format!("lm={}", entry.last_modified_ledger_seq),
@@ -4497,6 +4741,7 @@ fn maybe_snapshot_soroban_state_size_window(
     bucket_list: &stellar_core_bucket::BucketList,
     soroban_state_size: u64,
     aggregator: &mut CoalescedLedgerChanges,
+    archival_override: Option<stellar_xdr::curr::StateArchivalSettings>,
 ) {
     use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
     use stellar_xdr::curr::{
@@ -4508,16 +4753,21 @@ fn maybe_snapshot_soroban_state_size_window(
         return;
     }
 
-    let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::StateArchival,
-    });
-    let Some(archival_entry) = bucket_list.get(&archival_key).ok().flatten() else {
-        return;
-    };
-    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival)) =
-        archival_entry.data
-    else {
-        return;
+    let archival = if let Some(override_settings) = archival_override {
+        override_settings
+    } else {
+        let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::StateArchival,
+        });
+        let Some(archival_entry) = bucket_list.get(&archival_key).ok().flatten() else {
+            return;
+        };
+        let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival)) =
+            archival_entry.data
+        else {
+            return;
+        };
+        archival
     };
 
     let sample_period = archival.live_soroban_state_size_window_sample_period;

@@ -1464,9 +1464,13 @@ impl TransactionExecutor {
         };
 
         // Validate fee
-        let required_fee = frame.operation_count() as u32 * base_fee;
         if frame.is_fee_bump() {
-            if frame.inner_fee() < required_fee {
+            let op_count = frame.operation_count() as i64;
+            let outer_op_count = std::cmp::max(1_i64, op_count + 1);
+            let outer_min_inclusion_fee = base_fee as i64 * outer_op_count;
+            let outer_inclusion_fee = frame.inclusion_fee();
+
+            if outer_inclusion_fee < outer_min_inclusion_fee {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
@@ -1479,7 +1483,57 @@ impl TransactionExecutor {
                     post_fee_changes: None,
                 });
             }
-            if frame.total_fee() < frame.inner_fee() as i64 {
+
+            let (inner_inclusion_fee, inner_is_soroban) = match frame.envelope() {
+                TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                        let inner_env = TransactionEnvelope::Tx(inner.clone());
+                        let inner_frame =
+                            TransactionFrame::with_network(inner_env, self.network_id);
+                        (inner_frame.inclusion_fee(), inner_frame.is_soroban())
+                    }
+                },
+                _ => (0, false),
+            };
+
+            if inner_inclusion_fee >= 0 {
+                let inner_min_inclusion_fee = base_fee as i64 * std::cmp::max(1_i64, op_count);
+                let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
+                let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
+
+                if v1 < v2 {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Insufficient fee".into()),
+                        failure: Some(ExecutionFailure::InsufficientFee),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                    });
+                }
+            } else {
+                let allow_negative_inner =
+                    self.protocol_version >= 23 && inner_is_soroban;
+                if !allow_negative_inner {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Fee bump inner transaction invalid".into()),
+                        failure: Some(ExecutionFailure::OperationFailed),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                    });
+                }
+            }
+        } else {
+            let required_fee = frame.operation_count() as u32 * base_fee;
+            if frame.fee() < required_fee {
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
@@ -1492,18 +1546,6 @@ impl TransactionExecutor {
                     post_fee_changes: None,
                 });
             }
-        } else if frame.fee() < required_fee {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Insufficient fee".into()),
-                failure: Some(ExecutionFailure::InsufficientFee),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-            });
         }
 
         let validation_ctx = ValidationContext::new(
@@ -1903,6 +1945,9 @@ impl TransactionExecutor {
         let mut seq_created = Vec::new();
         let mut seq_updated = Vec::new();
         let mut seq_deleted = Vec::new();
+        let mut signer_created = Vec::new();
+        let mut signer_updated = Vec::new();
+        let mut signer_deleted = Vec::new();
 
         if self.protocol_version >= 10 {
             // For fee bump transactions in two-phase mode, C++ stellar-core's
@@ -1932,6 +1977,50 @@ impl TransactionExecutor {
             } else {
                 vec![]
             };
+
+            let mut signer_changes = empty_entry_changes();
+            if self.protocol_version != 7 {
+                let mut source_accounts = Vec::new();
+                source_accounts.push(inner_source_id.clone());
+                for op in frame.operations().iter() {
+                    if let Some(ref source) = op.source_account {
+                        source_accounts.push(stellar_core_tx::muxed_to_account_id(source));
+                    }
+                }
+                source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
+                source_accounts.dedup_by(|a, b| a.0 == b.0);
+
+                let delta_before_signers = delta_snapshot(&self.state);
+                let mut signer_state_overrides = HashMap::new();
+                for account_id in &source_accounts {
+                    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                        account_id: account_id.clone(),
+                    });
+                    if let Some(entry) = self.state.get_entry(&key) {
+                        signer_state_overrides.insert(key, entry);
+                    }
+                }
+
+                self.state.remove_one_time_signers_from_all_sources(
+                    &outer_hash,
+                    &source_accounts,
+                    self.protocol_version,
+                );
+                self.state.flush_modified_entries();
+                let delta_after_signers = delta_snapshot(&self.state);
+                let delta_changes =
+                    delta_changes_between(self.state.delta(), delta_before_signers, delta_after_signers);
+                signer_created = delta_changes.created;
+                signer_updated = delta_changes.updated;
+                signer_deleted = delta_changes.deleted;
+                signer_changes = build_entry_changes_with_state_overrides(
+                    &self.state,
+                    &signer_created,
+                    &signer_updated,
+                    &signer_deleted,
+                    &signer_state_overrides,
+                );
+            }
 
             let delta_before_seq = delta_snapshot(&self.state);
             // Capture the current account state BEFORE modification for STATE entry.
@@ -1976,8 +2065,9 @@ impl TransactionExecutor {
             // This matches C++ stellar-core where FeeBumpFrame captures fee source state,
             // then inner tx does seq bump.
             let mut combined =
-                Vec::with_capacity(fee_bump_wrapper_changes.len() + seq_changes.len());
+                Vec::with_capacity(fee_bump_wrapper_changes.len() + signer_changes.len() + seq_changes.len());
             combined.extend(fee_bump_wrapper_changes);
+            combined.extend(signer_changes.iter().cloned());
             combined.extend(seq_changes.iter().cloned());
             tx_changes_before = combined.try_into().unwrap_or_default();
         }
@@ -2266,6 +2356,12 @@ impl TransactionExecutor {
             // accumulated fees to avoid losing fees from previous failed transactions.
             if self.protocol_version >= 10 {
                 restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
+                restore_delta_entries(
+                    &mut self.state,
+                    &signer_created,
+                    &signer_updated,
+                    &signer_deleted,
+                );
             }
             if let (Some(runner), Some(snapshot)) =
                 (self.op_invariants.as_mut(), op_invariant_snapshot)
@@ -2383,9 +2479,28 @@ impl TransactionExecutor {
             }
             OperationBody::ClaimClaimableBalance(op_data) => {
                 self.load_claimable_balance(snapshot, &op_data.balance_id)?;
+                let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                    balance_id: op_data.balance_id.clone(),
+                });
+                if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+                    self.load_account(snapshot, &sponsor)?;
+                }
+                if let Some(entry) = self.state.get_claimable_balance(&op_data.balance_id) {
+                    let asset = entry.asset.clone();
+                    if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
+                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                        self.load_asset_issuer(snapshot, &asset)?;
+                    }
+                }
             }
             OperationBody::ClawbackClaimableBalance(op_data) => {
                 self.load_claimable_balance(snapshot, &op_data.balance_id)?;
+                let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                    balance_id: op_data.balance_id.clone(),
+                });
+                if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+                    self.load_account(snapshot, &sponsor)?;
+                }
             }
             OperationBody::CreateClaimableBalance(op_data) => {
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {

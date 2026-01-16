@@ -257,7 +257,8 @@ fn execute_manage_offer(
         ));
     }
 
-    let mut max_sheep_send = can_sell_at_most(source, selling, state, context)?;
+    let mut max_sheep_send =
+        can_sell_at_most(source, selling, state, context, reserve_subentry)?;
     let mut max_wheat_receive = can_buy_at_most(source, buying, state);
     offer_kind.apply_limits(&mut max_sheep_send, 0, &mut max_wheat_receive, 0);
     if max_wheat_receive == 0 {
@@ -310,7 +311,8 @@ fn execute_manage_offer(
     }
 
     let amount = if sheep_stays {
-        let mut sheep_limit = can_sell_at_most(source, selling, state, context)?;
+        let mut sheep_limit =
+            can_sell_at_most(source, selling, state, context, reserve_subentry)?;
         let mut wheat_limit = can_buy_at_most(source, buying, state);
         offer_kind.apply_limits(
             &mut sheep_limit,
@@ -342,10 +344,6 @@ fn execute_manage_offer(
         };
 
         if old_offer.is_none() {
-            state.create_offer(offer);
-            if let Some(account) = state.get_account_mut(source) {
-                account.num_sub_entries += 1;
-            }
             if let Some(sponsor) = sponsor {
                 let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
                     seller_id: source.clone(),
@@ -357,6 +355,10 @@ fn execute_manage_offer(
                     Some(source),
                     1,
                 )?;
+            }
+            state.create_offer(offer);
+            if let Some(account) = state.get_account_mut(source) {
+                account.num_sub_entries += 1;
             }
             ManageOfferSuccessResultOffer::Created(create_offer_entry(
                 source, offer_id, selling, buying, amount, price,
@@ -583,11 +585,12 @@ fn delete_offer(
         seller_id: source.clone(),
         offer_id,
     });
-    if state.entry_sponsor(&ledger_key).is_some() {
-        state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 1)?;
-    }
-
+    let sponsor = state.entry_sponsor(&ledger_key).cloned();
     state.delete_offer(source, offer_id);
+    if let Some(sponsor) = sponsor {
+        state.update_num_sponsoring(&sponsor, -1)?;
+        state.update_num_sponsored(source, -1)?;
+    }
 
     // Decrement the source account's sub-entries
     if let Some(account) = state.get_account_mut(source) {
@@ -717,13 +720,18 @@ fn can_sell_at_most(
     asset: &Asset,
     state: &LedgerStateManager,
     context: &LedgerContext,
+    reserve_subentry: bool,
 ) -> Result<i64> {
     if matches!(asset, Asset::Native) {
         let Some(account) = state.get_account(source) else {
             return Ok(0);
         };
-        let min_balance =
-            state.minimum_balance_for_account(account, context.protocol_version, 0)?;
+        let additional_subentries = if reserve_subentry { 1 } else { 0 };
+        let min_balance = state.minimum_balance_for_account(
+            account,
+            context.protocol_version,
+            additional_subentries,
+        )?;
         let available = account.balance - min_balance - account_liabilities(account).selling;
         return Ok(available.max(0));
     }
@@ -869,10 +877,6 @@ fn convert_with_offers(
             state,
             context,
         )?;
-        if num_wheat_received == 0 && num_sheep_send == 0 {
-            return Ok(ConvertResult::Partial);
-        }
-
         *sheep_sent += num_sheep_send;
         *wheat_received += num_wheat_received;
         max_sheep_send -= num_sheep_send;
@@ -939,8 +943,12 @@ fn cross_offer_v10(
     )?;
 
     let max_wheat_send =
-        offer.amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
+        offer.amount.min(can_sell_at_most(&seller, &wheat, state, context, false)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+    let adjusted_offer_amount =
+        adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
+            .map_err(map_exchange_error)?;
+    let max_wheat_send = adjusted_offer_amount;
     let exchange = exchange_v10(
         offer.price.clone(),
         max_wheat_send,
@@ -963,15 +971,32 @@ fn cross_offer_v10(
         apply_balance_delta(&seller, &wheat, -num_wheat_received, state)?;
     }
 
-    let mut new_amount = offer.amount;
+    let mut new_amount = adjusted_offer_amount;
     if wheat_stays {
         new_amount = new_amount.saturating_sub(num_wheat_received);
+        if new_amount > 0 {
+            let max_wheat_send =
+                new_amount.min(can_sell_at_most(&seller, &wheat, state, context, false)?);
+            let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+            new_amount =
+                adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
+                    .map_err(map_exchange_error)?;
+        }
     } else {
         new_amount = 0;
     }
 
     if new_amount == 0 {
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: seller.clone(),
+            offer_id: offer.offer_id,
+        });
+        let sponsor = state.entry_sponsor(&ledger_key).cloned();
         state.delete_offer(&seller, offer.offer_id);
+        if let Some(sponsor) = sponsor {
+            state.update_num_sponsoring(&sponsor, -1)?;
+            state.update_num_sponsored(&seller, -1)?;
+        }
         if let Some(account) = state.get_account_mut(&seller) {
             if account.num_sub_entries > 0 {
                 account.num_sub_entries -= 1;
@@ -994,16 +1019,14 @@ fn cross_offer_v10(
         )?;
     }
 
-    if num_wheat_received > 0 && num_sheep_send > 0 {
-        offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
-            seller_id: seller,
-            offer_id: offer.offer_id,
-            asset_sold: wheat,
-            amount_sold: num_wheat_received,
-            asset_bought: sheep,
-            amount_bought: num_sheep_send,
-        }));
-    }
+    offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
+        seller_id: seller,
+        offer_id: offer.offer_id,
+        asset_sold: wheat,
+        amount_sold: num_wheat_received,
+        asset_bought: sheep,
+        amount_bought: num_sheep_send,
+    }));
 
     Ok((num_wheat_received, num_sheep_send, wheat_stays))
 }

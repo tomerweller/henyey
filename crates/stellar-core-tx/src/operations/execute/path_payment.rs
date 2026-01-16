@@ -20,7 +20,10 @@ use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
-use super::offer_exchange::{exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError, RoundingType};
+use super::offer_exchange::{
+    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError,
+    RoundingType,
+};
 
 /// Execute a PathPaymentStrictReceive operation.
 ///
@@ -575,6 +578,7 @@ fn convert_with_offers_and_pools(
     };
 
     if use_book {
+        *state = temp_state;
         *amount_send = book_amount_send;
         *amount_recv = book_amount_recv;
         offer_trail.clear();
@@ -707,6 +711,10 @@ fn cross_offer_v10(
     let max_wheat_send =
         offer.amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+    let adjusted_offer_amount =
+        adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
+            .map_err(map_exchange_error)?;
+    let max_wheat_send = adjusted_offer_amount;
     let exchange = exchange_v10(
         offer.price.clone(),
         max_wheat_send,
@@ -728,9 +736,17 @@ fn cross_offer_v10(
         apply_balance_delta(&seller, &wheat, -num_wheat_received, state)?;
     }
 
-    let mut new_amount = offer.amount;
+    let mut new_amount = adjusted_offer_amount;
     if wheat_stays {
         new_amount = new_amount.saturating_sub(num_wheat_received);
+        if new_amount > 0 {
+            let max_wheat_send =
+                new_amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
+            let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+            new_amount =
+                adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
+                    .map_err(map_exchange_error)?;
+        }
     } else {
         new_amount = 0;
     }
@@ -740,10 +756,12 @@ fn cross_offer_v10(
             seller_id: seller.clone(),
             offer_id: offer.offer_id,
         });
-        if state.entry_sponsor(&ledger_key).is_some() {
-            state.remove_entry_sponsorship_and_update_counts(&ledger_key, &seller, 1)?;
-        }
+        let sponsor = state.entry_sponsor(&ledger_key).cloned();
         state.delete_offer(&seller, offer.offer_id);
+        if let Some(sponsor) = sponsor {
+            state.update_num_sponsoring(&sponsor, -1)?;
+            state.update_num_sponsored(&seller, -1)?;
+        }
         if let Some(account) = state.get_account_mut(&seller) {
             if account.num_sub_entries > 0 {
                 account.num_sub_entries -= 1;

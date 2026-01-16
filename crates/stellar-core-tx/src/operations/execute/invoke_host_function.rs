@@ -215,10 +215,9 @@ fn execute_upload_wasm(
         .map(|bytes| bytes.len() as u32)
         .unwrap_or(0);
 
-    // Check if this code already exists
-    if let Some(existing) = state.get_contract_code(&code_hash).cloned() {
-        // Code already exists; update last_modified to reflect the write.
-        state.update_contract_code(existing);
+    // Check if this code already exists.
+    if state.get_contract_code(&code_hash).is_some() {
+        // Code already exists; return success without modifying state.
         return Ok(OperationExecutionResult::with_soroban_meta(
             make_result(InvokeHostFunctionResultCode::Success, result_hash),
             SorobanOperationMeta {

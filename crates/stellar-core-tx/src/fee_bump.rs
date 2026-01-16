@@ -126,6 +126,8 @@ impl std::error::Error for FeeBumpError {}
 pub struct FeeBumpFrame {
     /// The underlying transaction frame.
     frame: TransactionFrame,
+    /// The inner transaction frame wrapped by the fee bump.
+    inner_frame: TransactionFrame,
     /// Network ID for hash computation.
     network_id: NetworkId,
     /// Cached inner transaction hash.
@@ -144,8 +146,20 @@ impl FeeBumpFrame {
             return Err(FeeBumpError::NotFeeBump);
         }
 
+        let inner_envelope = match &envelope {
+            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => inner.clone(),
+            },
+            _ => unreachable!("FeeBumpFrame always contains a fee bump transaction"),
+        };
+        let inner_frame = TransactionFrame::with_network(
+            TransactionEnvelope::Tx(inner_envelope),
+            *network_id,
+        );
+
         Ok(Self {
             frame: TransactionFrame::with_network(envelope, *network_id),
+            inner_frame,
             network_id: *network_id,
             inner_hash: None,
         })
@@ -162,8 +176,20 @@ impl FeeBumpFrame {
             return Err(FeeBumpError::NotFeeBump);
         }
 
+        let inner_envelope = match frame.envelope() {
+            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => inner.clone(),
+            },
+            _ => unreachable!("FeeBumpFrame always contains a fee bump transaction"),
+        };
+        let inner_frame = TransactionFrame::with_network(
+            TransactionEnvelope::Tx(inner_envelope),
+            *network_id,
+        );
+
         Ok(Self {
             frame,
+            inner_frame,
             network_id: *network_id,
             inner_hash: None,
         })
@@ -262,9 +288,7 @@ impl FeeBumpFrame {
             return Ok(hash);
         }
 
-        let inner_env = TransactionEnvelope::Tx(self.inner_envelope().clone());
-        let inner_frame = TransactionFrame::with_network(inner_env, self.network_id);
-        let hash = inner_frame.hash(&self.network_id)?;
+        let hash = self.inner_frame.hash(&self.network_id)?;
 
         self.inner_hash = Some(hash);
         Ok(hash)
@@ -287,26 +311,26 @@ impl FeeBumpFrame {
 
     /// Check if the inner transaction is a Soroban transaction.
     pub fn is_soroban(&self) -> bool {
-        self.frame.is_soroban()
+        self.inner_frame.is_soroban()
     }
 
     /// Get the declared Soroban resource fee.
     pub fn declared_soroban_resource_fee(&self) -> i64 {
-        self.frame.declared_soroban_resource_fee()
+        self.inner_frame.declared_soroban_resource_fee()
     }
 
     /// Get a reference to the inner transaction frame.
     ///
     /// This provides access to the inner V1 transaction wrapped by this fee bump.
     pub fn inner_frame(&self) -> &TransactionFrame {
-        &self.frame
+        &self.inner_frame
     }
 
     /// Get the refundable fee for Soroban transactions.
     ///
     /// Delegates to the inner frame's refundable fee calculation.
     pub fn refundable_fee(&self) -> Option<i64> {
-        self.frame.refundable_fee()
+        self.inner_frame.refundable_fee()
     }
 }
 
@@ -329,22 +353,39 @@ pub fn validate_fee_bump(
     frame: &mut FeeBumpFrame,
     context: &LedgerContext,
 ) -> std::result::Result<(), FeeBumpError> {
-    // Validate outer fee >= inner fee
-    // The minimum outer fee must cover at least base_fee * (op_count + 1)
-    // because fee bumps are charged an extra "virtual" operation
+    // Validate inclusion fee against min fee and ensure the fee bump is actually bumping.
+    // This mirrors C++ FeeBumpTransactionFrame::commonValidPreSeqNum logic.
     let op_count = frame.operation_count() as i64;
-    let min_fee = (op_count + 1) * context.base_fee as i64;
-    let inner_fee = frame.inner_fee() as i64;
+    let outer_op_count = std::cmp::max(1_i64, op_count + 1);
+    let outer_min_inclusion_fee = outer_op_count * context.base_fee as i64;
+    let outer_inclusion_fee = frame.frame().inclusion_fee();
 
-    // Outer fee must be at least the max of min_fee and inner_fee
-    let required_min = std::cmp::max(min_fee, inner_fee);
-    let outer_fee = frame.outer_fee();
-
-    if outer_fee < required_min {
+    if outer_inclusion_fee < outer_min_inclusion_fee {
         return Err(FeeBumpError::InsufficientOuterFee {
-            outer_fee,
-            required_min,
+            outer_fee: frame.outer_fee(),
+            required_min: outer_min_inclusion_fee,
         });
+    }
+
+    let inner_inclusion_fee = frame.inner_frame().inclusion_fee();
+    if inner_inclusion_fee >= 0 {
+        let inner_min_inclusion_fee = std::cmp::max(1_i64, op_count) * context.base_fee as i64;
+        let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
+        let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
+        if v1 < v2 {
+            let required_outer = ((v2 + inner_min_inclusion_fee as i128 - 1)
+                / inner_min_inclusion_fee as i128) as i64;
+            return Err(FeeBumpError::InsufficientOuterFee {
+                outer_fee: frame.outer_fee(),
+                required_min: std::cmp::max(outer_min_inclusion_fee, required_outer),
+            });
+        }
+    } else {
+        let allow_negative_inner =
+            context.protocol_version >= 23 && frame.inner_frame().is_soroban();
+        if !allow_negative_inner {
+            return Err(FeeBumpError::InvalidInnerTxType);
+        }
     }
 
     // Validate inner transaction operation count

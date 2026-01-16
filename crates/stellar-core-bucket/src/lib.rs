@@ -191,6 +191,8 @@ pub use snapshot::{
 
 /// First protocol version supporting INITENTRY and METAENTRY (CAP-0020).
 pub const FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY: u32 = 11;
+/// First protocol version where bucket shadows are removed (CAP-0020 follow-up).
+pub const FIRST_PROTOCOL_SHADOWS_REMOVED: u32 = 12;
 
 /// First protocol version supporting persistent eviction (CAP-0046/Soroban).
 pub const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;

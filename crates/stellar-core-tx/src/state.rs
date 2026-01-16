@@ -123,6 +123,8 @@ pub struct LedgerStateManager {
     liquidity_pools: HashMap<[u8; 32], LiquidityPoolEntry>,
     /// Sponsoring account IDs for ledger entries (only when sponsored).
     entry_sponsorships: HashMap<LedgerKey, AccountId>,
+    /// Ledger entries that have a sponsorship extension (even if not currently sponsored).
+    entry_sponsorship_ext: HashSet<LedgerKey>,
     /// Last modified ledger sequence for each entry.
     entry_last_modified: HashMap<LedgerKey, u32>,
     /// Per-operation snapshot of entries before mutation.
@@ -175,6 +177,8 @@ pub struct LedgerStateManager {
     liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
     /// Snapshot of entry sponsorships for rollback.
     entry_sponsorship_snapshots: HashMap<LedgerKey, Option<AccountId>>,
+    /// Snapshot of sponsorship extension presence for rollback.
+    entry_sponsorship_ext_snapshots: HashMap<LedgerKey, bool>,
     /// Snapshot of last modified ledger sequence for rollback.
     entry_last_modified_snapshots: HashMap<LedgerKey, Option<u32>>,
     /// Track accounts created in this transaction (for rollback).
@@ -225,6 +229,7 @@ impl LedgerStateManager {
             claimable_balances: HashMap::new(),
             liquidity_pools: HashMap::new(),
             entry_sponsorships: HashMap::new(),
+            entry_sponsorship_ext: HashSet::new(),
             entry_last_modified: HashMap::new(),
             op_entry_snapshots: HashMap::new(),
             op_snapshots_active: false,
@@ -250,6 +255,7 @@ impl LedgerStateManager {
             claimable_balance_snapshots: HashMap::new(),
             liquidity_pool_snapshots: HashMap::new(),
             entry_sponsorship_snapshots: HashMap::new(),
+            entry_sponsorship_ext_snapshots: HashMap::new(),
             entry_last_modified_snapshots: HashMap::new(),
             created_accounts: HashSet::new(),
             created_trustlines: HashSet::new(),
@@ -294,17 +300,24 @@ impl LedgerStateManager {
     }
 
     fn ledger_entry_ext_for_snapshot(&self, key: &LedgerKey) -> LedgerEntryExt {
-        if let Some(snapshot) = self.entry_sponsorship_snapshots.get(key) {
-            if let Some(sponsor) = snapshot {
-                LedgerEntryExt::V1(LedgerEntryExtensionV1 {
-                    sponsoring_id: SponsorshipDescriptor(Some(sponsor.clone())),
-                    ext: LedgerEntryExtensionV1Ext::V0,
-                })
-            } else {
-                LedgerEntryExt::V0
-            }
+        let ext_present = self
+            .entry_sponsorship_ext_snapshots
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| self.entry_sponsorship_ext.contains(key));
+        let sponsor_snapshot = if let Some(snapshot) = self.entry_sponsorship_snapshots.get(key) {
+            snapshot.clone()
         } else {
-            self.ledger_entry_ext_for(key)
+            self.entry_sponsorships.get(key).cloned()
+        };
+
+        if ext_present || sponsor_snapshot.is_some() {
+            LedgerEntryExt::V1(LedgerEntryExtensionV1 {
+                sponsoring_id: SponsorshipDescriptor(sponsor_snapshot),
+                ext: LedgerEntryExtensionV1Ext::V0,
+            })
+        } else {
+            LedgerEntryExt::V0
         }
     }
 
@@ -488,6 +501,7 @@ impl LedgerStateManager {
         self.claimable_balances.clear();
         self.liquidity_pools.clear();
         self.entry_sponsorships.clear();
+        self.entry_sponsorship_ext.clear();
         self.entry_last_modified.clear();
 
         // Clear all transaction-level state
@@ -517,6 +531,7 @@ impl LedgerStateManager {
         self.claimable_balance_snapshots.clear();
         self.liquidity_pool_snapshots.clear();
         self.entry_sponsorship_snapshots.clear();
+        self.entry_sponsorship_ext_snapshots.clear();
         self.entry_last_modified_snapshots.clear();
 
         self.created_accounts.clear();
@@ -593,23 +608,40 @@ impl LedgerStateManager {
         self.entry_sponsorships.get(key)
     }
 
-    /// Set the sponsor for a ledger entry.
-    pub fn set_entry_sponsor(&mut self, key: LedgerKey, sponsor: AccountId) {
-        if !self.entry_sponsorship_snapshots.contains_key(&key) {
-            self.entry_sponsorship_snapshots
-                .insert(key.clone(), self.entry_sponsorships.get(&key).cloned());
+    fn snapshot_entry_sponsorship_ext(&mut self, key: &LedgerKey) {
+        if !self.entry_sponsorship_ext_snapshots.contains_key(key) {
+            self.entry_sponsorship_ext_snapshots
+                .insert(key.clone(), self.entry_sponsorship_ext.contains(key));
         }
-        self.capture_op_snapshot_for_key(&key);
-        self.entry_sponsorships.insert(key, sponsor);
     }
 
-    /// Remove and return the sponsor for a ledger entry, if any.
-    pub fn remove_entry_sponsor(&mut self, key: &LedgerKey) -> Option<AccountId> {
+    fn snapshot_entry_sponsorship_metadata(&mut self, key: &LedgerKey) {
         if !self.entry_sponsorship_snapshots.contains_key(key) {
             self.entry_sponsorship_snapshots
                 .insert(key.clone(), self.entry_sponsorships.get(key).cloned());
         }
+        self.snapshot_entry_sponsorship_ext(key);
+    }
+
+    fn clear_entry_sponsorship_metadata(&mut self, key: &LedgerKey) {
+        self.snapshot_entry_sponsorship_metadata(key);
+        self.entry_sponsorships.remove(key);
+        self.entry_sponsorship_ext.remove(key);
+    }
+
+    /// Set the sponsor for a ledger entry.
+    pub fn set_entry_sponsor(&mut self, key: LedgerKey, sponsor: AccountId) {
+        self.snapshot_entry_sponsorship_metadata(&key);
+        self.capture_op_snapshot_for_key(&key);
+        self.entry_sponsorships.insert(key.clone(), sponsor);
+        self.entry_sponsorship_ext.insert(key);
+    }
+
+    /// Remove and return the sponsor for a ledger entry, if any.
+    pub fn remove_entry_sponsor(&mut self, key: &LedgerKey) -> Option<AccountId> {
+        self.snapshot_entry_sponsorship_metadata(key);
         self.capture_op_snapshot_for_key(key);
+        self.entry_sponsorship_ext.insert(key.clone());
         self.entry_sponsorships.remove(key)
     }
 
@@ -898,9 +930,10 @@ impl LedgerStateManager {
     }
 
     fn ledger_entry_ext_for(&self, key: &LedgerKey) -> LedgerEntryExt {
-        if let Some(sponsor) = self.entry_sponsorships.get(key) {
+        let sponsor = self.entry_sponsorships.get(key).cloned();
+        if self.entry_sponsorship_ext.contains(key) || sponsor.is_some() {
             LedgerEntryExt::V1(LedgerEntryExtensionV1 {
-                sponsoring_id: SponsorshipDescriptor(Some(sponsor.clone())),
+                sponsoring_id: SponsorshipDescriptor(sponsor),
                 ext: LedgerEntryExtensionV1Ext::V0,
             })
         } else {
@@ -920,6 +953,7 @@ impl LedgerStateManager {
     /// Load a single entry into the state manager.
     pub fn load_entry(&mut self, entry: LedgerEntry) {
         let sponsor = sponsorship_from_entry_ext(&entry);
+        let has_sponsorship_ext = matches!(entry.ext, LedgerEntryExt::V1(_));
         let last_modified = entry.last_modified_ledger_seq;
         match entry.data {
             LedgerEntryData::Account(account) => {
@@ -930,6 +964,9 @@ impl LedgerStateManager {
                 self.accounts.insert(key, account);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -944,6 +981,9 @@ impl LedgerStateManager {
                 self.trustlines.insert((account_key, asset_key), trustline);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -957,6 +997,9 @@ impl LedgerStateManager {
                 self.offers.insert((seller_key, offer.offer_id), offer);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -971,6 +1014,9 @@ impl LedgerStateManager {
                 self.data_entries.insert((account_key, name), data);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -989,6 +1035,9 @@ impl LedgerStateManager {
                 self.contract_data.insert(key, contract_data);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -1001,6 +1050,9 @@ impl LedgerStateManager {
                 self.contract_code.insert(key, contract_code);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -1013,6 +1065,9 @@ impl LedgerStateManager {
                 self.ttl_entries.insert(key, ttl);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -1025,6 +1080,9 @@ impl LedgerStateManager {
                 self.claimable_balances.insert(key, cb);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -1037,6 +1095,9 @@ impl LedgerStateManager {
                 self.liquidity_pools.insert(key, lp);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
                 if let Some(sponsor) = sponsor {
                     self.entry_sponsorships.insert(ledger_key, sponsor);
                 }
@@ -1281,6 +1342,10 @@ impl LedgerStateManager {
                 // Config settings not tracked
             }
         }
+
+        self.entry_sponsorships.remove(key);
+        self.entry_sponsorship_ext.remove(key);
+        self.entry_last_modified.remove(key);
     }
 
     /// Delete an account entry.
@@ -1308,6 +1373,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.accounts.remove(&key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -1501,6 +1567,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.trustlines.remove(&key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -1537,6 +1604,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.trustlines.remove(&key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -1674,6 +1742,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.offers.remove(&key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -1809,12 +1878,10 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.data_entries.insert(key.clone(), entry);
+        self.data_entries.insert(key.clone(), entry.clone());
 
-        // Track modification
-        if !self.modified_data.contains(&key) {
-            self.modified_data.push(key);
-        }
+        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
+        self.data_snapshots.insert(key, Some(entry));
     }
 
     /// Delete a data entry.
@@ -1841,6 +1908,7 @@ impl LedgerStateManager {
             // Get pre-state (current value BEFORE deletion)
             let pre_state = self.data_to_ledger_entry(&entry);
             self.delta.record_delete(ledger_key.clone(), pre_state);
+            self.clear_entry_sponsorship_metadata(&ledger_key);
             self.remove_last_modified_key(&ledger_key);
         }
 
@@ -2004,6 +2072,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.contract_data.remove(&lookup_key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -2133,6 +2202,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.contract_code.remove(&key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -2312,6 +2382,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.ttl_entries.remove(&key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -2334,6 +2405,32 @@ impl LedgerStateManager {
     ) -> Option<&ClaimableBalanceEntry> {
         let key = claimable_balance_id_to_bytes(balance_id);
         self.claimable_balances.get(&key)
+    }
+
+    /// Get a mutable reference to a claimable balance entry.
+    pub fn get_claimable_balance_mut(
+        &mut self,
+        balance_id: &ClaimableBalanceId,
+    ) -> Option<&mut ClaimableBalanceEntry> {
+        let key = claimable_balance_id_to_bytes(balance_id);
+
+        if self.claimable_balances.contains_key(&key) {
+            if !self.claimable_balance_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+                let snapshot = self.claimable_balances.get(&key).cloned();
+                self.claimable_balance_snapshots.insert(key, snapshot);
+            }
+            let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                balance_id: balance_id.clone(),
+            });
+            self.capture_op_snapshot_for_key(&ledger_key);
+            self.snapshot_last_modified_key(&ledger_key);
+            if !self.modified_claimable_balances.contains(&key) {
+                self.modified_claimable_balances.push(key);
+            }
+            self.claimable_balances.get_mut(&key)
+        } else {
+            None
+        }
     }
 
     /// Create a new claimable balance entry.
@@ -2393,6 +2490,7 @@ impl LedgerStateManager {
         }
 
         // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
         self.claimable_balances.remove(&key);
         self.remove_last_modified_key(&ledger_key);
     }
@@ -2427,12 +2525,10 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.claimable_balances.insert(key, entry);
+        self.claimable_balances.insert(key, entry.clone());
 
-        // Track modification
-        if !self.modified_claimable_balances.contains(&key) {
-            self.modified_claimable_balances.push(key);
-        }
+        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
+        self.claimable_balance_snapshots.insert(key, Some(entry));
     }
 
     // ==================== Liquidity Pool Operations ====================
@@ -2855,6 +2951,15 @@ impl LedgerStateManager {
             }
         }
 
+        // Restore sponsorship extension snapshots
+        for (key, snapshot) in self.entry_sponsorship_ext_snapshots.drain() {
+            if snapshot {
+                self.entry_sponsorship_ext.insert(key);
+            } else {
+                self.entry_sponsorship_ext.remove(&key);
+            }
+        }
+
         // Restore last modified snapshots
         for (key, snapshot) in self.entry_last_modified_snapshots.drain() {
             match snapshot {
@@ -2951,10 +3056,17 @@ impl LedgerStateManager {
                     if let Some(entry) = self.accounts.get(&key).cloned() {
                         let should_record = self.multi_op_mode || &entry != snapshot_entry;
                         if should_record {
-                            let pre_state = self.account_to_ledger_entry(snapshot_entry);
                             let ledger_key = LedgerKey::Account(LedgerKeyAccount {
                                 account_id: entry.account_id.clone(),
                             });
+                            let pre_state = if self.op_snapshots_active {
+                                self.op_entry_snapshots
+                                    .get(&ledger_key)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.account_to_ledger_entry(snapshot_entry))
+                            } else {
+                                self.account_to_ledger_entry(snapshot_entry)
+                            };
                             self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                             let post_state = self.account_to_ledger_entry(&entry);
                             self.delta.record_update(pre_state, post_state);

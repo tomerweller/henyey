@@ -59,10 +59,11 @@ use crate::entry::{
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
 };
-use crate::merge::merge_buckets_with_options;
+use crate::merge::merge_buckets_with_options_and_shadows;
 use crate::{
     BucketError, Result,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+    FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
 };
 
@@ -207,6 +208,7 @@ impl BucketLevel {
         protocol_version: u32,
         incoming: Bucket,
         keep_dead_entries: bool,
+        shadow_buckets: &[Bucket],
         normalize_init: bool,
         use_empty_curr: bool,
     ) -> Result<()> {
@@ -243,12 +245,13 @@ impl BucketLevel {
         );
 
         // Merge curr (or empty) with the incoming bucket
-        let merged = merge_buckets_with_options(
+        let merged = merge_buckets_with_options_and_shadows(
             &curr_for_merge,
             &incoming,
             keep_dead_entries,
             protocol_version,
             normalize_init,
+            shadow_buckets,
         )?;
 
         tracing::debug!(
@@ -621,11 +624,22 @@ impl BucketList {
                 let keep_dead = Self::keep_tombstone_entries(i);
                 let normalize_init = false; // Never normalize INIT to LIVE during merges
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
+                let shadow_buckets = if protocol_version < FIRST_PROTOCOL_SHADOWS_REMOVED {
+                    let mut shadows = Vec::new();
+                    for level in self.levels.iter().take(i - 1) {
+                        shadows.push(level.curr.clone());
+                        shadows.push(level.snap.clone());
+                    }
+                    shadows
+                } else {
+                    Vec::new()
+                };
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
                     protocol_version,
                     spilling_snap,
                     keep_dead,
+                    &shadow_buckets,
                     normalize_init,
                     use_empty_curr,
                 )?;
@@ -649,6 +663,7 @@ impl BucketList {
             protocol_version,
             new_bucket,
             keep_dead_0,
+            &[],
             false, // don't normalize at level 0
             false, // level 0 never uses empty curr
         )?;
@@ -941,6 +956,7 @@ impl BucketList {
                 merge_protocol_version,
                 prev_snap,
                 keep_dead,
+                &[],
                 normalize_init,
                 use_empty_curr,
             )?;
@@ -1594,7 +1610,7 @@ mod tests {
         .unwrap();
 
         level
-            .prepare_with_normalization(5, TEST_PROTOCOL, incoming, false, true, false)
+            .prepare_with_normalization(5, TEST_PROTOCOL, incoming, false, &[], true, false)
             .unwrap();
         level.commit();
 

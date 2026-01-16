@@ -478,8 +478,8 @@ mod tests {
         assert!(iter.is_curr_bucket);
 
         // Advance through remaining levels...
-        for _ in 0..8 {
-            // 7 snap, 8 curr, 8 snap, 9 curr, 9 snap, 10 curr, 10 snap, wrap to 6 curr
+        for _ in 0..7 {
+            // 7 snap, 8 curr, 8 snap, 9 curr, 9 snap, 10 curr, wrap to 6 curr
             iter.advance_to_next_bucket(6);
         }
 
@@ -504,8 +504,9 @@ mod tests {
             assert!(count < 100, "Iterator didn't wrap");
         }
 
-        // Should take 10 advances: 6c->6s, 6s->7c, 7c->7s, 7s->8c, 8c->8s, 8s->9c, 9c->9s, 9s->10c, 10c->10s, 10s->6c (wrap)
-        assert_eq!(count, 10);
+        // Should take 9 advances: 6c->6s, 6s->7c, 7c->7s, 7s->8c, 8c->8s,
+        // 8s->9c, 9c->9s, 9s->10c, 10c->6c (wrap; last level has no snap)
+        assert_eq!(count, 9);
     }
 
     #[test]
@@ -521,18 +522,13 @@ mod tests {
             }
             assert!(count < 100);
         }
-        // All 11 levels, 2 buckets each = 22 advances
-        assert_eq!(count, 22);
+        // All 11 levels, last level has no snap = 21 advances
+        assert_eq!(count, 21);
 
         // Test starting at level 10 (top level)
         let mut iter = EvictionIterator::new(10);
         let wrapped = iter.advance_to_next_bucket(10);
-        assert!(!wrapped); // 10 curr -> 10 snap
-        assert_eq!(iter.bucket_list_level, 10);
-        assert!(!iter.is_curr_bucket);
-
-        let wrapped = iter.advance_to_next_bucket(10);
-        assert!(wrapped); // 10 snap -> wraps to 10 curr
+        assert!(wrapped); // 10 curr -> wrap to 10 curr (last level has no snap)
         assert_eq!(iter.bucket_list_level, 10);
         assert!(iter.is_curr_bucket);
     }
@@ -568,8 +564,8 @@ mod tests {
         assert!(!was_reset);
         assert_eq!(iter.bucket_file_offset, 5000);
 
-        // Ledger 2048 - level 5 spills, iterator SHOULD reset
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2048);
+        // Ledger 2049 - previous ledger spills, iterator SHOULD reset
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2049);
         assert!(was_reset);
         assert_eq!(iter.bucket_file_offset, 0);
     }
@@ -589,8 +585,8 @@ mod tests {
         assert!(!was_reset);
         assert_eq!(iter.bucket_file_offset, 5000);
 
-        // Ledger 8192 - level 6 spills, iterator SHOULD reset
-        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 8192);
+        // Ledger 8193 - previous ledger spills, iterator SHOULD reset
+        let was_reset = update_starting_eviction_iterator(&mut iter, 6, 8193);
         assert!(was_reset);
         assert_eq!(iter.bucket_file_offset, 0);
     }

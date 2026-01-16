@@ -181,6 +181,20 @@ pub fn execute_liquidity_pool_deposit(
         }
     };
 
+    if shares_received < 0 {
+        let pool_id_prefix = &op.liquidity_pool_id.0.0[0..4];
+        tracing::warn!(
+            pool_id_prefix = ?pool_id_prefix,
+            total_shares,
+            reserve_a,
+            reserve_b,
+            deposit_a,
+            deposit_b,
+            shares_received,
+            "Computed negative pool shares for liquidity pool deposit"
+        );
+    }
+
     if i64::MAX - reserve_a < deposit_a
         || i64::MAX - reserve_b < deposit_b
         || i64::MAX - total_shares < shares_received
@@ -573,7 +587,7 @@ fn big_divide(a: i64, b: i64, c: i64, round: Round) -> Result<i64> {
 fn big_square_root(a: i64, b: i64) -> i64 {
     let product = (a as i128) * (b as i128);
     let mut low: i128 = 0;
-    let mut high: i128 = product;
+    let mut high: i128 = product.min(i64::MAX as i128);
     while low <= high {
         let mid = (low + high) / 2;
         let sq = mid * mid;

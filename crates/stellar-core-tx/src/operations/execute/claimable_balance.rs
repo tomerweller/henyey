@@ -229,7 +229,6 @@ pub fn execute_create_claimable_balance(
         },
     };
 
-    state.create_claimable_balance(entry);
     let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
         balance_id: balance_id.clone(),
     });
@@ -239,6 +238,7 @@ pub fn execute_create_claimable_balance(
         None,
         sponsorship_multiplier,
     )?;
+    state.create_claimable_balance(entry);
 
     Ok(make_create_result(
         CreateClaimableBalanceResultCode::Success,
@@ -288,8 +288,8 @@ pub fn execute_claim_claimable_balance(
         return Ok(make_claim_result(ClaimClaimableBalanceResultCode::CannotClaim));
     }
 
-    // Check source account exists
-    if state.get_account(source).is_none() {
+    // Check source account exists (use mutable access to mirror C++ loadSourceAccount)
+    if state.get_account_mut(source).is_none() {
         return Ok(make_claim_result(ClaimClaimableBalanceResultCode::CannotClaim));
     }
 
@@ -330,16 +330,12 @@ pub fn execute_claim_claimable_balance(
     let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
         balance_id: entry.balance_id.clone(),
     });
-    if state.entry_sponsor(&ledger_key).is_some() {
-        state.remove_entry_sponsorship_with_sponsor_counts(
-            &ledger_key,
-            None,
-            sponsorship_multiplier,
-        )?;
-    }
-
+    let sponsor = state.entry_sponsor(&ledger_key).cloned();
     // Delete the claimable balance entry
     state.delete_claimable_balance(&op.balance_id);
+    if let Some(sponsor) = sponsor {
+        state.update_num_sponsoring(&sponsor, -sponsorship_multiplier)?;
+    }
 
     Ok(make_claim_result(ClaimClaimableBalanceResultCode::Success))
 }

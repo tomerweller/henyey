@@ -41,13 +41,14 @@
 
 use std::cmp::Ordering;
 
-use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
+use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey};
 
-use crate::bucket::Bucket;
+use crate::bucket::{Bucket, BucketIter};
 use crate::entry::{compare_keys, BucketEntry};
 use crate::{
     BucketError, Result,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+    FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
 };
 
@@ -239,6 +240,121 @@ pub fn merge_buckets_with_options(
         "merge_buckets complete"
     );
     Ok(result)
+}
+
+/// Merge two buckets with shadow elimination for pre-shadow-removal protocols.
+///
+/// Shadows are only used before protocol 12 to avoid reintroducing entries
+/// that are already shadowed by newer levels of the bucket list.
+pub fn merge_buckets_with_options_and_shadows(
+    old_bucket: &Bucket,
+    new_bucket: &Bucket,
+    keep_dead_entries: bool,
+    max_protocol_version: u32,
+    normalize_init_entries: bool,
+    shadow_buckets: &[Bucket],
+) -> Result<Bucket> {
+    let merged = merge_buckets_with_options(
+        old_bucket,
+        new_bucket,
+        keep_dead_entries,
+        max_protocol_version,
+        normalize_init_entries,
+    )?;
+
+    if shadow_buckets.is_empty() || max_protocol_version >= FIRST_PROTOCOL_SHADOWS_REMOVED {
+        return Ok(merged);
+    }
+
+    let keep_shadowed_lifecycle_entries =
+        max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
+    filter_shadowed_entries(&merged, shadow_buckets, keep_shadowed_lifecycle_entries)
+}
+
+struct ShadowCursor<'a> {
+    iter: BucketIter<'a>,
+    current: Option<BucketEntry>,
+}
+
+impl<'a> ShadowCursor<'a> {
+    fn new(bucket: &'a Bucket) -> Self {
+        let mut iter = bucket.iter();
+        let current = next_non_meta(&mut iter);
+        Self { iter, current }
+    }
+
+    fn advance_to_key_or_after(&mut self, key: &LedgerKey) -> bool {
+        loop {
+            let Some(entry) = self.current.as_ref() else {
+                return false;
+            };
+            let Some(entry_key) = entry.key() else {
+                self.current = next_non_meta(&mut self.iter);
+                continue;
+            };
+
+            match compare_keys(&entry_key, key) {
+                Ordering::Less => {
+                    self.current = next_non_meta(&mut self.iter);
+                }
+                Ordering::Equal => return true,
+                Ordering::Greater => return false,
+            }
+        }
+    }
+}
+
+fn next_non_meta(iter: &mut BucketIter<'_>) -> Option<BucketEntry> {
+    while let Some(entry) = iter.next() {
+        if !entry.is_metadata() {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> bool {
+    let Some(key) = entry.key() else {
+        return false;
+    };
+
+    for cursor in cursors.iter_mut() {
+        if cursor.advance_to_key_or_after(&key) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn filter_shadowed_entries(
+    merged: &Bucket,
+    shadow_buckets: &[Bucket],
+    keep_shadowed_lifecycle_entries: bool,
+) -> Result<Bucket> {
+    let mut cursors: Vec<ShadowCursor<'_>> = shadow_buckets
+        .iter()
+        .map(ShadowCursor::new)
+        .collect();
+
+    let mut filtered = Vec::with_capacity(merged.len());
+    for entry in merged.iter() {
+        if entry.is_metadata() {
+            filtered.push(entry);
+            continue;
+        }
+
+        if keep_shadowed_lifecycle_entries && (entry.is_init() || entry.is_dead()) {
+            filtered.push(entry);
+            continue;
+        }
+
+        if !is_shadowed(&entry, &mut cursors) {
+            filtered.push(entry);
+        }
+    }
+
+    Bucket::from_sorted_entries(filtered)
 }
 
 /// Check if an entry should be kept in the merged output.
@@ -539,20 +655,26 @@ fn build_output_metadata(
     new_meta: Option<&BucketMetadata>,
     max_protocol_version: u32,
 ) -> Result<(u32, Option<BucketEntry>)> {
-    let mut protocol_version = 0u32;
+    let mut input_version = 0u32;
     if let Some(meta) = old_meta {
-        protocol_version = protocol_version.max(meta.ledger_version);
+        input_version = input_version.max(meta.ledger_version);
     }
     if let Some(meta) = new_meta {
-        protocol_version = protocol_version.max(meta.ledger_version);
+        input_version = input_version.max(meta.ledger_version);
     }
 
-    if max_protocol_version > 0 && protocol_version > max_protocol_version {
+    if max_protocol_version > 0 && input_version > max_protocol_version {
         return Err(BucketError::Merge(format!(
             "bucket protocol version {} exceeds max_protocol_version {}",
-            protocol_version, max_protocol_version
+            input_version, max_protocol_version
         )));
     }
+
+    let protocol_version = if max_protocol_version > 0 {
+        max_protocol_version
+    } else {
+        input_version
+    };
 
     let use_meta = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
     if !use_meta {

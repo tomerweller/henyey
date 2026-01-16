@@ -75,11 +75,14 @@ pub fn execute_create_account(
         }
     }
 
-    // Deduct from source
-    let source_account_mut = state
-        .get_account_mut(source)
-        .ok_or(TxError::SourceAccountNotFound)?;
-    source_account_mut.balance -= op.starting_balance;
+    // Deduct from source. Use in-place mutation to avoid duplicate updates when
+    // sponsorship counters also modify the same account.
+    if op.starting_balance != 0 {
+        let source_account = state
+            .get_account_mut(source)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        source_account.balance -= op.starting_balance;
+    }
 
     let starting_seq = state.starting_sequence_number()?;
 
