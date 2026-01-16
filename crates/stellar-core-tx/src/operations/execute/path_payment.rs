@@ -62,6 +62,7 @@ pub fn execute_path_payment_strict_receive(
         op.dest_amount,
         bypass_issuer_check,
         state,
+        context,
     ) {
         return Ok(make_strict_receive_result_with_asset(
             err.code,
@@ -90,7 +91,7 @@ pub fn execute_path_payment_strict_receive(
         }
 
         if !bypass_issuer_check {
-            if let Err(err) = check_issuer(&send_asset, state) {
+            if let Err(err) = check_issuer(&send_asset, state, context) {
                 return Ok(make_strict_receive_result_with_asset(
                     err.code,
                     err.no_issuer_asset,
@@ -220,7 +221,7 @@ pub fn execute_path_payment_strict_send(
         }
 
         if !bypass_issuer_check {
-            if let Err(err) = check_issuer(&recv_asset, state) {
+            if let Err(err) = check_issuer(&recv_asset, state, context) {
                 return Ok(make_strict_send_result_with_asset(
                     convert_receive_to_send_code(err.code),
                     err.no_issuer_asset,
@@ -278,6 +279,7 @@ pub fn execute_path_payment_strict_send(
         max_amount_send,
         bypass_issuer_check,
         state,
+        context,
     ) {
         return Ok(make_strict_send_result_with_asset(
             convert_receive_to_send_code(err.code),
@@ -309,7 +311,12 @@ struct TransferError {
 fn check_issuer(
     asset: &Asset,
     state: &LedgerStateManager,
+    context: &LedgerContext,
 ) -> std::result::Result<(), TransferError> {
+    // In protocol 13+, issuer checks were removed (CAP-0017)
+    if context.protocol_version >= 13 {
+        return Ok(());
+    }
     if let Some(issuer) = issuer_for_asset(asset) {
         if state.get_account(issuer).is_none() {
             return Err(TransferError {
@@ -369,7 +376,7 @@ fn update_source_balance(
     }
 
     if !bypass_issuer_check {
-        check_issuer(asset, state)?;
+        check_issuer(asset, state, context)?;
     }
 
     if issuer_for_asset(asset) == Some(source) {
@@ -413,6 +420,7 @@ fn update_dest_balance(
     amount: i64,
     bypass_issuer_check: bool,
     state: &mut LedgerStateManager,
+    context: &LedgerContext,
 ) -> std::result::Result<(), TransferError> {
     if matches!(asset, Asset::Native) {
         let dest_account = state.get_account(dest).ok_or(TransferError {
@@ -436,7 +444,7 @@ fn update_dest_balance(
     }
 
     if !bypass_issuer_check {
-        check_issuer(asset, state)?;
+        check_issuer(asset, state, context)?;
     }
 
     if issuer_for_asset(asset) == Some(dest) {
@@ -1345,6 +1353,7 @@ fn make_strict_send_result_with_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_core_common::NetworkId;
     use stellar_xdr::curr::*;
 
     const AUTH_REQUIRED_FLAG: u32 = 0x1;
@@ -1374,6 +1383,20 @@ mod tests {
 
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
+    }
+
+    /// Create a test context with a specific protocol version.
+    /// Used for testing pre-protocol-13 behavior (like NoIssuer checks).
+    fn create_test_context_with_protocol(protocol_version: u32) -> LedgerContext {
+        LedgerContext {
+            sequence: 1,
+            close_time: 1000,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            protocol_version,
+            network_id: NetworkId::testnet(),
+            soroban_prng_seed: None,
+        }
     }
 
     fn create_test_trustline(
@@ -1512,7 +1535,8 @@ mod tests {
     #[test]
     fn test_path_payment_credit_no_issuer() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let context = create_test_context();
+        // Use protocol 12 (before CAP-0017 in protocol 13 removed issuer checks)
+        let context = create_test_context_with_protocol(12);
 
         let issuer_id = create_test_account_id(9);
         let source_id = create_test_account_id(0);
@@ -1679,7 +1703,8 @@ mod tests {
     #[test]
     fn test_path_payment_strict_send_credit_no_issuer() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let context = create_test_context();
+        // Use protocol 12 (before CAP-0017 in protocol 13 removed issuer checks)
+        let context = create_test_context_with_protocol(12);
 
         let issuer_id = create_test_account_id(9);
         let source_id = create_test_account_id(0);

@@ -19,6 +19,10 @@ const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
     TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
 const AUTH_REQUIRED_FLAG: u32 = 0x1;
+const AUTH_REVOCABLE_FLAG: u32 = 0x2;
+
+/// Trustline auth flags mask
+const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
 
 /// Execute an AllowTrust operation (deprecated).
 ///
@@ -46,10 +50,23 @@ pub fn execute_allow_trust(
         ));
     }
 
-    if &op.trustor == source {
+    // Check if trustor == source (self not allowed) - protocol 3+
+    if context.protocol_version >= 3 && &op.trustor == source {
         return Ok(make_allow_trust_result(
             AllowTrustResultCode::SelfNotAllowed,
         ));
+    }
+
+    // Check AUTH_REVOCABLE for revocation (first check - before loading trustline)
+    // Cannot fully deauthorize (authorize == 0) without AUTH_REVOCABLE
+    let auth_revocable = issuer.flags & AUTH_REVOCABLE_FLAG != 0;
+    if !auth_revocable && op.authorize == 0 {
+        return Ok(make_allow_trust_result(AllowTrustResultCode::CantRevoke));
+    }
+
+    // For protocol <= 2, trustor == source just returns success
+    if &op.trustor == source {
+        return Ok(make_allow_trust_result(AllowTrustResultCode::Success));
     }
 
     // Convert the asset code to a full Asset
@@ -76,31 +93,16 @@ pub fn execute_allow_trust(
         }
     };
 
-    // Update the trustline flags based on the authorize value
+    // Calculate new flags: clear auth flags, then set based on authorize value
     let mut new_flags = trustline.flags;
+    new_flags &= !TRUSTLINE_AUTH_FLAGS;
+    new_flags |= op.authorize;
 
-    // Clear existing auth flags
-    new_flags &= !(AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG);
-
-    // Set new auth flags based on authorize value
-    // authorize is a u32 that can be:
-    // 0 = not authorized
-    // 1 = authorized
-    // 2 = authorized to maintain liabilities only
-    match op.authorize {
-        0 => {
-            // Deauthorize - flags already cleared
-        }
-        1 => {
-            new_flags |= AUTHORIZED_FLAG;
-        }
-        _ => {
-            // Authorized to maintain liabilities
-            new_flags |= AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
-        }
-    }
-
-    if op.authorize == 0 && has_liabilities(&trustline) {
+    // Second CantRevoke check: Cannot downgrade from AUTHORIZED to
+    // AUTHORIZED_TO_MAINTAIN_LIABILITIES without AUTH_REVOCABLE
+    let was_authorized = trustline.flags & AUTHORIZED_FLAG != 0;
+    let setting_maintain_liabilities = new_flags & AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG != 0;
+    if !auth_revocable && was_authorized && setting_maintain_liabilities {
         return Ok(make_allow_trust_result(AllowTrustResultCode::CantRevoke));
     }
 
@@ -115,12 +117,6 @@ pub fn execute_allow_trust(
 /// Execute a SetTrustLineFlags operation.
 ///
 /// This operation sets or clears specific flags on a trustline.
-/// Auth revocable flag on accounts
-const AUTH_REVOCABLE_FLAG: u32 = 0x2;
-
-/// Trustline auth flags mask
-const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
-
 pub fn execute_set_trust_line_flags(
     op: &SetTrustLineFlagsOp,
     source: &AccountId,
@@ -198,19 +194,16 @@ pub fn execute_set_trust_line_flags(
         ));
     }
 
-    // Calculate new flags
+    // Calculate new flags: apply clear first, then set
     let mut new_flags = trustline.flags;
     new_flags &= !op.clear_flags;
     new_flags |= op.set_flags;
 
-    // If setting AUTHORIZED, must clear AUTHORIZED_TO_MAINTAIN_LIABILITIES
-    if op.set_flags & AUTHORIZED_FLAG != 0 {
-        new_flags &= !AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
-    }
-
-    // If setting AUTHORIZED_TO_MAINTAIN_LIABILITIES, must clear AUTHORIZED
-    if op.set_flags & AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG != 0 {
-        new_flags &= !AUTHORIZED_FLAG;
+    // Check if the resulting flags are valid - cannot have both auth flags set
+    if !is_trust_line_flag_auth_valid(new_flags) {
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::InvalidState,
+        ));
     }
 
     if !is_authorized_to_maintain_liabilities(new_flags) && has_liabilities(&trustline) {
@@ -269,6 +262,13 @@ fn has_liabilities(trustline: &TrustLineEntry) -> bool {
 
 fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
     flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
+}
+
+/// Check if the trust line auth flags are valid.
+/// Both AUTHORIZED_FLAG and AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG cannot be set at the same time.
+fn is_trust_line_flag_auth_valid(flags: u32) -> bool {
+    // Multiple auth flags can't be set simultaneously
+    (flags & TRUSTLINE_AUTH_FLAGS) != TRUSTLINE_AUTH_FLAGS
 }
 
 #[cfg(test)]

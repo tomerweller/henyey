@@ -134,6 +134,14 @@ fn execute_manage_offer(
                 }
             };
 
+            // Check balance first (before authorization check)
+            if trustline.balance == 0 {
+                return Ok(make_sell_offer_result(
+                    ManageSellOfferResultCode::Underfunded,
+                    None,
+                ));
+            }
+
             if !is_trustline_authorized(trustline.flags) {
                 return Ok(make_sell_offer_result(
                     ManageSellOfferResultCode::SellNotAuthorized,
