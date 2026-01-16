@@ -165,7 +165,9 @@ pub use manager::{BucketManager, BucketManagerStats};
 // Merge operations
 // ============================================================================
 
-pub use merge::{merge_buckets, merge_buckets_with_options, merge_in_memory, merge_multiple, MergeIterator};
+pub use merge::{
+    merge_buckets, merge_buckets_with_options, merge_in_memory, merge_multiple, MergeIterator,
+};
 
 // ============================================================================
 // Async bucket merging

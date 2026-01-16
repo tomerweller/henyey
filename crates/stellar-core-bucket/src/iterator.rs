@@ -485,7 +485,10 @@ impl BucketOutputIterator {
 
         // Finish compression and get hash
         let encoder = self.writer.into_inner().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to flush writer: {}", e))
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to flush writer: {}", e),
+            )
         })?;
         encoder.finish()?;
 
@@ -586,8 +589,10 @@ impl MergeInput for MemoryMergeInput<'_> {
         if self.new_index >= self.new_entries.len() {
             return true;
         }
-        compare_entries(&self.old_entries[self.old_index], &self.new_entries[self.new_index])
-            == std::cmp::Ordering::Less
+        compare_entries(
+            &self.old_entries[self.old_index],
+            &self.new_entries[self.new_index],
+        ) == std::cmp::Ordering::Less
     }
 
     fn new_first(&self) -> bool {
@@ -597,16 +602,20 @@ impl MergeInput for MemoryMergeInput<'_> {
         if self.old_index >= self.old_entries.len() {
             return true;
         }
-        compare_entries(&self.new_entries[self.new_index], &self.old_entries[self.old_index])
-            == std::cmp::Ordering::Less
+        compare_entries(
+            &self.new_entries[self.new_index],
+            &self.old_entries[self.old_index],
+        ) == std::cmp::Ordering::Less
     }
 
     fn equal_keys(&self) -> bool {
         if self.old_index >= self.old_entries.len() || self.new_index >= self.new_entries.len() {
             return false;
         }
-        compare_entries(&self.old_entries[self.old_index], &self.new_entries[self.new_index])
-            == std::cmp::Ordering::Equal
+        compare_entries(
+            &self.old_entries[self.old_index],
+            &self.new_entries[self.new_index],
+        ) == std::cmp::Ordering::Equal
     }
 
     fn get_old_entry(&self) -> Option<&BucketEntry> {
@@ -642,7 +651,9 @@ impl FileMergeInput {
 
     /// Returns the metadata from the new iterator (preferred) or old iterator.
     pub fn metadata(&self) -> Option<&BucketMetadata> {
-        self.new_iter.metadata().or_else(|| self.old_iter.metadata())
+        self.new_iter
+            .metadata()
+            .or_else(|| self.old_iter.metadata())
     }
 }
 

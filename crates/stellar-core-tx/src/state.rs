@@ -199,6 +199,9 @@ pub struct LedgerStateManager {
     created_claimable_balances: HashSet<[u8; 32]>,
     /// Track liquidity pools created in this transaction (for rollback).
     created_liquidity_pools: HashSet<[u8; 32]>,
+    /// Snapshot of id_pool for rollback. When an ID is generated during a transaction
+    /// that later fails, the id_pool must be restored to its pre-transaction value.
+    id_pool_snapshot: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +269,7 @@ impl LedgerStateManager {
             created_ttl: HashSet::new(),
             created_claimable_balances: HashSet::new(),
             created_liquidity_pools: HashSet::new(),
+            id_pool_snapshot: None,
         }
     }
 
@@ -468,7 +472,15 @@ impl LedgerStateManager {
     }
 
     /// Generate the next ID from the pool.
+    ///
+    /// The first call within a transaction snapshots the id_pool so it can be
+    /// restored on rollback. This ensures that failed transactions don't consume
+    /// offer IDs.
     pub fn next_id(&mut self) -> i64 {
+        // Snapshot id_pool before first modification in this transaction
+        if self.id_pool_snapshot.is_none() {
+            self.id_pool_snapshot = Some(self.id_pool);
+        }
         self.id_pool = self.id_pool.checked_add(1).expect("id_pool overflow");
         i64::try_from(self.id_pool).expect("id_pool exceeds i64::MAX")
     }
@@ -2902,6 +2914,12 @@ impl LedgerStateManager {
     ///
     /// This restores all entries to their original state and clears the delta.
     pub fn rollback(&mut self) {
+        // Restore id_pool snapshot if present (must be done before entry snapshots
+        // since offer IDs need to be correct for subsequent transactions)
+        if let Some(snapshot) = self.id_pool_snapshot.take() {
+            self.id_pool = snapshot;
+        }
+
         // Restore account snapshots. Entries created in this transaction are removed,
         // others are restored from their snapshot.
         for (key, snapshot) in self.account_snapshots.drain() {
@@ -3053,6 +3071,9 @@ impl LedgerStateManager {
 
     /// Commit changes by clearing snapshots (changes become permanent).
     pub fn commit(&mut self) {
+        // Clear id_pool snapshot (the incremented value is now committed)
+        self.id_pool_snapshot = None;
+
         // Clear all snapshots
         self.account_snapshots.clear();
         self.trustline_snapshots.clear();

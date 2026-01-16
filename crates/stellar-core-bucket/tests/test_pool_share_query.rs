@@ -24,7 +24,8 @@ fn make_account_id(bytes: [u8; 32]) -> AccountId {
 fn make_asset(code: &str, issuer: [u8; 32]) -> Asset {
     let mut code_bytes = [0u8; 4];
     let code_bytes_src = code.as_bytes();
-    code_bytes[..code_bytes_src.len().min(4)].copy_from_slice(&code_bytes_src[..code_bytes_src.len().min(4)]);
+    code_bytes[..code_bytes_src.len().min(4)]
+        .copy_from_slice(&code_bytes_src[..code_bytes_src.len().min(4)]);
     Asset::CreditAlphanum4(AlphaNum4 {
         asset_code: AssetCode4(code_bytes),
         issuer: make_account_id(issuer),
@@ -97,7 +98,12 @@ fn make_ledger_header(ledger_seq: u32) -> LedgerHeader {
         base_fee: 100,
         base_reserve: 5_000_000,
         max_tx_set_size: 100,
-        skip_list: [Hash([0u8; 32]), Hash([0u8; 32]), Hash([0u8; 32]), Hash([0u8; 32])],
+        skip_list: [
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+        ],
         ext: LedgerHeaderExt::V0,
     }
 }
@@ -169,10 +175,8 @@ fn test_load_pool_share_trustlines_by_account_and_asset() {
     let searchable = create_searchable_snapshot(&bucket_list);
 
     // Query for pool share trustlines with asset_to_search
-    let result = searchable.load_pool_share_trustlines_by_account_and_asset(
-        &account_to_search,
-        &asset_to_search,
-    );
+    let result = searchable
+        .load_pool_share_trustlines_by_account_and_asset(&account_to_search, &asset_to_search);
 
     // Should return trustlines for pool1 and pool2 (which contain asset_to_search)
     // but NOT pool3 (which doesn't contain asset_to_search)
@@ -269,11 +273,10 @@ fn test_load_pool_share_trustlines_deleted_pool() {
     assert_eq!(result.len(), 1);
 
     // Delete the pool
-    let pool_key = stellar_xdr::curr::LedgerKey::LiquidityPool(
-        stellar_xdr::curr::LedgerKeyLiquidityPool {
+    let pool_key =
+        stellar_xdr::curr::LedgerKey::LiquidityPool(stellar_xdr::curr::LedgerKeyLiquidityPool {
             liquidity_pool_id: pool_id,
-        },
-    );
+        });
     bucket_list
         .add_batch(
             2,

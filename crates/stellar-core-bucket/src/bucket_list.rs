@@ -279,11 +279,7 @@ impl BucketLevel {
     /// # Returns
     ///
     /// The merged bucket with in-memory entries set for the next merge.
-    fn prepare_first_level(
-        &mut self,
-        protocol_version: u32,
-        incoming: Bucket,
-    ) -> Result<()> {
+    fn prepare_first_level(&mut self, protocol_version: u32, incoming: Bucket) -> Result<()> {
         if self.level != 0 {
             return Err(BucketError::Merge(
                 "prepare_first_level can only be called on level 0".to_string(),
@@ -301,10 +297,7 @@ impl BucketLevel {
             self.curr.has_in_memory_entries() && incoming.has_in_memory_entries();
 
         let merged = if can_use_in_memory_merge {
-            tracing::debug!(
-                level = 0,
-                "prepare_first_level: using in-memory merge path"
-            );
+            tracing::debug!(level = 0, "prepare_first_level: using in-memory merge path");
             merge_in_memory(&self.curr, &incoming, protocol_version)?
         } else {
             tracing::debug!(
@@ -318,7 +311,7 @@ impl BucketLevel {
             merge_buckets_with_options_and_shadows(
                 &self.curr,
                 &incoming,
-                true,  // keep_dead_entries
+                true, // keep_dead_entries
                 protocol_version,
                 false, // normalize_init_entries
                 &[],   // no shadow buckets at level 0

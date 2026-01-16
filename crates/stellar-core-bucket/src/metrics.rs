@@ -234,8 +234,7 @@ impl EvictionCounters {
 
     /// Records an incomplete bucket scan.
     pub fn record_incomplete_scan(&self) {
-        self.incomplete_bucket_scans
-            .fetch_add(1, Ordering::Relaxed);
+        self.incomplete_bucket_scans.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a completed scan cycle.

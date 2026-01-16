@@ -561,7 +561,9 @@ impl BucketManager {
 }
 
 /// Returns the ledger entry type for a given entry data.
-fn ledger_entry_type(data: &stellar_xdr::curr::LedgerEntryData) -> stellar_xdr::curr::LedgerEntryType {
+fn ledger_entry_type(
+    data: &stellar_xdr::curr::LedgerEntryData,
+) -> stellar_xdr::curr::LedgerEntryType {
     use stellar_xdr::curr::{LedgerEntryData, LedgerEntryType};
     match data {
         LedgerEntryData::Account(_) => LedgerEntryType::Account,
@@ -729,7 +731,10 @@ impl BucketManager {
     /// # Returns
     ///
     /// A list of (expected_hash, actual_hash) pairs for any mismatched buckets.
-    pub fn verify_bucket_hashes(&self, bucket_hashes: &[Hash256]) -> Result<Vec<(Hash256, Hash256)>> {
+    pub fn verify_bucket_hashes(
+        &self,
+        bucket_hashes: &[Hash256],
+    ) -> Result<Vec<(Hash256, Hash256)>> {
         let mut mismatches = Vec::new();
 
         for expected_hash in bucket_hashes {
@@ -774,7 +779,11 @@ impl BucketManager {
     /// # Returns
     ///
     /// The number of buckets that were fetched (not already present).
-    pub fn ensure_buckets_exist<F>(&self, bucket_hashes: &[Hash256], mut fetch_bucket: F) -> Result<usize>
+    pub fn ensure_buckets_exist<F>(
+        &self,
+        bucket_hashes: &[Hash256],
+        mut fetch_bucket: F,
+    ) -> Result<usize>
     where
         F: FnMut(&Hash256) -> Result<Vec<u8>>,
     {
@@ -1202,9 +1211,7 @@ mod tests {
 
         // Second call should fetch 0 (already exists)
         let fetched = manager
-            .ensure_buckets_exist(&[bucket.hash()], |_hash| {
-                panic!("Should not be called")
-            })
+            .ensure_buckets_exist(&[bucket.hash()], |_hash| panic!("Should not be called"))
             .unwrap();
         assert_eq!(fetched, 0);
     }
