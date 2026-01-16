@@ -108,6 +108,8 @@ fn execute_contract_invocation(
         soroban_config,
     ) {
         Ok(result) => {
+            // C++ stellar-core check: event size (done first in collectEvents before
+            // recordStorageChanges in doApply, but logically we need this check)
             if soroban_config.tx_max_contract_events_size_bytes > 0
                 && result.contract_events_and_return_value_size
                     > soroban_config.tx_max_contract_events_size_bytes
@@ -117,6 +119,23 @@ fn execute_contract_invocation(
                     Hash([0u8; 32]),
                 )));
             }
+
+            // C++ stellar-core check: write bytes (recordStorageChanges lines 639-652)
+            // Sum the XDR sizes of all non-TTL entries being written and check against
+            // the specified write_bytes limit.
+            let total_write_bytes = compute_total_write_bytes(&result.storage_changes);
+            if total_write_bytes > soroban_data.resources.write_bytes {
+                tracing::warn!(
+                    total_write_bytes,
+                    specified_write_bytes = soroban_data.resources.write_bytes,
+                    "Write bytes exceeded specified limit"
+                );
+                return Ok(OperationExecutionResult::new(make_result(
+                    InvokeHostFunctionResultCode::ResourceLimitExceeded,
+                    Hash([0u8; 32]),
+                )));
+            }
+
             // Apply storage changes back to our state.
             apply_soroban_storage_changes(
                 state,
@@ -370,6 +389,28 @@ fn compute_key_hash(key: &LedgerKey) -> Hash {
         hasher.update(&bytes);
     }
     Hash(hasher.finalize().into())
+}
+
+/// Compute total write bytes for storage changes.
+///
+/// This matches C++ stellar-core's recordStorageChanges() which sums the XDR size of all
+/// non-TTL entries being written. TTL entries are excluded because their write fees come
+/// out of refundableFee, already accounted for by the host.
+fn compute_total_write_bytes(storage_changes: &[crate::soroban::StorageChange]) -> u32 {
+    let mut total: u32 = 0;
+    for change in storage_changes {
+        if let Some(entry) = &change.new_entry {
+            // Skip TTL entries - their write fees are handled separately
+            if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
+                continue;
+            }
+            // Add the XDR size of the entry
+            if let Ok(bytes) = entry.to_xdr(Limits::none()) {
+                total = total.saturating_add(bytes.len() as u32);
+            }
+        }
+    }
+    total
 }
 
 /// Compute the hash of the success preimage (return value + events).
