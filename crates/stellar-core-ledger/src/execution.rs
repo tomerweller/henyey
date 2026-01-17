@@ -1159,6 +1159,54 @@ impl TransactionExecutor {
         self.state.commit();
     }
 
+    /// Apply ledger entry changes preserving account sequence numbers.
+    ///
+    /// This is similar to `apply_ledger_entry_changes` but preserves the current
+    /// sequence number for existing accounts. This is needed because CDP metadata
+    /// for operation changes can capture sequence numbers that include effects from
+    /// later transactions in the same ledger (due to how C++ stellar-core captures STATE values).
+    ///
+    /// For Account UPDATED entries:
+    /// - If the account exists in our state, preserve our sequence number
+    /// - Apply all other fields from the CDP entry (balance, etc.)
+    pub fn apply_ledger_entry_changes_preserve_seq(
+        &mut self,
+        changes: &stellar_xdr::curr::LedgerEntryChanges,
+    ) {
+        use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData};
+
+        for change in changes.iter() {
+            match change {
+                LedgerEntryChange::Updated(entry) => {
+                    // For Account entries, preserve our sequence number
+                    if let LedgerEntryData::Account(new_acc) = &entry.data {
+                        if let Some(existing_acc) = self.state.get_account_mut(&new_acc.account_id) {
+                            // Preserve our sequence number
+                            let our_seq = existing_acc.seq_num.0;
+                            // Apply all fields from CDP entry
+                            *existing_acc = new_acc.clone();
+                            // Restore our sequence
+                            existing_acc.seq_num.0 = our_seq;
+                            continue;
+                        }
+                    }
+                    // For non-account entries or new accounts, apply normally
+                    self.state.apply_entry_no_tracking(entry);
+                }
+                LedgerEntryChange::Created(entry) | LedgerEntryChange::Restored(entry) => {
+                    self.state.apply_entry_no_tracking(entry);
+                }
+                LedgerEntryChange::Removed(key) => {
+                    self.state.delete_entry_no_tracking(key);
+                }
+                LedgerEntryChange::State(_) => {
+                    // State changes are informational only, no action needed
+                }
+            }
+        }
+        self.state.commit();
+    }
+
     /// Apply a fee refund to an account WITHOUT delta tracking.
     ///
     /// This is used during verification to sync the fee refund from CDP's

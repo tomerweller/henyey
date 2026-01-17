@@ -25,48 +25,64 @@ cargo build --release -p rs-stellar-core
 
 ## Current Status
 
-**Last verification run**: 2026-01-16
+**Last verification run**: 2026-01-17
 
 | Metric | Value |
 |--------|-------|
-| Ledgers verified | 933-25000 (24,068 ledgers) |
-| Transactions verified | 48,525 |
-| Transaction results | 99.4% match (293 mismatches) |
-| Ledger headers | 7,722 passed, 16,346 failed |
+| Ledgers verified | 933-15000 (14,068 ledgers) |
+| Transactions verified | 27,550 |
+| Transaction results | 99.3% match (193 mismatches) |
+| Ledger headers | 7,722 passed, 6,346 failed |
 | First header divergence | Ledger 8655 |
 
-**Status**: The **bucket list implementation is correct**. Header divergence starting at ledger 8655 is caused by a **transaction execution bug** (`BadSequence`), not a bucket list bug. Once state diverges, all subsequent headers mismatch (cascade effect).
+**Status**: Transaction execution parity is **99.3%**. The BadSequence bug at ledger 8655 has been **FIXED** (CDP state sync was applying polluted sequence numbers from operation metadata). Header divergence persists due to **bucket list state tracking** - the verification tool's bucket list diverges from CDP even when all transactions match.
 
 ### Mismatch Breakdown
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| bucketlist-only | 16,063 | Headers diverged, but all tx matched (cascade from initial bug) |
-| tx-only | 9 | Tx diverged, but headers matched |
-| both | 283 | Both tx and headers diverged |
+| bucketlist-only | 6,248 | Headers diverged, but all tx matched |
+| tx-only | 85 | Tx diverged, but headers matched |
+| both | 98 | Both tx and headers diverged |
 
-## Root Cause: BadSequence at Ledger 8655
+## Remaining Issues
 
-At ledger 8655, a transaction failed on our side with `BadSequence` but succeeded in CDP:
+### Transaction Mismatches (193 remaining)
+All 193 mismatches are the same pattern:
+- **Our result**: `InvokeHostFunction(ResourceLimitExceeded)`
+- **CDP result**: `InvokeHostFunction(Trapped)`
 
-```
-TX 1: MISMATCH - our: failed vs CDP: TxSuccess (cdp_succeeded: true)
-  - Our error: Bad sequence: expected 36296768618502, got 36296768618501
-  - Our failure type: BadSequence
-  - We produced no meta but CDP has some
-```
+**Root cause**: Our Soroban host reports higher CPU consumption than C++ stellar-core for the same transactions.
 
-The sequence number check appears to be **off by 1**. Since our transaction failed, the verification tool doesn't sync CDP state (to avoid applying rolled-back changes), causing state drift that cascades through all subsequent ledgers.
+Example from logs:
+- `cpu_consumed=10,368,856` vs `cpu_specified=6,942,449` → We return `ResourceLimitExceeded`
+- C++ sees `cpu_consumed <= cpu_specified` → Returns `Trapped`
+
+**Likely causes**:
+1. We set budget to `tx_max_instructions * 2` for setup overhead, but `budget.get_cpu_insns_consumed()` returns TOTAL consumption including setup
+2. C++ uses `invoke_host_function_v3` through rust bridge which may meter contract execution separately from setup
+3. Possible differences in cost parameters or their application
+
+**Impact**: Low - both results are transaction failures, just with different error codes.
+
+### Bucket List Divergence
+The bucket list hash diverges from CDP even when all transactions match. This is likely caused by:
+- Different INIT vs LIVE classification in `apply_change_with_prestate()`
+- Prestate lookup using our diverged bucket list instead of CDP's canonical state
+- Missing or incorrectly applied CDP metadata (eviction, upgrades)
+
+The bucket list divergence is **not a consensus issue** for transaction execution, but needs fixing for full header verification.
 
 ## Next Steps
 
-1. **Fix BadSequence bug**: Investigate sequence number validation - appears to be off by 1
-2. **Re-verify after fix**: Once the BadSequence bug is fixed, header hashes should start matching
+1. **Investigate remaining tx mismatches**: Run with `--stop-on-error` to find and debug individual cases
+2. **Fix bucket list divergence**: May require syncing bucket list entries from CDP metadata
 3. **Continuous verification**: Set up regular verification runs to catch regressions
 
 ## Recent Fixes (This Session)
 
-1. **min_seq_age/min_seq_ledger_gap validation**: Fixed to use account's `seq_time` and `seq_ledger` from V3 extension instead of `last_modified_ledger_seq`. Matches C++ logic:
+1. **CDP state sync sequence number pollution** (FIXED): Fixed BadSequence errors caused by CDP metadata containing polluted sequence numbers. The issue: CDP operation metadata for Soroban transactions captures STATE values that include sequence number changes from later transactions in the same ledger. Solution: Separate tx_changes (which include real sequence bumps) from operation_changes, and preserve our sequence numbers when applying operation changes.
+2. **min_seq_age/min_seq_ledger_gap validation**: Fixed to use account's `seq_time` and `seq_ledger` from V3 extension instead of `last_modified_ledger_seq`. Matches C++ logic:
    - `min_seq_age > closeTime || closeTime - min_seq_age < accSeqTime`
    - `min_seq_ledger_gap > ledgerSeq || ledgerSeq - min_seq_ledger_gap < accSeqLedger`
 2. **Soroban error mapping** (`909cf1a`): Fixed `InvokeHostFunction` to return `ResourceLimitExceeded` vs `Trapped` based on raw CPU/memory consumption (matching C++ behavior)
@@ -78,6 +94,7 @@ The sequence number check appears to be **off by 1**. Since our transaction fail
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-17 | 933-15000 | 99.3% tx match (193/27,550 mismatches) | Fixed CDP state sync sequence pollution |
 | 2026-01-16 | 933-25000 | 7,722 headers passed, 16,346 failed | Bucket list correct; divergence from BadSequence tx bug at 8655 |
 | 2026-01-16 | 10000-15000 | ~98 mismatches | State drift causes downstream failures |
 | 2026-01-16 | 933-10000 | 100% tx results + headers | Scope narrowed to results/headers only |

@@ -3140,6 +3140,7 @@ async fn cmd_verify_execution(
                 // Pass the pre-fee state for fee bump transactions so the STATE entry
                 // in tx_changes_before shows the correct pre-fee value
                 let fee_source_pre_state = fee_source_pre_states.get(tx_idx).cloned().flatten();
+
                 let exec_result = executor.execute_transaction_with_fee_mode_and_pre_state(
                     &snapshot_handle,
                     &tx_info.envelope,
@@ -3173,11 +3174,20 @@ async fn cmd_verify_execution(
                 // persisted to ledger state. Syncing them would incorrectly apply state changes
                 // that C++ stellar-core rolled back.
                 if cdp_succeeded {
-                    let cdp_changes = extract_changes_from_meta(&tx_info.meta);
+                    // Apply changes in phases to handle sequence number pollution in CDP metadata.
+                    // The issue: CDP metadata for operation changes can contain sequence numbers
+                    // from later transactions in the same ledger (due to how C++ captures STATE).
+                    // Solution: Apply tx_changes normally (includes real seq bumps), but preserve
+                    // our sequence numbers when applying operation changes.
+                    let (tx_changes, op_changes) = extract_changes_by_source(&tx_info.meta);
 
-                    let cdp_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
-                        cdp_changes.try_into().unwrap_or_default();
-                    executor.apply_ledger_entry_changes(&cdp_changes_vec);
+                    let tx_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
+                        tx_changes.try_into().unwrap_or_default();
+                    executor.apply_ledger_entry_changes(&tx_changes_vec);
+
+                    let op_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
+                        op_changes.try_into().unwrap_or_default();
+                    executor.apply_ledger_entry_changes_preserve_seq(&op_changes_vec);
 
                     if !tx_info.post_fee_meta.is_empty() {
                         if cdp_header.ledger_version >= 23 {
@@ -4956,50 +4966,128 @@ fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> St
     }
 }
 
-/// Extract all ledger entry changes from TransactionMeta.
+/// Extract all ledger entry changes from TransactionMeta, filtering out no-op changes.
+/// A no-op change is a STATE/UPDATED pair where the entries are identical (read but not modified).
 fn extract_changes_from_meta(
     meta: &stellar_xdr::curr::TransactionMeta,
 ) -> Vec<stellar_xdr::curr::LedgerEntryChange> {
-    use stellar_xdr::curr::TransactionMeta;
+    use stellar_xdr::curr::{LedgerEntryChange, TransactionMeta};
 
-    let mut changes = Vec::new();
+    let mut raw_changes = Vec::new();
 
     match meta {
         TransactionMeta::V0(operations) => {
             for op_meta in operations.iter() {
-                changes.extend(op_meta.changes.iter().cloned());
+                raw_changes.extend(op_meta.changes.iter().cloned());
             }
         }
         TransactionMeta::V1(v1) => {
-            changes.extend(v1.tx_changes.iter().cloned());
+            raw_changes.extend(v1.tx_changes.iter().cloned());
             for op_meta in v1.operations.iter() {
-                changes.extend(op_meta.changes.iter().cloned());
+                raw_changes.extend(op_meta.changes.iter().cloned());
             }
         }
         TransactionMeta::V2(v2) => {
-            changes.extend(v2.tx_changes_before.iter().cloned());
+            raw_changes.extend(v2.tx_changes_before.iter().cloned());
             for op_meta in v2.operations.iter() {
-                changes.extend(op_meta.changes.iter().cloned());
+                raw_changes.extend(op_meta.changes.iter().cloned());
             }
-            changes.extend(v2.tx_changes_after.iter().cloned());
+            raw_changes.extend(v2.tx_changes_after.iter().cloned());
         }
         TransactionMeta::V3(v3) => {
-            changes.extend(v3.tx_changes_before.iter().cloned());
+            raw_changes.extend(v3.tx_changes_before.iter().cloned());
             for op_meta in v3.operations.iter() {
-                changes.extend(op_meta.changes.iter().cloned());
+                raw_changes.extend(op_meta.changes.iter().cloned());
             }
-            changes.extend(v3.tx_changes_after.iter().cloned());
+            raw_changes.extend(v3.tx_changes_after.iter().cloned());
         }
         TransactionMeta::V4(v4) => {
-            changes.extend(v4.tx_changes_before.iter().cloned());
+            raw_changes.extend(v4.tx_changes_before.iter().cloned());
             for op_meta in v4.operations.iter() {
-                changes.extend(op_meta.changes.iter().cloned());
+                raw_changes.extend(op_meta.changes.iter().cloned());
             }
-            changes.extend(v4.tx_changes_after.iter().cloned());
+            raw_changes.extend(v4.tx_changes_after.iter().cloned());
         }
     }
 
-    changes
+    // Filter out no-op STATE/UPDATED pairs where the entry data is unchanged.
+    // In Stellar metadata, STATE and UPDATED always come as consecutive pairs.
+    // If STATE[i].data == UPDATED[i+1].data, it's a read without modification - skip both.
+    // Note: We compare only the `data` field, not `last_modified_ledger_seq` which changes on write.
+    let mut filtered = Vec::new();
+    let mut i = 0;
+    while i < raw_changes.len() {
+        if i + 1 < raw_changes.len() {
+            if let (LedgerEntryChange::State(state_entry), LedgerEntryChange::Updated(updated_entry)) =
+                (&raw_changes[i], &raw_changes[i + 1])
+            {
+                // Compare data portions only - last_modified_ledger_seq will differ
+                if state_entry.data == updated_entry.data {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        filtered.push(raw_changes[i].clone());
+        i += 1;
+    }
+
+    filtered
+}
+
+/// Extract ledger entry changes separated by source: tx_changes vs operation_changes.
+///
+/// Returns (tx_changes, operation_changes) where:
+/// - tx_changes = tx_changes_before + tx_changes_after (includes real sequence bumps)
+/// - operation_changes = all changes from operation execution (may have polluted seq values)
+fn extract_changes_by_source(
+    meta: &stellar_xdr::curr::TransactionMeta,
+) -> (
+    Vec<stellar_xdr::curr::LedgerEntryChange>,
+    Vec<stellar_xdr::curr::LedgerEntryChange>,
+) {
+    use stellar_xdr::curr::TransactionMeta;
+
+    let mut tx_changes = Vec::new();
+    let mut op_changes = Vec::new();
+
+    match meta {
+        TransactionMeta::V0(operations) => {
+            // V0 has no tx_changes, only operation changes
+            for op_meta in operations.iter() {
+                op_changes.extend(op_meta.changes.iter().cloned());
+            }
+        }
+        TransactionMeta::V1(v1) => {
+            tx_changes.extend(v1.tx_changes.iter().cloned());
+            for op_meta in v1.operations.iter() {
+                op_changes.extend(op_meta.changes.iter().cloned());
+            }
+        }
+        TransactionMeta::V2(v2) => {
+            tx_changes.extend(v2.tx_changes_before.iter().cloned());
+            for op_meta in v2.operations.iter() {
+                op_changes.extend(op_meta.changes.iter().cloned());
+            }
+            tx_changes.extend(v2.tx_changes_after.iter().cloned());
+        }
+        TransactionMeta::V3(v3) => {
+            tx_changes.extend(v3.tx_changes_before.iter().cloned());
+            for op_meta in v3.operations.iter() {
+                op_changes.extend(op_meta.changes.iter().cloned());
+            }
+            tx_changes.extend(v3.tx_changes_after.iter().cloned());
+        }
+        TransactionMeta::V4(v4) => {
+            tx_changes.extend(v4.tx_changes_before.iter().cloned());
+            for op_meta in v4.operations.iter() {
+                op_changes.extend(op_meta.changes.iter().cloned());
+            }
+            tx_changes.extend(v4.tx_changes_after.iter().cloned());
+        }
+    }
+
+    (tx_changes, op_changes)
 }
 
 /// Sample config command handler.
