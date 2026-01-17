@@ -5018,8 +5018,10 @@ fn extract_changes_from_meta(
     let mut i = 0;
     while i < raw_changes.len() {
         if i + 1 < raw_changes.len() {
-            if let (LedgerEntryChange::State(state_entry), LedgerEntryChange::Updated(updated_entry)) =
-                (&raw_changes[i], &raw_changes[i + 1])
+            if let (
+                LedgerEntryChange::State(state_entry),
+                LedgerEntryChange::Updated(updated_entry),
+            ) = (&raw_changes[i], &raw_changes[i + 1])
             {
                 // Compare data portions only - last_modified_ledger_seq will differ
                 if state_entry.data == updated_entry.data {

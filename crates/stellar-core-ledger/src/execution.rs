@@ -1180,7 +1180,8 @@ impl TransactionExecutor {
                 LedgerEntryChange::Updated(entry) => {
                     // For Account entries, preserve our sequence number
                     if let LedgerEntryData::Account(new_acc) = &entry.data {
-                        if let Some(existing_acc) = self.state.get_account_mut(&new_acc.account_id) {
+                        if let Some(existing_acc) = self.state.get_account_mut(&new_acc.account_id)
+                        {
                             // Preserve our sequence number
                             let our_seq = existing_acc.seq_num.0;
                             // Apply all fields from CDP entry
