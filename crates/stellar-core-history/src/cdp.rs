@@ -597,6 +597,94 @@ pub struct TransactionProcessingInfo {
     ///
     /// These changes are applied after the transaction body, such as Soroban refunds.
     pub post_fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+
+    /// Per-transaction base fee from the transaction set.
+    ///
+    /// This may differ from `header.base_fee` during surge pricing.
+    /// When `None`, use the ledger header's `base_fee`.
+    pub base_fee: Option<u32>,
+}
+
+/// Helper to build a map from transaction hash to per-component base fee.
+///
+/// The `GeneralizedTransactionSet` can contain per-phase/per-component base fees
+/// that differ from `header.base_fee` during surge pricing.
+fn build_tx_hash_to_base_fee_map(
+    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+    network_id: &[u8; 32],
+) -> std::collections::HashMap<[u8; 32], Option<u32>> {
+    let mut map = std::collections::HashMap::new();
+
+    let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = tx_set;
+    for phase in v1.phases.iter() {
+        match phase {
+            stellar_xdr::curr::TransactionPhase::V0(components) => {
+                for comp in components.iter() {
+                    match comp {
+                        stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                            let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                            for env in c.txs.iter() {
+                                if let Some(hash) = compute_tx_hash(env, network_id) {
+                                    map.insert(hash, base_fee);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                let base_fee = parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                for stage in parallel.execution_stages.iter() {
+                    for cluster in stage.iter() {
+                        for env in cluster.0.iter() {
+                            if let Some(hash) = compute_tx_hash(env, network_id) {
+                                map.insert(hash, base_fee);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    map
+}
+
+/// Compute the network-aware transaction hash.
+fn compute_tx_hash(
+    env: &stellar_xdr::curr::TransactionEnvelope,
+    network_id: &[u8; 32],
+) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{EnvelopeType, Limits, WriteXdr};
+
+    let mut hasher = Sha256::new();
+    hasher.update(network_id);
+
+    let envelope_type = match env {
+        stellar_xdr::curr::TransactionEnvelope::TxV0(_) => EnvelopeType::TxV0,
+        stellar_xdr::curr::TransactionEnvelope::Tx(_) => EnvelopeType::Tx,
+        stellar_xdr::curr::TransactionEnvelope::TxFeeBump(_) => EnvelopeType::TxFeeBump,
+    };
+    hasher.update((envelope_type as i32).to_be_bytes());
+
+    match env {
+        stellar_xdr::curr::TransactionEnvelope::TxV0(tx_v0) => {
+            let tx_xdr = tx_v0.tx.to_xdr(Limits::none()).ok()?;
+            hasher.update(&tx_xdr);
+        }
+        stellar_xdr::curr::TransactionEnvelope::Tx(tx_v1) => {
+            let tx_xdr = tx_v1.tx.to_xdr(Limits::none()).ok()?;
+            hasher.update(&tx_xdr);
+        }
+        stellar_xdr::curr::TransactionEnvelope::TxFeeBump(tx_bump) => {
+            let tx_xdr = tx_bump.tx.to_xdr(Limits::none()).ok()?;
+            hasher.update(&tx_xdr);
+        }
+    }
+
+    let result = hasher.finalize();
+    Some(result.into())
 }
 
 /// Extract complete transaction processing info in apply order.
@@ -626,6 +714,7 @@ pub fn extract_transaction_processing(
     match meta {
         LedgerCloseMeta::V0(v0) => {
             // V0 has a simpler structure - tx_set.txs and tx_processing should align
+            // V0 doesn't have per-component base fees, use header's base_fee
             let txs = &v0.tx_set.txs;
             let processing_count = v0.tx_processing.len();
             let result: Vec<_> = v0
@@ -639,6 +728,7 @@ pub fn extract_transaction_processing(
                         meta: tp.tx_apply_processing.clone(),
                         fee_meta: tp.fee_processing.clone(),
                         post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
+                        base_fee: None, // V0 doesn't have per-tx base fees
                     })
                 })
                 .collect();
@@ -657,6 +747,7 @@ pub fn extract_transaction_processing(
             // The transaction_hash uses network-aware hashing
             let txs = extract_txs_from_generalized_set(&v1.tx_set);
             let tx_map = build_tx_hash_map_with_network(&txs, network_id);
+            let base_fee_map = build_tx_hash_to_base_fee_map(&v1.tx_set, network_id);
             let processing_count = v1.tx_processing.len();
 
             let result: Vec<_> = v1
@@ -670,6 +761,7 @@ pub fn extract_transaction_processing(
                         meta: tp.tx_apply_processing.clone(),
                         fee_meta: tp.fee_processing.clone(),
                         post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
+                        base_fee: base_fee_map.get(&tx_hash).copied().flatten(),
                     })
                 })
                 .collect();
@@ -686,6 +778,7 @@ pub fn extract_transaction_processing(
         LedgerCloseMeta::V2(v2) => {
             let txs = extract_txs_from_generalized_set(&v2.tx_set);
             let tx_map = build_tx_hash_map_with_network(&txs, network_id);
+            let base_fee_map = build_tx_hash_to_base_fee_map(&v2.tx_set, network_id);
             let processing_count = v2.tx_processing.len();
 
             let result: Vec<_> = v2
@@ -699,6 +792,7 @@ pub fn extract_transaction_processing(
                         meta: tp.tx_apply_processing.clone(),
                         fee_meta: tp.fee_processing.clone(),
                         post_fee_meta: tp.post_tx_apply_fee_processing.clone(),
+                        base_fee: base_fee_map.get(&tx_hash).copied().flatten(),
                     })
                 })
                 .collect();

@@ -3078,10 +3078,14 @@ async fn cmd_verify_execution(
                 };
                 fee_source_pre_states.push(pre_fee_state);
 
+                // Use per-tx base_fee from transaction set if available (for surge pricing)
+                // otherwise fall back to header's base_fee
+                let effective_base_fee = tx_info.base_fee.unwrap_or(cdp_header.base_fee);
+
                 let fee_result = executor.process_fee_only(
                     &snapshot_handle,
                     &tx_info.envelope,
-                    cdp_header.base_fee,
+                    effective_base_fee,
                 );
 
                 // Compare our Phase 1 fee changes with CDP's fee_meta
@@ -3141,10 +3145,13 @@ async fn cmd_verify_execution(
                 // in tx_changes_before shows the correct pre-fee value
                 let fee_source_pre_state = fee_source_pre_states.get(tx_idx).cloned().flatten();
 
+                // Use per-tx base_fee from transaction set if available (for surge pricing)
+                let effective_base_fee = tx_info.base_fee.unwrap_or(cdp_header.base_fee);
+
                 let exec_result = executor.execute_transaction_with_fee_mode_and_pre_state(
                     &snapshot_handle,
                     &tx_info.envelope,
-                    cdp_header.base_fee,
+                    effective_base_fee,
                     prng_seed,
                     false, // deduct_fee = false - fees already processed
                     fee_source_pre_state,
