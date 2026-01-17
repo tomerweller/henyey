@@ -10,21 +10,31 @@ use sha2::{Digest, Sha256};
 // Use soroban-env-host types for Host interaction
 use soroban_env_host24::xdr::{ReadXdr as ReadXdrP24, WriteXdr as WriteXdrP24};
 use soroban_env_host24::{
-    budget::Budget,
+    budget::{AsBudget, Budget},
     e2e_invoke::{self},
     fees::{compute_rent_fee, LedgerEntryRentChange},
     storage::{EntryWithLiveUntil, SnapshotSource},
-    HostError as HostErrorP24, LedgerInfo as LedgerInfoP24,
+    vm::VersionedContractCodeCostInputs,
+    CompilationContext, ErrorHandler, HostError as HostErrorP24, LedgerInfo as LedgerInfoP24,
+    ModuleCache,
 };
 use soroban_env_host25::HostError as HostErrorP25;
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 
+// P25 module cache types
+use soroban_env_host25::{
+    budget::AsBudget as AsBudgetP25,
+    vm::VersionedContractCodeCostInputs as VersionedContractCodeCostInputsP25,
+    CompilationContext as CompilationContextP25, ErrorHandler as ErrorHandlerP25,
+    ModuleCache as ModuleCacheP25,
+};
+
 // Both soroban-env-host v25 and our code use stellar-xdr v25, so we can use types directly
 use stellar_xdr::curr::{
-    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry, SorobanTransactionData,
-    SorobanTransactionDataExt, WriteXdr,
+    AccountId, ContractCodeEntryExt, DiagnosticEvent, Hash, HostFunction, LedgerEntry,
+    LedgerEntryData, LedgerEntryExt, LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry,
+    SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
 };
 
 use super::error::convert_host_error_p24_to_p25;
@@ -641,6 +651,270 @@ fn convert_contract_cost_params_to_p24(
     .ok()
 }
 
+/// Context for pre-compiling WASM modules outside of transaction execution.
+/// This mimics how C++ stellar-core pre-compiles all contracts with an unlimited budget.
+/// We use the default budget limits (100M CPU, 40MB memory) which should be sufficient
+/// for compiling any individual contract.
+#[derive(Clone)]
+struct WasmCompilationContext(Budget);
+
+impl WasmCompilationContext {
+    /// Create a new compilation context with default budget limits.
+    /// The default limits (100M CPU, 40MB memory) are sufficient for compiling contracts.
+    fn new() -> Self {
+        Self(Budget::default())
+    }
+}
+
+impl ErrorHandler for WasmCompilationContext {
+    fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, HostErrorP24>
+    where
+        soroban_env_host24::Error: From<E>,
+        E: std::fmt::Debug,
+    {
+        res.map_err(HostErrorP24::from)
+    }
+
+    fn error(
+        &self,
+        error: soroban_env_host24::Error,
+        _msg: &str,
+        _args: &[soroban_env_host24::Val],
+    ) -> HostErrorP24 {
+        HostErrorP24::from(error)
+    }
+}
+
+impl AsBudget for WasmCompilationContext {
+    fn as_budget(&self) -> &Budget {
+        &self.0
+    }
+}
+
+impl CompilationContext for WasmCompilationContext {}
+
+/// Build a module cache by pre-compiling contract code entries from the footprint.
+///
+/// This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+/// all WASM contracts outside of transaction budgets. Without this, each
+/// transaction pays the full VmInstantiation cost for parsing WASM, which
+/// causes budget exceeded errors for transactions that would succeed with caching.
+///
+/// # Arguments
+///
+/// * `state` - Ledger state to read contract code from
+/// * `footprint` - Transaction footprint containing entries to cache
+/// * `protocol_version` - Current protocol version for module compilation
+/// * `current_ledger` - Current ledger sequence for TTL checks
+///
+/// # Returns
+///
+/// A module cache with pre-compiled contracts, or None if compilation context creation fails.
+fn build_module_cache_for_footprint(
+    state: &LedgerStateManager,
+    footprint: &stellar_xdr::curr::LedgerFootprint,
+    protocol_version: u32,
+    current_ledger: u32,
+) -> Option<ModuleCache> {
+    let ctx = WasmCompilationContext::new();
+    let cache = ModuleCache::new(&ctx).ok()?;
+
+    // Process both read-only and read-write keys
+    let all_keys = footprint
+        .read_only
+        .iter()
+        .chain(footprint.read_write.iter());
+
+    for key in all_keys {
+        if let LedgerKey::ContractCode(cc_key) = key {
+            // Check TTL to see if entry is still live
+            let live_until = get_entry_ttl(state, key, current_ledger);
+            if let Some(ttl) = live_until {
+                if ttl < current_ledger {
+                    // Entry is archived, skip it - it will need to be restored first
+                    continue;
+                }
+            }
+
+            // Get the contract code
+            if let Some(code_entry) = state.get_contract_code(&cc_key.hash) {
+                // Compute the contract ID (hash of the WASM code)
+                let contract_id = soroban_env_host24::xdr::Hash(
+                    <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
+                );
+
+                // Get cost inputs from the contract code entry extension
+                let cost_inputs = match &code_entry.ext {
+                    ContractCodeEntryExt::V0 => VersionedContractCodeCostInputs::V0 {
+                        wasm_bytes: code_entry.code.len(),
+                    },
+                    ContractCodeEntryExt::V1(v1) => {
+                        // Convert cost inputs from current XDR to P24 format
+                        if let Ok(bytes) = v1.cost_inputs.to_xdr(Limits::none()) {
+                            if let Ok(cost_inputs_p24) =
+                                soroban_env_host24::xdr::ContractCodeCostInputs::from_xdr(
+                                    &bytes,
+                                    soroban_env_host24::xdr::Limits::none(),
+                                )
+                            {
+                                VersionedContractCodeCostInputs::V1(cost_inputs_p24)
+                            } else {
+                                VersionedContractCodeCostInputs::V0 {
+                                    wasm_bytes: code_entry.code.len(),
+                                }
+                            }
+                        } else {
+                            VersionedContractCodeCostInputs::V0 {
+                                wasm_bytes: code_entry.code.len(),
+                            }
+                        }
+                    }
+                };
+
+                // Parse and cache the module
+                if let Err(e) = cache.parse_and_cache_module(
+                    &ctx,
+                    protocol_version,
+                    &contract_id,
+                    &code_entry.code,
+                    cost_inputs,
+                ) {
+                    tracing::warn!(
+                        hash = ?cc_key.hash,
+                        error = ?e,
+                        "Failed to pre-compile contract code for module cache"
+                    );
+                } else {
+                    tracing::debug!(
+                        hash = ?cc_key.hash,
+                        wasm_size = code_entry.code.len(),
+                        "Pre-compiled contract code for module cache"
+                    );
+                }
+            }
+        }
+    }
+
+    Some(cache)
+}
+
+/// Context for pre-compiling WASM modules outside of transaction execution (P25 version).
+/// This mimics how C++ stellar-core pre-compiles all contracts with an unlimited budget.
+/// We use the default budget limits (100M CPU, 40MB memory) which should be sufficient
+/// for compiling any individual contract.
+#[derive(Clone)]
+struct WasmCompilationContextP25(soroban_env_host25::budget::Budget);
+
+impl WasmCompilationContextP25 {
+    /// Create a new compilation context with default budget limits.
+    /// The default limits (100M CPU, 40MB memory) are sufficient for compiling contracts.
+    fn new() -> Self {
+        Self(soroban_env_host25::budget::Budget::default())
+    }
+}
+
+impl ErrorHandlerP25 for WasmCompilationContextP25 {
+    fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, HostErrorP25>
+    where
+        soroban_env_host25::Error: From<E>,
+        E: std::fmt::Debug,
+    {
+        res.map_err(HostErrorP25::from)
+    }
+
+    fn error(
+        &self,
+        error: soroban_env_host25::Error,
+        _msg: &str,
+        _args: &[soroban_env_host25::Val],
+    ) -> HostErrorP25 {
+        HostErrorP25::from(error)
+    }
+}
+
+impl AsBudgetP25 for WasmCompilationContextP25 {
+    fn as_budget(&self) -> &soroban_env_host25::budget::Budget {
+        &self.0
+    }
+}
+
+impl CompilationContextP25 for WasmCompilationContextP25 {}
+
+/// Build a module cache by pre-compiling contract code entries from the footprint (P25 version).
+///
+/// This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+/// all WASM contracts outside of transaction budgets.
+fn build_module_cache_for_footprint_p25(
+    state: &LedgerStateManager,
+    footprint: &stellar_xdr::curr::LedgerFootprint,
+    protocol_version: u32,
+    current_ledger: u32,
+) -> Option<ModuleCacheP25> {
+    let ctx = WasmCompilationContextP25::new();
+    let cache = ModuleCacheP25::new(&ctx).ok()?;
+
+    // Process both read-only and read-write keys
+    let all_keys = footprint
+        .read_only
+        .iter()
+        .chain(footprint.read_write.iter());
+
+    for key in all_keys {
+        if let LedgerKey::ContractCode(cc_key) = key {
+            // Check TTL to see if entry is still live
+            let live_until = get_entry_ttl(state, key, current_ledger);
+            if let Some(ttl) = live_until {
+                if ttl < current_ledger {
+                    // Entry is archived, skip it - it will need to be restored first
+                    continue;
+                }
+            }
+
+            // Get the contract code
+            if let Some(code_entry) = state.get_contract_code(&cc_key.hash) {
+                // Compute the contract ID (hash of the WASM code)
+                let contract_id = soroban_env_host25::xdr::Hash(
+                    <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
+                );
+
+                // Get cost inputs from the contract code entry extension
+                let cost_inputs = match &code_entry.ext {
+                    ContractCodeEntryExt::V0 => VersionedContractCodeCostInputsP25::V0 {
+                        wasm_bytes: code_entry.code.len(),
+                    },
+                    ContractCodeEntryExt::V1(v1) => {
+                        // P25 uses the same XDR types, so we can use them directly
+                        VersionedContractCodeCostInputsP25::V1(v1.cost_inputs.clone())
+                    }
+                };
+
+                // Parse and cache the module
+                if let Err(e) = cache.parse_and_cache_module(
+                    &ctx,
+                    protocol_version,
+                    &contract_id,
+                    &code_entry.code,
+                    cost_inputs,
+                ) {
+                    tracing::warn!(
+                        hash = ?cc_key.hash,
+                        error = ?e,
+                        "P25: Failed to pre-compile contract code for module cache"
+                    );
+                } else {
+                    tracing::debug!(
+                        hash = ?cc_key.hash,
+                        wasm_size = code_entry.code.len(),
+                        "P25: Pre-compiled contract code for module cache"
+                    );
+                }
+            }
+        }
+    }
+
+    Some(cache)
+}
+
 /// Execute a Soroban host function using soroban-env-host's e2e_invoke API.
 ///
 /// This uses the same high-level API that C++ stellar-core uses, which handles
@@ -708,12 +982,12 @@ fn execute_host_function_p24(
         mem_bytes_consumed: 0,
     };
 
-    // Create budget with network cost parameters
-    // Use a larger budget for the e2e_invoke call which includes XDR parsing overhead
-    // The transaction's instruction limit is for contract execution only, but e2e_invoke
-    // also meters the setup operations (XDR parsing, storage map building, etc.)
-    let instruction_limit = soroban_config.tx_max_instructions * 2; // Double for setup overhead
-    let memory_limit = soroban_config.tx_max_memory_bytes * 2; // Double for setup overhead
+    // Create budget with network cost parameters.
+    // C++ stellar-core passes the per-transaction specified instruction limit directly
+    // to the host (mResources.instructions in InvokeHostFunctionOpFrame.cpp line 547).
+    // The memory limit comes from the network config (ledger_info.memory_limit).
+    let instruction_limit = soroban_data.resources.instructions as u64;
+    let memory_limit = soroban_config.tx_max_memory_bytes;
 
     let budget = if soroban_config.has_valid_cost_params() {
         let cpu_cost_params = convert_contract_cost_params_to_p24(&soroban_config.cpu_cost_params)
@@ -1003,6 +1277,16 @@ fn execute_host_function_p24(
         "P24: Prepared entries for e2e_invoke"
     );
 
+    // Build module cache with pre-compiled contracts from the footprint.
+    // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+    // all WASM contracts outside of transaction budgets.
+    let module_cache = build_module_cache_for_footprint(
+        state,
+        &soroban_data.resources.footprint,
+        context.protocol_version,
+        context.sequence,
+    );
+
     // Call e2e_invoke - iterator yields &Vec<u8> which implements AsRef<[u8]>
     let mut diagnostic_events: Vec<soroban_env_host24::xdr::DiagnosticEvent> = Vec::new();
     let result = match e2e_invoke::invoke_host_function(
@@ -1019,7 +1303,7 @@ fn execute_host_function_p24(
         &seed,
         &mut diagnostic_events,
         None, // trace_hook
-        None, // module_cache - let host load from storage
+        module_cache,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -1149,8 +1433,11 @@ fn execute_host_function_p25(
         mem_bytes_consumed: 0,
     };
 
-    let instruction_limit = soroban_config.tx_max_instructions * 2;
-    let memory_limit = soroban_config.tx_max_memory_bytes * 2;
+    // C++ stellar-core passes the per-transaction specified instruction limit directly
+    // to the host (mResources.instructions in InvokeHostFunctionOpFrame.cpp line 547).
+    // The memory limit comes from the network config (ledger_info.memory_limit).
+    let instruction_limit = soroban_data.resources.instructions as u64;
+    let memory_limit = soroban_config.tx_max_memory_bytes;
 
     let budget = if soroban_config.has_valid_cost_params() {
         Budget::try_from_configs(
@@ -1381,6 +1668,16 @@ fn execute_host_function_p25(
         "P25: Prepared entries for e2e_invoke"
     );
 
+    // Build module cache with pre-compiled contracts from the footprint.
+    // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+    // all WASM contracts outside of transaction budgets.
+    let module_cache = build_module_cache_for_footprint_p25(
+        state,
+        &soroban_data.resources.footprint,
+        context.protocol_version,
+        context.sequence,
+    );
+
     let mut diagnostic_events: Vec<soroban_env_host25::xdr::DiagnosticEvent> = Vec::new();
 
     let result = match e2e_invoke::invoke_host_function(
@@ -1397,7 +1694,7 @@ fn execute_host_function_p25(
         &seed,
         &mut diagnostic_events,
         None,
-        None,
+        module_cache,
     ) {
         Ok(r) => r,
         Err(e) => {
