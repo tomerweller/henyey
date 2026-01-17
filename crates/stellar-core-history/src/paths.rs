@@ -348,10 +348,14 @@ mod tests {
     fn test_is_dirty_path() {
         use std::path::Path;
 
-        assert!(is_dirty_path(Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty")));
+        assert!(is_dirty_path(Path::new(
+            "ledger/00/00/00/ledger-0000003f.xdr.gz.dirty"
+        )));
         assert!(is_dirty_path(Path::new("foo.dirty")));
 
-        assert!(!is_dirty_path(Path::new("ledger/00/00/00/ledger-0000003f.xdr.gz")));
+        assert!(!is_dirty_path(Path::new(
+            "ledger/00/00/00/ledger-0000003f.xdr.gz"
+        )));
         assert!(!is_dirty_path(Path::new("foo.txt")));
         assert!(!is_dirty_path(Path::new(".dirty")));
     }

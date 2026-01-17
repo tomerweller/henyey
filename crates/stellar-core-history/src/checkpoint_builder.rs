@@ -199,16 +199,28 @@ impl CheckpointBuilder {
         }
 
         // Open new writers
-        let headers_dirty = self.publish_dir.join(checkpoint_path_dirty("ledger", checkpoint, "xdr.gz"));
-        let headers_final = self.publish_dir.join(checkpoint_path("ledger", checkpoint, "xdr.gz"));
+        let headers_dirty = self
+            .publish_dir
+            .join(checkpoint_path_dirty("ledger", checkpoint, "xdr.gz"));
+        let headers_final = self
+            .publish_dir
+            .join(checkpoint_path("ledger", checkpoint, "xdr.gz"));
         self.headers_writer = Some(XdrStreamWriter::new(headers_dirty, headers_final)?);
 
-        let tx_dirty = self.publish_dir.join(checkpoint_path_dirty("transactions", checkpoint, "xdr.gz"));
-        let tx_final = self.publish_dir.join(checkpoint_path("transactions", checkpoint, "xdr.gz"));
+        let tx_dirty =
+            self.publish_dir
+                .join(checkpoint_path_dirty("transactions", checkpoint, "xdr.gz"));
+        let tx_final = self
+            .publish_dir
+            .join(checkpoint_path("transactions", checkpoint, "xdr.gz"));
         self.transactions_writer = Some(XdrStreamWriter::new(tx_dirty, tx_final)?);
 
-        let results_dirty = self.publish_dir.join(checkpoint_path_dirty("results", checkpoint, "xdr.gz"));
-        let results_final = self.publish_dir.join(checkpoint_path("results", checkpoint, "xdr.gz"));
+        let results_dirty = self
+            .publish_dir
+            .join(checkpoint_path_dirty("results", checkpoint, "xdr.gz"));
+        let results_final = self
+            .publish_dir
+            .join(checkpoint_path("results", checkpoint, "xdr.gz"));
         self.results_writer = Some(XdrStreamWriter::new(results_dirty, results_final)?);
 
         self.current_checkpoint = Some(checkpoint);
@@ -461,12 +473,7 @@ mod tests {
                 base_fee: 100,
                 base_reserve: 5000000,
                 max_tx_set_size: 100,
-                skip_list: [
-                    Hash([0; 32]),
-                    Hash([0; 32]),
-                    Hash([0; 32]),
-                    Hash([0; 32]),
-                ],
+                skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
                 ext: LedgerHeaderExt::V0,
             },
             ext: LedgerHeaderHistoryEntryExt::default(),

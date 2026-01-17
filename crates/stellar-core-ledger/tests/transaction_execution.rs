@@ -603,6 +603,167 @@ fn test_execute_transaction_min_seq_num_precondition() {
     assert_eq!(result.failure, Some(ExecutionFailure::BadMinSeqAgeOrGap));
 }
 
+/// Test that with minSeqNum set, sequence validation is relaxed.
+/// Instead of requiring tx.seqNum == account.seqNum + 1,
+/// it allows any tx.seqNum where account.seqNum >= minSeqNum AND account.seqNum < tx.seqNum
+#[test]
+fn test_execute_transaction_min_seq_num_relaxed_sequence() {
+    let secret = SecretKey::from_seed(&[14u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    // Account has seq_num = 100
+    let (key, entry) = create_account_entry(account_id.clone(), 100, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .expect("add entry")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // With minSeqNum = 50, account.seqNum (100) >= minSeqNum (50) is satisfied.
+    // tx.seqNum = 105, account.seqNum (100) < tx.seqNum (105) is satisfied.
+    // Without minSeqNum, this would fail because 100 + 1 != 105.
+    // With minSeqNum, this should pass the sequence check.
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: None,
+        min_seq_num: Some(SequenceNumber(50)),
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(105), // Not account.seqNum + 1, but within valid range
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // Should succeed (or at least not fail with BadSequence)
+    // The tx might fail for other reasons (like destination doesn't exist),
+    // but the sequence check should pass.
+    assert!(
+        result.failure != Some(ExecutionFailure::BadSequence),
+        "Transaction should not fail with BadSequence when minSeqNum is set and sequence is in valid range"
+    );
+}
+
+/// Test that without minSeqNum, the strict sequence check still applies.
+#[test]
+fn test_execute_transaction_strict_sequence_without_min_seq_num() {
+    let secret = SecretKey::from_seed(&[15u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    // Account has seq_num = 100
+    let (key, entry) = create_account_entry(account_id.clone(), 100, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .expect("add entry")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // Without minSeqNum, tx.seqNum must equal account.seqNum + 1.
+    // tx.seqNum = 105, but account.seqNum + 1 = 101, so this should fail.
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: None,
+        min_seq_num: None, // No minSeqNum
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(105), // Wrong: should be 101
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // Should fail with BadSequence because strict check: 100 + 1 != 105
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::BadSequence),
+        "Transaction should fail with BadSequence when minSeqNum is not set and sequence doesn't match"
+    );
+}
+
 #[test]
 fn test_execute_transaction_min_seq_age_precondition() {
     let secret = SecretKey::from_seed(&[12u8; 32]);

@@ -1377,14 +1377,10 @@ impl Work for CheckSingleLedgerHeaderWork {
         match self.archive.get_ledger_headers(ledger_seq).await {
             Ok(headers) => {
                 // Find the header with the matching sequence
-                match headers
-                    .iter()
-                    .find(|h| h.header.ledger_seq == ledger_seq)
-                {
+                match headers.iter().find(|h| h.header.ledger_seq == ledger_seq) {
                     Some(found) => {
                         // Compare the headers
-                        if found.hash == self.expected.hash
-                            && found.header == self.expected.header
+                        if found.hash == self.expected.hash && found.header == self.expected.header
                         {
                             tracing::debug!(
                                 ledger_seq,
@@ -1407,12 +1403,10 @@ impl Work for CheckSingleLedgerHeaderWork {
                             ))
                         }
                     }
-                    None => {
-                        WorkOutcome::Failed(format!(
-                            "ledger header {} not found in checkpoint",
-                            ledger_seq
-                        ))
-                    }
+                    None => WorkOutcome::Failed(format!(
+                        "ledger header {} not found in checkpoint",
+                        ledger_seq
+                    )),
                 }
             }
             Err(err) => WorkOutcome::Failed(format!(

@@ -1687,6 +1687,12 @@ impl TransactionExecutor {
         }
 
         // Validate sequence number
+        // C++ stellar-core logic from TransactionFrame::isBadSeq:
+        // 1. Always reject if tx.seqNum == starting sequence for this ledger
+        // 2. If minSeqNum is set (protocol >= 19), use relaxed check:
+        //    bad if account.seqNum < minSeqNum OR account.seqNum >= tx.seqNum
+        // 3. Otherwise, use strict check:
+        //    bad if account.seqNum + 1 != tx.seqNum
         if self.ledger_seq <= i32::MAX as u32 {
             let starting_seq = (self.ledger_seq as i64) << 32;
             if frame.sequence_number() == starting_seq {
@@ -1703,30 +1709,51 @@ impl TransactionExecutor {
                 });
             }
         }
-        let Some(expected_seq) = source_account.seq_num.0.checked_add(1) else {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Bad sequence: sequence overflow".into()),
-                failure: Some(ExecutionFailure::BadSequence),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-            });
+
+        // Check for relaxed sequence validation (minSeqNum precondition)
+        let min_seq_num = match frame.preconditions() {
+            Preconditions::V2(cond) => cond.min_seq_num.map(|s| s.0),
+            _ => None,
         };
-        if frame.sequence_number() != expected_seq {
+
+        let account_seq = source_account.seq_num.0;
+        let tx_seq = frame.sequence_number();
+
+        tracing::debug!(
+            account_seq,
+            tx_seq,
+            min_seq_num = ?min_seq_num,
+            preconditions_type = ?std::mem::discriminant(&frame.preconditions()),
+            "Sequence number validation"
+        );
+
+        let is_bad_seq = if let Some(min_seq) = min_seq_num {
+            // Relaxed check: account.seqNum must be >= minSeqNum AND < tx.seqNum
+            account_seq < min_seq || account_seq >= tx_seq
+        } else {
+            // Strict check: account.seqNum + 1 must equal tx.seqNum
+            account_seq == i64::MAX || account_seq + 1 != tx_seq
+        };
+
+        if is_bad_seq {
+            let error_msg = if let Some(min_seq) = min_seq_num {
+                format!(
+                    "Bad sequence: account seq {} not in valid range [minSeqNum={}, txSeq={})",
+                    account_seq, min_seq, tx_seq
+                )
+            } else {
+                format!(
+                    "Bad sequence: expected {}, got {}",
+                    account_seq.saturating_add(1),
+                    tx_seq
+                )
+            };
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
                 fee_refund: 0,
                 operation_results: vec![],
-                error: Some(format!(
-                    "Bad sequence: expected {}, got {}",
-                    expected_seq,
-                    frame.sequence_number()
-                )),
+                error: Some(error_msg),
                 failure: Some(ExecutionFailure::BadSequence),
                 tx_meta: None,
                 fee_changes: None,

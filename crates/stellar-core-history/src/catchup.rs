@@ -1057,7 +1057,8 @@ impl CatchupManager {
             self.progress.current_ledger = seq;
             let checkpoint = checkpoint::checkpoint_containing(seq);
 
-            if let std::collections::hash_map::Entry::Vacant(e) = checkpoint_cache.entry(checkpoint) {
+            if let std::collections::hash_map::Entry::Vacant(e) = checkpoint_cache.entry(checkpoint)
+            {
                 let downloaded = self.download_checkpoint_ledger_data(checkpoint).await?;
                 e.insert(downloaded);
             }

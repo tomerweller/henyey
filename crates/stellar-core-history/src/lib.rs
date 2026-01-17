@@ -536,11 +536,7 @@ impl ArchiveEntry {
 
     /// Check if this archive can be used for reading.
     pub fn can_read(&self) -> bool {
-        self.archive.is_some()
-            || self
-                .remote
-                .as_ref()
-                .is_some_and(|r| r.can_read())
+        self.archive.is_some() || self.remote.as_ref().is_some_and(|r| r.can_read())
     }
 
     /// Check if this archive can be used for writing.
