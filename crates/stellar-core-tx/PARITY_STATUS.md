@@ -318,7 +318,10 @@ Transaction execution verified against CDP metadata for testnet ledgers:
 | Range | Transactions | Match Rate | Notes |
 |-------|--------------|------------|-------|
 | 32769-33000 | 432 | 98.8% (427/432) | Starting from fresh checkpoint |
-| 30001-35000 | 12,515 | 93.9% (11,754/12,515) | Includes state divergence effects |
+| 40001-41000 | 1,826 | 98.8% (1,804/1,826) | All mismatches after bucket list divergence |
+| 50001-52000 | 2,597 | 98.3% (2,553/2,597) | 44 mismatches, all state-dependent |
+
+**Key finding**: All transaction mismatches occur AFTER bucket list state diverges. Classic operations (Payment, ChangeTrust, etc.) return different error codes when state differs (e.g., `NoIssuer` vs `NoTrust`).
 
 ### Soroban WASM Module Cache
 
