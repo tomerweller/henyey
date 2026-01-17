@@ -313,27 +313,35 @@ Parity is verified through:
 
 ## Testnet Verification Results (January 2026)
 
-Transaction execution verified against CDP metadata for testnet ledgers 15001-50000:
+Transaction execution verified against CDP metadata for testnet ledgers:
 
-| Metric | Ledgers 15001-30000 | Ledgers 30001-50000 |
-|--------|---------------------|---------------------|
-| Classic transactions | >99% match | >99% match |
-| Soroban transactions | ~98% match | ~99% match |
+| Range | Transactions | Match Rate | Notes |
+|-------|--------------|------------|-------|
+| 32769-33000 | 432 | 98.8% (427/432) | Starting from fresh checkpoint |
+| 30001-35000 | 12,515 | 93.9% (11,754/12,515) | Includes state divergence effects |
 
-### Known Soroban Execution Differences
+### Soroban WASM Module Cache
 
-The remaining ~1-2% of Soroban transaction mismatches involve error code mapping:
+The Rust implementation now includes per-transaction WASM module caching that pre-compiles contract code from the transaction footprint before execution. This matches C++ stellar-core's `SharedModuleCacheCompiler` behavior:
 
-1. **Resource Limit Errors**: When a contract exceeds CPU/memory limits, Rust returns `InvokeHostFunction(ResourceLimitExceeded)` while C++ may return `InvokeHostFunction(Trapped)`.
+- **C++**: Pre-compiles ALL contract WASM from bucket list at startup (global cache)
+- **Rust**: Pre-compiles WASM for contracts in each transaction's footprint (per-TX cache)
 
-2. **Error Propagation**: The Soroban VM (`soroban-env-host`) maps host errors differently in some edge cases. The transaction still fails in both implementations, but with different result codes.
+Both approaches ensure WASM compilation costs are NOT charged against transaction CPU budgets.
 
-Example mismatch (ledger 32784):
-```
-Rust:  InvokeHostFunction(ResourceLimitExceeded)
-C++:   InvokeHostFunction(Trapped)
+### Known Execution Differences
 
-Context: cpu_consumed=10,368,752 cpu_specified=6,942,341
-```
+1. **Bucket List Divergence**: Header hash mismatches begin at ledger 32787 when starting from checkpoint 32767. This causes accumulated state divergence that can affect subsequent transaction execution.
 
-These differences do not affect ledger state correctness when the transaction fails - both implementations reject the transaction and charge fees. However, the differing result codes cause bucket list hash divergence in subsequent ledgers.
+2. **CPU Metering Differences**: Minor CPU consumption differences exist for some contract executions:
+   - Small differences (~100 instructions): `cpu_consumed=729769` vs `cpu_specified=729668`
+   - These are likely due to subtle differences in cost model calibration
+
+3. **State-Dependent Failures**: When bucket list state diverges, contracts may:
+   - Access storage entries with different values
+   - Fail with `Storage(ExceededLimit)` when expected entries don't exist
+   - Have different execution paths leading to different CPU consumption
+
+### Remaining Work
+
+The primary blocker for higher match rates is **bucket list state divergence**, which is being addressed in the `stellar-core-bucket` crate. Once bucket list parity is achieved, transaction execution match rates should exceed 99%.
