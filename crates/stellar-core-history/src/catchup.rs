@@ -56,7 +56,7 @@ use crate::{
 use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellar_core_bucket::{BucketList, BucketManager};
+use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
 use stellar_core_invariant::{
@@ -783,7 +783,7 @@ impl CatchupManager {
         &self,
         has: &HistoryArchiveState,
         buckets: &[(Hash256, Vec<u8>)],
-    ) -> Result<(BucketList, Option<BucketList>)> {
+    ) -> Result<(BucketList, Option<HotArchiveBucketList>)> {
         use std::collections::HashMap;
         use std::sync::Mutex;
         use stellar_core_bucket::Bucket;
@@ -978,7 +978,10 @@ impl CatchupManager {
         );
 
         // Build hot archive bucket list if present (protocol 23+)
+        // Hot archive uses HotArchiveBucketEntry (Metaentry/Archived/Live), not BucketEntry
         let hot_archive_bucket_list = if has.has_hot_archive_buckets() {
+            use stellar_core_bucket::HotArchiveBucket;
+
             let mut hot_hashes = Vec::with_capacity(22);
 
             for level_idx in 0..11 {
@@ -1004,7 +1007,70 @@ impl CatchupManager {
                 }
             }
 
-            let hot_bucket_list = BucketList::restore_from_hashes(&hot_hashes, load_bucket)
+            // Create a loader for HotArchiveBucket (different from live Bucket)
+            // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry
+            let bucket_dir_clone = bucket_dir.clone();
+            let archives_clone = archives.clone();
+
+            let load_hot_archive_bucket = |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
+                // Zero hash means empty bucket
+                if hash.is_zero() {
+                    return Ok(HotArchiveBucket::empty());
+                }
+
+                // Check if we have the XDR data in the pre-downloaded cache
+                let bucket_path = bucket_dir_clone.join(format!("{}.bucket", hash.to_hex()));
+
+                let xdr_data = if let Some(data) = {
+                    let mut preloaded = preloaded_buckets.lock().unwrap();
+                    preloaded.remove(hash)
+                } {
+                    data
+                } else if bucket_path.exists() {
+                    // Already saved to disk, read it back
+                    std::fs::read(&bucket_path).map_err(|e| {
+                        stellar_core_bucket::BucketError::NotFound(format!(
+                            "failed to read bucket from disk: {}",
+                            e
+                        ))
+                    })?
+                } else {
+                    // Download if needed (shouldn't happen if download_buckets was called)
+                    warn!("Hot archive bucket {} not found in cache, downloading", hash);
+                    let hash = *hash;
+                    let archives = archives_clone.clone();
+                    let download = async move {
+                        for archive in &archives {
+                            match archive.get_bucket(&hash).await {
+                                Ok(data) => return Ok(data),
+                                Err(e) => {
+                                    warn!("Failed to download hot archive bucket {} from archive: {}", hash, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(stellar_core_bucket::BucketError::NotFound(format!(
+                            "hot archive bucket {} not available from any archive",
+                            hash
+                        )))
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            stellar_core_bucket::BucketError::NotFound(format!(
+                                "failed to build runtime: {}",
+                                e
+                            ))
+                        })?;
+                    rt.block_on(download)?
+                };
+
+                // Parse as HotArchiveBucket (uses HotArchiveBucketEntry XDR)
+                HotArchiveBucket::from_xdr_bytes(&xdr_data)
+            };
+
+            let hot_bucket_list = HotArchiveBucketList::restore_from_hashes(&hot_hashes, load_hot_archive_bucket)
                 .map_err(|e| {
                     HistoryError::CatchupFailed(format!(
                         "Failed to restore hot archive bucket list: {}",
@@ -1251,7 +1317,7 @@ impl CatchupManager {
         &self,
         header: &LedgerHeader,
         bucket_list: &BucketList,
-        hot_archive_bucket_list: &Option<BucketList>,
+        hot_archive_bucket_list: &Option<HotArchiveBucketList>,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
@@ -1489,7 +1555,7 @@ impl CatchupManager {
     async fn replay_ledgers(
         &mut self,
         bucket_list: &mut BucketList,
-        mut hot_archive_bucket_list: Option<&mut BucketList>,
+        mut hot_archive_bucket_list: Option<&mut HotArchiveBucketList>,
         ledger_data: &[LedgerData],
         network_id: NetworkId,
     ) -> Result<ReplayedLedgerState> {
@@ -1774,7 +1840,7 @@ impl Default for CatchupManagerBuilder {
 fn create_header_from_replay_state(
     replay_state: &ReplayedLedgerState,
     bucket_list: &BucketList,
-    hot_archive_bucket_list: Option<&BucketList>,
+    hot_archive_bucket_list: Option<&HotArchiveBucketList>,
 ) -> LedgerHeader {
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::{

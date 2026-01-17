@@ -208,7 +208,7 @@ const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 
 fn combined_bucket_list_hash(
     live_bucket_list: &stellar_core_bucket::BucketList,
-    hot_archive_bucket_list: Option<&stellar_core_bucket::BucketList>,
+    hot_archive_bucket_list: Option<&stellar_core_bucket::HotArchiveBucketList>,
     protocol_version: u32,
 ) -> Hash256 {
     if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
@@ -308,7 +308,7 @@ pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
     bucket_list: &mut stellar_core_bucket::BucketList,
-    mut hot_archive_bucket_list: Option<&mut stellar_core_bucket::BucketList>,
+    mut hot_archive_bucket_list: Option<&mut stellar_core_bucket::HotArchiveBucketList>,
     network_id: &NetworkId,
     config: &ReplayConfig,
     expected_tx_results: Option<&[TransactionResultPair]>,
@@ -336,10 +336,12 @@ pub fn replay_ledger_with_execution(
         }
         // If not found and we have a hot archive, search there for archived entries and TTLs
         if let Some(ref hot_archive) = hot_archive_ref {
+            // HotArchiveBucketList::get returns Option<&LedgerEntry>, so clone if found
             return hot_archive
                 .read()
                 .map_err(|_| LedgerError::Snapshot("hot archive lock poisoned".to_string()))?
                 .get(key)
+                .map(|opt| opt.cloned())
                 .map_err(LedgerError::Bucket);
         }
         Ok(None)
@@ -528,14 +530,13 @@ pub fn replay_ledger_with_execution(
             archived_count = archived_entries.len(),
             "Hot archive add_batch - BEFORE"
         );
+        // HotArchiveBucketList::add_batch takes (ledger_seq, protocol_version, archived_entries, restored_keys)
         hot_archive
             .add_batch(
                 header.ledger_seq,
                 header.ledger_version,
-                BucketListType::HotArchive,
                 archived_entries,
-                vec![],
-                vec![],
+                vec![], // restored_keys
             )
             .map_err(HistoryError::Bucket)?;
         let post_hash = hot_archive.hash();

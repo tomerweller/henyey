@@ -566,7 +566,6 @@ impl HotArchiveBucketList {
         // Add new entries to level 0
         // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_tombstones_0 = Self::keep_tombstone_entries(0);
-
         self.levels[0].prepare(protocol_version, new_bucket, keep_tombstones_0, false)?;
         self.levels[0].commit();
 

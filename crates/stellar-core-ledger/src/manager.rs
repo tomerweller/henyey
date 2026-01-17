@@ -42,7 +42,7 @@ use crate::{
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellar_core_bucket::{BucketList, EvictionIterator, StateArchivalSettings};
+use stellar_core_bucket::{BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
 use stellar_core_invariant::{
@@ -278,7 +278,7 @@ pub struct LedgerManager {
     ///
     /// Contains archived/evicted entries. When present, its hash is combined
     /// with the live bucket list hash for the header's bucket_list_hash.
-    hot_archive_bucket_list: Arc<RwLock<Option<BucketList>>>,
+    hot_archive_bucket_list: Arc<RwLock<Option<HotArchiveBucketList>>>,
 
     /// Network passphrase (e.g., "Public Global Stellar Network ; September 2015").
     network_passphrase: String,
@@ -473,7 +473,7 @@ impl LedgerManager {
     pub fn initialize_from_buckets(
         &self,
         bucket_list: BucketList,
-        hot_archive_bucket_list: Option<BucketList>,
+        hot_archive_bucket_list: Option<HotArchiveBucketList>,
         header: LedgerHeader,
         header_hash: Option<Hash256>,
     ) -> Result<()> {
@@ -583,7 +583,7 @@ impl LedgerManager {
     pub fn reinitialize_from_buckets(
         &self,
         bucket_list: BucketList,
-        hot_archive_bucket_list: Option<BucketList>,
+        hot_archive_bucket_list: Option<HotArchiveBucketList>,
         header: LedgerHeader,
         header_hash: Option<Hash256>,
     ) -> Result<()> {
@@ -1337,13 +1337,13 @@ impl<'a> LedgerCloseContext<'a> {
                 if let Some(ref mut hot_archive) = *hot_archive_guard {
                     // Add archived entries to hot archive bucket list
                     // Must call add_batch even with empty entries to maintain spill consistency
+                    // Note: restored_keys would be populated when entries are restored from archive
+                    // (e.g., via restoreEntry operations), but for now we pass empty vec
                     hot_archive.add_batch(
                         self.close_data.ledger_seq,
                         protocol_version,
-                        BucketListType::HotArchive,
                         archived_entries,
-                        vec![],
-                        vec![],
+                        vec![], // restored_keys
                     )?;
 
                     use sha2::{Digest, Sha256};

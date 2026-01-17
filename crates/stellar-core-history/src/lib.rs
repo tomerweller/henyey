@@ -429,7 +429,7 @@ pub struct CatchupOutput {
     ///
     /// Contains recently evicted persistent entries that can be restored
     /// via the `RestoreFootprint` operation.
-    pub hot_archive_bucket_list: Option<stellar_core_bucket::BucketList>,
+    pub hot_archive_bucket_list: Option<stellar_core_bucket::HotArchiveBucketList>,
 
     /// The ledger header at the target ledger.
     ///
