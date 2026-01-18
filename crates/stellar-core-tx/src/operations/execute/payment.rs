@@ -110,15 +110,16 @@ fn execute_native_payment(
 
 /// Execute a credit asset payment.
 ///
-/// The order of checks matches C++ stellar-core's PathPaymentStrictReceive implementation:
+/// The order of operations matches C++ stellar-core's PathPaymentStrictReceive implementation:
 /// 1. Check destination exists
-/// 2. Check issuer exists
-/// 3. Check destination trustline (NoTrust)
-/// 4. Check destination authorized (NotAuthorized)
-/// 5. Check destination has room (LineFull)
-/// 6. Check source trustline (SrcNoTrust)
-/// 7. Check source authorized (SrcNotAuthorized)
-/// 8. Check source balance (Underfunded)
+/// 2. Check destination trustline exists and is authorized (NoTrust, NotAuthorized)
+/// 3. **Credit destination** (LineFull check happens here)
+/// 4. Check source trustline exists and is authorized (SrcNoTrust, SrcNotAuthorized)
+/// 5. **Debit source** (Underfunded check happens here)
+///
+/// IMPORTANT: The credit-before-debit order is critical for self-payments (source == dest).
+/// For a self-payment, both operations affect the same trustline. By crediting first, the
+/// balance is available for the subsequent debit, so self-payments succeed even with 0 balance.
 fn execute_credit_payment(
     source: &AccountId,
     dest: &AccountId,
@@ -141,14 +142,14 @@ fn execute_credit_payment(
     // Since we only support protocol 23+, we skip the issuer existence check.
     // The NoIssuer error code is effectively unused in modern protocols.
 
-    // Check destination trustline first (C++ updateDestBalance is called before updateSourceBalance)
+    // Step 1: Check and credit destination (updateDestBalance in C++)
     if issuer != dest {
         let dest_trustline = match state.get_trustline(dest, asset) {
             Some(tl) => tl,
             None => return Ok(make_result(PaymentResultCode::NoTrust)),
         };
 
-        // Check destination is authorized - this is unconditional (not dependent on auth_required)
+        // Check destination is authorized
         if !is_trustline_authorized(dest_trustline.flags) {
             return Ok(make_result(PaymentResultCode::NotAuthorized));
         }
@@ -160,38 +161,56 @@ fn execute_credit_payment(
         if dest_available < amount {
             return Ok(make_result(PaymentResultCode::LineFull));
         }
-    }
 
-    // Check source trustline (C++ updateSourceBalance is called after updateDestBalance)
-    if issuer != source {
-        let source_trustline = match state.get_trustline(source, asset) {
-            Some(tl) => tl,
-            None => return Ok(make_result(PaymentResultCode::SrcNoTrust)),
-        };
-
-        // Check source is authorized - this is unconditional (not dependent on auth_required)
-        // The AUTH_REQUIRED flag on issuer only affects whether NEW trustlines start authorized,
-        // but once a trustline exists, its AUTHORIZED flag controls whether it can send.
-        if !is_trustline_authorized(source_trustline.flags) {
-            return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
-        }
-
-        // Check source has sufficient balance
-        let available = source_trustline.balance - trustline_liabilities(source_trustline).selling;
-        if available < amount {
-            return Ok(make_result(PaymentResultCode::Underfunded));
-        }
-    }
-
-    // Apply the transfer - update destination first, then source
-    if issuer != dest {
+        // Credit destination NOW (before checking source)
+        // This is critical for self-payments where source == dest
         let dest_trustline_mut = state
             .get_trustline_mut(dest, asset)
             .ok_or_else(|| TxError::Internal("destination trustline disappeared".into()))?;
         dest_trustline_mut.balance += amount;
     }
 
+    // Step 2: Check and debit source (updateSourceBalance in C++)
     if issuer != source {
+        let source_trustline = match state.get_trustline(source, asset) {
+            Some(tl) => tl,
+            None => {
+                // Rollback destination credit if source check fails
+                if issuer != dest {
+                    if let Some(dest_tl) = state.get_trustline_mut(dest, asset) {
+                        dest_tl.balance -= amount;
+                    }
+                }
+                return Ok(make_result(PaymentResultCode::SrcNoTrust));
+            }
+        };
+
+        // Check source is authorized
+        if !is_trustline_authorized(source_trustline.flags) {
+            // Rollback destination credit
+            if issuer != dest {
+                if let Some(dest_tl) = state.get_trustline_mut(dest, asset) {
+                    dest_tl.balance -= amount;
+                }
+            }
+            return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
+        }
+
+        // Check source has sufficient balance (after destination credit)
+        // For self-payments, the balance now includes the credited amount
+        let selling_liabilities = trustline_liabilities(source_trustline).selling;
+        let available = source_trustline.balance - selling_liabilities;
+        if available < amount {
+            // Rollback destination credit
+            if issuer != dest {
+                if let Some(dest_tl) = state.get_trustline_mut(dest, asset) {
+                    dest_tl.balance -= amount;
+                }
+            }
+            return Ok(make_result(PaymentResultCode::Underfunded));
+        }
+
+        // Debit source
         let source_trustline_mut = state
             .get_trustline_mut(source, asset)
             .ok_or_else(|| TxError::Internal("source trustline disappeared".into()))?;
@@ -824,6 +843,103 @@ mod tests {
         match result {
             OperationResult::OpInner(OperationResultTr::Payment(r)) => {
                 assert!(matches!(r, PaymentResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_credit_self_payment_with_zero_balance_succeeds() {
+        // This tests the critical self-payment behavior where source == destination.
+        // Even with zero balance, a self-payment should succeed because:
+        // 1. The destination trustline is credited first (+amount)
+        // 2. Then the source trustline is debited (-amount)
+        // Since they're the same trustline, the credit makes the balance available for debit.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let account_id = create_test_account_id(0);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(account_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
+            issuer: issuer_id.clone(),
+        });
+        // Create trustline with ZERO balance
+        state.create_trustline(create_test_trustline(
+            account_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
+                issuer: issuer_id.clone(),
+            }),
+            0, // Zero balance!
+            1_000_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Self-payment: account pays itself 20,000 USDZ
+        let op = PaymentOp {
+            destination: create_test_muxed_account(0), // Same as source
+            asset,
+            amount: 200_000_000, // 20,000 USDZ (7 decimals)
+        };
+
+        let result = execute_payment(&op, &account_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Balance should still be zero after self-payment
+        let trustline = state.get_trustline(&account_id, &Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
+            issuer: issuer_id.clone(),
+        })).unwrap();
+        assert_eq!(trustline.balance, 0);
+    }
+
+    #[test]
+    fn test_credit_self_payment_line_full() {
+        // Self-payment should fail with LineFull if amount exceeds available room
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(9);
+        let account_id = create_test_account_id(0);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(account_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
+            issuer: issuer_id.clone(),
+        });
+        // Create trustline with balance near limit
+        state.create_trustline(create_test_trustline(
+            account_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
+                issuer: issuer_id.clone(),
+            }),
+            90, // Balance = 90
+            100, // Limit = 100, only 10 room
+            AUTHORIZED_FLAG,
+        ));
+
+        // Self-payment of 20 exceeds available room (10)
+        let op = PaymentOp {
+            destination: create_test_muxed_account(0), // Same as source
+            asset,
+            amount: 20,
+        };
+
+        let result = execute_payment(&op, &account_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::LineFull));
             }
             _ => panic!("Unexpected result type"),
         }

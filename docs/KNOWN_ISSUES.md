@@ -123,3 +123,44 @@ The original "CPU metering differences" were misattributed. The actual cause was
 3. Leading to different execution paths and results
 
 **Fixing the bucket list divergence (Issue #2) will eliminate all transaction execution mismatches.**
+
+---
+
+## 5. Credit Asset Self-Payment Order of Operations (RESOLVED)
+
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
+**Component:** Payment Operation
+**Fixed:** 2026-01-18
+
+### Description
+Self-payments (source == destination) for credit assets with zero balance were failing with `Payment(Underfunded)` instead of succeeding.
+
+### Root Cause
+The order of operations in `execute_credit_payment` was incorrect. The original code:
+1. Checked destination trustline authorization and room
+2. Checked source trustline authorization and balance → **FAILED** with 0 balance
+3. Credited destination
+4. Debited source
+
+The C++ stellar-core uses a different order via `PathPaymentStrictReceive`:
+1. Credits destination first (`updateDestBalance`)
+2. Then checks and debits source (`updateSourceBalance`)
+
+For self-payments where source == dest, both operations affect the **same trustline**. By crediting first, the balance becomes available for the subsequent debit check.
+
+### Resolution
+Reordered `execute_credit_payment` in `payment.rs` to:
+1. Check destination trustline authorization and room
+2. **Credit destination** (mutates the trustline)
+3. Check source trustline authorization and balance (sees the credited amount for self-payments)
+4. Debit source
+
+Added rollback logic to restore destination credit if source checks fail.
+
+### Affected Ledgers
+- Ledger 11143 TX 2: Self-payment of 20,000 USDZ
+- Ledger 11264, 11381, 11396: Similar self-payment transactions
+
+### Verification
+After fix: 611 transactions in range 11100-11400 verified with 0 mismatches.
