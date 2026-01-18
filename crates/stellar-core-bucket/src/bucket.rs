@@ -122,6 +122,19 @@ impl Bucket {
     ///
     /// Empty buckets are special-cased in bucket list operations and don't
     /// need to be stored on disk. The zero hash serves as a sentinel value.
+    ///
+    /// # In-memory entries for empty buckets
+    ///
+    /// In C++ stellar-core, empty buckets have `mEntries` initialized to an empty
+    /// vector. This means `hasInMemoryEntries()` returns true for empty buckets.
+    /// We match this behavior by setting `level_zero_entries` to an empty vector
+    /// rather than None. This is important because:
+    ///
+    /// 1. When level 0 snaps, curr becomes empty
+    /// 2. On the next ledger, prepare_first_level merges this empty curr with new entries
+    /// 3. If empty curr doesn't have "in-memory entries", we fall back to regular merge
+    /// 4. In C++, both empty curr and new entries have in-memory state, so in-memory merge is used
+    /// 5. We need to match this behavior for bucket list hash parity
     pub fn empty() -> Self {
         Self {
             hash: Hash256::ZERO,
@@ -129,7 +142,8 @@ impl Bucket {
                 entries: Arc::new(Vec::new()),
                 key_index: Arc::new(BTreeMap::new()),
             },
-            level_zero_entries: None,
+            // Empty vector, not None - matches C++ behavior where mEntries is an empty vector
+            level_zero_entries: Some(Arc::new(Vec::new())),
         }
     }
 
@@ -678,9 +692,23 @@ impl Bucket {
     ///
     /// This is like `from_sorted_entries` but also keeps entries in memory
     /// for level 0 optimization.
+    ///
+    /// # Important: METAENTRY exclusion from in-memory state
+    ///
+    /// Per C++ stellar-core (LiveBucket.h lines 35-38): "Stores all BucketEntries
+    /// (except METAENTRY) in the same order that they appear in the bucket file
+    /// for level 0 entries."
+    ///
+    /// The in-memory entries exclude METAENTRY because:
+    /// 1. METAENTRY is always first and can be reconstructed from protocol version
+    /// 2. In-memory merges generate fresh metadata based on max protocol version
+    /// 3. Keeping metadata separate simplifies the merge logic
     pub fn from_sorted_entries_with_in_memory(entries: Vec<BucketEntry>) -> Result<Self> {
         let mut bucket = Self::from_sorted_entries(entries.clone())?;
-        bucket.level_zero_entries = Some(Arc::new(entries));
+        // Store entries WITHOUT METAENTRY for in-memory merges (matches C++ behavior)
+        let in_memory_entries: Vec<BucketEntry> =
+            entries.into_iter().filter(|e| !e.is_metadata()).collect();
+        bucket.level_zero_entries = Some(Arc::new(in_memory_entries));
         Ok(bucket)
     }
 }

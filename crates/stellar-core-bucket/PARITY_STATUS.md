@@ -291,7 +291,7 @@ The Rust implementation correctly handles:
 - Bloom filter integration reduces disk I/O for negative lookups (fast rejection of missing keys)
 - Disk-backed buckets reduce memory usage during catchup but load entries on-demand
 - `RandomEvictionCache` provides LRU caching for frequently-accessed account entries
-- No in-memory level 0 optimization (all levels use same merge strategy)
+- In-memory level 0 optimization reduces disk I/O for frequent merges
 
 #### File Format Compatibility
 
@@ -312,7 +312,7 @@ The Rust implementation correctly handles:
 | LiveBucketList.h/cpp | bucket_list.rs | Complete |
 | HotArchiveBucketList.h/cpp | hot_archive.rs | Complete |
 | BucketBase.h/cpp | bucket.rs | Complete |
-| LiveBucket.h/cpp | bucket.rs, merge.rs | Partial (no in-memory optimization) |
+| LiveBucket.h/cpp | bucket.rs, merge.rs | Complete |
 | HotArchiveBucket.h/cpp | hot_archive.rs | Complete |
 | FutureBucket.h/cpp | future_bucket.rs | Complete (no shadow buckets) |
 | BucketManager.h/cpp | manager.rs | Complete (state operations) |

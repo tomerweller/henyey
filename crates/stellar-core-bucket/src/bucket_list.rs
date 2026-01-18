@@ -1275,12 +1275,16 @@ impl BucketList {
 
             // If we finished this bucket, move to the next one
             if finished_bucket {
-                let wrapped = iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
+                iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
 
-                // Check if we've completed a full cycle
-                if wrapped
-                    || (iter.bucket_list_level == start_iter.bucket_list_level
-                        && iter.is_curr_bucket == start_iter.is_curr_bucket)
+                // Check if we've completed a full cycle - only break when we return
+                // to the exact starting bucket (same level AND same is_curr).
+                // Note: The `wrapped` flag from advance_to_next_bucket just means we
+                // went from level 10 back to the starting level - it doesn't mean
+                // we've completed a full cycle since we still need to scan curr
+                // before reaching snap.
+                if iter.bucket_list_level == start_iter.bucket_list_level
+                    && iter.is_curr_bucket == start_iter.is_curr_bucket
                 {
                     result.scan_complete = true;
                     break;
@@ -1289,17 +1293,6 @@ impl BucketList {
         }
 
         result.end_iterator = iter;
-
-        tracing::debug!(
-            current_ledger,
-            bytes_scanned = result.bytes_scanned,
-            archived_count = result.archived_entries.len(),
-            evicted_count = result.evicted_keys.len(),
-            end_level = result.end_iterator.bucket_list_level,
-            end_is_curr = result.end_iterator.is_curr_bucket,
-            end_offset = result.end_iterator.bucket_file_offset,
-            "Incremental eviction scan completed"
-        );
 
         Ok(result)
     }
