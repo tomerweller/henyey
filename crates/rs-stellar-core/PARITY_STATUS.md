@@ -199,22 +199,33 @@ The `verify-execution` tool compares transaction execution against CDP (Crypto D
 | Phase 1 fee calculations mismatched | 0 | 0% |
 | Phase 2 execution matched | 36,248 | 99.3% |
 | Phase 2 execution mismatched | 262 | 0.7% |
-| Header verifications passed | 2,786 | 13.9% |
-| Header mismatches (bucket list divergence) | 17,214 | 86.1% |
+| Header verifications passed | 20,000 | 100% |
+| Header mismatches | 0 | 0% |
+
+**Ledgers 30001-33000 (after eviction scan fix):**
+| Metric | Count | Rate |
+|--------|-------|------|
+| Phase 1 fee calculations matched | 7,212 | 100% |
+| Phase 1 fee calculations mismatched | 0 | 0% |
+| Phase 2 execution matched | 6,596 | 91.5% |
+| Phase 2 execution mismatched | 616 | 8.5% |
+| Header verifications passed | 3,000 | 100% |
+| Header mismatches | 0 | 0% |
 
 **Phase 1 (Fee Calculation)**: 100% parity after implementing per-transaction base fee extraction from `GeneralizedTransactionSet` to handle surge pricing.
 
-**Phase 2 (Execution)**: ~98-99% parity. Remaining mismatches are primarily Soroban contract execution differences:
-- Different error codes for contract failures (e.g., `ResourceLimitExceeded` vs `Trapped`)
-- These affect ~0.7-1.7% of transactions
+**Phase 2 (Execution)**: ~91-99% parity. Remaining mismatches are primarily Soroban contract execution differences:
+- CPU metering differences causing `ResourceLimitExceeded` vs success
+- Storage limit handling differences
+- These affect ~0.7-8.5% of transactions depending on ledger range
 
-**Header Verification**: Header mismatches in ledgers 32787+ are cascading effects from Phase 2 Soroban execution differences. When transaction results differ, the bucket list state diverges, causing subsequent header hash mismatches.
+**Header Verification**: 100% parity after fixing eviction scan cycle completion check. Previous header mismatches in ledgers 32787+ were caused by incorrect eviction iterator advancement when wrapping from level 10 back to the starting level.
 
 ##### Known Phase 2 Mismatch Patterns
 
-1. **Soroban Error Code Mapping**: When contracts fail due to resource limits, Rust returns `InvokeHostFunction(ResourceLimitExceeded)` while C++ may return `InvokeHostFunction(Trapped)`. This is a Soroban VM error propagation difference.
+1. **Soroban CPU Metering Differences**: Small differences in CPU instruction counting between Rust and C++ Soroban implementations can cause transactions that are close to their budget limit to succeed in one implementation but fail in the other.
 
-2. **Cascading Bucket List Divergence**: Once a transaction result differs, the resulting state changes differ, which propagates to the bucket list hash and all subsequent ledger headers.
+2. **Soroban Error Code Mapping**: When contracts fail due to resource limits, Rust returns `InvokeHostFunction(ResourceLimitExceeded)` while C++ may return `InvokeHostFunction(Trapped)`. This is a Soroban VM error propagation difference.
 
 ##### Verified Components
 
