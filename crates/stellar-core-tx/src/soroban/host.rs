@@ -32,7 +32,7 @@ use soroban_env_host25::{
 
 // Both soroban-env-host v25 and our code use stellar-xdr v25, so we can use types directly
 use stellar_xdr::curr::{
-    AccountId, ContractCodeEntryExt, DiagnosticEvent, Hash, HostFunction, LedgerEntry,
+    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry,
     SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
 };
@@ -743,32 +743,12 @@ fn build_module_cache_for_footprint(
                     <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
                 );
 
-                // Get cost inputs from the contract code entry extension
-                let cost_inputs = match &code_entry.ext {
-                    ContractCodeEntryExt::V0 => VersionedContractCodeCostInputs::V0 {
-                        wasm_bytes: code_entry.code.len(),
-                    },
-                    ContractCodeEntryExt::V1(v1) => {
-                        // Convert cost inputs from current XDR to P24 format
-                        if let Ok(bytes) = v1.cost_inputs.to_xdr(Limits::none()) {
-                            if let Ok(cost_inputs_p24) =
-                                soroban_env_host24::xdr::ContractCodeCostInputs::from_xdr(
-                                    &bytes,
-                                    soroban_env_host24::xdr::Limits::none(),
-                                )
-                            {
-                                VersionedContractCodeCostInputs::V1(cost_inputs_p24)
-                            } else {
-                                VersionedContractCodeCostInputs::V0 {
-                                    wasm_bytes: code_entry.code.len(),
-                                }
-                            }
-                        } else {
-                            VersionedContractCodeCostInputs::V0 {
-                                wasm_bytes: code_entry.code.len(),
-                            }
-                        }
-                    }
+                // Use V0 cost inputs (just wasm_bytes) to match C++ stellar-core's behavior.
+                // C++ stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
+                // which only uses V0 cost inputs, regardless of what's in the ContractCodeEntry extension.
+                // Using V1 cost inputs would result in different cost calculations and budget exceeded errors.
+                let cost_inputs = VersionedContractCodeCostInputs::V0 {
+                    wasm_bytes: code_entry.code.len(),
                 };
 
                 // Parse and cache the module
@@ -877,15 +857,12 @@ fn build_module_cache_for_footprint_p25(
                     <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
                 );
 
-                // Get cost inputs from the contract code entry extension
-                let cost_inputs = match &code_entry.ext {
-                    ContractCodeEntryExt::V0 => VersionedContractCodeCostInputsP25::V0 {
-                        wasm_bytes: code_entry.code.len(),
-                    },
-                    ContractCodeEntryExt::V1(v1) => {
-                        // P25 uses the same XDR types, so we can use them directly
-                        VersionedContractCodeCostInputsP25::V1(v1.cost_inputs.clone())
-                    }
+                // Use V0 cost inputs (just wasm_bytes) to match C++ stellar-core's behavior.
+                // C++ stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
+                // which only uses V0 cost inputs, regardless of what's in the ContractCodeEntry extension.
+                // Using V1 cost inputs would result in different cost calculations and budget exceeded errors.
+                let cost_inputs = VersionedContractCodeCostInputsP25::V0 {
+                    wasm_bytes: code_entry.code.len(),
                 };
 
                 // Parse and cache the module

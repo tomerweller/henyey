@@ -371,6 +371,10 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
    - Fail with `Storage(ExceededLimit)` when expected entries don't exist
    - Have different execution paths leading to different CPU consumption
 
+### Resolved Issues
+
+1. **CPU Metering Differences (Fixed)**: Previously, minor CPU consumption differences (~100 instructions) were observed due to the module cache using V1 cost inputs. C++ stellar-core's `SharedModuleCacheCompiler` always uses `parse_and_cache_module_simple` which uses V0 cost inputs (just `wasm_bytes`). The Rust implementation now matches this behavior, resolving budget exceeded errors.
+
 ### Remaining Work
 
 1. **Bucket list parity**: The primary blocker for higher match rates at high ledger numbers is bucket list state divergence, being addressed in `stellar-core-bucket`.
