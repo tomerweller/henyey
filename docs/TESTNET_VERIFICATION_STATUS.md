@@ -33,8 +33,10 @@ cargo build --release -p rs-stellar-core
 |--------|-------|
 | Total ledgers verified | ~100,000 |
 | Total TX verified | **221,355** |
-| TX match rate | **99.99%** (21 mismatches) |
+| TX match rate | **99.99%+** (14 mismatches, all bucket-list induced) |
 | Header mismatches | ~63,000 (bucket list divergence) |
+| **AMM Pool State** | ✅ RESOLVED (ledger 20226) |
+| **InvokeHostFunction** | ✅ RESOLVED (ledgers 26961-27057) |
 | **PRNG divergence** | ✅ RESOLVED (ledgers 71655, 71766) |
 
 ### Verification Results by Range (933-100000)
@@ -42,7 +44,7 @@ cargo build --release -p rs-stellar-core
 | Range | Transactions | Mismatches | Parity | Header Issues | Notes |
 |-------|--------------|------------|--------|---------------|-------|
 | 933-20000 | 38,572 | 1 | **99.997%** | 11,346 | 1 Phase 2 mismatch (bucket list induced) |
-| 20000-40000 | 41,679 | 7 | **99.98%** | **0** | ⚠️ Genuine mismatches (see below) |
+| 20000-40000 | 41,679 | 0 | **100%** | **0** | ✅ All 7 mismatches fixed |
 | 40000-60000 | 27,758 | 0 | **100%** | 19,030 | Clean TX execution |
 | 60000-80000 | 31,943 | 0 | **100%** | 14,463 | Clean TX execution |
 | 80000-100000 | 81,403 | 13 | **99.98%** | 18,074 | Mismatches caused by bucket list |
@@ -58,23 +60,19 @@ cargo build --release -p rs-stellar-core
 | 250000-251000 | 2,457 | **100%** | Clean range |
 | 300000-301000 | 2,228 | **100%** | Clean range |
 
-### NEW: Genuine Mismatches (20000-40000 Range) - NEEDS INVESTIGATION
+### RESOLVED: Genuine Mismatches (20000-40000 Range)
 
-The 20000-40000 range has **0 header mismatches** (bucket list is correct), but 7 transaction mismatches were found. These are **genuine execution differences**, not caused by bucket list corruption:
+The 20000-40000 range previously had 7 transaction mismatches. Both issues are now **RESOLVED**:
 
-1. **Ledger 20226 TX 2**: PathPaymentStrictReceive via Liquidity Pool
-   - Our `amount_bought`: 2,289,449,975
-   - CDP `amount_bought`: 2,291,485,078
-   - Difference: ~2M XLM in constant product AMM calculation
-   - **Root cause**: Liquidity pool calculation difference (needs investigation)
+1. **Ledger 20226 TX 2**: PathPaymentStrictReceive via Liquidity Pool ✅ FIXED
+   - **Root cause**: `load_liquidity_pool` was overwriting CDP-synced state with stale snapshot data
+   - **Fix**: Added check to return existing state if pool already loaded (matching other entry types)
 
-2. **Ledgers 26961, 26962, 26963, 26976, 26982, 27057**: InvokeHostFunction
-   - Our result: `ResourceLimitExceeded`
-   - CDP result: `Success`
-   - **Root cause**: Unknown - our code is failing with resource limits but C++ succeeds
-   - All 6 transactions return different successful hashes in CDP
+2. **Ledgers 26961-27057**: InvokeHostFunction ✅ FIXED
+   - **Root cause**: Pre-compilation budget too limited, causing WASM compilation during execution
+   - **Fix**: Increased `WasmCompilationContext` budget to 10B CPU / 1GB memory
 
-These mismatches need investigation as they occur in a range with verified correct bucket list state.
+**After fixes**: 41,679 transactions verified with **0 mismatches** (100% parity).
 
 ### RESOLVED: Soroban PRNG Seed Divergence (Fixed in `3105525`)
 
@@ -145,21 +143,7 @@ C++ stellar-core uses `subSha256(baseSeed, static_cast<uint64_t>(index))` where 
 
 ## Remaining Issues
 
-### 1. Liquidity Pool Constant Product Calculation (NEEDS INVESTIGATION)
-At ledger 20226, a PathPaymentStrictReceive via liquidity pool shows different `amount_bought` values:
-- Our calculation: 2,289,449,975
-- C++ calculation: 2,291,485,078
-- Difference: ~0.09%
-
-This occurs in a range with perfect bucket list parity, indicating a genuine calculation difference in our constant product AMM implementation.
-
-### 2. InvokeHostFunction Resource Limit Checking (NEEDS INVESTIGATION)
-6 transactions at ledgers 26961-27057 fail with `ResourceLimitExceeded` in our code but succeed in C++. This also occurs in a range with perfect bucket list parity. Potential causes:
-- Resource tracking difference
-- Resource limit calculation difference
-- Different state being read due to subtle entry lookup differences
-
-### 3. Bucket List Divergence (CRITICAL)
+### 1. Bucket List Divergence (CRITICAL)
 The bucket list hash diverges in ~63% of checkpoint segments (63,000 header mismatches out of ~100,000 ledgers). This causes **cascading transaction failures** when state corrupts.
 
 **Impact**: When bucket list state diverges, subsequent transactions see different account balances or entry states. For example, at ledger 10710, a Payment operation returns `Underfunded` instead of `Success` due to incorrect balance tracking.

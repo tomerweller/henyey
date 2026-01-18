@@ -933,11 +933,20 @@ impl TransactionExecutor {
     }
 
     /// Load a liquidity pool from the snapshot into the state manager.
+    ///
+    /// If the pool already exists in state (e.g., from CDP sync or previous loading),
+    /// returns the existing state without reloading from snapshot. This is critical
+    /// for verification mode where CDP sync updates state between transactions.
     pub fn load_liquidity_pool(
         &mut self,
         snapshot: &SnapshotHandle,
         pool_id: &PoolId,
     ) -> Result<Option<LiquidityPoolEntry>> {
+        // Check if already loaded in state - don't overwrite with snapshot data
+        if let Some(pool) = self.state.get_liquidity_pool(pool_id) {
+            return Ok(Some(pool.clone()));
+        }
+
         let key = stellar_xdr::curr::LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: pool_id.clone(),
         });

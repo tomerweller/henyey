@@ -67,57 +67,48 @@ Segments 2, 9, 10, 12, 14, 15, 17, and others show divergence. See `TESTNET_VERI
 
 ---
 
-## 3. Liquidity Pool Constant Product AMM Calculation
+## 3. Liquidity Pool State Overwrite During Loading (RESOLVED)
 
-**Status:** Under Investigation
-**Severity:** Medium - Causes amount differences in PathPaymentStrictReceive
-**Component:** Liquidity Pool
-**Discovered:** 2026-01-18
-**Last Updated:** 2026-01-18
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
+**Component:** Liquidity Pool / Execution
+**Fixed:** 2026-01-18
 
 ### Description
-PathPaymentStrictReceive operations via liquidity pools show different `amount_bought` values compared to C++ stellar-core.
+PathPaymentStrictReceive operations via liquidity pools showed different `amount_bought` values compared to C++ stellar-core. At ledger 20226 TX 2: our `amount_bought` was 2,289,449,975 vs C++ 2,291,485,078.
 
-### Evidence
-At ledger 20226 TX 2 (in a range with perfect bucket list parity):
-- Our `amount_bought`: 2,289,449,975
-- C++ `amount_bought`: 2,291,485,078
-- Difference: 2,035,103 XLM (~0.089%)
+### Root Cause
+The `load_liquidity_pool` function in `execution.rs` was unconditionally loading pool entries from the bucket-list snapshot, **overwriting** any state that had been updated via CDP sync between transactions.
 
-### Investigation Findings
+When verification mode syncs state with CDP metadata after each transaction (to ensure subsequent transactions see correct state), the pool reserves were updated. However, when the next transaction's path payment operation called `load_path_payment_pools`, it reloaded the pool from the immutable snapshot, discarding the CDP-synced state.
 
-**Verified Correct:**
-1. Formula matches C++ `hugeDivide` exactly: `ceil(A * B / C)` using remainder theorem
-2. Reserve mapping (asset_a/asset_b to reserves_to/reserves_from) is correct
-3. Fee calculation (30 bps) is correct
-4. `from_pool` value (USDC received) matches C++ exactly: 3,218,171,791
+**Example flow before fix:**
+1. TX 0 (PathPaymentStrictSend) modifies pool: XLM=1,124,681,177,663 → 1,125,181,177,663
+2. CDP sync updates pool in state to 1,125,181,177,663
+3. TX 2 (PathPaymentStrictReceive) calls `load_liquidity_pool`
+4. `load_liquidity_pool` loads from snapshot → **overwrites** with OLD value 1,124,681,177,663
+5. Path payment computes wrong result using stale reserves
 
-**Intermediate Values (our calculation):**
+### Resolution
+Fixed `load_liquidity_pool` in `execution.rs` to check if the pool already exists in state before loading from snapshot:
+
+```rust
+pub fn load_liquidity_pool(...) -> Result<Option<LiquidityPoolEntry>> {
+    // Check if already loaded in state - don't overwrite with snapshot data
+    if let Some(pool) = self.state.get_liquidity_pool(pool_id) {
+        return Ok(Some(pool.clone()));
+    }
+    // ... load from snapshot only if not in state
+}
 ```
-a = 10000 (MAX_BPS)
-b = reserves_to_pool * from_pool = 3619417239823725904433
-c = (reserves_from_pool - from_pool) * (MAX_BPS - fee_bps) = 15809112581432040
-q = b / c = 228944
-r = b % c = 15768980348938673
-result = a*q + ceil(a*r/c) = 2289440000 + 9975 = 2289449975
-```
 
-This is mathematically correct given the inputs. The 0.089% difference suggests C++ may be reading different pool reserve values, despite bucket list hash matching at the ledger end.
-
-**Potential Root Causes:**
-1. Pool reserves differ during execution (earlier TX in same ledger modifies pool?)
-2. Subtle difference in how XDR pool entry is parsed/read
-3. Different intermediate state snapshot timing
+This matches the pattern used by `load_account`, `load_trustline`, `load_offer`, and other entry loading functions.
 
 ### Affected Transactions
 - Ledger 20226 TX 2: PathPaymentStrictReceive via XLM/USDC pool
-- Pool ID: 4cd1f6defba237eecbc5fefe259f89ebc4b5edd49116beb5536c4034fc48d63f
-- Reserves seen: XLM=1,124,681,177,663, USDC=1,588,886,434,723
 
-### Next Steps
-- Compare pool reserve values at transaction execution time vs CDP metadata
-- Check if earlier transactions in the same ledger modify this pool
-- Run C++ stellar-core with debug logging to capture intermediate values
+### Verification
+After fix: 41,679 transactions in range 20000-40000 verified with 0 mismatches (100% parity).
 
 ---
 
