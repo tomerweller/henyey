@@ -27,6 +27,49 @@ cargo build --release -p rs-stellar-core
 
 **Last verification run**: 2026-01-18
 
+### Extended Verification Summary
+
+| Metric | Value |
+|--------|-------|
+| Total TX verified | ~100,000+ |
+| TX match rate | **99.98%+** |
+| Clean ranges verified | 30000-36000, 50000-60000, 100000-110000, 250000-251000, 300000-301000 |
+| **Critical finding** | 2 real Soroban execution divergences |
+
+### Verification Results by Range
+
+| Range | Transactions | Parity | Notes |
+|-------|--------------|--------|-------|
+| 30000-36000 | 14,651 | **100%** | Clean range, all match |
+| 30000-40000 | 21,999 | 99.98% | 4 mismatches after bucket list diverges |
+| 50000-60000 | 13,246 | **100%** | Clean range |
+| 70000-75000 | 9,027 | 99.98% | **2 REAL DIVERGENCES** at 71655, 71766 |
+| 100000-110000 | 37,744 | **100%** | Clean range |
+| 250000-251000 | 2,457 | **100%** | Clean range |
+| 300000-301000 | 2,228 | **100%** | Clean range |
+
+### Critical Finding: Real Soroban Execution Divergence
+
+**Found 2 transactions where both Rust and C++ succeeded but returned DIFFERENT hash values:**
+
+1. **Ledger 71655**:
+   - Our hash: `e12337f8aabf2af4c90ad7c7c0aff9495a0d346008a0c40c02e17a818dc53014`
+   - CDP hash: `7ecf7e8454b3758e6a5f8a68801b377141d40691308f009e82e6c780c4a0b0d3`
+
+2. **Ledger 71766**:
+   - Our hash: `5d52ad15f24c4a27c17e3923d880b3d6561ceb152e4ee495155e96fbf038fece`
+   - CDP hash: `2834b42856c37e9e494d5bcc8717165d5b0a82166033347473544d678f4983c0`
+
+**These are NOT bucket list divergence issues** - both executions succeeded (`InvokeHostFunction(Success(...))`) but the returned hash (contract return value) differs. This indicates a real Soroban execution difference.
+
+**Possible causes**:
+- PRNG seed differences (Soroban contracts can use randomness)
+- Ledger timestamp/sequence number handling
+- Contract storage state differences
+- Host function implementation differences
+
+**Status**: Under investigation
+
 ### Parallel Full Testnet Verification (Partial - 41/109 segments)
 
 | Metric | Value |
@@ -102,15 +145,20 @@ The bucket list hash diverges from CDP in ledgers 933-15000, but is correct in 1
 
 ## Next Steps
 
-1. **Extend verification range**: Test beyond ledger 15000 to verify larger dataset
-2. **Monitor for new issues**: Run verification periodically to catch regressions
-3. **Soroban metering investigation** (low priority): Investigate why our soroban-env-host consumes more CPU than C++
+1. **Investigate Soroban hash divergence** (HIGH PRIORITY): Debug ledgers 71655 and 71766 to find root cause of different return values
+2. **Extend verification range**: Continue testing across full testnet history
+3. **Monitor for new issues**: Run verification periodically to catch regressions
+4. **Soroban metering investigation** (low priority): Investigate why our soroban-env-host consumes more CPU than C++
 
-## Recent Fixes (This Session)
+## Recent Fixes (January 2026)
 
-1. **minSeqNum relaxed sequence validation** (`7b249b5`): Fixed sequence validation to use relaxed check when minSeqNum is set. C++ allows any `tx.seqNum` where `account.seqNum >= minSeqNum AND account.seqNum < tx.seqNum`.
-2. **CDP state sync sequence number pollution** (`1898c9b`): Fixed BadSequence errors caused by CDP metadata containing polluted sequence numbers from operation changes.
-3. **min_seq_age/min_seq_ledger_gap validation** (`10620bc`): Fixed to use account's V3 extension fields (`seq_time`, `seq_ledger`) instead of `last_modified_ledger_seq`.
+1. **Clawback trustline flag fix** (`4f39c0e`): Fixed Clawback to check `TRUSTLINE_CLAWBACK_ENABLED_FLAG` (0x4) on the trustline instead of `AUTH_CLAWBACK_ENABLED_FLAG` (0x8) on the issuer account.
+2. **Payment NoIssuer fix** (`5a567b1`): Removed protocol-obsolete issuer existence check in Payment operations. Since protocol v13 (CAP-0017), issuer existence is not checked.
+3. **HashX signature validation** (`80a9870`): Fixed signature validation to accept variable-length HashX signatures instead of requiring 64-byte Ed25519 format.
+4. **Soroban temporary entry archival** (`80a9870`): Fixed to treat expired temporary entries as non-existent rather than archived.
+5. **minSeqNum relaxed sequence validation** (`7b249b5`): Fixed sequence validation to use relaxed check when minSeqNum is set.
+6. **CDP state sync sequence number pollution** (`1898c9b`): Fixed BadSequence errors caused by polluted sequence numbers in CDP metadata.
+7. **min_seq_age/min_seq_ledger_gap validation** (`10620bc`): Fixed to use account's V3 extension fields.
 
 ---
 
