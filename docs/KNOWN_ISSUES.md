@@ -164,3 +164,31 @@ Added rollback logic to restore destination credit if source checks fail.
 
 ### Verification
 After fix: 611 transactions in range 11100-11400 verified with 0 mismatches.
+
+---
+
+## 6. ClaimClaimableBalance NoTrust (Unresolved)
+
+**Status:** Unresolved - Needs Investigation
+**Severity:** Medium - Affects specific transactions
+**Component:** Claimable Balance / Trustline Loading
+**Discovered:** 2026-01-18
+
+### Description
+Three transactions fail with `ClaimClaimableBalance(NoTrust)` instead of `Success` even when bucket list state is correct (0 header mismatches in the segment).
+
+### Affected Ledgers
+- Ledger 37272 TX 0: ClaimClaimableBalance(NoTrust) vs Success
+- Ledger 37307 TX 0: ClaimClaimableBalance(NoTrust) vs Success
+- Ledger 37316 TX 1: ClaimClaimableBalance(NoTrust) vs Success
+
+### Symptoms
+The `NoTrust` error indicates the claimant's trustline for the claimed asset was not found. However:
+- Horizon confirms these transactions succeeded
+- The bucket list state is correct (headers match)
+- This suggests an issue with trustline/claimable balance entry loading
+
+### Potential Causes
+1. Trustline not being loaded from bucket list correctly
+2. Claimable balance entry asset type mismatch
+3. Issue with entry key generation for lookup

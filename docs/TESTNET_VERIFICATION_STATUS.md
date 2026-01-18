@@ -40,10 +40,12 @@ cargo build --release -p rs-stellar-core
 
 | Range | Transactions | Parity | Notes |
 |-------|--------------|--------|-------|
+| 10000-20000 | 26,916 | **100%** | ✅ Self-payment fix verified |
 | 30000-36000 | 14,651 | **100%** | Clean range, all match |
-| 30000-40000 | 21,999 | 99.98% | 4 mismatches after bucket list diverges |
-| 50000-60000 | 13,246 | **100%** | Clean range |
+| 30000-40000 | 21,999 | 99.98% | 4 mismatches (ClaimClaimableBalance/InvokeHostFunction) |
+| 50000-60000 | 13,246 | **100%** | Clean range (header mismatches due to bucket list) |
 | 70000-75000 | 9,027 | **100%** | Fixed: PRNG seed was 2 divergences (now resolved) |
+| 70000-80000 | 16,662 | **100%** | Clean range (header mismatches due to bucket list) |
 | 100000-110000 | 37,744 | **100%** | Clean range |
 | 250000-251000 | 2,457 | **100%** | Clean range |
 | 300000-301000 | 2,228 | **100%** | Clean range |
@@ -133,6 +135,15 @@ The bucket list hash diverges in ~54% of segments. This is the **root cause of A
 ### Phase 1 Fee Differences (52 cases - NEEDS INVESTIGATION)
 A small number of transactions show Phase 1 fee calculation differences. This needs further investigation to understand the root cause.
 
+### ClaimClaimableBalance NoTrust (4 cases - NEEDS INVESTIGATION)
+Four transactions in segment 30000-40000 show `ClaimClaimableBalance(NoTrust)` instead of `Success`:
+- Ledger 37272 TX 0: ClaimClaimableBalance + Payment
+- Ledger 37307 TX 0: ClaimClaimableBalance + Payment
+- Ledger 37316 TX 1: ClaimClaimableBalance + Payment
+- Ledger 37046 TX 1: InvokeHostFunction (separate Soroban issue)
+
+These occur in a segment with **correct bucket list state** (0 header mismatches), suggesting a bug in claimable balance or trustline handling rather than state corruption.
+
 ### ~~Soroban CPU Metering (RESOLVED)~~
 ~~Previously reported as "our soroban-env-host consumes more CPU than C++".~~
 
@@ -157,6 +168,7 @@ A small number of transactions show Phase 1 fee calculation differences. This ne
 9. **Ed25519SignedPayload extra signer verification** (2026-01-18): Fixed two bugs in signed payload signature verification per CAP-0040:
    - Hint calculation: Must use XOR of public key hint and payload hint (not just public key hint)
    - Signature verification: Must verify signature against raw payload bytes (not SHA256 hash of payload)
+10. **Credit asset self-payment order of operations** (2026-01-18): Fixed self-payments (source == destination) for credit assets to credit destination before checking source balance. C++ stellar-core uses `updateDestBalance` before `updateSourceBalance` in PathPaymentStrictReceive, so for self-payments the credited amount is available for the debit check. Affected ledgers: 11143, 11264, 11381, 11396.
 
 ---
 
