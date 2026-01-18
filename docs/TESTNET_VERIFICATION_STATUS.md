@@ -135,14 +135,14 @@ The bucket list hash diverges in ~54% of segments. This is the **root cause of A
 ### Phase 1 Fee Differences (52 cases - NEEDS INVESTIGATION)
 A small number of transactions show Phase 1 fee calculation differences. This needs further investigation to understand the root cause.
 
-### ClaimClaimableBalance NoTrust (4 cases - NEEDS INVESTIGATION)
-Four transactions in segment 30000-40000 show `ClaimClaimableBalance(NoTrust)` instead of `Success`:
-- Ledger 37272 TX 0: ClaimClaimableBalance + Payment
-- Ledger 37307 TX 0: ClaimClaimableBalance + Payment
-- Ledger 37316 TX 1: ClaimClaimableBalance + Payment
-- Ledger 37046 TX 1: InvokeHostFunction (separate Soroban issue)
+### ClaimClaimableBalance Issuer NoTrust (RESOLVED)
+~~Four transactions in segment 30000-40000 showed `ClaimClaimableBalance(NoTrust)` instead of `Success`.~~
 
-These occur in a segment with **correct bucket list state** (0 header mismatches), suggesting a bug in claimable balance or trustline handling rather than state corruption.
+**Root Cause**: Issuers claiming their own claimable balances don't need trustlines. C++ `TrustLineWrapper::IssuerImpl` handles this, but our Rust code was missing the issuer check.
+
+**Fix**: Added issuer check in `execute_claim_claimable_balance` - if source is the asset issuer, skip trustline lookup.
+
+**Remaining**: 1 InvokeHostFunction(Trapped) at ledger 37046 (separate Soroban issue).
 
 ### ~~Soroban CPU Metering (RESOLVED)~~
 ~~Previously reported as "our soroban-env-host consumes more CPU than C++".~~
@@ -169,6 +169,7 @@ These occur in a segment with **correct bucket list state** (0 header mismatches
    - Hint calculation: Must use XOR of public key hint and payload hint (not just public key hint)
    - Signature verification: Must verify signature against raw payload bytes (not SHA256 hash of payload)
 10. **Credit asset self-payment order of operations** (2026-01-18): Fixed self-payments (source == destination) for credit assets to credit destination before checking source balance. C++ stellar-core uses `updateDestBalance` before `updateSourceBalance` in PathPaymentStrictReceive, so for self-payments the credited amount is available for the debit check. Affected ledgers: 11143, 11264, 11381, 11396.
+11. **ClaimClaimableBalance issuer handling** (2026-01-18): Fixed issuers claiming their own claimable balances. C++ `TrustLineWrapper::IssuerImpl` allows issuers to receive their own asset without a trustline. Added issuer check to skip trustline lookup. Affected ledgers: 37272, 37307, 37316.
 
 ---
 

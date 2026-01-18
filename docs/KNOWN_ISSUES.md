@@ -167,28 +167,40 @@ After fix: 611 transactions in range 11100-11400 verified with 0 mismatches.
 
 ---
 
-## 6. ClaimClaimableBalance NoTrust (Unresolved)
+## 6. ClaimClaimableBalance Issuer NoTrust (RESOLVED)
 
-**Status:** Unresolved - Needs Investigation
-**Severity:** Medium - Affects specific transactions
-**Component:** Claimable Balance / Trustline Loading
-**Discovered:** 2026-01-18
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
+**Component:** Claimable Balance
+**Fixed:** 2026-01-18
 
 ### Description
-Three transactions fail with `ClaimClaimableBalance(NoTrust)` instead of `Success` even when bucket list state is correct (0 header mismatches in the segment).
+Three transactions failed with `ClaimClaimableBalance(NoTrust)` instead of `Success` when the claimant was the issuer of the claimed asset.
+
+### Root Cause
+In C++ stellar-core, `TrustLineWrapper` has special handling for issuers via `IssuerImpl`:
+- When `getIssuer(asset) == accountID`, creates an `IssuerImpl` instead of loading a trustline
+- `IssuerImpl` always returns `true` for existence/authorization, `INT64_MAX` for balance
+- This allows issuers to receive their own asset without a trustline
+
+Our Rust code was missing this issuer handling - we always tried to load a trustline, which returns `None` for issuers (they don't have trustlines for their own assets).
+
+### Resolution
+Added issuer check in `execute_claim_claimable_balance`:
+```rust
+if source == issuer {
+    // Issuer claiming their own asset: no trustline update needed
+    // (tokens are effectively burned/returned to issuer)
+} else {
+    // Non-issuer: check trustline exists
+    ...
+}
+```
 
 ### Affected Ledgers
-- Ledger 37272 TX 0: ClaimClaimableBalance(NoTrust) vs Success
-- Ledger 37307 TX 0: ClaimClaimableBalance(NoTrust) vs Success
-- Ledger 37316 TX 1: ClaimClaimableBalance(NoTrust) vs Success
+- Ledger 37272 TX 0: Issuer claiming USDPEND claimable balance
+- Ledger 37307 TX 0: Same issuer claiming claimable balance
+- Ledger 37316 TX 1: Same issuer claiming claimable balance
 
-### Symptoms
-The `NoTrust` error indicates the claimant's trustline for the claimed asset was not found. However:
-- Horizon confirms these transactions succeeded
-- The bucket list state is correct (headers match)
-- This suggests an issue with trustline/claimable balance entry loading
-
-### Potential Causes
-1. Trustline not being loaded from bucket list correctly
-2. Claimable balance entry asset type mismatch
-3. Issue with entry key generation for lookup
+### Verification
+After fix: 481 transactions in range 37040-37320 verified with only 1 mismatch (separate InvokeHostFunction issue at ledger 37046).

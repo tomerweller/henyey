@@ -309,22 +309,36 @@ pub fn execute_claim_claimable_balance(
             }
         }
         _ => {
-            // For non-native assets, check trustline exists
-            match state.get_trustline_mut(source, &entry.asset) {
-                Some(tl) => {
-                    if !is_trustline_authorized(tl.flags) {
-                        return Ok(make_claim_result(
-                            ClaimClaimableBalanceResultCode::NotAuthorized,
-                        ));
+            // Get the issuer of the asset
+            let issuer = match &entry.asset {
+                Asset::CreditAlphanum4(a) => &a.issuer,
+                Asset::CreditAlphanum12(a) => &a.issuer,
+                Asset::Native => unreachable!(),
+            };
+
+            // If source is the issuer, they don't need a trustline (C++ IssuerImpl behavior).
+            // Issuers have unlimited trust for their own assets - just skip the trustline check.
+            if source == issuer {
+                // Issuer claiming their own asset: no trustline update needed
+                // (the tokens are effectively burned/returned to issuer)
+            } else {
+                // Non-issuer: check trustline exists
+                match state.get_trustline_mut(source, &entry.asset) {
+                    Some(tl) => {
+                        if !is_trustline_authorized(tl.flags) {
+                            return Ok(make_claim_result(
+                                ClaimClaimableBalanceResultCode::NotAuthorized,
+                            ));
+                        }
+                        // Check trustline limit
+                        if tl.balance + entry.amount > tl.limit {
+                            return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
+                        }
+                        tl.balance += entry.amount;
                     }
-                    // Check trustline limit
-                    if tl.balance + entry.amount > tl.limit {
-                        return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
+                    None => {
+                        return Ok(make_claim_result(ClaimClaimableBalanceResultCode::NoTrust));
                     }
-                    tl.balance += entry.amount;
-                }
-                None => {
-                    return Ok(make_claim_result(ClaimClaimableBalanceResultCode::NoTrust));
                 }
             }
         }
@@ -994,6 +1008,52 @@ mod tests {
         match result {
             OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
                 assert!(matches!(r, ClaimClaimableBalanceResult::NoTrust));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_claim_claimable_balance_issuer_success() {
+        // Test that an issuer can claim their own claimable balance without a trustline.
+        // This matches C++ TrustLineWrapper::IssuerImpl behavior where issuers have
+        // unlimited trust for their own assets.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        // Issuer is both the asset issuer AND the claimant
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        // Note: Issuer does NOT have a trustline for their own asset
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create claimable balance where the issuer is the claimant
+        let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: issuer_id.clone(), // Issuer is the claimant
+            predicate: ClaimPredicate::Unconditional,
+        })];
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([99u8; 32]));
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: claimants.try_into().unwrap(),
+            asset,
+            amount: 100_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+
+        // Issuer claims their own claimable balance
+        let op = ClaimClaimableBalanceOp { balance_id };
+        let result =
+            execute_claim_claimable_balance(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                // Should succeed - issuer doesn't need trustline
+                assert!(matches!(r, ClaimClaimableBalanceResult::Success));
             }
             other => panic!("unexpected result: {:?}", other),
         }
