@@ -32,9 +32,9 @@ cargo build --release -p rs-stellar-core
 | Metric | Value |
 |--------|-------|
 | Total TX verified | ~100,000+ |
-| TX match rate | **99.98%+** |
-| Clean ranges verified | 30000-36000, 50000-60000, 100000-110000, 250000-251000, 300000-301000 |
-| **Critical finding** | 2 real Soroban execution divergences |
+| TX match rate | **99.99%+** |
+| Clean ranges verified | 30000-36000, 50000-60000, 70000-75000, 100000-110000, 250000-251000, 300000-301000 |
+| **PRNG divergence** | ✅ RESOLVED (ledgers 71655, 71766) |
 
 ### Verification Results by Range
 
@@ -43,32 +43,30 @@ cargo build --release -p rs-stellar-core
 | 30000-36000 | 14,651 | **100%** | Clean range, all match |
 | 30000-40000 | 21,999 | 99.98% | 4 mismatches after bucket list diverges |
 | 50000-60000 | 13,246 | **100%** | Clean range |
-| 70000-75000 | 9,027 | 99.98% | **2 REAL DIVERGENCES** at 71655, 71766 |
+| 70000-75000 | 9,027 | **100%** | Fixed: PRNG seed was 2 divergences (now resolved) |
 | 100000-110000 | 37,744 | **100%** | Clean range |
 | 250000-251000 | 2,457 | **100%** | Clean range |
 | 300000-301000 | 2,228 | **100%** | Clean range |
 
-### Critical Finding: Real Soroban Execution Divergence
+### RESOLVED: Soroban PRNG Seed Divergence (Fixed in `3105525`)
 
-**Found 2 transactions where both Rust and C++ succeeded but returned DIFFERENT hash values:**
+**Previously found 2 transactions where both Rust and C++ succeeded but returned DIFFERENT hash values:**
 
 1. **Ledger 71655**:
-   - Our hash: `e12337f8aabf2af4c90ad7c7c0aff9495a0d346008a0c40c02e17a818dc53014`
+   - Our hash (before fix): `e12337f8aabf2af4c90ad7c7c0aff9495a0d346008a0c40c02e17a818dc53014`
    - CDP hash: `7ecf7e8454b3758e6a5f8a68801b377141d40691308f009e82e6c780c4a0b0d3`
 
 2. **Ledger 71766**:
-   - Our hash: `5d52ad15f24c4a27c17e3923d880b3d6561ceb152e4ee495155e96fbf038fece`
+   - Our hash (before fix): `5d52ad15f24c4a27c17e3923d880b3d6561ceb152e4ee495155e96fbf038fece`
    - CDP hash: `2834b42856c37e9e494d5bcc8717165d5b0a82166033347473544d678f4983c0`
 
-**These are NOT bucket list divergence issues** - both executions succeeded (`InvokeHostFunction(Success(...))`) but the returned hash (contract return value) differs. This indicates a real Soroban execution difference.
+**Root cause**: PRNG seed computation was incorrect:
+- **Bug 1**: `sub_sha256` in `hash.rs` used little-endian byte order instead of big-endian
+- **Bug 2**: PRNG seed in `execution.rs` and `main.rs` used 4-byte u32 instead of 8-byte u64
 
-**Possible causes**:
-- PRNG seed differences (Soroban contracts can use randomness)
-- Ledger timestamp/sequence number handling
-- Contract storage state differences
-- Host function implementation differences
+C++ stellar-core uses `subSha256(baseSeed, static_cast<uint64_t>(index))` where `xdr_to_opaque` serializes the u64 as 8 bytes big-endian (XDR network byte order).
 
-**Status**: Under investigation
+**Status**: ✅ FIXED - Both ledgers now verify correctly
 
 ### Parallel Full Testnet Verification (Partial - 41/109 segments)
 
@@ -145,20 +143,20 @@ The bucket list hash diverges from CDP in ledgers 933-15000, but is correct in 1
 
 ## Next Steps
 
-1. **Investigate Soroban hash divergence** (HIGH PRIORITY): Debug ledgers 71655 and 71766 to find root cause of different return values
-2. **Extend verification range**: Continue testing across full testnet history
-3. **Monitor for new issues**: Run verification periodically to catch regressions
-4. **Soroban metering investigation** (low priority): Investigate why our soroban-env-host consumes more CPU than C++
+1. **Extend verification range**: Continue testing across full testnet history
+2. **Monitor for new issues**: Run verification periodically to catch regressions
+3. **Soroban metering investigation** (low priority): Investigate why our soroban-env-host consumes more CPU than C++
 
 ## Recent Fixes (January 2026)
 
-1. **Clawback trustline flag fix** (`4f39c0e`): Fixed Clawback to check `TRUSTLINE_CLAWBACK_ENABLED_FLAG` (0x4) on the trustline instead of `AUTH_CLAWBACK_ENABLED_FLAG` (0x8) on the issuer account.
-2. **Payment NoIssuer fix** (`5a567b1`): Removed protocol-obsolete issuer existence check in Payment operations. Since protocol v13 (CAP-0017), issuer existence is not checked.
-3. **HashX signature validation** (`80a9870`): Fixed signature validation to accept variable-length HashX signatures instead of requiring 64-byte Ed25519 format.
-4. **Soroban temporary entry archival** (`80a9870`): Fixed to treat expired temporary entries as non-existent rather than archived.
-5. **minSeqNum relaxed sequence validation** (`7b249b5`): Fixed sequence validation to use relaxed check when minSeqNum is set.
-6. **CDP state sync sequence number pollution** (`1898c9b`): Fixed BadSequence errors caused by polluted sequence numbers in CDP metadata.
-7. **min_seq_age/min_seq_ledger_gap validation** (`10620bc`): Fixed to use account's V3 extension fields.
+1. **Soroban PRNG seed fix** (`3105525`): Fixed PRNG seed computation to use 8-byte XDR u64 big-endian encoding instead of 4-byte little-endian. This caused contracts using randomness (PRNG) to produce different results at ledgers 71655 and 71766.
+2. **Clawback trustline flag fix** (`4f39c0e`): Fixed Clawback to check `TRUSTLINE_CLAWBACK_ENABLED_FLAG` (0x4) on the trustline instead of `AUTH_CLAWBACK_ENABLED_FLAG` (0x8) on the issuer account.
+3. **Payment NoIssuer fix** (`5a567b1`): Removed protocol-obsolete issuer existence check in Payment operations. Since protocol v13 (CAP-0017), issuer existence is not checked.
+4. **HashX signature validation** (`80a9870`): Fixed signature validation to accept variable-length HashX signatures instead of requiring 64-byte Ed25519 format.
+5. **Soroban temporary entry archival** (`80a9870`): Fixed to treat expired temporary entries as non-existent rather than archived.
+6. **minSeqNum relaxed sequence validation** (`7b249b5`): Fixed sequence validation to use relaxed check when minSeqNum is set.
+7. **CDP state sync sequence number pollution** (`1898c9b`): Fixed BadSequence errors caused by polluted sequence numbers in CDP metadata.
+8. **min_seq_age/min_seq_ledger_gap validation** (`10620bc`): Fixed to use account's V3 extension fields.
 
 ---
 
