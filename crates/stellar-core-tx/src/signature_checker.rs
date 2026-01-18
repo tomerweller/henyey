@@ -316,45 +316,62 @@ fn verify_ed25519(sig: &DecoratedSignature, signer: &Signer, contents_hash: &Has
 
 /// Verify an Ed25519 signed payload signature.
 ///
-/// The signature is verified against SHA256(transaction_hash || payload).
+/// Per CAP-0040, the signature is verified against the raw payload bytes.
+/// The hint is XOR of pubkey hint and payload hint.
 fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> bool {
-    let SignerKey::Ed25519SignedPayload(payload_signer) = &signer.key else {
+    let SignerKey::Ed25519SignedPayload(signed_payload) = &signer.key else {
         return false;
     };
 
-    // Check hint matches last 4 bytes of public key
-    let expected_hint = [
-        payload_signer.ed25519.0[28],
-        payload_signer.ed25519.0[29],
-        payload_signer.ed25519.0[30],
-        payload_signer.ed25519.0[31],
+    // The hint for signed payloads is XOR of pubkey hint and payload hint.
+    // See SignatureUtils::getSignedPayloadHint in C++ stellar-core.
+    let pubkey_hint = [
+        signed_payload.ed25519.0[28],
+        signed_payload.ed25519.0[29],
+        signed_payload.ed25519.0[30],
+        signed_payload.ed25519.0[31],
     ];
+    let payload_hint = if signed_payload.payload.len() >= 4 {
+        let len = signed_payload.payload.len();
+        [
+            signed_payload.payload[len - 4],
+            signed_payload.payload[len - 3],
+            signed_payload.payload[len - 2],
+            signed_payload.payload[len - 1],
+        ]
+    } else {
+        // For shorter payloads, C++ getHint copies from the beginning
+        let mut hint = [0u8; 4];
+        for (i, &byte) in signed_payload.payload.iter().enumerate() {
+            if i < 4 {
+                hint[i] = byte;
+            }
+        }
+        hint
+    };
+    let expected_hint = [
+        pubkey_hint[0] ^ payload_hint[0],
+        pubkey_hint[1] ^ payload_hint[1],
+        pubkey_hint[2] ^ payload_hint[2],
+        pubkey_hint[3] ^ payload_hint[3],
+    ];
+
     if sig.hint.0 != expected_hint {
         return false;
     }
 
-    // For signed payloads, we need the payload in the signer key
-    // The signature is over SHA256(transaction_hash || payload)
-    // However, we don't have the transaction hash here in the signer verification
-    // This matches C++ behavior where the payload is part of the signer key
-
-    let Ok(_public_key) = PublicKey::from_bytes(&payload_signer.ed25519.0) else {
+    let Ok(public_key) = PublicKey::from_bytes(&signed_payload.ed25519.0) else {
         return false;
     };
 
-    let Ok(_signature) = Signature::try_from(&sig.signature) else {
+    let Ok(ed_sig) = Signature::try_from(&sig.signature) else {
         return false;
     };
 
-    // Create the data to verify: SHA256(tx_hash || payload)
-    // Note: This is a simplified check - in practice the tx_hash needs to be
-    // incorporated. For now we verify the signature format is valid.
-    // The actual data signed is handled by the caller.
-
-    // For the hint-only check (matching C++ behavior at this level),
-    // we just verify the signature can be parsed and the hint matches
-    // Full verification requires the transaction hash context
-    true
+    // C++ stellar-core verifies the signature against the raw payload bytes,
+    // not a hash. This is per CAP-0040 - the signed payload signer
+    // requires a valid signature of the payload from the ed25519 public key.
+    stellar_core_crypto::verify(&public_key, &signed_payload.payload, &ed_sig).is_ok()
 }
 
 /// Collect all signers for an account including the master key.

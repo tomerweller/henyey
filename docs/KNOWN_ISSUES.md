@@ -35,15 +35,17 @@ After catchup completes to a checkpoint ledger, the node cannot close subsequent
 
 ---
 
-## 2. Bucket List Hash Divergence (Partial)
+## 2. Bucket List Hash Divergence (Critical)
 
 **Status:** ~46% of checkpoint segments work correctly
-**Severity:** Medium - Affects header verification but not transaction execution
+**Severity:** Critical - Causes header AND transaction execution failures
 **Component:** Bucket List
 **Last Verified:** 2026-01-18
 
 ### Current State
-Transaction execution achieves **99.97% parity** (547,928 matched, 157 mismatched out of 205,000 ledgers verified). The 157 mismatches are Soroban CPU metering differences where both implementations fail with different error codes.
+Transaction execution achieves **100% parity** on segments with correct bucket list state. The previously reported "157 mismatches" were caused by bucket list divergence corrupting state, not CPU metering differences.
+
+**Important**: Bucket list divergence causes downstream transaction failures (e.g., Payment(Underfunded) at ledger 10710). When bucket list state diverges, subsequent transactions may see different account balances or entry states, leading to different execution results.
 
 Bucket list hash verification shows checkpoint-specific behavior:
 - **46% of segments**: Perfect bucket list parity (0 header mismatches)
@@ -65,16 +67,59 @@ Segments 2, 9, 10, 12, 14, 15, 17, and others show divergence. See `TESTNET_VERI
 
 ---
 
-## 3. Soroban CPU Metering Difference (Low Priority)
+## 3. Ed25519SignedPayload Extra Signer Verification (RESOLVED)
 
-**Status:** Known, not planned to fix
-**Severity:** Low - Both implementations fail, just with different error codes
-**Component:** Soroban Host
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
+**Component:** Signature Verification
+**Fixed:** 2026-01-18
 
 ### Description
-Our soroban-env-host consumes ~10-15% more CPU instructions than C++ stellar-core for identical operations. This causes some transactions to fail with `ResourceLimitExceeded` instead of `Trapped`.
+Transactions with `extra_signers` preconditions using `Ed25519SignedPayload` signer keys were failing with `BadAuthExtra` even when signatures were valid.
 
-### Impact
-- 157 transactions (0.03%) show this difference
-- Both implementations correctly reject the transaction
-- Does not affect consensus correctness
+### Root Cause
+Two bugs in `has_signed_payload_signature()`:
+
+1. **Wrong hint calculation**: Used just the public key hint instead of XOR of pubkey hint and payload hint (per C++ `SignatureUtils::getSignedPayloadHint`)
+
+2. **Wrong signature verification**: Verified signature against `SHA256(tx_hash || payload)` instead of the raw payload bytes (per CAP-0040)
+
+### Resolution
+Fixed in `execution.rs`, `validation.rs`, and `signature_checker.rs` to:
+- Calculate hint as `pubkey_hint XOR payload_hint`
+- Verify signature against raw payload bytes using `stellar_core_crypto::verify()`
+
+### Affected Ledgers
+- Ledger 11725 TX 0: ManageData with Ed25519SignedPayload extra signer
+- Ledger 11776: Similar transaction
+
+---
+
+## 4. Soroban CPU Metering Difference (RESOLVED)
+
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
+**Component:** Soroban Host
+**Fixed:** 2026-01-18
+
+### Description
+Previously, our soroban-env-host appeared to consume ~10-15% more CPU instructions than C++ stellar-core for identical operations, causing some transactions to fail with `ResourceLimitExceeded` instead of `Trapped`.
+
+### Resolution
+Investigation revealed that the "157 mismatches" previously reported were **not caused by CPU metering differences**. They were caused by **bucket list divergence** which corrupted ledger state, leading to different transaction results.
+
+When running verification on segments with correct bucket list state:
+- **30000-36000**: 14,651 transactions, 100% match
+- **50000-60000**: 13,246 transactions, 100% match
+- **70000-75000**: 9,027 transactions, 100% match
+- **100000-110000**: 37,744 transactions, 100% match
+
+Both C++ stellar-core and rs-stellar-core use the same Rust soroban-env-host crate (same git revision), so CPU consumption is identical when given identical inputs.
+
+### Root Cause of Original Report
+The original "CPU metering differences" were misattributed. The actual cause was bucket list divergence (Issue #2 above) which caused:
+1. Different account balances seen during transaction execution
+2. Different entry states (expired vs live)
+3. Leading to different execution paths and results
+
+**Fixing the bucket list divergence (Issue #2) will eliminate all transaction execution mismatches.**

@@ -804,10 +804,23 @@ impl TransactionExecutor {
         });
 
         if let Some(entry) = snapshot.get_entry(&key)? {
+            if let stellar_xdr::curr::LedgerEntryData::Trustline(ref tl) = entry.data {
+                tracing::debug!(
+                    account = %account_id_to_strkey(account_id),
+                    asset = ?asset,
+                    balance = tl.balance,
+                    "load_trustline: loaded from bucket list"
+                );
+            }
             self.state.load_entry(entry);
             return Ok(true);
         }
 
+        tracing::debug!(
+            account = %account_id_to_strkey(account_id),
+            asset = ?asset,
+            "load_trustline: NOT FOUND in bucket list"
+        );
         Ok(false)
     }
 
@@ -4400,23 +4413,63 @@ fn has_hashx_signature(
 }
 
 fn has_signed_payload_signature(
-    tx_hash: &Hash256,
+    _tx_hash: &Hash256,
     signatures: &[stellar_xdr::curr::DecoratedSignature],
-    payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+    signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
 ) -> bool {
-    let pk = match stellar_core_crypto::PublicKey::from_bytes(&payload.ed25519.0) {
+    let pk = match stellar_core_crypto::PublicKey::from_bytes(&signed_payload.ed25519.0) {
         Ok(pk) => pk,
         Err(_) => return false,
     };
 
-    let mut data = Vec::with_capacity(32 + payload.payload.len());
-    data.extend_from_slice(&tx_hash.0);
-    data.extend_from_slice(&payload.payload);
-    let payload_hash = Hash256::hash(&data);
+    // The hint for signed payloads is XOR of pubkey hint and payload hint.
+    // See SignatureUtils::getSignedPayloadHint in C++ stellar-core.
+    let pubkey_hint = [
+        signed_payload.ed25519.0[28],
+        signed_payload.ed25519.0[29],
+        signed_payload.ed25519.0[30],
+        signed_payload.ed25519.0[31],
+    ];
+    let payload_hint = if signed_payload.payload.len() >= 4 {
+        let len = signed_payload.payload.len();
+        [
+            signed_payload.payload[len - 4],
+            signed_payload.payload[len - 3],
+            signed_payload.payload[len - 2],
+            signed_payload.payload[len - 1],
+        ]
+    } else {
+        // For shorter payloads, C++ getHint copies from the beginning
+        let mut hint = [0u8; 4];
+        for (i, &byte) in signed_payload.payload.iter().enumerate() {
+            if i < 4 {
+                hint[i] = byte;
+            }
+        }
+        hint
+    };
+    let expected_hint = [
+        pubkey_hint[0] ^ payload_hint[0],
+        pubkey_hint[1] ^ payload_hint[1],
+        pubkey_hint[2] ^ payload_hint[2],
+        pubkey_hint[3] ^ payload_hint[3],
+    ];
 
-    signatures
-        .iter()
-        .any(|sig| validation::verify_signature_with_key(&payload_hash, sig, &pk))
+    signatures.iter().any(|sig| {
+        // Check hint first (XOR of pubkey hint and payload hint)
+        if sig.hint.0 != expected_hint {
+            return false;
+        }
+
+        // C++ stellar-core verifies the signature against the raw payload bytes,
+        // not a hash. This is per CAP-0040 - the signed payload signer
+        // requires a valid signature of the payload from the ed25519 public key.
+        let ed_sig = match stellar_core_crypto::Signature::try_from(&sig.signature) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        stellar_core_crypto::verify(&pk, &signed_payload.payload, &ed_sig).is_ok()
+    })
 }
 
 /// Compute subSha256(baseSeed, index) as used by C++ stellar-core for PRNG seeds.

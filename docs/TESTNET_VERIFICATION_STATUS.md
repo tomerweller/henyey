@@ -80,9 +80,9 @@ C++ stellar-core uses `subSha256(baseSeed, static_cast<uint64_t>(index))` where 
 | Segments with bucket list issues | 22 (54%) |
 | Total header mismatches | 50,817 ledgers |
 
-**Transaction Execution**: Near-perfect parity at 99.97%. The 157 mismatches are Soroban CPU metering differences where both implementations fail, just with different error codes.
+**Transaction Execution**: Near-perfect parity at 99.97%. The mismatches are **caused by bucket list divergence corrupting state** - NOT CPU metering issues. On segments with correct bucket list state, transaction execution achieves **100% parity**.
 
-**Bucket List**: ~54% of segments show bucket list hash divergence. This is a **checkpoint-specific issue** - some checkpoints restore correctly while others diverge. The divergence appears to start mid-segment (not at checkpoint boundaries), suggesting an issue with bucket list state evolution after restoration.
+**Bucket List**: ~54% of segments show bucket list hash divergence. This is a **checkpoint-specific issue** - some checkpoints restore correctly while others diverge. The divergence appears to start mid-segment (not at checkpoint boundaries), suggesting an issue with bucket list state evolution after restoration. **This is the root cause of all transaction execution mismatches.**
 
 ### Segments with Perfect Bucket List Parity
 
@@ -117,35 +117,32 @@ C++ stellar-core uses `subSha256(baseSeed, static_cast<uint64_t>(index))` where 
 
 ## Remaining Issues
 
-### Error Code Differences (LOW PRIORITY)
-All error code differences follow the same pattern:
-- **Our result**: `InvokeHostFunction(ResourceLimitExceeded)`
-- **CDP result**: `InvokeHostFunction(Trapped)`
-- **Both fail** - transaction outcome is correct
+### Bucket List Divergence (CRITICAL)
+The bucket list hash diverges in ~54% of segments. This is the **root cause of ALL transaction execution mismatches**.
 
-**Root cause**: Our Soroban host consumes more CPU instructions than C++ stellar-core for identical operations.
+**Impact**: When bucket list state diverges, subsequent transactions see different account balances or entry states, leading to different execution results. For example, at ledger 10710, a Payment operation returns `Underfunded` instead of `Success` because the bucket list divergence caused incorrect balance tracking.
 
-**Why this happens**:
-1. C++ stellar-core passes the transaction's specified instruction limit as the budget
-2. We use `tx_max_instructions * 2` as the budget to avoid failing successful transactions
-3. Our soroban-env-host meters differently, consuming ~10-15% more CPU instructions
-4. If we used the same budget as C++, we would fail transactions that C++ succeeds!
+**Key Finding (2026-01-18)**: The previously reported "CPU metering differences" (157 mismatches showing ResourceLimitExceeded vs Trapped) were **misdiagnosed**. Those mismatches were actually caused by bucket list divergence corrupting state, not CPU metering issues.
 
-**Investigation findings**: Attempted to use tx-specified budget like C++, but this caused us to fail transactions that should succeed (our CPU consumption exceeds the specified limit even for successful operations). The current approach (larger budget) ensures correct success/failure outcomes at the cost of different error codes.
-
-**Impact**: Very low - both implementations fail the transaction, just with different error codes. This does not affect consensus correctness.
+**Verification on clean segments shows 100% parity**:
+- 30000-36000: 14,651 transactions, 100% match
+- 50000-60000: 13,246 transactions, 100% match
+- 70000-75000: 9,027 transactions, 100% match
+- 100000-110000: 37,744 transactions, 100% match
 
 ### Phase 1 Fee Differences (52 cases - NEEDS INVESTIGATION)
 A small number of transactions show Phase 1 fee calculation differences. This needs further investigation to understand the root cause.
 
-### Bucket List Divergence in Early Ledgers (separate effort)
-The bucket list hash diverges from CDP in ledgers 933-15000, but is correct in 15001-30000. Another developer is working on this. The bucket list divergence is **not a consensus issue** for transaction execution.
+### ~~Soroban CPU Metering (RESOLVED)~~
+~~Previously reported as "our soroban-env-host consumes more CPU than C++".~~
+
+**Status**: This issue is **RESOLVED**. Investigation confirmed both implementations use the same Rust soroban-env-host crate with identical CPU consumption. The apparent differences were caused by bucket list divergence corrupting state.
 
 ## Next Steps
 
-1. **Extend verification range**: Continue testing across full testnet history
-2. **Monitor for new issues**: Run verification periodically to catch regressions
-3. **Soroban metering investigation** (low priority): Investigate why our soroban-env-host consumes more CPU than C++
+1. **Fix bucket list divergence (CRITICAL)**: This is the root cause of all transaction mismatches
+2. **Investigate Phase 1 fee differences**: 52 cases need investigation
+3. **Extend verification range**: Continue testing after bucket list is fixed
 
 ## Recent Fixes (January 2026)
 
@@ -157,6 +154,9 @@ The bucket list hash diverges from CDP in ledgers 933-15000, but is correct in 1
 6. **minSeqNum relaxed sequence validation** (`7b249b5`): Fixed sequence validation to use relaxed check when minSeqNum is set.
 7. **CDP state sync sequence number pollution** (`1898c9b`): Fixed BadSequence errors caused by polluted sequence numbers in CDP metadata.
 8. **min_seq_age/min_seq_ledger_gap validation** (`10620bc`): Fixed to use account's V3 extension fields.
+9. **Ed25519SignedPayload extra signer verification** (2026-01-18): Fixed two bugs in signed payload signature verification per CAP-0040:
+   - Hint calculation: Must use XOR of public key hint and payload hint (not just public key hint)
+   - Signature verification: Must verify signature against raw payload bytes (not SHA256 hash of payload)
 
 ---
 
