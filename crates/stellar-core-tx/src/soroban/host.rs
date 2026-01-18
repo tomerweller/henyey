@@ -653,16 +653,29 @@ fn convert_contract_cost_params_to_p24(
 
 /// Context for pre-compiling WASM modules outside of transaction execution.
 /// This mimics how C++ stellar-core pre-compiles all contracts with an unlimited budget.
-/// We use the default budget limits (100M CPU, 40MB memory) which should be sufficient
-/// for compiling any individual contract.
+/// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
+/// due to budget constraints. C++ stellar-core's SharedModuleCacheCompiler compiles
+/// without any budget metering.
 #[derive(Clone)]
 struct WasmCompilationContext(Budget);
 
 impl WasmCompilationContext {
-    /// Create a new compilation context with default budget limits.
-    /// The default limits (100M CPU, 40MB memory) are sufficient for compiling contracts.
+    /// Create a new compilation context with very high budget limits.
+    /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
+    /// never fails due to budget constraints. The actual compilation cost is
+    /// typically much lower, but we want to match C++ behavior which doesn't
+    /// meter compilation at all.
     fn new() -> Self {
-        Self(Budget::default())
+        // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
+        // C++ stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
+        let budget = Budget::try_from_configs(
+            10_000_000_000,      // 10 billion CPU instructions
+            1_000_000_000,       // 1 GB memory
+            Default::default(), // Default CPU cost params
+            Default::default(), // Default memory cost params
+        )
+        .unwrap_or_else(|_| Budget::default());
+        Self(budget)
     }
 }
 
@@ -780,16 +793,29 @@ fn build_module_cache_for_footprint(
 
 /// Context for pre-compiling WASM modules outside of transaction execution (P25 version).
 /// This mimics how C++ stellar-core pre-compiles all contracts with an unlimited budget.
-/// We use the default budget limits (100M CPU, 40MB memory) which should be sufficient
-/// for compiling any individual contract.
+/// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
+/// due to budget constraints. C++ stellar-core's SharedModuleCacheCompiler compiles
+/// without any budget metering.
 #[derive(Clone)]
 struct WasmCompilationContextP25(soroban_env_host25::budget::Budget);
 
 impl WasmCompilationContextP25 {
-    /// Create a new compilation context with default budget limits.
-    /// The default limits (100M CPU, 40MB memory) are sufficient for compiling contracts.
+    /// Create a new compilation context with very high budget limits.
+    /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
+    /// never fails due to budget constraints. The actual compilation cost is
+    /// typically much lower, but we want to match C++ behavior which doesn't
+    /// meter compilation at all.
     fn new() -> Self {
-        Self(soroban_env_host25::budget::Budget::default())
+        // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
+        // C++ stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
+        let budget = soroban_env_host25::budget::Budget::try_from_configs(
+            10_000_000_000,      // 10 billion CPU instructions
+            1_000_000_000,       // 1 GB memory
+            Default::default(), // Default CPU cost params
+            Default::default(), // Default memory cost params
+        )
+        .unwrap_or_else(|_| soroban_env_host25::budget::Budget::default());
+        Self(budget)
     }
 }
 

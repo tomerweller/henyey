@@ -1171,20 +1171,29 @@ fn exchange_with_pool(
             }
             *from_pool = max_receive_from_pool;
 
-            let numerator = u128::from(MAX_BPS as u64)
-                * u128::from(reserves_to_pool as u64)
-                * u128::from(*from_pool as u64);
-            let denominator = u128::from((reserves_from_pool - *from_pool) as u64)
+            // Use hugeDivide algorithm matching C++ stellar-core exactly:
+            // result = ceil(A * B / C) where A = MAX_BPS (int32), B and C are u128
+            // C++ computes: A*Q + ceil(A*R/C) where Q = B/C, R = B%C
+            let a = MAX_BPS as u128;
+            let b = u128::from(reserves_to_pool as u64) * u128::from(*from_pool as u64);
+            let c = u128::from((reserves_from_pool - *from_pool) as u64)
                 * u128::from((MAX_BPS - fee_bps) as u64);
 
-            if denominator == 0 {
+            if c == 0 {
                 return Ok(false);
             }
-            let value = (numerator + denominator - 1) / denominator;
+
+            let q = b / c;
+            let r = b % c;
+
+            // result = A*Q + ceil(A*R/C)
+            let value = a * q + (a * r + c - 1) / c;
+
             if value > i64::MAX as u128 {
                 return Err(TxError::Internal("pool exchange overflow".into()));
             }
             *to_pool = value as i64;
+
             Ok(*to_pool <= max_send_to_pool)
         }
         RoundingType::Normal => Ok(false),

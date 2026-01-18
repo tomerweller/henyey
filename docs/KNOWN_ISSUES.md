@@ -67,12 +67,13 @@ Segments 2, 9, 10, 12, 14, 15, 17, and others show divergence. See `TESTNET_VERI
 
 ---
 
-## 3. Liquidity Pool Constant Product AMM Calculation (NEW)
+## 3. Liquidity Pool Constant Product AMM Calculation
 
 **Status:** Under Investigation
 **Severity:** Medium - Causes amount differences in PathPaymentStrictReceive
 **Component:** Liquidity Pool
 **Discovered:** 2026-01-18
+**Last Updated:** 2026-01-18
 
 ### Description
 PathPaymentStrictReceive operations via liquidity pools show different `amount_bought` values compared to C++ stellar-core.
@@ -81,38 +82,85 @@ PathPaymentStrictReceive operations via liquidity pools show different `amount_b
 At ledger 20226 TX 2 (in a range with perfect bucket list parity):
 - Our `amount_bought`: 2,289,449,975
 - C++ `amount_bought`: 2,291,485,078
-- Difference: ~2M XLM (~0.09%)
+- Difference: 2,035,103 XLM (~0.089%)
 
-### Investigation Notes
-This occurs in a range with 0 header mismatches, confirming this is a genuine calculation difference in our constant product AMM implementation rather than bucket list state corruption.
+### Investigation Findings
 
-Potential causes:
-- Rounding differences in constant product formula
-- Integer overflow handling differences
-- Precision loss in intermediate calculations
+**Verified Correct:**
+1. Formula matches C++ `hugeDivide` exactly: `ceil(A * B / C)` using remainder theorem
+2. Reserve mapping (asset_a/asset_b to reserves_to/reserves_from) is correct
+3. Fee calculation (30 bps) is correct
+4. `from_pool` value (USDC received) matches C++ exactly: 3,218,171,791
+
+**Intermediate Values (our calculation):**
+```
+a = 10000 (MAX_BPS)
+b = reserves_to_pool * from_pool = 3619417239823725904433
+c = (reserves_from_pool - from_pool) * (MAX_BPS - fee_bps) = 15809112581432040
+q = b / c = 228944
+r = b % c = 15768980348938673
+result = a*q + ceil(a*r/c) = 2289440000 + 9975 = 2289449975
+```
+
+This is mathematically correct given the inputs. The 0.089% difference suggests C++ may be reading different pool reserve values, despite bucket list hash matching at the ledger end.
+
+**Potential Root Causes:**
+1. Pool reserves differ during execution (earlier TX in same ledger modifies pool?)
+2. Subtle difference in how XDR pool entry is parsed/read
+3. Different intermediate state snapshot timing
+
+### Affected Transactions
+- Ledger 20226 TX 2: PathPaymentStrictReceive via XLM/USDC pool
+- Pool ID: 4cd1f6defba237eecbc5fefe259f89ebc4b5edd49116beb5536c4034fc48d63f
+- Reserves seen: XLM=1,124,681,177,663, USDC=1,588,886,434,723
+
+### Next Steps
+- Compare pool reserve values at transaction execution time vs CDP metadata
+- Check if earlier transactions in the same ledger modify this pool
+- Run C++ stellar-core with debug logging to capture intermediate values
 
 ---
 
-## 4. InvokeHostFunction Resource Limit Failures (NEW)
+## 4. InvokeHostFunction Resource Limit Failures (RESOLVED)
 
-**Status:** Under Investigation
-**Severity:** Medium - Causes transactions to fail incorrectly
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
 **Component:** Soroban Host
-**Discovered:** 2026-01-18
+**Fixed:** 2026-01-18
 
 ### Description
-Some InvokeHostFunction transactions fail with `ResourceLimitExceeded` in our code but succeed in C++ stellar-core.
+Some InvokeHostFunction transactions failed with `ResourceLimitExceeded` in our code but succeeded in C++ stellar-core.
 
-### Evidence
-6 transactions at ledgers 26961, 26962, 26963, 26976, 26982, 27057 (in a range with perfect bucket list parity):
-- Our result: `ResourceLimitExceeded`
-- C++ result: `Success` (with valid return hashes)
+### Root Cause
+The WASM module pre-compilation budget was too limited. When pre-compilation failed due to budget constraints, the host had to compile the module during transaction execution. This extra compilation cost (~110K CPU instructions) pushed transactions over their specified instruction limit.
 
-### Investigation Notes
-This occurs in a range with 0 header mismatches, confirming this is a genuine execution difference. Potential causes:
-- Resource tracking difference during Soroban execution
-- Resource limit calculation difference
-- Pre-execution resource estimation difference
+Specifically:
+1. C++ stellar-core uses `SharedModuleCacheCompiler` which compiles WASM **without any budget metering**
+2. Our `WasmCompilationContext` used `Budget::default()` which has limited resources
+3. When pre-compilation failed with `Error(Budget, ExceededLimit)`, the module wasn't cached
+4. During transaction execution, the host compiled the module within the transaction's budget
+5. This extra compilation cost caused the transaction to exceed its specified CPU limit
+
+### Resolution
+Fixed in `host.rs` by increasing the `WasmCompilationContext` budget limits from default (~100M CPU) to very high limits (10B CPU, 1GB memory). This ensures pre-compilation never fails due to budget constraints, matching C++ behavior.
+
+```rust
+// Before: Budget::default() with limited resources
+// After: Very high limits to match C++ unmetered compilation
+let budget = Budget::try_from_configs(
+    10_000_000_000,      // 10 billion CPU instructions
+    1_000_000_000,       // 1 GB memory
+    Default::default(),
+    Default::default(),
+).unwrap_or_else(|_| Budget::default());
+```
+
+### Affected Ledgers
+- Ledger 26961 TX 2: USDC `transfer` function call
+- Ledger 26962, 26963, 26976, 26982, 27057: Similar InvokeHostFunction transactions
+
+### Verification
+After fix: 223 transactions in range 26961-27060 verified with 0 mismatches (100% parity)
 
 ---
 
