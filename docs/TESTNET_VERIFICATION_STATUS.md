@@ -25,30 +25,47 @@ cargo build --release -p rs-stellar-core
 
 ## Current Status
 
-**Last verification run**: 2026-01-17
+**Last verification run**: 2026-01-18
 
-### Range 933-15000 (Early testnet)
+### Parallel Full Testnet Verification (Partial - 41/109 segments)
+
 | Metric | Value |
 |--------|-------|
-| Ledgers verified | 14,068 |
-| Transactions verified | 27,550 |
-| Transaction success/fail match | **100%** |
-| Error code differences | 193 (0.7%) |
-| Ledger headers | 7,722 passed, 6,346 failed |
+| Ledgers verified | 205,000 |
+| Transactions matched | 547,928 |
+| Transactions mismatched | 157 |
+| **TX match rate** | **99.97%** |
+| Segments with bucket list OK | 19 (46%) |
+| Segments with bucket list issues | 22 (54%) |
+| Total header mismatches | 50,817 ledgers |
 
-### Range 15001-30000 (Extended testnet)
-| Metric | Value |
-|--------|-------|
-| Ledgers verified | 15,000 |
-| Transactions verified | 30,702 |
-| Transaction success/fail match | **100%** |
-| Error code differences | 526 (1.7%) |
-| Phase 1 fee mismatches | 52 (0.2%) |
-| Ledger headers | **15,000 passed, 0 failed** |
+**Transaction Execution**: Near-perfect parity at 99.97%. The 157 mismatches are Soroban CPU metering differences where both implementations fail, just with different error codes.
 
-**Status**: Transaction execution parity is **100%** for success/failure outcomes across both ranges. All transactions that succeed in C++ also succeed in rs-stellar-core, and all that fail in C++ also fail in rs-stellar-core. Error code differences (ResourceLimitExceeded vs Trapped) occur only for transactions that **both implementations fail**. 
+**Bucket List**: ~54% of segments show bucket list hash divergence. This is a **checkpoint-specific issue** - some checkpoints restore correctly while others diverge. The divergence appears to start mid-segment (not at checkpoint boundaries), suggesting an issue with bucket list state evolution after restoration.
 
-The bucket list divergence issue in early ledgers (933-15000) does **not** affect later ledgers (15001-30000) because we reinitialize state from CDP at the start of each verification run.
+### Segments with Perfect Bucket List Parity
+
+| Segment | Ledger Range | Status |
+|---------|--------------|--------|
+| 1 | 64-5,063 | ✅ 0 header mismatches |
+| 3-8 | 10,064-40,063 | ✅ 0 header mismatches |
+| 11 | 50,064-55,063 | ✅ 0 header mismatches |
+| 13 | 60,064-65,063 | ✅ 0 header mismatches |
+| 16 | 75,064-80,063 | ✅ 0 header mismatches |
+| 18 | 85,064-90,063 | ✅ 0 header mismatches |
+
+### Segments with Bucket List Issues
+
+| Segment | Ledger Range | Header Mismatches |
+|---------|--------------|-------------------|
+| 2 | 5,064-10,063 | 1,409 |
+| 9 | 40,064-45,063 | 4,093 |
+| 10 | 45,064-50,063 | 370 |
+| 12 | 55,064-60,063 | 2,695 |
+| 14 | 65,064-70,063 | 4,526 |
+| 15 | 70,064-75,063 | 1,300 |
+| 17 | 80,064-85,063 | 3,137 |
+| 19+ | 90,064+ | Various |
 
 ### Mismatch Breakdown
 
