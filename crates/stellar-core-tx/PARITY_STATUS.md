@@ -371,9 +371,19 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
    - Fail with `Storage(ExceededLimit)` when expected entries don't exist
    - Have different execution paths leading to different CPU consumption
 
+4. **Payment NoIssuer vs NoTrust**: In rare cases, Payment operations may return `NoIssuer` instead of `NoTrust`. Both indicate transaction failure; the difference is in which check fails first. This affects 4 transactions in the testnet range 30000-35000.
+
 ### Resolved Issues
 
 1. **CPU Metering Differences (Fixed)**: Previously, minor CPU consumption differences (~100 instructions) were observed due to the module cache using V1 cost inputs. C++ stellar-core's `SharedModuleCacheCompiler` always uses `parse_and_cache_module_simple` which uses V0 cost inputs (just `wasm_bytes`). The Rust implementation now matches this behavior, resolving budget exceeded errors.
+
+2. **HashX Signature Validation (Fixed January 2026)**: Signature validation was incorrectly requiring all signatures to be exactly 64 bytes (Ed25519 format). Stellar supports multiple signature types:
+   - Ed25519: 64 bytes
+   - HashX: Variable length (the preimage whose SHA256 matches the signer key)
+   - Pre-auth TX: 0 bytes (the tx hash itself proves authorization)
+   The validation now correctly accepts all signature formats, with actual verification happening during signer weight accumulation.
+
+3. **Soroban Temporary Entry Archival (Fixed January 2026)**: Temporary Soroban entries with expired TTLs were incorrectly treated as "archived", causing `EntryArchived` errors. Per C++ stellar-core, temporary entries with expired TTLs should be treated as if they don't exist (not archived). Only persistent entries (ContractCode or ContractData with durability=Persistent) can be archived and restored.
 
 ### Remaining Work
 

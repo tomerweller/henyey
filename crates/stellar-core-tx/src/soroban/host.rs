@@ -32,9 +32,9 @@ use soroban_env_host25::{
 
 // Both soroban-env-host v25 and our code use stellar-xdr v25, so we can use types directly
 use stellar_xdr::curr::{
-    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry,
-    LedgerEntryData, LedgerEntryExt, LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry,
-    SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
+    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry, SorobanTransactionData,
+    SorobanTransactionDataExt, WriteXdr,
 };
 
 use super::error::convert_host_error_p24_to_p25;

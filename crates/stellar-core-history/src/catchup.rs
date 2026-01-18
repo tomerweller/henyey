@@ -1012,71 +1012,76 @@ impl CatchupManager {
             let bucket_dir_clone = bucket_dir.clone();
             let archives_clone = archives.clone();
 
-            let load_hot_archive_bucket = |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
-                // Zero hash means empty bucket
-                if hash.is_zero() {
-                    return Ok(HotArchiveBucket::empty());
-                }
+            let load_hot_archive_bucket =
+                |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
+                    // Zero hash means empty bucket
+                    if hash.is_zero() {
+                        return Ok(HotArchiveBucket::empty());
+                    }
 
-                // Check if we have the XDR data in the pre-downloaded cache
-                let bucket_path = bucket_dir_clone.join(format!("{}.bucket", hash.to_hex()));
+                    // Check if we have the XDR data in the pre-downloaded cache
+                    let bucket_path = bucket_dir_clone.join(format!("{}.bucket", hash.to_hex()));
 
-                let xdr_data = if let Some(data) = {
-                    let mut preloaded = preloaded_buckets.lock().unwrap();
-                    preloaded.remove(hash)
-                } {
-                    data
-                } else if bucket_path.exists() {
-                    // Already saved to disk, read it back
-                    std::fs::read(&bucket_path).map_err(|e| {
-                        stellar_core_bucket::BucketError::NotFound(format!(
-                            "failed to read bucket from disk: {}",
-                            e
-                        ))
-                    })?
-                } else {
-                    // Download if needed (shouldn't happen if download_buckets was called)
-                    warn!("Hot archive bucket {} not found in cache, downloading", hash);
-                    let hash = *hash;
-                    let archives = archives_clone.clone();
-                    let download = async move {
-                        for archive in &archives {
-                            match archive.get_bucket(&hash).await {
-                                Ok(data) => return Ok(data),
-                                Err(e) => {
-                                    warn!("Failed to download hot archive bucket {} from archive: {}", hash, e);
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(stellar_core_bucket::BucketError::NotFound(format!(
-                            "hot archive bucket {} not available from any archive",
-                            hash
-                        )))
-                    };
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
+                    let xdr_data = if let Some(data) = {
+                        let mut preloaded = preloaded_buckets.lock().unwrap();
+                        preloaded.remove(hash)
+                    } {
+                        data
+                    } else if bucket_path.exists() {
+                        // Already saved to disk, read it back
+                        std::fs::read(&bucket_path).map_err(|e| {
                             stellar_core_bucket::BucketError::NotFound(format!(
-                                "failed to build runtime: {}",
+                                "failed to read bucket from disk: {}",
                                 e
                             ))
-                        })?;
-                    rt.block_on(download)?
+                        })?
+                    } else {
+                        // Download if needed (shouldn't happen if download_buckets was called)
+                        warn!(
+                            "Hot archive bucket {} not found in cache, downloading",
+                            hash
+                        );
+                        let hash = *hash;
+                        let archives = archives_clone.clone();
+                        let download = async move {
+                            for archive in &archives {
+                                match archive.get_bucket(&hash).await {
+                                    Ok(data) => return Ok(data),
+                                    Err(e) => {
+                                        warn!("Failed to download hot archive bucket {} from archive: {}", hash, e);
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(stellar_core_bucket::BucketError::NotFound(format!(
+                                "hot archive bucket {} not available from any archive",
+                                hash
+                            )))
+                        };
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                stellar_core_bucket::BucketError::NotFound(format!(
+                                    "failed to build runtime: {}",
+                                    e
+                                ))
+                            })?;
+                        rt.block_on(download)?
+                    };
+
+                    // Parse as HotArchiveBucket (uses HotArchiveBucketEntry XDR)
+                    HotArchiveBucket::from_xdr_bytes(&xdr_data)
                 };
 
-                // Parse as HotArchiveBucket (uses HotArchiveBucketEntry XDR)
-                HotArchiveBucket::from_xdr_bytes(&xdr_data)
-            };
-
-            let hot_bucket_list = HotArchiveBucketList::restore_from_hashes(&hot_hashes, load_hot_archive_bucket)
-                .map_err(|e| {
-                    HistoryError::CatchupFailed(format!(
-                        "Failed to restore hot archive bucket list: {}",
-                        e
-                    ))
-                })?;
+            let hot_bucket_list =
+                HotArchiveBucketList::restore_from_hashes(&hot_hashes, load_hot_archive_bucket)
+                    .map_err(|e| {
+                        HistoryError::CatchupFailed(format!(
+                            "Failed to restore hot archive bucket list: {}",
+                            e
+                        ))
+                    })?;
 
             info!(
                 "Hot archive bucket list restored: {} total entries",

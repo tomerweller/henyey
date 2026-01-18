@@ -4386,13 +4386,14 @@ fn has_hashx_signature(
     key: &stellar_xdr::curr::Uint256,
 ) -> bool {
     signatures.iter().any(|sig| {
-        if sig.signature.0.len() != 32 {
-            return false;
-        }
+        // HashX signatures can be any length - the signature is the preimage
+        // whose SHA256 hash should equal the signer key.
+        // Check hint first (last 4 bytes of key)
         let expected_hint = [key.0[28], key.0[29], key.0[30], key.0[31]];
         if sig.hint.0 != expected_hint {
             return false;
         }
+        // Hash the preimage (signature) and compare to key
         let hash = Hash256::hash(&sig.signature.0);
         hash.0 == key.0
     })

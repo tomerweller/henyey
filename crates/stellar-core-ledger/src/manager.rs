@@ -42,7 +42,9 @@ use crate::{
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellar_core_bucket::{BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings};
+use stellar_core_bucket::{
+    BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
+};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
 use stellar_core_invariant::{

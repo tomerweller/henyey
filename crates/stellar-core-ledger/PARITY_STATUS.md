@@ -85,6 +85,7 @@ This section documents the implementation status compared to the C++ upstream in
 - [x] Operation-level invariant validation
 - [x] Refundable fee tracking and refund calculation
 - [x] Transaction executor with state manager integration
+- [x] HashX signature verification (variable length preimages)
 
 #### Network Configuration (`NetworkConfig.h/.cpp` -> `execution.rs`)
 - [x] Loading contract cost parameters (CPU/memory)

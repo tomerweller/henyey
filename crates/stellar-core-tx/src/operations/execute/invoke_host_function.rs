@@ -696,6 +696,19 @@ fn is_archived_contract_entry(
     key: &LedgerKey,
     current_ledger: u32,
 ) -> bool {
+    // First, check if this is a temporary entry. Temporary entries with expired TTLs
+    // are treated as if they don't exist, not as archived (per C++ stellar-core).
+    // Only persistent entries (ContractCode or ContractData with durability=Persistent)
+    // can be "archived".
+    let is_temporary = matches!(
+        key,
+        LedgerKey::ContractData(cd) if cd.durability == stellar_xdr::curr::ContractDataDurability::Temporary
+    );
+    if is_temporary {
+        // Temporary entries can never be "archived" - they just disappear when expired
+        return false;
+    }
+
     match key {
         LedgerKey::ContractData(cd) => {
             if state

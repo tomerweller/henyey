@@ -299,27 +299,18 @@ pub fn validate_signatures(
     frame: &TransactionFrame,
     context: &LedgerContext,
 ) -> std::result::Result<(), ValidationError> {
-    let tx_hash = frame
-        .hash(&context.network_id)
-        .map_err(|_| ValidationError::InvalidSignature)?;
+    // Compute transaction hash - this can fail if the envelope is malformed
+    let _tx_hash = frame.hash(&context.network_id).map_err(|e| {
+        tracing::warn!("validate_signatures: hash computation failed: {:?}", e);
+        ValidationError::InvalidSignature
+    })?;
 
-    // Validate signatures on the outer envelope
-    for sig in frame.signatures() {
-        if !is_valid_signature(&tx_hash, sig) {
-            return Err(ValidationError::InvalidSignature);
-        }
-    }
-
-    // For fee bump, also validate inner signatures
-    if frame.is_fee_bump() {
-        for sig in frame.inner_signatures() {
-            // Inner signatures are for the inner tx hash
-            // For simplicity in catchup, we just check they're well-formed
-            if sig.signature.0.len() != 64 {
-                return Err(ValidationError::InvalidSignature);
-            }
-        }
-    }
+    // Note: We don't validate individual signature formats here because:
+    // - Ed25519 signatures are 64 bytes
+    // - HashX signatures can be any length (the preimage)
+    // - Pre-auth TX signatures are 0 bytes
+    // The actual signature verification happens in has_sufficient_signer_weight()
+    // when we have access to the account's signers.
 
     Ok(())
 }
@@ -781,22 +772,8 @@ fn has_signed_payload_signature(
         .any(|sig| verify_signature_with_key(&payload_hash, sig, &pk))
 }
 
-/// Check if a signature is cryptographically valid.
+/// Check if a signature is well-formed.
 ///
-/// Note: This only checks the signature format/validity, not whether
-/// the signer has authority over the account.
-fn is_valid_signature(_tx_hash: &stellar_core_common::Hash256, sig: &DecoratedSignature) -> bool {
-    // The signature should be 64 bytes for Ed25519
-    if sig.signature.0.len() != 64 {
-        return false;
-    }
-
-    // We can't fully verify without the public key
-    // The hint only gives us the last 4 bytes
-    // For catchup, we trust the archive data
-    true
-}
-
 /// Verify a signature against a known public key.
 pub fn verify_signature_with_key(
     tx_hash: &stellar_core_common::Hash256,
