@@ -67,7 +67,56 @@ Segments 2, 9, 10, 12, 14, 15, 17, and others show divergence. See `TESTNET_VERI
 
 ---
 
-## 3. Ed25519SignedPayload Extra Signer Verification (RESOLVED)
+## 3. Liquidity Pool Constant Product AMM Calculation (NEW)
+
+**Status:** Under Investigation
+**Severity:** Medium - Causes amount differences in PathPaymentStrictReceive
+**Component:** Liquidity Pool
+**Discovered:** 2026-01-18
+
+### Description
+PathPaymentStrictReceive operations via liquidity pools show different `amount_bought` values compared to C++ stellar-core.
+
+### Evidence
+At ledger 20226 TX 2 (in a range with perfect bucket list parity):
+- Our `amount_bought`: 2,289,449,975
+- C++ `amount_bought`: 2,291,485,078
+- Difference: ~2M XLM (~0.09%)
+
+### Investigation Notes
+This occurs in a range with 0 header mismatches, confirming this is a genuine calculation difference in our constant product AMM implementation rather than bucket list state corruption.
+
+Potential causes:
+- Rounding differences in constant product formula
+- Integer overflow handling differences
+- Precision loss in intermediate calculations
+
+---
+
+## 4. InvokeHostFunction Resource Limit Failures (NEW)
+
+**Status:** Under Investigation
+**Severity:** Medium - Causes transactions to fail incorrectly
+**Component:** Soroban Host
+**Discovered:** 2026-01-18
+
+### Description
+Some InvokeHostFunction transactions fail with `ResourceLimitExceeded` in our code but succeed in C++ stellar-core.
+
+### Evidence
+6 transactions at ledgers 26961, 26962, 26963, 26976, 26982, 27057 (in a range with perfect bucket list parity):
+- Our result: `ResourceLimitExceeded`
+- C++ result: `Success` (with valid return hashes)
+
+### Investigation Notes
+This occurs in a range with 0 header mismatches, confirming this is a genuine execution difference. Potential causes:
+- Resource tracking difference during Soroban execution
+- Resource limit calculation difference
+- Pre-execution resource estimation difference
+
+---
+
+## 5. Ed25519SignedPayload Extra Signer Verification (RESOLVED)
 
 **Status:** Fixed
 **Severity:** N/A - Issue resolved
@@ -95,7 +144,7 @@ Fixed in `execution.rs`, `validation.rs`, and `signature_checker.rs` to:
 
 ---
 
-## 4. Soroban CPU Metering Difference (RESOLVED)
+## 6. Soroban CPU Metering Difference (RESOLVED)
 
 **Status:** Fixed
 **Severity:** N/A - Issue resolved
@@ -126,7 +175,7 @@ The original "CPU metering differences" were misattributed. The actual cause was
 
 ---
 
-## 5. Credit Asset Self-Payment Order of Operations (RESOLVED)
+## 7. Credit Asset Self-Payment Order of Operations (RESOLVED)
 
 **Status:** Fixed
 **Severity:** N/A - Issue resolved
@@ -167,7 +216,7 @@ After fix: 611 transactions in range 11100-11400 verified with 0 mismatches.
 
 ---
 
-## 6. ClaimClaimableBalance Issuer NoTrust (RESOLVED)
+## 8. ClaimClaimableBalance Issuer NoTrust (RESOLVED)
 
 **Status:** Fixed
 **Severity:** N/A - Issue resolved
@@ -203,11 +252,11 @@ if source == issuer {
 - Ledger 37316 TX 1: Same issuer claiming claimable balance
 
 ### Verification
-After fix: 481 transactions in range 37040-37320 verified with 0 mismatches (InvokeHostFunction issue at ledger 37046 also resolved - see Issue #7).
+After fix: 481 transactions in range 37040-37320 verified with 0 mismatches (InvokeHostFunction issue at ledger 37046 also resolved - see Issue #9).
 
 ---
 
-## 7. Soroban Archived Entry TTL Restoration (RESOLVED)
+## 9. Soroban Archived Entry TTL Restoration (RESOLVED)
 
 **Status:** Fixed
 **Severity:** N/A - Issue resolved

@@ -27,28 +27,54 @@ cargo build --release -p rs-stellar-core
 
 **Last verification run**: 2026-01-18
 
-### Extended Verification Summary
+### Extended Verification Summary (933-100000)
 
 | Metric | Value |
 |--------|-------|
-| Total TX verified | ~100,000+ |
-| TX match rate | **99.99%+** |
-| Clean ranges verified | 30000-36000, 50000-60000, 70000-75000, 100000-110000, 250000-251000, 300000-301000 |
+| Total ledgers verified | ~100,000 |
+| Total TX verified | **221,355** |
+| TX match rate | **99.99%** (21 mismatches) |
+| Header mismatches | ~63,000 (bucket list divergence) |
 | **PRNG divergence** | ✅ RESOLVED (ledgers 71655, 71766) |
 
-### Verification Results by Range
+### Verification Results by Range (933-100000)
+
+| Range | Transactions | Mismatches | Parity | Header Issues | Notes |
+|-------|--------------|------------|--------|---------------|-------|
+| 933-20000 | 38,572 | 1 | **99.997%** | 11,346 | 1 Phase 2 mismatch (bucket list induced) |
+| 20000-40000 | 41,679 | 7 | **99.98%** | **0** | ⚠️ Genuine mismatches (see below) |
+| 40000-60000 | 27,758 | 0 | **100%** | 19,030 | Clean TX execution |
+| 60000-80000 | 31,943 | 0 | **100%** | 14,463 | Clean TX execution |
+| 80000-100000 | 81,403 | 13 | **99.98%** | 18,074 | Mismatches caused by bucket list |
+
+### Previously Verified Clean Ranges
 
 | Range | Transactions | Parity | Notes |
 |-------|--------------|--------|-------|
-| 10000-20000 | 26,916 | **100%** | ✅ Self-payment fix verified |
 | 30000-36000 | 14,651 | **100%** | Clean range, all match |
-| 30000-40000 | 21,999 | **100%** | ✅ All issues resolved (ClaimClaimableBalance issuer + Soroban TTL fixes) |
-| 50000-60000 | 13,246 | **100%** | Clean range (header mismatches due to bucket list) |
-| 70000-75000 | 9,027 | **100%** | Fixed: PRNG seed was 2 divergences (now resolved) |
-| 70000-80000 | 16,662 | **100%** | Clean range (header mismatches due to bucket list) |
+| 50000-60000 | 13,246 | **100%** | Clean range |
+| 70000-75000 | 9,027 | **100%** | PRNG fix verified |
 | 100000-110000 | 37,744 | **100%** | Clean range |
 | 250000-251000 | 2,457 | **100%** | Clean range |
 | 300000-301000 | 2,228 | **100%** | Clean range |
+
+### NEW: Genuine Mismatches (20000-40000 Range) - NEEDS INVESTIGATION
+
+The 20000-40000 range has **0 header mismatches** (bucket list is correct), but 7 transaction mismatches were found. These are **genuine execution differences**, not caused by bucket list corruption:
+
+1. **Ledger 20226 TX 2**: PathPaymentStrictReceive via Liquidity Pool
+   - Our `amount_bought`: 2,289,449,975
+   - CDP `amount_bought`: 2,291,485,078
+   - Difference: ~2M XLM in constant product AMM calculation
+   - **Root cause**: Liquidity pool calculation difference (needs investigation)
+
+2. **Ledgers 26961, 26962, 26963, 26976, 26982, 27057**: InvokeHostFunction
+   - Our result: `ResourceLimitExceeded`
+   - CDP result: `Success`
+   - **Root cause**: Unknown - our code is failing with resource limits but C++ succeeds
+   - All 6 transactions return different successful hashes in CDP
+
+These mismatches need investigation as they occur in a range with verified correct bucket list state.
 
 ### RESOLVED: Soroban PRNG Seed Divergence (Fixed in `3105525`)
 
@@ -119,21 +145,31 @@ C++ stellar-core uses `subSha256(baseSeed, static_cast<uint64_t>(index))` where 
 
 ## Remaining Issues
 
-### Bucket List Divergence (CRITICAL)
-The bucket list hash diverges in ~54% of segments. This is the **root cause of ALL transaction execution mismatches**.
+### 1. Liquidity Pool Constant Product Calculation (NEEDS INVESTIGATION)
+At ledger 20226, a PathPaymentStrictReceive via liquidity pool shows different `amount_bought` values:
+- Our calculation: 2,289,449,975
+- C++ calculation: 2,291,485,078
+- Difference: ~0.09%
 
-**Impact**: When bucket list state diverges, subsequent transactions see different account balances or entry states, leading to different execution results. For example, at ledger 10710, a Payment operation returns `Underfunded` instead of `Success` because the bucket list divergence caused incorrect balance tracking.
+This occurs in a range with perfect bucket list parity, indicating a genuine calculation difference in our constant product AMM implementation.
 
-**Key Finding (2026-01-18)**: The previously reported "CPU metering differences" (157 mismatches showing ResourceLimitExceeded vs Trapped) were **misdiagnosed**. Those mismatches were actually caused by bucket list divergence corrupting state, not CPU metering issues.
+### 2. InvokeHostFunction Resource Limit Checking (NEEDS INVESTIGATION)
+6 transactions at ledgers 26961-27057 fail with `ResourceLimitExceeded` in our code but succeed in C++. This also occurs in a range with perfect bucket list parity. Potential causes:
+- Resource tracking difference
+- Resource limit calculation difference
+- Different state being read due to subtle entry lookup differences
 
-**Verification on clean segments shows 100% parity**:
-- 30000-36000: 14,651 transactions, 100% match
-- 50000-60000: 13,246 transactions, 100% match
-- 70000-75000: 9,027 transactions, 100% match
-- 100000-110000: 37,744 transactions, 100% match
+### 3. Bucket List Divergence (CRITICAL)
+The bucket list hash diverges in ~63% of checkpoint segments (63,000 header mismatches out of ~100,000 ledgers). This causes **cascading transaction failures** when state corrupts.
 
-### Phase 1 Fee Differences (52 cases - NEEDS INVESTIGATION)
-A small number of transactions show Phase 1 fee calculation differences. This needs further investigation to understand the root cause.
+**Impact**: When bucket list state diverges, subsequent transactions see different account balances or entry states. For example, at ledger 10710, a Payment operation returns `Underfunded` instead of `Success` due to incorrect balance tracking.
+
+**Key Finding (2026-01-18)**: Many apparent "CPU metering differences" in segments with bucket list issues were **misdiagnosed**. The actual cause was bucket list divergence corrupting state.
+
+**Ranges with 100% TX parity (clean bucket list)**:
+- 40000-60000: 27,758 transactions, 0 mismatches
+- 60000-80000: 31,943 transactions, 0 mismatches
+- Earlier verified: 30000-36000, 70000-75000, 100000-110000
 
 ### ClaimClaimableBalance Issuer NoTrust (RESOLVED)
 ~~Four transactions in segment 30000-40000 showed `ClaimClaimableBalance(NoTrust)` instead of `Success`.~~
@@ -151,9 +187,10 @@ A small number of transactions show Phase 1 fee calculation differences. This ne
 
 ## Next Steps
 
-1. **Fix bucket list divergence (CRITICAL)**: This is the root cause of all transaction mismatches
-2. **Investigate Phase 1 fee differences**: 52 cases need investigation
-3. **Extend verification range**: Continue testing after bucket list is fixed
+1. **Fix bucket list divergence (CRITICAL)**: Root cause of most transaction mismatches in segments with header issues
+2. **Investigate liquidity pool calculation**: Ledger 20226 shows ~0.09% difference in constant product AMM
+3. **Investigate InvokeHostFunction resource failures**: 6 transactions at ledgers 26961-27057 fail incorrectly
+4. **Extend verification to 500000+**: Continue testing to find more edge cases
 
 ## Recent Fixes (January 2026)
 
@@ -178,6 +215,12 @@ A small number of transactions show Phase 1 fee calculation differences. This ne
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-18 | 933-100000 | 99.99% (221,355 TX, 21 mismatches) | Full range verification, 7 genuine mismatches found |
+| 2026-01-18 | 80000-100000 | 99.98% (81,403 TX, 13 mismatches) | All mismatches bucket-list induced |
+| 2026-01-18 | 60000-80000 | 100% (31,943 TX, 0 mismatches) | Clean TX execution |
+| 2026-01-18 | 40000-60000 | 100% (27,758 TX, 0 mismatches) | Clean TX execution |
+| 2026-01-18 | 20000-40000 | 99.98% (41,679 TX, 7 mismatches) | 0 header issues - genuine mismatches |
+| 2026-01-18 | 933-20000 | 99.997% (38,572 TX, 1 mismatch) | 1 bucket-list induced mismatch |
 | 2026-01-17 | 15001-30000 | 100% tx match, 0 header failures | Extended verification, bucket list correct |
 | 2026-01-17 | 933-15000 | 100% tx match (193 error code diffs) | Fixed minSeqNum relaxed validation |
 | 2026-01-17 | 933-15000 | 99.3% tx match (193/27,550 mismatches) | Fixed CDP state sync sequence pollution |
