@@ -203,4 +203,51 @@ if source == issuer {
 - Ledger 37316 TX 1: Same issuer claiming claimable balance
 
 ### Verification
-After fix: 481 transactions in range 37040-37320 verified with only 1 mismatch (separate InvokeHostFunction issue at ledger 37046).
+After fix: 481 transactions in range 37040-37320 verified with 0 mismatches (InvokeHostFunction issue at ledger 37046 also resolved - see Issue #7).
+
+---
+
+## 7. Soroban Archived Entry TTL Restoration (RESOLVED)
+
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
+**Component:** Soroban Host
+**Fixed:** 2026-01-18
+
+### Description
+InvokeHostFunction transactions that restored archived entries (ContractData, ContractCode) from the bucket list were failing with `InvokeHostFunction(Trapped)` instead of succeeding.
+
+### Root Cause
+When building the storage map for Soroban execution, archived entries being restored need a TTL (Time-To-Live) value. Our code was providing `live_until_ledger_seq: 0` for entries without an existing TTL.
+
+The soroban-env-host's `build_storage_map_from_xdr_ledger_entries` validates that:
+```rust
+if ttl_entry.live_until_ledger_seq < ledger_num {
+    return Err(Error::from_type_and_code(
+        ScErrorType::Storage,
+        ScErrorCode::InternalError,
+    ).into());
+}
+```
+
+Since `0 < current_ledger`, the host rejected these entries with `Storage InternalError`, causing the transaction to fail with `Trapped`.
+
+### Resolution
+Fixed in `host.rs` (P24 and P25 implementations) and `protocol/p24.rs` to provide `live_until_ledger_seq: current_ledger` instead of `0` for archived entries being restored:
+
+```rust
+} else if needs_ttl {
+    // For archived entries being restored, provide a TTL at the current ledger.
+    // The host validates that TTL >= current_ledger, so we can't use 0 or an expired value.
+    // The actual TTL extension happens as part of the restoration operation.
+    let ttl_entry = TtlEntry {
+        key_hash,
+        live_until_ledger_seq: current_ledger, // Use current ledger as minimum valid TTL
+    };
+```
+
+### Affected Ledgers
+- Ledger 37046 TX 1: USDC `transfer` function call restoring archived ContractData entry
+
+### Verification
+After fix: 21,999 transactions in range 30000-40000 verified with 0 mismatches (100% parity).

@@ -1098,6 +1098,7 @@ fn execute_host_function_p24(
     // For non-contract entries (Account, etc), we pass empty bytes for TTL
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
+    let current_ledger = context.sequence; // Capture for use in closure
 
     // Helper to encode an entry and its TTL
     let mut add_entry = |key: &LedgerKey,
@@ -1138,12 +1139,14 @@ fn execute_host_function_p24(
                     ))
                 })?
         } else if needs_ttl {
-            // For archived entries being restored, provide expired TTL (0)
-            // The host will extend this TTL as part of restoration
+            // For archived entries being restored, provide a TTL at the current ledger.
+            // The host validates that TTL >= current_ledger, so we can't use 0 or an expired value.
+            // The actual TTL extension happens as part of the restoration operation.
+            // We use current_ledger (exactly at threshold) to pass the validity check.
             let key_hash = compute_key_hash(key);
             let ttl_entry = soroban_env_host24::xdr::TtlEntry {
                 key_hash: soroban_env_host24::xdr::Hash(key_hash.0),
-                live_until_ledger_seq: 0, // Expired/archived
+                live_until_ledger_seq: current_ledger, // Use current ledger as minimum valid TTL
             };
             ttl_entry
                 .to_xdr(soroban_env_host24::xdr::Limits::none())
@@ -1520,6 +1523,7 @@ fn execute_host_function_p25(
 
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
+    let current_ledger_p25 = context.sequence; // Capture for use in closure
 
     let mut add_entry = |key: &LedgerKey,
                          entry: &LedgerEntry,
@@ -1551,12 +1555,13 @@ fn execute_host_function_p25(
                 ))
             })?
         } else if needs_ttl {
-            // For archived entries being restored, provide expired TTL (0)
-            // The host will extend this TTL as part of restoration
+            // For archived entries being restored, provide a TTL at the current ledger.
+            // The host validates that TTL >= current_ledger, so we can't use 0 or an expired value.
+            // The actual TTL extension happens as part of the restoration operation.
             let key_hash = compute_key_hash(key);
             let ttl_entry = stellar_xdr::curr::TtlEntry {
                 key_hash,
-                live_until_ledger_seq: 0, // Expired/archived
+                live_until_ledger_seq: current_ledger_p25, // Use current ledger as minimum valid TTL
             };
             ttl_entry.to_xdr(Limits::none()).map_err(|_| {
                 make_setup_error(HostErrorP25::from(

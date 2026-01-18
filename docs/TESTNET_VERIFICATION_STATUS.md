@@ -42,7 +42,7 @@ cargo build --release -p rs-stellar-core
 |-------|--------------|--------|-------|
 | 10000-20000 | 26,916 | **100%** | ✅ Self-payment fix verified |
 | 30000-36000 | 14,651 | **100%** | Clean range, all match |
-| 30000-40000 | 21,999 | 99.98% | 4 mismatches (ClaimClaimableBalance/InvokeHostFunction) |
+| 30000-40000 | 21,999 | **100%** | ✅ All issues resolved (ClaimClaimableBalance issuer + Soroban TTL fixes) |
 | 50000-60000 | 13,246 | **100%** | Clean range (header mismatches due to bucket list) |
 | 70000-75000 | 9,027 | **100%** | Fixed: PRNG seed was 2 divergences (now resolved) |
 | 70000-80000 | 16,662 | **100%** | Clean range (header mismatches due to bucket list) |
@@ -142,7 +142,7 @@ A small number of transactions show Phase 1 fee calculation differences. This ne
 
 **Fix**: Added issuer check in `execute_claim_claimable_balance` - if source is the asset issuer, skip trustline lookup.
 
-**Remaining**: 1 InvokeHostFunction(Trapped) at ledger 37046 (separate Soroban issue).
+**Status**: ✅ Fully resolved. The InvokeHostFunction(Trapped) at ledger 37046 was a separate issue (Soroban archived entry TTL) also fixed on 2026-01-18.
 
 ### ~~Soroban CPU Metering (RESOLVED)~~
 ~~Previously reported as "our soroban-env-host consumes more CPU than C++".~~
@@ -170,6 +170,7 @@ A small number of transactions show Phase 1 fee calculation differences. This ne
    - Signature verification: Must verify signature against raw payload bytes (not SHA256 hash of payload)
 10. **Credit asset self-payment order of operations** (2026-01-18): Fixed self-payments (source == destination) for credit assets to credit destination before checking source balance. C++ stellar-core uses `updateDestBalance` before `updateSourceBalance` in PathPaymentStrictReceive, so for self-payments the credited amount is available for the debit check. Affected ledgers: 11143, 11264, 11381, 11396.
 11. **ClaimClaimableBalance issuer handling** (2026-01-18): Fixed issuers claiming their own claimable balances. C++ `TrustLineWrapper::IssuerImpl` allows issuers to receive their own asset without a trustline. Added issuer check to skip trustline lookup. Affected ledgers: 37272, 37307, 37316.
+12. **Soroban archived entry TTL restoration** (2026-01-18): Fixed InvokeHostFunction failures when restoring archived entries (ContractData, ContractCode). The soroban-env-host validates that TTL >= current_ledger, but we were providing TTL=0. Changed to provide TTL=current_ledger for restored entries. Affected ledger: 37046.
 
 ---
 
