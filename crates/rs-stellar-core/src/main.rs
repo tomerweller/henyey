@@ -1606,7 +1606,7 @@ async fn cmd_replay_bucket_list(
     cdp_date: &str,
 ) -> anyhow::Result<()> {
     use stellar_core_bucket::{
-        is_persistent_entry, BucketList, BucketManager, HotArchiveBucketList,
+        is_persistent_entry, BucketList, BucketManager, HasNextState, HotArchiveBucketList,
     };
     use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
     use stellar_core_common::{Hash256, NetworkId};
@@ -1744,41 +1744,87 @@ async fn cmd_replay_bucket_list(
     );
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
-    // Download buckets
-    let bucket_hashes: Vec<Hash256> = init_has
+    // Extract live bucket hashes as tuples for restore_from_has
+    let bucket_hashes: Vec<(Hash256, Hash256)> = init_has
         .current_buckets
         .iter()
-        .flat_map(|level| {
-            vec![
+        .map(|level| {
+            (
                 Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
                 Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-            ]
+            )
         })
         .collect();
 
-    let hot_archive_hashes: Option<Vec<Hash256>> =
+    // Extract live bucket next states from HAS
+    let live_next_states: Vec<HasNextState> = init_has
+        .current_buckets
+        .iter()
+        .map(|level| HasNextState {
+            state: level.next.state,
+            output: level
+                .next
+                .output
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+        })
+        .collect();
+
+    // Extract hot archive bucket hashes as tuples for restore_from_has
+    let hot_archive_hashes: Option<Vec<(Hash256, Hash256)>> =
         init_has.hot_archive_buckets.as_ref().map(|levels| {
             levels
                 .iter()
-                .flat_map(|level| {
-                    vec![
+                .map(|level| {
+                    (
                         Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
                         Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-                    ]
+                    )
                 })
                 .collect()
         });
 
-    let all_hashes: Vec<&Hash256> = bucket_hashes
-        .iter()
-        .chain(
-            hot_archive_hashes
-                .as_ref()
-                .map(|v| v.iter())
-                .unwrap_or_default(),
-        )
-        .filter(|h| !h.is_zero())
-        .collect();
+    // Extract hot archive next states from HAS
+    let hot_archive_next_states: Option<Vec<HasNextState>> =
+        init_has.hot_archive_buckets.as_ref().map(|levels| {
+            levels
+                .iter()
+                .map(|level| HasNextState {
+                    state: level.next.state,
+                    output: level
+                        .next
+                        .output
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                })
+                .collect()
+        });
+
+    // Collect all hashes to download
+    let mut all_hashes_vec: Vec<Hash256> = Vec::new();
+    for (curr, snap) in &bucket_hashes {
+        all_hashes_vec.push(curr.clone());
+        all_hashes_vec.push(snap.clone());
+    }
+    for state in &live_next_states {
+        if let Some(ref output) = state.output {
+            all_hashes_vec.push(output.clone());
+        }
+    }
+    if let Some(ref ha_hashes) = hot_archive_hashes {
+        for (curr, snap) in ha_hashes {
+            all_hashes_vec.push(curr.clone());
+            all_hashes_vec.push(snap.clone());
+        }
+    }
+    if let Some(ref ha_states) = hot_archive_next_states {
+        for state in ha_states {
+            if let Some(ref output) = state.output {
+                all_hashes_vec.push(output.clone());
+            }
+        }
+    }
+    let all_hashes: Vec<&Hash256> = all_hashes_vec.iter().filter(|h| !h.is_zero()).collect();
 
     print!("Buckets ({} required):", all_hashes.len());
     let (cached, downloaded) =
@@ -1787,21 +1833,32 @@ async fn cmd_replay_bucket_list(
         println!(" {} cached", cached);
     }
 
-    // Restore bucket lists
-    let mut bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
+    // Restore live bucket list using restore_from_hashes, then restart pending merges.
+    // The HAS at a checkpoint has all state=0 (no pending merges), so we need restart_merges
+    // to recreate any merges that should be in progress based on the checkpoint ledger timing.
+    let live_bucket_hashes: Vec<Hash256> = bucket_hashes
+        .iter()
+        .flat_map(|(curr, snap)| vec![curr.clone(), snap.clone()])
+        .collect();
+    let mut bucket_list = BucketList::restore_from_hashes(&live_bucket_hashes, |hash| {
         bucket_manager.load_bucket(hash).map(|b| (*b).clone())
     })?;
 
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
     // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
-    let mut hot_archive_bucket_list: Option<HotArchiveBucketList> = hot_archive_hashes
-        .as_ref()
-        .map(|hashes| {
-            HotArchiveBucketList::restore_from_hashes(hashes, |hash| {
-                bucket_manager.load_hot_archive_bucket(hash)
-            })
-        })
-        .transpose()?;
+    // Use restore_from_has to properly load pending merge states from the HAS.
+    let mut hot_archive_bucket_list: Option<HotArchiveBucketList> =
+        if let (Some(ref hashes), Some(ref next_states)) =
+            (&hot_archive_hashes, &hot_archive_next_states)
+        {
+            Some(HotArchiveBucketList::restore_from_has(
+                hashes,
+                next_states,
+                |hash| bucket_manager.load_hot_archive_bucket(hash),
+            )?)
+        } else {
+            None
+        };
 
     let init_cp_headers = archive.get_ledger_headers(init_checkpoint).await?;
     let init_header_entry = init_cp_headers
@@ -1819,10 +1876,11 @@ async fn cmd_replay_bucket_list(
         println!("Pre-restart hot archive hash: {}", hot_hash.to_hex());
     }
 
-    // Restart any pending merges that should have been in progress at the checkpoint.
+    // Restart merges for both bucket lists.
+    // At checkpoint boundaries (state=0), this recreates pending merges based on timing.
     bucket_list.restart_merges(init_checkpoint, init_protocol_version)?;
-    if let Some(ref mut hot) = hot_archive_bucket_list {
-        hot.restart_merges(init_checkpoint, init_protocol_version)?;
+    if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+        hot_archive.restart_merges(init_checkpoint, init_protocol_version)?;
     }
 
     let initial_live_hash = bucket_list.hash();
@@ -2330,6 +2388,14 @@ async fn cmd_replay_bucket_list(
                     for (i, level) in bucket_list.levels().iter().enumerate() {
                         println!("      L{}: curr={}", i, level.curr.hash().to_hex());
                         println!("          snap={}", level.snap.hash().to_hex());
+                    }
+                    // Debug: print hot archive bucket list state
+                    if let Some(ref hot) = hot_archive_bucket_list {
+                        println!("    Hot archive bucket list full state:");
+                        for (i, level) in hot.levels().iter().enumerate() {
+                            println!("      L{}: curr={}", i, level.curr.hash().to_hex());
+                            println!("          snap={}", level.snap.hash().to_hex());
+                        }
                     }
                     mismatches += 1;
                     if stop_on_error {
