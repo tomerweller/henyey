@@ -4421,13 +4421,17 @@ fn has_signed_payload_signature(
 
 /// Compute subSha256(baseSeed, index) as used by C++ stellar-core for PRNG seeds.
 ///
-/// This computes SHA256(baseSeed || index) where index is encoded as 4 big-endian bytes
-/// (matching C++ network byte order used in XDR).
+/// This computes SHA256(baseSeed || xdr::xdr_to_opaque(index)) where index is a u64.
+/// XDR encodes uint64 as 8 bytes in big-endian (network byte order).
+///
+/// Note: C++ uses `static_cast<uint64_t>(index)` before passing to `xdr::xdr_to_opaque`,
+/// so even though the index is originally an int, it's serialized as 8 bytes.
 fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(base_seed);
-    hasher.update(&index.to_be_bytes()); // 4 bytes big-endian (XDR byte order)
+    // XDR uint64 is 8 bytes big-endian
+    hasher.update(&(index as u64).to_be_bytes());
     hasher.finalize().into()
 }
 

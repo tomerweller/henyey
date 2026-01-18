@@ -3197,11 +3197,13 @@ async fn cmd_verify_execution(
             let mut deferred_post_fee_changes: Vec<stellar_xdr::curr::LedgerEntryChanges> =
                 Vec::new();
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
-                // Compute PRNG seed for Soroban: SHA256(txSetHash || txIndex)
+                // Compute PRNG seed for Soroban: SHA256(txSetHash || xdr(u64(txIndex)))
+                // C++ uses subSha256(baseSeed, static_cast<uint64_t>(index)) where
+                // xdr_to_opaque serializes the u64 as 8 bytes big-endian.
                 let prng_seed = {
-                    let mut data = Vec::with_capacity(36);
+                    let mut data = Vec::with_capacity(40); // 32 + 8 bytes
                     data.extend_from_slice(&cdp_header.scp_value.tx_set_hash.0);
-                    data.extend_from_slice(&(tx_idx as u32).to_be_bytes());
+                    data.extend_from_slice(&(tx_idx as u64).to_be_bytes()); // XDR u64 is 8 bytes BE
                     let hash = stellar_core_crypto::sha256(&data);
                     Some(*hash.as_bytes())
                 };
