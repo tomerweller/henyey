@@ -7,7 +7,7 @@
 use stellar_xdr::curr::{
     AccountId, Asset, ClawbackClaimableBalanceOp, ClawbackClaimableBalanceResult,
     ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult, ClawbackResultCode, LedgerKey,
-    LedgerKeyClaimableBalance, OperationResult, OperationResultTr,
+    LedgerKeyClaimableBalance, OperationResult, OperationResultTr, TrustLineFlags,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -18,11 +18,14 @@ use crate::Result;
 /// Account flag for clawback enabled
 const AUTH_CLAWBACK_ENABLED_FLAG: u32 = 0x8;
 
+/// Trustline flag for clawback enabled
+const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
+
 /// Execute a Clawback operation.
 ///
 /// This operation claws back an amount of an asset from an account's trustline.
-/// The source account must be the issuer of the asset and must have
-/// the AUTH_CLAWBACK_ENABLED flag set.
+/// The source account must be the issuer of the asset and the trustline must have
+/// the TRUSTLINE_CLAWBACK_ENABLED flag set.
 pub fn execute_clawback(
     op: &ClawbackOp,
     source: &AccountId,
@@ -39,14 +42,6 @@ pub fn execute_clawback(
         return Ok(make_clawback_result(ClawbackResultCode::Malformed));
     }
 
-    // Check source account exists and is the issuer
-    let issuer = match state.get_account(source) {
-        Some(a) => a.clone(),
-        None => {
-            return Ok(make_clawback_result(ClawbackResultCode::Malformed));
-        }
-    };
-
     // Verify source is the issuer of the asset
     let asset_issuer = match &op.asset {
         Asset::Native => {
@@ -60,11 +55,6 @@ pub fn execute_clawback(
         return Ok(make_clawback_result(ClawbackResultCode::Malformed));
     }
 
-    // Check issuer has AUTH_CLAWBACK_ENABLED flag
-    if issuer.flags & AUTH_CLAWBACK_ENABLED_FLAG == 0 {
-        return Ok(make_clawback_result(ClawbackResultCode::NotClawbackEnabled));
-    }
-
     // Convert MuxedAccount to AccountId for trustline lookup
     let from_account_id = muxed_to_account_id(&op.from);
 
@@ -75,6 +65,12 @@ pub fn execute_clawback(
             return Ok(make_clawback_result(ClawbackResultCode::NoTrust));
         }
     };
+
+    // Check trustline has TRUSTLINE_CLAWBACK_ENABLED flag set
+    // Per C++ stellar-core, we check the trustline flag, not the issuer account flag
+    if trustline.flags & TRUSTLINE_CLAWBACK_ENABLED_FLAG == 0 {
+        return Ok(make_clawback_result(ClawbackResultCode::NotClawbackEnabled));
+    }
 
     // Check trustline has sufficient balance
     if trustline.balance < op.amount {
@@ -233,7 +229,7 @@ mod tests {
         let issuer_id = create_test_account_id(0);
         let holder_id = create_test_account_id(1);
 
-        // Issuer without clawback enabled
+        // Issuer account (clawback flag on account doesn't matter for Clawback op)
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
         state.create_account(create_test_account(holder_id.clone(), 10_000_000, 0));
 
@@ -242,7 +238,7 @@ mod tests {
             issuer: issuer_id.clone(),
         });
 
-        // Create trustline with balance
+        // Create trustline WITHOUT clawback enabled flag (only authorized)
         let trustline = TrustLineEntry {
             account_id: holder_id.clone(),
             asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
@@ -251,7 +247,7 @@ mod tests {
             }),
             balance: 1000,
             limit: i64::MAX,
-            flags: 1, // Authorized
+            flags: 1, // Authorized only, no clawback flag
             ext: TrustLineEntryExt::V0,
         };
         state.create_trustline(trustline);
@@ -281,12 +277,8 @@ mod tests {
         let issuer_id = create_test_account_id(0);
         let holder_id = create_test_account_id(1);
 
-        // Issuer with clawback enabled (flag 0x8)
-        state.create_account(create_test_account(
-            issuer_id.clone(),
-            100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
-        ));
+        // Issuer account (clawback flag on account doesn't matter for Clawback op)
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
         state.create_account(create_test_account(holder_id.clone(), 10_000_000, 0));
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
@@ -294,7 +286,7 @@ mod tests {
             issuer: issuer_id.clone(),
         });
 
-        // Create trustline with balance
+        // Create trustline WITH clawback enabled flag
         let trustline = TrustLineEntry {
             account_id: holder_id.clone(),
             asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
@@ -303,7 +295,7 @@ mod tests {
             }),
             balance: 1000,
             limit: i64::MAX,
-            flags: 1, // Authorized
+            flags: 1 | TRUSTLINE_CLAWBACK_ENABLED_FLAG, // Authorized + Clawback enabled
             ext: TrustLineEntryExt::V0,
         };
         state.create_trustline(trustline);

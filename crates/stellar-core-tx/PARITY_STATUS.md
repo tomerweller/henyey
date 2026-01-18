@@ -1,6 +1,6 @@
 # C++ Parity Status
 
-**Overall Parity: 100%** (12,517 transactions in testnet range 30000-35000)
+**Overall Parity: 100%** (14,651 transactions in testnet range 30000-36000)
 
 This document provides a detailed comparison between the Rust `stellar-core-tx` crate and the upstream C++ stellar-core v25 implementation in `.upstream-v25/src/transactions/`.
 
@@ -319,7 +319,7 @@ Transaction execution verified against CDP metadata for testnet ledgers.
 
 | Range | Transactions | Match Rate | Notes |
 |-------|--------------|------------|-------|
-| 30000-35000 | 12,517 | 100% (12,517/12,517) | **Full parity achieved** (January 2026) |
+| 30000-36000 | 14,651 | 100% (14,651/14,651) | **Full parity achieved** (January 2026) |
 | 32769-33000 | 432 | 98.8% (427/432) | Starting from fresh checkpoint |
 | 40001-41000 | 1,826 | 98.8% (1,804/1,826) | All mismatches after bucket list divergence |
 | 50001-52000 | 2,597 | 98.3% (2,553/2,597) | 44 mismatches, all state-dependent |
@@ -344,7 +344,7 @@ Testing early testnet ledgers reveals **variable parity rates** that correlate w
 
 ### Key Findings
 
-1. **100% Transaction Execution Parity Achieved**: The testnet range 30000-35000 (12,517 transactions) now achieves **100% parity** with C++ stellar-core v25. All classic and Soroban operations match exactly.
+1. **100% Transaction Execution Parity Achieved**: The testnet range 30000-36000 (14,651 transactions) now achieves **100% parity** with C++ stellar-core v25. All classic and Soroban operations match exactly.
 
 2. **Testnet validator version variance**: Early testnet ledgers were executed with different stellar-core versions over time, using different soroban-env-host revisions with varying cost model characteristics.
 
@@ -388,10 +388,12 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 4. **Payment NoIssuer Check (Fixed January 2026)**: Payment operations were incorrectly returning `NoIssuer` instead of `NoTrust` when the issuer account didn't exist. Per C++ stellar-core (CAP-0017), the issuer existence check was removed in protocol v13. Since we only support protocol 23+, the check should not be performed. The `NoIssuer` error code is effectively unused in modern protocols.
 
+5. **Clawback Trustline Flag Check (Fixed January 2026)**: Clawback operations were checking `AUTH_CLAWBACK_ENABLED_FLAG` on the issuer account instead of `TRUSTLINE_CLAWBACK_ENABLED_FLAG` on the trustline. Per C++ stellar-core (`ClawbackOpFrame.cpp:42-46`), the clawback operation checks `isClawbackEnabledOnTrustline(trust)` which verifies the trustline's flag (0x4), not the issuer account's flag (0x8). The issuer account flag controls whether new trustlines get the clawback flag when created, but the actual clawback operation checks the trustline flag.
+
 ### Remaining Work
 
 1. **Bucket list parity**: The primary blocker for higher match rates at high ledger numbers is bucket list state divergence, being addressed in `stellar-core-bucket`.
 
 2. **Mainnet verification**: Mainnet has more consistent stellar-core versions across history. Verification against mainnet will provide cleaner parity metrics.
 
-3. **Identify clean testnet ranges**: The variable parity in early testnet is expected behavior. For regression testing, use ranges with known 100% parity (2000-2100, 3000-3200, 5000-5200, 8000-8200).
+5. **Identify clean testnet ranges**: The variable parity in early testnet is expected behavior. For regression testing, use ranges with known 100% parity (2000-2100, 3000-3200, 5000-5200, 8000-8200, 30000-36000).
