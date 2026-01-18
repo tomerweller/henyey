@@ -137,10 +137,9 @@ fn execute_credit_payment(
         return Ok(make_result(PaymentResultCode::NoDestination));
     }
 
-    // Check issuer exists
-    if state.get_account(issuer).is_none() {
-        return Ok(make_result(PaymentResultCode::NoIssuer));
-    }
+    // Note: C++ stellar-core only checks if issuer exists before protocol v13.
+    // Since we only support protocol 23+, we skip the issuer existence check.
+    // The NoIssuer error code is effectively unused in modern protocols.
 
     // Check destination trustline first (C++ updateDestBalance is called before updateSourceBalance)
     if issuer != dest {
@@ -476,13 +475,16 @@ mod tests {
     }
 
     #[test]
-    fn test_credit_payment_no_issuer() {
+    fn test_credit_payment_issuer_not_exist_succeeds_in_protocol_23() {
+        // In protocol 23+, the issuer existence check was removed (CAP-0017).
+        // Payments succeed as long as trustlines exist, even if the issuer account doesn't.
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
         let source_id = create_test_account_id(0);
         let dest_id = create_test_account_id(1);
+        // Note: issuer account is NOT created - only source and dest exist
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
 
@@ -517,10 +519,11 @@ mod tests {
             amount: 10,
         };
 
+        // Payment succeeds even without issuer account in protocol 23+
         let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::Payment(r)) => {
-                assert!(matches!(r, PaymentResult::NoIssuer));
+                assert!(matches!(r, PaymentResult::Success));
             }
             _ => panic!("Unexpected result type"),
         }
