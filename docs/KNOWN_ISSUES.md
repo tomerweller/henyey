@@ -657,12 +657,13 @@ The code fix addresses the protocol-version-dependent fee selection bug. Full re
 
 ---
 
-## 15. ManageSellOffer TooManySubentries Check Missing (NEW)
+## 15. ManageSellOffer TooManySubentries Check Missing (RESOLVED)
 
-**Status:** Unresolved
-**Severity:** Critical - We accept invalid transactions
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
 **Component:** Offer Management / Subentry Counting
 **Discovered:** 2026-01-19
+**Fixed:** 2026-01-19
 
 ### Description
 At ledger 407293, a transaction with many ManageSellOffer operations succeeds in our code but fails in C++ stellar-core with `OpTooManySubentries` starting at operation 48.
@@ -670,23 +671,55 @@ At ledger 407293, a transaction with many ManageSellOffer operations succeeds in
 ### Details
 ```
 Ledger 407293 TX 1:
-  - Our result: TxSuccess (all 56 operations succeed)
+  - Our result (before fix): TxSuccess (all 56 operations succeed)
   - CDP result: TxFailed (ops 0-47 succeed, ops 48-55 fail with OpTooManySubentries)
 ```
 
-The transaction attempts to create 56 new offers for the same account. C++ stellar-core correctly rejects operations 48+ because the account would exceed its subentry limit. Our code does not enforce this limit.
+The transaction attempts to create 56 new offers for the same account. C++ stellar-core correctly rejects operations 48+ because the account would exceed its subentry limit.
 
 ### Root Cause
-Our ManageSellOffer implementation doesn't properly check or enforce the account subentry limit. In Stellar, each offer counts as a subentry, and accounts have a limit based on their number of signers and other factors.
+Our ManageSellOffer implementation didn't check the account subentry limit (1000) before creating new offers. In C++ stellar-core, this check is performed in `createEntryWithPossibleSponsorship()` starting from protocol version 11.
 
-The formula for max subentries is typically:
-- Base reserve accounts for 2 base subentries
-- Additional subentries require additional reserve
+The limit is defined as `ACCOUNT_SUBENTRY_LIMIT = 1000` in `.upstream-v25/src/ledger/LedgerTxn.cpp`.
 
-When an account reaches its subentry limit, new offer creation should fail with `OpTooManySubentries`.
+The check applies only when creating a **new** offer (`offer_id == 0`), not when updating or deleting existing offers.
+
+### Resolution
+Fixed in `crates/stellar-core-tx/src/operations/execute/manage_offer.rs`:
+
+1. Added constants:
+```rust
+/// Maximum number of subentries per account.
+/// This limit is enforced starting from protocol version 11.
+const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
+
+/// First protocol version that enforces operation limits.
+const FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS: u32 = 11;
+```
+
+2. Added subentry limit check before creating new offers:
+```rust
+if old_offer.is_none() {
+    // Check subentry limit before creating a new offer.
+    if context.protocol_version >= FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS {
+        let source_account = state
+            .get_account(source)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
+            return Ok(OperationResult::OpTooManySubentries);
+        }
+    }
+    // ... rest of offer creation
+}
+```
+
+This matches C++ stellar-core's behavior in `ManageOfferOpFrameBase.cpp` and `SponsorshipUtils.cpp`.
 
 ### Affected Ledgers
 - Ledger 407293 TX 1
+
+### Verification
+After fix: Ledgers 407293-407294 verified with 6 transactions, all matched (100% parity).
 
 ---
 
@@ -694,14 +727,13 @@ When an account reaches its subentry limit, new offer creation should fail with 
 
 ### Genuine Bugs (tx_only mismatches in segments with clean bucket list OR consistent behavior)
 
-| Issue | Ledger | Description |
-|-------|--------|-------------|
-| #15 | 407293 | ManageSellOffer TooManySubentries not enforced |
+None currently known.
 
 ### Recently Fixed Bugs
 
 | Issue | Ledger | Description | Fixed |
 |-------|--------|-------------|-------|
+| #15 | 407293 | ManageSellOffer TooManySubentries not enforced | 2026-01-19 |
 | #10 | 237057 | ManageSellOffer OpNotSupported (sponsored offer deletion) | 2026-01-19 |
 
 ### Confirmed Bucket-List Induced (segments with header mismatches)
@@ -863,9 +895,9 @@ C++ stellar-core uses a persistent `SharedModuleCacheCompiler`:
 
 ### Priority Order for Fixes
 
-1. **Critical**: #15 (TooManySubentries) - We accept invalid transactions
-2. **High**: #17 (Module Cache) - 10x performance degradation
-3. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
-4. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+1. **High**: #17 (Module Cache) - 10x performance degradation
+2. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
+3. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+4. **Resolved**: #15 (TooManySubentries) - Fixed 2026-01-19
 5. **Resolved**: #10 (ManageSellOffer OpNotSupported) - Fixed 2026-01-19
 6. **Resolved**: #16 (SetTrustLineFlags CantRevoke) - Fixed 2026-01-19

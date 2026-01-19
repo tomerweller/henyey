@@ -22,6 +22,13 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
+/// Maximum number of subentries per account.
+/// This limit is enforced starting from protocol version 11.
+const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
+
+/// First protocol version that enforces operation limits (subentry limit, offers to cross limit).
+const FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS: u32 = 11;
+
 /// Execute a ManageSellOffer operation.
 ///
 /// This operation creates, updates, or deletes an offer to sell one asset for another.
@@ -190,6 +197,17 @@ fn execute_manage_offer(
     }
 
     if old_offer.is_none() {
+        // Check subentry limit before creating a new offer.
+        // This check applies from protocol 11 onwards (FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS).
+        if context.protocol_version >= FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS {
+            let source_account = state
+                .get_account(source)
+                .ok_or(TxError::SourceAccountNotFound)?;
+            if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
+                return Ok(OperationResult::OpTooManySubentries);
+            }
+        }
+
         if let Some(sponsor) = &sponsor {
             let sponsor_account = state
                 .get_account(sponsor)
