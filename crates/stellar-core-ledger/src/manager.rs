@@ -53,6 +53,7 @@ use stellar_core_invariant::{
     LastModifiedLedgerSeqMatchesHeader, LedgerEntryChange, LedgerEntryIsValid, LedgerSeqIncrement,
     LiabilitiesMatchOffers, OrderBookIsNotCrossed, SponsorshipCountIsValid,
 };
+use stellar_core_tx::soroban::PersistentModuleCache;
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
@@ -304,6 +305,13 @@ pub struct LedgerManager {
 
     /// Configuration options.
     config: LedgerManagerConfig,
+
+    /// Persistent module cache for Soroban WASM compilation.
+    ///
+    /// This cache stores pre-compiled WASM modules for contract code entries,
+    /// significantly improving performance for Soroban transactions by avoiding
+    /// repeated compilation of the same contract code.
+    module_cache: RwLock<Option<PersistentModuleCache>>,
 }
 
 impl LedgerManager {
@@ -350,6 +358,7 @@ impl LedgerManager {
             snapshots: SnapshotManager::new(config.max_snapshots),
             invariants: RwLock::new(invariants),
             config,
+            module_cache: RwLock::new(None),
         }
     }
 
@@ -562,16 +571,27 @@ impl LedgerManager {
         // Update state
         *self.bucket_list.write() = bucket_list;
         *self.hot_archive_bucket_list.write() = hot_archive_bucket_list;
-        state.header = header;
+        state.header = header.clone();
         state.header_hash = header_hash;
         state.initialized = true;
 
-        // Clear cache
+        let ledger_seq = state.header.ledger_seq;
+        let header_hash_hex = state.header_hash.to_hex();
+
+        // Release state lock before initializing module cache (which needs bucket_list read lock)
+        drop(state);
+
+        // Clear entry cache
         self.entry_cache.write().clear();
 
+        // Initialize module cache for Soroban contract execution.
+        // This pre-compiles all WASM modules from CONTRACT_CODE entries in the bucket list,
+        // significantly improving performance for Soroban transactions.
+        self.initialize_module_cache(header.ledger_version)?;
+
         info!(
-            ledger_seq = state.header.ledger_seq,
-            header_hash = %state.header_hash.to_hex(),
+            ledger_seq,
+            header_hash = %header_hash_hex,
             "Ledger initialized from buckets"
         );
 
@@ -616,15 +636,19 @@ impl LedgerManager {
 
         // Update state
         *self.bucket_list.write() = bucket_list;
-        state.header = header;
+        state.header = header.clone();
         state.header_hash = header_hash;
         state.initialized = true;
 
-        // Clear cache
+        // Clear entry cache
         self.entry_cache.write().clear();
 
+        // Initialize module cache for Soroban contract execution
+        drop(state); // Release state lock before initializing module cache
+        self.initialize_module_cache(header.ledger_version)?;
+
         info!(
-            ledger_seq = state.header.ledger_seq,
+            ledger_seq = header.ledger_seq,
             "Ledger initialized from buckets (verification skipped)"
         );
 
@@ -636,11 +660,59 @@ impl LedgerManager {
         *self.hot_archive_bucket_list.write() = None;
         self.entry_cache.write().clear();
         self.snapshots.clear();
+        *self.module_cache.write() = None;
 
         let mut state = self.state.write();
         state.header = create_genesis_header();
         state.header_hash = Hash256::ZERO;
         state.initialized = false;
+    }
+
+    /// Initialize the persistent module cache from CONTRACT_CODE entries in the bucket list.
+    ///
+    /// This scans the bucket list for all contract code entries and pre-compiles them
+    /// for reuse across transactions. This is only done for protocol versions that
+    /// support Soroban (20+).
+    fn initialize_module_cache(&self, protocol_version: u32) -> Result<()> {
+        use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
+
+        if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
+            // Soroban not supported at this protocol version
+            *self.module_cache.write() = None;
+            return Ok(());
+        }
+
+        // Create a new module cache for this protocol version
+        let cache = match PersistentModuleCache::new_for_protocol(protocol_version) {
+            Some(c) => c,
+            None => {
+                *self.module_cache.write() = None;
+                return Ok(());
+            }
+        };
+
+        // Scan bucket list for CONTRACT_CODE entries and pre-compile them
+        let bucket_list = self.bucket_list.read();
+        let live_entries = bucket_list.live_entries().map_err(|e| {
+            LedgerError::Internal(format!("Failed to get live entries for module cache: {}", e))
+        })?;
+
+        let mut contracts_added = 0;
+        for entry in &live_entries {
+            if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
+                if cache.add_contract(contract_code.code.as_slice(), protocol_version) {
+                    contracts_added += 1;
+                }
+            }
+        }
+
+        info!(
+            contracts_added,
+            protocol_version, "Initialized module cache from bucket list"
+        );
+
+        *self.module_cache.write() = Some(cache);
+        Ok(())
     }
 
     /// Apply a ledger from history (replay mode).
@@ -1093,10 +1165,12 @@ impl<'a> LedgerCloseContext<'a> {
             emit_classic_events: self.manager.config.emit_classic_events,
             backfill_stellar_asset_events: self.manager.config.backfill_stellar_asset_events,
         };
-        // TODO: Add PersistentModuleCache support to LedgerManager for improved Soroban
-        // performance. The cache should be initialized from contract code entries in the
-        // bucket list and reused across ledger closes. Currently passing None, which means
-        // WASM modules are recompiled for each transaction.
+
+        // Get reference to the module cache for Soroban contract execution.
+        // The cache is pre-initialized from bucket list CONTRACT_CODE entries.
+        let module_cache_guard = self.manager.module_cache.read();
+        let module_cache = module_cache_guard.as_ref();
+
         let (results, tx_results, mut tx_result_metas, id_pool) = execute_transaction_set(
             &self.snapshot,
             &transactions,
@@ -1111,7 +1185,7 @@ impl<'a> LedgerCloseContext<'a> {
             soroban_base_prng_seed.0,
             classic_events,
             op_invariants,
-            None, // Module cache not yet wired up for online ledger closing
+            module_cache,
         )?;
         if classic_events.events_enabled(self.prev_header.ledger_version) {
             for (idx, ((envelope, _), meta)) in transactions
