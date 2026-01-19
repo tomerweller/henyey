@@ -342,30 +342,69 @@ After fix: 21,999 transactions in range 30000-40000 verified with 0 mismatches (
 
 ---
 
-## 10. ManageSellOffer OpNotSupported Bug (NEW)
+## 10. ManageSellOffer OpNotSupported Bug (RESOLVED)
 
-**Status:** Unresolved
-**Severity:** Medium - Affects specific ManageSellOffer operations
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
 **Component:** Offer Management
 **Discovered:** 2026-01-19
+**Fixed:** 2026-01-19
 
 ### Description
-At ledger 237057, a ManageSellOffer operation returns `OpNotSupported` in our code but succeeds in C++ stellar-core with `offer: Deleted`.
+At ledger 237057, a ManageSellOffer operation returned `OpNotSupported` in our code but succeeded in C++ stellar-core with `offer: Deleted`.
 
 ### Details
 ```
 Ledger 237057 TX 0:
-  - Our result: OpNotSupported (transaction failed)
+  - Our result (before fix): OpNotSupported (transaction failed)
   - CDP result: ManageSellOffer(Success { offers_claimed: [], offer: Deleted })
 ```
 
-This segment has **0 header mismatches**, meaning the bucket list state is correct. This is a genuine execution bug, not caused by state divergence.
+This segment has **0 header mismatches**, meaning the bucket list state is correct. This was a genuine execution bug.
 
 ### Root Cause
-Under investigation. The operation appears to be a deletion of an existing offer that our code incorrectly rejects as not supported.
+When deleting an offer that has a sponsor, the sponsor account must be loaded to update its `num_sponsoring` counter. Our code loaded the offer entry when preparing for a ManageSellOffer operation, but did NOT load the sponsor account if the offer was sponsored.
+
+The flow was:
+1. ManageSellOffer with `amount=0` and `offer_id != 0` is a delete operation
+2. `load_operation_accounts` loaded the offer entry (correctly extracting sponsor from entry extension)
+3. `delete_offer` called `update_num_sponsoring(&sponsor, -1)` to decrement sponsor's counter
+4. `update_num_sponsoring` failed with "source account not found" because sponsor was never loaded
+5. The error propagated and was incorrectly mapped to `OpNotSupported`
+
+C++ stellar-core handles this differently: it loads accounts dynamically during execution via `loadAccount(ltx, sponsoringID)` in `removeEntryWithPossibleSponsorship()`.
+
+### Resolution
+Fixed in `crates/stellar-core-ledger/src/execution.rs` by adding a `load_offer_sponsor()` helper function that loads the sponsor account after loading an offer:
+
+```rust
+/// Load the sponsor account for an offer if it has one.
+/// This is needed when deleting or modifying an offer with sponsorship,
+/// as we need to update the sponsor's num_sponsoring counter.
+fn load_offer_sponsor(
+    &mut self,
+    snapshot: &SnapshotHandle,
+    seller_id: &AccountId,
+    offer_id: i64,
+) -> Result<()> {
+    let key = LedgerKey::Offer(LedgerKeyOffer {
+        seller_id: seller_id.clone(),
+        offer_id,
+    });
+    if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+        self.load_account(snapshot, &sponsor)?;
+    }
+    Ok(())
+}
+```
+
+This function is called after `load_offer()` for both ManageSellOffer and ManageBuyOffer operations when `offer_id != 0`.
 
 ### Affected Ledgers
 - Ledger 237057 TX 0
+
+### Verification
+After fix: 51 ledgers (237050-237100) verified with 185 transactions, all matched (100% parity).
 
 ---
 
@@ -657,8 +696,13 @@ When an account reaches its subentry limit, new offer creation should fail with 
 
 | Issue | Ledger | Description |
 |-------|--------|-------------|
-| #10 | 237057 | ManageSellOffer OpNotSupported vs Success (0 header mismatches) |
 | #15 | 407293 | ManageSellOffer TooManySubentries not enforced |
+
+### Recently Fixed Bugs
+
+| Issue | Ledger | Description | Fixed |
+|-------|--------|-------------|-------|
+| #10 | 237057 | ManageSellOffer OpNotSupported (sponsored offer deletion) | 2026-01-19 |
 
 ### Confirmed Bucket-List Induced (segments with header mismatches)
 
@@ -787,7 +831,7 @@ C++ stellar-core uses a persistent `SharedModuleCacheCompiler`:
 
 1. **Critical**: #15 (TooManySubentries) - We accept invalid transactions
 2. **High**: #17 (Module Cache) - 10x performance degradation
-3. **Medium**: #10 (OpNotSupported) - Legitimate operations rejected
-4. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
-5. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
-6. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+3. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
+4. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
+5. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+6. **Resolved**: #10 (ManageSellOffer OpNotSupported) - Fixed 2026-01-19
