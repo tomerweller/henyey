@@ -357,8 +357,13 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         fee_per_transaction_size_1kb: fee_tx_size_1kb,
     };
 
+    // RentFeeConfiguration.fee_per_write_1kb must be feeFlatRateWrite1KB() to match C++
+    // rustBridgeRentFeeConfiguration(). This is 0 for protocol < 23 (the setting doesn't exist),
+    // which is correct because the TTL entry write fee component was introduced in protocol 23.
+    // This is DIFFERENT from FeeConfiguration.fee_per_write_1kb which uses fee_per_rent_1kb
+    // for protocol < 23.
     let rent_fee_config = RentFeeConfiguration {
-        fee_per_write_1kb: fee_per_write_1kb_for_config,
+        fee_per_write_1kb: fee_write_1kb,
         fee_per_rent_1kb,
         fee_per_write_entry: fee_write_ledger_entry,
         persistent_rent_rate_denominator,
@@ -549,6 +554,14 @@ impl RefundableFeeTracker {
             .consumed_event_size_bytes
             .saturating_add(event_size_bytes);
         self.consumed_rent_fee = self.consumed_rent_fee.saturating_add(rent_fee);
+
+        // First check: rent fee alone must not exceed max refundable fee.
+        // This matches C++ stellar-core's consumeRefundableSorobanResources which checks
+        // if (mMaximumRefundableFee < mConsumedRentFee) before computing events fee.
+        if self.consumed_rent_fee > self.max_refundable_fee {
+            return false;
+        }
+
         let (_, refundable_fee) = match compute_soroban_resource_fee(
             frame,
             protocol_version,
@@ -559,6 +572,8 @@ impl RefundableFeeTracker {
             None => return false,
         };
         self.consumed_refundable_fee = self.consumed_rent_fee.saturating_add(refundable_fee);
+
+        // Second check: total consumed (rent + events) must not exceed max refundable fee.
         self.consumed_refundable_fee <= self.max_refundable_fee
     }
 

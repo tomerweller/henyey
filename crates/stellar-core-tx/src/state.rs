@@ -1777,6 +1777,11 @@ impl LedgerStateManager {
         self.remove_last_modified_key(&ledger_key);
     }
 
+    /// Iterate over all offers.
+    pub fn offers_iter(&self) -> impl Iterator<Item = &OfferEntry> {
+        self.offers.values()
+    }
+
     /// Get the best offer for a buying/selling pair (lowest price, then offer ID).
     pub fn best_offer(&self, buying: &Asset, selling: &Asset) -> Option<OfferEntry> {
         self.offers
@@ -3675,9 +3680,13 @@ fn compare_offer(lhs: &OfferEntry, rhs: &OfferEntry) -> std::cmp::Ordering {
 }
 
 fn compare_price(lhs: &Price, rhs: &Price) -> std::cmp::Ordering {
-    let lhs_value = i128::from(lhs.n) * i128::from(rhs.d);
-    let rhs_value = i128::from(rhs.n) * i128::from(lhs.d);
-    lhs_value.cmp(&rhs_value)
+    // Use floating-point comparison to match C++ stellar-core behavior.
+    // The C++ code stores `price = double(price.n) / double(price.d)` in the database
+    // and uses `ORDER BY price` for offer ordering. The isBetterOffer function also
+    // uses double comparison to match this SQL ordering.
+    let lhs_price = lhs.n as f64 / lhs.d as f64;
+    let rhs_price = rhs.n as f64 / rhs.d as f64;
+    lhs_price.partial_cmp(&rhs_price).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 fn sponsorship_counts(account: &AccountEntry) -> (i64, i64) {

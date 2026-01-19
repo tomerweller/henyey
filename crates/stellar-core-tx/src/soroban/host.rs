@@ -1378,15 +1378,21 @@ fn execute_host_function_p24(
                 .get_archived_with_restore_info(&Rc::new(key_p24), key)
                 .map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?;
             if let Some((entry, live_until, live_bl_restore)) = result {
+                // For restored entries, pass the RESTORED TTL to the host, not the old expired TTL.
+                // This matches C++ behavior where restoredLiveUntilLedger = ledgerSeq + minPersistentTTL - 1
+                // is passed to the host for auto-restored entries.
+                let restored_live_until =
+                    Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
                 tracing::info!(
                     idx = idx,
                     key_type = ?std::mem::discriminant(key),
-                    live_until = ?live_until,
+                    old_live_until = ?live_until,
+                    restored_live_until = ?restored_live_until,
                     current_ledger = context.sequence,
                     is_live_bl_restore = live_bl_restore.is_some(),
                     "P24: Archived entry found for restoration"
                 );
-                add_entry(key, &entry, live_until)?;
+                add_entry(key, &entry, restored_live_until)?;
 
                 // Track live BL restorations
                 if let Some(restore) = live_bl_restore {
@@ -1784,13 +1790,20 @@ fn execute_host_function_p25(
                 .get_archived_with_restore_info(&Rc::new(key.clone()))
                 .map_err(make_setup_error)?;
             if let Some((entry, live_until, live_bl_restore)) = result {
+                // For restored entries, pass the RESTORED TTL to the host, not the old expired TTL.
+                // This matches C++ behavior where restoredLiveUntilLedger = ledgerSeq + minPersistentTTL - 1
+                // is passed to the host for auto-restored entries.
+                let restored_live_until =
+                    Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
                 tracing::info!(
                     idx = idx,
                     key_type = ?std::mem::discriminant(key),
+                    old_live_until = ?live_until,
+                    restored_live_until = ?restored_live_until,
                     is_live_bl_restore = live_bl_restore.is_some(),
                     "P25: Archived entry found for restoration"
                 );
-                add_entry(key, &entry, live_until)?;
+                add_entry(key, &entry, restored_live_until)?;
 
                 // Track live BL restorations
                 if let Some(restore) = live_bl_restore {
@@ -1902,7 +1915,7 @@ fn execute_host_function_p25(
         }
     }
 
-    let rent_changes: Vec<LedgerEntryRentChange> =
+    let rent_changes: Vec<soroban_env_host25::fees::LedgerEntryRentChange> =
         e2e_invoke::extract_rent_changes(&result.ledger_changes);
 
     let storage_changes = result
