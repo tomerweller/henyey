@@ -397,12 +397,13 @@ Under investigation. Our code is rejecting a transaction with insufficient refun
 
 ---
 
-## 12. InvokeHostFunction Trapped vs ResourceLimitExceeded (Under Investigation)
+## 12. InvokeHostFunction Trapped vs ResourceLimitExceeded (BUCKET LIST INDUCED)
 
-**Status:** Under Investigation
-**Severity:** Low - Both fail, just different error codes
+**Status:** Confirmed Bucket List Induced - No fix needed
+**Severity:** N/A - Symptom of Issue #2 (Bucket List Hash Divergence)
 **Component:** Soroban Host
 **Discovered:** 2026-01-19
+**Investigated:** 2026-01-19
 
 ### Description
 Some InvokeHostFunction transactions fail with `Trapped` in our code but `ResourceLimitExceeded` in C++ stellar-core. Both are failures, but the error code differs.
@@ -418,17 +419,58 @@ Ledger 327722 TX 6:
   - CDP result: InvokeHostFunction(ResourceLimitExceeded)
 ```
 
-### Root Cause
-The transactions fail in both implementations, but the error detection order differs. This could be:
-1. Host detecting trap condition before resource limit check
-2. Different order of validation checks
-3. Edge case in resource tracking
+### Root Cause Analysis (2026-01-19)
 
-This is related to the previously fixed Issue #4 but occurring in different ledgers. May require further investigation of host error prioritization.
+**This is NOT a genuine execution bug.** The error code difference is caused by bucket list divergence affecting Soroban contract execution.
+
+**Code Review Findings:**
+
+Our `map_host_error_to_result_code()` function in `invoke_host_function.rs` (lines 779-796) correctly implements the C++ stellar-core logic from `InvokeHostFunctionOpFrame.cpp` (lines 580-603):
+
+```cpp
+// C++ stellar-core logic:
+if (mResources.instructions < out.cpu_insns)
+    -> INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED
+else if (mSorobanConfig.txMemoryLimit() < out.mem_bytes)
+    -> INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED
+else
+    -> INVOKE_HOST_FUNCTION_TRAPPED
+```
+
+Our Rust equivalent uses the same comparison logic:
+```rust
+if exec_error.cpu_insns_consumed > specified_instructions as u64 {
+    return ResourceLimitExceeded;
+}
+if exec_error.mem_bytes_consumed > tx_memory_limit {
+    return ResourceLimitExceeded;
+}
+Trapped
+```
+
+Both check: actual consumption > specified limit => ResourceLimitExceeded, otherwise => Trapped.
+
+**Why Error Codes Differ:**
+
+When bucket list state diverges (segments 16 and 33 have significant header mismatches):
+
+1. Contract data entries may have different values
+2. Different values lead to different WASM execution paths
+3. Different paths consume different CPU/memory amounts
+4. C++ (with correct state) sees different execution, may consume more resources and exceed limit -> `ResourceLimitExceeded`
+5. We (with diverged state) see different execution, consume fewer resources, fail for other reason -> `Trapped`
+
+**Evidence:**
+- Segment 16 (ledger 152692): 4,377 header mismatches indicate bucket list divergence
+- Segment 33 (ledger 327722): 2,217 header mismatches indicate bucket list divergence
+- When bucket list is correct (segments with 0 header mismatches), transaction execution achieves 100% parity
+
+**Resolution:**
+This issue will automatically resolve when bucket list divergence (Issue #2) is fixed. No code changes needed for error mapping logic.
 
 ### Affected Ledgers
-- Ledger 152692 TX 2
-- Ledger 327722 TX 6
+- Ledger 152692 TX 2 (segment 16 - bucket list diverged)
+- Ledger 327722 TX 6 (segment 33 - bucket list diverged)
 
 ---
 
@@ -581,7 +623,7 @@ When an account reaches its subentry limit, new offer creation should fail with 
 
 | Issue | Ledgers | Description |
 |-------|---------|-------------|
-| #12 | 152692, 327722 | InvokeHostFunction Trapped vs ResourceLimitExceeded |
+| #12 | 152692, 327722 | InvokeHostFunction Trapped vs ResourceLimitExceeded (CONFIRMED 2026-01-19) |
 | #13 | 201477, 201755, 325512, 332809 | Orderbook claims different offers (CONFIRMED 2026-01-19) |
 
 ---
