@@ -589,10 +589,54 @@ Our SetTrustLineFlags implementation may have incorrect logic for determining wh
 
 ---
 
+## 17. Missing Persistent WASM Module Cache (Performance)
+
+**Status:** Unresolved
+**Severity:** High - Causes 10x+ slowdown in Soroban-heavy segments
+**Component:** Soroban Host / WASM Compilation
+**Discovered:** 2026-01-19
+
+### Description
+Verification of later testnet segments (380k+ ledgers) runs ~10x slower than earlier segments despite similar transaction counts. Processing rate drops from ~3,000 TX/min to ~300 TX/min.
+
+### Details
+| Segment | Ledger Start | TXs | Duration | TX/min |
+|---------|--------------|-----|----------|--------|
+| 20 | 190,064 | 33,288 | 604s | 3,306 |
+| 35 | 340,064 | 33,025 | 919s | 2,156 |
+| 39 | 380,064 | 35,459 | 6,965s | 305 |
+| 44 | 430,064 | 37,452 | 7,932s | 283 |
+
+### Root Cause
+Our implementation builds a **new ModuleCache for every transaction** in `build_module_cache_for_footprint()`. This means:
+1. Every Soroban transaction creates a fresh `ModuleCache`
+2. All WASM modules in the footprint are compiled from scratch
+3. Compiled modules are discarded after the transaction
+
+C++ stellar-core uses a `SharedModuleCacheCompiler` that:
+1. Persists the module cache across transactions via `app.getLedgerManager().getModuleCache()`
+2. `ThreadParallelApplyLedgerState` stores `mModuleCache` and reuses it
+3. Compiled WASM modules are cached and reused for subsequent transactions
+
+If the same contract (e.g., USDC) is called 1000 times in a segment, we compile its WASM 1000 times instead of once.
+
+### Affected Code
+- `crates/stellar-core-tx/src/soroban/host.rs`: `build_module_cache_for_footprint()` and `build_module_cache_for_footprint_p25()`
+- Need to add persistent cache at verification/execution level
+
+### Fix Approach
+1. Create a persistent `ModuleCache` at the segment/ledger-range level
+2. Pass the cache into `invoke_host_function_p24`/`invoke_host_function_p25`
+3. Populate cache incrementally as new contracts are encountered
+4. Match C++ `SharedModuleCacheCompiler` behavior
+
+---
+
 ### Priority Order for Fixes
 
 1. **Critical**: #15 (TooManySubentries) - We accept invalid transactions
 2. **High**: #14 (Refundable Fee) - Bidirectional fee validation mismatch
-3. **Medium**: #10 (OpNotSupported) - Legitimate operations rejected
-4. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
-5. **Low**: #12, #13 - May resolve when bucket list is fixed
+3. **High**: #17 (Module Cache) - 10x performance degradation
+4. **Medium**: #10 (OpNotSupported) - Legitimate operations rejected
+5. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
+6. **Low**: #12, #13 - May resolve when bucket list is fixed
