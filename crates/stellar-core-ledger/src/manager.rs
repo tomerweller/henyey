@@ -1086,7 +1086,7 @@ impl<'a> LedgerCloseContext<'a> {
         };
 
         // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
-        let soroban_config = crate::execution::load_soroban_config(&self.snapshot);
+        let soroban_config = crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version);
         // Use transaction set hash as base PRNG seed for Soroban execution
         let soroban_base_prng_seed = self.close_data.tx_set_hash();
         let classic_events = ClassicEventConfig {

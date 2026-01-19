@@ -40,6 +40,7 @@ use soroban_env_host_p25::fees::{
     compute_rent_write_fee_per_1kb, compute_transaction_resource_fee, FeeConfiguration,
     RentFeeConfiguration, RentWriteFeeConfiguration,
 };
+use stellar_core_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_crypto::account_id_to_strkey;
 use stellar_core_invariant::{
@@ -164,7 +165,14 @@ fn load_config_setting(
 /// This loads the cost parameters and limits from the ledger state,
 /// which are required for accurate Soroban transaction execution.
 /// If any required settings are missing, returns a default config.
-pub fn load_soroban_config(snapshot: &SnapshotHandle) -> SorobanConfig {
+///
+/// The `protocol_version` parameter is used to determine which fee to use
+/// for `fee_per_write_1kb` in the FeeConfiguration:
+/// - For protocol >= 23: uses `fee_write1_kb` from ContractLedgerCostExtV0
+/// - For protocol < 23: uses the computed `fee_per_rent_1kb` (state-size based)
+///
+/// This matches C++ stellar-core's `rustBridgeFeeConfiguration()` behavior.
+pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> SorobanConfig {
     // Load CPU cost params
     let cpu_cost_params =
         load_config_setting(snapshot, ConfigSettingId::ContractCostParamsCpuInstructions)
@@ -328,19 +336,29 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle) -> SorobanConfig {
     let fee_per_rent_1kb =
         compute_rent_write_fee_per_1kb(average_soroban_state_size, &rent_write_config);
 
+    // Protocol version-dependent fee selection matching C++ rustBridgeFeeConfiguration():
+    // - For protocol >= 23: use fee_write_1kb (flat rate from ContractLedgerCostExtV0)
+    // - For protocol < 23: use fee_per_rent_1kb (computed from state size)
+    let fee_per_write_1kb_for_config =
+        if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+            fee_write_1kb
+        } else {
+            fee_per_rent_1kb
+        };
+
     let fee_config = FeeConfiguration {
         fee_per_instruction_increment,
         fee_per_disk_read_entry: fee_disk_read_ledger_entry,
         fee_per_write_entry: fee_write_ledger_entry,
         fee_per_disk_read_1kb: fee_disk_read_1kb,
-        fee_per_write_1kb: fee_write_1kb,
+        fee_per_write_1kb: fee_per_write_1kb_for_config,
         fee_per_historical_1kb: fee_historical_1kb,
         fee_per_contract_event_1kb: fee_contract_events_1kb,
         fee_per_transaction_size_1kb: fee_tx_size_1kb,
     };
 
     let rent_fee_config = RentFeeConfiguration {
-        fee_per_write_1kb: fee_write_1kb,
+        fee_per_write_1kb: fee_per_write_1kb_for_config,
         fee_per_rent_1kb,
         fee_per_write_entry: fee_write_ledger_entry,
         persistent_rent_rate_denominator,
@@ -917,6 +935,25 @@ impl TransactionExecutor {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Load the sponsor account for an offer if it has one.
+    /// This is needed when deleting or modifying an offer with sponsorship,
+    /// as we need to update the sponsor's num_sponsoring counter.
+    fn load_offer_sponsor(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        seller_id: &AccountId,
+        offer_id: i64,
+    ) -> Result<()> {
+        let key = stellar_xdr::curr::LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id,
+        });
+        if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+            self.load_account(snapshot, &sponsor)?;
+        }
+        Ok(())
     }
 
     fn load_asset_issuer(&mut self, snapshot: &SnapshotHandle, asset: &Asset) -> Result<()> {
@@ -2603,6 +2640,8 @@ impl TransactionExecutor {
                 // Load existing offer if modifying/deleting (offer_id != 0)
                 if op_data.offer_id != 0 {
                     self.load_offer(snapshot, &op_source, op_data.offer_id)?;
+                    // If the offer has a sponsor, load the sponsor account for sponsorship updates
+                    self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
                 }
             }
             OperationBody::CreatePassiveSellOffer(op_data) => {
@@ -2624,6 +2663,8 @@ impl TransactionExecutor {
                 // Load existing offer if modifying/deleting (offer_id != 0)
                 if op_data.offer_id != 0 {
                     self.load_offer(snapshot, &op_source, op_data.offer_id)?;
+                    // If the offer has a sponsor, load the sponsor account for sponsorship updates
+                    self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
                 }
             }
             OperationBody::PathPaymentStrictSend(op_data) => {

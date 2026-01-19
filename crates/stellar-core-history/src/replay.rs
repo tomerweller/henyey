@@ -351,7 +351,7 @@ pub fn replay_ledger_with_execution(
     let mut delta = LedgerDelta::new(header.ledger_seq);
     let transactions = tx_set.transactions_with_base_fee();
     // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
-    let soroban_config = load_soroban_config(&snapshot);
+    let soroban_config = load_soroban_config(&snapshot, header.ledger_version);
     let eviction_settings =
         load_state_archival_settings(&snapshot).unwrap_or(config.eviction_settings);
     // Use transaction set hash as base PRNG seed for Soroban execution

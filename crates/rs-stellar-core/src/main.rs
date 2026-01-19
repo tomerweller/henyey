@@ -2788,7 +2788,7 @@ async fn cmd_verify_execution(
             std::collections::HashMap::new(),
         );
         let snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
-        let soroban_config = load_soroban_config(&snapshot_handle);
+        let soroban_config = load_soroban_config(&snapshot_handle, init_protocol_version);
         SorobanRentConfig {
             cpu_cost_params: soroban_config.cpu_cost_params,
             mem_cost_params: soroban_config.mem_cost_params,
@@ -3010,7 +3010,7 @@ async fn cmd_verify_execution(
             snapshot_handle.set_entries_lookup(entries_fn);
 
             // Load Soroban config from ledger state
-            let soroban_config = load_soroban_config(&snapshot_handle);
+            let soroban_config = load_soroban_config(&snapshot_handle, header.ledger_version);
             let rent_config = SorobanRentConfig {
                 cpu_cost_params: soroban_config.cpu_cost_params.clone(),
                 mem_cost_params: soroban_config.mem_cost_params.clone(),
