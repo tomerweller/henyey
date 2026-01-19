@@ -22,9 +22,11 @@ use std::fmt;
 /// and begins participating in consensus. Each state determines which operations
 /// are permitted (e.g., receiving transactions, processing SCP envelopes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum HerderState {
     /// Initial state after startup.
     /// The node is booting up and hasn't yet connected to the network.
+    #[default]
     Booting,
 
     /// Syncing state during catchup.
@@ -74,11 +76,6 @@ impl HerderState {
     }
 }
 
-impl Default for HerderState {
-    fn default() -> Self {
-        HerderState::Booting
-    }
-}
 
 impl fmt::Display for HerderState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

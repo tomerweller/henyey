@@ -186,7 +186,7 @@ impl LedgerCloseData {
     /// A `LedgerCloseData` if deserialization succeeds.
     pub fn from_xdr(sts: StoredDebugTransactionSet) -> Result<Self, LedgerCloseDataError> {
         let tx_set = TransactionSet::from_xdr_stored_set(&sts.tx_set)
-            .map_err(|e| LedgerCloseDataError::TxSetDecodeError(e))?;
+            .map_err(LedgerCloseDataError::TxSetDecodeError)?;
 
         // Verify hash matches
         if tx_set.hash.0 != sts.scp_value.tx_set_hash.0 {
@@ -267,7 +267,7 @@ where
     }
 
     // Transaction set hash (abbreviated)
-    let tx_hash_hex = hex::encode(&sv.tx_set_hash.0);
+    let tx_hash_hex = hex::encode(sv.tx_set_hash.0);
     let short_hash = &tx_hash_hex[..8.min(tx_hash_hex.len())];
     res.push_str(&format!(" txH: {}", short_hash));
 
@@ -310,7 +310,7 @@ fn upgrade_to_string(upgrade: &stellar_xdr::curr::LedgerUpgrade) -> String {
         LedgerUpgrade::Flags(f) => format!("flags={}", f),
         LedgerUpgrade::Config(c) => {
             // Config upgrades have contract_id and content_hash
-            let hash_hex = hex::encode(&c.content_hash.0);
+            let hash_hex = hex::encode(c.content_hash.0);
             let short_hash = &hash_hex[..8.min(hash_hex.len())];
             format!("config(hash={})", short_hash)
         }

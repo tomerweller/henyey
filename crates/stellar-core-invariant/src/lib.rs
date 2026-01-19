@@ -880,11 +880,7 @@ impl Invariant for LedgerEntryIsValid {
                         LedgerEntryData::LiquidityPool(pool) => pool,
                         _ => unreachable!("entry data already matched"),
                     };
-                    let cp = match &pool.body {
-                        stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
-                            cp,
-                        ) => cp,
-                    };
+                    let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.body;
                     if !asset_valid(&cp.params.asset_a) {
                         return Err(InvariantError::Violated {
                             name: self.name().to_string(),
@@ -935,11 +931,7 @@ impl Invariant for LedgerEntryIsValid {
                     }
                     if let Some(prev) = previous {
                         if let LedgerEntryData::LiquidityPool(prev_pool) = &prev.data {
-                            let prev_body = match &prev_pool.body {
-                                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
-                                    prev_cp,
-                                ) => prev_cp,
-                            };
+                            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(prev_body) = &prev_pool.body;
                             if prev_body.params != cp.params {
                                 return Err(InvariantError::Violated {
                                     name: self.name().to_string(),
@@ -1417,11 +1409,10 @@ fn check_order_book_crossed(
     let highest_bid = price_as_f64(&highest_bid_price);
 
     if lowest_ask_price <= highest_bid {
-        if lowest_ask_price == highest_bid {
-            if lowest_ask.is_passive() || highest_bid_inverse.is_passive() {
+        if lowest_ask_price == highest_bid
+            && (lowest_ask.is_passive() || highest_bid_inverse.is_passive()) {
                 return Ok(());
             }
-        }
         return Err(InvariantError::Violated {
             name: "OrderBookIsNotCrossed".to_string(),
             details: "order book is crossed".to_string(),
@@ -1543,12 +1534,8 @@ impl Invariant for ConstantProductInvariant {
                 _ => continue,
             };
 
-            let prev_cp = match &prev_pool.body {
-                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => cp,
-            };
-            let curr_cp = match &curr_pool.body {
-                stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => cp,
-            };
+            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(prev_cp) = &prev_pool.body;
+            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(curr_cp) = &curr_pool.body;
 
             if curr_cp.reserve_a < 0
                 || curr_cp.reserve_b < 0
@@ -1765,9 +1752,7 @@ fn aggregate_event_diffs(
             maybe_asset
         };
 
-        let Some(event_name) = scval_symbol_string(&topics[0]) else {
-            return None;
-        };
+        let event_name = scval_symbol_string(&topics[0])?;
 
         match event_name.as_str() {
             "transfer" => {
@@ -1988,9 +1973,7 @@ fn verify_events_delta(
                 }
                 _ => None,
             };
-            let Some(asset) = asset else {
-                return None;
-            };
+            let asset = asset?;
 
             let address = get_address_from_balance_key(&contract_data.key);
             let event_diff = address

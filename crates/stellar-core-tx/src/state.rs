@@ -1032,12 +1032,12 @@ impl LedgerStateManager {
                 let key = ContractDataKey::new(
                     contract_data.contract.clone(),
                     contract_data.key.clone(),
-                    contract_data.durability.clone(),
+                    contract_data.durability,
                 );
                 let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
                     contract: contract_data.contract.clone(),
                     key: contract_data.key.clone(),
-                    durability: contract_data.durability.clone(),
+                    durability: contract_data.durability,
                 });
                 self.contract_data.insert(key, contract_data);
                 self.entry_last_modified
@@ -1171,9 +1171,7 @@ impl LedgerStateManager {
         });
 
         // Save snapshot (None because it didn't exist)
-        if !self.account_snapshots.contains_key(&key) {
-            self.account_snapshots.insert(key, None);
-        }
+        self.account_snapshots.entry(key).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -1284,7 +1282,7 @@ impl LedgerStateManager {
                 let key = ContractDataKey::new(
                     cd.contract.clone(),
                     cd.key.clone(),
-                    cd.durability.clone(),
+                    cd.durability,
                 );
                 self.contract_data.insert(key, cd.clone());
             }
@@ -1337,7 +1335,7 @@ impl LedgerStateManager {
             }
             LedgerKey::ContractData(k) => {
                 let cd_key =
-                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability.clone());
+                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data.remove(&cd_key);
             }
             LedgerKey::ContractCode(k) => {
@@ -1687,9 +1685,7 @@ impl LedgerStateManager {
         });
 
         // Save snapshot (None because it didn't exist)
-        if !self.offer_snapshots.contains_key(&key) {
-            self.offer_snapshots.insert(key, None);
-        }
+        self.offer_snapshots.entry(key).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -2045,12 +2041,12 @@ impl LedgerStateManager {
         let key = ContractDataKey::new(
             entry.contract.clone(),
             entry.key.clone(),
-            entry.durability.clone(),
+            entry.durability,
         );
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
-            durability: entry.durability.clone(),
+            durability: entry.durability,
         });
 
         // Save snapshot (None because it didn't exist)
@@ -2081,12 +2077,12 @@ impl LedgerStateManager {
         let key = ContractDataKey::new(
             entry.contract.clone(),
             entry.key.clone(),
-            entry.durability.clone(),
+            entry.durability,
         );
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
-            durability: entry.durability.clone(),
+            durability: entry.durability,
         });
 
         // Save snapshot if not already saved
@@ -2125,11 +2121,11 @@ impl LedgerStateManager {
         key: &ScVal,
         durability: ContractDataDurability,
     ) {
-        let lookup_key = ContractDataKey::new(contract.clone(), key.clone(), durability.clone());
+        let lookup_key = ContractDataKey::new(contract.clone(), key.clone(), durability);
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: contract.clone(),
             key: key.clone(),
-            durability: durability.clone(),
+            durability,
         });
 
         // Save snapshot if not already saved
@@ -2203,9 +2199,7 @@ impl LedgerStateManager {
         });
 
         // Save snapshot (None because it didn't exist)
-        if !self.contract_code_snapshots.contains_key(&key) {
-            self.contract_code_snapshots.insert(key, None);
-        }
+        self.contract_code_snapshots.entry(key).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -2339,9 +2333,7 @@ impl LedgerStateManager {
         });
 
         // Save snapshot (None because it didn't exist)
-        if !self.ttl_snapshots.contains_key(&key) {
-            self.ttl_snapshots.insert(key, None);
-        }
+        self.ttl_snapshots.entry(key).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -2410,9 +2402,7 @@ impl LedgerStateManager {
             // Only extend if the new TTL is greater
             if live_until_ledger_seq > ttl_entry.live_until_ledger_seq {
                 // Save snapshot if not already saved
-                if !self.ttl_snapshots.contains_key(&key) {
-                    self.ttl_snapshots.insert(key, Some(ttl_entry.clone()));
-                }
+                self.ttl_snapshots.entry(key).or_insert_with(|| Some(ttl_entry.clone()));
                 let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                     key_hash: key_hash.clone(),
                 });
@@ -2538,9 +2528,7 @@ impl LedgerStateManager {
         });
 
         // Save snapshot (None because it didn't exist)
-        if !self.claimable_balance_snapshots.contains_key(&key) {
-            self.claimable_balance_snapshots.insert(key, None);
-        }
+        self.claimable_balance_snapshots.entry(key).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -2675,9 +2663,7 @@ impl LedgerStateManager {
         });
 
         // Save snapshot (None because it didn't exist)
-        if !self.liquidity_pool_snapshots.contains_key(&key) {
-            self.liquidity_pool_snapshots.insert(key, None);
-        }
+        self.liquidity_pool_snapshots.entry(key).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -2767,7 +2753,7 @@ impl LedgerStateManager {
                 result.map(|e| self.data_to_ledger_entry(e))
             }
             LedgerKey::ContractData(k) => self
-                .get_contract_data(&k.contract, &k.key, k.durability.clone())
+                .get_contract_data(&k.contract, &k.key, k.durability)
                 .map(|e| self.contract_data_to_ledger_entry(e)),
             LedgerKey::ContractCode(k) => self
                 .get_contract_code(&k.hash)
@@ -2846,7 +2832,7 @@ impl LedgerStateManager {
             }
             LedgerKey::ContractData(k) => {
                 let lookup_key =
-                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability.clone());
+                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data_snapshots
                     .get(&lookup_key)
                     .and_then(|entry| entry.clone())
@@ -3385,7 +3371,7 @@ impl LedgerStateManager {
                             let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
                                 contract: entry.contract.clone(),
                                 key: entry.key.clone(),
-                                durability: entry.durability.clone(),
+                                durability: entry.durability,
                             });
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
@@ -3586,7 +3572,7 @@ impl LedgerStateManager {
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
-            durability: entry.durability.clone(),
+            durability: entry.durability,
         });
         let last_modified = self.last_modified_for_key(&ledger_key);
         LedgerEntry {

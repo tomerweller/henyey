@@ -591,7 +591,7 @@ impl BucketManager {
     /// # Arguments
     ///
     /// * `bucket_hashes` - List of bucket hashes in order from level 10 snap to level 0 curr
-    ///                     (oldest to newest is correct order for last-write-wins)
+    ///   (oldest to newest is correct order for last-write-wins)
     ///
     /// # Returns
     ///

@@ -408,7 +408,7 @@ impl InMemorySorobanState {
             LedgerEntryData::ContractData(cd) => LedgerKeyContractData {
                 contract: cd.contract.clone(),
                 key: cd.key.clone(),
-                durability: cd.durability.clone(),
+                durability: cd.durability,
             },
             _ => {
                 return Err(LedgerError::InvalidEntry(
@@ -452,7 +452,7 @@ impl InMemorySorobanState {
             LedgerEntryData::ContractData(cd) => LedgerKeyContractData {
                 contract: cd.contract.clone(),
                 key: cd.key.clone(),
-                durability: cd.durability.clone(),
+                durability: cd.durability,
             },
             _ => {
                 return Err(LedgerError::InvalidEntry(
@@ -831,7 +831,7 @@ impl InMemorySorobanState {
                     LedgerEntryData::ContractData(cd) => LedgerKeyContractData {
                         contract: cd.contract.clone(),
                         key: cd.key.clone(),
-                        durability: cd.durability.clone(),
+                        durability: cd.durability,
                     },
                     _ => unreachable!(),
                 };

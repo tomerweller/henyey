@@ -302,7 +302,7 @@ impl TxQueueLimiter {
             "Transaction type mismatch"
         );
 
-        if let Some(ref old) = old_tx {
+        if let Some(old) = old_tx {
             let old_frame = TransactionFrame::with_network(old.envelope.clone(), self.network_id);
             assert_eq!(
                 old_frame.is_soroban(),

@@ -75,11 +75,11 @@ impl ContractEvent {
         let mut hasher = Sha256::new();
 
         // Hash event type
-        hasher.update(&[self.event_type as u8]);
+        hasher.update([self.event_type as u8]);
 
         // Hash contract ID if present
         if let Some(ref id) = self.contract_id {
-            hasher.update(&id.0 .0);
+            hasher.update(id.0 .0);
         }
 
         // Hash topics
@@ -152,7 +152,7 @@ impl ContractEvents {
 
         let mut hasher = Sha256::new();
         for event in &self.events {
-            hasher.update(&event.hash().0);
+            hasher.update(event.hash().0);
         }
         Hash(hasher.finalize().into())
     }

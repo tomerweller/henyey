@@ -118,8 +118,8 @@ impl ConfigUpgradeSetKeyJson {
         use base64::{engine::general_purpose::STANDARD, Engine};
         Self {
             // ContractId wraps Hash which wraps [u8; 32]
-            contract_id: STANDARD.encode(&key.contract_id.0 .0),
-            content_hash: STANDARD.encode(&key.content_hash.0),
+            contract_id: STANDARD.encode(key.contract_id.0 .0),
+            content_hash: STANDARD.encode(key.content_hash.0),
         }
     }
 
@@ -541,7 +541,7 @@ pub fn upgrade_to_string(upgrade: &LedgerUpgrade) -> String {
         LedgerUpgrade::BaseReserve(v) => format!("basereserve={}", v),
         LedgerUpgrade::Flags(v) => format!("flags={}", v),
         LedgerUpgrade::Config(key) => {
-            format!("configupgradesetkey={}", hex::encode(&key.content_hash.0))
+            format!("configupgradesetkey={}", hex::encode(key.content_hash.0))
         }
         LedgerUpgrade::MaxSorobanTxSetSize(v) => {
             format!("maxsorobantxsetsize={}", v)

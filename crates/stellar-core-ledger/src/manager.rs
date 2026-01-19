@@ -79,7 +79,7 @@ fn prepend_fee_event(
     }
 
     let mut manager =
-        TxEventManager::new(true, protocol_version, network_id.clone(), classic_events);
+        TxEventManager::new(true, protocol_version, *network_id, classic_events);
     manager.new_fee_event(fee_source, fee_charged, TransactionEventStage::BeforeAllTxs);
     let fee_events = manager.finalize();
     if fee_events.is_empty() {
@@ -1096,7 +1096,7 @@ impl<'a> LedgerCloseContext<'a> {
         }
 
         // Otherwise read from snapshot
-        Ok(self.snapshot.get_entry(key)?)
+        self.snapshot.get_entry(key)
     }
 
     /// Load an account from the snapshot.
@@ -1179,7 +1179,7 @@ impl<'a> LedgerCloseContext<'a> {
             self.prev_header.base_fee,
             self.prev_header.base_reserve,
             self.prev_header.ledger_version,
-            self.manager.network_id.clone(),
+            self.manager.network_id,
             &mut self.delta,
             soroban_config,
             soroban_base_prng_seed.0,
@@ -1196,7 +1196,7 @@ impl<'a> LedgerCloseContext<'a> {
                 let fee_charged = tx_results[idx].result.fee_charged;
                 let frame = TransactionFrame::with_network(
                     envelope.clone(),
-                    self.manager.network_id.clone(),
+                    self.manager.network_id,
                 );
                 let fee_source = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
                 prepend_fee_event(
@@ -1316,7 +1316,7 @@ impl<'a> LedgerCloseContext<'a> {
                     );
 
                     // Use pre-loaded eviction settings (loaded before bucket list lock)
-                    let eviction_settings = eviction_settings.clone().unwrap_or_default();
+                    let eviction_settings = eviction_settings.unwrap_or_default();
 
                     tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
@@ -1358,7 +1358,7 @@ impl<'a> LedgerCloseContext<'a> {
                             self.close_data.ledger_seq,
                             &eviction_settings,
                         )
-                        .map_err(|e| LedgerError::Bucket(e))?;
+                        .map_err(LedgerError::Bucket)?;
                     let eviction_duration = eviction_start.elapsed();
 
                     tracing::info!(

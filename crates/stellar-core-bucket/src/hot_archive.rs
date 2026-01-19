@@ -135,7 +135,7 @@ impl HotArchiveBucket {
 
     /// Get the hash of this bucket.
     pub fn hash(&self) -> Hash256 {
-        self.hash.clone()
+        self.hash
     }
 
     /// Check if the bucket is empty.
@@ -154,10 +154,8 @@ impl HotArchiveBucket {
     /// Returns the ledger_version from the bucket's metadata entry, or 0 if no metadata.
     pub fn get_protocol_version(&self) -> u32 {
         // Metadata entry is stored with empty key
-        if let Some(entry) = self.entries.get(&Vec::new()) {
-            if let HotArchiveBucketEntry::Metaentry(meta) = entry {
-                return meta.ledger_version;
-            }
+        if let Some(HotArchiveBucketEntry::Metaentry(meta)) = self.entries.get(&Vec::new()) {
+            return meta.ledger_version;
         }
         0
     }
@@ -203,7 +201,7 @@ impl HotArchiveBucket {
                 ((sz >> 8) & 0xFF) as u8,
                 (sz & 0xFF) as u8,
             ];
-            hasher.update(&record_mark);
+            hasher.update(record_mark);
             hasher.update(&bytes);
         }
 
@@ -385,7 +383,7 @@ impl HotArchiveBucketLevel {
 
     /// Snap curr to snap and return the new snap (matches C++ BucketLevel::snap).
     fn snap(&mut self) -> HotArchiveBucket {
-        self.snap = std::mem::replace(&mut self.curr, HotArchiveBucket::empty());
+        self.snap = std::mem::take(&mut self.curr);
         self.snap.clone()
     }
 
@@ -452,7 +450,7 @@ impl HotArchiveBucketList {
     /// Get the hash of the entire bucket list.
     pub fn hash(&self) -> Hash256 {
         let mut hasher = Sha256::new();
-        for (_i, level) in self.levels.iter().enumerate() {
+        for level in self.levels.iter() {
             let level_hash = level.hash();
             hasher.update(level_hash.as_bytes());
         }

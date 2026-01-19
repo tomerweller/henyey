@@ -156,7 +156,7 @@ impl FetchingEnvelopes {
         let mut slot_state = self
             .slots
             .entry(slot)
-            .or_insert_with(SlotEnvelopes::default);
+            .or_default();
 
         // Check if already processed or discarded
         if slot_state.processed.contains(&env_hash) || slot_state.discarded.contains(&env_hash) {
@@ -209,7 +209,7 @@ impl FetchingEnvelopes {
     pub fn recv_tx_set(&self, hash: Hash256, slot: SlotIndex, data: Vec<u8>) -> bool {
         // Check if we're fetching this TxSet
         if !self.tx_set_fetcher.is_tracking(&Hash(hash.0)) {
-            trace!("Received unrequested TxSet {}", hex::encode(&hash.0));
+            trace!("Received unrequested TxSet {}", hex::encode(hash.0));
             return false;
         }
 
@@ -223,7 +223,7 @@ impl FetchingEnvelopes {
 
         debug!(
             "Received TxSet {}, {} envelopes waiting",
-            hex::encode(&hash.0),
+            hex::encode(hash.0),
             waiting.len()
         );
 
@@ -241,7 +241,7 @@ impl FetchingEnvelopes {
     pub fn recv_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) -> bool {
         // Check if we're fetching this QuorumSet
         if !self.quorum_set_fetcher.is_tracking(&Hash(hash.0)) {
-            trace!("Received unrequested QuorumSet {}", hex::encode(&hash.0));
+            trace!("Received unrequested QuorumSet {}", hex::encode(hash.0));
             return false;
         }
 
@@ -255,7 +255,7 @@ impl FetchingEnvelopes {
 
         debug!(
             "Received QuorumSet {}, {} envelopes waiting",
-            hex::encode(&hash.0),
+            hex::encode(hash.0),
             waiting.len()
         );
 

@@ -257,10 +257,8 @@ impl PeerManager {
             .map_err(|e| OverlayError::DatabaseError(format!("Failed to query peers: {}", e)))?;
 
         let mut cache = HashMap::new();
-        for row in rows {
-            if let Ok(record) = row {
-                cache.insert((record.ip.clone(), record.port), record);
-            }
+        for record in rows.flatten() {
+            cache.insert((record.ip.clone(), record.port), record);
         }
 
         Ok(cache)

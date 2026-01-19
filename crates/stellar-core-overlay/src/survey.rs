@@ -57,20 +57,17 @@ const SURVEY_THROTTLE_TIMEOUT_MS: u64 = 200;
 
 /// Current phase of a survey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SurveyPhase {
     /// Survey is actively collecting data from peers.
     Collecting,
     /// Collecting is complete, data is available for reporting.
     Reporting,
     /// No active survey in progress.
+    #[default]
     Inactive,
 }
 
-impl Default for SurveyPhase {
-    fn default() -> Self {
-        Self::Inactive
-    }
-}
 
 /// Data collected about this node during a survey.
 #[derive(Debug, Clone, Default)]

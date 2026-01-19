@@ -358,7 +358,7 @@ fn validate_extra_signers(
     if let Preconditions::V2(cond) = frame.preconditions() {
         if !cond.extra_signers.is_empty() {
             let extra_hash = fee_bump_inner_hash(frame, &context.network_id)
-                .map_err(|e| ValidationError::InvalidStructure(e))?;
+                .map_err(ValidationError::InvalidStructure)?;
             let extra_signatures = if frame.is_fee_bump() {
                 frame.inner_signatures()
             } else {

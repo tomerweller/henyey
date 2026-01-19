@@ -329,8 +329,8 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
 
     let rent_write_config = RentWriteFeeConfiguration {
         state_target_size_bytes: soroban_state_target_size_bytes,
-        rent_fee_1kb_state_size_low: rent_fee_1kb_state_size_low,
-        rent_fee_1kb_state_size_high: rent_fee_1kb_state_size_high,
+        rent_fee_1kb_state_size_low,
+        rent_fee_1kb_state_size_high,
         state_size_rent_fee_growth_factor: soroban_state_rent_fee_growth_factor,
     };
     let fee_per_rent_1kb =
@@ -427,8 +427,8 @@ pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNet
 
     // Load compute settings
     if let ConfigSettingEntry::ContractComputeV0(compute) = compute_v0 {
-        info.tx_max_instructions = compute.tx_max_instructions as i64;
-        info.ledger_max_instructions = compute.ledger_max_instructions as i64;
+        info.tx_max_instructions = compute.tx_max_instructions;
+        info.ledger_max_instructions = compute.ledger_max_instructions;
         info.fee_rate_per_instructions_increment = compute.fee_rate_per_instructions_increment;
         info.tx_memory_limit = compute.tx_memory_limit;
     }
@@ -2237,7 +2237,7 @@ impl TransactionExecutor {
         // host for restoration. The previous approach of clearing them was designed
         // for when all entries came from the live bucket list, but with hot archive
         // support, archived entries are properly sourced and must be preserved.
-        if let Some(ref data) = soroban_data {
+        if let Some(data) = soroban_data {
             self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
         }
 
@@ -3999,7 +3999,7 @@ fn build_transaction_meta(
 ) -> TransactionMeta {
     let operations: Vec<OperationMetaV2> = op_changes
         .into_iter()
-        .zip(op_events.into_iter())
+        .zip(op_events)
         .map(|(changes, events)| OperationMetaV2 {
             ext: ExtensionPoint::V0,
             changes,
@@ -4362,33 +4362,29 @@ fn has_sufficient_signer_weight(
         match key {
             SignerKey::Ed25519(key) => {
                 if let Ok(pk) = stellar_core_crypto::PublicKey::from_bytes(&key.0) {
-                    if has_ed25519_signature(tx_hash, signatures, &pk) {
-                        if counted.insert(id) {
-                            total = total.saturating_add(signer.weight as u32);
+                    if has_ed25519_signature(tx_hash, signatures, &pk)
+                        && counted.insert(id) {
+                            total = total.saturating_add(signer.weight);
                         }
-                    }
                 }
             }
             SignerKey::PreAuthTx(key) => {
-                if key.0 == tx_hash.0 {
-                    if counted.insert(id) {
-                        total = total.saturating_add(signer.weight as u32);
+                if key.0 == tx_hash.0
+                    && counted.insert(id) {
+                        total = total.saturating_add(signer.weight);
                     }
-                }
             }
             SignerKey::HashX(key) => {
-                if has_hashx_signature(signatures, key) {
-                    if counted.insert(id) {
-                        total = total.saturating_add(signer.weight as u32);
+                if has_hashx_signature(signatures, key)
+                    && counted.insert(id) {
+                        total = total.saturating_add(signer.weight);
                     }
-                }
             }
             SignerKey::Ed25519SignedPayload(payload) => {
-                if has_signed_payload_signature(tx_hash, signatures, payload) {
-                    if counted.insert(id) {
-                        total = total.saturating_add(signer.weight as u32);
+                if has_signed_payload_signature(tx_hash, signatures, payload)
+                    && counted.insert(id) {
+                        total = total.saturating_add(signer.weight);
                     }
-                }
             }
         }
 
@@ -4553,7 +4549,7 @@ fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(base_seed);
     // XDR uint64 is 8 bytes big-endian
-    hasher.update(&(index as u64).to_be_bytes());
+    hasher.update((index as u64).to_be_bytes());
     hasher.finalize().into()
 }
 
@@ -4664,7 +4660,7 @@ pub fn execute_transaction_set_with_fee_mode(
             Some(tx_prng_seed),
             deduct_fee,
         )?;
-        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
+        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
         let tx_result = build_tx_result_pair(
             &frame,
             &executor.network_id,
@@ -4675,7 +4671,7 @@ pub fn execute_transaction_set_with_fee_mode(
         let tx_meta = result
             .tx_meta
             .clone()
-            .unwrap_or_else(|| empty_transaction_meta());
+            .unwrap_or_else(empty_transaction_meta);
         let fee_changes = result
             .fee_changes
             .clone()
@@ -4711,7 +4707,7 @@ pub fn execute_transaction_set_with_fee_mode(
         for (idx, (tx, _)) in transactions.iter().enumerate() {
             let refund = results[idx].fee_refund;
             if refund > 0 {
-                let frame = TransactionFrame::with_network(tx.clone(), executor.network_id.clone());
+                let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
                 let fee_source_id =
                     stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
 

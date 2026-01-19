@@ -454,13 +454,13 @@ impl FutureBucket {
     pub fn get_hashes(&self) -> Vec<Hash256> {
         let mut hashes = Vec::new();
         if let Some(h) = &self.input_curr_hash {
-            hashes.push(h.clone());
+            hashes.push(*h);
         }
         if let Some(h) = &self.input_snap_hash {
-            hashes.push(h.clone());
+            hashes.push(*h);
         }
         if let Some(h) = &self.output_hash {
-            hashes.push(h.clone());
+            hashes.push(*h);
         }
         hashes
     }
@@ -560,8 +560,8 @@ impl FutureBucket {
         match self.state {
             FutureBucketState::LiveInputs | FutureBucketState::HashInputs => Some(MergeKey::new(
                 self.keep_tombstones,
-                self.input_curr_hash.clone()?,
-                self.input_snap_hash.clone()?,
+                self.input_curr_hash?,
+                self.input_snap_hash?,
             )),
             _ => None,
         }

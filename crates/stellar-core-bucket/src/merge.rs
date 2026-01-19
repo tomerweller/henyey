@@ -476,12 +476,7 @@ impl<'a> ShadowCursor<'a> {
 }
 
 fn next_non_meta(iter: &mut BucketIter<'_>) -> Option<BucketEntry> {
-    while let Some(entry) = iter.next() {
-        if !entry.is_metadata() {
-            return Some(entry);
-        }
-    }
-    None
+    iter.by_ref().find(|entry| !entry.is_metadata())
 }
 
 fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> bool {

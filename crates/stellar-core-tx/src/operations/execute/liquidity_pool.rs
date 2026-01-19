@@ -228,15 +228,13 @@ pub fn execute_liquidity_pool_deposit(
             }
             account.balance -= deposit_a;
         }
-    } else {
-        if let Some(tl) = state.get_trustline_mut(source, &asset_a) {
-            if tl.balance < deposit_a {
-                return Ok(make_deposit_result(
-                    LiquidityPoolDepositResultCode::Underfunded,
-                ));
-            }
-            tl.balance -= deposit_a;
+    } else if let Some(tl) = state.get_trustline_mut(source, &asset_a) {
+        if tl.balance < deposit_a {
+            return Ok(make_deposit_result(
+                LiquidityPoolDepositResultCode::Underfunded,
+            ));
         }
+        tl.balance -= deposit_a;
     }
 
     if matches!(&asset_b, Asset::Native) {
@@ -248,15 +246,13 @@ pub fn execute_liquidity_pool_deposit(
             }
             account.balance -= deposit_b;
         }
-    } else {
-        if let Some(tl) = state.get_trustline_mut(source, &asset_b) {
-            if tl.balance < deposit_b {
-                return Ok(make_deposit_result(
-                    LiquidityPoolDepositResultCode::Underfunded,
-                ));
-            }
-            tl.balance -= deposit_b;
+    } else if let Some(tl) = state.get_trustline_mut(source, &asset_b) {
+        if tl.balance < deposit_b {
+            return Ok(make_deposit_result(
+                LiquidityPoolDepositResultCode::Underfunded,
+            ));
         }
+        tl.balance -= deposit_b;
     }
 
     // Credit pool shares to source

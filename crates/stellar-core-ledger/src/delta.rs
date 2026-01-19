@@ -154,7 +154,7 @@ pub fn entry_to_key(entry: &LedgerEntry) -> Result<LedgerKey> {
             LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
                 contract: data.contract.clone(),
                 key: data.key.clone(),
-                durability: data.durability.clone(),
+                durability: data.durability,
             })
         }
         LedgerEntryData::ContractCode(code) => {

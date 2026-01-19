@@ -183,7 +183,7 @@ impl BucketLevel {
     /// mNextCurr is a FutureBucket that stays pending until explicitly committed.
     fn snap(&mut self) -> Bucket {
         // Move curr to snap (curr becomes empty via replace)
-        self.snap = std::mem::replace(&mut self.curr, Bucket::empty());
+        self.snap = std::mem::take(&mut self.curr);
         // Return the new snap (old curr) for merging into next level
         self.snap.clone()
     }

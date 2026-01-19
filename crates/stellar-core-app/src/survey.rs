@@ -109,7 +109,7 @@ impl SurveyMessageLimiter {
         let ledger_entry = self
             .record_map
             .entry(request.ledger_num)
-            .or_insert_with(HashMap::new);
+            .or_default();
 
         let ledger_entry_len = ledger_entry.len() as u32;
         let surveyor_entry = ledger_entry.entry(request.surveyor_peer_id.clone());

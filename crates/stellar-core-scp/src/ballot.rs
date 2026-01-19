@@ -359,11 +359,10 @@ impl BallotProtocol {
         }
 
         // In EXTERNALIZE, we must have commit and high
-        if self.phase == BallotPhase::Externalize {
-            if self.commit.is_none() || self.high_ballot.is_none() {
+        if self.phase == BallotPhase::Externalize
+            && (self.commit.is_none() || self.high_ballot.is_none()) {
                 return Err("externalize phase requires commit and high".to_string());
             }
-        }
 
         Ok(())
     }
@@ -1509,7 +1508,7 @@ impl BallotProtocol {
         let mut candidates: Vec<ScpBallot> = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        hint_ballots.sort_by(|a, b| ballot_compare(a, b));
+        hint_ballots.sort_by(ballot_compare);
 
         for top_vote in hint_ballots.iter().rev() {
             for envelope in self.latest_envelopes.values() {
@@ -1558,7 +1557,7 @@ impl BallotProtocol {
             }
         }
 
-        candidates.sort_by(|a, b| ballot_compare(a, b));
+        candidates.sort_by(ballot_compare);
         candidates
     }
 

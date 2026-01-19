@@ -240,9 +240,7 @@ fn execute_upload_wasm(
     let code_in_rw_footprint = soroban_data
         .resources
         .footprint
-        .read_write
-        .iter()
-        .any(|k| *k == code_key);
+        .read_write.contains(&code_key);
 
     // Check if this code already exists.
     if let Some(existing_code) = state.get_contract_code(&code_hash).cloned() {
@@ -352,11 +350,9 @@ fn extract_wasm_cost_inputs(wasm: &[u8]) -> ContractCodeCostInputs {
                 costs.n_functions = costs.n_functions.saturating_add(s.count());
             }
             TableSection(s) => {
-                for table in s {
-                    if let Ok(table) = table {
-                        costs.n_table_entries =
-                            costs.n_table_entries.saturating_add(table.ty.initial);
-                    }
+                for table in s.into_iter().flatten() {
+                    costs.n_table_entries =
+                        costs.n_table_entries.saturating_add(table.ty.initial);
                 }
             }
             GlobalSection(s) => {
@@ -370,12 +366,10 @@ fn extract_wasm_cost_inputs(wasm: &[u8]) -> ContractCodeCostInputs {
             }
             DataSection(s) => {
                 costs.n_data_segments = costs.n_data_segments.saturating_add(s.count());
-                for d in s {
-                    if let Ok(d) = d {
-                        costs.n_data_segment_bytes = costs
-                            .n_data_segment_bytes
-                            .saturating_add(d.data.len() as u32);
-                    }
+                for d in s.into_iter().flatten() {
+                    costs.n_data_segment_bytes = costs
+                        .n_data_segment_bytes
+                        .saturating_add(d.data.len() as u32);
                 }
             }
             CodeSectionEntry(s) => {

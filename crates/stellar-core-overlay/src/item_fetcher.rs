@@ -219,7 +219,7 @@ impl Tracker {
             trace!(
                 "Peer {} does not have {}",
                 peer,
-                hex::encode(&self.item_hash.0)
+                hex::encode(self.item_hash.0)
             );
             self.last_asked_peer = None;
             true
@@ -243,7 +243,7 @@ impl Tracker {
     pub fn try_next_peer(&mut self, available_peers: &[PeerId]) -> NextPeerResult {
         trace!(
             "tryNextPeer {} last: {:?}",
-            hex::encode(&self.item_hash.0),
+            hex::encode(self.item_hash.0),
             self.last_asked_peer
         );
 
@@ -267,7 +267,7 @@ impl Tracker {
             trace!(
                 "Asking peer {} for {}",
                 peer,
-                hex::encode(&self.item_hash.0)
+                hex::encode(self.item_hash.0)
             );
 
             NextPeerResult::AskPeer {
@@ -281,7 +281,7 @@ impl Tracker {
 
             trace!(
                 "tryNextPeer {} restarting fetch #{}",
-                hex::encode(&self.item_hash.0),
+                hex::encode(self.item_hash.0),
                 self.num_list_rebuild
             );
 
@@ -371,7 +371,7 @@ impl ItemFetcher {
         let available_peers = self.available_peers.lock().unwrap().clone();
         let mut trackers = self.trackers.lock().unwrap();
 
-        trace!("fetch {:?} {}", self.item_type, hex::encode(&item_hash.0));
+        trace!("fetch {:?} {}", self.item_type, hex::encode(item_hash.0));
 
         if let Some(tracker) = trackers.get_mut(&item_hash) {
             // Already tracking, just add the envelope
@@ -389,7 +389,7 @@ impl ItemFetcher {
                             "Immediately asking peer {} for {:?} {}",
                             peer,
                             self.item_type,
-                            hex::encode(&item_hash.0)
+                            hex::encode(item_hash.0)
                         );
                         ask_peer(peer, &item_hash, self.item_type);
                     }
@@ -413,7 +413,7 @@ impl ItemFetcher {
             trace!(
                 "stopFetch {:?} {} : {}",
                 self.item_type,
-                hex::encode(&item_hash.0),
+                hex::encode(item_hash.0),
                 tracker.len()
             );
 
@@ -426,7 +426,7 @@ impl ItemFetcher {
             trace!(
                 "stopFetch untracked {:?} {}",
                 self.item_type,
-                hex::encode(&item_hash.0)
+                hex::encode(item_hash.0)
             );
         }
     }
@@ -480,7 +480,7 @@ impl ItemFetcher {
             trace!(
                 "Recv {:?} {} : {}",
                 self.item_type,
-                hex::encode(&item_hash.0),
+                hex::encode(item_hash.0),
                 tracker.len()
             );
 
@@ -488,7 +488,7 @@ impl ItemFetcher {
             debug!(
                 "Fetched {:?} {} in {:?}",
                 self.item_type,
-                hex::encode(&item_hash.0),
+                hex::encode(item_hash.0),
                 duration
             );
 
@@ -506,7 +506,7 @@ impl ItemFetcher {
             trace!(
                 "Recv untracked {:?} {}",
                 self.item_type,
-                hex::encode(&item_hash.0)
+                hex::encode(item_hash.0)
             );
             Vec::new()
         }
@@ -562,7 +562,7 @@ impl ItemFetcher {
                 trace!(
                     "Processing pending {:?} {} -> peer {}",
                     self.item_type,
-                    hex::encode(&request.item_hash.0),
+                    hex::encode(request.item_hash.0),
                     request.peer
                 );
                 ask_peer(&request.peer, &request.item_hash, self.item_type);

@@ -1124,7 +1124,7 @@ fn exchange_with_pool(
     round: RoundingType,
 ) -> Result<bool> {
     const MAX_BPS: i64 = 10_000;
-    if fee_bps < 0 || fee_bps >= MAX_BPS {
+    if !(0..MAX_BPS).contains(&fee_bps) {
         return Err(TxError::Internal("pool fee out of range".into()));
     }
     if reserves_to_pool <= 0 || reserves_from_pool <= 0 {
@@ -1187,7 +1187,7 @@ fn exchange_with_pool(
             let r = b % c;
 
             // result = A*Q + ceil(A*R/C)
-            let value = a * q + (a * r + c - 1) / c;
+            let value = a * q + (a * r).div_ceil(c);
 
             if value > i64::MAX as u128 {
                 return Err(TxError::Internal("pool exchange overflow".into()));

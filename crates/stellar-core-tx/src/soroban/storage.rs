@@ -34,7 +34,7 @@ impl StorageKey {
         LedgerKey::ContractData(LedgerKeyContractData {
             contract: self.contract.clone(),
             key: self.key.clone(),
-            durability: self.durability.clone(),
+            durability: self.durability,
         })
     }
 
@@ -83,7 +83,7 @@ impl StorageEntry {
             ext: stellar_xdr::curr::ExtensionPoint::V0,
             contract: self.key.contract.clone(),
             key: self.key.key.clone(),
-            durability: self.key.durability.clone(),
+            durability: self.key.durability,
             val: self.value.clone(),
         }
     }

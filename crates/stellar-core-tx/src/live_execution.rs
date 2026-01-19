@@ -328,7 +328,7 @@ pub fn process_fee_seq_num_fee_bump(
     ctx: &mut LiveExecutionContext,
     base_fee: Option<i64>,
 ) -> Result<FeeSeqNumResult> {
-    let fee_source_id = muxed_to_account_id(&fee_bump.fee_source());
+    let fee_source_id = muxed_to_account_id(fee_bump.fee_source());
     let base = base_fee.unwrap_or(ctx.base_fee() as i64);
 
     // Calculate the fee for fee bump (outer fee)
@@ -515,7 +515,7 @@ pub fn process_post_apply_fee_bump(
     }
 
     // Fee bump refunds go to the fee source, not the inner tx source
-    let fee_source_id = muxed_to_account_id(&fee_bump.fee_source());
+    let fee_source_id = muxed_to_account_id(fee_bump.fee_source());
     refund_soroban_fee(ctx, &fee_source_id, tx_result, None)
 }
 
@@ -579,7 +579,7 @@ pub fn process_post_tx_set_apply_fee_bump(
     }
 
     // Fee bump refunds go to the fee source
-    let fee_source_id = muxed_to_account_id(&fee_bump.fee_source());
+    let fee_source_id = muxed_to_account_id(fee_bump.fee_source());
     refund_soroban_fee(ctx, &fee_source_id, tx_result, tx_event_manager)
 }
 

@@ -180,7 +180,7 @@ impl BucketInputIterator {
                 }
                 Some(data) => {
                     // Update hash
-                    self.hasher.update(&(data.len() as u32).to_be_bytes());
+                    self.hasher.update((data.len() as u32).to_be_bytes());
                     self.hasher.update(&data);
                     self.bytes_read += 4 + data.len();
 
@@ -408,7 +408,7 @@ impl BucketOutputIterator {
         let data = entry.to_xdr()?;
 
         // Update hash
-        self.hasher.update(&(data.len() as u32).to_be_bytes());
+        self.hasher.update((data.len() as u32).to_be_bytes());
         self.hasher.update(&data);
 
         // Write record
@@ -485,8 +485,7 @@ impl BucketOutputIterator {
 
         // Finish compression and get hash
         let encoder = self.writer.into_inner().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("Failed to flush writer: {}", e),
             )
         })?;

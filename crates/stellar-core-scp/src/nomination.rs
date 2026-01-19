@@ -432,11 +432,10 @@ impl NominationProtocol {
                     continue;
                 }
 
-                if self.should_ratify_value(&value, local_quorum_set, driver) {
-                    if Self::insert_unique(&mut self.candidates, value.clone()) {
+                if self.should_ratify_value(&value, local_quorum_set, driver)
+                    && Self::insert_unique(&mut self.candidates, value.clone()) {
                         new_candidates = true;
                     }
-                }
             }
 
             if new_candidates {
@@ -652,7 +651,7 @@ impl NominationProtocol {
 
     fn sorted_values(&self, values: &[Value]) -> Vec<Value> {
         let mut values = values.to_vec();
-        values.sort_by(|a, b| self.value_key(a).cmp(&self.value_key(b)));
+        values.sort_by_key(|a| self.value_key(a));
         values.dedup_by(|a, b| self.value_key(a) == self.value_key(b));
         values
     }

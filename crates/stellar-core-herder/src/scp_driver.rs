@@ -527,7 +527,7 @@ impl ScpDriver {
                 LedgerUpgrade::Config(_) => 5,
                 LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
             };
-            if last_upgrade_order.map_or(false, |prev| order <= prev) {
+            if last_upgrade_order.is_some_and(|prev| order <= prev) {
                 debug!("Invalid ledger upgrade encountered");
                 return ValueValidation::Invalid;
             }

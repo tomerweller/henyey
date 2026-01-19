@@ -161,7 +161,7 @@ impl MessageDispatcher {
     fn handle_get_tx_set(&self, from_peer: &PeerId, hash: &Hash) -> Option<StellarMessage> {
         trace!(
             "Received GetTxSet {} from {}",
-            hex::encode(&hash.0),
+            hex::encode(hash.0),
             from_peer
         );
 
@@ -191,7 +191,7 @@ impl MessageDispatcher {
         let data = TxSetData::Legacy(tx_set);
         let hash = data.hash();
 
-        trace!("Received TxSet {} from {}", hex::encode(&hash.0), from_peer);
+        trace!("Received TxSet {} from {}", hex::encode(hash.0), from_peer);
 
         // Cache it
         {
@@ -225,7 +225,7 @@ impl MessageDispatcher {
 
         trace!(
             "Received GeneralizedTxSet {} from {}",
-            hex::encode(&hash.0),
+            hex::encode(hash.0),
             from_peer
         );
 
@@ -254,7 +254,7 @@ impl MessageDispatcher {
     fn handle_get_quorum_set(&self, from_peer: &PeerId, hash: &Hash) -> Option<StellarMessage> {
         trace!(
             "Received GetScpQuorumSet {} from {}",
-            hex::encode(&hash.0),
+            hex::encode(hash.0),
             from_peer
         );
 
@@ -285,7 +285,7 @@ impl MessageDispatcher {
 
         trace!(
             "Received ScpQuorumSet {} from {}",
-            hex::encode(&hash.0),
+            hex::encode(hash.0),
             from_peer
         );
 
@@ -317,7 +317,7 @@ impl MessageDispatcher {
         trace!(
             "Received DontHave {:?} {} from {}",
             dont_have.type_,
-            hex::encode(&hash.0),
+            hex::encode(hash.0),
             from_peer
         );
 
@@ -339,13 +339,13 @@ impl MessageDispatcher {
 
     /// Fetch a TxSet needed by an SCP envelope.
     pub fn fetch_tx_set(&self, hash: Hash, envelope: &ScpEnvelope) {
-        trace!("Requesting TxSet {}", hex::encode(&hash.0));
+        trace!("Requesting TxSet {}", hex::encode(hash.0));
         self.tx_set_fetcher.fetch(hash, envelope);
     }
 
     /// Fetch a QuorumSet needed by an SCP envelope.
     pub fn fetch_quorum_set(&self, hash: Hash, envelope: &ScpEnvelope) {
-        trace!("Requesting QuorumSet {}", hex::encode(&hash.0));
+        trace!("Requesting QuorumSet {}", hex::encode(hash.0));
         self.quorum_set_fetcher.fetch(hash, envelope);
     }
 

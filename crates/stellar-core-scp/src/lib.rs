@@ -282,7 +282,7 @@ impl QuorumSetJson {
             validators: qs
                 .validators
                 .iter()
-                .map(|n| quorum_config::node_id_to_strkey(n))
+                .map(quorum_config::node_id_to_strkey)
                 .collect(),
             inner_sets: qs.inner_sets.iter().map(QuorumSetJson::from_xdr).collect(),
         }

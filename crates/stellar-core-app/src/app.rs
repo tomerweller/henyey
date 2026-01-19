@@ -1269,15 +1269,14 @@ impl App {
                 "Transaction count mismatch while persisting history"
             );
         }
-        if let Some(_) = tx_metas {
-            if meta_count < tx_count {
+        if tx_metas.is_some()
+            && meta_count < tx_count {
                 tracing::warn!(
                     tx_count,
                     meta_count,
                     "Transaction meta count mismatch while persisting history"
                 );
             }
-        }
 
         let tx_set_entry = match tx_set_variant {
             TransactionSetVariant::Classic(set) => set.clone(),
@@ -2061,7 +2060,7 @@ impl App {
             }
         }
 
-        Ok(build_checkpoint_data(&state).await?)
+        build_checkpoint_data(&state).await
     }
 
     /// Run the main event loop.
@@ -3022,7 +3021,7 @@ impl App {
             let buffer = self.syncing_ledgers.read().await;
             buffer
                 .get(&first_buffered)
-                .map_or(false, |info| info.tx_set.is_some())
+                .is_some_and(|info| info.tx_set.is_some())
         } else {
             false
         };
@@ -3105,7 +3104,7 @@ impl App {
                                 .last_catchup_completed_at
                                 .read()
                                 .await
-                                .map_or(false, |t| t.elapsed().as_secs() < CATCHUP_COOLDOWN_SECS);
+                                .is_some_and(|t| t.elapsed().as_secs() < CATCHUP_COOLDOWN_SECS);
 
                             let use_fast_timeout = !recently_caught_up
                                 && (all_peers_exhausted || has_stale_requests || recovery_failed);
@@ -4157,9 +4156,7 @@ impl App {
             }
         };
 
-        let body = match response_body {
-            SurveyResponseBody::SurveyTopologyResponseV2(body) => body,
-        };
+        let SurveyResponseBody::SurveyTopologyResponseV2(body) = response_body;
         let (inbound_len, outbound_len) = {
             let mut results = self.survey_results.write().await;
             let entry = results
@@ -4179,15 +4176,14 @@ impl App {
 
         let needs_more_inbound = body.inbound_peers.0.len() == TIME_SLICED_PEERS_MAX;
         let needs_more_outbound = body.outbound_peers.0.len() == TIME_SLICED_PEERS_MAX;
-        if needs_more_inbound || needs_more_outbound {
-            if self.survey_reporting.read().await.running {
+        if (needs_more_inbound || needs_more_outbound)
+            && self.survey_reporting.read().await.running {
                 let next_inbound = inbound_len as u32;
                 let next_outbound = outbound_len as u32;
                 let _ = self
                     .survey_topology_timesliced(peer_id.clone(), next_inbound, next_outbound)
                     .await;
             }
-        }
     }
 
     fn local_node_id(&self) -> stellar_xdr::curr::NodeId {
@@ -4367,7 +4363,7 @@ impl App {
         }
 
         let mut hashes = qset_hashes.into_iter().collect::<Vec<_>>();
-        hashes.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        hashes.sort_by_key(|a| a.to_hex());
 
         let mut qsets = Vec::new();
         for hash in hashes {
@@ -5451,7 +5447,7 @@ impl App {
     fn filter_advertised_peers(&self, peers: Vec<PeerAddress>) -> Vec<PeerAddress> {
         peers
             .into_iter()
-            .filter(|peer| Self::is_public_peer(peer))
+            .filter(Self::is_public_peer)
             .collect()
     }
 

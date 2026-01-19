@@ -63,7 +63,7 @@ pub fn execute_restore_footprint(
     // Restore all entries in the read-write footprint
     // (RestoreFootprint only restores entries that are in read-write)
     for key in footprint.read_write.iter() {
-        if let Err(_) = restore_entry(key, new_ttl, state, current_ledger) {
+        if restore_entry(key, new_ttl, state, current_ledger).is_err() {
             return Ok(make_result(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
             ));

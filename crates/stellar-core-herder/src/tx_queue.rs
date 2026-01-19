@@ -514,7 +514,7 @@ fn is_fee_bump_envelope(envelope: &TransactionEnvelope) -> bool {
 /// Convert an XDR-encoded account key back to AccountId.
 fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
     use stellar_xdr::curr::ReadXdr;
-    AccountId::from_xdr(key, Limits::none()).unwrap_or_else(|_| {
+    AccountId::from_xdr(key, Limits::none()).unwrap_or({
         // Fallback to a zero account ID if decoding fails
         AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
             stellar_xdr::curr::Uint256([0; 32]),
@@ -989,7 +989,7 @@ impl TransactionQueue {
                 base_fee,
                 5_000_000, // base reserve
                 ctx.protocol_version,
-                self.config.network_id.clone(),
+                self.config.network_id,
             );
 
             if validate_time_bounds(&frame, &ledger_ctx).is_err() {
@@ -1009,7 +1009,7 @@ impl TransactionQueue {
                 base_fee,
                 5_000_000, // base reserve
                 ctx.protocol_version,
-                self.config.network_id.clone(),
+                self.config.network_id,
             );
 
             if validate_signatures(&frame, &ledger_ctx).is_err() {
@@ -1019,12 +1019,11 @@ impl TransactionQueue {
 
         // Validate preconditions (extra signers / min seq age+gap)
         if let Preconditions::V2(cond) = frame.preconditions() {
-            if !cond.extra_signers.is_empty() {
-                if !extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)?
+            if !cond.extra_signers.is_empty()
+                && !extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)?
                 {
                     return Err("extra signer validation failed");
                 }
-            }
         }
 
         Ok(())
@@ -1060,7 +1059,7 @@ impl TransactionQueue {
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
         // Validate transaction before queueing
-        if let Err(_) = self.validate_transaction(&envelope) {
+        if self.validate_transaction(&envelope).is_err() {
             return TxQueueResult::Invalid;
         }
 
@@ -1478,7 +1477,7 @@ impl TransactionQueue {
             // Update the sequence-source account state (stores the pending transaction)
             let seq_state = account_states
                 .entry(seq_source_key.clone())
-                .or_insert_with(AccountState::default);
+                .or_default();
 
             // If replacing, and same fee source as old tx, adjust the fee delta
             let fee_to_add = if let Some(ref old_tx) = replaced_tx {
@@ -1506,7 +1505,7 @@ impl TransactionQueue {
                 // Different accounts - update fee-source separately
                 let fee_state = account_states
                     .entry(new_fee_source_key)
-                    .or_insert_with(AccountState::default);
+                    .or_default();
                 fee_state.total_fees = fee_state.total_fees.saturating_add(fee_to_add);
             }
         }
@@ -1620,9 +1619,7 @@ impl TransactionQueue {
                 .unwrap_or(base_fee);
             let mut lane_base_fee = vec![base_fee; lane_count];
             if classic_limited {
-                for fee in &mut lane_base_fee {
-                    *fee = min_lane_fee;
-                }
+                lane_base_fee.fill(min_lane_fee);
             }
             if has_dex_lane && dex_limited {
                 let dex_fee = lowest_lane_fee[crate::surge_pricing::DEX_LANE];
@@ -1922,7 +1919,7 @@ impl TransactionQueue {
             limit.set_val(ResourceType::TxByteSize, clamped);
         }
         let (soroban_selected, soroban_limited) = if let Some(limit) = soroban_limit {
-            let mut had_not_fitting = vec![false];
+            let mut had_not_fitting = [false];
             let lane_config = SorobanGenericLaneConfig::new(limit);
             let mut queue = SurgePricingPriorityQueue::new(Box::new(lane_config), seed);
             let mut positions: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -1934,7 +1931,7 @@ impl TransactionQueue {
             }
 
             let mut selected = Vec::new();
-            let mut lane_left = vec![queue.lane_limits(GENERIC_LANE)];
+            let mut lane_left = [queue.lane_limits(GENERIC_LANE)];
             while let Some((lane, entry)) = queue.peek_top() {
                 let frame = stellar_core_tx::TransactionFrame::with_network(
                     entry.tx.envelope.clone(),

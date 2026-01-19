@@ -343,7 +343,7 @@ pub fn execute_operation_with_soroban(
     let op_source = op
         .source_account
         .as_ref()
-        .map(|m| muxed_to_account_id(m))
+        .map(muxed_to_account_id)
         .unwrap_or_else(|| source_account_id.clone());
 
     // Check that the operation's source account exists.

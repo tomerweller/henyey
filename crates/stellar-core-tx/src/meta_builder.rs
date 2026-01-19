@@ -43,6 +43,7 @@ use crate::result::RefundableFeeTracker;
 
 /// Configuration for diagnostic event collection.
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct DiagnosticConfig {
     /// Enable diagnostic events during apply.
     pub enable_soroban_diagnostic_events: bool,
@@ -50,14 +51,6 @@ pub struct DiagnosticConfig {
     pub enable_diagnostics_for_tx_submission: bool,
 }
 
-impl Default for DiagnosticConfig {
-    fn default() -> Self {
-        Self {
-            enable_soroban_diagnostic_events: false,
-            enable_diagnostics_for_tx_submission: false,
-        }
-    }
-}
 
 /// Manages diagnostic events during transaction validation and application.
 ///

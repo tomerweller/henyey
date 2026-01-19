@@ -290,7 +290,7 @@ pub fn find_closest_v_blocking(
     let mut res = Vec::new();
 
     for validator in quorum_set.validators.iter() {
-        if excluded.map_or(false, |node| node == validator) {
+        if excluded == Some(validator) {
             continue;
         }
 
@@ -349,7 +349,7 @@ pub fn normalize_quorum_set(quorum_set: &mut ScpQuorumSet) {
     normalize_quorum_set_simplify(quorum_set);
 
     let mut validators: Vec<_> = quorum_set.validators.iter().cloned().collect();
-    validators.sort_by(|a, b| node_id_cmp(a, b));
+    validators.sort_by(node_id_cmp);
     quorum_set.validators = validators.try_into().unwrap_or_default();
 
     let mut inner_sets: Vec<_> = quorum_set.inner_sets.iter().cloned().collect();
@@ -357,7 +357,7 @@ pub fn normalize_quorum_set(quorum_set: &mut ScpQuorumSet) {
         normalize_quorum_set(inner_set);
     }
 
-    inner_sets.sort_by(|a, b| quorum_set_cmp(a, b));
+    inner_sets.sort_by(quorum_set_cmp);
     quorum_set.inner_sets = inner_sets.try_into().unwrap_or_default();
 }
 

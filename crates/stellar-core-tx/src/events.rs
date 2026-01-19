@@ -45,19 +45,12 @@ use stellar_xdr::curr::{
 };
 
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct ClassicEventConfig {
     pub emit_classic_events: bool,
     pub backfill_stellar_asset_events: bool,
 }
 
-impl Default for ClassicEventConfig {
-    fn default() -> Self {
-        Self {
-            emit_classic_events: false,
-            backfill_stellar_asset_events: false,
-        }
-    }
-}
 
 impl ClassicEventConfig {
     pub fn events_enabled(self, protocol_version: u32) -> bool {
@@ -934,7 +927,7 @@ fn get_asset_contract_id(network_id: &NetworkId, asset: &Asset) -> ContractId {
         contract_id_preimage: ContractIdPreimage::Asset(asset.clone()),
     });
     let hash = stellar_core_common::Hash256::hash_xdr(&preimage)
-        .unwrap_or_else(|_| stellar_core_common::Hash256::ZERO);
+        .unwrap_or(stellar_core_common::Hash256::ZERO);
     ContractId(Hash::from(hash))
 }
 

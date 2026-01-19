@@ -121,7 +121,7 @@ impl<'a> SignatureChecker<'a> {
                 hash_x_signers,
                 needed_weight,
                 &mut total_weight,
-                |sig, signer| verify_hash_x(sig, signer),
+                verify_hash_x,
             ) {
                 return true;
             }
@@ -129,7 +129,7 @@ impl<'a> SignatureChecker<'a> {
 
         // 3. Check ED25519 signers
         if let Some(ed25519_signers) = signers_by_type.get_mut(&SignerKeyType::Ed25519) {
-            let contents_hash = self.contents_hash.clone();
+            let contents_hash = self.contents_hash;
             if self.verify_all_of_type(
                 ed25519_signers,
                 needed_weight,
@@ -147,7 +147,7 @@ impl<'a> SignatureChecker<'a> {
                 payload_signers,
                 needed_weight,
                 &mut total_weight,
-                |sig, signer| verify_ed25519_signed_payload(sig, signer),
+                verify_ed25519_signed_payload,
             ) {
                 return true;
             }

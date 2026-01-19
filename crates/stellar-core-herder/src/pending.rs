@@ -196,7 +196,7 @@ impl PendingEnvelopes {
         // Add to pending
         self.seen_hashes.insert(pending.hash, ());
 
-        let mut entry = self.slots.entry(slot).or_insert_with(Vec::new);
+        let mut entry = self.slots.entry(slot).or_default();
         if entry.len() >= self.config.max_per_slot {
             return PendingResult::BufferFull;
         }

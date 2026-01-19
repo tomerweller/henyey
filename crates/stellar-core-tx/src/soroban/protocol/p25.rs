@@ -78,7 +78,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                 // we pass all entries to Soroban and let it handle TTL checking.
                 // The live_until value is still included for Soroban to use.
                 self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::ContractData(cd.clone()),
@@ -208,7 +208,7 @@ fn get_entry_for_restoration(
     // Fetch entry from state WITHOUT filtering by TTL
     let entry = match key {
         LedgerKey::ContractData(cd_key) => state
-            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
             .map(|cd| LedgerEntry {
                 last_modified_ledger_seq: current_ledger,
                 data: LedgerEntryData::ContractData(cd.clone()),
@@ -318,9 +318,9 @@ pub fn invoke_host_function(
     } else {
         tracing::warn!("P25: Using fallback PRNG seed - results may differ from C++ stellar-core");
         let mut hasher = Sha256::new();
-        hasher.update(&context.network_id.0 .0);
-        hasher.update(&context.sequence.to_le_bytes());
-        hasher.update(&context.close_time.to_le_bytes());
+        hasher.update(context.network_id.0 .0);
+        hasher.update(context.sequence.to_le_bytes());
+        hasher.update(context.close_time.to_le_bytes());
         hasher.finalize().to_vec()
     };
 

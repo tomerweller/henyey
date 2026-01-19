@@ -234,7 +234,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
             LedgerKey::ContractData(cd_key) => {
                 // No TTL check for archived entries
                 self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::ContractData(cd.clone()),
@@ -305,7 +305,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                                 .get_contract_data(
                                     &cd_key.contract,
                                     &cd_key.key,
-                                    cd_key.durability.clone(),
+                                    cd_key.durability,
                                 )
                                 .map(|cd| LedgerEntry {
                                     last_modified_ledger_seq: self.current_ledger,
@@ -335,16 +335,12 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                                 ext: LedgerEntryExt::V0,
                             });
 
-                            if let Some(te) = ttl_entry {
-                                Some(super::protocol::LiveBucketListRestore {
+                            ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
                                     key: current_key.clone(),
                                     entry: e,
                                     ttl_key,
                                     ttl_entry: te,
                                 })
-                            } else {
-                                None
-                            }
                         } else {
                             None
                         }
@@ -405,7 +401,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     }
                 }
                 self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::ContractData(cd.clone()),
@@ -499,7 +495,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
             LedgerKey::ContractData(cd_key) => {
                 // No TTL check for archived entries
                 self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::ContractData(cd.clone()),
@@ -565,16 +561,12 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                             ext: LedgerEntryExt::V0,
                         });
 
-                        if let Some(te) = ttl_entry {
-                            Some(super::protocol::LiveBucketListRestore {
+                        ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
                                 key: key.as_ref().clone(),
                                 entry: entry.as_ref().clone(),
                                 ttl_key,
                                 ttl_entry: te,
                             })
-                        } else {
-                            None
-                        }
                     } else {
                         None
                     }
@@ -625,7 +617,7 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
                     }
                 }
                 self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability.clone())
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
                         last_modified_ledger_seq: self.current_ledger,
                         data: LedgerEntryData::ContractData(cd.clone()),
@@ -1192,9 +1184,9 @@ fn execute_host_function_p24(
         // This will cause Soroban contract results to differ from C++ stellar-core.
         tracing::warn!("Using fallback PRNG seed - results may differ from C++ stellar-core");
         let mut hasher = Sha256::new();
-        hasher.update(&context.network_id.0 .0);
-        hasher.update(&context.sequence.to_le_bytes());
-        hasher.update(&context.close_time.to_le_bytes());
+        hasher.update(context.network_id.0 .0);
+        hasher.update(context.sequence.to_le_bytes());
+        hasher.update(context.close_time.to_le_bytes());
         hasher.finalize().to_vec()
     };
 
@@ -1633,9 +1625,9 @@ fn execute_host_function_p25(
     } else {
         tracing::warn!("P25: Using fallback PRNG seed - results may differ from C++ stellar-core");
         let mut hasher = Sha256::new();
-        hasher.update(&context.network_id.0 .0);
-        hasher.update(&context.sequence.to_le_bytes());
-        hasher.update(&context.close_time.to_le_bytes());
+        hasher.update(context.network_id.0 .0);
+        hasher.update(context.sequence.to_le_bytes());
+        hasher.update(context.close_time.to_le_bytes());
         hasher.finalize().to_vec()
     };
 
