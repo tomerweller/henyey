@@ -386,6 +386,7 @@ pub fn replay_ledger_with_execution(
         soroban_base_prng_seed.0,
         classic_events,
         op_invariants,
+        None, // TODO: Add module cache support for history replay
     )
     .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 

@@ -50,7 +50,7 @@ use stellar_core_invariant::{
 use stellar_core_tx::{
     make_account_address, make_claimable_balance_address, make_muxed_account_address,
     operations::OperationType,
-    soroban::SorobanConfig,
+    soroban::{PersistentModuleCache, SorobanConfig},
     state::{get_account_seq_ledger, get_account_seq_time},
     validation::{self, LedgerContext as ValidationContext},
     ClassicEventConfig, LedgerContext, LedgerStateManager, OpEventManager, TransactionFrame,
@@ -647,6 +647,9 @@ pub struct TransactionExecutor {
     classic_events: ClassicEventConfig,
     /// Optional operation-level invariants runner.
     op_invariants: Option<OperationInvariantRunner>,
+    /// Optional persistent module cache for Soroban WASM compilation.
+    /// This cache is populated once from the bucket list and reused across transactions.
+    module_cache: Option<PersistentModuleCache>,
 }
 
 impl TransactionExecutor {
@@ -675,7 +678,22 @@ impl TransactionExecutor {
             soroban_config,
             classic_events,
             op_invariants,
+            module_cache: None,
         }
+    }
+
+    /// Set the persistent module cache for WASM compilation.
+    ///
+    /// The module cache should be populated with contract code from the bucket list
+    /// before executing transactions. This enables reuse of compiled WASM modules
+    /// across transactions, significantly improving performance.
+    pub fn set_module_cache(&mut self, cache: PersistentModuleCache) {
+        self.module_cache = Some(cache);
+    }
+
+    /// Get a reference to the module cache, if set.
+    pub fn module_cache(&self) -> Option<&PersistentModuleCache> {
+        self.module_cache.as_ref()
     }
 
     /// Advance to a new ledger, preserving the current state.
@@ -2853,6 +2871,7 @@ impl TransactionExecutor {
             context,
             soroban_data,
             Some(&self.soroban_config),
+            self.module_cache.as_ref(),
         )
     }
 
@@ -4558,6 +4577,7 @@ pub fn execute_transaction_set(
     soroban_base_prng_seed: [u8; 32],
     classic_events: ClassicEventConfig,
     op_invariants: Option<OperationInvariantRunner>,
+    module_cache: Option<&PersistentModuleCache>,
 ) -> Result<(
     Vec<TransactionExecutionResult>,
     Vec<TransactionResultPair>,
@@ -4579,10 +4599,17 @@ pub fn execute_transaction_set(
         classic_events,
         op_invariants,
         true,
+        module_cache,
     )
 }
 
 /// Execute a full transaction set with configurable fee deduction.
+///
+/// # Arguments
+///
+/// * `module_cache` - Optional persistent module cache for reusing compiled WASM.
+///   When provided, Soroban contract execution reuses pre-compiled modules,
+///   significantly improving performance for workloads with many contract calls.
 pub fn execute_transaction_set_with_fee_mode(
     snapshot: &SnapshotHandle,
     transactions: &[(TransactionEnvelope, Option<u32>)],
@@ -4598,6 +4625,7 @@ pub fn execute_transaction_set_with_fee_mode(
     classic_events: ClassicEventConfig,
     op_invariants: Option<OperationInvariantRunner>,
     deduct_fee: bool,
+    module_cache: Option<&PersistentModuleCache>,
 ) -> Result<(
     Vec<TransactionExecutionResult>,
     Vec<TransactionResultPair>,
@@ -4616,6 +4644,10 @@ pub fn execute_transaction_set_with_fee_mode(
         classic_events,
         op_invariants,
     );
+    // Set the module cache if provided for better Soroban performance
+    if let Some(cache) = module_cache {
+        executor.set_module_cache(cache.clone());
+    }
 
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());

@@ -1093,6 +1093,10 @@ impl<'a> LedgerCloseContext<'a> {
             emit_classic_events: self.manager.config.emit_classic_events,
             backfill_stellar_asset_events: self.manager.config.backfill_stellar_asset_events,
         };
+        // TODO: Add PersistentModuleCache support to LedgerManager for improved Soroban
+        // performance. The cache should be initialized from contract code entries in the
+        // bucket list and reused across ledger closes. Currently passing None, which means
+        // WASM modules are recompiled for each transaction.
         let (results, tx_results, mut tx_result_metas, id_pool) = execute_transaction_set(
             &self.snapshot,
             &transactions,
@@ -1107,6 +1111,7 @@ impl<'a> LedgerCloseContext<'a> {
             soroban_base_prng_seed.0,
             classic_events,
             op_invariants,
+            None, // Module cache not yet wired up for online ledger closing
         )?;
         if classic_events.events_enabled(self.prev_header.ledger_version) {
             for (idx, ((envelope, _), meta)) in transactions

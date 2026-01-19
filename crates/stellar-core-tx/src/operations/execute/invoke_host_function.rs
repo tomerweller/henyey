@@ -12,7 +12,7 @@ use stellar_xdr::curr::{
 };
 
 use super::{OperationExecutionResult, SorobanOperationMeta};
-use crate::soroban::SorobanConfig;
+use crate::soroban::{PersistentModuleCache, SorobanConfig};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -32,6 +32,7 @@ use crate::Result;
 /// * `context` - The ledger context
 /// * `soroban_data` - The Soroban transaction data
 /// * `soroban_config` - The Soroban network configuration with cost parameters
+/// * `module_cache` - Optional persistent module cache for reusing compiled WASM
 ///
 /// # Returns
 ///
@@ -44,6 +45,7 @@ pub fn execute_invoke_host_function(
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
     soroban_config: &SorobanConfig,
+    module_cache: Option<&PersistentModuleCache>,
 ) -> Result<OperationExecutionResult> {
     // Validate we have Soroban data for footprint
     let soroban_data = match soroban_data {
@@ -62,7 +64,15 @@ pub fn execute_invoke_host_function(
         | HostFunction::CreateContract(_)
         | HostFunction::CreateContractV2(_) => {
             // For contract operations, use soroban-env-host
-            execute_contract_invocation(op, source, state, context, soroban_data, soroban_config)
+            execute_contract_invocation(
+                op,
+                source,
+                state,
+                context,
+                soroban_data,
+                soroban_config,
+                module_cache,
+            )
         }
         HostFunction::UploadContractWasm(wasm) => {
             // WASM upload can be handled locally without full host
@@ -79,8 +89,9 @@ fn execute_contract_invocation(
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
+    module_cache: Option<&PersistentModuleCache>,
 ) -> Result<OperationExecutionResult> {
-    use crate::soroban::execute_host_function;
+    use crate::soroban::execute_host_function_with_cache;
 
     // Convert auth entries to a slice
     let auth_entries: Vec<_> = op.auth.iter().cloned().collect();
@@ -98,7 +109,7 @@ fn execute_contract_invocation(
     }
 
     // Execute via soroban-env-host
-    match execute_host_function(
+    match execute_host_function_with_cache(
         &op.host_function,
         &auth_entries,
         source,
@@ -106,6 +117,7 @@ fn execute_contract_invocation(
         context,
         soroban_data,
         soroban_config,
+        module_cache,
     ) {
         Ok(result) => {
             // C++ stellar-core check: event size (done first in collectEvents before
@@ -827,7 +839,7 @@ mod tests {
         };
 
         let result =
-            execute_invoke_host_function(&op, &source, &mut state, &context, None, &config)
+            execute_invoke_host_function(&op, &source, &mut state, &context, None, &config, None)
                 .expect("invoke host function");
 
         match result.result {
@@ -877,6 +889,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
         )
         .expect("invoke host function");
 
@@ -952,6 +965,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
         )
         .expect("invoke host function");
 
@@ -1029,6 +1043,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
         )
         .expect("invoke host function");
 

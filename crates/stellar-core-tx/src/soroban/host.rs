@@ -86,6 +86,102 @@ pub struct StorageChange {
     pub live_until: Option<u32>,
 }
 
+/// Persistent module cache that can be reused across transactions.
+///
+/// This enum wraps either a P24 or P25 module cache, allowing it to be
+/// passed through the execution layer without knowing the protocol version
+/// upfront. The cache is populated once at ledger start and reused for all
+/// transactions in that ledger, matching C++ stellar-core's SharedModuleCacheCompiler.
+#[derive(Clone)]
+pub enum PersistentModuleCache {
+    /// Protocol 24 module cache
+    P24(ModuleCache),
+    /// Protocol 25+ module cache
+    P25(ModuleCacheP25),
+}
+
+impl PersistentModuleCache {
+    /// Create a new empty P24 cache.
+    pub fn new_p24() -> Option<Self> {
+        let ctx = WasmCompilationContext::new();
+        ModuleCache::new(&ctx).ok().map(PersistentModuleCache::P24)
+    }
+
+    /// Create a new empty P25 cache.
+    pub fn new_p25() -> Option<Self> {
+        let ctx = WasmCompilationContextP25::new();
+        ModuleCacheP25::new(&ctx).ok().map(PersistentModuleCache::P25)
+    }
+
+    /// Create a new cache for the given protocol version.
+    pub fn new_for_protocol(protocol_version: u32) -> Option<Self> {
+        if protocol_version >= 25 {
+            Self::new_p25()
+        } else {
+            Self::new_p24()
+        }
+    }
+
+    /// Add a contract code entry to the cache.
+    /// Returns true if compilation succeeded, false otherwise.
+    pub fn add_contract(
+        &self,
+        code: &[u8],
+        protocol_version: u32,
+    ) -> bool {
+        match self {
+            PersistentModuleCache::P24(cache) => {
+                let ctx = WasmCompilationContext::new();
+                let contract_id = soroban_env_host24::xdr::Hash(
+                    <Sha256 as Digest>::digest(code).into(),
+                );
+                let cost_inputs = VersionedContractCodeCostInputs::V0 {
+                    wasm_bytes: code.len(),
+                };
+                cache.parse_and_cache_module(
+                    &ctx,
+                    protocol_version,
+                    &contract_id,
+                    code,
+                    cost_inputs,
+                ).is_ok()
+            }
+            PersistentModuleCache::P25(cache) => {
+                let ctx = WasmCompilationContextP25::new();
+                let contract_id = soroban_env_host25::xdr::Hash(
+                    <Sha256 as Digest>::digest(code).into(),
+                );
+                let cost_inputs = VersionedContractCodeCostInputsP25::V0 {
+                    wasm_bytes: code.len(),
+                };
+                cache.parse_and_cache_module(
+                    &ctx,
+                    protocol_version,
+                    &contract_id,
+                    code,
+                    cost_inputs,
+                ).is_ok()
+            }
+        }
+    }
+
+    /// Get the P24 cache if this is a P24 cache.
+    pub fn as_p24(&self) -> Option<&ModuleCache> {
+        match self {
+            PersistentModuleCache::P24(cache) => Some(cache),
+            PersistentModuleCache::P25(_) => None,
+        }
+    }
+
+    /// Get the P25 cache if this is a P25 cache.
+    pub fn as_p25(&self) -> Option<&ModuleCacheP25> {
+        match self {
+            PersistentModuleCache::P24(_) => None,
+            PersistentModuleCache::P25(cache) => Some(cache),
+        }
+    }
+}
+
 /// Adapter that provides snapshot access to our ledger state for Soroban.
 pub struct LedgerSnapshotAdapter<'a> {
     state: &'a LedgerStateManager,
@@ -947,7 +1043,46 @@ pub fn execute_host_function(
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
+    execute_host_function_with_cache(
+        host_function,
+        auth_entries,
+        source,
+        state,
+        context,
+        soroban_data,
+        soroban_config,
+        None,
+    )
+}
+
+/// Execute a Soroban host function with an optional pre-populated module cache.
+///
+/// This is the same as `execute_host_function` but accepts an optional persistent
+/// module cache. When provided, the cache is reused across transactions, avoiding
+/// repeated WASM compilation. This matches C++ stellar-core's SharedModuleCacheCompiler.
+///
+/// # Arguments
+///
+/// * `host_function` - The host function to execute
+/// * `auth_entries` - Authorization entries for the invocation
+/// * `source` - Source account for the transaction
+/// * `state` - Ledger state manager for reading entries
+/// * `context` - Ledger context with sequence, close time, etc.
+/// * `soroban_data` - Soroban transaction data with footprint and resources
+/// * `soroban_config` - Network configuration with cost parameters
+/// * `module_cache` - Optional pre-populated module cache for WASM reuse
+pub fn execute_host_function_with_cache(
+    host_function: &HostFunction,
+    auth_entries: &[SorobanAuthorizationEntry],
+    source: &AccountId,
+    state: &LedgerStateManager,
+    context: &LedgerContext,
+    soroban_data: &SorobanTransactionData,
+    soroban_config: &SorobanConfig,
+    module_cache: Option<&PersistentModuleCache>,
+) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     if context.protocol_version >= 25 {
+        let p25_cache = module_cache.and_then(|c| c.as_p25());
         return execute_host_function_p25(
             host_function,
             auth_entries,
@@ -956,8 +1091,10 @@ pub fn execute_host_function(
             context,
             soroban_data,
             soroban_config,
+            p25_cache,
         );
     }
+    let p24_cache = module_cache.and_then(|c| c.as_p24());
     execute_host_function_p24(
         host_function,
         auth_entries,
@@ -966,6 +1103,7 @@ pub fn execute_host_function(
         context,
         soroban_data,
         soroban_config,
+        p24_cache,
     )
 }
 
@@ -977,6 +1115,7 @@ fn execute_host_function_p24(
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
+    existing_cache: Option<&ModuleCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     // Helper to create error with zero consumed resources (for setup errors before budget exists)
     let make_setup_error = |e: HostErrorP25| SorobanExecutionError {
@@ -1283,15 +1422,24 @@ fn execute_host_function_p24(
         "P24: Prepared entries for e2e_invoke"
     );
 
-    // Build module cache with pre-compiled contracts from the footprint.
-    // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
-    // all WASM contracts outside of transaction budgets.
-    let module_cache = build_module_cache_for_footprint(
-        state,
-        &soroban_data.resources.footprint,
-        context.protocol_version,
-        context.sequence,
-    );
+    // Use existing module cache if provided, otherwise build one from the footprint.
+    // When a persistent cache is provided, it should already contain all contracts
+    // from the bucket list, so we just use it directly. Otherwise we fall back to
+    // building a per-transaction cache from the footprint.
+    let module_cache = if let Some(cache) = existing_cache {
+        tracing::debug!("P24: Using existing persistent module cache");
+        Some(cache.clone())
+    } else {
+        // Build module cache with pre-compiled contracts from the footprint.
+        // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+        // all WASM contracts outside of transaction budgets.
+        build_module_cache_for_footprint(
+            state,
+            &soroban_data.resources.footprint,
+            context.protocol_version,
+            context.sequence,
+        )
+    };
 
     // Call e2e_invoke - iterator yields &Vec<u8> which implements AsRef<[u8]>
     let mut diagnostic_events: Vec<soroban_env_host24::xdr::DiagnosticEvent> = Vec::new();
@@ -1424,6 +1572,7 @@ fn execute_host_function_p25(
     context: &LedgerContext,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
+    existing_cache: Option<&ModuleCacheP25>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     use soroban_env_host25::{
         budget::Budget,
@@ -1676,15 +1825,24 @@ fn execute_host_function_p25(
         "P25: Prepared entries for e2e_invoke"
     );
 
-    // Build module cache with pre-compiled contracts from the footprint.
-    // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
-    // all WASM contracts outside of transaction budgets.
-    let module_cache = build_module_cache_for_footprint_p25(
-        state,
-        &soroban_data.resources.footprint,
-        context.protocol_version,
-        context.sequence,
-    );
+    // Use existing module cache if provided, otherwise build one from the footprint.
+    // When a persistent cache is provided, it should already contain all contracts
+    // from the bucket list, so we just use it directly. Otherwise we fall back to
+    // building a per-transaction cache from the footprint.
+    let module_cache = if let Some(cache) = existing_cache {
+        tracing::debug!("P25: Using existing persistent module cache");
+        Some(cache.clone())
+    } else {
+        // Build module cache with pre-compiled contracts from the footprint.
+        // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+        // all WASM contracts outside of transaction budgets.
+        build_module_cache_for_footprint_p25(
+            state,
+            &soroban_data.resources.footprint,
+            context.protocol_version,
+            context.sequence,
+        )
+    };
 
     let mut diagnostic_events: Vec<soroban_env_host25::xdr::DiagnosticEvent> = Vec::new();
 

@@ -808,10 +808,11 @@ After fix: Ledgers 416662-416663 verified with 7 transactions, all matched (100%
 
 ## 17. Missing Persistent WASM Module Cache (Performance)
 
-**Status:** Unresolved (Investigation Complete)
+**Status:** Resolved
 **Severity:** High - Causes 10x+ slowdown in Soroban-heavy segments
 **Component:** Soroban Host / WASM Compilation
 **Discovered:** 2026-01-19
+**Fixed:** 2026-01-19
 
 ### Description
 Verification of later testnet segments (380k+ ledgers) runs ~10x slower than earlier segments despite similar transaction counts. Processing rate drops from ~3,000 TX/min to ~300 TX/min.
@@ -886,6 +887,43 @@ C++ stellar-core uses a persistent `SharedModuleCacheCompiler`:
 | `stellar-core-ledger/src/execution.rs` | Add `ModuleCache` field to `TransactionExecutor` |
 | `rs-stellar-core/src/main.rs` | Initialize persistent cache in verification mode |
 
+### Implementation Details
+
+Implemented `PersistentModuleCache` type in `stellar-core-tx/src/soroban/host.rs`:
+
+```rust
+/// Persistent module cache that can be reused across transactions.
+pub enum PersistentModuleCache {
+    P24(ModuleCache),
+    P25(ModuleCacheP25),
+}
+
+impl PersistentModuleCache {
+    pub fn new_for_protocol(protocol_version: u32) -> Option<Self>;
+    pub fn add_contract(&self, code: &[u8], protocol_version: u32) -> bool;
+}
+```
+
+**Files Modified:**
+| File | Change |
+|------|--------|
+| `stellar-core-tx/src/soroban/host.rs` | Added `PersistentModuleCache` type and `execute_host_function_with_cache` |
+| `stellar-core-tx/src/soroban/mod.rs` | Exported new types |
+| `stellar-core-tx/src/operations/execute/invoke_host_function.rs` | Added module_cache parameter |
+| `stellar-core-tx/src/operations/execute/mod.rs` | Added module_cache to operation dispatcher |
+| `stellar-core-ledger/src/execution.rs` | Added `module_cache` field and `set_module_cache` method to TransactionExecutor |
+| `stellar-core-ledger/src/manager.rs` | Added TODO for online mode cache integration |
+| `rs-stellar-core/src/main.rs` | Implemented cache population from bucket list in verification mode |
+
+**Verification Mode:**
+- On startup: scans bucket list for CONTRACT_CODE entries
+- Pre-compiles all WASM into persistent `PersistentModuleCache`
+- Cache is shared across all transaction execution in the verification run
+
+**Online Mode (TODO):**
+- Module cache wiring added to `execute_transaction_set` API
+- LedgerManager needs to manage cache lifecycle for full online benefit
+
 ### Expected Impact
 - **Before**: 10,000 Soroban TXs = 10,000 separate WASM compilations per unique contract
 - **After**: 10,000 Soroban TXs = 1 compilation per unique contract
@@ -895,9 +933,9 @@ C++ stellar-core uses a persistent `SharedModuleCacheCompiler`:
 
 ### Priority Order for Fixes
 
-1. **High**: #17 (Module Cache) - 10x performance degradation
-2. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
-3. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+1. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
+2. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+3. **Resolved**: #17 (Module Cache) - Fixed 2026-01-19, cache implementation complete
 4. **Resolved**: #15 (TooManySubentries) - Fixed 2026-01-19
 5. **Resolved**: #10 (ManageSellOffer OpNotSupported) - Fixed 2026-01-19
 6. **Resolved**: #16 (SetTrustLineFlags CantRevoke) - Fixed 2026-01-19

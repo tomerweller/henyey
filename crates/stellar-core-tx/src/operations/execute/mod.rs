@@ -13,7 +13,7 @@ use stellar_xdr::curr::{
 };
 
 use crate::frame::muxed_to_account_id;
-use crate::soroban::SorobanConfig;
+use crate::soroban::{PersistentModuleCache, SorobanConfig};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -310,6 +310,7 @@ pub fn execute_operation(
         context,
         None,
         None,
+        None, // No module cache for simple execution
     )
 }
 
@@ -323,6 +324,8 @@ pub fn execute_operation(
 /// * `soroban_config` - Optional Soroban config with cost parameters. Required for
 ///   accurate Soroban transaction execution. If None, uses default config which may
 ///   produce incorrect results.
+/// * `module_cache` - Optional persistent module cache for reusing compiled WASM
+///   across transactions. Significantly improves performance for contracts.
 pub fn execute_operation_with_soroban(
     op: &Operation,
     source_account_id: &AccountId,
@@ -333,6 +336,7 @@ pub fn execute_operation_with_soroban(
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
     soroban_config: Option<&SorobanConfig>,
+    module_cache: Option<&PersistentModuleCache>,
 ) -> Result<OperationExecutionResult> {
     // Get the actual source for this operation
     // If the operation has an explicit source, use it; otherwise use the transaction source
@@ -384,6 +388,7 @@ pub fn execute_operation_with_soroban(
                 context,
                 soroban_data,
                 config,
+                module_cache,
             )
         }
         OperationBody::ExtendFootprintTtl(op_data) => {

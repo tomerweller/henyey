@@ -94,6 +94,7 @@ pub use budget::{
 };
 pub use events::{ContractEvent, ContractEvents, EventType};
 pub use host::{
-    execute_host_function, SorobanExecutionError, SorobanExecutionResult, StorageChange,
+    execute_host_function, execute_host_function_with_cache, PersistentModuleCache,
+    SorobanExecutionError, SorobanExecutionResult, StorageChange,
 };
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};

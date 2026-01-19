@@ -2481,8 +2481,9 @@ async fn cmd_verify_execution(
     use stellar_core_ledger::{
         InMemorySorobanState, LedgerError, LedgerSnapshot, SnapshotHandle, SorobanRentConfig,
     };
+    use stellar_core_tx::soroban::PersistentModuleCache;
     use stellar_core_tx::ClassicEventConfig;
-    use stellar_xdr::curr::{BucketListType, LedgerEntry, LedgerKey};
+    use stellar_xdr::curr::{BucketListType, LedgerEntry, LedgerEntryData, LedgerKey};
 
     if !quiet {
         println!("Transaction Execution Verification");
@@ -2801,6 +2802,7 @@ async fn cmd_verify_execution(
 
     // Initialize in-memory Soroban state from the checkpoint.
     let mut soroban_state = InMemorySorobanState::new();
+    let mut module_cache: Option<PersistentModuleCache> = None;
     if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
         let live_entries = bucket_list.read().unwrap().live_entries()?;
         soroban_state
@@ -2813,6 +2815,27 @@ async fn cmd_verify_execution(
                 Some(&init_rent_config),
             )
             .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
+
+        // Initialize persistent module cache from contract code entries.
+        // This pre-compiles all WASM modules for reuse across transactions,
+        // matching C++ stellar-core's SharedModuleCacheCompiler behavior.
+        if let Some(cache) = PersistentModuleCache::new_for_protocol(init_protocol_version) {
+            let mut contracts_added = 0;
+            for entry in &live_entries {
+                if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
+                    if cache.add_contract(contract_code.code.as_slice(), init_protocol_version) {
+                        contracts_added += 1;
+                    }
+                }
+            }
+            if !quiet && contracts_added > 0 {
+                println!(
+                    "Module cache: pre-compiled {} contract modules",
+                    contracts_added
+                );
+            }
+            module_cache = Some(cache);
+        }
     }
 
     // Track results
@@ -3037,7 +3060,7 @@ async fn cmd_verify_execution(
                     soroban_config,
                 );
             } else {
-                executor = Some(TransactionExecutor::new(
+                let mut new_executor = TransactionExecutor::new(
                     seq,
                     cdp_header.scp_value.close_time.0,
                     cdp_header.base_reserve,
@@ -3047,7 +3070,12 @@ async fn cmd_verify_execution(
                     soroban_config,
                     ClassicEventConfig::default(),
                     None, // No invariant checking for now
-                ));
+                );
+                // Set the persistent module cache if available
+                if let Some(ref cache) = module_cache {
+                    new_executor.set_module_cache(cache.clone());
+                }
+                executor = Some(new_executor);
             }
 
             // Update prev_id_pool for the next ledger
