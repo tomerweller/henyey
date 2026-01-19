@@ -206,10 +206,17 @@ pub fn execute_set_trust_line_flags(
         ));
     }
 
-    if !is_authorized_to_maintain_liabilities(new_flags) && has_liabilities(&trustline) {
-        return Ok(make_set_flags_result(
-            SetTrustLineFlagsResultCode::CantRevoke,
-        ));
+    // Check if we need to remove offers (when revoking liabilities authorization)
+    // This matches C++ stellar-core behavior: when going from authorized-to-maintain-liabilities
+    // to not-authorized-to-maintain-liabilities, remove all offers by this account for this asset.
+    let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(trustline.flags);
+    let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
+
+    if was_authorized_to_maintain && !will_be_authorized_to_maintain {
+        // Remove all offers owned by the trustor that are buying or selling this asset
+        state.remove_offers_by_account_and_asset(&op.trustor, &op.asset);
+        // Note: Pool share trustline redemption is not yet implemented.
+        // The C++ code also redeems pool share trustlines here (removeOffersAndPoolShareTrustLines).
     }
 
     // Update the trustline

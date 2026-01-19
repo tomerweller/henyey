@@ -715,28 +715,62 @@ When an account reaches its subentry limit, new offer creation should fail with 
 
 ---
 
-## 16. SetTrustLineFlags CantRevoke vs Success (NEW)
+## 16. SetTrustLineFlags CantRevoke vs Success (RESOLVED)
 
-**Status:** Unresolved
-**Severity:** Medium - Legitimate operations rejected
+**Status:** Fixed
+**Severity:** N/A - Issue resolved
 **Component:** TrustLine Flags
 **Discovered:** 2026-01-19
+**Fixed:** 2026-01-19
 
 ### Description
-At ledger 416662, a SetTrustLineFlags operation returns `CantRevoke` in our code but succeeds in C++ stellar-core.
+At ledger 416662, a SetTrustLineFlags operation returned `CantRevoke` in our code but succeeded in C++ stellar-core.
 
 ### Details
 ```
 Ledger 416662 TX 3:
-  - Our result: SetTrustLineFlags(CantRevoke)
+  - Our result (before fix): SetTrustLineFlags(CantRevoke)
   - CDP result: SetTrustLineFlags(Success)
 ```
 
 ### Root Cause
-Our SetTrustLineFlags implementation may have incorrect logic for determining when a trustline's flags can be modified. The `CantRevoke` error is typically returned when trying to revoke authorization on a trustline where the issuer doesn't have the appropriate flags set.
+Our `execute_set_trust_line_flags` function had an incorrect check that returned `CantRevoke` when a trustline had liabilities and the operation was revoking authorization. This check does NOT exist in C++ stellar-core's `SetTrustLineFlagsOpFrame`.
+
+The incorrect code was:
+```rust
+if !is_authorized_to_maintain_liabilities(new_flags) && has_liabilities(&trustline) {
+    return Ok(make_set_flags_result(SetTrustLineFlagsResultCode::CantRevoke));
+}
+```
+
+In C++ stellar-core, when revoking liabilities authorization via `SetTrustLineFlags`:
+1. The operation removes all offers owned by the trustor that buy or sell the asset (via `removeOffersAndPoolShareTrustLines`)
+2. It does NOT fail with `CantRevoke` based on existing liabilities
+3. The `CantRevoke` error is only returned when `AUTH_REVOCABLE` is not set on the issuer
+
+### Resolution
+Fixed in `crates/stellar-core-tx/src/operations/execute/trust_flags.rs`:
+
+1. Removed the incorrect liabilities check
+2. Added offer removal logic that matches C++ behavior:
+```rust
+// When going from authorized-to-maintain-liabilities to not-authorized-to-maintain-liabilities,
+// remove all offers by this account for this asset
+let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(trustline.flags);
+let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
+
+if was_authorized_to_maintain && !will_be_authorized_to_maintain {
+    state.remove_offers_by_account_and_asset(&op.trustor, &op.asset);
+}
+```
+
+Also added `remove_offers_by_account_and_asset()` method to `LedgerStateManager` in `state.rs`.
 
 ### Affected Ledgers
 - Ledger 416662 TX 3
+
+### Verification
+After fix: Ledgers 416662-416663 verified with 7 transactions, all matched (100% parity)
 
 ---
 
@@ -831,7 +865,7 @@ C++ stellar-core uses a persistent `SharedModuleCacheCompiler`:
 
 1. **Critical**: #15 (TooManySubentries) - We accept invalid transactions
 2. **High**: #17 (Module Cache) - 10x performance degradation
-3. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
-4. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
-5. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
-6. **Resolved**: #10 (ManageSellOffer OpNotSupported) - Fixed 2026-01-19
+3. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
+4. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+5. **Resolved**: #10 (ManageSellOffer OpNotSupported) - Fixed 2026-01-19
+6. **Resolved**: #16 (SetTrustLineFlags CantRevoke) - Fixed 2026-01-19

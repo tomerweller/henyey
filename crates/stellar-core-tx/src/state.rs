@@ -1808,6 +1808,35 @@ impl LedgerStateManager {
             .cloned()
     }
 
+    /// Remove all offers owned by an account that are buying or selling a specific asset.
+    /// This is used when revoking authorization on a trustline.
+    /// Returns the list of (seller_id, offer_id) pairs that were removed.
+    pub fn remove_offers_by_account_and_asset(
+        &mut self,
+        account_id: &AccountId,
+        asset: &Asset,
+    ) -> Vec<(AccountId, i64)> {
+        let account_key = account_id_to_bytes(account_id);
+
+        // Find all offers by this account that buy or sell this asset
+        let offers_to_remove: Vec<_> = self
+            .offers
+            .iter()
+            .filter(|((seller_key, _), offer)| {
+                *seller_key == account_key
+                    && (offer.buying == *asset || offer.selling == *asset)
+            })
+            .map(|((_, offer_id), offer)| (offer.seller_id.clone(), *offer_id))
+            .collect();
+
+        // Remove each offer
+        for (seller_id, offer_id) in &offers_to_remove {
+            self.delete_offer(seller_id, *offer_id);
+        }
+
+        offers_to_remove
+    }
+
     // ==================== Data Entry Operations ====================
 
     /// Get a data entry by account and name (read-only).
