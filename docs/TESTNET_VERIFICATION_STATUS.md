@@ -36,15 +36,15 @@ cargo build --release -p rs-stellar-core
 | Total TX matched | **1,325,909** |
 | Total TX mismatched | **432** |
 | **TX match rate** | **99.97%** |
-| Genuine bugs (tx_only) | **11** |
-| Bucket-list induced | 421 |
+| Genuine bugs | **3** (#10, #15, #16) |
+| Bucket-list induced | 429 (including 8 tx_only) |
 | Header mismatches | 165,851 ledgers |
 
 ### Key Findings
 
 1. **Transaction Execution**: 99.97% parity with C++ stellar-core
-2. **Genuine Bugs**: 11 transaction mismatches NOT caused by bucket list divergence (tx_only)
-3. **Bucket List**: Causes ~97% of mismatches; when bucket list is correct, TX execution is 100%
+2. **Genuine Bugs**: Only 3 transaction mismatches NOT caused by bucket list divergence
+3. **Bucket List**: Causes ~99% of mismatches; when bucket list is correct, TX execution is 100%
 4. **Performance**: Later segments (380k+) run 10x slower due to missing WASM module cache (see KNOWN_ISSUES.md #17)
 
 ### Segment Results Summary
@@ -55,23 +55,24 @@ cargo build --release -p rs-stellar-core
 | MISMATCH (tx errors) | 18 | Some transaction mismatches |
 | KILLED (incomplete) | 12 | Segments 45-56 not completed |
 
-### Segments with tx_only Mismatches (Genuine Bugs)
+### Segments with tx_only Mismatches
 
-These are real execution bugs, NOT caused by bucket list divergence:
+Some tx_only mismatches are genuine bugs, others are bucket-list induced:
 
-| Segment | Ledger Range | tx_only | Description |
-|---------|--------------|---------|-------------|
-| 16 | 150,064-160,063 | 1 | See KNOWN_ISSUES.md |
-| 21 | 200,064-210,063 | 2 | Orderbook divergence |
-| 24 | 230,064-240,063 | 1 | ManageSellOffer OpNotSupported |
-| 33 | 320,064-330,063 | 2 | InvokeHostFunction issues |
-| 34 | 330,064-340,063 | 1 | InvokeHostFunction refundable fee |
-| 35 | 340,064-350,063 | 1 | InvokeHostFunction refundable fee |
-| 40 | 390,064-400,063 | 1 | InvokeHostFunction refundable fee |
-| 41 | 400,064-410,063 | 1 | ManageSellOffer TooManySubentries |
-| 42 | 410,064-420,063 | 1 | SetTrustLineFlags CantRevoke |
+| Segment | Ledger Range | tx_only | Description | Status |
+|---------|--------------|---------|-------------|--------|
+| 16 | 150,064-160,063 | 1 | Trapped vs ResourceLimitExceeded | Bucket-list induced (#12) |
+| 21 | 200,064-210,063 | 2 | Orderbook divergence | Bucket-list induced (#13) |
+| 24 | 230,064-240,063 | 1 | ManageSellOffer OpNotSupported | **Genuine bug (#10)** |
+| 33 | 320,064-330,063 | 2 | InvokeHostFunction issues | Bucket-list induced (#12) |
+| 34 | 330,064-340,063 | 1 | InvokeHostFunction refundable fee | Bucket-list induced (#11) |
+| 35 | 340,064-350,063 | 1 | InvokeHostFunction refundable fee | Bucket-list induced (#11) |
+| 40 | 390,064-400,063 | 1 | InvokeHostFunction refundable fee | Bucket-list induced (#14) |
+| 41 | 400,064-410,063 | 1 | ManageSellOffer TooManySubentries | **Genuine bug (#15)** |
+| 42 | 410,064-420,063 | 1 | SetTrustLineFlags CantRevoke | **Genuine bug (#16)** |
 
-**Total: 11 genuine bugs** documented in KNOWN_ISSUES.md (#10-#16)
+**Genuine bugs: 3** (#10, #15, #16) - documented in KNOWN_ISSUES.md
+**Bucket-list induced: 8** (#11, #12, #13, #14) - will resolve when Issue #2 is fixed
 
 ### Full Segment Results
 

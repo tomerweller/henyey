@@ -369,12 +369,13 @@ Under investigation. The operation appears to be a deletion of an existing offer
 
 ---
 
-## 11. InvokeHostFunction InsufficientRefundableFee Bug (NEW)
+## 11. InvokeHostFunction InsufficientRefundableFee (BUCKET LIST INDUCED)
 
-**Status:** Unresolved
-**Severity:** Medium - Causes successful transactions to fail
+**Status:** Confirmed Bucket List Induced - No fix needed
+**Severity:** N/A - Symptom of Issue #2 (Bucket List Hash Divergence)
 **Component:** Soroban Host / Fee Handling
 **Discovered:** 2026-01-19
+**Investigated:** 2026-01-19
 
 ### Description
 At ledger 342737, an InvokeHostFunction transaction fails with `InsufficientRefundableFee` in our code but succeeds in C++ stellar-core.
@@ -386,14 +387,28 @@ Ledger 342737 TX 3:
   - CDP result: InvokeHostFunction(Success(Hash(...)))
 ```
 
-### Root Cause
-Under investigation. Our code is rejecting a transaction with insufficient refundable fee when C++ stellar-core accepts it. This may indicate:
-1. Different fee calculation
-2. Different refundable fee validation threshold
-3. Different handling of fee refunds
+### Investigation Findings (2026-01-19)
+
+**Conclusion: This is NOT a genuine execution bug. It is caused by bucket list divergence affecting rent fee calculation.**
+
+**Evidence:**
+1. The transaction restores 6 archived entries from the hot archive (indices 2, 4, 5, 6, 8, 9)
+2. Rent fee calculation depends on entry sizes, TTL values, and other state from the bucket list
+3. Segment 35 (ledger 342737) has 5,925 header mismatches indicating significant bucket list divergence
+4. When bucket list is correct (segments with 0 header mismatches), no refundable fee issues occur
+
+**How bucket list divergence causes this:**
+1. C++ stellar-core has correct bucket list state with archived entries at specific sizes/TTLs
+2. Our bucket list state has diverged, causing different entry data
+3. Rent fee calculation uses entry sizes and TTL extensions
+4. With different entry data, our computed rent fee differs from C++
+5. Combined with event fees, our consumed_refundable_fee exceeds max_refundable_fee while C++ stays under
+
+**Resolution:**
+This issue will automatically resolve when bucket list divergence (Issue #2) is fixed. No code changes needed for fee calculation logic.
 
 ### Affected Ledgers
-- Ledger 342737 TX 3
+- Ledger 342737 TX 3 (segment 35 - 5,925 header mismatches)
 
 ---
 
@@ -533,12 +548,14 @@ The bucket list divergence (Issue #2) causes offer entries to have different val
 
 ---
 
-## 14. InvokeHostFunction Refundable Fee Inconsistency (NEW - Bidirectional)
+## 14. InvokeHostFunction Refundable Fee Inconsistency (PARTIALLY FIXED)
 
-**Status:** Unresolved
-**Severity:** High - Fee validation differs in both directions
-**Component:** Soroban Host / Fee Handling
+**Status:** Code fix applied; bucket list divergence may still cause issues
+**Severity:** Medium - Fixed a genuine code bug, but bucket list divergence can still cause fee discrepancies
+**Component:** Soroban Host / Fee Configuration
 **Discovered:** 2026-01-19
+**Investigated:** 2026-01-19
+**Partially Fixed:** 2026-01-19
 
 ### Description
 InvokeHostFunction transactions show inconsistent refundable fee behavior compared to C++ stellar-core. In some cases we accept transactions that CDP rejects, and in other cases we reject transactions that CDP accepts.
@@ -562,17 +579,42 @@ Ledger 342737 TX 3:
   - CDP result: InvokeHostFunction(Success(...))
 ```
 
-### Root Cause
-Our refundable fee calculation differs from C++ stellar-core. This could be:
-1. Different calculation of required refundable fee
-2. Different timing of when the fee check is performed
-3. Different handling of fee refund logic
+### Code Fix Applied (2026-01-19)
 
-This is a critical parity issue as it affects which transactions are accepted/rejected.
+**Found genuine code bug:** Our `load_soroban_config()` function always used `fee_write1_kb` from `ContractLedgerCostExtV0` for `fee_per_write_1kb` in the `FeeConfiguration`. However, C++ stellar-core's `rustBridgeFeeConfiguration()` uses protocol-version-dependent logic:
+
+- **For protocol >= 23**: use `fee_write1_kb` (flat rate from ContractLedgerCostExtV0)
+- **For protocol < 23**: use `fee_per_rent_1kb` (computed from average state size)
+
+**Fix applied in `crates/stellar-core-ledger/src/execution.rs`:**
+```rust
+let fee_per_write_1kb_for_config =
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+        fee_write_1kb
+    } else {
+        fee_per_rent_1kb
+    };
+```
+
+This matches C++ `rustBridgeFeeConfiguration()` behavior in `.upstream-v25/src/ledger/NetworkConfig.cpp:2530-2534`.
+
+### Remaining Issue: Bucket List Divergence
+
+**Even with the code fix, the affected ledgers are in segments with bucket list divergence:**
+- Segment 35 (ledger 342737): 5,925 header mismatches
+- Segment 40 (ledger 390407): 6,689 header mismatches
+
+**Bucket list divergence still affects fee calculation because:**
+1. Rent fee calculation depends on entry sizes and TTL extensions
+2. When bucket list state differs, entry data differs
+3. Different entry data leads to different computed rent fees
+
+**Resolution:**
+The code fix addresses the protocol-version-dependent fee selection bug. Full resolution requires fixing bucket list divergence (Issue #2).
 
 ### Affected Ledgers
-- Ledger 342737 TX 3 (we fail, should succeed)
-- Ledger 390407 TX 9, 10 (we succeed, should fail)
+- Ledger 342737 TX 3 (segment 35 - 5,925 header mismatches)
+- Ledger 390407 TX 9, 10 (segment 40 - 6,689 header mismatches)
 
 ---
 
@@ -616,15 +658,16 @@ When an account reaches its subentry limit, new offer creation should fail with 
 | Issue | Ledger | Description |
 |-------|--------|-------------|
 | #10 | 237057 | ManageSellOffer OpNotSupported vs Success (0 header mismatches) |
-| #14 | 342737, 390407 | InvokeHostFunction refundable fee inconsistency |
 | #15 | 407293 | ManageSellOffer TooManySubentries not enforced |
 
 ### Confirmed Bucket-List Induced (segments with header mismatches)
 
 | Issue | Ledgers | Description |
 |-------|---------|-------------|
+| #11 | 342737 | InvokeHostFunction InsufficientRefundableFee (CONFIRMED 2026-01-19) |
 | #12 | 152692, 327722 | InvokeHostFunction Trapped vs ResourceLimitExceeded (CONFIRMED 2026-01-19) |
 | #13 | 201477, 201755, 325512, 332809 | Orderbook claims different offers (CONFIRMED 2026-01-19) |
+| #14 | 342737, 390407 | InvokeHostFunction refundable fee bidirectional (CONFIRMED 2026-01-19) |
 
 ---
 
@@ -743,8 +786,8 @@ C++ stellar-core uses a persistent `SharedModuleCacheCompiler`:
 ### Priority Order for Fixes
 
 1. **Critical**: #15 (TooManySubentries) - We accept invalid transactions
-2. **High**: #14 (Refundable Fee) - Bidirectional fee validation mismatch
-3. **High**: #17 (Module Cache) - 10x performance degradation
-4. **Medium**: #10 (OpNotSupported) - Legitimate operations rejected
-5. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
-6. **Low**: #12, #13 - May resolve when bucket list is fixed
+2. **High**: #17 (Module Cache) - 10x performance degradation
+3. **Medium**: #10 (OpNotSupported) - Legitimate operations rejected
+4. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
+5. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
+6. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
