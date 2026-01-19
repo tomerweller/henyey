@@ -591,7 +591,7 @@ Our SetTrustLineFlags implementation may have incorrect logic for determining wh
 
 ## 17. Missing Persistent WASM Module Cache (Performance)
 
-**Status:** Unresolved
+**Status:** Unresolved (Investigation Complete)
 **Severity:** High - Causes 10x+ slowdown in Soroban-heavy segments
 **Component:** Soroban Host / WASM Compilation
 **Discovered:** 2026-01-19
@@ -608,27 +608,71 @@ Verification of later testnet segments (380k+ ledgers) runs ~10x slower than ear
 | 44 | 430,064 | 37,452 | 7,932s | 283 |
 
 ### Root Cause
-Our implementation builds a **new ModuleCache for every transaction** in `build_module_cache_for_footprint()`. This means:
+Our implementation builds a **new ModuleCache for every transaction** in `build_module_cache_for_footprint()`:
+
+```rust
+// crates/stellar-core-tx/src/soroban/host.rs:726-733
+fn build_module_cache_for_footprint(...) -> Option<ModuleCache> {
+    let ctx = WasmCompilationContext::new();
+    let cache = ModuleCache::new(&ctx).ok()?;  // NEW cache every time!
+    // ... compiles all WASM in footprint from scratch
+}
+```
+
+This means:
 1. Every Soroban transaction creates a fresh `ModuleCache`
 2. All WASM modules in the footprint are compiled from scratch
 3. Compiled modules are discarded after the transaction
 
-C++ stellar-core uses a `SharedModuleCacheCompiler` that:
-1. Persists the module cache across transactions via `app.getLedgerManager().getModuleCache()`
-2. `ThreadParallelApplyLedgerState` stores `mModuleCache` and reuses it
-3. Compiled WASM modules are cached and reused for subsequent transactions
+### C++ stellar-core Implementation
+C++ stellar-core uses a persistent `SharedModuleCacheCompiler`:
 
-If the same contract (e.g., USDC) is called 1000 times in a segment, we compile its WASM 1000 times instead of once.
+1. **Persistent storage**: `LedgerManagerImpl::ApplyState::mModuleCache` (`.upstream-v25/src/ledger/LedgerManagerImpl.h:160`)
+2. **Startup**: `SharedModuleCacheCompiler` scans entire bucket list for CONTRACT_CODE entries and pre-compiles all WASM
+3. **Runtime**: `addAnyContractsToModuleCache()` adds newly created contracts after each ledger
+4. **Eviction**: `evictFromModuleCache()` removes evicted contracts
+5. **Access**: `getModuleCache()->shallow_clone()` provides the cache to transaction execution
 
-### Affected Code
-- `crates/stellar-core-tx/src/soroban/host.rs`: `build_module_cache_for_footprint()` and `build_module_cache_for_footprint_p25()`
-- Need to add persistent cache at verification/execution level
+### Investigation Findings
+
+**Key files in C++ upstream:**
+- `.upstream-v25/src/ledger/SharedModuleCacheCompiler.cpp` - Multi-threaded WASM pre-compilation
+- `.upstream-v25/src/ledger/LedgerManagerImpl.h:160` - `mModuleCache` field in `ApplyState`
+- `.upstream-v25/src/ledger/LedgerManagerImpl.cpp:2911-2912` - `addAnyContractsToModuleCache()` after ledger close
+
+**Key insight**: The soroban-env-host `e2e_invoke::invoke_host_function()` accepts `module_cache: Option<ModuleCache>` as its last parameter, so we can pass a persistent cache.
 
 ### Fix Approach
-1. Create a persistent `ModuleCache` at the segment/ledger-range level
-2. Pass the cache into `invoke_host_function_p24`/`invoke_host_function_p25`
-3. Populate cache incrementally as new contracts are encountered
-4. Match C++ `SharedModuleCacheCompiler` behavior
+
+1. **Modify `execute_host_function` API** (`crates/stellar-core-tx/src/soroban/host.rs`):
+   - Add `module_cache: Option<&ModuleCache>` parameter to public function
+   - If provided, add only missing entries to existing cache
+   - If not provided (backwards compat), build temporary cache as before
+
+2. **Add cache to `TransactionExecutor`** (`crates/stellar-core-ledger/src/execution.rs`):
+   - Add `module_cache: ModuleCache` field to `TransactionExecutor` struct
+   - Pass cache through to `execute_host_function`
+
+3. **Initialize cache in verification** (`crates/rs-stellar-core/src/main.rs`):
+   - On startup: scan bucket list for all CONTRACT_CODE entries
+   - Pre-compile all WASM into persistent cache
+   - Pass cache to `TransactionExecutor::new()`
+
+4. **Add incremental updates**:
+   - After each ledger, add any new CONTRACT_CODE entries to cache
+   - (Optional) Handle eviction for long-running processes
+
+### Files to Modify
+| File | Change |
+|------|--------|
+| `stellar-core-tx/src/soroban/host.rs` | Add optional cache param to `execute_host_function` |
+| `stellar-core-ledger/src/execution.rs` | Add `ModuleCache` field to `TransactionExecutor` |
+| `rs-stellar-core/src/main.rs` | Initialize persistent cache in verification mode |
+
+### Expected Impact
+- **Before**: 10,000 Soroban TXs = 10,000 separate WASM compilations per unique contract
+- **After**: 10,000 Soroban TXs = 1 compilation per unique contract
+- **Performance**: ~10x speedup for Soroban-heavy segments (back to ~3,000 TX/min)
 
 ---
 
