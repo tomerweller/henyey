@@ -25,121 +25,116 @@ cargo build --release -p rs-stellar-core
 
 ## Current Status
 
-**Last verification run**: 2026-01-18
+**Last verification run**: 2026-01-19
 
-### Extended Verification Summary (933-100000)
-
-| Metric | Value |
-|--------|-------|
-| Total ledgers verified | ~100,000 |
-| Total TX verified | **221,355** |
-| TX match rate | **99.99%+** (14 mismatches, all bucket-list induced) |
-| Header mismatches | ~63,000 (bucket list divergence) |
-| **AMM Pool State** | ✅ RESOLVED (ledger 20226) |
-| **InvokeHostFunction** | ✅ RESOLVED (ledgers 26961-27057) |
-| **PRNG divergence** | ✅ RESOLVED (ledgers 71655, 71766) |
-
-### Verification Results by Range (933-100000)
-
-| Range | Transactions | Mismatches | Parity | Header Issues | Notes |
-|-------|--------------|------------|--------|---------------|-------|
-| 933-20000 | 38,572 | 1 | **99.997%** | 11,346 | 1 Phase 2 mismatch (bucket list induced) |
-| 20000-40000 | 41,679 | 0 | **100%** | **0** | ✅ All 7 mismatches fixed |
-| 40000-60000 | 27,758 | 0 | **100%** | 19,030 | Clean TX execution |
-| 60000-80000 | 31,943 | 0 | **100%** | 14,463 | Clean TX execution |
-| 80000-100000 | 81,403 | 13 | **99.98%** | 18,074 | Mismatches caused by bucket list |
-
-### Previously Verified Clean Ranges
-
-| Range | Transactions | Parity | Notes |
-|-------|--------------|--------|-------|
-| 30000-36000 | 14,651 | **100%** | Clean range, all match |
-| 50000-60000 | 13,246 | **100%** | Clean range |
-| 70000-75000 | 9,027 | **100%** | PRNG fix verified |
-| 100000-110000 | 37,744 | **100%** | Clean range |
-| 250000-251000 | 2,457 | **100%** | Clean range |
-| 300000-301000 | 2,228 | **100%** | Clean range |
-
-### RESOLVED: Genuine Mismatches (20000-40000 Range)
-
-The 20000-40000 range previously had 7 transaction mismatches. Both issues are now **RESOLVED**:
-
-1. **Ledger 20226 TX 2**: PathPaymentStrictReceive via Liquidity Pool ✅ FIXED
-   - **Root cause**: `load_liquidity_pool` was overwriting CDP-synced state with stale snapshot data
-   - **Fix**: Added check to return existing state if pool already loaded (matching other entry types)
-
-2. **Ledgers 26961-27057**: InvokeHostFunction ✅ FIXED
-   - **Root cause**: Pre-compilation budget too limited, causing WASM compilation during execution
-   - **Fix**: Increased `WasmCompilationContext` budget to 10B CPU / 1GB memory
-
-**After fixes**: 41,679 transactions verified with **0 mismatches** (100% parity).
-
-### RESOLVED: Soroban PRNG Seed Divergence (Fixed in `3105525`)
-
-**Previously found 2 transactions where both Rust and C++ succeeded but returned DIFFERENT hash values:**
-
-1. **Ledger 71655**:
-   - Our hash (before fix): `e12337f8aabf2af4c90ad7c7c0aff9495a0d346008a0c40c02e17a818dc53014`
-   - CDP hash: `7ecf7e8454b3758e6a5f8a68801b377141d40691308f009e82e6c780c4a0b0d3`
-
-2. **Ledger 71766**:
-   - Our hash (before fix): `5d52ad15f24c4a27c17e3923d880b3d6561ceb152e4ee495155e96fbf038fece`
-   - CDP hash: `2834b42856c37e9e494d5bcc8717165d5b0a82166033347473544d678f4983c0`
-
-**Root cause**: PRNG seed computation was incorrect:
-- **Bug 1**: `sub_sha256` in `hash.rs` used little-endian byte order instead of big-endian
-- **Bug 2**: PRNG seed in `execution.rs` and `main.rs` used 4-byte u32 instead of 8-byte u64
-
-C++ stellar-core uses `subSha256(baseSeed, static_cast<uint64_t>(index))` where `xdr_to_opaque` serializes the u64 as 8 bytes big-endian (XDR network byte order).
-
-**Status**: ✅ FIXED - Both ledgers now verify correctly
-
-### Parallel Full Testnet Verification (Partial - 41/109 segments)
+### Full Testnet Verification Summary (64-440,063)
 
 | Metric | Value |
 |--------|-------|
-| Ledgers verified | 205,000 |
-| Transactions matched | 547,928 |
-| Transactions mismatched | 157 |
+| Ledgers verified | **440,000** |
+| Segments completed | 44 / 56 |
+| Total TX matched | **1,325,909** |
+| Total TX mismatched | **432** |
 | **TX match rate** | **99.97%** |
-| Segments with bucket list OK | 19 (46%) |
-| Segments with bucket list issues | 22 (54%) |
-| Total header mismatches | 50,817 ledgers |
+| Genuine bugs (tx_only) | **11** |
+| Bucket-list induced | 421 |
+| Header mismatches | 165,851 ledgers |
 
-**Transaction Execution**: Near-perfect parity at 99.97%. The mismatches are **caused by bucket list divergence corrupting state** - NOT CPU metering issues. On segments with correct bucket list state, transaction execution achieves **100% parity**.
+### Key Findings
 
-**Bucket List**: ~54% of segments show bucket list hash divergence. This is a **checkpoint-specific issue** - some checkpoints restore correctly while others diverge. The divergence appears to start mid-segment (not at checkpoint boundaries), suggesting an issue with bucket list state evolution after restoration. **This is the root cause of all transaction execution mismatches.**
+1. **Transaction Execution**: 99.97% parity with C++ stellar-core
+2. **Genuine Bugs**: 11 transaction mismatches NOT caused by bucket list divergence (tx_only)
+3. **Bucket List**: Causes ~97% of mismatches; when bucket list is correct, TX execution is 100%
+4. **Performance**: Later segments (380k+) run 10x slower due to missing WASM module cache (see KNOWN_ISSUES.md #17)
 
-### Segments with Perfect Bucket List Parity
+### Segment Results Summary
 
-| Segment | Ledger Range | Status |
-|---------|--------------|--------|
-| 1 | 64-5,063 | ✅ 0 header mismatches |
-| 3-8 | 10,064-40,063 | ✅ 0 header mismatches |
-| 11 | 50,064-55,063 | ✅ 0 header mismatches |
-| 13 | 60,064-65,063 | ✅ 0 header mismatches |
-| 16 | 75,064-80,063 | ✅ 0 header mismatches |
-| 18 | 85,064-90,063 | ✅ 0 header mismatches |
+| Category | Count | Description |
+|----------|-------|-------------|
+| SUCCESS (0 tx mismatches) | 26 | Clean transaction execution |
+| MISMATCH (tx errors) | 18 | Some transaction mismatches |
+| KILLED (incomplete) | 12 | Segments 45-56 not completed |
 
-### Segments with Bucket List Issues
+### Segments with tx_only Mismatches (Genuine Bugs)
 
-| Segment | Ledger Range | Header Mismatches |
-|---------|--------------|-------------------|
-| 2 | 5,064-10,063 | 1,409 |
-| 9 | 40,064-45,063 | 4,093 |
-| 10 | 45,064-50,063 | 370 |
-| 12 | 55,064-60,063 | 2,695 |
-| 14 | 65,064-70,063 | 4,526 |
-| 15 | 70,064-75,063 | 1,300 |
-| 17 | 80,064-85,063 | 3,137 |
-| 19+ | 90,064+ | Various |
+These are real execution bugs, NOT caused by bucket list divergence:
 
-### Mismatch Breakdown
+| Segment | Ledger Range | tx_only | Description |
+|---------|--------------|---------|-------------|
+| 16 | 150,064-160,063 | 1 | See KNOWN_ISSUES.md |
+| 21 | 200,064-210,063 | 2 | Orderbook divergence |
+| 24 | 230,064-240,063 | 1 | ManageSellOffer OpNotSupported |
+| 33 | 320,064-330,063 | 2 | InvokeHostFunction issues |
+| 34 | 330,064-340,063 | 1 | InvokeHostFunction refundable fee |
+| 35 | 340,064-350,063 | 1 | InvokeHostFunction refundable fee |
+| 40 | 390,064-400,063 | 1 | InvokeHostFunction refundable fee |
+| 41 | 400,064-410,063 | 1 | ManageSellOffer TooManySubentries |
+| 42 | 410,064-420,063 | 1 | SetTrustLineFlags CantRevoke |
 
-| Range | Error Code Diffs | Phase 1 Fee Diffs | Header Failures |
-|-------|------------------|-------------------|-----------------|
-| 933-15000 | 193 | 0 | 6,346 |
-| 15001-30000 | 526 | 52 | 0 |
+**Total: 11 genuine bugs** documented in KNOWN_ISSUES.md (#10-#16)
+
+### Full Segment Results
+
+| Seg | Ledger Range | TXs | Mismatched | Header Issues | tx_only | Status |
+|-----|--------------|-----|------------|---------------|---------|--------|
+| 1 | 64-10,063 | 12,515 | 1 | 1,409 | 0 | MISMATCH |
+| 2 | 10,064-20,063 | 26,842 | 0 | 0 | 0 | ✅ SUCCESS |
+| 3 | 20,064-30,063 | 19,712 | 0 | 0 | 0 | ✅ SUCCESS |
+| 4 | 30,064-40,063 | 21,936 | 0 | 0 | 0 | ✅ SUCCESS |
+| 5 | 40,064-50,063 | 14,521 | 0 | 9,093 | 0 | ✅ SUCCESS |
+| 6 | 50,064-60,063 | 13,235 | 0 | 2,695 | 0 | ✅ SUCCESS |
+| 7 | 60,064-70,063 | 15,278 | 0 | 4,526 | 0 | ✅ SUCCESS |
+| 8 | 70,064-80,063 | 16,650 | 0 | 6,300 | 0 | ✅ SUCCESS |
+| 9 | 80,064-90,063 | 34,249 | 8 | 8,137 | 0 | MISMATCH |
+| 10 | 90,064-100,063 | 48,312 | 5 | 9,925 | 0 | MISMATCH |
+| 11 | 100,064-110,063 | 36,616 | 0 | 3,557 | 0 | ✅ SUCCESS |
+| 12 | 110,064-120,063 | 33,193 | 0 | 5,327 | 0 | ✅ SUCCESS |
+| 13 | 120,064-130,063 | 24,095 | 0 | 7 | 0 | ✅ SUCCESS |
+| 14 | 130,064-140,063 | 30,978 | 71 | 8,937 | 0 | MISMATCH |
+| 15 | 140,064-150,063 | 30,447 | 0 | 2,580 | 0 | ✅ SUCCESS |
+| 16 | 150,064-160,063 | 32,990 | 1 | 4,377 | 1 | MISMATCH |
+| 17 | 160,064-170,063 | 29,909 | 0 | 6,209 | 0 | ✅ SUCCESS |
+| 18 | 170,064-180,063 | 28,463 | 0 | 8,012 | 0 | ✅ SUCCESS |
+| 19 | 180,064-190,063 | 29,407 | 0 | 1,434 | 0 | ✅ SUCCESS |
+| 20 | 190,064-200,063 | 33,288 | 0 | 3,365 | 0 | ✅ SUCCESS |
+| 21 | 200,064-210,063 | 41,894 | 320 | 5,147 | 2 | MISMATCH |
+| 22 | 210,064-220,063 | 29,097 | 0 | 7,018 | 0 | ✅ SUCCESS |
+| 23 | 220,064-230,063 | 37,917 | 0 | 8,822 | 0 | ✅ SUCCESS |
+| 24 | 230,064-240,063 | 41,887 | 1 | 0 | 1 | MISMATCH |
+| 25 | 240,064-250,063 | 31,873 | 0 | 0 | 0 | ✅ SUCCESS |
+| 26 | 250,064-260,063 | 26,506 | 0 | 6,023 | 0 | ✅ SUCCESS |
+| 27 | 260,064-270,063 | 25,034 | 5 | 7,916 | 0 | MISMATCH |
+| 28 | 270,064-280,063 | 29,185 | 1 | 9,633 | 0 | MISMATCH |
+| 29 | 280,064-290,063 | 26,458 | 0 | 3,198 | 0 | ✅ SUCCESS |
+| 30 | 290,064-300,063 | 29,733 | 0 | 4,975 | 0 | ✅ SUCCESS |
+| 31 | 300,064-310,063 | 25,497 | 0 | 1,399 | 0 | ✅ SUCCESS |
+| 32 | 310,064-320,063 | 23,127 | 1 | 8,737 | 0 | MISMATCH |
+| 33 | 320,064-330,063 | 43,997 | 5 | 2,217 | 2 | MISMATCH |
+| 34 | 330,064-340,063 | 38,555 | 1 | 4,166 | 1 | MISMATCH |
+| 35 | 340,064-350,063 | 33,025 | 2 | 5,925 | 1 | MISMATCH |
+| 36 | 350,064-360,063 | 43,232 | 0 | 0 | 0 | ✅ SUCCESS |
+| 37 | 360,064-370,063 | 42,337 | 0 | 9,402 | 0 | ✅ SUCCESS |
+| 38 | 370,064-380,063 | 40,213 | 1 | 6,192 | 0 | MISMATCH |
+| 39 | 380,064-390,063 | 35,459 | 0 | 4,988 | 0 | ✅ SUCCESS |
+| 40 | 390,064-400,063 | 46,945 | 5 | 6,689 | 1 | MISMATCH |
+| 41 | 400,064-410,063 | 40,207 | 1 | 22 | 1 | MISMATCH |
+| 42 | 410,064-420,063 | 36,050 | 3 | 2,246 | 1 | MISMATCH |
+| 43 | 420,064-430,063 | 31,744 | 6 | 4,011 | 0 | MISMATCH |
+| 44 | 430,064-440,063 | 37,452 | 0 | 109 | 0 | ✅ SUCCESS |
+| 45-56 | 440,064-556,157 | - | - | - | - | KILLED |
+
+### Performance Analysis
+
+Later segments show significant slowdown due to missing persistent WASM module cache:
+
+| Segment | Duration | TX/min | Notes |
+|---------|----------|--------|-------|
+| 20 | 604s | 3,306 | Normal speed |
+| 35 | 919s | 2,156 | Slight slowdown |
+| 39 | 6,965s | 305 | **10x slower** |
+| 44 | 7,932s | 283 | **10x slower** |
+
+See KNOWN_ISSUES.md #17 for details on the module cache fix.
 
 ## Remaining Issues
 
