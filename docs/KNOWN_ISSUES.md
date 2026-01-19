@@ -339,3 +339,260 @@ Fixed in `host.rs` (P24 and P25 implementations) and `protocol/p24.rs` to provid
 
 ### Verification
 After fix: 21,999 transactions in range 30000-40000 verified with 0 mismatches (100% parity).
+
+---
+
+## 10. ManageSellOffer OpNotSupported Bug (NEW)
+
+**Status:** Unresolved
+**Severity:** Medium - Affects specific ManageSellOffer operations
+**Component:** Offer Management
+**Discovered:** 2026-01-19
+
+### Description
+At ledger 237057, a ManageSellOffer operation returns `OpNotSupported` in our code but succeeds in C++ stellar-core with `offer: Deleted`.
+
+### Details
+```
+Ledger 237057 TX 0:
+  - Our result: OpNotSupported (transaction failed)
+  - CDP result: ManageSellOffer(Success { offers_claimed: [], offer: Deleted })
+```
+
+This segment has **0 header mismatches**, meaning the bucket list state is correct. This is a genuine execution bug, not caused by state divergence.
+
+### Root Cause
+Under investigation. The operation appears to be a deletion of an existing offer that our code incorrectly rejects as not supported.
+
+### Affected Ledgers
+- Ledger 237057 TX 0
+
+---
+
+## 11. InvokeHostFunction InsufficientRefundableFee Bug (NEW)
+
+**Status:** Unresolved
+**Severity:** Medium - Causes successful transactions to fail
+**Component:** Soroban Host / Fee Handling
+**Discovered:** 2026-01-19
+
+### Description
+At ledger 342737, an InvokeHostFunction transaction fails with `InsufficientRefundableFee` in our code but succeeds in C++ stellar-core.
+
+### Details
+```
+Ledger 342737 TX 3:
+  - Our result: InvokeHostFunction(InsufficientRefundableFee)
+  - CDP result: InvokeHostFunction(Success(Hash(...)))
+```
+
+### Root Cause
+Under investigation. Our code is rejecting a transaction with insufficient refundable fee when C++ stellar-core accepts it. This may indicate:
+1. Different fee calculation
+2. Different refundable fee validation threshold
+3. Different handling of fee refunds
+
+### Affected Ledgers
+- Ledger 342737 TX 3
+
+---
+
+## 12. InvokeHostFunction Trapped vs ResourceLimitExceeded (Under Investigation)
+
+**Status:** Under Investigation
+**Severity:** Low - Both fail, just different error codes
+**Component:** Soroban Host
+**Discovered:** 2026-01-19
+
+### Description
+Some InvokeHostFunction transactions fail with `Trapped` in our code but `ResourceLimitExceeded` in C++ stellar-core. Both are failures, but the error code differs.
+
+### Details
+```
+Ledger 152692 TX 2:
+  - Our result: InvokeHostFunction(Trapped)
+  - CDP result: InvokeHostFunction(ResourceLimitExceeded)
+
+Ledger 327722 TX 6:
+  - Our result: InvokeHostFunction(Trapped)
+  - CDP result: InvokeHostFunction(ResourceLimitExceeded)
+```
+
+### Root Cause
+The transactions fail in both implementations, but the error detection order differs. This could be:
+1. Host detecting trap condition before resource limit check
+2. Different order of validation checks
+3. Edge case in resource tracking
+
+This is related to the previously fixed Issue #4 but occurring in different ledgers. May require further investigation of host error prioritization.
+
+### Affected Ledgers
+- Ledger 152692 TX 2
+- Ledger 327722 TX 6
+
+---
+
+## 13. ManageSellOffer/ManageBuyOffer Orderbook State Divergence (Under Investigation)
+
+**Status:** Under Investigation - Likely Bucket List Induced
+**Severity:** Low - May be caused by bucket list divergence
+**Component:** Offer Management / Orderbook
+**Discovered:** 2026-01-19
+
+### Description
+Several ManageSellOffer and ManageBuyOffer transactions claim different offers than C++ stellar-core. Both succeed but with different `offers_claimed` results.
+
+### Details
+```
+Ledger 201477 TX 2:
+  - Our offers_claimed: [offer_id: 8071, 8072]
+  - CDP offers_claimed: [offer_id: 8072, 8065, 8003, 7975]
+
+Ledger 325512 TX 4:
+  - Our offers_claimed: [offer_id: 13058 amount: 318136]
+  - CDP offers_claimed: [offer_id: 13058 amount: 203789]
+
+Ledger 332809 TX 4:
+  - Our offers_claimed: [offer_id: 13470, 13472, 13474]
+  - CDP offers_claimed: [offer_id: 13480, 13482, 13484]
+```
+
+### Root Cause
+Likely caused by bucket list divergence. The segments containing these ledgers have significant header mismatches, indicating the orderbook state (offers) differs due to corrupted bucket list state.
+
+**Note**: These are likely NOT genuine execution bugs but rather symptoms of bucket list divergence (Issue #2). When the bucket list diverges, offer entries have different values, leading to different orderbook matching results.
+
+### Affected Ledgers
+- Ledger 201477, 201755 (segment 21 - has header mismatches)
+- Ledger 325512 (segment 33 - has header mismatches)
+- Ledger 332809 (segment 34 - has header mismatches)
+
+---
+
+## 14. InvokeHostFunction Refundable Fee Inconsistency (NEW - Bidirectional)
+
+**Status:** Unresolved
+**Severity:** High - Fee validation differs in both directions
+**Component:** Soroban Host / Fee Handling
+**Discovered:** 2026-01-19
+
+### Description
+InvokeHostFunction transactions show inconsistent refundable fee behavior compared to C++ stellar-core. In some cases we accept transactions that CDP rejects, and in other cases we reject transactions that CDP accepts.
+
+### Details
+**Case 1: We succeed, CDP fails (ledger 390407)**
+```
+Ledger 390407 TX 9:
+  - Our result: InvokeHostFunction(Success(...))
+  - CDP result: InvokeHostFunction(InsufficientRefundableFee)
+
+Ledger 390407 TX 10:
+  - Our result: InvokeHostFunction(Success(...))
+  - CDP result: InvokeHostFunction(InsufficientRefundableFee)
+```
+
+**Case 2: We fail, CDP succeeds (ledger 342737)**
+```
+Ledger 342737 TX 3:
+  - Our result: InvokeHostFunction(InsufficientRefundableFee)
+  - CDP result: InvokeHostFunction(Success(...))
+```
+
+### Root Cause
+Our refundable fee calculation differs from C++ stellar-core. This could be:
+1. Different calculation of required refundable fee
+2. Different timing of when the fee check is performed
+3. Different handling of fee refund logic
+
+This is a critical parity issue as it affects which transactions are accepted/rejected.
+
+### Affected Ledgers
+- Ledger 342737 TX 3 (we fail, should succeed)
+- Ledger 390407 TX 9, 10 (we succeed, should fail)
+
+---
+
+## 15. ManageSellOffer TooManySubentries Check Missing (NEW)
+
+**Status:** Unresolved
+**Severity:** Critical - We accept invalid transactions
+**Component:** Offer Management / Subentry Counting
+**Discovered:** 2026-01-19
+
+### Description
+At ledger 407293, a transaction with many ManageSellOffer operations succeeds in our code but fails in C++ stellar-core with `OpTooManySubentries` starting at operation 48.
+
+### Details
+```
+Ledger 407293 TX 1:
+  - Our result: TxSuccess (all 56 operations succeed)
+  - CDP result: TxFailed (ops 0-47 succeed, ops 48-55 fail with OpTooManySubentries)
+```
+
+The transaction attempts to create 56 new offers for the same account. C++ stellar-core correctly rejects operations 48+ because the account would exceed its subentry limit. Our code does not enforce this limit.
+
+### Root Cause
+Our ManageSellOffer implementation doesn't properly check or enforce the account subentry limit. In Stellar, each offer counts as a subentry, and accounts have a limit based on their number of signers and other factors.
+
+The formula for max subentries is typically:
+- Base reserve accounts for 2 base subentries
+- Additional subentries require additional reserve
+
+When an account reaches its subentry limit, new offer creation should fail with `OpTooManySubentries`.
+
+### Affected Ledgers
+- Ledger 407293 TX 1
+
+---
+
+## Summary: Genuine Execution Bugs vs Bucket-List Induced
+
+### Genuine Bugs (tx_only mismatches in segments with clean bucket list OR consistent behavior)
+
+| Issue | Ledger | Description |
+|-------|--------|-------------|
+| #10 | 237057 | ManageSellOffer OpNotSupported vs Success (0 header mismatches) |
+| #14 | 342737, 390407 | InvokeHostFunction refundable fee inconsistency |
+| #15 | 407293 | ManageSellOffer TooManySubentries not enforced |
+
+### Likely Bucket-List Induced (segments with header mismatches)
+
+| Issue | Ledgers | Description |
+|-------|---------|-------------|
+| #12 | 152692, 327722 | InvokeHostFunction Trapped vs ResourceLimitExceeded |
+| #13 | 201477, 201755, 325512, 332809 | Orderbook claims different offers |
+
+---
+
+## 16. SetTrustLineFlags CantRevoke vs Success (NEW)
+
+**Status:** Unresolved
+**Severity:** Medium - Legitimate operations rejected
+**Component:** TrustLine Flags
+**Discovered:** 2026-01-19
+
+### Description
+At ledger 416662, a SetTrustLineFlags operation returns `CantRevoke` in our code but succeeds in C++ stellar-core.
+
+### Details
+```
+Ledger 416662 TX 3:
+  - Our result: SetTrustLineFlags(CantRevoke)
+  - CDP result: SetTrustLineFlags(Success)
+```
+
+### Root Cause
+Our SetTrustLineFlags implementation may have incorrect logic for determining when a trustline's flags can be modified. The `CantRevoke` error is typically returned when trying to revoke authorization on a trustline where the issuer doesn't have the appropriate flags set.
+
+### Affected Ledgers
+- Ledger 416662 TX 3
+
+---
+
+### Priority Order for Fixes
+
+1. **Critical**: #15 (TooManySubentries) - We accept invalid transactions
+2. **High**: #14 (Refundable Fee) - Bidirectional fee validation mismatch
+3. **Medium**: #10 (OpNotSupported) - Legitimate operations rejected
+4. **Medium**: #16 (SetTrustLineFlags CantRevoke) - Legitimate operations rejected
+5. **Low**: #12, #13 - May resolve when bucket list is fixed
