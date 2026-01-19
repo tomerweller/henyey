@@ -144,7 +144,8 @@ impl ApplicatorCounters {
 #[derive(Debug, Clone)]
 pub enum EntryToApply {
     /// Upsert (insert or update) an entry.
-    Upsert(LedgerKey, LedgerEntry),
+    /// The LedgerEntry is boxed to reduce enum size (LedgerEntry is ~256 bytes).
+    Upsert(LedgerKey, Box<LedgerEntry>),
     /// Delete an entry.
     Delete(LedgerKey),
 }
@@ -334,7 +335,7 @@ impl BucketApplicator {
 
                         let entry_type = ledger_entry_type(&ledger_entry.data);
                         counters.record_upsert(entry_type);
-                        batch.push(EntryToApply::Upsert(key, ledger_entry.clone()));
+                        batch.push(EntryToApply::Upsert(key, Box::new(ledger_entry.clone())));
                     }
                 }
                 BucketEntry::Dead(key) => {
@@ -625,7 +626,7 @@ mod tests {
         let entry = make_account_entry(1);
         let key = make_account_key(1);
 
-        let upsert = EntryToApply::Upsert(key.clone(), entry.clone());
+        let upsert = EntryToApply::Upsert(key.clone(), Box::new(entry.clone()));
         assert!(!upsert.is_delete());
         assert!(upsert.entry().is_some());
         assert_eq!(upsert.key(), &key);

@@ -42,6 +42,22 @@ use super::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 
+/// Return type for `get_archived_with_restore_info` (p24 version).
+/// Contains: (entry, live_until, live_bl_restore_info)
+type ArchivedWithRestoreInfoP24 = Option<(
+    Rc<soroban_env_host24::xdr::LedgerEntry>,
+    Option<u32>,
+    Option<super::protocol::LiveBucketListRestore>,
+)>;
+
+/// Return type for `get_archived_with_restore_info` (p25 version).
+/// Contains: (entry, live_until, live_bl_restore_info)
+type ArchivedWithRestoreInfoP25 = Option<(
+    Rc<LedgerEntry>,
+    Option<u32>,
+    Option<super::protocol::LiveBucketListRestore>,
+)>;
+
 /// Result of Soroban host function execution.
 pub struct SorobanExecutionResult {
     /// The return value of the function.
@@ -283,14 +299,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
         &self,
         key: &Rc<soroban_env_host24::xdr::LedgerKey>,
         current_key: &LedgerKey,
-    ) -> Result<
-        Option<(
-            Rc<soroban_env_host24::xdr::LedgerEntry>,
-            Option<u32>,
-            Option<super::protocol::LiveBucketListRestore>,
-        )>,
-        HostErrorP24,
-    > {
+    ) -> Result<ArchivedWithRestoreInfoP24, HostErrorP24> {
         let result = self.get_archived(key)?;
 
         match result {
@@ -535,14 +544,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     pub fn get_archived_with_restore_info(
         &self,
         key: &Rc<LedgerKey>,
-    ) -> Result<
-        Option<(
-            Rc<LedgerEntry>,
-            Option<u32>,
-            Option<super::protocol::LiveBucketListRestore>,
-        )>,
-        HostErrorP25,
-    > {
+    ) -> Result<ArchivedWithRestoreInfoP25, HostErrorP25> {
         let result = self.get_archived(key)?;
 
         match result {
@@ -1063,6 +1065,7 @@ pub fn execute_host_function(
 /// * `soroban_data` - Soroban transaction data with footprint and resources
 /// * `soroban_config` - Network configuration with cost parameters
 /// * `module_cache` - Optional pre-populated module cache for WASM reuse
+#[allow(clippy::too_many_arguments)]
 pub fn execute_host_function_with_cache(
     host_function: &HostFunction,
     auth_entries: &[SorobanAuthorizationEntry],
@@ -1099,6 +1102,7 @@ pub fn execute_host_function_with_cache(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_host_function_p24(
     host_function: &HostFunction,
     auth_entries: &[SorobanAuthorizationEntry],
@@ -1556,6 +1560,7 @@ fn execute_host_function_p24(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_host_function_p25(
     host_function: &HostFunction,
     auth_entries: &[SorobanAuthorizationEntry],

@@ -17,6 +17,23 @@ use stellar_xdr::curr::{
 
 use super::super::error::DbError;
 
+/// Database row type for account queries.
+/// Fields: (balance, seqnum, numsubentries, inflationdest, homedomain,
+///          thresholds, flags, buyingliabilities, sellingliabilities, signers, extension)
+type AccountRow = (
+    i64,             // balance
+    i64,             // seqnum
+    i32,             // numsubentries
+    Option<String>,  // inflationdest
+    Option<String>,  // homedomain
+    String,          // thresholds
+    i32,             // flags
+    i64,             // buyingliabilities
+    i64,             // sellingliabilities
+    Option<String>,  // signers
+    Option<Vec<u8>>, // extension
+);
+
 /// Query trait for account operations.
 ///
 /// Provides methods for CRUD operations on the `accounts` table.
@@ -104,19 +121,7 @@ impl AccountQueries for Connection {
     fn load_account(&self, id: &AccountId) -> Result<Option<AccountEntry>, DbError> {
         let account_id_str = account_id_to_string(id);
 
-        let result: Option<(
-            i64,             // balance
-            i64,             // seqnum
-            i32,             // numsubentries
-            Option<String>,  // inflationdest
-            Option<String>,  // homedomain
-            String,          // thresholds
-            i32,             // flags
-            i64,             // buyingliabilities
-            i64,             // sellingliabilities
-            Option<String>,  // signers
-            Option<Vec<u8>>, // extension
-        )> = self
+        let result: Option<AccountRow> = self
             .query_row(
                 r#"
                 SELECT balance, seqnum, numsubentries, inflationdest, homedomain,

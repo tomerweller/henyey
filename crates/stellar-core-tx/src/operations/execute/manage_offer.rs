@@ -51,6 +51,7 @@ pub fn execute_manage_sell_offer(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_manage_offer(
     source: &AccountId,
     selling: &Asset,
@@ -867,6 +868,7 @@ enum OfferFilterResult {
     StopCrossSelf,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_with_offers(
     source: &AccountId,
     selling: &Asset,

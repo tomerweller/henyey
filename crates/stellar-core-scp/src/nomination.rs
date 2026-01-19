@@ -287,6 +287,7 @@ impl NominationProtocol {
     ///
     /// # Returns
     /// True if nomination was updated.
+    #[allow(clippy::too_many_arguments)]
     pub fn nominate<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,

@@ -1516,14 +1516,14 @@ impl<'a> LedgerCloseContext<'a> {
                 .changes()
                 .map(|change| match change {
                     EntryChange::Created(entry) => LedgerEntryChange::Created {
-                        current: entry.clone(),
+                        current: Box::new(entry.clone()),
                     },
                     EntryChange::Updated { previous, current } => LedgerEntryChange::Updated {
-                        previous: previous.clone(),
-                        current: current.clone(),
+                        previous: Box::new(previous.clone()),
+                        current: Box::new(current.clone()),
                     },
                     EntryChange::Deleted { previous } => LedgerEntryChange::Deleted {
-                        previous: previous.clone(),
+                        previous: Box::new(previous.clone()),
                     },
                 })
                 .collect::<Vec<_>>();

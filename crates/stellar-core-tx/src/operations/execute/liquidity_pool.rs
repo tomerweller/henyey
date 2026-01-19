@@ -487,6 +487,7 @@ fn deposit_into_empty_pool(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deposit_into_non_empty_pool(
     max_amount_a: i64,
     max_amount_b: i64,

@@ -506,6 +506,7 @@ enum ConvertResult {
     FilterStopCrossSelf,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_with_offers_and_pools(
     source: &AccountId,
     send_asset: &Asset,
@@ -626,6 +627,7 @@ fn convert_with_offers_and_pools(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_with_offers(
     source: &AccountId,
     send_asset: &Asset,
@@ -1113,6 +1115,7 @@ fn pool_id_for_assets(send_asset: &Asset, recv_asset: &Asset) -> Result<PoolId> 
     Ok(PoolId(Hash(hasher.finalize().into())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exchange_with_pool(
     reserves_to_pool: i64,
     max_send_to_pool: i64,

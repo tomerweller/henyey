@@ -3483,18 +3483,18 @@ impl OperationInvariantRunner {
                     self.entries.insert(key_bytes, entry.clone());
                     match previous {
                         Some(prev) => invariant_changes.push(InvariantLedgerEntryChange::Updated {
-                            previous: prev,
-                            current: entry.clone(),
+                            previous: Box::new(prev),
+                            current: Box::new(entry.clone()),
                         }),
                         None => invariant_changes.push(InvariantLedgerEntryChange::Created {
-                            current: entry.clone(),
+                            current: Box::new(entry.clone()),
                         }),
                     }
                 }
                 LedgerEntryChange::Removed(key) => {
                     let key_bytes = key.to_xdr(Limits::none())?;
                     if let Some(previous) = self.entries.remove(&key_bytes) {
-                        invariant_changes.push(InvariantLedgerEntryChange::Deleted { previous });
+                        invariant_changes.push(InvariantLedgerEntryChange::Deleted { previous: Box::new(previous) });
                     }
                 }
             }

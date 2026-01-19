@@ -326,6 +326,7 @@ pub fn execute_operation(
 ///   produce incorrect results.
 /// * `module_cache` - Optional persistent module cache for reusing compiled WASM
 ///   across transactions. Significantly improves performance for contracts.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_operation_with_soroban(
     op: &Operation,
     source_account_id: &AccountId,

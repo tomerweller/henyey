@@ -2198,12 +2198,13 @@ fn test_classic_events_emitted_for_clawback() {
     let (issuer_key, issuer_entry) =
         create_account_entry_with_flags(issuer_id.clone(), 1, 50_000_000, 0x8);
     let (trustor_key, trustor_entry) = create_account_entry(trustor_id.clone(), 1, 20_000_000);
+    // Flags: AUTHORIZED_FLAG (0x1) | TRUSTLINE_CLAWBACK_ENABLED_FLAG (0x4) = 0x5
     let (trustline_key, trustline_entry) = create_trustline_entry(
         trustor_id.clone(),
         trustline_asset,
         50_000_000,
         100_000_000,
-        0,
+        0x5,
     );
 
     let snapshot = SnapshotBuilder::new(1)

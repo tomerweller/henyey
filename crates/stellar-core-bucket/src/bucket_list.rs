@@ -200,6 +200,7 @@ impl BucketLevel {
     ///   backward compatibility with tests.
     /// - `use_empty_curr`: If true, use an empty bucket instead of self.curr for the merge.
     ///   This is used when the level is about to snap its curr (shouldMergeWithEmptyCurr).
+    #[allow(clippy::too_many_arguments)]
     fn prepare_with_normalization(
         &mut self,
         _ledger_seq: u32,
@@ -1300,6 +1301,7 @@ impl BucketList {
     /// Scan a region of a bucket for evictable entries.
     ///
     /// Returns (entries_scanned, bytes_used, finished_bucket).
+    #[allow(clippy::too_many_arguments)]
     fn scan_bucket_region(
         &self,
         bucket: &Bucket,

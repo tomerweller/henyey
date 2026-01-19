@@ -115,21 +115,24 @@ pub enum InvariantError {
 #[derive(Debug, Clone)]
 pub enum LedgerEntryChange {
     /// A new ledger entry was created.
+    /// The entry is boxed to reduce enum size (LedgerEntry is ~256 bytes).
     Created {
         /// The newly created entry.
-        current: LedgerEntry,
+        current: Box<LedgerEntry>,
     },
     /// An existing ledger entry was updated.
+    /// Entries are boxed to reduce enum size.
     Updated {
         /// The entry state before the update.
-        previous: LedgerEntry,
+        previous: Box<LedgerEntry>,
         /// The entry state after the update.
-        current: LedgerEntry,
+        current: Box<LedgerEntry>,
     },
     /// A ledger entry was deleted.
+    /// The entry is boxed to reduce enum size.
     Deleted {
         /// The entry that was deleted.
-        previous: LedgerEntry,
+        previous: Box<LedgerEntry>,
     },
 }
 
@@ -3633,7 +3636,7 @@ mod tests {
     fn make_changes(entries: Vec<LedgerEntry>) -> Vec<LedgerEntryChange> {
         entries
             .into_iter()
-            .map(|entry| LedgerEntryChange::Created { current: entry })
+            .map(|entry| LedgerEntryChange::Created { current: Box::new(entry) })
             .collect()
     }
 
@@ -3747,7 +3750,7 @@ mod tests {
             account.balance += 10;
         }
 
-        let changes = vec![LedgerEntryChange::Updated { previous, current }];
+        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
 
         let contract_id = get_asset_contract_id(&network_id.0, &Asset::Native).unwrap();
         let topics: VecM<ScVal> = vec![
@@ -4175,8 +4178,8 @@ mod tests {
             TrustLineEntryExt::V0,
         );
         let changes = vec![LedgerEntryChange::Updated {
-            previous: prev_entry,
-            current: curr_entry,
+            previous: Box::new(prev_entry),
+            current: Box::new(curr_entry),
         }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4210,7 +4213,7 @@ mod tests {
         let curr = make_header(2, Hash256::ZERO);
         let previous = make_ttl_entry(Hash([1u8; 32]), 10);
         let current = make_ttl_entry(Hash([2u8; 32]), 10);
-        let changes = vec![LedgerEntryChange::Updated { previous, current }];
+        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4223,7 +4226,7 @@ mod tests {
         let curr = make_header(2, Hash256::ZERO);
         let previous = make_ttl_entry(Hash([1u8; 32]), 10);
         let current = make_ttl_entry(Hash([1u8; 32]), 9);
-        let changes = vec![LedgerEntryChange::Updated { previous, current }];
+        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4483,7 +4486,7 @@ mod tests {
         let hash_curr = Hash(*Hash256::hash(&code_curr).as_bytes());
         let previous = make_contract_code_entry(code_prev, hash_prev);
         let current = make_contract_code_entry(code_curr, hash_curr);
-        let changes = vec![LedgerEntryChange::Updated { previous, current }];
+        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4746,7 +4749,7 @@ mod tests {
             ClaimableBalanceEntryExt::V0,
             entry_ext,
         );
-        let changes = vec![LedgerEntryChange::Updated { previous, current }];
+        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4769,14 +4772,14 @@ mod tests {
 
         let changes = vec![
             LedgerEntryChange::Updated {
-                previous: prev_sponsor,
-                current: curr_sponsor,
+                previous: Box::new(prev_sponsor),
+                current: Box::new(curr_sponsor),
             },
             LedgerEntryChange::Updated {
-                previous: prev_sponsored,
-                current: curr_sponsored,
+                previous: Box::new(prev_sponsored),
+                current: Box::new(curr_sponsored),
             },
-            LedgerEntryChange::Created { current: trustline },
+            LedgerEntryChange::Created { current: Box::new(trustline) },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4800,14 +4803,14 @@ mod tests {
 
         let changes = vec![
             LedgerEntryChange::Updated {
-                previous: prev_sponsor,
-                current: curr_sponsor,
+                previous: Box::new(prev_sponsor),
+                current: Box::new(curr_sponsor),
             },
             LedgerEntryChange::Updated {
-                previous: prev_sponsored,
-                current: curr_sponsored,
+                previous: Box::new(prev_sponsored),
+                current: Box::new(curr_sponsored),
             },
-            LedgerEntryChange::Created { current: trustline },
+            LedgerEntryChange::Created { current: Box::new(trustline) },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4827,10 +4830,10 @@ mod tests {
 
         let changes = vec![
             LedgerEntryChange::Updated {
-                previous: prev_account,
-                current: curr_account,
+                previous: Box::new(prev_account),
+                current: Box::new(curr_account),
             },
-            LedgerEntryChange::Created { current: trustline },
+            LedgerEntryChange::Created { current: Box::new(trustline) },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4850,10 +4853,10 @@ mod tests {
 
         let changes = vec![
             LedgerEntryChange::Updated {
-                previous: prev_account,
-                current: curr_account,
+                previous: Box::new(prev_account),
+                current: Box::new(curr_account),
             },
-            LedgerEntryChange::Created { current: trustline },
+            LedgerEntryChange::Created { current: Box::new(trustline) },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4896,8 +4899,8 @@ mod tests {
             LedgerEntryExt::V0,
         );
         let changes = vec![LedgerEntryChange::Updated {
-            previous: prev_entry,
-            current: curr_entry,
+            previous: Box::new(prev_entry),
+            current: Box::new(curr_entry),
         }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4940,8 +4943,8 @@ mod tests {
             LedgerEntryExt::V0,
         );
         let changes = vec![LedgerEntryChange::Updated {
-            previous: prev_entry,
-            current: curr_entry,
+            previous: Box::new(prev_entry),
+            current: Box::new(curr_entry),
         }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4984,8 +4987,8 @@ mod tests {
             LedgerEntryExt::V0,
         );
         let changes = vec![LedgerEntryChange::Updated {
-            previous: prev_entry,
-            current: curr_entry,
+            previous: Box::new(prev_entry),
+            current: Box::new(curr_entry),
         }];
         let ctx = make_ctx(&prev, &curr, &changes);
 

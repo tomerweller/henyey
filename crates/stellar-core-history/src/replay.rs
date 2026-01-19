@@ -425,16 +425,16 @@ pub fn replay_ledger_with_execution(
         .changes()
         .map(|change| match change {
             stellar_core_ledger::EntryChange::Created(entry) => LedgerEntryChange::Created {
-                current: entry.clone(),
+                current: Box::new(entry.clone()),
             },
             stellar_core_ledger::EntryChange::Updated { previous, current } => {
                 LedgerEntryChange::Updated {
-                    previous: previous.clone(),
-                    current: current.clone(),
+                    previous: Box::new(previous.clone()),
+                    current: Box::new(current.clone()),
                 }
             }
             stellar_core_ledger::EntryChange::Deleted { previous } => LedgerEntryChange::Deleted {
-                previous: previous.clone(),
+                previous: Box::new(previous.clone()),
             },
         })
         .collect::<Vec<_>>();

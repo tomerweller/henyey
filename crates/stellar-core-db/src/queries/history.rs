@@ -16,6 +16,10 @@ use stellar_xdr::curr::{
 
 use super::super::error::DbError;
 
+/// Database row type for transaction history queries.
+/// Fields: (ledgerseq, txindex, txbody, txresult, txmeta)
+type TxHistoryRow = (u32, u32, Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
 /// A stored transaction record.
 ///
 /// Contains all the data needed to reconstruct a transaction's execution,
@@ -120,7 +124,7 @@ impl HistoryQueries for Connection {
     }
 
     fn load_transaction(&self, tx_id: &str) -> Result<Option<TxRecord>, DbError> {
-        let result: Option<(u32, u32, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = self
+        let result: Option<TxHistoryRow> = self
             .query_row(
                 r#"
                 SELECT ledgerseq, txindex, txbody, txresult, txmeta

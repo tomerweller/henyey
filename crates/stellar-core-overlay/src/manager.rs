@@ -901,6 +901,7 @@ impl OverlayManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn connect_outbound_inner(
         addr: &PeerAddress,
         local_node: LocalNode,
