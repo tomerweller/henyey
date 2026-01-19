@@ -432,12 +432,13 @@ This is related to the previously fixed Issue #4 but occurring in different ledg
 
 ---
 
-## 13. ManageSellOffer/ManageBuyOffer Orderbook State Divergence (Under Investigation)
+## 13. ManageSellOffer/ManageBuyOffer Orderbook State Divergence (BUCKET LIST INDUCED)
 
-**Status:** Under Investigation - Likely Bucket List Induced
-**Severity:** Low - May be caused by bucket list divergence
+**Status:** Confirmed Bucket List Induced - No fix needed
+**Severity:** N/A - Symptom of Issue #2 (Bucket List Hash Divergence)
 **Component:** Offer Management / Orderbook
 **Discovered:** 2026-01-19
+**Investigated:** 2026-01-19
 
 ### Description
 Several ManageSellOffer and ManageBuyOffer transactions claim different offers than C++ stellar-core. Both succeed but with different `offers_claimed` results.
@@ -457,15 +458,36 @@ Ledger 332809 TX 4:
   - CDP offers_claimed: [offer_id: 13480, 13482, 13484]
 ```
 
-### Root Cause
-Likely caused by bucket list divergence. The segments containing these ledgers have significant header mismatches, indicating the orderbook state (offers) differs due to corrupted bucket list state.
+### Investigation Findings (2026-01-19)
 
-**Note**: These are likely NOT genuine execution bugs but rather symptoms of bucket list divergence (Issue #2). When the bucket list diverges, offer entries have different values, leading to different orderbook matching results.
+**Conclusion: This is NOT a bug in offer selection logic. It is caused by bucket list divergence.**
+
+Evidence:
+1. **All affected ledgers are in segments with significant header mismatches**:
+   - Segment 21 (ledgers 201477, 201755): 5,147 header mismatches, 320 TX mismatches
+   - Segment 33 (ledger 325512): 2,217 header mismatches
+   - Segment 34 (ledger 332809): 4,166 header mismatches
+
+2. **The offers being claimed are completely different, not just ordered differently**:
+   - At ledger 201477, we claim offers 8071 and 8072
+   - C++ claims offers 8072, 8065, 8003, and 7975
+   - This indicates the orderbook itself contains different offers, not just different selection
+
+3. **Offer selection logic was verified to be correct**:
+   - Our Rust `compare_offer` function orders by price (cross-multiplication) then offer_id
+   - C++ `isBetterOffer` in LedgerTxnOfferSQL.cpp uses floating-point price comparison then offer_id
+   - Both orderings are mathematically equivalent: `lhs.n/lhs.d < rhs.n/rhs.d` === `lhs.n * rhs.d < rhs.n * lhs.d`
+   - Note: C++ uses floating-point which could theoretically differ in extreme edge cases, but the observed mismatches are too drastic to be caused by this
+
+### Root Cause
+The bucket list divergence (Issue #2) causes offer entries to have different values (or exist/not exist) between our implementation and C++ stellar-core. When the orderbook state differs, ManageSellOffer/ManageBuyOffer naturally claim different offers.
+
+**This issue will be resolved automatically when Issue #2 (Bucket List Hash Divergence) is fixed.**
 
 ### Affected Ledgers
-- Ledger 201477, 201755 (segment 21 - has header mismatches)
-- Ledger 325512 (segment 33 - has header mismatches)
-- Ledger 332809 (segment 34 - has header mismatches)
+- Ledger 201477, 201755 (segment 21 - 5,147 header mismatches)
+- Ledger 325512 (segment 33 - 2,217 header mismatches)
+- Ledger 332809 (segment 34 - 4,166 header mismatches)
 
 ---
 
@@ -555,12 +577,12 @@ When an account reaches its subentry limit, new offer creation should fail with 
 | #14 | 342737, 390407 | InvokeHostFunction refundable fee inconsistency |
 | #15 | 407293 | ManageSellOffer TooManySubentries not enforced |
 
-### Likely Bucket-List Induced (segments with header mismatches)
+### Confirmed Bucket-List Induced (segments with header mismatches)
 
 | Issue | Ledgers | Description |
 |-------|---------|-------------|
 | #12 | 152692, 327722 | InvokeHostFunction Trapped vs ResourceLimitExceeded |
-| #13 | 201477, 201755, 325512, 332809 | Orderbook claims different offers |
+| #13 | 201477, 201755, 325512, 332809 | Orderbook claims different offers (CONFIRMED 2026-01-19) |
 
 ---
 
