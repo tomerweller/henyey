@@ -934,8 +934,42 @@ impl PersistentModuleCache {
 ### Priority Order for Fixes
 
 1. **Low**: #11, #12, #13 - Will resolve when bucket list (Issue #2) is fixed
-2. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
-3. **Resolved**: #17 (Module Cache) - Fixed 2026-01-19, cache implementation complete
-4. **Resolved**: #15 (TooManySubentries) - Fixed 2026-01-19
-5. **Resolved**: #10 (ManageSellOffer OpNotSupported) - Fixed 2026-01-19
-6. **Resolved**: #16 (SetTrustLineFlags CantRevoke) - Fixed 2026-01-19
+2. **Low**: #18 (Online Module Cache) - Performance optimization for online mode
+3. **Partially Fixed**: #14 (Refundable Fee) - Code fix applied, bucket list still affects results
+4. **Resolved**: #17 (Module Cache) - Fixed 2026-01-19, cache implementation complete
+5. **Resolved**: #15 (TooManySubentries) - Fixed 2026-01-19
+6. **Resolved**: #10 (ManageSellOffer OpNotSupported) - Fixed 2026-01-19
+7. **Resolved**: #16 (SetTrustLineFlags CantRevoke) - Fixed 2026-01-19
+
+---
+
+## 18. Module Cache Not Wired for Online Ledger Closing (Performance)
+
+**Status:** Open
+**Severity:** Low - Only affects online mode performance, not correctness
+**Component:** Ledger Manager / Soroban Execution
+**Discovered:** 2026-01-19
+
+### Description
+The `PersistentModuleCache` implementation (Issue #17) is fully wired for verification/replay mode but not yet integrated into the `LedgerManager` for online ledger closing. Online mode will still work correctly but won't benefit from the WASM compilation caching.
+
+### Current State
+- `execute_transaction_set()` accepts `Option<&PersistentModuleCache>` parameter
+- `LedgerCloseContext::apply_transactions()` passes `None` for the cache
+- A TODO comment marks the integration point in `manager.rs:1096-1099`
+
+### Required Changes
+1. Add `module_cache: Option<PersistentModuleCache>` field to `LedgerManager`
+2. Initialize cache from bucket list CONTRACT_CODE entries in `initialize_from_buckets()`
+3. Pass cache reference to `execute_transaction_set()` in `apply_transactions()`
+4. Add `addAnyContractsToModuleCache()` equivalent after ledger close for new contracts
+5. (Optional) Add eviction support for long-running processes
+
+### Files to Modify
+| File | Change |
+|------|--------|
+| `stellar-core-ledger/src/manager.rs` | Add cache field, initialize, and pass to execution |
+
+### Impact
+- **Without fix**: Online Soroban execution recompiles WASM per transaction
+- **With fix**: ~10x speedup for Soroban-heavy ledgers in online mode
