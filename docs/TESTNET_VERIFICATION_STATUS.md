@@ -27,6 +27,8 @@ cargo build --release -p rs-stellar-core
 
 **Last verification run**: 2026-01-20
 
+**Latest verification**: `./target/release/rs-stellar-core --testnet offline verify-execution --from 152690 --to 152694 --show-diff` (0 mismatches)
+
 ### Executive Summary
 
 | Metric | Value |
@@ -44,7 +46,7 @@ cargo build --release -p rs-stellar-core
 | Ledger Range | Header Mismatches | TX Mismatches | Notes |
 |--------------|-------------------|---------------|-------|
 | 100,000-100,200 | **0** | **0** | ✅ Clean range |
-| 152,600-152,800 | **0** | 1 | Issue #3: Historical cost model variance |
+| 152,600-152,800 | **0** | **0** | ✅ Issue #3 mismatch resolved (disk read metering) |
 | 180,000-180,200 | **0** | **0** | ✅ Clean range |
 | 201,400-201,800 | **0** | **0** | ✅ Issue #5 FIXED |
 | 236,900-237,100 | **0** | **0** | ✅ Issue #10 FIXED |
@@ -97,7 +99,6 @@ When running verification **continuously** from ledger 64 (not starting from a c
 
 | Issue | Ledger | Description | Status |
 |-------|--------|-------------|--------|
-| #3 | 152692 | Trapped vs ResourceLimitExceeded | Cannot fix - historical cost model |
 | #6 | 390407 | Refundable fee bidirectional | Partially fixed - 2 remaining may be CDP anomaly |
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
@@ -122,6 +123,8 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
 | 2026-01-20 | 201,400-201,800 | 100% match | Issue #5 confirmed FIXED |
 | 2026-01-20 | 342,600-342,800 | 100% match | Issue #4 confirmed FIXED |
 | 2026-01-20 | Multi-checkpoint | 0 header per checkpoint | 100,000-416,700 all pass |
+| 2026-01-20 | 152,600-152,800 | 0 mismatches | Issue #3 mismatch resolved (disk read metering) |
+| 2026-01-20 | 152,690-152,694 | 0 mismatches | Targeted verify-execution sanity check |
 | 2026-01-19 | 236,900-237,100 | 100% match | Issue #10 confirmed FIXED |
 | 2026-01-19 | 407,200-407,400 | 100% match | Issue #15 confirmed FIXED |
 | 2026-01-19 | 416,600-416,700 | 100% match | Issue #16 confirmed FIXED |
@@ -136,7 +139,7 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
 When investigating a specific issue, run verification around that ledger:
 
 ```bash
-# Verify around ledger 152692 (Issue #3)
+# Verify around ledger 152692 (Issue #3 fix)
 ./target/release/rs-stellar-core --testnet offline verify-execution --from 152600 --to 152800
 
 # Show detailed diff

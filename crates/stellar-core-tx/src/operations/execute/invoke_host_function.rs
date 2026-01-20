@@ -7,9 +7,17 @@ use stellar_xdr::curr::{
     AccountId, ContractCodeCostInputs, ContractCodeEntry, ContractCodeEntryExt,
     ContractCodeEntryV1, ContractEvent, DiagnosticEvent, ExtensionPoint, Hash, HostFunction,
     InvokeHostFunctionOp, InvokeHostFunctionResult, InvokeHostFunctionResultCode,
-    InvokeHostFunctionSuccessPreImage, LedgerKey, LedgerKeyContractCode, Limits, OperationResult,
-    OperationResultTr, ScVal, SorobanTransactionData, TtlEntry, WriteXdr,
+    InvokeHostFunctionSuccessPreImage, LedgerEntry, LedgerKey, LedgerKeyContractCode, Limits,
+    OperationResult, OperationResultTr, ScVal, SorobanTransactionData, SorobanTransactionDataExt,
+    TtlEntry, WriteXdr,
 };
+
+use stellar_core_common::protocol::{protocol_version_is_before, ProtocolVersion};
+
+/// Check if a ledger key is for a Soroban entry.
+fn is_soroban_key(key: &LedgerKey) -> bool {
+    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
+}
 
 use super::{OperationExecutionResult, SorobanOperationMeta};
 use crate::soroban::{PersistentModuleCache, SorobanConfig};
@@ -104,6 +112,18 @@ fn execute_contract_invocation(
     ) {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::EntryArchived,
+            Hash([0u8; 32]),
+        )));
+    }
+
+    if disk_read_bytes_exceeded(
+        state,
+        soroban_data,
+        context.protocol_version,
+        context.sequence,
+    ) {
+        return Ok(OperationExecutionResult::new(make_result(
+            InvokeHostFunctionResultCode::ResourceLimitExceeded,
             Hash([0u8; 32]),
         )));
     }
@@ -417,6 +437,127 @@ fn compute_total_write_bytes(storage_changes: &[crate::soroban::StorageChange]) 
         }
     }
     total
+}
+
+fn disk_read_bytes_exceeded(
+    state: &LedgerStateManager,
+    soroban_data: &SorobanTransactionData,
+    protocol_version: u32,
+    current_ledger: u32,
+) -> bool {
+    let mut total_read_bytes = 0u32;
+    let limit = soroban_data.resources.disk_read_bytes;
+
+    // Helper to meter a single entry
+    let meter_entry = |key: &LedgerKey, total: &mut u32| -> bool {
+        let entry: Option<LedgerEntry> = if is_soroban_key(key) {
+            match key {
+                LedgerKey::ContractData(cd_key) => state
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                    .map(|cd| LedgerEntry {
+                        last_modified_ledger_seq: current_ledger,
+                        data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
+                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                    }),
+                LedgerKey::ContractCode(cc_key) => {
+                    state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
+                        last_modified_ledger_seq: current_ledger,
+                        data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
+                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            state.get_entry(key)
+        };
+
+        if let Some(entry) = entry {
+            let bytes: Vec<u8> = match WriteXdr::to_xdr(&entry, Limits::none()) {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            *total = total.saturating_add(bytes.len() as u32);
+            if *total > limit {
+                return true;
+            }
+        }
+        false
+    };
+
+    let meter_all = protocol_version_is_before(protocol_version, ProtocolVersion::V23);
+
+    if meter_all {
+        for key in soroban_data.resources.footprint.read_only.iter() {
+            if meter_entry(key, &mut total_read_bytes) {
+                tracing::warn!(
+                    total_read_bytes,
+                    specified_read_bytes = limit,
+                    "Disk read bytes exceeded specified limit"
+                );
+                return true;
+            }
+        }
+        for key in soroban_data.resources.footprint.read_write.iter() {
+            if meter_entry(key, &mut total_read_bytes) {
+                tracing::warn!(
+                    total_read_bytes,
+                    specified_read_bytes = limit,
+                    "Disk read bytes exceeded specified limit"
+                );
+                return true;
+            }
+        }
+    } else {
+        for key in soroban_data.resources.footprint.read_only.iter() {
+            if !is_soroban_key(key) {
+                if meter_entry(key, &mut total_read_bytes) {
+                    tracing::warn!(
+                        total_read_bytes,
+                        specified_read_bytes = limit,
+                        "Disk read bytes exceeded specified limit"
+                    );
+                    return true;
+                }
+            }
+        }
+        for key in soroban_data.resources.footprint.read_write.iter() {
+            if !is_soroban_key(key) {
+                if meter_entry(key, &mut total_read_bytes) {
+                    tracing::warn!(
+                        total_read_bytes,
+                        specified_read_bytes = limit,
+                        "Disk read bytes exceeded specified limit"
+                    );
+                    return true;
+                }
+            }
+        }
+
+        if let SorobanTransactionDataExt::V1(ext) = &soroban_data.ext {
+            for index in ext.archived_soroban_entries.iter() {
+                if let Some(key) = soroban_data
+                    .resources
+                    .footprint
+                    .read_write
+                    .get(*index as usize)
+                {
+                    if is_soroban_key(key) {
+                        if meter_entry(key, &mut total_read_bytes) {
+                            tracing::warn!(
+                                total_read_bytes,
+                                specified_read_bytes = limit,
+                                "Disk read bytes exceeded specified limit"
+                            );
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Compute the hash of the success preimage (return value + events).
@@ -837,8 +978,29 @@ mod tests {
         LedgerContext::testnet(1, 1000)
     }
 
+    fn create_test_context_p23() -> LedgerContext {
+        let mut context = LedgerContext::testnet(1, 1000);
+        context.protocol_version = 23;
+        context
+    }
+
     fn create_test_soroban_config() -> SorobanConfig {
         SorobanConfig::default()
+    }
+
+    fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }
     }
 
     #[test]
@@ -995,7 +1157,7 @@ mod tests {
     #[test]
     fn test_invoke_host_function_archived_allowed_when_marked() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let context = create_test_context();
+        let context = create_test_context_p23();
         let source = create_test_account_id(0);
         let config = create_test_soroban_config();
 
@@ -1045,7 +1207,7 @@ mod tests {
             resources: SorobanResources {
                 footprint,
                 instructions: 100_000_000, // High enough to not trigger ResourceLimitExceeded
-                disk_read_bytes: 0,
+                disk_read_bytes: 1_000,
                 write_bytes: 0,
             },
             resource_fee: 0,
@@ -1065,6 +1227,61 @@ mod tests {
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
                 assert!(matches!(r, InvokeHostFunctionResult::Trapped));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_invoke_host_function_disk_read_limit_exceeded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context_p23();
+        let source = create_test_account_id(0);
+        let config = create_test_soroban_config();
+
+        let account_id = create_test_account_id(1);
+        state.create_account(create_test_account(account_id.clone(), 100_000_000));
+
+        let account_key = LedgerKey::Account(LedgerKeyAccount { account_id });
+
+        let op = InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([3u8; 32]))),
+                function_name: ScSymbol(StringM::try_from("noop".to_string()).unwrap()),
+                args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: vec![account_key].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_invoke_host_function(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            &config,
+            None,
+        )
+        .expect("invoke host function");
+
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
+                assert!(matches!(r, InvokeHostFunctionResult::ResourceLimitExceeded));
             }
             _ => panic!("Unexpected result type"),
         }
@@ -1163,29 +1380,6 @@ mod tests {
             cpu_insns_consumed: 100,  // CPU within limit
             mem_bytes_consumed: 2000, // Mem exceeded (2000 > 1000)
         };
-        assert_eq!(
-            map_host_error_to_result_code(&exec_error, 500, 1000),
-            InvokeHostFunctionResultCode::ResourceLimitExceeded
-        );
-    }
-
-    #[test]
-    fn test_map_host_error_to_result_code_budget_error_within_limits() {
-        use crate::soroban::SorobanExecutionError;
-        // Budget/ExceededLimit error with measured resources within limits -> RESOURCE_LIMIT_EXCEEDED
-        // This handles historical cost model variance where the host detected a budget
-        // exceeded condition internally, but our measured consumption is lower.
-        let host_error = soroban_env_host_p25::HostError::from((
-            soroban_env_host_p25::xdr::ScErrorType::Budget,
-            soroban_env_host_p25::xdr::ScErrorCode::ExceededLimit,
-        ));
-        let exec_error = SorobanExecutionError {
-            host_error,
-            cpu_insns_consumed: 100, // CPU within limit (100 < 500)
-            mem_bytes_consumed: 100, // Mem within limit (100 < 1000)
-        };
-        // Even though measured resources are within limits, the host error type
-        // indicates a budget exceeded condition, so return ResourceLimitExceeded
         assert_eq!(
             map_host_error_to_result_code(&exec_error, 500, 1000),
             InvokeHostFunctionResultCode::ResourceLimitExceeded

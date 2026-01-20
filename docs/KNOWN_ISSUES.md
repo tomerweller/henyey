@@ -120,9 +120,9 @@ The bucket list divergence at ledger 40971 is caused by **accumulated state diff
 
 ## 3. InvokeHostFunction Trapped vs ResourceLimitExceeded
 
-**Status:** Historical Cost Model Variance - Cannot Fix
-**Severity:** Low - Affects only historical testnet transactions
-**Component:** Soroban Host / Cost Model
+**Status:** Partially Fixed - Historical Cost Model Variance persists
+**Severity:** Low - Affects historical testnet transactions
+**Component:** Soroban Host / Cost Model + Footprint metering
 **Last Verified:** 2026-01-20
 
 ### Description
@@ -133,41 +133,31 @@ Some InvokeHostFunction transactions return different results than the original 
 
 This is also the root cause of Issue #2 (Bucket List Continuous Replay Divergence) - approximately **16,000 Soroban TX mismatches** over the first ~40,970 ledgers cause accumulated state differences.
 
+We resolved the specific 152692 mismatch by adding disk-read byte metering before host invocation, but the broader historical cost-model variance remains.
+
 ### Details
 ```
 Ledger 152692 TX 2:
   - Our result: InvokeHostFunction(Trapped)
   - CDP result: InvokeHostFunction(ResourceLimitExceeded)
-  - Host error: Error(Auth, InvalidAction)
-  - CPU consumed: 835,973 (measured by us)
+  - Host error: Error(Storage, ExceededLimit)
+  - CPU consumed: 824,450 (measured by us)
   - CPU specified: 933,592 (transaction limit)
 ```
 
 ### Root Cause Analysis
-This is a **historical cost model variance** issue, not a bug in our error mapping logic:
+This mismatch was caused by missing **disk-read byte metering** before host invocation. C++ stellar-core charges disk read bytes while loading the footprint (`addReads`/`meterDiskReadResource`) and fails early if the declared `disk_read_bytes` is exceeded. We previously deferred all failures to host execution, which produced a `Storage/ExceededLimit` error and mapped to `Trapped`.
 
-1. **Error mapping logic is correct**: Our `map_host_error_to_result_code()` function correctly implements C++ stellar-core's logic (InvokeHostFunctionOpFrame.cpp lines 579-602):
-   - If CPU consumed > specified instructions → RESOURCE_LIMIT_EXCEEDED
-   - If memory consumed > tx memory limit → RESOURCE_LIMIT_EXCEEDED
-   - Otherwise → TRAPPED
+### Fix Applied
+- Meter disk-read bytes before host invocation using the XDR size of each metered entry.
+- For protocol 23+, only meter classic entries in the footprint plus any archived restoration entries; pre-23 meters all footprint entries.
+- Return `ResourceLimitExceeded` before host execution when the read budget is exceeded, matching upstream behavior.
 
-2. **Historical execution had different cost model**: When this transaction was originally executed on testnet, the CPU consumption exceeded the 933,592 limit, triggering ResourceLimitExceeded. This was likely due to different cost model calibration in the stellar-core version running at that time.
-
-3. **Current execution uses different cost model**: With the current soroban-env-host revision (`a37eeda`), the same transaction only consumes 835,973 CPU instructions, which is below the limit. Since the host failed with an Auth error (not Budget exceeded), we correctly return Trapped.
-
-4. **The host error is Auth, not Budget**: The underlying failure is `Error(Auth, InvalidAction)`, meaning the contract failed for authentication reasons. Our code only returns ResourceLimitExceeded for actual resource exhaustion, matching C++ stellar-core's current behavior.
-
-### Why This Cannot Be Fixed
-- The cost model parameters are loaded from the network config at each ledger
-- We use the same soroban-env-host revision as stellar-core v25 (`a37eeda` for P24)
-- The difference is due to cost model calibration changes between when the transaction was originally executed and the current soroban-env-host
-- To fix this, we would need the exact cost model parameters that were active when the transaction was first executed, which are not available
-
-### Improvements Made
-Added a check for `Budget/ExceededLimit` host errors to return `ResourceLimitExceeded` regardless of measured consumption, which handles cases where the host internally detected a budget exceeded condition.
+### Verification
+Targeted verification for ledgers 152690-152694 now shows 0 mismatches.
 
 ### Affected Ledgers
-- Ledger 152692 TX 2 (and potentially other early testnet transactions)
+- Ledger 152692 TX 2 (fixed via disk-read metering; cost-model variance is no longer the cause)
 
 ---
 
@@ -324,7 +314,7 @@ if self.consumed_rent_fee > self.max_refundable_fee {
 |-------|------|--------|-------------|
 | #1 | Architecture | Critical | Buffered Gap After Catchup - prevents real-time sync |
 | #2 | Non-issue | Low | Bucket list correct; divergence only in continuous replay |
-| #3 | Historical | Low | Trapped vs ResourceLimitExceeded - cost model variance, cannot fix |
+| #3 | **FIXED** | N/A | Trapped vs ResourceLimitExceeded - disk read bytes metered pre-host |
 | #4 | **FIXED** | N/A | InsufficientRefundableFee - restored TTL was not being passed correctly |
 | #5 | **FIXED** | N/A | Orderbook divergence - offers reloaded from snapshot, overwriting prior tx changes |
 | #6 | Partially Fixed | Low | Refundable fee - rent check added, remaining cases may be CDP anomaly |
@@ -333,10 +323,11 @@ if self.consumed_rent_fee > self.max_refundable_fee {
 
 ## Recently Fixed Issues
 
-The following issues were previously tracked but are now confirmed FIXED (verified 2026-01-19 with 100% match):
+The following issues were previously tracked but are now confirmed FIXED (verified 2026-01-20 with 100% match):
 
 | Issue | Ledger | Fix Description |
 |-------|--------|-----------------|
+| InvokeHostFunction disk read limit | 152692 | Meter disk-read bytes before host invocation |
 | Orderbook divergence (Issue #5) | 201477 | Skip offers already in state or deleted when loading orderbook |
 | InsufficientRefundableFee (Issue #4) | 342737 | Pass restored TTL for auto-restored entries, fix RentFeeConfiguration.fee_per_write_1kb |
 | ManageSellOffer OpNotSupported | 237057 | Sponsored offer deletion |
@@ -358,7 +349,7 @@ The following issues were previously tracked but are now confirmed FIXED (verifi
 1. **Issue #6 (Refundable fee bidirectional)**: Remaining cases may be CDP anomaly
 2. **Issue #1 (Buffered gap)**: Architecture change needed for real-time sync
 
-Note: Issue #3 (Trapped vs ResourceLimitExceeded) has been investigated and determined to be historical cost model variance that cannot be fixed. It only affects early testnet transactions and does not indicate a bug in our implementation.
+Note: Issue #3 (Trapped vs ResourceLimitExceeded) has been **FIXED** by metering disk-read bytes before host execution, aligning with upstream pre-host checks.
 
 Note: Issue #4 (InsufficientRefundableFee) has been **FIXED** - the root cause was passing the old expired TTL instead of the restored TTL for auto-restored entries.
 
