@@ -301,11 +301,33 @@ pub fn merge_in_memory(
     let old_entries = old_bucket.get_in_memory_entries().unwrap();
     let new_entries = new_bucket.get_in_memory_entries().unwrap();
 
+    // DEBUG: Print merge inputs
+    tracing::debug!(
+        old_entries_count = old_entries.len(),
+        new_entries_count = new_entries.len(),
+        max_protocol_version = max_protocol_version,
+        "merge_in_memory: starting"
+    );
+
     // Build output metadata
     let old_meta = extract_metadata(old_entries);
     let new_meta = extract_metadata(new_entries);
+
+    // DEBUG: print metadata extraction
+    tracing::debug!(
+        old_meta = ?old_meta,
+        new_meta = ?new_meta,
+        "merge_in_memory: extracted metadata"
+    );
+
     let (_, output_meta) =
         build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
+
+    // DEBUG: print output metadata
+    tracing::debug!(
+        output_meta = ?output_meta,
+        "merge_in_memory: built output metadata"
+    );
 
     // Pre-allocate output vector
     let mut merged = Vec::with_capacity(
@@ -408,6 +430,13 @@ pub fn merge_in_memory(
         }
         return Ok(Bucket::empty());
     }
+
+    // DEBUG: Print merge output
+    tracing::debug!(
+        merged_count = merged.len(),
+        has_meta = merged.first().map(|e| e.is_metadata()).unwrap_or(false),
+        "merge_in_memory: finished merge"
+    );
 
     // Create bucket with in-memory entries preserved
     Bucket::from_sorted_entries_with_in_memory(merged)

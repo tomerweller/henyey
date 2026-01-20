@@ -3422,13 +3422,21 @@ async fn cmd_verify_execution(
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = bucket_list.read().unwrap();
 
-                // Apply per-transaction changes in ledger order:
-                // fee -> tx_meta -> post_fee
+                // Apply per-transaction changes in ledger order.
+                // For Protocol 23+, post_fee_meta must be applied AFTER all tx_meta
+                // because the STATE entries in later transactions reflect state before
+                // earlier transactions' post_fee refunds were applied.
+                let defer_post_fee = cdp_header.ledger_version >= 23;
+                let mut deferred_post_fee_aggregator: Vec<stellar_xdr::curr::LedgerEntryChanges> =
+                    Vec::new();
+
                 for tx_info in &tx_processing {
+                    // 1. Apply fee_meta (fee deduction)
                     for change in tx_info.fee_meta.iter() {
                         apply_change_with_prestate(&mut aggregator, &bl, change);
                     }
 
+                    // 2. Apply tx_meta (tx_changes_before, operations, tx_changes_after)
                     let succeeded = tx_succeeded(&tx_info.result);
                     match &tx_info.meta {
                         stellar_xdr::curr::TransactionMeta::V0(operations) => {
@@ -3499,10 +3507,24 @@ async fn cmd_verify_execution(
                         }
                     }
 
+                    // 3. Handle post_fee_meta
                     if !tx_info.post_fee_meta.is_empty() {
-                        for change in tx_info.post_fee_meta.iter() {
-                            apply_change_with_prestate(&mut aggregator, &bl, change);
+                        if defer_post_fee {
+                            // For Protocol 23+, defer post_fee_meta until after all tx_meta
+                            deferred_post_fee_aggregator.push(tx_info.post_fee_meta.clone());
+                        } else {
+                            // For older protocols, apply immediately
+                            for change in tx_info.post_fee_meta.iter() {
+                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                            }
                         }
+                    }
+                }
+
+                // Apply deferred post_fee_meta for Protocol 23+
+                for post_fee_changes in deferred_post_fee_aggregator {
+                    for change in post_fee_changes.iter() {
+                        apply_change_with_prestate(&mut aggregator, &bl, change);
                     }
                 }
 
@@ -3571,6 +3593,11 @@ async fn cmd_verify_execution(
                     });
                 let has_eviction_iter_change = aggregator.changes.contains_key(&eviction_iter_key);
 
+                // EvictionIterator handling:
+                // C++ always updates EvictionIterator in resolveBackgroundEvictionScan() and
+                // includes it in getAllEntries() output. CDP metadata doesn't include this
+                // change (computed at ledger close time, not part of tx meta), so we must
+                // add it synthetically.
                 if cdp_header.ledger_version >= 23 && !has_eviction_iter_change {
                     let settings = if let Some(override_settings) = archival_override.clone() {
                         StateArchivalSettings {

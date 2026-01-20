@@ -895,10 +895,15 @@ mod tests {
         }
 
         // Balance should still be zero after self-payment
-        let trustline = state.get_trustline(&account_id, &Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
-            issuer: issuer_id.clone(),
-        })).unwrap();
+        let trustline = state
+            .get_trustline(
+                &account_id,
+                &Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
+                    issuer: issuer_id.clone(),
+                }),
+            )
+            .unwrap();
         assert_eq!(trustline.balance, 0);
     }
 
@@ -924,7 +929,7 @@ mod tests {
                 asset_code: AssetCode4([b'U', b'S', b'D', b'Z']),
                 issuer: issuer_id.clone(),
             }),
-            90, // Balance = 90
+            90,  // Balance = 90
             100, // Limit = 100, only 10 room
             AUTHORIZED_FLAG,
         ));

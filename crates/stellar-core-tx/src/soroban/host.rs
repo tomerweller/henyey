@@ -759,8 +759,8 @@ impl WasmCompilationContext {
         // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
         // C++ stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
         let budget = Budget::try_from_configs(
-            10_000_000_000,      // 10 billion CPU instructions
-            1_000_000_000,       // 1 GB memory
+            10_000_000_000,     // 10 billion CPU instructions
+            1_000_000_000,      // 1 GB memory
             Default::default(), // Default CPU cost params
             Default::default(), // Default memory cost params
         )
@@ -899,8 +899,8 @@ impl WasmCompilationContextP25 {
         // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
         // C++ stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
         let budget = soroban_env_host25::budget::Budget::try_from_configs(
-            10_000_000_000,      // 10 billion CPU instructions
-            1_000_000_000,       // 1 GB memory
+            10_000_000_000,     // 10 billion CPU instructions
+            1_000_000_000,      // 1 GB memory
             Default::default(), // Default CPU cost params
             Default::default(), // Default memory cost params
         )

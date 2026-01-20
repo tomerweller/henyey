@@ -310,11 +310,155 @@ fn compare_sc_address(
     a: &stellar_xdr::curr::ScAddress,
     b: &stellar_xdr::curr::ScAddress,
 ) -> Ordering {
-    a.cmp(b)
+    // Compare by type discriminant first, then by content
+    // Use XDR byte comparison for correctness matching C++ xdrpp
+    use stellar_xdr::curr::Limits;
+    let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+    let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+    a_bytes.cmp(&b_bytes)
 }
 
+/// Compare two ScVal values using the same order as C++ stellar-core.
+///
+/// This uses explicit type discriminant comparison followed by value comparison,
+/// matching the C++ xdrpp library's behavior. This is critical for bucket hash
+/// determinism across implementations.
 fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) -> Ordering {
-    a.cmp(b)
+    use stellar_xdr::curr::{Limits, ScVal::*};
+
+    // Compare by type discriminant first
+    let type_a = sc_val_type_discriminant(a);
+    let type_b = sc_val_type_discriminant(b);
+    if type_a != type_b {
+        return type_a.cmp(&type_b);
+    }
+
+    // Same type, compare by value
+    match (a, b) {
+        (Bool(a), Bool(b)) => a.cmp(b),
+        (Void, Void) => Ordering::Equal,
+        (Error(a), Error(b)) => {
+            // Compare by XDR bytes
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+        (U32(a), U32(b)) => a.cmp(b),
+        (I32(a), I32(b)) => a.cmp(b),
+        (U64(a), U64(b)) => a.cmp(b),
+        (I64(a), I64(b)) => a.cmp(b),
+        (Timepoint(a), Timepoint(b)) => a.cmp(b),
+        (Duration(a), Duration(b)) => a.cmp(b),
+        (U128(a), U128(b)) => match a.hi.cmp(&b.hi) {
+            Ordering::Equal => a.lo.cmp(&b.lo),
+            other => other,
+        },
+        (I128(a), I128(b)) => match a.hi.cmp(&b.hi) {
+            Ordering::Equal => a.lo.cmp(&b.lo),
+            other => other,
+        },
+        (U256(a), U256(b)) => {
+            for (a_part, b_part) in [
+                (a.hi_hi, b.hi_hi),
+                (a.hi_lo, b.hi_lo),
+                (a.lo_hi, b.lo_hi),
+                (a.lo_lo, b.lo_lo),
+            ] {
+                match a_part.cmp(&b_part) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            Ordering::Equal
+        }
+        (I256(a), I256(b)) => {
+            // I256 has mixed types for hi/lo parts, use XDR bytes
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+        (Bytes(a), Bytes(b)) => a.as_slice().cmp(b.as_slice()),
+        (String(a), String(b)) => a.as_slice().cmp(b.as_slice()),
+        (Symbol(a), Symbol(b)) => a.as_slice().cmp(b.as_slice()),
+        (Vec(a_opt), Vec(b_opt)) => match (a_opt, b_opt) {
+            (Some(a), Some(b)) => {
+                for (a_elem, b_elem) in a.iter().zip(b.iter()) {
+                    match compare_sc_val(a_elem, b_elem) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        },
+        (Map(a_opt), Map(b_opt)) => match (a_opt, b_opt) {
+            (Some(a), Some(b)) => {
+                for (a_entry, b_entry) in a.iter().zip(b.iter()) {
+                    match compare_sc_val(&a_entry.key, &b_entry.key) {
+                        Ordering::Equal => match compare_sc_val(&a_entry.val, &b_entry.val) {
+                            Ordering::Equal => continue,
+                            other => return other,
+                        },
+                        other => return other,
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        },
+        (Address(a), Address(b)) => compare_sc_address(a, b),
+        (LedgerKeyContractInstance, LedgerKeyContractInstance) => Ordering::Equal,
+        (LedgerKeyNonce(a), LedgerKeyNonce(b)) => a.nonce.cmp(&b.nonce),
+        (ContractInstance(a), ContractInstance(b)) => {
+            // Compare by XDR bytes as fallback
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+        // For any remaining cases, use XDR byte comparison
+        _ => {
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+    }
+}
+
+/// Get the XDR type discriminant for an ScVal.
+///
+/// These values must match the XDR ScValType enum discriminants exactly
+/// for deterministic comparison across implementations.
+fn sc_val_type_discriminant(v: &stellar_xdr::curr::ScVal) -> i32 {
+    use stellar_xdr::curr::ScVal::*;
+    match v {
+        Bool(_) => 0,
+        Void => 1,
+        Error(_) => 2,
+        U32(_) => 3,
+        I32(_) => 4,
+        U64(_) => 5,
+        I64(_) => 6,
+        Timepoint(_) => 7,
+        Duration(_) => 8,
+        U128(_) => 9,
+        I128(_) => 10,
+        U256(_) => 11,
+        I256(_) => 12,
+        Bytes(_) => 13,
+        String(_) => 14,
+        Symbol(_) => 15,
+        Vec(_) => 16,
+        Map(_) => 17,
+        Address(_) => 18,
+        ContractInstance(_) => 19,
+        LedgerKeyContractInstance => 20,
+        LedgerKeyNonce(_) => 21,
+    }
 }
 
 /// Compare two BucketEntry values by key.

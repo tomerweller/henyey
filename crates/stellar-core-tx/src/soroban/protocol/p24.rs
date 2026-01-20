@@ -201,7 +201,9 @@ fn get_entry_for_restoration(
     let live_until = match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             let key_hash = compute_key_hash(key);
-            state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq)
+            state
+                .get_ttl(&key_hash)
+                .map(|ttl| ttl.live_until_ledger_seq)
         }
         _ => None,
     };

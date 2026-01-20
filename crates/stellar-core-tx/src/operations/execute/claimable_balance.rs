@@ -332,7 +332,9 @@ pub fn execute_claim_claimable_balance(
                         }
                         // Check trustline limit
                         if tl.balance + entry.amount > tl.limit {
-                            return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
+                            return Ok(make_claim_result(
+                                ClaimClaimableBalanceResultCode::LineFull,
+                            ));
                         }
                         tl.balance += entry.amount;
                     }
