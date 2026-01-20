@@ -883,7 +883,8 @@ impl Invariant for LedgerEntryIsValid {
                         LedgerEntryData::LiquidityPool(pool) => pool,
                         _ => unreachable!("entry data already matched"),
                     };
-                    let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.body;
+                    let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) =
+                        &pool.body;
                     if !asset_valid(&cp.params.asset_a) {
                         return Err(InvariantError::Violated {
                             name: self.name().to_string(),
@@ -1413,9 +1414,10 @@ fn check_order_book_crossed(
 
     if lowest_ask_price <= highest_bid {
         if lowest_ask_price == highest_bid
-            && (lowest_ask.is_passive() || highest_bid_inverse.is_passive()) {
-                return Ok(());
-            }
+            && (lowest_ask.is_passive() || highest_bid_inverse.is_passive())
+        {
+            return Ok(());
+        }
         return Err(InvariantError::Violated {
             name: "OrderBookIsNotCrossed".to_string(),
             details: "order book is crossed".to_string(),
@@ -1537,8 +1539,10 @@ impl Invariant for ConstantProductInvariant {
                 _ => continue,
             };
 
-            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(prev_cp) = &prev_pool.body;
-            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(curr_cp) = &curr_pool.body;
+            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(prev_cp) =
+                &prev_pool.body;
+            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(curr_cp) =
+                &curr_pool.body;
 
             if curr_cp.reserve_a < 0
                 || curr_cp.reserve_b < 0
@@ -3636,7 +3640,9 @@ mod tests {
     fn make_changes(entries: Vec<LedgerEntry>) -> Vec<LedgerEntryChange> {
         entries
             .into_iter()
-            .map(|entry| LedgerEntryChange::Created { current: Box::new(entry) })
+            .map(|entry| LedgerEntryChange::Created {
+                current: Box::new(entry),
+            })
             .collect()
     }
 
@@ -3750,7 +3756,10 @@ mod tests {
             account.balance += 10;
         }
 
-        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
+        let changes = vec![LedgerEntryChange::Updated {
+            previous: Box::new(previous),
+            current: Box::new(current),
+        }];
 
         let contract_id = get_asset_contract_id(&network_id.0, &Asset::Native).unwrap();
         let topics: VecM<ScVal> = vec![
@@ -4213,7 +4222,10 @@ mod tests {
         let curr = make_header(2, Hash256::ZERO);
         let previous = make_ttl_entry(Hash([1u8; 32]), 10);
         let current = make_ttl_entry(Hash([2u8; 32]), 10);
-        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
+        let changes = vec![LedgerEntryChange::Updated {
+            previous: Box::new(previous),
+            current: Box::new(current),
+        }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4226,7 +4238,10 @@ mod tests {
         let curr = make_header(2, Hash256::ZERO);
         let previous = make_ttl_entry(Hash([1u8; 32]), 10);
         let current = make_ttl_entry(Hash([1u8; 32]), 9);
-        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
+        let changes = vec![LedgerEntryChange::Updated {
+            previous: Box::new(previous),
+            current: Box::new(current),
+        }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4486,7 +4501,10 @@ mod tests {
         let hash_curr = Hash(*Hash256::hash(&code_curr).as_bytes());
         let previous = make_contract_code_entry(code_prev, hash_prev);
         let current = make_contract_code_entry(code_curr, hash_curr);
-        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
+        let changes = vec![LedgerEntryChange::Updated {
+            previous: Box::new(previous),
+            current: Box::new(current),
+        }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4749,7 +4767,10 @@ mod tests {
             ClaimableBalanceEntryExt::V0,
             entry_ext,
         );
-        let changes = vec![LedgerEntryChange::Updated { previous: Box::new(previous), current: Box::new(current) }];
+        let changes = vec![LedgerEntryChange::Updated {
+            previous: Box::new(previous),
+            current: Box::new(current),
+        }];
         let ctx = make_ctx(&prev, &curr, &changes);
 
         let inv = LedgerEntryIsValid;
@@ -4779,7 +4800,9 @@ mod tests {
                 previous: Box::new(prev_sponsored),
                 current: Box::new(curr_sponsored),
             },
-            LedgerEntryChange::Created { current: Box::new(trustline) },
+            LedgerEntryChange::Created {
+                current: Box::new(trustline),
+            },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4810,7 +4833,9 @@ mod tests {
                 previous: Box::new(prev_sponsored),
                 current: Box::new(curr_sponsored),
             },
-            LedgerEntryChange::Created { current: Box::new(trustline) },
+            LedgerEntryChange::Created {
+                current: Box::new(trustline),
+            },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4833,7 +4858,9 @@ mod tests {
                 previous: Box::new(prev_account),
                 current: Box::new(curr_account),
             },
-            LedgerEntryChange::Created { current: Box::new(trustline) },
+            LedgerEntryChange::Created {
+                current: Box::new(trustline),
+            },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 
@@ -4856,7 +4883,9 @@ mod tests {
                 previous: Box::new(prev_account),
                 current: Box::new(curr_account),
             },
-            LedgerEntryChange::Created { current: Box::new(trustline) },
+            LedgerEntryChange::Created {
+                current: Box::new(trustline),
+            },
         ];
         let ctx = make_ctx(&prev, &curr, &changes);
 

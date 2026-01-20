@@ -1279,11 +1279,7 @@ impl LedgerStateManager {
                 self.liquidity_pools.insert(key, lp.clone());
             }
             LedgerEntryData::ContractData(cd) => {
-                let key = ContractDataKey::new(
-                    cd.contract.clone(),
-                    cd.key.clone(),
-                    cd.durability,
-                );
+                let key = ContractDataKey::new(cd.contract.clone(), cd.key.clone(), cd.durability);
                 self.contract_data.insert(key, cd.clone());
             }
             LedgerEntryData::ContractCode(cc) => {
@@ -1334,8 +1330,7 @@ impl LedgerStateManager {
                 self.liquidity_pools.remove(&pool_key);
             }
             LedgerKey::ContractData(k) => {
-                let cd_key =
-                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                let cd_key = ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data.remove(&cd_key);
             }
             LedgerKey::ContractCode(k) => {
@@ -1824,8 +1819,7 @@ impl LedgerStateManager {
             .offers
             .iter()
             .filter(|((seller_key, _), offer)| {
-                *seller_key == account_key
-                    && (offer.buying == *asset || offer.selling == *asset)
+                *seller_key == account_key && (offer.buying == *asset || offer.selling == *asset)
             })
             .map(|((_, offer_id), offer)| (offer.seller_id.clone(), *offer_id))
             .collect();
@@ -2043,11 +2037,7 @@ impl LedgerStateManager {
 
     /// Create a new contract data entry.
     pub fn create_contract_data(&mut self, entry: ContractDataEntry) {
-        let key = ContractDataKey::new(
-            entry.contract.clone(),
-            entry.key.clone(),
-            entry.durability,
-        );
+        let key = ContractDataKey::new(entry.contract.clone(), entry.key.clone(), entry.durability);
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
@@ -2079,11 +2069,7 @@ impl LedgerStateManager {
 
     /// Update an existing contract data entry.
     pub fn update_contract_data(&mut self, entry: ContractDataEntry) {
-        let key = ContractDataKey::new(
-            entry.contract.clone(),
-            entry.key.clone(),
-            entry.durability,
-        );
+        let key = ContractDataKey::new(entry.contract.clone(), entry.key.clone(), entry.durability);
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
@@ -2407,7 +2393,9 @@ impl LedgerStateManager {
             // Only extend if the new TTL is greater
             if live_until_ledger_seq > ttl_entry.live_until_ledger_seq {
                 // Save snapshot if not already saved
-                self.ttl_snapshots.entry(key).or_insert_with(|| Some(ttl_entry.clone()));
+                self.ttl_snapshots
+                    .entry(key)
+                    .or_insert_with(|| Some(ttl_entry.clone()));
                 let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                     key_hash: key_hash.clone(),
                 });
@@ -3686,7 +3674,9 @@ fn compare_price(lhs: &Price, rhs: &Price) -> std::cmp::Ordering {
     // uses double comparison to match this SQL ordering.
     let lhs_price = lhs.n as f64 / lhs.d as f64;
     let rhs_price = rhs.n as f64 / rhs.d as f64;
-    lhs_price.partial_cmp(&rhs_price).unwrap_or(std::cmp::Ordering::Equal)
+    lhs_price
+        .partial_cmp(&rhs_price)
+        .unwrap_or(std::cmp::Ordering::Equal)
 }
 
 fn sponsorship_counts(account: &AccountEntry) -> (i64, i64) {

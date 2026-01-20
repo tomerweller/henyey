@@ -78,8 +78,7 @@ fn prepend_fee_event(
         return;
     }
 
-    let mut manager =
-        TxEventManager::new(true, protocol_version, *network_id, classic_events);
+    let mut manager = TxEventManager::new(true, protocol_version, *network_id, classic_events);
     manager.new_fee_event(fee_source, fee_charged, TransactionEventStage::BeforeAllTxs);
     let fee_events = manager.finalize();
     if fee_events.is_empty() {
@@ -694,7 +693,10 @@ impl LedgerManager {
         // Scan bucket list for CONTRACT_CODE entries and pre-compile them
         let bucket_list = self.bucket_list.read();
         let live_entries = bucket_list.live_entries().map_err(|e| {
-            LedgerError::Internal(format!("Failed to get live entries for module cache: {}", e))
+            LedgerError::Internal(format!(
+                "Failed to get live entries for module cache: {}",
+                e
+            ))
         })?;
 
         let mut contracts_added = 0;
@@ -1158,7 +1160,8 @@ impl<'a> LedgerCloseContext<'a> {
         };
 
         // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
-        let soroban_config = crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version);
+        let soroban_config =
+            crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version);
         // Use transaction set hash as base PRNG seed for Soroban execution
         let soroban_base_prng_seed = self.close_data.tx_set_hash();
         let classic_events = ClassicEventConfig {
@@ -1194,10 +1197,8 @@ impl<'a> LedgerCloseContext<'a> {
                 .enumerate()
             {
                 let fee_charged = tx_results[idx].result.fee_charged;
-                let frame = TransactionFrame::with_network(
-                    envelope.clone(),
-                    self.manager.network_id,
-                );
+                let frame =
+                    TransactionFrame::with_network(envelope.clone(), self.manager.network_id);
                 let fee_source = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
                 prepend_fee_event(
                     &mut meta.tx_apply_processing,

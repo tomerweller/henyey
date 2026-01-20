@@ -56,8 +56,7 @@ pub const SURVEY_THROTTLE_TIMEOUT_MULT: u32 = 3;
 const SURVEY_THROTTLE_TIMEOUT_MS: u64 = 200;
 
 /// Current phase of a survey.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SurveyPhase {
     /// Survey is actively collecting data from peers.
     Collecting,
@@ -67,7 +66,6 @@ pub enum SurveyPhase {
     #[default]
     Inactive,
 }
-
 
 /// Data collected about this node during a survey.
 #[derive(Debug, Clone, Default)]

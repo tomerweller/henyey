@@ -153,10 +153,7 @@ impl FetchingEnvelopes {
         self.stats.write().envelopes_received += 1;
 
         // Get or create slot state
-        let mut slot_state = self
-            .slots
-            .entry(slot)
-            .or_default();
+        let mut slot_state = self.slots.entry(slot).or_default();
 
         // Check if already processed or discarded
         if slot_state.processed.contains(&env_hash) || slot_state.discarded.contains(&env_hash) {

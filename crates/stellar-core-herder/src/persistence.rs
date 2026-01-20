@@ -752,21 +752,15 @@ impl ScpStatePersistence for SqliteScpPersistence {
     }
 
     fn load_tx_set(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
-        self.inner
-            .load_tx_set(hash)
-            .map_err(HerderError::Internal)
+        self.inner.load_tx_set(hash).map_err(HerderError::Internal)
     }
 
     fn load_all_tx_sets(&self) -> Result<Vec<(Hash, Vec<u8>)>> {
-        self.inner
-            .load_all_tx_sets()
-            .map_err(HerderError::Internal)
+        self.inner.load_all_tx_sets().map_err(HerderError::Internal)
     }
 
     fn has_tx_set(&self, hash: &Hash) -> Result<bool> {
-        self.inner
-            .has_tx_set(hash)
-            .map_err(HerderError::Internal)
+        self.inner.has_tx_set(hash).map_err(HerderError::Internal)
     }
 
     fn delete_tx_sets_below(&self, slot: u64) -> Result<()> {

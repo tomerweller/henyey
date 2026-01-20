@@ -129,10 +129,9 @@ pub fn execute_set_options(
 
     // Can't clear revocable if clawback is set
     if let Some(clear_flags) = op.clear_flags {
-        if clear_flags & AUTH_REVOCABLE_FLAG != 0
-            && current_flags & AUTH_CLAWBACK_FLAG != 0 {
-                return Ok(make_result(SetOptionsResultCode::AuthRevocableRequired));
-            }
+        if clear_flags & AUTH_REVOCABLE_FLAG != 0 && current_flags & AUTH_CLAWBACK_FLAG != 0 {
+            return Ok(make_result(SetOptionsResultCode::AuthRevocableRequired));
+        }
     }
 
     // Get current signer count for sub-entry calculations
@@ -323,10 +322,8 @@ pub fn execute_set_options(
             signers_vec.push(new_signer);
             if needs_sponsoring_ids {
                 sponsoring_ids.push(new_sponsor_id);
-                let mut combined: Vec<(Signer, SponsorshipDescriptor)> = signers_vec
-                    .into_iter()
-                    .zip(sponsoring_ids)
-                    .collect();
+                let mut combined: Vec<(Signer, SponsorshipDescriptor)> =
+                    signers_vec.into_iter().zip(sponsoring_ids).collect();
                 combined.sort_by(|a, b| compare_signer_keys(&a.0.key, &b.0.key));
                 let (sorted_signers, sorted_sponsoring): (Vec<Signer>, Vec<SponsorshipDescriptor>) =
                     combined.into_iter().unzip();

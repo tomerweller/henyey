@@ -300,7 +300,8 @@ pub(crate) struct SurgePricingPriorityQueue {
 impl SurgePricingPriorityQueue {
     pub(crate) fn new(lane_config: Box<dyn SurgePricingLaneConfig>, seed: u64) -> Self {
         let lane_limits = lane_config.lane_limits().to_vec();
-        let resource_len = lane_limits.first()
+        let resource_len = lane_limits
+            .first()
             .map(|limit| limit.size())
             .unwrap_or(NUM_CLASSIC_TX_RESOURCES);
         let lane_current_count = lane_limits

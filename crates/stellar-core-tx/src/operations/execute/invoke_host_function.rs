@@ -240,7 +240,8 @@ fn execute_upload_wasm(
     let code_in_rw_footprint = soroban_data
         .resources
         .footprint
-        .read_write.contains(&code_key);
+        .read_write
+        .contains(&code_key);
 
     // Check if this code already exists.
     if let Some(existing_code) = state.get_contract_code(&code_hash).cloned() {
@@ -351,8 +352,7 @@ fn extract_wasm_cost_inputs(wasm: &[u8]) -> ContractCodeCostInputs {
             }
             TableSection(s) => {
                 for table in s.into_iter().flatten() {
-                    costs.n_table_entries =
-                        costs.n_table_entries.saturating_add(table.ty.initial);
+                    costs.n_table_entries = costs.n_table_entries.saturating_add(table.ty.initial);
                 }
             }
             GlobalSection(s) => {
@@ -811,7 +811,10 @@ fn map_host_error_to_result_code(
     // exceeded condition, even if our measured consumption differs due to
     // historical cost model variance.
     if exec_error.host_error.error.is_type(ScErrorType::Budget)
-        && exec_error.host_error.error.is_code(ScErrorCode::ExceededLimit)
+        && exec_error
+            .host_error
+            .error
+            .is_code(ScErrorCode::ExceededLimit)
     {
         return InvokeHostFunctionResultCode::ResourceLimitExceeded;
     }

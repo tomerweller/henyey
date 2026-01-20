@@ -126,7 +126,9 @@ impl PersistentModuleCache {
     /// Create a new empty P25 cache.
     pub fn new_p25() -> Option<Self> {
         let ctx = WasmCompilationContextP25::new();
-        ModuleCacheP25::new(&ctx).ok().map(PersistentModuleCache::P25)
+        ModuleCacheP25::new(&ctx)
+            .ok()
+            .map(PersistentModuleCache::P25)
     }
 
     /// Create a new cache for the given protocol version.
@@ -140,43 +142,29 @@ impl PersistentModuleCache {
 
     /// Add a contract code entry to the cache.
     /// Returns true if compilation succeeded, false otherwise.
-    pub fn add_contract(
-        &self,
-        code: &[u8],
-        protocol_version: u32,
-    ) -> bool {
+    pub fn add_contract(&self, code: &[u8], protocol_version: u32) -> bool {
         match self {
             PersistentModuleCache::P24(cache) => {
                 let ctx = WasmCompilationContext::new();
-                let contract_id = soroban_env_host24::xdr::Hash(
-                    <Sha256 as Digest>::digest(code).into(),
-                );
+                let contract_id =
+                    soroban_env_host24::xdr::Hash(<Sha256 as Digest>::digest(code).into());
                 let cost_inputs = VersionedContractCodeCostInputs::V0 {
                     wasm_bytes: code.len(),
                 };
-                cache.parse_and_cache_module(
-                    &ctx,
-                    protocol_version,
-                    &contract_id,
-                    code,
-                    cost_inputs,
-                ).is_ok()
+                cache
+                    .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
+                    .is_ok()
             }
             PersistentModuleCache::P25(cache) => {
                 let ctx = WasmCompilationContextP25::new();
-                let contract_id = soroban_env_host25::xdr::Hash(
-                    <Sha256 as Digest>::digest(code).into(),
-                );
+                let contract_id =
+                    soroban_env_host25::xdr::Hash(<Sha256 as Digest>::digest(code).into());
                 let cost_inputs = VersionedContractCodeCostInputsP25::V0 {
                     wasm_bytes: code.len(),
                 };
-                cache.parse_and_cache_module(
-                    &ctx,
-                    protocol_version,
-                    &contract_id,
-                    code,
-                    cost_inputs,
-                ).is_ok()
+                cache
+                    .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
+                    .is_ok()
             }
         }
     }
@@ -311,11 +299,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                         let current_entry = match current_key {
                             LedgerKey::ContractData(cd_key) => self
                                 .state
-                                .get_contract_data(
-                                    &cd_key.contract,
-                                    &cd_key.key,
-                                    cd_key.durability,
-                                )
+                                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                                 .map(|cd| LedgerEntry {
                                     last_modified_ledger_seq: self.current_ledger,
                                     data: LedgerEntryData::ContractData(cd.clone()),
@@ -345,11 +329,11 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                             });
 
                             ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
-                                    key: current_key.clone(),
-                                    entry: e,
-                                    ttl_key,
-                                    ttl_entry: te,
-                                })
+                                key: current_key.clone(),
+                                entry: e,
+                                ttl_key,
+                                ttl_entry: te,
+                            })
                         } else {
                             None
                         }
@@ -564,11 +548,11 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                         });
 
                         ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
-                                key: key.as_ref().clone(),
-                                entry: entry.as_ref().clone(),
-                                ttl_key,
-                                ttl_entry: te,
-                            })
+                            key: key.as_ref().clone(),
+                            entry: entry.as_ref().clone(),
+                            ttl_key,
+                            ttl_entry: te,
+                        })
                     } else {
                         None
                     }

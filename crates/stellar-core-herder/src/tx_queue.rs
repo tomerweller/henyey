@@ -1021,9 +1021,9 @@ impl TransactionQueue {
         if let Preconditions::V2(cond) = frame.preconditions() {
             if !cond.extra_signers.is_empty()
                 && !extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)?
-                {
-                    return Err("extra signer validation failed");
-                }
+            {
+                return Err("extra signer validation failed");
+            }
         }
 
         Ok(())
@@ -1475,9 +1475,7 @@ impl TransactionQueue {
             let mut account_states = self.account_states.write();
 
             // Update the sequence-source account state (stores the pending transaction)
-            let seq_state = account_states
-                .entry(seq_source_key.clone())
-                .or_default();
+            let seq_state = account_states.entry(seq_source_key.clone()).or_default();
 
             // If replacing, and same fee source as old tx, adjust the fee delta
             let fee_to_add = if let Some(ref old_tx) = replaced_tx {
@@ -1503,9 +1501,7 @@ impl TransactionQueue {
                 seq_state.total_fees = seq_state.total_fees.saturating_add(fee_to_add);
             } else {
                 // Different accounts - update fee-source separately
-                let fee_state = account_states
-                    .entry(new_fee_source_key)
-                    .or_default();
+                let fee_state = account_states.entry(new_fee_source_key).or_default();
                 fee_state.total_fees = fee_state.total_fees.saturating_add(fee_to_add);
             }
         }

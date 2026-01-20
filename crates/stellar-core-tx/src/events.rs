@@ -44,13 +44,11 @@ use stellar_xdr::curr::{
     TransactionEvent, TransactionEventStage,
 };
 
-#[derive(Debug, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ClassicEventConfig {
     pub emit_classic_events: bool,
     pub backfill_stellar_asset_events: bool,
 }
-
 
 impl ClassicEventConfig {
     pub fn events_enabled(self, protocol_version: u32) -> bool {

@@ -264,11 +264,7 @@ impl Tracker {
             self.peers_asked.insert(peer.clone(), false);
             self.last_ask_time = Some(Instant::now());
 
-            trace!(
-                "Asking peer {} for {}",
-                peer,
-                hex::encode(self.item_hash.0)
-            );
+            trace!("Asking peer {} for {}", peer, hex::encode(self.item_hash.0));
 
             NextPeerResult::AskPeer {
                 peer: peer.clone(),

@@ -1269,14 +1269,13 @@ impl App {
                 "Transaction count mismatch while persisting history"
             );
         }
-        if tx_metas.is_some()
-            && meta_count < tx_count {
-                tracing::warn!(
-                    tx_count,
-                    meta_count,
-                    "Transaction meta count mismatch while persisting history"
-                );
-            }
+        if tx_metas.is_some() && meta_count < tx_count {
+            tracing::warn!(
+                tx_count,
+                meta_count,
+                "Transaction meta count mismatch while persisting history"
+            );
+        }
 
         let tx_set_entry = match tx_set_variant {
             TransactionSetVariant::Classic(set) => set.clone(),
@@ -4176,14 +4175,14 @@ impl App {
 
         let needs_more_inbound = body.inbound_peers.0.len() == TIME_SLICED_PEERS_MAX;
         let needs_more_outbound = body.outbound_peers.0.len() == TIME_SLICED_PEERS_MAX;
-        if (needs_more_inbound || needs_more_outbound)
-            && self.survey_reporting.read().await.running {
-                let next_inbound = inbound_len as u32;
-                let next_outbound = outbound_len as u32;
-                let _ = self
-                    .survey_topology_timesliced(peer_id.clone(), next_inbound, next_outbound)
-                    .await;
-            }
+        if (needs_more_inbound || needs_more_outbound) && self.survey_reporting.read().await.running
+        {
+            let next_inbound = inbound_len as u32;
+            let next_outbound = outbound_len as u32;
+            let _ = self
+                .survey_topology_timesliced(peer_id.clone(), next_inbound, next_outbound)
+                .await;
+        }
     }
 
     fn local_node_id(&self) -> stellar_xdr::curr::NodeId {
@@ -5445,10 +5444,7 @@ impl App {
     }
 
     fn filter_advertised_peers(&self, peers: Vec<PeerAddress>) -> Vec<PeerAddress> {
-        peers
-            .into_iter()
-            .filter(Self::is_public_peer)
-            .collect()
+        peers.into_iter().filter(Self::is_public_peer).collect()
     }
 
     fn is_public_peer(peer: &PeerAddress) -> bool {

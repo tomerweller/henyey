@@ -4,8 +4,7 @@
 //! particularly for eviction, hot archive operations, and bucket list mechanics.
 
 use stellar_core_bucket::{
-    BucketList, EvictionIterator, HotArchiveBucketList,
-    update_starting_eviction_iterator,
+    update_starting_eviction_iterator, BucketList, EvictionIterator, HotArchiveBucketList,
 };
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::*;
@@ -41,7 +40,11 @@ fn make_contract_code_key(seed: u8) -> LedgerKey {
 }
 
 #[allow(dead_code)]
-fn make_contract_data_entry(seed: u8, durability: ContractDataDurability, last_modified: u32) -> LedgerEntry {
+fn make_contract_data_entry(
+    seed: u8,
+    durability: ContractDataDurability,
+    last_modified: u32,
+) -> LedgerEntry {
     let mut key_bytes = [0u8; 32];
     key_bytes[0] = seed;
 
@@ -154,16 +157,13 @@ fn test_hot_archive_tombstones_expire_at_bottom_level() {
         TEST_PROTOCOL,
         archived_entries.clone(),
         vec![], // No restorations yet
-    ).unwrap();
+    )
+    .unwrap();
 
     // Add restoration markers (Live tombstones) for some entries
     let keys_to_restore: Vec<_> = restored_keys.iter().take(2).cloned().collect();
-    bl.add_batch(
-        2,
-        TEST_PROTOCOL,
-        vec![],
-        keys_to_restore.clone(),
-    ).unwrap();
+    bl.add_batch(2, TEST_PROTOCOL, vec![], keys_to_restore.clone())
+        .unwrap();
 
     // Continue adding empty batches to push entries through levels
     // This simulates ledger progression
@@ -184,7 +184,10 @@ fn test_hot_archive_tombstones_expire_at_bottom_level() {
         let result = bl.get(key).unwrap();
         // After enough merges, restored entries should not be findable in archive
         // because Live tombstones shadow them
-        assert!(result.is_none(), "Restored entry should be shadowed by tombstone");
+        assert!(
+            result.is_none(),
+            "Restored entry should be shadowed by tombstone"
+        );
     }
 }
 
@@ -203,13 +206,16 @@ fn test_hot_archive_multiple_archives_and_restores() {
     let entry_v1 = make_contract_code_entry(1, 10);
 
     // Archive V0
-    bl.add_batch(1, TEST_PROTOCOL, vec![entry_v0.clone()], vec![]).unwrap();
+    bl.add_batch(1, TEST_PROTOCOL, vec![entry_v0.clone()], vec![])
+        .unwrap();
 
     // Restore (adds Live tombstone)
-    bl.add_batch(2, TEST_PROTOCOL, vec![], vec![key.clone()]).unwrap();
+    bl.add_batch(2, TEST_PROTOCOL, vec![], vec![key.clone()])
+        .unwrap();
 
     // Re-archive V1
-    bl.add_batch(3, TEST_PROTOCOL, vec![entry_v1.clone()], vec![]).unwrap();
+    bl.add_batch(3, TEST_PROTOCOL, vec![entry_v1.clone()], vec![])
+        .unwrap();
 
     // Push through more ledgers to merge everything
     for ledger in 4..100 {
@@ -222,7 +228,10 @@ fn test_hot_archive_multiple_archives_and_restores() {
 
     let found = result.unwrap();
     // Check it's V1 (last_modified = 10)
-    assert_eq!(found.last_modified_ledger_seq, 10, "Should have V1 (newest) version");
+    assert_eq!(
+        found.last_modified_ledger_seq, 10,
+        "Should have V1 (newest) version"
+    );
 }
 
 /// Test that archive and restore in the same batch works correctly
@@ -233,21 +242,21 @@ fn test_hot_archive_concurrent_archive_and_restore() {
     // Archive entry 1
     let entry1 = make_contract_code_entry(1, 1);
     let key1 = make_contract_code_key(1);
-    bl.add_batch(1, TEST_PROTOCOL, vec![entry1], vec![]).unwrap();
+    bl.add_batch(1, TEST_PROTOCOL, vec![entry1], vec![])
+        .unwrap();
 
     // Archive entry 2 and restore entry 1 in the same batch
     let entry2 = make_contract_code_entry(2, 2);
     let key2 = make_contract_code_key(2);
-    bl.add_batch(
-        2,
-        TEST_PROTOCOL,
-        vec![entry2],
-        vec![key1.clone()],
-    ).unwrap();
+    bl.add_batch(2, TEST_PROTOCOL, vec![entry2], vec![key1.clone()])
+        .unwrap();
 
     // Entry 1 should be shadowed (was restored)
     let result1 = bl.get(&key1).unwrap();
-    assert!(result1.is_none(), "Entry 1 should be shadowed after restoration");
+    assert!(
+        result1.is_none(),
+        "Entry 1 should be shadowed after restoration"
+    );
 
     // Entry 2 should exist
     let result2 = bl.get(&key2).unwrap();
@@ -287,7 +296,8 @@ fn test_bucket_list_basic_operations() {
             entries,
             vec![],
             dead_keys,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify level sizes are bounded
         for level_idx in 0..bl.levels().len() {
@@ -301,19 +311,27 @@ fn test_bucket_list_basic_operations() {
                 assert!(
                     curr_entries <= level_half as usize * 100,
                     "Level {} curr has {} entries, expected <= {}",
-                    level_idx, curr_entries, level_half * 100
+                    level_idx,
+                    curr_entries,
+                    level_half * 100
                 );
                 assert!(
                     snap_entries <= level_half as usize * 100,
                     "Level {} snap has {} entries, expected <= {}",
-                    level_idx, snap_entries, level_half * 100
+                    level_idx,
+                    snap_entries,
+                    level_half * 100
                 );
             }
         }
     }
 
     // Verify hash is non-zero after adding entries
-    assert_ne!(bl.hash(), Hash256::ZERO, "Bucket list hash should be non-zero");
+    assert_ne!(
+        bl.hash(),
+        Hash256::ZERO,
+        "Bucket list hash should be non-zero"
+    );
 }
 
 /// Test matching upstream: "BucketList snap reaches steady state"
@@ -336,7 +354,8 @@ fn test_bucket_list_snap_steady_state() {
             entries,
             vec![],
             vec![],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // At steady state, snap buckets should have consistent sizes
@@ -344,7 +363,10 @@ fn test_bucket_list_snap_steady_state() {
     if let Some(level0) = bl.level(0) {
         let snap_count = level0.snap.len();
         // Snap should have entries (not be empty at steady state)
-        assert!(snap_count > 0, "Level 0 snap should have entries at steady state");
+        assert!(
+            snap_count > 0,
+            "Level 0 snap should have entries at steady state"
+        );
     }
 }
 
@@ -368,7 +390,8 @@ fn test_bucket_list_deepest_curr_accumulates() {
             entries,
             vec![],
             vec![],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Check that entries have propagated to deeper levels
@@ -382,7 +405,10 @@ fn test_bucket_list_deepest_curr_accumulates() {
         }
     }
 
-    assert!(found_entries_in_deep_level, "Entries should propagate to deeper levels");
+    assert!(
+        found_entries_in_deep_level,
+        "Entries should propagate to deeper levels"
+    );
 }
 
 /// Test matching upstream: "single entry bubbling up"
@@ -403,7 +429,8 @@ fn test_single_entry_bubbling_up() {
         vec![entry.clone()],
         vec![],
         vec![],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify entry exists
     let found = bl.get(&key).unwrap();
@@ -418,7 +445,8 @@ fn test_single_entry_bubbling_up() {
             vec![],
             vec![],
             vec![],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Entry should still be findable at every step
         let found = bl.get(&key).unwrap();
@@ -452,7 +480,8 @@ fn test_init_dead_annihilation() {
         vec![entry],
         vec![],
         vec![],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Delete the entry (creates DEAD at level 0)
     bl.add_batch(
@@ -462,7 +491,8 @@ fn test_init_dead_annihilation() {
         vec![],
         vec![],
         vec![key.clone()],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Entry should not be found
     let found = bl.get(&key).unwrap();
@@ -477,18 +507,25 @@ fn test_init_dead_annihilation() {
             vec![],
             vec![],
             vec![],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Should still be gone
     let found = bl.get(&key).unwrap();
-    assert!(found.is_none(), "Entry should remain annihilated after merges");
+    assert!(
+        found.is_none(),
+        "Entry should remain annihilated after merges"
+    );
 
     // Verify live_entries doesn't include the deleted entry
     let live = bl.live_entries().unwrap();
     let has_key = live.iter().any(|e| {
         if let LedgerEntryData::Account(a) = &e.data {
-            a.account_id == AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32].map(|_| 1))))
+            a.account_id
+                == AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [1u8; 32].map(|_| 1),
+                )))
         } else {
             false
         }
@@ -514,12 +551,21 @@ fn test_tombstones_expire_at_bottom_level() {
         vec![entry],
         vec![],
         vec![],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Delete the entry on a later ledger (not same ledger as creation)
     // This means the INIT will be in snap, DEAD in curr, and they won't annihilate immediately
     for i in 2..=10 {
-        bl.add_batch(i, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![]).unwrap();
+        bl.add_batch(
+            i,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
     }
 
     // Now delete
@@ -530,7 +576,8 @@ fn test_tombstones_expire_at_bottom_level() {
         vec![],
         vec![],
         vec![key.clone()],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Entry should not be found
     let found = bl.get(&key).unwrap();
@@ -545,7 +592,8 @@ fn test_tombstones_expire_at_bottom_level() {
             vec![],
             vec![],
             vec![],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Entry should still be gone
@@ -583,7 +631,8 @@ fn test_searchable_bucket_list_snapshots() {
                 vec![],
                 vec![entry.clone()],
                 vec![],
-            ).unwrap();
+            )
+            .unwrap();
         } else {
             bl.add_batch(
                 ledger_seq,
@@ -592,7 +641,8 @@ fn test_searchable_bucket_list_snapshots() {
                 vec![],
                 vec![],
                 vec![],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Entry should always be findable with current value
@@ -601,7 +651,8 @@ fn test_searchable_bucket_list_snapshots() {
             let expected_balance = ((ledger_seq - 1) / 5 + 1) as i64;
             assert_eq!(
                 account.balance, expected_balance,
-                "Balance should be {} at ledger {}", expected_balance, ledger_seq
+                "Balance should be {} at ledger {}",
+                expected_balance, ledger_seq
             );
         }
     }
@@ -651,7 +702,10 @@ fn test_eviction_iterator_resets_on_spill() {
     let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2049);
 
     // A spill occurred, iterator should reset
-    assert!(was_reset, "Reset should occur at ledger 2049 (prev_ledger = 2048 is spill boundary for level 5)");
+    assert!(
+        was_reset,
+        "Reset should occur at ledger 2049 (prev_ledger = 2048 is spill boundary for level 5)"
+    );
     assert_eq!(iter.bucket_file_offset, 0, "Offset should reset");
 }
 
@@ -689,25 +743,42 @@ fn test_eviction_scan_basic() {
         entries_with_ttl,
         vec![],
         vec![],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify entries exist before expiration
     for i in 0..5 {
         let key = make_contract_code_key(i);
         let found = bl.get(&key).unwrap();
-        assert!(found.is_some(), "Entry {} should exist before expiration", i);
+        assert!(
+            found.is_some(),
+            "Entry {} should exist before expiration",
+            i
+        );
     }
 
     // Advance ledgers (add empty batches)
     for ledger in 2..=5 {
-        bl.add_batch(ledger, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![]).unwrap();
+        bl.add_batch(
+            ledger,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
     }
 
     // Entries should still exist (not yet expired)
     for i in 0..5 {
         let key = make_contract_code_key(i);
         let found = bl.get(&key).unwrap();
-        assert!(found.is_some(), "Entry {} should still exist at ledger 5", i);
+        assert!(
+            found.is_some(),
+            "Entry {} should still exist at ledger 5",
+            i
+        );
     }
 
     // Now perform eviction scan at ledger 7 (after TTL expiration at 6)
@@ -716,20 +787,25 @@ fn test_eviction_scan_basic() {
 
     // All 5 ContractCode entries should be archived (they're persistent)
     assert_eq!(
-        archived_entries.len(), 5,
+        archived_entries.len(),
+        5,
         "Should have 5 archived persistent entries"
     );
 
     // No temporary entries were created, so no deletions
     assert_eq!(
-        deleted_keys.len(), 0,
+        deleted_keys.len(),
+        0,
         "Should have no deleted keys (no temporary entries)"
     );
 
     // Verify the archived entries are the ones we created
     for archived in &archived_entries {
         if let LedgerEntryData::ContractCode(code) = &archived.data {
-            assert!(code.hash.0[0] < 5, "Archived entry should be one of our created entries");
+            assert!(
+                code.hash.0[0] < 5,
+                "Archived entry should be one of our created entries"
+            );
         } else {
             panic!("Expected ContractCode entry in archived list");
         }
@@ -758,10 +834,19 @@ fn test_eviction_scan_shadowed_entries_not_evicted() {
         vec![code_entry, ttl_entry],
         vec![],
         vec![],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Advance to ledger 2
-    bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![]).unwrap();
+    bl.add_batch(
+        2,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![],
+        vec![],
+        vec![],
+    )
+    .unwrap();
 
     // Update the TTL to extend it (shadow the old TTL)
     let extended_ttl = 20; // Now expires at ledger 20
@@ -774,24 +859,26 @@ fn test_eviction_scan_shadowed_entries_not_evicted() {
         vec![],
         vec![updated_ttl_entry], // Update existing entry
         vec![],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Perform eviction scan at ledger 10 (after original TTL but before extended TTL)
     let (archived_entries, deleted_keys) = bl.scan_for_eviction(10).unwrap();
 
     // Entry should NOT be evicted because TTL was extended
     assert_eq!(
-        archived_entries.len(), 0,
+        archived_entries.len(),
+        0,
         "Entry should not be archived - TTL was extended"
     );
-    assert_eq!(
-        deleted_keys.len(), 0,
-        "No entries should be deleted"
-    );
+    assert_eq!(deleted_keys.len(), 0, "No entries should be deleted");
 
     // Verify entry still exists
     let found = bl.get(&code_key).unwrap();
-    assert!(found.is_some(), "Entry should still exist after TTL extension");
+    assert!(
+        found.is_some(),
+        "Entry should still exist after TTL extension"
+    );
 }
 
 /// Test incremental eviction scan with settings
@@ -821,7 +908,8 @@ fn test_eviction_scan_incremental() {
         entries,
         vec![],
         vec![],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Create settings for incremental scan
     let settings = StateArchivalSettings {
@@ -837,7 +925,9 @@ fn test_eviction_scan_incremental() {
     };
 
     // Perform incremental scan at ledger 5 (after expiration)
-    let result = bl.scan_for_eviction_incremental(iter, 5, &settings).unwrap();
+    let result = bl
+        .scan_for_eviction_incremental(iter, 5, &settings)
+        .unwrap();
 
     // Should have scanned some bytes
     assert!(result.bytes_scanned > 0, "Should have scanned some bytes");
@@ -854,9 +944,9 @@ fn test_eviction_scan_incremental() {
     // If scan_complete is true, the iterator may have wrapped back to start.
     if !result.scan_complete {
         assert!(
-            result.end_iterator.bucket_file_offset > 0 ||
-            result.end_iterator.bucket_list_level > 0 ||
-            !result.end_iterator.is_curr_bucket,
+            result.end_iterator.bucket_file_offset > 0
+                || result.end_iterator.bucket_list_level > 0
+                || !result.end_iterator.is_curr_bucket,
             "Iterator should have advanced (scan not complete)"
         );
     }
@@ -891,7 +981,8 @@ fn test_bucket_manager_persistence() {
         let manager = BucketManager::new(bucket_dir.clone()).unwrap();
 
         // Create a bucket from entries (create_bucket handles saving to disk)
-        let bucket_entries: Vec<BucketEntry> = entries.iter()
+        let bucket_entries: Vec<BucketEntry> = entries
+            .iter()
             .map(|e| BucketEntry::Init(e.clone()))
             .collect();
 
@@ -899,7 +990,10 @@ fn test_bucket_manager_persistence() {
         bucket_hash = bucket.hash();
 
         // Verify bucket exists
-        assert!(manager.bucket_exists(&bucket_hash), "Bucket should exist after create");
+        assert!(
+            manager.bucket_exists(&bucket_hash),
+            "Bucket should exist after create"
+        );
     }
 
     // Phase 2: Reopen manager, verify bucket persists
@@ -907,12 +1001,23 @@ fn test_bucket_manager_persistence() {
         let manager = BucketManager::new(bucket_dir.clone()).unwrap();
 
         // Bucket should still exist
-        assert!(manager.bucket_exists(&bucket_hash), "Bucket should persist across manager restart");
+        assert!(
+            manager.bucket_exists(&bucket_hash),
+            "Bucket should persist across manager restart"
+        );
 
         // Load and verify the bucket
         let loaded_bucket = manager.load_bucket(&bucket_hash).unwrap();
-        assert_eq!(loaded_bucket.hash(), bucket_hash, "Loaded bucket hash should match");
-        assert_eq!(loaded_bucket.len(), 10, "Loaded bucket should have 10 entries");
+        assert_eq!(
+            loaded_bucket.hash(),
+            bucket_hash,
+            "Loaded bucket hash should match"
+        );
+        assert_eq!(
+            loaded_bucket.len(),
+            10,
+            "Loaded bucket should have 10 entries"
+        );
 
         // Verify entry contents
         for i in 0..10 {
@@ -922,7 +1027,12 @@ fn test_bucket_manager_persistence() {
 
             if let Some(BucketEntry::Init(entry)) = found {
                 if let LedgerEntryData::Account(account) = &entry.data {
-                    assert_eq!(account.balance, 1000 + i as i64, "Entry {} should have correct balance", i);
+                    assert_eq!(
+                        account.balance,
+                        1000 + i as i64,
+                        "Entry {} should have correct balance",
+                        i
+                    );
                 }
             }
         }
@@ -953,7 +1063,8 @@ fn test_bucket_manager_load_by_hash() {
             })
             .collect();
 
-        let bucket_entries: Vec<BucketEntry> = entries.iter()
+        let bucket_entries: Vec<BucketEntry> = entries
+            .iter()
             .map(|e| BucketEntry::Init(e.clone()))
             .collect();
 
@@ -972,7 +1083,10 @@ fn test_bucket_manager_load_by_hash() {
 
     // Verify non-existent bucket returns error or None
     let fake_hash = Hash256::from_bytes([99u8; 32]);
-    assert!(!manager.bucket_exists(&fake_hash), "Fake bucket should not exist");
+    assert!(
+        !manager.bucket_exists(&fake_hash),
+        "Fake bucket should not exist"
+    );
 }
 
 /// Test BucketManager handles empty buckets correctly
@@ -991,15 +1105,29 @@ fn test_bucket_manager_empty_bucket() {
     let empty_hash = empty_bucket.hash();
 
     // Empty bucket hash should be zero
-    assert_eq!(empty_hash, Hash256::ZERO, "Empty bucket should have zero hash");
+    assert_eq!(
+        empty_hash,
+        Hash256::ZERO,
+        "Empty bucket should have zero hash"
+    );
 
     // Empty bucket check should work
-    assert!(empty_bucket.is_empty(), "Empty bucket should report as empty");
+    assert!(
+        empty_bucket.is_empty(),
+        "Empty bucket should report as empty"
+    );
 
     // Also test Bucket::empty() directly
     let direct_empty = Bucket::empty();
-    assert_eq!(direct_empty.hash(), Hash256::ZERO, "Direct empty bucket should have zero hash");
-    assert!(direct_empty.is_empty(), "Direct empty bucket should report as empty");
+    assert_eq!(
+        direct_empty.hash(),
+        Hash256::ZERO,
+        "Direct empty bucket should have zero hash"
+    );
+    assert!(
+        direct_empty.is_empty(),
+        "Direct empty bucket should report as empty"
+    );
 }
 
 /// Test bucket verification
@@ -1014,11 +1142,10 @@ fn test_bucket_manager_verify_buckets() {
     let manager = BucketManager::new(bucket_dir).unwrap();
 
     // Create and save a bucket
-    let entries: Vec<_> = (0..5)
-        .map(|i| make_account_entry(i, 500))
-        .collect();
+    let entries: Vec<_> = (0..5).map(|i| make_account_entry(i, 500)).collect();
 
-    let bucket_entries: Vec<BucketEntry> = entries.iter()
+    let bucket_entries: Vec<BucketEntry> = entries
+        .iter()
         .map(|e| BucketEntry::Init(e.clone()))
         .collect();
 
@@ -1027,8 +1154,14 @@ fn test_bucket_manager_verify_buckets() {
 
     // Verify the bucket using verify_bucket_hashes (plural)
     let mismatches = manager.verify_bucket_hashes(&[hash]).unwrap();
-    assert!(mismatches.is_empty(), "Bucket hash verification should find no mismatches");
+    assert!(
+        mismatches.is_empty(),
+        "Bucket hash verification should find no mismatches"
+    );
 
     // Also verify bucket exists
-    assert!(manager.bucket_exists(&hash), "Bucket should exist after verification");
+    assert!(
+        manager.bucket_exists(&hash),
+        "Bucket should exist after verification"
+    );
 }

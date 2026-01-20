@@ -42,15 +42,13 @@ use crate::frame::TransactionFrame;
 use crate::result::RefundableFeeTracker;
 
 /// Configuration for diagnostic event collection.
-#[derive(Debug, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DiagnosticConfig {
     /// Enable diagnostic events during apply.
     pub enable_soroban_diagnostic_events: bool,
     /// Enable diagnostics for transaction submission validation.
     pub enable_diagnostics_for_tx_submission: bool,
 }
-
 
 /// Manages diagnostic events during transaction validation and application.
 ///

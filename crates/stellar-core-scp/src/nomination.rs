@@ -434,9 +434,10 @@ impl NominationProtocol {
                 }
 
                 if self.should_ratify_value(&value, local_quorum_set, driver)
-                    && Self::insert_unique(&mut self.candidates, value.clone()) {
-                        new_candidates = true;
-                    }
+                    && Self::insert_unique(&mut self.candidates, value.clone())
+                {
+                    new_candidates = true;
+                }
             }
 
             if new_candidates {

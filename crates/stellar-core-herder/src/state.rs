@@ -21,8 +21,7 @@ use std::fmt;
 /// The Herder transitions through these states as it synchronizes with the network
 /// and begins participating in consensus. Each state determines which operations
 /// are permitted (e.g., receiving transactions, processing SCP envelopes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum HerderState {
     /// Initial state after startup.
     /// The node is booting up and hasn't yet connected to the network.
@@ -75,7 +74,6 @@ impl HerderState {
         }
     }
 }
-
 
 impl fmt::Display for HerderState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

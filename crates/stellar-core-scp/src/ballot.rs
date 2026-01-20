@@ -360,9 +360,10 @@ impl BallotProtocol {
 
         // In EXTERNALIZE, we must have commit and high
         if self.phase == BallotPhase::Externalize
-            && (self.commit.is_none() || self.high_ballot.is_none()) {
-                return Err("externalize phase requires commit and high".to_string());
-            }
+            && (self.commit.is_none() || self.high_ballot.is_none())
+        {
+            return Err("externalize phase requires commit and high".to_string());
+        }
 
         Ok(())
     }

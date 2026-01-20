@@ -3525,7 +3525,9 @@ impl OperationInvariantRunner {
                 LedgerEntryChange::Removed(key) => {
                     let key_bytes = key.to_xdr(Limits::none())?;
                     if let Some(previous) = self.entries.remove(&key_bytes) {
-                        invariant_changes.push(InvariantLedgerEntryChange::Deleted { previous: Box::new(previous) });
+                        invariant_changes.push(InvariantLedgerEntryChange::Deleted {
+                            previous: Box::new(previous),
+                        });
                     }
                 }
             }
@@ -4393,29 +4395,26 @@ fn has_sufficient_signer_weight(
         match key {
             SignerKey::Ed25519(key) => {
                 if let Ok(pk) = stellar_core_crypto::PublicKey::from_bytes(&key.0) {
-                    if has_ed25519_signature(tx_hash, signatures, &pk)
-                        && counted.insert(id) {
-                            total = total.saturating_add(signer.weight);
-                        }
+                    if has_ed25519_signature(tx_hash, signatures, &pk) && counted.insert(id) {
+                        total = total.saturating_add(signer.weight);
+                    }
                 }
             }
             SignerKey::PreAuthTx(key) => {
-                if key.0 == tx_hash.0
-                    && counted.insert(id) {
-                        total = total.saturating_add(signer.weight);
-                    }
+                if key.0 == tx_hash.0 && counted.insert(id) {
+                    total = total.saturating_add(signer.weight);
+                }
             }
             SignerKey::HashX(key) => {
-                if has_hashx_signature(signatures, key)
-                    && counted.insert(id) {
-                        total = total.saturating_add(signer.weight);
-                    }
+                if has_hashx_signature(signatures, key) && counted.insert(id) {
+                    total = total.saturating_add(signer.weight);
+                }
             }
             SignerKey::Ed25519SignedPayload(payload) => {
-                if has_signed_payload_signature(tx_hash, signatures, payload)
-                    && counted.insert(id) {
-                        total = total.saturating_add(signer.weight);
-                    }
+                if has_signed_payload_signature(tx_hash, signatures, payload) && counted.insert(id)
+                {
+                    total = total.saturating_add(signer.weight);
+                }
             }
         }
 

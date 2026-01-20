@@ -484,11 +484,10 @@ impl BucketOutputIterator {
         self.flush_buffer()?;
 
         // Finish compression and get hash
-        let encoder = self.writer.into_inner().map_err(|e| {
-            std::io::Error::other(
-                format!("Failed to flush writer: {}", e),
-            )
-        })?;
+        let encoder = self
+            .writer
+            .into_inner()
+            .map_err(|e| std::io::Error::other(format!("Failed to flush writer: {}", e)))?;
         encoder.finish()?;
 
         let hash = Hash256::from_bytes(self.hasher.finalize().into());
