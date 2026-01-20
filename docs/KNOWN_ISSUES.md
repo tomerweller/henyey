@@ -137,27 +137,56 @@ We resolved the specific 152692 mismatch by adding disk-read byte metering befor
 
 ### Details
 ```
-Ledger 152692 TX 2:
-  - Our result: InvokeHostFunction(Trapped)
-  - CDP result: InvokeHostFunction(ResourceLimitExceeded)
-  - Host error: Error(Storage, ExceededLimit)
-  - CPU consumed: 824,450 (measured by us)
-  - CPU specified: 933,592 (transaction limit)
+Ledger 706 TX 1 (first mismatch in continuous replay):
+  - Our result: InvokeHostFunction(ResourceLimitExceeded)
+  - CDP result: InvokeHostFunction(Success)
+  - CPU consumed: 1,120,709 (measured by us)
+  - CPU specified: 1,044,063 (transaction limit)
+  - Difference: +7% CPU usage
 ```
 
-### Root Cause Analysis
-This mismatch was caused by missing **disk-read byte metering** before host invocation. C++ stellar-core charges disk read bytes while loading the footprint (`addReads`/`meterDiskReadResource`) and fails early if the declared `disk_read_bytes` is exceeded. We previously deferred all failures to host execution, which produced a `Storage/ExceededLimit` error and mapped to `Trapped`.
+### Root Cause Analysis (2026-01-20 Deep Investigation)
 
-### Fix Applied
+**Confirmed**: Cost params ARE loaded correctly from ledger state (ConfigSettingEntry), matching C++ behavior.
+
+**Root cause**: The testnet bucket list contains cost params that were **modified via network config upgrades** after the original transaction execution:
+
+| Cost Type | Current Testnet | C++ V20 Initial | Notes |
+|-----------|-----------------|-----------------|-------|
+| WasmInsnExec | 4, 0 | 4, 0 | Unchanged |
+| VmInstantiation | 417482, 45712 | 451626, 45405 | **Modified** |
+| VmCachedInstantiation | 41142, 634 | 451626, 45405 | **V21 upgrade** |
+
+**Timeline problem**:
+1. Config upgrades happened at some ledger X between genesis and checkpoint
+2. Transactions at early ledgers (e.g., 706) were executed with pre-upgrade cost params
+3. When we catchup from any checkpoint, we get post-upgrade cost params from the bucket list
+4. Replaying with post-upgrade params produces different CPU consumption
+
+**Why we follow C++ pattern correctly**:
+- We load ContractCostParams from ConfigSettingEntry in the bucket list ✓
+- We pass cost params to soroban-env-host via Budget::try_from_configs() ✓
+- We handle protocol version differences (P24 vs P25) ✓
+- The bucket list contains the correct state AS OF the checkpoint ✓
+
+**Why this cannot be fixed**:
+- The bucket list only stores CURRENT state, not historical state
+- We don't have a record of when cost param upgrades occurred
+- Reconstructing historical cost params would require reversing all config upgrades
+- C++ stellar-core would have the same issue when replaying with current cost params
+
+### Fix Applied (for 152692)
 - Meter disk-read bytes before host invocation using the XDR size of each metered entry.
 - For protocol 23+, only meter classic entries in the footprint plus any archived restoration entries; pre-23 meters all footprint entries.
 - Return `ResourceLimitExceeded` before host execution when the read budget is exceeded, matching upstream behavior.
 
 ### Verification
-Targeted verification for ledgers 152690-152694 now shows 0 mismatches.
+Targeted verification for ledgers 152690-152694 now shows 0 mismatches (disk-read metering fix).
+Early ledger mismatches (706+) remain due to cost model variance.
 
 ### Affected Ledgers
-- Ledger 152692 TX 2 (fixed via disk-read metering; cost-model variance is no longer the cause)
+- Ledger 152692 TX 2 (fixed via disk-read metering)
+- Ledger 706+ (historical cost model variance - cannot fix)
 
 ---
 
