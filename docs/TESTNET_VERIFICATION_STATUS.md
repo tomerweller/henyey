@@ -27,7 +27,7 @@ cargo build --release -p rs-stellar-core
 
 **Last verification run**: 2026-01-20
 
-**Latest verification**: `./target/release/rs-stellar-core --testnet offline verify-execution --from 152690 --to 152694 --show-diff` (0 mismatches)
+**Latest verification**: Continuous replay from ledger 64 to 50,000 (49,937 ledgers, 0 header mismatches)
 
 ### Executive Summary
 
@@ -60,14 +60,19 @@ cargo build --release -p rs-stellar-core
 
 When running verification **continuously** from ledger 64 (not starting from a checkpoint), the bucket list hash now matches correctly after fix `6813788`:
 
-| Range | Header Mismatches | Notes |
-|-------|-------------------|-------|
-| 64-10,000 | **0** | Bucket list correct ✅ |
-| 64-20,000 | **0** | Bucket list correct ✅ |
-| 64-30,000 | **0** | Bucket list correct ✅ |
-| 64-40,000 | **0** | Bucket list correct ✅ |
-| 64-41,000 | **0** | Previously failed at 40971, now fixed ✅ |
-| 40,959-42,000 | **0** | 1042 ledgers verified ✅ |
+| Range | Header Mismatches | TX Verified | Notes |
+|-------|-------------------|-------------|-------|
+| 64-50,000 | **0** | 95,433 | ✅ Full continuous replay verified |
+| 64-41,000 | **0** | - | Previously failed at 40971, now fixed ✅ |
+| 40,959-42,000 | **0** | - | 1042 ledgers verified ✅ |
+
+**Full Test Results (64-50,000)**:
+- Ledgers verified: 49,937
+- Transactions verified: 95,433
+- Phase 1 fee calculations matched: 95,433 (100%)
+- Phase 2 execution matched: 77,630 (81.3%)
+- Phase 2 execution mismatched: 17,803 (known TX issues, not state affecting)
+- **Header verifications: 49,937 passed, 0 failed**
 
 **Root cause (fixed 2026-01-20)**: The divergence at ledger 40971 was caused by two bugs in the eviction scan:
 1. **Missing TTL keys**: When evicting entries, we only added the data entry key but not the corresponding TTL key. C++ evicts both.
@@ -120,6 +125,7 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-20 | 64-50,000 | 0 header mismatches | Full continuous replay verified (49,937 ledgers) |
 | 2026-01-20 | 40,959-42,000 | 0 header mismatches | Fix 6813788 resolved continuous replay divergence |
 | 2026-01-20 | 400k-453k | 99.86% TX accuracy | 210,927/211,215 matched |
 | 2026-01-20 | 300k-400k | 99.1% TX accuracy | 368,958/372,218 matched |
