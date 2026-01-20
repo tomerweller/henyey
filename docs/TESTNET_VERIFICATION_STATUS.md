@@ -35,9 +35,10 @@ cargo build --release -p rs-stellar-core
 |--------|-------|
 | **Bucket list implementation** | ✅ **Correct** |
 | **Checkpoint-based verification** | ✅ **100% header match** |
+| **Continuous replay** | ✅ **100% header match** |
 | **Transaction execution accuracy** | **99.86%** (recent ledgers) |
-| **Issues remaining** | 2 genuine bugs + 1 historical |
-| **Issues fixed** | 13+ bugs fixed |
+| **Issues remaining** | 2 (historical cost model + CDP anomaly) |
+| **Issues fixed** | 15+ bugs fixed |
 
 ### Key Finding
 
@@ -57,7 +58,7 @@ cargo build --release -p rs-stellar-core
 
 ### Continuous Replay Analysis
 
-When running verification **continuously** from ledger 64 (not starting from a checkpoint), bucket list divergence accumulates. After fix `5e4f2f1`, correct replay extended from ~8,591 to ~40,970 ledgers:
+When running verification **continuously** from ledger 64 (not starting from a checkpoint), the bucket list hash now matches correctly after fix `6813788`:
 
 | Range | Header Mismatches | Notes |
 |-------|-------------------|-------|
@@ -65,13 +66,14 @@ When running verification **continuously** from ledger 64 (not starting from a c
 | 64-20,000 | **0** | Bucket list correct ✅ |
 | 64-30,000 | **0** | Bucket list correct ✅ |
 | 64-40,000 | **0** | Bucket list correct ✅ |
-| 64-40,970 | **0** | Last clean ledger ✅ |
-| 64-41,000 | 30 | Divergence begins at 40971 |
-| 64-50,000 | 9,030 | Accumulating divergence |
+| 64-41,000 | **0** | Previously failed at 40971, now fixed ✅ |
+| 40,959-42,000 | **0** | 1042 ledgers verified ✅ |
 
-**Root cause (investigated 2026-01-20)**: The divergence at ledger 40971 is caused by **~16,000 Soroban TX execution mismatches** in ledgers 64-40970. These transactions (mostly InvokeHostFunction) fail with `ResourceLimitExceeded` in our execution but succeeded in the original execution due to historical cost model calibration differences. The accumulated state differences from these mismatches eventually cause the bucket list hash to diverge. See Issue #3 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for details.
+**Root cause (fixed 2026-01-20)**: The divergence at ledger 40971 was caused by two bugs in the eviction scan:
+1. **Missing TTL keys**: When evicting entries, we only added the data entry key but not the corresponding TTL key. C++ evicts both.
+2. **Missing max_entries_to_archive limit**: Our StateArchivalSettings was missing the `max_entries_to_archive` field (default 1000), which caps how many data entries can be evicted per ledger.
 
-**Key observation**: Continuous replay divergence is a **low priority** issue since production nodes always catch up from recent checkpoints.
+These were fixed in commit `6813788`.
 
 ---
 
@@ -94,6 +96,8 @@ When running verification **continuously** from ledger 64 (not starting from a c
 | Soroban Archived Entry TTL | - | Minimum TTL provision | Fixed |
 | Persistent WASM Module Cache | - | PersistentModuleCache | Fixed |
 | Module Cache Wiring | - | Wired to LedgerManager | Fixed |
+| **Eviction Scan TTL Keys** | 40971 | Include TTL keys in evicted_keys | ✅ 100% match |
+| **max_entries_to_archive** | 40971 | Add missing field to StateArchivalSettings | ✅ 100% match |
 
 ### Remaining Issues
 
@@ -109,7 +113,6 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
 
 1. **Issue #6 (Refundable fee)**: Remaining cases may be CDP anomaly (bucket list matches)
 2. **Issue #1 (Buffered gap)**: Architecture change needed for real-time sync
-3. **Issue #2 (Continuous replay divergence at 40971)**: Low priority - only affects testing
 
 ---
 
@@ -117,6 +120,7 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-20 | 40,959-42,000 | 0 header mismatches | Fix 6813788 resolved continuous replay divergence |
 | 2026-01-20 | 400k-453k | 99.86% TX accuracy | 210,927/211,215 matched |
 | 2026-01-20 | 300k-400k | 99.1% TX accuracy | 368,958/372,218 matched |
 | 2026-01-20 | 64-40,970 | 0 header mismatches | Fix 5e4f2f1 extended correct replay |
