@@ -1,10 +1,166 @@
-## C++ Parity Status
+# Parity Status: stellar-core-history
 
-**Overall Parity: ~90%**
+**Overall Parity: ~85%**
 
 This document tracks the parity between this Rust crate (`stellar-core-history`) and the C++ `stellar-core/src/history/` module. The upstream reference is `.upstream-v25/src/history/`.
 
-### Module Mapping
+## Overview
+
+The `stellar-core-history` crate provides history archive access, catchup, replay, and publish support for rs-stellar-core. It corresponds to the C++ `src/history/` module and related components in `src/catchup/` and `src/historywork/`.
+
+---
+
+## Implemented Features
+
+- [x] HistoryArchive - HTTP client for fetching archive data
+- [x] HistoryManager - Multi-archive access with failover
+- [x] HistoryArchiveManager - Archive management with writable detection
+- [x] HistoryArchiveState - Full JSON parsing/serialization (v1 and v2)
+- [x] Checkpoint utilities - Path generation, frequency, boundary detection
+- [x] CheckpointBuilder - Crash-safe checkpoint construction with dirty files
+- [x] PublishQueue - Persistent SQLite-backed publish queue
+- [x] CatchupManager - Full catchup orchestration (7-step process)
+- [x] Bucket download/verification - Parallel downloads with hash verification
+- [x] Ledger replay - Transaction re-execution and TransactionMeta-based replay
+- [x] Header chain verification - Cryptographic hash chain validation
+- [x] Transaction set/result verification
+- [x] RemoteArchive - Shell command-based upload (put_cmd, mkdir_cmd)
+- [x] CDP Integration - SEP-0054 data lake client (Rust-only extension)
+
+## Not Implemented (Gaps)
+
+- [ ] Work-based catchup orchestration (C++ uses explicit work graph)
+- [ ] FutureBucket in-progress merge resolution
+- [ ] Publish success/failure metrics (Medida instrumentation)
+- [ ] Publication callback mechanism
+- [ ] Get command templating for shell-based fetch
+- [ ] History archive report work
+- [ ] SCP message writing in published snapshots
+- [ ] Accelerated checkpoint frequency for testing
+
+---
+
+## Test Coverage Comparison
+
+### C++ Tests (upstream: `.upstream-v25/src/history/test/`)
+
+| Test File | Test Name | Rust Equivalent | Status |
+|-----------|-----------|-----------------|--------|
+| **HistoryTests.cpp** | | | |
+| | `checkpoint containing ledger` | `checkpoint.rs::test_checkpoint_containing_matches_upstream` | ✅ Covered |
+| | `HistoryManager compress` | `download_utils.rs::test_decompress_gzip_roundtrip` | ✅ Covered |
+| | `HistoryArchiveState get_put` | `lib.rs::archive_manager_tests` | 🔶 Partial |
+| | `History bucket verification` | `catchup_integration.rs::test_catchup_against_local_archive_checkpoint` | ✅ Covered |
+| | `History bucket verification (live)` | `catchup_integration.rs` | ✅ Covered |
+| | `History bucket verification (hot archive)` | `catchup_integration.rs` | 🔶 Partial (hot archive not tested separately) |
+| | `History bucket verification (file not found)` | — | ❌ Missing |
+| | `History bucket verification (corrupted zip)` | — | ❌ Missing |
+| | `History bucket verification (hash mismatch)` | — | ❌ Missing |
+| | `Ledger chain verification` | `verify.rs::test_verify_header_chain_*` | ✅ Covered |
+| | `Ledger chain verification (bad hash)` | `verify.rs::test_verify_header_chain_broken` | ✅ Covered |
+| | `Ledger chain verification (bad ledger version)` | — | ❌ Missing |
+| | `Ledger chain verification (overshot)` | — | ❌ Missing |
+| | `Ledger chain verification (undershot)` | — | ❌ Missing |
+| | `Ledger chain verification (missing entries)` | — | ❌ Missing |
+| | `Tx results verification` | `replay_integration.rs::test_catchup_replay_bucket_hash_verification` | 🔶 Partial |
+| | `Tx results verification (header file missing)` | — | ❌ Missing |
+| | `Tx results verification (hash mismatch)` | — | ❌ Missing |
+| | `History publish` | — | ❌ Missing |
+| | `History publish with restart` | — | ❌ Missing |
+| | `History publish to multiple archives` | — | ❌ Missing |
+| | `History catchup with extra validation` | — | ❌ Missing |
+| | `Publish works correctly post shadow removal` | — | ❌ Missing |
+| | `History catchup` | `catchup_integration.rs` | 🔶 Partial |
+| | `Publish throttles catchup` | — | ❌ Missing |
+| | `History catchup with different modes` | — | ❌ Missing |
+| | `Retriggering catchups after trimming mSyncingLedgers` | — | ❌ Missing |
+| | `History prefix catchup` | — | ❌ Missing |
+| | `Catchup with protocol upgrade` | — | ❌ Missing |
+| | `Catchup fatal failure` | — | ❌ Missing |
+| | `Catchup non-initentry buckets to initentry-supporting works` | — | ❌ Missing |
+| | `Publish catchup alternation with stall` | — | ❌ Missing |
+| | `Publish catchup via s3` | — | ❌ Missing (hidden test) |
+| | `HAS in publishqueue remains in pristine state until publish` | — | ❌ Missing |
+| | `persist publish queue` | — | ❌ Missing |
+| | `catchup with a gap` | — | ❌ Missing |
+| | `Catchup recent` | — | ❌ Missing |
+| | `Catchup manual` | — | ❌ Missing |
+| | `initialize existing history store fails` | `lib.rs::archive_manager_tests` | 🔶 Partial |
+| | `Catchup failure recovery with buffered checkpoint` | — | ❌ Missing |
+| | `Change ordering of buffered ledgers` | — | ❌ Missing |
+| | `Introduce and fix gap without starting catchup` | — | ❌ Missing |
+| | `Receive trigger and checkpoint ledger out of order` | — | ❌ Missing |
+| | `Externalize gap while catchup work is running` | — | ❌ Missing |
+| | `CheckpointBuilder` | — | ❌ Missing |
+| **SerializeTests.cpp** | | | |
+| | `Serialization round trip` | `serialize_roundtrip.rs::test_history_archive_state_roundtrip` | ✅ Covered |
+
+### Legend
+
+- ✅ **Covered**: Rust test exists with equivalent functionality
+- 🔶 **Partial**: Some aspects tested but not complete coverage
+- ❌ **Missing**: No Rust equivalent test
+
+### Rust-only Tests
+
+These tests exist in Rust but have no direct C++ equivalent:
+
+| Test File | Test Name | Description |
+|-----------|-----------|-------------|
+| `serialize_roundtrip.rs` | `test_history_archive_state_roundtrip` | Tests HAS JSON round-trip with real testnet/mainnet fixtures |
+| `download_utils.rs` | `test_decompress_gzip_roundtrip` | Gzip compression/decompression |
+| `download_utils.rs` | `test_parse_xdr_stream_raw` | Raw XDR stream parsing |
+| `download_utils.rs` | `test_parse_xdr_stream_record_marked` | Record-marked XDR parsing (RFC 5531) |
+| `catchup_integration.rs` | `test_catchup_against_local_archive_checkpoint` | Full catchup against mock HTTP server |
+| `replay_integration.rs` | `test_catchup_replay_bucket_hash_verification` | Replay with bucket list hash verification |
+| `checkpoint.rs` | `test_latest_checkpoint_before_or_at` | Checkpoint boundary utility |
+| `checkpoint.rs` | `test_next_checkpoint` | Next checkpoint calculation |
+| `checkpoint.rs` | `test_checkpoint_start` | First ledger in checkpoint |
+| `checkpoint.rs` | `test_checkpoint_range` | Checkpoint ledger range |
+| `verify.rs` | `test_verify_header_chain_valid` | Valid header chain verification |
+| `verify.rs` | `test_verify_header_chain_broken` | Broken hash chain detection |
+| `verify.rs` | `test_verify_header_chain_non_consecutive` | Sequence gap detection |
+| `verify.rs` | `test_verify_bucket_hash` | Bucket content hash verification |
+| `verify.rs` | `test_verify_header_chain_empty` | Empty chain edge case |
+| `verify.rs` | `test_verify_header_chain_single` | Single header edge case |
+| `lib.rs` | `test_archive_entry_read_only` | Read-only archive configuration |
+| `lib.rs` | `test_archive_entry_write_only` | Write-only archive configuration |
+| `lib.rs` | `test_archive_entry_fully_configured` | Full read/write archive |
+| `lib.rs` | `test_manager_publish_enabled_*` | Publish capability detection |
+| `lib.rs` | `test_manager_get_archive` | Archive lookup by name |
+| `lib.rs` | `test_manager_check_sensible_config_*` | Archive config validation |
+
+---
+
+## Known Gaps
+
+### Critical Test Coverage Gaps
+
+1. **Bucket verification failure modes**: The C++ tests extensively test bucket download failures (file not found, corrupted zip, hash mismatch). Rust lacks these negative test cases.
+
+2. **Ledger chain verification edge cases**: C++ tests `VERIFY_STATUS_ERR_BAD_LEDGER_VERSION`, `VERIFY_STATUS_ERR_OVERSHOT`, `VERIFY_STATUS_ERR_UNDERSHOT`, `VERIFY_STATUS_ERR_MISSING_ENTRIES`. Rust only tests basic chain validation.
+
+3. **Online catchup scenarios**: C++ has extensive tests for online catchup with buffered ledgers, gaps, out-of-order delivery, and recovery. Rust tests are primarily offline catchup.
+
+4. **Publish workflow**: C++ tests publish with restart, multiple archives, crash recovery with dirty files. Rust lacks publish integration tests.
+
+5. **Protocol upgrade during catchup**: C++ tests catching up across protocol upgrades (e.g., generalized tx sets, hot archive buckets). Rust lacks these.
+
+6. **CheckpointBuilder crash scenarios**: C++ tests `mThrowOnAppend` for simulating crashes during checkpoint building. Rust lacks crash simulation tests.
+
+### Functionality Gaps
+
+1. **FutureBucket resolution**: C++ resolves in-progress bucket merges from HAS `next` field. Rust parses but ignores merge state.
+
+2. **Metrics**: C++ tracks publish success/failure counts via Medida. Rust uses only logging.
+
+3. **Online catchup buffering**: C++ has sophisticated `mSyncingLedgers` buffer management with trimming. Rust's catchup is simpler.
+
+4. **Archive report work**: C++ can check what's published on remote archives. Rust lacks this.
+
+---
+
+## Module Mapping
 
 | Rust Module | C++ File(s) | Status |
 |-------------|-------------|--------|
@@ -26,364 +182,75 @@ This document tracks the parity between this Rust crate (`stellar-core-history`)
 
 ---
 
-### Implemented Features
+## Architectural Differences
 
-#### Core Archive Access (`archive.rs`, `lib.rs`)
+### Async Model
 
-- [x] **HistoryArchive** - HTTP client for fetching archive data
-  - `get_root_has()` - Fetch `.well-known/stellar-history.json`
-  - `get_checkpoint_has()` - Fetch checkpoint-specific HAS files
-  - `get_ledger_headers()` - Download ledger header XDR files
-  - `get_transactions()` - Download transaction history XDR files
-  - `get_results()` - Download transaction result XDR files
-  - `get_scp_history()` - Download SCP history entries
-  - `get_bucket()` - Download bucket files by hash
-- [x] **HistoryManager** - Multi-archive access with failover
-  - Sequential archive iteration until one succeeds
-  - Similar to C++ `HistoryArchiveManager::selectRandomReadableHistoryArchive`
-- [x] **CatchupMode** enum - Minimal, Complete, Recent modes
-- [x] **ArchiveEntry** - Combined read/write archive configuration
-  - `can_read()` / `can_write()` - Capability detection
-- [x] **HistoryArchiveManager** - Multi-archive management with writable detection
-  - `publish_enabled()` - Check if any archive supports publishing
-  - `get_writable_archives()` - Get all archives with put command
-  - `check_sensible_config()` - Validate archive configuration
-  - `initialize_history_archive()` - Create new archive with empty HAS
-  - `get_archive()` - Retrieve archive by name
+Rust uses `async/await` with Tokio. C++ uses a Work-based state machine pattern (`WorkScheduler`, `BasicWork` subclasses). The Rust approach is more idiomatic but doesn't map 1:1 to C++ Work classes.
 
-#### History Archive State (`archive_state.rs`)
+### Database Integration
 
-- [x] **HistoryArchiveState** - Full JSON parsing/serialization
-  - Version 1 and 2 format support
-  - Network passphrase field (version 2)
-  - `currentBuckets` array with curr/snap/next structure
-  - `hotArchiveBuckets` for protocol 23+ state archival
-- [x] **HASBucketLevel** - Per-level bucket hash tracking
-  - `curr` and `snap` bucket hashes
-  - `next` merge state tracking (parsed but not resolved)
-- [x] `all_bucket_hashes()` / `unique_bucket_hashes()` - Bucket enumeration
-- [x] `bucket_hashes_at_level()` / `hot_archive_bucket_hashes_at_level()`
+C++ integrates deeply with its SQL database for persistent state. Rust uses `stellar-core-db` more standalone.
 
-#### Path Generation (`paths.rs`, `checkpoint.rs`)
+### Crash Safety
 
-- [x] **Checkpoint frequency** - 64 ledgers (matches `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING=false`)
-- [x] `checkpoint_ledger()` / `checkpoint_containing()` - Checkpoint calculation
-- [x] `is_checkpoint_ledger()` - Checkpoint boundary detection
-- [x] `latest_checkpoint_before_or_at()` - Find catchup starting point
-- [x] `checkpoint_path()` - Generate `{category}/AA/BB/CC/{category}-AABBCCDD.xdr.gz` paths
-- [x] `bucket_path()` - Generate `bucket/AA/BB/CC/bucket-{hash}.xdr.gz` paths
-- [x] `root_has_path()` - `.well-known/stellar-history.json`
-- [x] `has_path()` - Per-checkpoint HAS file paths
-- [x] **Dirty file helpers** (crash-safe checkpoint building)
-  - `checkpoint_path_dirty()` - Generate `.dirty` temporary paths
-  - `is_dirty_path()` - Check if path is a dirty file
-  - `dirty_to_final_path()` - Convert dirty path to final path
-  - `final_to_dirty_path()` - Convert final path to dirty path
+C++ `CheckpointBuilder` implements ACID-like semantics with `.dirty` files and atomic renames. Rust's `CheckpointBuilder` mirrors this approach, but `PublishManager` writes files directly.
 
-#### Download Infrastructure (`download.rs`)
+### Metrics
 
-- [x] HTTP download with configurable retries and timeouts
-- [x] Gzip decompression for archive files
-- [x] XDR stream parsing (record-marked format per RFC 5531)
-- [x] `DownloadConfig` - Timeout, retry, and chunk size configuration
-
-#### Catchup (`catchup.rs`)
-
-- [x] **CatchupManager** - Full catchup orchestration
-  - 7-step process: HAS download, bucket download, bucket apply, ledger download, verify, replay, complete
-  - Progress tracking with `CatchupProgress` and `CatchupStatus`
-- [x] **Bucket download and application**
-  - Parallel bucket downloads (16 concurrent, matches C++ `MAX_CONCURRENT_SUBPROCESSES`)
-  - Disk-backed bucket storage for memory efficiency
-  - Bucket hash verification before use
-- [x] **Ledger data download**
-  - Headers, transactions, and results per checkpoint
-  - SCP history entry download and persistence
-- [x] **Pre-downloaded checkpoint data support**
-  - `catchup_to_ledger_with_checkpoint_data()` for testing/alternative sources
-- [x] **Verification during catchup**
-  - Header chain verification
-  - Transaction set hash verification (classic and generalized)
-  - Transaction result set hash verification
-  - Bucket list hash verification at checkpoints
-
-#### Replay (`replay.rs`)
-
-- [x] **Transaction re-execution replay** (`replay_ledger_with_execution`)
-  - Re-executes transactions against bucket list state
-  - Produces init/live/dead entry batches for bucket list updates
-  - Works with traditional archives (no TransactionMeta needed)
-- [x] **TransactionMeta-based replay** (`replay_ledger`)
-  - Applies exact entry changes from archives
-  - Requires CDP or LedgerCloseMeta sources
-- [x] **Eviction iterator tracking** (protocol 23+)
-  - Loads `EvictionIterator` ConfigSettingEntry from checkpoint
-  - Incremental eviction scan during replay
-  - Updates iterator position per-ledger
-- [x] **Hot archive bucket list updates**
-  - Archived persistent entries moved to hot archive during eviction
-  - Combined bucket list hash: `SHA256(live_hash || hot_archive_hash)`
-- [x] **Invariant verification during replay**
-  - Conservation of lumens, valid entry structure, sequence progression
-- [x] **ReplayConfig** - Verification and event emission options
-
-#### Publishing (`publish.rs`)
-
-- [x] **PublishManager** - Checkpoint publishing to local directory
-  - `publish_checkpoint()` - Write all checkpoint files
-  - `is_published()` / `latest_published_checkpoint()` - Publication tracking
-- [x] **File writing**
-  - Ledger headers, transactions, results (gzipped XDR)
-  - Bucket files from bucket list entries
-  - HAS file generation (JSON)
-- [x] **Directory structure creation** following archive layout
-- [x] **Remote archive commands** via `RemoteArchive` in `remote_archive.rs`
-  - Configurable shell commands for upload and mkdir (`put_cmd`, `mkdir_cmd`)
-  - Templates with `{0}` (local) and `{1}` (remote) placeholders matching C++
-  - `RemoteArchive::put_file()`, `RemoteArchive::mkdir()`, `RemoteArchive::get_file()`
-  - `put_file_with_mkdir()` convenience helper
-- [x] **Verification before publishing**
-  - Header chain verification
-  - Transaction set and result hash verification
-
-#### Publish Queue (`publish_queue.rs`)
-
-- [x] **PublishQueue** - Persistent queue backed by SQLite
-  - `enqueue()` / `dequeue()` - Queue management with HAS state persistence
-  - `len()` / `is_empty()` - Queue size tracking
-  - `min_ledger()` / `max_ledger()` - Ledger range queries
-  - `get_state()` - Retrieve queued HistoryArchiveState
-  - `get_all()` - Load all queued checkpoints
-  - `get_referenced_bucket_hashes()` - Bucket retention tracking
-  - `stats()` / `log_status()` - Queue statistics and logging
-- [x] **Database schema** - `publishqueue` table matching C++ format
-
-#### Checkpoint Builder (`checkpoint_builder.rs`)
-
-- [x] **CheckpointBuilder** - Crash-safe checkpoint construction
-  - Write to `.dirty` temporary files first
-  - Atomic rename to final paths on commit
-  - `cleanup(lcl)` recovery on startup
-- [x] **XdrStreamWriter** - Gzip-compressed XDR stream writing
-  - RFC 5531 record marking (4-byte length prefix)
-  - Fsync after writes for durability
-- [x] **Crash recovery scenarios**
-  - Both dirty and final exist: delete dirty
-  - Only dirty exists: delete (will be rebuilt)
-  - Only final exists: keep as-is
-- [x] **Incremental API**
-  - `append_ledger_header()` - Add header during ledger close
-  - `append_transaction_set()` - Add transactions during ledger close
-  - `checkpoint_complete()` - Commit checkpoint with atomic renames
-
-#### Verification (`verify.rs`)
-
-- [x] **Header chain verification** (`verify_header_chain`)
-- [x] **Bucket hash verification** (`verify_bucket_hash`)
-- [x] **Transaction set hash verification** (`verify_tx_set`, `compute_tx_set_hash`)
-  - Classic format: `SHA256(previous_ledger_hash || tx1_xdr || tx2_xdr || ...)`
-  - Generalized format: `SHA256(full_tx_set_xdr)`
-- [x] **Transaction result set verification** (`verify_tx_result_set`)
-- [x] **Ledger hash verification** (`verify_ledger_hash`)
-- [x] **HAS structure validation** (`verify_has_structure`, `verify_has_checkpoint`)
-- [x] **SCP history entry verification** (`verify_scp_history_entries`)
-
-#### CDP Integration (`cdp.rs`) - Rust Extension
-
-- [x] **CdpDataLake** - SEP-0054 compliant data lake client
-  - Partition and batch file path calculation
-  - Zstd decompression for LedgerCloseMetaBatch files
-- [x] `extract_ledger_header()` - Header extraction from LedgerCloseMeta
-- [x] `extract_transaction_envelopes()` - Transaction envelope extraction
-- [x] `extract_transaction_metas()` - TransactionMeta extraction
-- [x] `extract_transaction_results()` - Transaction result extraction
-- [x] `extract_evicted_keys()` - V2 evicted keys extraction
-- [x] `extract_upgrade_metas()` - Protocol upgrade metadata extraction
-- [x] `extract_transaction_processing()` - Combined envelope/result/meta extraction
+C++ uses Medida for publish success/failure metrics. Rust uses `tracing` for structured logging but lacks equivalent metrics.
 
 ---
 
-### Not Yet Implemented (Gaps)
+## Design Decisions (Rust Extensions)
 
-#### Catchup Work Pipeline (`src/catchup/*`)
-
-- [ ] **Work-based catchup orchestration**
-  - C++ uses `CatchupWork` + `CatchupConfiguration` and an explicit work graph
-  - Rust uses a direct `CatchupManager` without per-step work objects
-- [ ] **Bucket indexing and application works**
-  - `IndexBucketsWork` (index build) and `ApplyBucketsWork` (apply bucket list)
-  - Rust restores bucket lists directly via `BucketList::restore_from_hashes`
-- [ ] **Buffered ledger apply pipeline**
-  - `ApplyBufferedLedgersWork`, `ApplyCheckpointWork`, `ApplyLedgerWork`
-  - Rust replays and applies ledgers inline in `catchup.rs`
-- [ ] **Ledger chain verification work**
-  - `VerifyLedgerChainWork` for header chain verification as a work item
-  - Rust runs header chain verification inline during catchup
-
-#### CheckpointBuilder (`CheckpointBuilder.h/cpp`)
-
-- [x] **ACID transactional checkpoint building**
-  - Implemented in `checkpoint_builder.rs`
-  - Writes to temporary `.dirty` files first, then atomically renames on commit
-  - Provides crash-safe checkpoint construction with automatic recovery
-- [x] **Incremental transaction appending**
-  - `append_ledger_header()`, `append_transaction_set()` - Append ledger-by-ledger during close
-- [x] **Dirty file cleanup** (`cleanup(lcl)`)
-  - Remove uncommitted publish data on startup
-  - Handles all crash recovery scenarios
-
-#### HistoryManager Publishing Integration
-
-- [ ] **Publish queue migration** (`dropSQLBasedPublish()`)
-  - One-time migration from old SQL-based format to file-based format
-  - Populates checkpoint files from DB history during upgrade
-- [ ] **Publication success/failure tracking**
-  - `getPublishSuccessCount()`, `getPublishFailureCount()` metrics
-  - Medida-based instrumentation in C++
-- [ ] **Publication callback** (`historyPublished()`)
-  - Callback mechanism for successful/failed publication
-  - Dequeues from publish queue after all archives succeed
-- [ ] **Wait for checkpoint publish** (`waitForCheckpointPublish()`)
-  - Blocking wait for publication completion (utility scenarios)
-
-#### HistoryArchive Remote Operations
-
-- [x] **Archive initialization** (`initializeHistoryArchive()`)
-  - Create `.well-known/stellar-history.json` in new archive
-  - Implemented in `HistoryArchiveManager::initialize_history_archive()`
-- [ ] **Get command templating** (`getFileCmd`)
-  - C++ can use shell commands for fetch, not just HTTP
-  - Rust has `RemoteArchive::get_file()` but HTTP fetch is still via `reqwest`
-
-#### HistoryArchiveManager
-
-- [x] **Writable archive detection** (`publishEnabled()`, `getWritableHistoryArchives()`)
-  - `ArchiveEntry::can_read()` / `can_write()` - Based on presence of get/put commands
-  - `HistoryArchiveManager::publish_enabled()` - Check if any archive supports publishing
-  - `HistoryArchiveManager::get_writable_archives()` - Get all writable archives
-- [x] **Archive configuration validation** (`checkSensibleConfig()`)
-  - Verify archive configuration is sensible (not just remote or just local)
-  - Warns about read-only archives
-- [ ] **History archive report work** (`getHistoryArchiveReportWork()`)
-  - Check last-published checkpoint on each configured archive
-- [x] **Ledger header verification work** (`getCheckLedgerHeaderWork()`)
-  - Implemented as `CheckSingleLedgerHeaderWork` in `stellar-core-historywork`
-
-#### FutureBucket Support
-
-- [ ] **In-progress merge resolution**
-  - HAS `next` field with `state != 0` indicates ongoing bucket merge
-  - C++ `resolveAllFutures()`, `resolveAnyReadyFutures()` for completing merges
-  - Rust parses `next` field but ignores merge state
-- [ ] **Bucket merge persistence**
-  - C++ can save/restore in-progress merges across restarts
-
-#### StateSnapshot (`StateSnapshot.h/cpp`)
-
-- [ ] **SCP message writing** (`writeSCPMessages()`)
-  - Include SCP history in published snapshots
-- [ ] **Differing HAS file computation** (`differingHASFiles()`)
-  - Compute what files need uploading vs existing archive state
-  - Optimization for incremental publishing
-
-#### Testing Support
-
-- [ ] **Publication enable/disable** (`setPublicationEnabled(bool)`)
-  - Testing interface to pause/resume publication
-- [ ] **Throw-on-append testing** (`mThrowOnAppend`)
-  - Crash testing for checkpoint builder
-- [ ] **Accelerated checkpoint frequency**
-  - `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING` sets frequency to 8
-
----
-
-### Architectural Differences
-
-#### Async Model
-
-The Rust implementation uses `async/await` with Tokio, while C++ uses a Work-based state machine pattern (WorkScheduler, BasicWork subclasses). The Rust approach is more idiomatic but doesn't map 1:1 to C++ Work classes like `GetRemoteFileWork`, `ApplyBucketsWork`, etc.
-
-#### Database Integration
-
-C++ integrates deeply with its SQL database for persistent state:
-- Publish queue in DB (migrated to files in recent versions)
-- Transaction/result history from DB during catchup
-- LCL tracking for crash recovery
-
-Rust uses `stellar-core-db` more standalone, with dedicated queries for:
-- Storing ledger headers and transaction history
-- Bucket list snapshots
-- SCP history entries
-
-#### Remote Publishing
-
-C++ supports configurable shell commands for remote archive access:
-```toml
-[HISTORY.archive_name]
-get = "curl -sf {0} -o {1}"
-put = "aws s3 cp {1} s3://bucket{0} --region us-east-1"
-mkdir = "aws s3 mb s3://bucket{0}"
-```
-
-Rust supports remote upload via configured shell commands (`put_cmd`, `mkdir_cmd`) through
-`RemoteArchive`, while fetch still uses HTTP via `reqwest`.
-
-#### Crash Safety
-
-C++ `CheckpointBuilder` implements ACID-like semantics:
-1. Write to `.dirty` temp files with fsync
-2. Atomic rename to final names after commit
-3. `cleanup(lcl)` on startup to recover valid state
-4. File-based publish queue with `durableRename`
-
-Rust's `PublishManager` writes files directly without explicit crash recovery. The publish queue uses SQLite transactions for atomicity.
-
-#### Metrics and Instrumentation
-
-C++ uses Medida for publish success/failure metrics and timing:
-- `history.publish.success` / `history.publish.failure` meters
-- `history.publish.time` timer
-- StatusManager for publish status messages
-
-Rust uses `tracing` for structured logging but lacks equivalent metrics.
-
----
-
-### Design Decisions (Rust Extensions)
-
-#### CDP Integration (SEP-0054)
+### CDP Integration (SEP-0054)
 
 The Rust crate includes first-class CDP support not present in C++:
 - `CdpDataLake` for accessing LedgerCloseMeta from cloud storage
 - Full `TransactionMeta` extraction for exact replay
-- Evicted keys and upgrade metadata extraction
 
-This provides richer data than traditional archives for indexers and replay.
+### Disk-Backed Buckets
 
-#### Disk-Backed Buckets
+During catchup, Rust saves buckets to disk and uses file-backed storage with compact key-to-offset indexes.
 
-During catchup, Rust saves buckets to disk and uses file-backed storage with compact key-to-offset indexes. This is similar in spirit to C++'s bucket management but implemented differently:
-- Buckets cached as `{hash}.bucket` files
-- Memory-mapped access for large buckets
-- Reduces memory from O(entries) to O(unique_keys) for indexes
+### Re-execution Focus
 
-#### Re-execution Focus
+Rust emphasizes transaction re-execution during replay rather than TransactionMeta application. Works with traditional archives lacking TransactionMeta.
 
-Rust emphasizes transaction re-execution during replay rather than TransactionMeta application:
-- Works with traditional archives lacking TransactionMeta
-- May produce different intermediate results than C++
-- Final state verification at checkpoints ensures correctness
+### Invariant Integration
 
-For exact verification, CDP data with `LedgerCloseMeta` can be used.
+The Rust crate integrates with `stellar-core-invariant` for runtime verification during replay.
 
-#### Invariant Integration
+---
 
-The Rust crate integrates with `stellar-core-invariant` for runtime verification:
-- Conservation of lumens
-- Valid ledger entry structure
-- Sequence number progression
-- Close time non-decreasing
-- Liabilities match offers
-- Order book not crossed
+## Notes
 
-These run during replay when `verify_invariants` is enabled.
+- The C++ test infrastructure (`CatchupSimulation`, `HistoryConfigurator`, etc.) is significantly more sophisticated than the Rust test setup. Many C++ tests require this simulation framework.
+- Several C++ tests use `REAL_TIME` virtual clock mode for timeout testing; Rust tests are primarily unit/integration tests.
+- The `[acceptance]` tagged tests in C++ are longer-running integration tests; Rust could benefit from similar acceptance-level tests.
+- Hot archive bucket testing should be expanded as protocol 23+ features mature.
+
+---
+
+## Recommendations for Improving Parity
+
+### High Priority
+
+1. Add bucket verification failure tests (file not found, corrupted, hash mismatch)
+2. Add ledger chain verification edge case tests (overshot, undershot, missing entries)
+3. Add publish integration tests with checkpoint completion
+4. Add online catchup tests with buffered ledgers
+
+### Medium Priority
+
+5. Add protocol upgrade catchup tests
+6. Add CheckpointBuilder crash recovery tests
+7. Add multi-archive publish tests
+8. Add FutureBucket resolution (or document why it's not needed)
+
+### Low Priority
+
+9. Add metrics tracking
+10. Add archive report work
+11. Add S3-style remote archive tests

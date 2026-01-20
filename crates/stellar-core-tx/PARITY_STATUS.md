@@ -292,16 +292,138 @@ The Rust crate supports both live execution and catchup/replay modes as first-cl
 - **C++**: Mutable result objects with error codes
 - **Rust**: Result types with structured errors + mutable result for apply phase
 
-## Test Coverage
+## Test Coverage Comparison
 
-The Rust implementation includes comprehensive unit tests:
-- Frame creation and property access
-- Hash computation across networks
-- Validation error handling
-- Signature checking with all signer types
-- Operation execution for all 27 operations
-- Fee processing and refunds
-- Protocol version-specific behavior
+### Summary Statistics
+
+| Metric | C++ (upstream) | Rust | Coverage Ratio |
+|--------|---------------|------|----------------|
+| Test files | 31 | 38 | - |
+| TEST_CASE macros | 127 | - | - |
+| SECTION blocks | ~1,800 | - | - |
+| #[test] functions | - | 309 | - |
+| Integration tests (real transactions) | ~200 | 14,651+ | Rust via testnet verification |
+
+### C++ Test Files (upstream)
+
+| Test File | TEST_CASE | SECTION | Key Areas Covered |
+|-----------|-----------|---------|-------------------|
+| InvokeHostFunctionTests.cpp | 70 | 301 | Soroban contract invocation, storage, archival |
+| OfferTests.cpp | 2 | 178 | DEX operations, order matching |
+| TxEnvelopeTests.cpp | 5 | 154 | Signatures, multisig, extra signers, batching |
+| PathPaymentTests.cpp | 2 | 122 | Path payment strict receive edge cases |
+| LiquidityPoolTradeTests.cpp | 2 | 86 | Pool trading, cross-pool operations |
+| ExchangeTests.cpp | 6 | 85 | Offer exchange mechanics |
+| PaymentTests.cpp | 2 | 76 | Payment scenarios, fees |
+| ClaimableBalanceTests.cpp | 1 | 72 | All predicate types, sponsorship |
+| SetTrustLineFlagsTests.cpp | 2 | 70 | Trust flags, authorization states |
+| ManageBuyOfferTests.cpp | 8 | 69 | Buy offer liabilities, crossing |
+| RevokeSponsorshipTests.cpp | 1 | 65 | All sponsorship revocation scenarios |
+| PathPaymentStrictSendTests.cpp | 2 | 57 | Strict send edge cases |
+| AllowTrustTests.cpp | 2 | 54 | Authorization, clawback setup |
+| MergeTests.cpp | 2 | 46 | Account merge with sponsorship |
+| TxResultsTests.cpp | 1 | 38 | Result code validation |
+| ChangeTrustTests.cpp | 2 | 37 | Pool trustlines, sponsorship |
+| FeeBumpTransactionTests.cpp | 1 | 23 | Fee bump validity, apply |
+| SetOptionsTests.cpp | 1 | 21 | Signers, flags, thresholds |
+| ClawbackTests.cpp | 1 | 18 | Clawback operations |
+| InflationTests.cpp | 2 | 16 | Inflation (deprecated) |
+| ClawbackClaimableBalanceTests.cpp | 1 | 14 | Claimable balance clawback |
+| LiquidityPoolWithdrawTests.cpp | 1 | 12 | Pool withdrawal scenarios |
+| LiquidityPoolDepositTests.cpp | 1 | 12 | Pool deposit scenarios |
+| BumpSequenceTests.cpp | 1 | 11 | Sequence bumping, minSeq |
+| CreateAccountTests.cpp | 1 | 10 | Account creation, sponsorship |
+| BeginSponsoringFutureReservesTests.cpp | 1 | 9 | Sponsorship begin |
+| EventTests.cpp | 1 | 8 | SAC events, memos |
+| ManageDataTests.cpp | 1 | 4 | Data entry operations |
+| EndSponsoringFutureReservesTests.cpp | 1 | 2 | Sponsorship end |
+| SignatureUtilsTest.cpp | 2 | 0 | Pubkey, HashX signatures |
+| ParallelApplyTest.cpp | 4 | 0 | Parallel execution (N/A for Rust) |
+
+### Rust Test Coverage by Module
+
+| Module | Tests | Key Areas Covered |
+|--------|-------|-------------------|
+| `operations/execute/manage_offer.rs` | 20 | Sell/buy offers, passive offers, rounding |
+| `meta_builder.rs` | 20 | V2/V3/V4 meta, operation changes |
+| `fee_bump.rs` | 19 | Fee bump validation, result wrapping |
+| `result.rs` | 17 | Result codes, refundable fees |
+| `lumen_reconciler.rs` | 17 | Event reconciliation, mint/burn |
+| `operations/mod.rs` | 15 | Threshold levels, operation types |
+| `operations/execute/claimable_balance.rs` | 15 | Create/claim balance, predicates |
+| `operations/execute/payment.rs` | 14 | Native/credit payments, auth |
+| `operations/execute/manage_data.rs` | 13 | Data entries, limits |
+| `operations/execute/change_trust.rs` | 13 | Trustlines, pool shares |
+| `live_execution.rs` | 13 | Fee/seq processing, refunds |
+| `operations/execute/set_options.rs` | 12 | Signers, thresholds, flags |
+| `operations/execute/invoke_host_function.rs` | 11 | Soroban execution, budget |
+| `operations/execute/sponsorship.rs` | 11 | Begin/end/revoke sponsorship |
+| `signature_checker.rs` | 11 | All signer types, weights |
+| `validation.rs` | 11 | Structure, fees, bounds, signatures |
+| `state.rs` | 8 | State management, snapshots |
+| `operations/execute/path_payment.rs` | 8 | Strict send/receive |
+| `frame.rs` | 8 | Frame properties, hashing |
+| `operations/execute/account_merge.rs` | 5 | Merge with subentries |
+| `operations/execute/extend_footprint_ttl.rs` | 5 | TTL extension |
+| `operations/execute/liquidity_pool.rs` | 5 | Deposit/withdraw |
+| `operations/execute/trust_flags.rs` | 5 | AllowTrust, SetTrustLineFlags |
+| `apply.rs` | 5 | History application |
+| `operations/execute/restore_footprint.rs` | 4 | Entry restoration |
+| `operations/execute/bump_sequence.rs` | 3 | Sequence bumping |
+| `operations/execute/clawback.rs` | 3 | Clawback operations |
+| `operations/execute/create_account.rs` | 3 | Account creation |
+| `lib.rs` | 4 | Integration tests |
+| `soroban/storage.rs` | 3 | Storage snapshots |
+| `soroban/events.rs` | 3 | Contract events |
+| `soroban/budget.rs` | 2 | Budget tracking |
+| `operations/execute/inflation.rs` | 1 | Inflation (deprecated) |
+| `soroban/host.rs` | 1 | Host configuration |
+| `operations/execute/mod.rs` | 1 | Execute dispatch |
+
+### Test Coverage Gaps
+
+The following C++ test scenarios have **limited or no direct Rust unit test equivalents**, though many are covered by integration testing against testnet:
+
+| C++ Test Area | C++ Sections | Rust Unit Tests | Coverage Method |
+|---------------|--------------|-----------------|-----------------|
+| InvokeHostFunction edge cases | 301 | 11 | Testnet integration |
+| Offer exchange mechanics | 178 | 20 | Testnet integration |
+| TxEnvelope multisig scenarios | 154 | 11 | Partial + testnet |
+| PathPayment complex paths | 122 | 8 | Testnet integration |
+| LiquidityPool trading | 86 | 5 | Testnet integration |
+| ClaimableBalance predicates | 72 | 15 | Good coverage |
+| SetTrustLineFlags scenarios | 70 | 5 | Testnet integration |
+| RevokeSponsorshipTests | 65 | 11 | Partial + testnet |
+| ParallelApplyTest | 4 | 0 | N/A (not implemented) |
+
+### Rust-Only Tests
+
+The Rust implementation includes tests without C++ equivalents:
+- `lumen_reconciler.rs`: 17 tests for SAC event reconciliation
+- `meta_builder.rs`: 20 tests for transaction meta building
+- `result.rs`: 17 tests for result/fee tracker abstractions
+- Protocol-versioned behavior (P23, P24, P25 differences)
+
+### Gap Analysis
+
+**Well-covered areas:**
+- All 27 operations have basic unit tests
+- Fee bump transactions: comprehensive
+- Signature checking: all signer types covered
+- Event emission: good coverage
+- Result handling: comprehensive
+
+**Areas needing more unit tests:**
+1. **Complex multisig scenarios** - C++ has 154 SECTION blocks in TxEnvelopeTests
+2. **DEX order matching edge cases** - C++ has 178 SECTION blocks for offers
+3. **Path payment with multiple hops** - C++ has 122 SECTION blocks
+4. **Soroban edge cases** - C++ has 301 SECTION blocks in InvokeHostFunctionTests
+5. **Sponsorship transfer scenarios** - C++ has 65 SECTION blocks
+
+**Mitigation:** These gaps are largely covered by:
+1. **Testnet integration verification** - 14,651 real transactions verified at 100% parity
+2. **Testnet transaction diversity** - covers Soroban, DEX, payments, sponsorship
+3. **Protocol behavior verified** against real network data
 
 ## Verification Approach
 
@@ -396,4 +518,23 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 2. **Mainnet verification**: Mainnet has more consistent stellar-core versions across history. Verification against mainnet will provide cleaner parity metrics.
 
-5. **Identify clean testnet ranges**: The variable parity in early testnet is expected behavior. For regression testing, use ranges with known 100% parity (2000-2100, 3000-3200, 5000-5200, 8000-8200, 30000-36000).
+3. **Identify clean testnet ranges**: The variable parity in early testnet is expected behavior. For regression testing, use ranges with known 100% parity (2000-2100, 3000-3200, 5000-5200, 8000-8200, 30000-36000).
+
+## Recommendations for Test Coverage Improvement
+
+To improve unit test coverage closer to C++ parity:
+
+1. **High Priority** (complex scenarios with many edge cases):
+   - Add more multisig scenarios in `signature_checker.rs` (TxEnvelopeTests has 154 sections)
+   - Add DEX crossing/rounding tests in `manage_offer.rs` (OfferTests has 178 sections)
+   - Add complex path payment tests in `path_payment.rs` (PathPaymentTests has 122 sections)
+
+2. **Medium Priority**:
+   - Expand Soroban edge case tests (InvokeHostFunctionTests has 301 sections)
+   - Add more sponsorship scenarios in `sponsorship.rs` (RevokeSponsorshipTests has 65 sections)
+   - Add liquidity pool trading tests (LiquidityPoolTradeTests has 86 sections)
+
+3. **Low Priority** (already well-covered by testnet integration):
+   - Basic payment scenarios
+   - Simple account operations
+   - Standard trustline operations
