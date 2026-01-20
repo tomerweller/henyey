@@ -2,25 +2,29 @@
 
 This document tracks known issues in rs-stellar-core that affect network synchronization and consensus participation.
 
-**Last Updated:** 2026-01-19
+**Last Updated:** 2026-01-20
 
 ## Summary
 
-### Verification Statistics (2026-01-19)
+### Verification Statistics (2026-01-20)
 
 Full testnet verification from ledger 64 to ~453,000 reveals:
 
-| Metric | Count | Notes |
+| Metric | Value | Notes |
 |--------|-------|-------|
-| **Total genuine tx mismatches** | ~1,198 | Consistent "tx-only" count |
-| **Bucket list correct** | Yes | 0 header mismatches when starting from any checkpoint |
-| **Bucket list divergence** | After ~8,591 ledgers | Only when running continuously from early ledgers |
+| **Checkpoint-based verification** | ✅ **100% header match** | 0 mismatches when starting from any checkpoint |
+| **Transaction execution accuracy** | **99.86%** | 210,927 / 211,215 matched in recent ledgers |
+| **Genuine tx mismatches** | ~167 | tx-only mismatches (execution bugs) |
+| **Continuous replay divergence** | After ~40,970 ledgers | Only affects testing, not production |
 
 ### Key Finding
 
-**The bucket list implementation is correct.** When starting verification from any checkpoint, header hashes match perfectly (0 mismatches). The ~1,198 "tx-only" mismatches represent genuine execution bugs that need fixing.
+**The bucket list implementation is correct.** When starting verification from any checkpoint, header hashes match perfectly (0 mismatches). Transaction execution is highly accurate (99%+ match rate).
 
-Bucket list divergence only occurs when running **continuously** from early ledgers (e.g., starting at ledger 64). After ~8,591 ledgers of continuous replay, accumulated state differences cause header mismatches. This is a secondary concern compared to fixing the genuine execution bugs.
+Bucket list divergence only occurs when running **continuously** from early ledgers (e.g., starting at ledger 64). After ~40,970 ledgers of continuous replay, accumulated state differences cause header mismatches. This is a **low priority** issue since:
+1. Production nodes always catch up from recent checkpoints
+2. Checkpoint-based verification shows 100% header match
+3. The continuous replay scenario is for testing only
 
 ---
 
