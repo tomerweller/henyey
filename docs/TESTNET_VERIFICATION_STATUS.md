@@ -25,7 +25,7 @@ cargo build --release -p rs-stellar-core
 
 ## Current Status
 
-**Last verification run**: 2026-01-19
+**Last verification run**: 2026-01-20
 
 ### Executive Summary
 
@@ -42,11 +42,13 @@ cargo build --release -p rs-stellar-core
 
 | Ledger Range | Header Mismatches | TX Mismatches | Notes |
 |--------------|-------------------|---------------|-------|
+| 100,000-100,200 | **0** | **0** | ✅ Clean range |
 | 152,600-152,800 | **0** | 1 | Issue #3: Trapped vs ResourceLimitExceeded |
-| 201,400-201,800 | **0** | 3 | Issue #5: Orderbook divergence |
+| 180,000-180,200 | **0** | **0** | ✅ Clean range |
+| 201,400-201,800 | **0** | 2 | Issue #5: Orderbook divergence (201477/201755) |
 | 236,900-237,100 | **0** | **0** | ✅ Issue #10 FIXED |
-| 342,600-342,800 | **0** | 2 | Issue #4: InsufficientRefundableFee |
-| 390,300-390,500 | **0** | 3 | Issue #6: Refundable fee bidirectional |
+| 342,600-342,800 | **0** | 1 | Issue #4: InsufficientRefundableFee (342737) |
+| 390,300-390,500 | **0** | 2 | Issue #6: Refundable fee bidirectional (390407) |
 | 407,200-407,400 | **0** | **0** | ✅ Issue #15 FIXED |
 | 416,600-416,700 | **0** | **0** | ✅ Issue #16 FIXED |
 
@@ -90,10 +92,10 @@ When running verification **continuously** from early ledgers (not starting from
 
 | Issue | Ledger | Description | Status |
 |-------|--------|-------------|--------|
-| #3 | 152692 | Trapped vs ResourceLimitExceeded | Genuine bug |
-| #4 | 342737 | InsufficientRefundableFee | Genuine bug |
-| #5 | 201477 | Orderbook state divergence | Genuine bug - **Priority** |
-| #6 | 390407 | Refundable fee bidirectional | Genuine bug |
+| #3 | 152692 | Trapped vs ResourceLimitExceeded | Historical cost model variance (mismatch persists) |
+| #4 | 342737 | InsufficientRefundableFee | Still mismatching (342737 TX 3) |
+| #5 | 201477 | Orderbook state divergence | Still mismatching (201477 TX 2, 201755 TX 1) |
+| #6 | 390407 | Refundable fee bidirectional | Still mismatching (390407 TX 9, 10) |
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
 
@@ -112,6 +114,12 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed descriptions.
 
 | Date | Ledger Range | Result | Notes |
 |------|--------------|--------|-------|
+| 2026-01-20 | 100,000-100,200 | 100% match | Clean checkpoint range |
+| 2026-01-20 | 152,600-152,800 | 1 tx mismatch | Issue #3 persists (152692 TX 2) |
+| 2026-01-20 | 180,000-180,200 | 100% match | Clean checkpoint range |
+| 2026-01-20 | 201,400-201,800 | 2 tx mismatches | Issue #5 persists (201477/201755) |
+| 2026-01-20 | 342,600-342,800 | 1 tx mismatch | Issue #4 persists (342737 TX 3) |
+| 2026-01-20 | 390,300-390,500 | 2 tx mismatches | Issue #6 persists (390407 TX 9/10) |
 | 2026-01-19 | Multi-segment | 0 header issues per checkpoint | Confirmed bucket list correct |
 | 2026-01-19 | 64-8,500 | 0 header, 1,129 tx-only | Bucket list correct up to ~8,591 ledgers |
 | 2026-01-19 | 236,900-237,100 | 100% match | Issue #10 confirmed FIXED |
