@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 use stellar_xdr::curr::{PeerAddress as XdrPeerAddress, PeerAddressIp, StellarMessage, VecM};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
+use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
 fn message_len(message: &StellarMessage) -> u64 {
@@ -693,6 +694,44 @@ impl OverlayManager {
             } else if is_fetch_message(&message) {
                 if let Ok(peer_lock) = peer.try_lock() {
                     peer_lock.record_fetch_stats(true, message_size);
+                }
+                // Log fetch messages for debugging tx_set issues
+                match &message {
+                    StellarMessage::TxSet(ts) => {
+                        info!(
+                            "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
+                            peer_id,
+                            hex::encode(sha2::Sha256::digest(
+                                &stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
+                            )),
+                            hex::encode(ts.previous_ledger_hash.0)
+                        );
+                    }
+                    StellarMessage::GeneralizedTxSet(ts) => {
+                        info!(
+                            "OVERLAY: Received GeneralizedTxSet from {} hash={}",
+                            peer_id,
+                            hex::encode(sha2::Sha256::digest(
+                                &stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
+                            ))
+                        );
+                    }
+                    StellarMessage::DontHave(dh) => {
+                        info!(
+                            "OVERLAY: Received DontHave from {} type={:?} hash={}",
+                            peer_id,
+                            dh.type_,
+                            hex::encode(dh.req_hash.0)
+                        );
+                    }
+                    StellarMessage::GetTxSet(hash) => {
+                        info!(
+                            "OVERLAY: Received GetTxSet from {} hash={}",
+                            peer_id,
+                            hex::encode(hash.0)
+                        );
+                    }
+                    _ => {}
                 }
             }
 

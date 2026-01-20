@@ -2706,12 +2706,30 @@ impl App {
             }
 
             StellarMessage::TxSet(tx_set) => {
-                tracing::info!(peer = %msg.from_peer, "Received TxSet");
+                // Compute hash for logging
+                let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(&tx_set, stellar_xdr::curr::Limits::none())
+                    .unwrap_or_default();
+                let computed_hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+                tracing::info!(
+                    peer = %msg.from_peer,
+                    computed_hash = %computed_hash,
+                    prev_ledger = hex::encode(tx_set.previous_ledger_hash.0),
+                    tx_count = tx_set.txs.len(),
+                    "APP: Received TxSet from overlay"
+                );
                 self.handle_tx_set(tx_set).await;
             }
 
             StellarMessage::GeneralizedTxSet(gen_tx_set) => {
-                tracing::info!(peer = %msg.from_peer, "Received GeneralizedTxSet");
+                // Compute hash for logging
+                let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(&gen_tx_set, stellar_xdr::curr::Limits::none())
+                    .unwrap_or_default();
+                let computed_hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+                tracing::info!(
+                    peer = %msg.from_peer,
+                    computed_hash = %computed_hash,
+                    "APP: Received GeneralizedTxSet from overlay"
+                );
                 self.handle_generalized_tx_set(gen_tx_set).await;
             }
 
@@ -5878,6 +5896,17 @@ impl App {
         let window_end = current_ledger as u64 + TX_SET_REQUEST_WINDOW;
         let mut pending = self.herder.get_pending_tx_sets();
         pending.sort_by_key(|(_, slot)| *slot);
+
+        // Log all pending tx_sets for debugging
+        if !pending.is_empty() {
+            tracing::debug!(
+                current_ledger,
+                pending_count = pending.len(),
+                pending_slots = ?pending.iter().map(|(h, s)| (*s, format!("{}...", &hex::encode(h.0)[..8]))).collect::<Vec<_>>(),
+                "Pending tx_sets before filtering"
+            );
+        }
+
         let pending_hashes: Vec<Hash256> = pending
             .into_iter()
             .filter(|(_, slot)| *slot >= min_slot && *slot <= window_end)
@@ -5887,6 +5916,13 @@ impl App {
         if pending_hashes.is_empty() {
             return;
         }
+
+        tracing::info!(
+            current_ledger,
+            pending_count = pending_hashes.len(),
+            hashes = ?pending_hashes.iter().map(|h| format!("{}...", &hex::encode(h.0)[..8])).collect::<Vec<_>>(),
+            "Will request tx_sets"
+        );
 
         let overlay = self.overlay.lock().await;
         let overlay = match overlay.as_ref() {

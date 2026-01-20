@@ -1377,10 +1377,31 @@ impl CatchupManager {
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
+        let live_hash = bucket_list.hash();
+        let expected_hash = Hash256::from(header.bucket_list_hash.0);
+
         let computed_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
             // Protocol 23+: combine live and hot archive bucket list hashes
-            let live_hash = bucket_list.hash();
             let hot_hash = hot_archive.hash();
+
+            info!(
+                ledger_seq = header.ledger_seq,
+                live_hash = %live_hash.to_hex(),
+                hot_hash = %hot_hash.to_hex(),
+                expected_combined = %expected_hash.to_hex(),
+                "Catchup verify_final_state: computing combined bucket list hash"
+            );
+
+            // Log per-level hashes for hot archive
+            for (level_idx, level) in hot_archive.levels().iter().enumerate().take(5) {
+                info!(
+                    level = level_idx,
+                    curr_hash = %level.curr.hash().to_hex(),
+                    snap_hash = %level.snap.hash().to_hex(),
+                    "Hot archive level hash after catchup"
+                );
+            }
+
             let mut hasher = Sha256::new();
             hasher.update(live_hash.as_bytes());
             hasher.update(hot_hash.as_bytes());
@@ -1390,8 +1411,22 @@ impl CatchupManager {
             Hash256::from_bytes(bytes)
         } else {
             // Pre-protocol 23: just the live bucket list hash
-            bucket_list.hash()
+            info!(
+                ledger_seq = header.ledger_seq,
+                live_hash = %live_hash.to_hex(),
+                expected = %expected_hash.to_hex(),
+                "Catchup verify_final_state: no hot archive"
+            );
+            live_hash
         };
+
+        info!(
+            ledger_seq = header.ledger_seq,
+            computed = %computed_hash.to_hex(),
+            expected = %expected_hash.to_hex(),
+            matches = (computed_hash == expected_hash),
+            "Catchup verify_final_state: final comparison"
+        );
 
         verify::verify_ledger_hash(header, &computed_hash)?;
 

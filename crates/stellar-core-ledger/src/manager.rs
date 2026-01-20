@@ -1440,10 +1440,11 @@ impl<'a> LedgerCloseContext<'a> {
                     // Add archived entries to hot archive bucket list
                     // Must call add_batch even with empty entries to maintain spill consistency
                     // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
+                    let pre_hot_hash = hot_archive.hash();
                     hot_archive.add_batch(
                         self.close_data.ledger_seq,
                         protocol_version,
-                        archived_entries,
+                        archived_entries.clone(),
                         self.hot_archive_restored_keys.clone(),
                     )?;
 
@@ -1455,10 +1456,28 @@ impl<'a> LedgerCloseContext<'a> {
                     let result = hasher.finalize();
                     let mut bytes = [0u8; 32];
                     bytes.copy_from_slice(&result);
-                    Hash256::from_bytes(bytes)
+                    let combined_hash = Hash256::from_bytes(bytes);
+
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        live_hash = %live_hash.to_hex(),
+                        pre_hot_hash = %pre_hot_hash.to_hex(),
+                        post_hot_hash = %hot_hash.to_hex(),
+                        combined_hash = %combined_hash.to_hex(),
+                        archived_count = archived_entries.len(),
+                        restored_count = self.hot_archive_restored_keys.len(),
+                        "Bucket list hash computation"
+                    );
+                    combined_hash
                 } else {
                     // No hot archive bucket list available, use live hash only
                     // This shouldn't happen for Protocol 23+ but fall back gracefully
+                    tracing::warn!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        protocol_version = protocol_version,
+                        live_hash = %live_hash.to_hex(),
+                        "HOT ARCHIVE IS NONE for Protocol 23+! Using live hash only - this WILL cause hash mismatch!"
+                    );
                     live_hash
                 }
             } else {
