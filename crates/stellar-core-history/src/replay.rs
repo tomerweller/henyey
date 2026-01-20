@@ -52,8 +52,11 @@ use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_invariant::LedgerEntryChange;
 use stellar_core_ledger::{
     execution::{execute_transaction_set, load_soroban_config, OperationInvariantRunner},
-    LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle, TransactionSetVariant,
+    prepend_fee_event, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
+    TransactionSetVariant,
 };
+use stellar_core_tx::soroban::PersistentModuleCache;
+use stellar_core_tx::{muxed_to_account_id, TransactionFrame};
 use stellar_xdr::curr::{
     BucketListType, ConfigSettingEntry, ConfigSettingId, EvictionIterator as XdrEvictionIterator,
     LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting,
@@ -305,6 +308,18 @@ pub fn replay_ledger(
 ///
 /// If `eviction_iterator` is provided, incremental eviction will be performed.
 /// The updated iterator is returned in the result for use in subsequent ledgers.
+///
+/// # Arguments
+///
+/// * `header` - The ledger header being replayed
+/// * `tx_set` - The transaction set to execute
+/// * `bucket_list` - The live bucket list (will be modified)
+/// * `hot_archive_bucket_list` - Optional hot archive bucket list for Protocol 23+
+/// * `network_id` - The network identifier
+/// * `config` - Replay configuration options
+/// * `expected_tx_results` - Optional expected results for comparison
+/// * `eviction_iterator` - Current eviction scan position (Protocol 23+)
+/// * `module_cache` - Optional persistent module cache for Soroban WASM reuse
 pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
@@ -314,6 +329,7 @@ pub fn replay_ledger_with_execution(
     config: &ReplayConfig,
     expected_tx_results: Option<&[TransactionResultPair]>,
     eviction_iterator: Option<EvictionIterator>,
+    module_cache: Option<&PersistentModuleCache>,
 ) -> Result<LedgerReplayResult> {
     if config.verify_results {
         verify::verify_tx_set(header, tx_set)?;
@@ -373,23 +389,45 @@ pub fn replay_ledger_with_execution(
         emit_classic_events: config.emit_classic_events,
         backfill_stellar_asset_events: config.backfill_stellar_asset_events,
     };
-    let (results, tx_results, _tx_result_metas, _total_fees) = execute_transaction_set(
-        &snapshot,
-        &transactions,
-        header.ledger_seq,
-        header.scp_value.close_time.0,
-        header.base_fee,
-        header.base_reserve,
-        header.ledger_version,
-        *network_id,
-        &mut delta,
-        soroban_config,
-        soroban_base_prng_seed.0,
-        classic_events,
-        op_invariants,
-        None, // TODO: Add module cache support for history replay
-    )
-    .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
+    let (results, tx_results, mut tx_result_metas, _total_fees, hot_archive_restored_keys) =
+        execute_transaction_set(
+            &snapshot,
+            &transactions,
+            header.ledger_seq,
+            header.scp_value.close_time.0,
+            header.base_fee,
+            header.base_reserve,
+            header.ledger_version,
+            *network_id,
+            &mut delta,
+            soroban_config,
+            soroban_base_prng_seed.0,
+            classic_events.clone(),
+            op_invariants,
+            module_cache,
+        )
+        .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
+
+    // Add fee events to transaction metadata (matching online mode behavior)
+    if classic_events.events_enabled(header.ledger_version) {
+        for (idx, ((envelope, _), meta)) in transactions
+            .iter()
+            .zip(tx_result_metas.iter_mut())
+            .enumerate()
+        {
+            let fee_charged = tx_results[idx].result.fee_charged;
+            let frame = TransactionFrame::with_network(envelope.clone(), *network_id);
+            let fee_source = muxed_to_account_id(&frame.fee_source_account());
+            prepend_fee_event(
+                &mut meta.tx_apply_processing,
+                &fee_source,
+                fee_charged,
+                header.ledger_version,
+                network_id,
+                classic_events.clone(),
+            );
+        }
+    }
 
     if config.verify_results {
         let result_set = TransactionResultSet {
@@ -533,12 +571,13 @@ pub fn replay_ledger_with_execution(
             "Hot archive add_batch - BEFORE"
         );
         // HotArchiveBucketList::add_batch takes (ledger_seq, protocol_version, archived_entries, restored_keys)
+        // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
         hot_archive
             .add_batch(
                 header.ledger_seq,
                 header.ledger_version,
                 archived_entries,
-                vec![], // restored_keys
+                hot_archive_restored_keys.clone(),
             )
             .map_err(HistoryError::Bucket)?;
         let post_hash = hot_archive.hash();
@@ -1240,6 +1279,7 @@ mod tests {
             &config,
             None,
             None,
+            None, // module_cache
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
@@ -1271,6 +1311,7 @@ mod tests {
             &config,
             None,
             None,
+            None, // module_cache
         );
 
         assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
@@ -1305,6 +1346,7 @@ mod tests {
             &config,
             None,
             None,
+            None, // module_cache
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));

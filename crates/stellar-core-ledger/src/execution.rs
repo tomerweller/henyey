@@ -620,6 +620,9 @@ pub struct TransactionExecutionResult {
     pub fee_changes: Option<LedgerEntryChanges>,
     /// Post-apply fee processing changes (refunds).
     pub post_fee_changes: Option<LedgerEntryChanges>,
+    /// Keys of entries restored from the hot archive (Protocol 23+).
+    /// These should be passed to HotArchiveBucketList::add_batch as restored_keys.
+    pub hot_archive_restored_keys: Vec<LedgerKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1560,6 +1563,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1575,6 +1579,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1589,6 +1594,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1606,6 +1612,7 @@ impl TransactionExecutor {
                     tx_meta: None,
                     fee_changes: None,
                     post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
                 });
             }
         };
@@ -1623,6 +1630,7 @@ impl TransactionExecutor {
                     tx_meta: None,
                     fee_changes: None,
                     post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
                 });
             }
         };
@@ -1645,6 +1653,7 @@ impl TransactionExecutor {
                     tx_meta: None,
                     fee_changes: None,
                     post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
                 });
             }
 
@@ -1676,6 +1685,7 @@ impl TransactionExecutor {
                         tx_meta: None,
                         fee_changes: None,
                         post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
                     });
                 }
             } else {
@@ -1691,6 +1701,7 @@ impl TransactionExecutor {
                         tx_meta: None,
                         fee_changes: None,
                         post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
                     });
                 }
             }
@@ -1707,6 +1718,7 @@ impl TransactionExecutor {
                     tx_meta: None,
                     fee_changes: None,
                     post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
                 });
             }
         }
@@ -1735,6 +1747,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1760,6 +1773,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1776,6 +1790,7 @@ impl TransactionExecutor {
                         tx_meta: None,
                         fee_changes: None,
                         post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
                     });
                 }
             }
@@ -1796,6 +1811,7 @@ impl TransactionExecutor {
                         tx_meta: None,
                         fee_changes: None,
                         post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
                     });
                 }
             }
@@ -1818,6 +1834,7 @@ impl TransactionExecutor {
                         tx_meta: None,
                         fee_changes: None,
                         post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
                     });
                 }
             }
@@ -1843,6 +1860,7 @@ impl TransactionExecutor {
                     tx_meta: None,
                     fee_changes: None,
                     post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
                 });
             }
         }
@@ -1895,6 +1913,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1910,6 +1929,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1934,6 +1954,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -1957,6 +1978,7 @@ impl TransactionExecutor {
                     tx_meta: None,
                     fee_changes: None,
                     post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
                 });
             }
         }
@@ -1991,6 +2013,7 @@ impl TransactionExecutor {
                 tx_meta: None,
                 fee_changes: None,
                 post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
             });
         }
 
@@ -2017,6 +2040,7 @@ impl TransactionExecutor {
                         tx_meta: None,
                         fee_changes: None,
                         post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
                     });
                 }
             }
@@ -2320,6 +2344,9 @@ impl TransactionExecutor {
         let op_invariant_snapshot = self.op_invariants.as_ref().map(|runner| runner.snapshot());
 
         let tx_seq = frame.sequence_number();
+        // Collect hot archive restored keys across all operations (Protocol 23+)
+        let mut collected_hot_archive_keys: Vec<LedgerKey> = Vec::new();
+
         if let Some(preflight_failure) = preflight_failure {
             all_success = false;
             failure = Some(preflight_failure);
@@ -2452,6 +2479,9 @@ impl TransactionExecutor {
                             let hot_archive =
                                 extract_hot_archive_restored_keys(soroban_data, op_type);
                             restored.hot_archive.extend(hot_archive);
+                            // Collect for return to caller (for HotArchiveBucketList::add_batch)
+                            collected_hot_archive_keys
+                                .extend(restored.hot_archive.iter().cloned());
                             (restored, soroban_data.map(|d| &d.resources.footprint))
                         } else {
                             (RestoredEntries::default(), None)
@@ -2616,6 +2646,7 @@ impl TransactionExecutor {
             tx_meta: Some(tx_meta),
             fee_changes: Some(fee_changes),
             post_fee_changes: Some(post_fee_changes),
+            hot_archive_restored_keys: collected_hot_archive_keys,
         })
     }
 
@@ -4637,6 +4668,7 @@ pub fn execute_transaction_set(
     Vec<TransactionResultPair>,
     Vec<TransactionResultMetaV1>,
     u64,
+    Vec<LedgerKey>, // Hot archive restored keys for HotArchiveBucketList::add_batch
 )> {
     execute_transaction_set_with_fee_mode(
         snapshot,
@@ -4664,6 +4696,15 @@ pub fn execute_transaction_set(
 /// * `module_cache` - Optional persistent module cache for reusing compiled WASM.
 ///   When provided, Soroban contract execution reuses pre-compiled modules,
 ///   significantly improving performance for workloads with many contract calls.
+///
+/// # Returns
+///
+/// A tuple containing:
+/// - Transaction execution results
+/// - Transaction result pairs (XDR)
+/// - Transaction result metadata
+/// - Updated ID pool
+/// - Hot archive restored keys (for passing to HotArchiveBucketList::add_batch)
 pub fn execute_transaction_set_with_fee_mode(
     snapshot: &SnapshotHandle,
     transactions: &[(TransactionEnvelope, Option<u32>)],
@@ -4685,6 +4726,7 @@ pub fn execute_transaction_set_with_fee_mode(
     Vec<TransactionResultPair>,
     Vec<TransactionResultMetaV1>,
     u64,
+    Vec<LedgerKey>, // Hot archive restored keys for HotArchiveBucketList::add_batch
 )> {
     let id_pool = snapshot.header().id_pool;
     let mut executor = TransactionExecutor::new(
@@ -4804,7 +4846,19 @@ pub fn execute_transaction_set_with_fee_mode(
         delta.record_fee_pool_delta(total_fees);
     }
 
-    Ok((results, tx_results, tx_result_metas, executor.id_pool()))
+    // Collect all hot archive restored keys across all transactions
+    let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
+    for result in &results {
+        all_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
+    }
+
+    Ok((
+        results,
+        tx_results,
+        tx_result_metas,
+        executor.id_pool(),
+        all_hot_archive_restored_keys,
+    ))
 }
 
 #[cfg(test)]

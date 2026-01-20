@@ -66,7 +66,20 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info};
 
-fn prepend_fee_event(
+/// Prepend a fee event to transaction metadata.
+///
+/// This adds a "NewFee" event at the beginning of the transaction's event list
+/// to record the fee charged. Used for Protocol 20+ classic event emission.
+///
+/// # Arguments
+///
+/// * `meta` - The transaction metadata to modify
+/// * `fee_source` - The account that paid the fee
+/// * `fee_charged` - The amount of fee charged in stroops
+/// * `protocol_version` - The current protocol version
+/// * `network_id` - The network identifier
+/// * `classic_events` - Classic event configuration
+pub fn prepend_fee_event(
     meta: &mut TransactionMeta,
     fee_source: &AccountId,
     fee_charged: i64,
@@ -836,6 +849,7 @@ impl LedgerManager {
             id_pool: state.header.id_pool,
             tx_results: Vec::new(),
             tx_result_metas: Vec::new(),
+            hot_archive_restored_keys: Vec::new(),
         })
     }
 
@@ -1053,6 +1067,9 @@ pub struct LedgerCloseContext<'a> {
     id_pool: u64,
     tx_results: Vec<stellar_xdr::curr::TransactionResultPair>,
     tx_result_metas: Vec<stellar_xdr::curr::TransactionResultMetaV1>,
+    /// Keys of entries restored from hot archive during transaction execution.
+    /// Passed to HotArchiveBucketList::add_batch to remove restored entries from archive.
+    hot_archive_restored_keys: Vec<LedgerKey>,
 }
 
 impl<'a> LedgerCloseContext<'a> {
@@ -1175,22 +1192,23 @@ impl<'a> LedgerCloseContext<'a> {
         let module_cache_guard = self.manager.module_cache.read();
         let module_cache = module_cache_guard.as_ref();
 
-        let (results, tx_results, mut tx_result_metas, id_pool) = execute_transaction_set(
-            &self.snapshot,
-            &transactions,
-            self.close_data.ledger_seq,
-            self.close_data.close_time,
-            self.prev_header.base_fee,
-            self.prev_header.base_reserve,
-            self.prev_header.ledger_version,
-            self.manager.network_id,
-            &mut self.delta,
-            soroban_config,
-            soroban_base_prng_seed.0,
-            classic_events,
-            op_invariants,
-            module_cache,
-        )?;
+        let (results, tx_results, mut tx_result_metas, id_pool, hot_archive_restored_keys) =
+            execute_transaction_set(
+                &self.snapshot,
+                &transactions,
+                self.close_data.ledger_seq,
+                self.close_data.close_time,
+                self.prev_header.base_fee,
+                self.prev_header.base_reserve,
+                self.prev_header.ledger_version,
+                self.manager.network_id,
+                &mut self.delta,
+                soroban_config,
+                soroban_base_prng_seed.0,
+                classic_events,
+                op_invariants,
+                module_cache,
+            )?;
         if classic_events.events_enabled(self.prev_header.ledger_version) {
             for (idx, ((envelope, _), meta)) in transactions
                 .iter()
@@ -1214,6 +1232,7 @@ impl<'a> LedgerCloseContext<'a> {
         self.id_pool = id_pool;
         self.tx_results = tx_results;
         self.tx_result_metas = tx_result_metas;
+        self.hot_archive_restored_keys = hot_archive_restored_keys;
 
         // Update stats
         let tx_count = results.len();
@@ -1420,13 +1439,12 @@ impl<'a> LedgerCloseContext<'a> {
                 if let Some(ref mut hot_archive) = *hot_archive_guard {
                     // Add archived entries to hot archive bucket list
                     // Must call add_batch even with empty entries to maintain spill consistency
-                    // Note: restored_keys would be populated when entries are restored from archive
-                    // (e.g., via restoreEntry operations), but for now we pass empty vec
+                    // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
                     hot_archive.add_batch(
                         self.close_data.ledger_seq,
                         protocol_version,
                         archived_entries,
-                        vec![], // restored_keys
+                        self.hot_archive_restored_keys.clone(),
                     )?;
 
                     use sha2::{Digest, Sha256};

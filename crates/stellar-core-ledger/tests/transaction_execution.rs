@@ -1044,6 +1044,7 @@ fn test_fee_bump_result_encoding() {
         tx_meta: None,
         fee_changes: None,
         post_fee_changes: None,
+        hot_archive_restored_keys: vec![],
     };
 
     let pair = build_tx_result_pair(

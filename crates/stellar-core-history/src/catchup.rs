@@ -1012,11 +1012,23 @@ impl CatchupManager {
             let bucket_dir_clone = bucket_dir.clone();
             let archives_clone = archives.clone();
 
+            // Cache for hot archive buckets (same hash can appear at multiple levels)
+            let hot_archive_bucket_cache: Mutex<HashMap<Hash256, HotArchiveBucket>> =
+                Mutex::new(HashMap::new());
+
             let load_hot_archive_bucket =
                 |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
                     // Zero hash means empty bucket
                     if hash.is_zero() {
                         return Ok(HotArchiveBucket::empty());
+                    }
+
+                    // Check cache first (same hash can appear at multiple levels)
+                    {
+                        let cache = hot_archive_bucket_cache.lock().unwrap();
+                        if let Some(bucket) = cache.get(hash) {
+                            return Ok(bucket.clone());
+                        }
                     }
 
                     // Check if we have the XDR data in the pre-downloaded cache
@@ -1058,20 +1070,59 @@ impl CatchupManager {
                                 hash
                             )))
                         };
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| {
-                                stellar_core_bucket::BucketError::NotFound(format!(
-                                    "failed to build runtime: {}",
-                                    e
-                                ))
-                            })?;
-                        rt.block_on(download)?
+
+                        // Handle async download from sync context properly
+                        // (matching the pattern used for live buckets)
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            if matches!(
+                                handle.runtime_flavor(),
+                                tokio::runtime::RuntimeFlavor::MultiThread
+                            ) {
+                                tokio::task::block_in_place(|| handle.block_on(download))?
+                            } else {
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .map_err(|e| {
+                                            stellar_core_bucket::BucketError::NotFound(format!(
+                                                "failed to build runtime: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    rt.block_on(download)
+                                })
+                                .join()
+                                .map_err(|_| {
+                                    stellar_core_bucket::BucketError::NotFound(
+                                        "bucket download thread panicked".to_string(),
+                                    )
+                                })??
+                            }
+                        } else {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|e| {
+                                    stellar_core_bucket::BucketError::NotFound(format!(
+                                        "failed to build runtime: {}",
+                                        e
+                                    ))
+                                })?;
+                            rt.block_on(download)?
+                        }
                     };
 
                     // Parse as HotArchiveBucket (uses HotArchiveBucketEntry XDR)
-                    HotArchiveBucket::from_xdr_bytes(&xdr_data)
+                    let bucket = HotArchiveBucket::from_xdr_bytes(&xdr_data)?;
+
+                    // Cache for reuse (same hash can appear at multiple levels)
+                    {
+                        let mut cache = hot_archive_bucket_cache.lock().unwrap();
+                        cache.insert(*hash, bucket.clone());
+                    }
+
+                    Ok(bucket)
                 };
 
             let hot_bucket_list =
@@ -1623,6 +1674,7 @@ impl CatchupManager {
                 &self.replay_config,
                 Some(&data.tx_results),
                 eviction_iterator,
+                None, // TODO: Initialize module cache for catchup performance
             )?;
 
             // Update eviction iterator for next ledger
