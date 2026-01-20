@@ -1146,6 +1146,22 @@ impl TransactionExecutor {
             let LedgerEntryData::Offer(offer) = &entry.data else {
                 continue;
             };
+            // Only load offers that haven't been touched this ledger.
+            // This preserves modifications (including deletions) made by previous transactions.
+            // We check both:
+            // 1. The entry currently exists in state (modified but not deleted)
+            // 2. The entry was deleted in the delta (by a previous tx)
+            let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                seller_id: offer.seller_id.clone(),
+                offer_id: offer.offer_id,
+            });
+            if self.state.get_entry(&offer_key).is_some() {
+                continue;
+            }
+            // Also check if the offer was deleted in the delta (by a previous tx)
+            if self.state.delta().deleted_keys().contains(&offer_key) {
+                continue;
+            }
             let offer = offer.clone();
             self.state.load_entry(entry);
             self.load_offer_dependencies(snapshot, &offer)?;

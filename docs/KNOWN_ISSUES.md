@@ -181,15 +181,32 @@ All transactions in range 342735-342740 now match CDP metadata.
 
 ## 5. ManageSellOffer/ManageBuyOffer Orderbook State Divergence
 
-**Status:** Investigated - CDP Data Anomaly
-**Severity:** Low - Final state is correct
+**Status:** FIXED
+**Severity:** N/A - Resolved
 **Component:** Offer Management / Orderbook
-**Last Verified:** 2026-01-19
+**Fixed:** 2026-01-20
 
 ### Description
-Some ManageSellOffer and ManageBuyOffer transactions claim different offers than CDP metadata shows. Both succeed but with different `offers_claimed` results.
+Some ManageSellOffer and ManageBuyOffer transactions were claiming different offers than expected. Verified against Horizon API - this was a genuine bug, not a CDP data anomaly.
 
-### Details
+### Root Cause
+When multiple transactions in a ledger need orderbook access, `load_orderbook_offers` was loading ALL offers from the **initial snapshot** (state at start of ledger), overwriting offer modifications made by previous transactions. This caused deleted offers to "reappear".
+
+### Fix Applied
+Modified `load_orderbook_offers` in `execution.rs` to:
+1. Skip offers that currently exist in state (already loaded/modified)
+2. Skip offers that were deleted in the delta (tracked by previous transactions)
+
+This preserves modifications made by previous transactions when subsequent transactions load the orderbook.
+
+### Affected Ledgers
+- Ledger 201477 TX 2 - **FIXED** (now matches Horizon/CDP)
+- Ledger 201755 - **FIXED**
+
+### Verification
+All transactions in range 201475-201500 now match CDP metadata exactly.
+
+### Historical Details
 ```
 Ledger 201477 TX 2:
   - Our offers_claimed: [offer_id: 8071, 8072]
@@ -279,7 +296,7 @@ if self.consumed_rent_fee > self.max_refundable_fee {
 | #2 | Non-issue | Low | Bucket list correct; divergence only in continuous replay |
 | #3 | Historical | Low | Trapped vs ResourceLimitExceeded - cost model variance, cannot fix |
 | #4 | **FIXED** | N/A | InsufficientRefundableFee - restored TTL was not being passed correctly |
-| #5 | CDP Anomaly | Low | Orderbook state divergence - final state correct, CDP data suspect |
+| #5 | **FIXED** | N/A | Orderbook divergence - offers reloaded from snapshot, overwriting prior tx changes |
 | #6 | Partially Fixed | Low | Refundable fee - rent check added, remaining cases may be CDP anomaly |
 
 ---
@@ -290,6 +307,7 @@ The following issues were previously tracked but are now confirmed FIXED (verifi
 
 | Issue | Ledger | Fix Description |
 |-------|--------|-----------------|
+| Orderbook divergence (Issue #5) | 201477 | Skip offers already in state or deleted when loading orderbook |
 | InsufficientRefundableFee (Issue #4) | 342737 | Pass restored TTL for auto-restored entries, fix RentFeeConfiguration.fee_per_write_1kb |
 | ManageSellOffer OpNotSupported | 237057 | Sponsored offer deletion |
 | TooManySubentries | 407293 | Subentry limit enforcement |
