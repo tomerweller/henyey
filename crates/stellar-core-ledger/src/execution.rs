@@ -711,6 +711,20 @@ impl TransactionExecutor {
         self.module_cache.as_ref()
     }
 
+    /// Add contract code to the module cache.
+    ///
+    /// This is called when new contract code entries are created, updated, or restored
+    /// during ledger close. Adding the code to the cache enables subsequent transactions
+    /// to use VmCachedInstantiation (cheap) instead of VmInstantiation (expensive).
+    ///
+    /// Without this, contracts deployed in transaction N would not be cached for
+    /// transaction N+1 in the same ledger, causing cost model divergence.
+    fn add_contract_to_cache(&self, code: &[u8]) {
+        if let Some(cache) = &self.module_cache {
+            cache.add_contract(code, self.protocol_version);
+        }
+    }
+
     /// Advance to a new ledger, preserving the current state.
     /// This is useful for replaying multiple consecutive ledgers without
     /// losing state changes between them.
@@ -1244,7 +1258,7 @@ impl TransactionExecutor {
     ///
     /// Uses no-tracking methods to avoid polluting the delta for subsequent transactions.
     pub fn apply_ledger_entry_changes(&mut self, changes: &stellar_xdr::curr::LedgerEntryChanges) {
-        use stellar_xdr::curr::LedgerEntryChange;
+        use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData};
 
         for change in changes.iter() {
             match change {
@@ -1252,6 +1266,12 @@ impl TransactionExecutor {
                 | LedgerEntryChange::Updated(entry)
                 | LedgerEntryChange::Restored(entry) => {
                     self.state.apply_entry_no_tracking(entry);
+                    // Add newly created/restored contract code to the module cache.
+                    // This ensures subsequent transactions can use VmCachedInstantiation
+                    // instead of the more expensive VmInstantiation for newly deployed contracts.
+                    if let LedgerEntryData::ContractCode(cc) = &entry.data {
+                        self.add_contract_to_cache(cc.code.as_slice());
+                    }
                 }
                 LedgerEntryChange::Removed(key) => {
                     self.state.delete_entry_no_tracking(key);
@@ -1301,9 +1321,17 @@ impl TransactionExecutor {
                     }
                     // For non-account entries or new accounts, apply normally
                     self.state.apply_entry_no_tracking(entry);
+                    // Add contract code to cache (Updated entries can be code re-uploads)
+                    if let LedgerEntryData::ContractCode(cc) = &entry.data {
+                        self.add_contract_to_cache(cc.code.as_slice());
+                    }
                 }
                 LedgerEntryChange::Created(entry) | LedgerEntryChange::Restored(entry) => {
                     self.state.apply_entry_no_tracking(entry);
+                    // Add newly created/restored contract code to the module cache
+                    if let LedgerEntryData::ContractCode(cc) = &entry.data {
+                        self.add_contract_to_cache(cc.code.as_slice());
+                    }
                 }
                 LedgerEntryChange::Removed(key) => {
                     self.state.delete_entry_no_tracking(key);

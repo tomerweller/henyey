@@ -2086,6 +2086,22 @@ async fn cmd_replay_bucket_list(
                 }
 
                 // 4. Upgrade changes
+                if !upgrade_metas.is_empty() {
+                    tracing::info!(
+                        ledger_seq = seq,
+                        num_upgrades = upgrade_metas.len(),
+                        "Applying upgrades from CDP"
+                    );
+                    for (i, upgrade) in upgrade_metas.iter().enumerate() {
+                        tracing::debug!(
+                            ledger_seq = seq,
+                            upgrade_index = i,
+                            upgrade_type = ?upgrade.upgrade,
+                            num_changes = upgrade.changes.len(),
+                            "Upgrade details"
+                        );
+                    }
+                }
                 for upgrade in &upgrade_metas {
                     for change in upgrade.changes.iter() {
                         apply_change_with_prestate(&mut aggregator, &bl, change);
