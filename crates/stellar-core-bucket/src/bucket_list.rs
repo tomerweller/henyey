@@ -1230,6 +1230,8 @@ impl BucketList {
 
         let start_iter = iter;
         let mut bytes_remaining = settings.eviction_scan_size;
+        // Track how many data entries we've evicted (not counting TTL entries)
+        let mut entries_remaining = settings.max_entries_to_archive;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
@@ -1250,17 +1252,24 @@ impl BucketList {
             };
 
             // Scan entries in this bucket starting from the offset
-            let (_entries_scanned, bytes_used, finished_bucket) = self.scan_bucket_region(
-                bucket,
-                &mut iter,
-                bytes_remaining,
-                current_ledger,
-                &mut result.archived_entries,
-                &mut result.evicted_keys,
-                &mut seen_keys,
-            )?;
+            let (_entries_scanned, bytes_used, data_entries_evicted, finished_bucket) =
+                self.scan_bucket_region(
+                    bucket,
+                    &mut iter,
+                    bytes_remaining,
+                    entries_remaining,
+                    current_ledger,
+                    &mut result.archived_entries,
+                    &mut result.evicted_keys,
+                    &mut seen_keys,
+                )?;
 
             result.bytes_scanned += bytes_used;
+            if entries_remaining > data_entries_evicted {
+                entries_remaining -= data_entries_evicted;
+            } else {
+                entries_remaining = 0;
+            }
 
             if bytes_remaining > bytes_used {
                 bytes_remaining -= bytes_used;
@@ -1268,8 +1277,8 @@ impl BucketList {
                 bytes_remaining = 0;
             }
 
-            // If we've scanned enough bytes, we're done
-            if bytes_remaining == 0 {
+            // If we've hit either limit (bytes or entry count), we're done
+            if bytes_remaining == 0 || entries_remaining == 0 {
                 result.scan_complete = true;
                 break;
             }
@@ -1300,26 +1309,28 @@ impl BucketList {
 
     /// Scan a region of a bucket for evictable entries.
     ///
-    /// Returns (entries_scanned, bytes_used, finished_bucket).
+    /// Returns (entries_scanned, bytes_used, data_entries_evicted, finished_bucket).
     #[allow(clippy::too_many_arguments)]
     fn scan_bucket_region(
         &self,
         bucket: &Bucket,
         iter: &mut EvictionIterator,
         max_bytes: u64,
+        max_entries: u32,
         current_ledger: u32,
         archived_entries: &mut Vec<LedgerEntry>,
         evicted_keys: &mut Vec<LedgerKey>,
         seen_keys: &mut HashSet<Vec<u8>>,
-    ) -> Result<(usize, u64, bool)> {
+    ) -> Result<(usize, u64, u32, bool)> {
         let mut entries_scanned = 0;
         let mut bytes_used = 0u64;
+        let mut data_entries_evicted = 0u32;
 
         // Skip buckets that predate Soroban; they cannot contain evictable entries.
         let bucket_protocol = bucket.protocol_version().unwrap_or(0);
         if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
             iter.bucket_file_offset = 0;
-            return Ok((entries_scanned, bytes_used, true));
+            return Ok((entries_scanned, bytes_used, data_entries_evicted, true));
         }
 
         // bucket_file_offset is a byte offset in the bucket file.
@@ -1352,7 +1363,7 @@ impl BucketList {
                     current_offset = entry_end;
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = current_offset;
-                        return Ok((entries_scanned, bytes_used, false));
+                        return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                     }
                     continue;
                 }
@@ -1360,7 +1371,7 @@ impl BucketList {
                     current_offset = entry_end;
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = current_offset;
-                        return Ok((entries_scanned, bytes_used, false));
+                        return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                     }
                     continue;
                 }
@@ -1371,7 +1382,7 @@ impl BucketList {
                 current_offset = entry_end;
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = current_offset;
-                    return Ok((entries_scanned, bytes_used, false));
+                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
             }
@@ -1381,7 +1392,7 @@ impl BucketList {
                 current_offset = entry_end;
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = current_offset;
-                    return Ok((entries_scanned, bytes_used, false));
+                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
             };
@@ -1393,7 +1404,7 @@ impl BucketList {
                     current_offset = entry_end;
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = current_offset;
-                        return Ok((entries_scanned, bytes_used, false));
+                        return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                     }
                     continue;
                 }
@@ -1403,7 +1414,7 @@ impl BucketList {
                 current_offset = entry_end;
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = current_offset;
-                    return Ok((entries_scanned, bytes_used, false));
+                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 // Already processed from a newer level
                 continue;
@@ -1414,7 +1425,7 @@ impl BucketList {
                 current_offset = entry_end;
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = current_offset;
-                    return Ok((entries_scanned, bytes_used, false));
+                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
             };
@@ -1424,7 +1435,7 @@ impl BucketList {
                 current_offset = entry_end;
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = current_offset;
-                    return Ok((entries_scanned, bytes_used, false));
+                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
             };
@@ -1434,7 +1445,7 @@ impl BucketList {
                 current_offset = entry_end;
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = current_offset;
-                    return Ok((entries_scanned, bytes_used, false));
+                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
             };
@@ -1443,30 +1454,37 @@ impl BucketList {
                 current_offset = entry_end;
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = current_offset;
-                    return Ok((entries_scanned, bytes_used, false));
+                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
             }
 
             // Entry is expired - categorize it
+            // When evicting an entry, we must remove BOTH the data entry AND its TTL entry
+            // Also check the max_entries limit (counts data entries only, not TTL)
             if is_temporary_entry(live_entry) {
                 evicted_keys.push(key);
+                evicted_keys.push(ttl_key);
+                data_entries_evicted += 1;
             } else if is_persistent_entry(live_entry) {
                 // Persistent entries go to hot archive AND are evicted from live
                 archived_entries.push(live_entry.clone());
                 evicted_keys.push(key);
+                evicted_keys.push(ttl_key);
+                data_entries_evicted += 1;
             }
 
             current_offset = entry_end;
-            if bytes_used >= max_bytes {
+            // Check both limits: bytes scanned and entries evicted
+            if bytes_used >= max_bytes || data_entries_evicted >= max_entries {
                 iter.bucket_file_offset = current_offset;
-                return Ok((entries_scanned, bytes_used, false));
+                return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
             }
         }
 
         // Finished the bucket
         iter.bucket_file_offset = current_offset;
-        Ok((entries_scanned, bytes_used, true))
+        Ok((entries_scanned, bytes_used, data_entries_evicted, true))
     }
 }
 

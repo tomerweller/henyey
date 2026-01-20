@@ -181,6 +181,7 @@ let mut iter = EvictionIterator::default();
 let settings = StateArchivalSettings {
     eviction_scan_size: 100_000,        // 100 KB per ledger
     starting_eviction_scan_level: 6,
+    max_entries_to_archive: 1000,       // Max data entries per ledger
 };
 
 // Perform incremental scan

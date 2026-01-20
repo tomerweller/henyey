@@ -915,6 +915,7 @@ fn test_eviction_scan_incremental() {
     let settings = StateArchivalSettings {
         starting_eviction_scan_level: 0,
         eviction_scan_size: 10_000, // Scan 10KB at a time
+        max_entries_to_archive: 1000, // Default limit
     };
 
     // Create iterator starting at level 0

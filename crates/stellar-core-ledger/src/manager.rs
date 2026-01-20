@@ -141,6 +141,7 @@ fn load_state_archival_settings_from_snapshot(
                 Some(StateArchivalSettings {
                     eviction_scan_size: settings.eviction_scan_size as u64,
                     starting_eviction_scan_level: settings.starting_eviction_scan_level,
+                    max_entries_to_archive: settings.max_entries_to_archive,
                 })
             } else {
                 None

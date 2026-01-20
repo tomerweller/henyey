@@ -2144,6 +2144,7 @@ async fn cmd_replay_bucket_list(
                             eviction_scan_size: override_settings.eviction_scan_size as u64,
                             starting_eviction_scan_level: override_settings
                                 .starting_eviction_scan_level,
+                            max_entries_to_archive: override_settings.max_entries_to_archive,
                         }
                     } else {
                         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
@@ -2157,6 +2158,7 @@ async fn cmd_replay_bucket_list(
                                 StateArchivalSettings {
                                     eviction_scan_size: s.eviction_scan_size as u64,
                                     starting_eviction_scan_level: s.starting_eviction_scan_level,
+                                    max_entries_to_archive: s.max_entries_to_archive,
                                 }
                             } else {
                                 StateArchivalSettings::default()
@@ -3604,6 +3606,7 @@ async fn cmd_verify_execution(
                             eviction_scan_size: override_settings.eviction_scan_size as u64,
                             starting_eviction_scan_level: override_settings
                                 .starting_eviction_scan_level,
+                            max_entries_to_archive: override_settings.max_entries_to_archive,
                         }
                     } else {
                         let key =
@@ -3618,6 +3621,7 @@ async fn cmd_verify_execution(
                                 StateArchivalSettings {
                                     eviction_scan_size: s.eviction_scan_size as u64,
                                     starting_eviction_scan_level: s.starting_eviction_scan_level,
+                                    max_entries_to_archive: s.max_entries_to_archive,
                                 }
                             } else {
                                 StateArchivalSettings::default()
@@ -3685,7 +3689,7 @@ async fn cmd_verify_execution(
                         &bl,
                         soroban_state.total_size(),
                         &mut aggregator,
-                        archival_override,
+                        archival_override.clone(),
                     );
                 }
 

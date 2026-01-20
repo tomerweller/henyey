@@ -224,13 +224,23 @@ pub struct StateArchivalSettings {
     /// Level 6 updates every 2048 ledgers, giving entries reasonable
     /// lifetime before they're scanned.
     pub starting_eviction_scan_level: u32,
+    /// Maximum number of data entries to evict per ledger (default: 1000).
+    ///
+    /// This caps the total number of data entries (not counting TTL entries)
+    /// that can be evicted in a single ledger. When this limit is reached,
+    /// the scan stops and remaining entries are left for subsequent ledgers.
+    pub max_entries_to_archive: u32,
 }
+
+/// Default maximum entries to archive per ledger.
+pub const DEFAULT_MAX_ENTRIES_TO_ARCHIVE: u32 = 1000;
 
 impl Default for StateArchivalSettings {
     fn default() -> Self {
         Self {
             eviction_scan_size: DEFAULT_EVICTION_SCAN_SIZE,
             starting_eviction_scan_level: DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
+            max_entries_to_archive: DEFAULT_MAX_ENTRIES_TO_ARCHIVE,
         }
     }
 }
