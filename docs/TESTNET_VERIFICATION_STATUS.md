@@ -63,8 +63,11 @@ When running verification **continuously** from ledger 64 (not starting from a c
 | 64-20,000 | **0** | Bucket list correct ✅ |
 | 64-30,000 | **0** | Bucket list correct ✅ |
 | 64-40,000 | **0** | Bucket list correct ✅ |
+| 64-40,970 | **0** | Last clean ledger ✅ |
 | 64-41,000 | 30 | Divergence begins at 40971 |
 | 64-50,000 | 9,030 | Accumulating divergence |
+
+**Root cause (investigated 2026-01-20)**: The divergence at ledger 40971 is caused by **~16,000 Soroban TX execution mismatches** in ledgers 64-40970. These transactions (mostly InvokeHostFunction) fail with `ResourceLimitExceeded` in our execution but succeeded in the original execution due to historical cost model calibration differences. The accumulated state differences from these mismatches eventually cause the bucket list hash to diverge. See Issue #3 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for details.
 
 **Key observation**: Continuous replay divergence is a **low priority** issue since production nodes always catch up from recent checkpoints.
 

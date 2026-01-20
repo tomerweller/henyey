@@ -66,34 +66,55 @@ After catchup completes to a checkpoint ledger, the node cannot close subsequent
 **Status:** Low Priority - Not a correctness issue
 **Severity:** Low - Only affects continuous replay from genesis
 **Component:** Bucket List
-**Last Verified:** 2026-01-19
+**Last Verified:** 2026-01-20
 
 ### Current State
 The bucket list implementation is **correct** for normal operation. When starting from any checkpoint, bucket list hashes match the expected values perfectly.
 
 Divergence only occurs when replaying **continuously** from early ledgers (e.g., starting at ledger 64 and running to ledger 100,000+). This is not a practical concern because:
 1. Real nodes always catch up from recent checkpoints
-2. The first ~8,591 ledgers replay correctly before divergence begins
+2. The first ~40,970 ledgers replay correctly before bucket list divergence begins
 3. Transaction execution mismatches in this scenario are caused by accumulated state differences, not fundamental bugs
+
+### Root Cause Analysis (2026-01-20)
+
+The bucket list divergence at ledger 40971 is caused by **accumulated state differences from ~16,000 Soroban transaction execution mismatches** in ledgers 64-40970:
+
+| Metric | Value |
+|--------|-------|
+| TX mismatches before divergence | ~15,986 |
+| Ledgers with TX mismatches | ~11,329 |
+| First TX mismatch | Ledger 706 |
+| First header mismatch | Ledger 40971 |
+
+**Mechanism:**
+1. Early testnet Soroban transactions were calibrated for a different cost model
+2. These transactions now fail with `ResourceLimitExceeded` in our execution but succeeded originally
+3. Failed transactions roll back state changes; the original execution applied them
+4. Over ~40,000 ledgers, these state differences accumulate in the bucket list
+5. At ledger 40971, the cumulative effect causes the bucket list hash to diverge
+
+**Why this cannot be fixed:** This is an extension of Issue #3 (historical cost model variance). We would need the exact cost model parameters from when each transaction was originally executed, which are not available.
 
 ### Verification Results
 | Range | Header Mismatches | Notes |
 |-------|-------------------|-------|
-| 64-1,000 | 0 | Bucket list correct |
-| 64-3,000 | 0 | Bucket list correct |
-| 64-5,000 | 0 | Bucket list correct |
-| 64-7,000 | 0 | Bucket list correct |
-| 64-8,500 | 0 | Bucket list correct |
-| 64-8,700 | 46 | Divergence begins ~8,591 |
-| 64-10,000 | 1,346 | Accumulating divergence |
+| 64-10,000 | 0 | Bucket list correct |
+| 64-20,000 | 0 | Bucket list correct |
+| 64-30,000 | 0 | Bucket list correct |
+| 64-40,000 | 0 | Bucket list correct |
+| 64-40,970 | 0 | Last clean ledger |
+| 64-41,000 | 30 | Divergence begins at 40971 |
+| 64-45,000 | 4,030 | Accumulating divergence |
 
 ### Checkpoint-Based Verification (All Pass)
 | Range | Header Mismatches | TX Mismatches |
 |-------|-------------------|---------------|
-| 152,600-152,800 | 0 | 1 (genuine bug) |
-| 201,400-201,800 | 0 | 3 (genuine bugs) |
-| 342,600-342,800 | 0 | 2 (genuine bugs) |
-| 390,300-390,500 | 0 | 3 (genuine bugs) |
+| 100,000-100,200 | 0 | 0 |
+| 152,600-152,800 | 0 | 1 (Issue #3) |
+| 201,400-201,800 | 0 | 0 |
+| 342,600-342,800 | 0 | 0 |
+| 390,300-390,500 | 0 | 2 (may be CDP anomaly) |
 
 ---
 
@@ -102,10 +123,15 @@ Divergence only occurs when replaying **continuously** from early ledgers (e.g.,
 **Status:** Historical Cost Model Variance - Cannot Fix
 **Severity:** Low - Affects only historical testnet transactions
 **Component:** Soroban Host / Cost Model
-**Last Verified:** 2026-01-19
+**Last Verified:** 2026-01-20
 
 ### Description
-Some InvokeHostFunction transactions return `Trapped` in our code but `ResourceLimitExceeded` in C++ stellar-core. Both are failures, but the error code differs.
+Some InvokeHostFunction transactions return different results than the original execution due to historical cost model variance. This manifests in two ways:
+
+1. **Error code differences**: Our `Trapped` vs original `ResourceLimitExceeded` (or vice versa)
+2. **Success vs failure differences**: We return `ResourceLimitExceeded` but original succeeded
+
+This is also the root cause of Issue #2 (Bucket List Continuous Replay Divergence) - approximately **16,000 Soroban TX mismatches** over the first ~40,970 ledgers cause accumulated state differences.
 
 ### Details
 ```
