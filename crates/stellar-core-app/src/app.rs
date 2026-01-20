@@ -365,6 +365,10 @@ pub struct App {
     /// Whether ledger application is currently in progress (for sync recovery).
     is_applying_ledger: AtomicBool,
 
+    /// Flag set by SyncRecoveryManager to request recovery from the main loop.
+    /// The main loop checks this and triggers buffered catchup when set.
+    sync_recovery_pending: AtomicBool,
+
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
     /// Monotonic counter used for ping IDs.
@@ -841,6 +845,7 @@ impl App {
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
+            sync_recovery_pending: AtomicBool::new(false),
             lost_sync_count: AtomicU64::new(0),
             ping_counter: AtomicU64::new(0),
             ping_inflight: RwLock::new(HashMap::new()),
@@ -2216,6 +2221,16 @@ impl App {
 
                 // Consensus timer - trigger ledger close for validators and process externalized
                 _ = consensus_interval.tick() => {
+                    // Check if SyncRecoveryManager requested recovery
+                    if self.sync_recovery_pending.swap(false, Ordering::SeqCst) {
+                        // SyncRecoveryManager triggered recovery - perform it now
+                        if let Ok(current_ledger) = self.get_current_ledger().await {
+                            self.out_of_sync_recovery(current_ledger).await;
+                        }
+                        // Also check for buffered catchup (this handles timeout-based catchup)
+                        self.maybe_start_buffered_catchup().await;
+                    }
+
                     // Check for externalized slots to process
                     self.process_externalized_slots().await;
 
@@ -3026,12 +3041,15 @@ impl App {
         };
 
         if sequential_with_tx_set {
-            // Tx set is available, clear stuck state and let normal flow handle it
-            *self.consensus_stuck_state.write().await = None;
-            tracing::info!(
+            // Tx set is available, let try_apply_buffered_ledgers() handle it.
+            // DON'T reset stuck state here - there's a race condition where the tx_set
+            // might have arrived after try_apply_buffered_ledgers() checked but before
+            // this check. The stuck state will naturally become invalid when current_ledger
+            // advances (the match condition state.current_ledger == current_ledger will fail).
+            tracing::debug!(
                 current_ledger,
                 first_buffered,
-                "Sequential ledger available; skipping buffered catchup"
+                "Sequential ledger tx set available; skipping buffered catchup"
             );
             return;
         }
@@ -3257,10 +3275,9 @@ impl App {
                             first_buffered,
                             "Skipping catchup: archive has no newer checkpoint"
                         );
-                        // Reset tx_set tracking to give pending requests a fresh chance.
-                        // When we're at a checkpoint boundary waiting for the next checkpoint,
-                        // peers may have responded DontHave for tx_sets that are now current.
-                        self.reset_tx_set_tracking_after_catchup().await;
+                        // DON'T reset tx_set tracking here - we're not completing catchup,
+                        // just waiting for the next checkpoint. Resetting tracking would
+                        // clear pending requests and prevent responses from being matched.
                         // Record skip time for cooldown to prevent repeated archive queries.
                         // This uses the same cooldown mechanism as catchup completion.
                         *self.last_catchup_completed_at.write().await = Some(Instant::now());
@@ -6473,11 +6490,11 @@ impl SyncRecoveryCallback for App {
     }
 
     fn on_out_of_sync_recovery(&self) {
-        tracing::info!("Performing out-of-sync recovery");
-        // Request SCP state from peers (spawn a task since this is async)
-        // Note: We use a simple approach here - the main event loop also
-        // handles SCP state requests, so we just trigger via the heartbeat mechanism
-        self.request_scp_state_sync();
+        tracing::info!("SyncRecoveryManager triggered out-of-sync recovery");
+        // Set flag so the main event loop will trigger recovery and buffered catchup.
+        // The main loop checks this flag and calls maybe_start_buffered_catchup()
+        // which handles the actual recovery logic including timeout-based catchup.
+        self.sync_recovery_pending.store(true, Ordering::SeqCst);
     }
 
     fn is_applying_ledger(&self) -> bool {
