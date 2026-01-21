@@ -807,6 +807,12 @@ impl LedgerManager {
 
         // Validate previous hash
         if close_data.prev_ledger_hash != state.header_hash {
+            // Describe the StellarValueExt for logging
+            let stellar_value_ext_desc = match &state.header.scp_value.ext {
+                stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
+                stellar_xdr::curr::StellarValueExt::Signed(_) => "Signed".to_string(),
+            };
+
             // Debug: Log header details to help diagnose hash mismatch
             tracing::error!(
                 current_seq = state.header.ledger_seq,
@@ -821,6 +827,13 @@ impl LedgerManager {
                 header_close_time = state.header.scp_value.close_time.0,
                 header_tx_set_hash = %Hash256::from(state.header.scp_value.tx_set_hash.0).to_hex(),
                 header_upgrades_count = state.header.scp_value.upgrades.len(),
+                header_stellar_value_ext = %stellar_value_ext_desc,
+                header_prev_ledger_hash = %Hash256::from(state.header.previous_ledger_hash.0).to_hex(),
+                header_id_pool = state.header.id_pool,
+                header_inflation_seq = state.header.inflation_seq,
+                header_base_fee = state.header.base_fee,
+                header_base_reserve = state.header.base_reserve,
+                header_max_tx_set_size = state.header.max_tx_set_size,
                 "Hash mismatch - our computed header hash differs from network's prev_ledger_hash"
             );
             return Err(LedgerError::HashMismatch {
@@ -1594,6 +1607,12 @@ impl<'a> LedgerCloseContext<'a> {
         self.stats
             .set_close_time(start.elapsed().as_millis() as u64);
 
+        // Describe the StellarValueExt for logging
+        let stellar_value_ext_desc = match &new_header.scp_value.ext {
+            stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
+            stellar_xdr::curr::StellarValueExt::Signed(_) => "Signed".to_string(),
+        };
+
         info!(
             ledger_seq = new_header.ledger_seq,
             tx_count = self.stats.tx_count,
@@ -1606,6 +1625,8 @@ impl<'a> LedgerCloseContext<'a> {
             close_time = new_header.scp_value.close_time.0,
             tx_set_hash = %Hash256::from(new_header.scp_value.tx_set_hash.0).to_hex(),
             upgrades_count = new_header.scp_value.upgrades.len(),
+            stellar_value_ext = %stellar_value_ext_desc,
+            prev_header_hash = %self.prev_header_hash.to_hex(),
             "Ledger closed"
         );
 

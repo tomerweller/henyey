@@ -2473,6 +2473,9 @@ async fn cmd_replay_bucket_list(
 /// * `cdp_date` - CDP date partition
 /// * `cache_dir` - Optional cache directory for buckets and CDP metadata
 /// * `no_cache` - Disable caching (use temp directories)
+///
+/// This command always uses our execution results for bucket list updates, making it a true
+/// end-to-end verification. CDP metadata is used only for comparison to detect divergence.
 async fn cmd_verify_execution(
     config: AppConfig,
     from: Option<u32>,
@@ -2507,6 +2510,7 @@ async fn cmd_verify_execution(
         println!("Transaction Execution Verification");
         println!("===================================");
         println!("Re-executes transactions and compares results against CDP metadata.");
+        println!("Uses our execution results for bucket list updates (true end-to-end test).");
         println!();
     }
 
@@ -3226,8 +3230,7 @@ async fn cmd_verify_execution(
                     }
                 }
 
-                // Always sync with CDP's fee_meta to ensure correct state for Phase 2
-                executor.apply_ledger_entry_changes(&tx_info.fee_meta);
+                // We use our own execution results, so no CDP sync here
             }
 
             // Accumulate Phase 1 fee mismatches
@@ -3240,8 +3243,6 @@ async fn cmd_verify_execution(
             // these refunds are applied after all transactions in the ledger.
 
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
-            let mut deferred_post_fee_changes: Vec<stellar_xdr::curr::LedgerEntryChanges> =
-                Vec::new();
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || xdr(u64(txIndex)))
                 // C++ uses subSha256(baseSeed, static_cast<uint64_t>(index)) where
@@ -3284,40 +3285,9 @@ async fn cmd_verify_execution(
                     _ => false,
                 };
 
-                // Sync state with CDP to ensure subsequent transactions see correct state.
-                // This is critical because even when both succeed, our state changes may differ
-                // from CDP's (e.g., fee calculations, refunds, or execution differences).
-                // Without syncing, these differences accumulate and cause subsequent failures.
-                //
-                // IMPORTANT: Only sync when the transaction succeeded. For failed transactions,
-                // the CDP metadata contains changes from successful operations within the failed
-                // transaction (for audit purposes), but these changes are rolled back and NOT
-                // persisted to ledger state. Syncing them would incorrectly apply state changes
-                // that C++ stellar-core rolled back.
-                if cdp_succeeded {
-                    // Apply changes in phases to handle sequence number pollution in CDP metadata.
-                    // The issue: CDP metadata for operation changes can contain sequence numbers
-                    // from later transactions in the same ledger (due to how C++ captures STATE).
-                    // Solution: Apply tx_changes normally (includes real seq bumps), but preserve
-                    // our sequence numbers when applying operation changes.
-                    let (tx_changes, op_changes) = extract_changes_by_source(&tx_info.meta);
-
-                    let tx_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
-                        tx_changes.try_into().unwrap_or_default();
-                    executor.apply_ledger_entry_changes(&tx_changes_vec);
-
-                    let op_changes_vec: stellar_xdr::curr::LedgerEntryChanges =
-                        op_changes.try_into().unwrap_or_default();
-                    executor.apply_ledger_entry_changes_preserve_seq(&op_changes_vec);
-
-                    if !tx_info.post_fee_meta.is_empty() {
-                        if cdp_header.ledger_version >= 23 {
-                            deferred_post_fee_changes.push(tx_info.post_fee_meta.clone());
-                        } else {
-                            executor.apply_ledger_entry_changes(&tx_info.post_fee_meta);
-                        }
-                    }
-                }
+                // We use our own execution results (no CDP sync).
+                // This is true end-to-end verification - any divergence in our execution
+                // will accumulate and show up as bucket list hash mismatches.
 
                 if in_test_range {
                     transactions_verified += 1;
@@ -3421,14 +3391,9 @@ async fn cmd_verify_execution(
                     }
                 }
             }
-            if cdp_header.ledger_version >= 23 {
-                for changes in deferred_post_fee_changes {
-                    executor.apply_ledger_entry_changes(&changes);
-                }
-            }
-
-            // Apply changes to bucket list for next ledger using CDP metadata
-            // This ensures subsequent ledgers have correct state for lookups
+            // Apply changes to bucket list for next ledger
+            // We always use our executor's state for true end-to-end verification
+            // CDP metadata is only used for comparison to detect divergence
             {
                 use stellar_core_bucket::ledger_entry_to_key;
                 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
@@ -3436,6 +3401,16 @@ async fn cmd_verify_execution(
                     ConfigSettingEntry, ConfigSettingId, LedgerEntryChange, LedgerEntryData,
                     LedgerEntryExt,
                 };
+
+                // Get entries from our executor's delta
+                // created_entries = init (new entries), updated_entries = live (modified entries)
+                // deleted_keys = dead (removed entries)
+                let delta = executor.state().delta();
+                let (our_init, mut our_live, our_dead): (Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>) = (
+                    delta.created_entries().to_vec(),
+                    delta.updated_entries().to_vec(),
+                    delta.deleted_keys().to_vec(),
+                );
 
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = bucket_list.read().unwrap();
@@ -3685,6 +3660,9 @@ async fn cmd_verify_execution(
                         )),
                         ext: LedgerEntryExt::V0,
                     };
+                    // Add eviction iterator to our execution delta (system update)
+                    our_live.push(iter_entry.clone());
+                    // Also track in aggregator for CDP comparison
                     apply_change_with_prestate(
                         &mut aggregator,
                         &bl,
@@ -3692,12 +3670,34 @@ async fn cmd_verify_execution(
                     );
                 }
 
+                // Check if state size window was already changed by transactions
                 let window_key =
                     LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
                         config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
                     });
-                let has_window_change = aggregator.changes.contains_key(&window_key);
+                let our_has_window = our_live.iter().any(|e| {
+                    matches!(
+                        &e.data,
+                        LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(_))
+                    )
+                });
 
+                // Compute state size window update for our execution
+                if !our_has_window {
+                    // Create state size window entry directly for our delta
+                    if let Some(window_entry) = compute_soroban_state_size_window_entry(
+                        seq,
+                        cdp_header.ledger_version,
+                        &bl,
+                        soroban_state.total_size(),
+                        archival_override.clone(),
+                    ) {
+                        our_live.push(window_entry);
+                    }
+                }
+
+                // Also apply to aggregator for CDP comparison
+                let has_window_change = aggregator.changes.contains_key(&window_key);
                 if !has_window_change {
                     maybe_snapshot_soroban_state_size_window(
                         seq,
@@ -3709,7 +3709,9 @@ async fn cmd_verify_execution(
                     );
                 }
 
-                let (all_init, all_live, all_dead) = aggregator.clone().to_vectors();
+                // Use our execution results for state updates
+                let (all_init, all_live, all_dead) = (our_init.clone(), our_live.clone(), our_dead.clone());
+
                 if cdp_header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
                     soroban_state
                         .update_state(
@@ -3723,7 +3725,138 @@ async fn cmd_verify_execution(
                         .map_err(|e| anyhow::anyhow!("soroban state update failed: {}", e))?;
                 }
 
-                let (all_init, all_live, all_dead) = aggregator.to_vectors();
+                // Diagnostic logging: compare our execution vs CDP metadata
+                let (cdp_init, cdp_live, cdp_dead) = aggregator.to_vectors();
+
+                // Build maps keyed by LedgerKey for comparison
+                let our_init_map: std::collections::HashMap<_, _> = our_init
+                    .iter()
+                    .filter_map(|e| ledger_entry_to_key(e).map(|k| (k, e.clone())))
+                    .collect();
+                let our_live_map: std::collections::HashMap<_, _> = our_live
+                    .iter()
+                    .filter_map(|e| ledger_entry_to_key(e).map(|k| (k, e.clone())))
+                    .collect();
+                let our_dead_set: std::collections::HashSet<_> = our_dead.iter().cloned().collect();
+
+                let cdp_init_map: std::collections::HashMap<_, _> = cdp_init
+                    .iter()
+                    .filter_map(|e| ledger_entry_to_key(e).map(|k| (k, e.clone())))
+                    .collect();
+                let cdp_live_map: std::collections::HashMap<_, _> = cdp_live
+                    .iter()
+                    .filter_map(|e| ledger_entry_to_key(e).map(|k| (k, e.clone())))
+                    .collect();
+                let cdp_dead_set: std::collections::HashSet<_> = cdp_dead.iter().cloned().collect();
+
+                // Compare INIT entries (new entries)
+                let mut init_only_ours = 0;
+                let mut init_only_cdp = 0;
+                let mut init_different = 0;
+
+                for (key, our_entry) in &our_init_map {
+                    if let Some(cdp_entry) = cdp_init_map.get(key) {
+                        if our_entry != cdp_entry {
+                            init_different += 1;
+                            if init_different <= 3 {
+                                println!("  INIT DIFFERS: {:?}", key);
+                                println!("    OURS: last_modified={}, data_type={:?}",
+                                    our_entry.last_modified_ledger_seq,
+                                    std::mem::discriminant(&our_entry.data));
+                                println!("    CDP:  last_modified={}, data_type={:?}",
+                                    cdp_entry.last_modified_ledger_seq,
+                                    std::mem::discriminant(&cdp_entry.data));
+                            }
+                        }
+                    } else {
+                        init_only_ours += 1;
+                        if init_only_ours <= 3 {
+                            println!("  INIT only in OURS: {:?}", key);
+                        }
+                    }
+                }
+                for key in cdp_init_map.keys() {
+                    if !our_init_map.contains_key(key) {
+                        init_only_cdp += 1;
+                        if init_only_cdp <= 3 {
+                            println!("  INIT only in CDP: {:?}", key);
+                        }
+                    }
+                }
+
+                // Compare LIVE entries (updated entries)
+                let mut live_only_ours = 0;
+                let mut live_only_cdp = 0;
+                let mut live_different = 0;
+
+                for (key, our_entry) in &our_live_map {
+                    if let Some(cdp_entry) = cdp_live_map.get(key) {
+                        if our_entry != cdp_entry {
+                            live_different += 1;
+                            if live_different <= 3 {
+                                println!("  LIVE DIFFERS: {:?}", key);
+                                println!("    OURS: last_modified={}, data_type={:?}",
+                                    our_entry.last_modified_ledger_seq,
+                                    std::mem::discriminant(&our_entry.data));
+                                println!("    CDP:  last_modified={}, data_type={:?}",
+                                    cdp_entry.last_modified_ledger_seq,
+                                    std::mem::discriminant(&cdp_entry.data));
+                            }
+                        }
+                    } else {
+                        live_only_ours += 1;
+                        if live_only_ours <= 3 {
+                            println!("  LIVE only in OURS: {:?}", key);
+                        }
+                    }
+                }
+                for key in cdp_live_map.keys() {
+                    if !our_live_map.contains_key(key) {
+                        live_only_cdp += 1;
+                        if live_only_cdp <= 3 {
+                            println!("  LIVE only in CDP: {:?}", key);
+                        }
+                    }
+                }
+
+                // Compare DEAD entries (deleted keys)
+                let mut dead_only_ours = 0;
+                let mut dead_only_cdp = 0;
+
+                for key in &our_dead_set {
+                    if !cdp_dead_set.contains(key) {
+                        dead_only_ours += 1;
+                        if dead_only_ours <= 3 {
+                            println!("  DEAD only in OURS: {:?}", key);
+                        }
+                    }
+                }
+                for key in &cdp_dead_set {
+                    if !our_dead_set.contains(key) {
+                        dead_only_cdp += 1;
+                        if dead_only_cdp <= 3 {
+                            println!("  DEAD only in CDP: {:?}", key);
+                        }
+                    }
+                }
+
+                // Summary
+                let has_diff = init_only_ours > 0 || init_only_cdp > 0 || init_different > 0
+                    || live_only_ours > 0 || live_only_cdp > 0 || live_different > 0
+                    || dead_only_ours > 0 || dead_only_cdp > 0;
+
+                if has_diff {
+                    println!("  DELTA COMPARISON for ledger {}:", seq);
+                    println!("    INIT: ours={}, cdp={}, only_ours={}, only_cdp={}, different={}",
+                        our_init.len(), cdp_init.len(), init_only_ours, init_only_cdp, init_different);
+                    println!("    LIVE: ours={}, cdp={}, only_ours={}, only_cdp={}, different={}",
+                        our_live.len(), cdp_live.len(), live_only_ours, live_only_cdp, live_different);
+                    println!("    DEAD: ours={}, cdp={}, only_ours={}, only_cdp={}",
+                        our_dead.len(), cdp_dead.len(), dead_only_ours, dead_only_cdp);
+                }
+
+                // Use our execution results for bucket list update
+                let (all_init, all_live, all_dead) = (our_init, our_live, our_dead);
 
                 // Before evicting entries from the live bucket list, look up full entry data
                 // for persistent entries that need to go to the hot archive. Use the
@@ -5374,6 +5507,99 @@ fn apply_change_with_prestate(
         }
         _ => aggregator.apply_change(change),
     }
+}
+
+/// Compute state size window entry if it needs updating at this ledger.
+/// Returns Some(entry) if the window needs to be updated, None otherwise.
+fn compute_soroban_state_size_window_entry(
+    seq: u32,
+    protocol_version: u32,
+    bucket_list: &stellar_core_bucket::BucketList,
+    soroban_state_size: u64,
+    archival_override: Option<stellar_xdr::curr::StateArchivalSettings>,
+) -> Option<stellar_xdr::curr::LedgerEntry> {
+    use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
+    use stellar_xdr::curr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+        LedgerKey, LedgerKeyConfigSetting, VecM,
+    };
+
+    if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
+        return None;
+    }
+
+    let archival = if let Some(override_settings) = archival_override {
+        override_settings
+    } else {
+        let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::StateArchival,
+        });
+        let archival_entry = bucket_list.get(&archival_key).ok()??;
+        let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival)) =
+            archival_entry.data
+        else {
+            return None;
+        };
+        archival
+    };
+
+    let sample_period = archival.live_soroban_state_size_window_sample_period;
+    let sample_size = archival.live_soroban_state_size_window_sample_size as usize;
+    if sample_period == 0 || sample_size == 0 {
+        return None;
+    }
+
+    let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+    });
+    let window_entry = bucket_list.get(&window_key).ok()??;
+    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) =
+        window_entry.data
+    else {
+        return None;
+    };
+
+    let mut window_vec: Vec<u64> = window.into();
+    if window_vec.is_empty() {
+        return None;
+    }
+
+    let mut changed = false;
+    if window_vec.len() != sample_size {
+        if sample_size < window_vec.len() {
+            let remove_count = window_vec.len() - sample_size;
+            window_vec.drain(0..remove_count);
+        } else {
+            let oldest = window_vec[0];
+            let insert_count = sample_size - window_vec.len();
+            for _ in 0..insert_count {
+                window_vec.insert(0, oldest);
+            }
+        }
+        changed = true;
+    }
+
+    if seq % sample_period == 0 {
+        if !window_vec.is_empty() {
+            window_vec.remove(0);
+            window_vec.push(soroban_state_size);
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let window_vecm: VecM<u64> = window_vec.try_into().ok()?;
+
+    Some(LedgerEntry {
+        last_modified_ledger_seq: seq,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+            window_vecm,
+        )),
+        ext: LedgerEntryExt::V0,
+    })
 }
 
 fn maybe_snapshot_soroban_state_size_window(
