@@ -117,6 +117,11 @@ pub struct LedgerStateManager {
     contract_code: HashMap<[u8; 32], ContractCodeEntry>,
     /// TTL entries by key hash.
     ttl_entries: HashMap<[u8; 32], TtlEntry>,
+    /// TTL values at ledger start (for Soroban execution).
+    /// This is captured at the start of each ledger and remains read-only during execution.
+    /// Soroban uses these values instead of ttl_entries to match C++ behavior where
+    /// transactions see the bucket list state at ledger start, not changes from previous txs.
+    ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
     /// Claimable balance entries by balance ID.
     claimable_balances: HashMap<[u8; 32], ClaimableBalanceEntry>,
     /// Liquidity pool entries by pool ID.
@@ -232,6 +237,7 @@ impl LedgerStateManager {
             contract_data: HashMap::new(),
             contract_code: HashMap::new(),
             ttl_entries: HashMap::new(),
+            ttl_bucket_list_snapshot: HashMap::new(),
             claimable_balances: HashMap::new(),
             liquidity_pools: HashMap::new(),
             entry_sponsorships: HashMap::new(),
@@ -522,6 +528,7 @@ impl LedgerStateManager {
         self.contract_data.clear();
         self.contract_code.clear();
         self.ttl_entries.clear();
+        self.ttl_bucket_list_snapshot.clear();
         self.claimable_balances.clear();
         self.liquidity_pools.clear();
         self.entry_sponsorships.clear();
@@ -1083,6 +1090,12 @@ impl LedgerStateManager {
                 let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                     key_hash: ttl.key_hash.clone(),
                 });
+                // Capture the bucket list TTL value for Soroban.
+                // Only capture if not already present - this ensures we keep the original
+                // bucket list value even if the entry is reloaded later.
+                self.ttl_bucket_list_snapshot
+                    .entry(key)
+                    .or_insert(ttl.live_until_ledger_seq);
                 self.ttl_entries.insert(key, ttl);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
@@ -1302,6 +1315,12 @@ impl LedgerStateManager {
             }
             LedgerEntryData::Ttl(ttl) => {
                 let key = ttl.key_hash.0;
+                // Capture the bucket list TTL value for Soroban.
+                // Only capture if not already present - this ensures we keep the original
+                // bucket list value even if the entry is reloaded later.
+                self.ttl_bucket_list_snapshot
+                    .entry(key)
+                    .or_insert(ttl.live_until_ledger_seq);
                 self.ttl_entries.insert(key, ttl.clone());
             }
             LedgerEntryData::ConfigSetting(_) => {
@@ -2300,6 +2319,30 @@ impl LedgerStateManager {
     /// Get a TTL entry by key hash (read-only).
     pub fn get_ttl(&self, key_hash: &Hash) -> Option<&TtlEntry> {
         self.ttl_entries.get(&key_hash.0)
+    }
+
+    /// Get the TTL live_until_ledger_seq at ledger start.
+    ///
+    /// This returns the TTL value from the bucket list snapshot captured at the
+    /// start of the ledger, before any transactions modified it. This is used
+    /// by Soroban execution to match C++ stellar-core behavior where transactions
+    /// see the bucket list state at ledger start, not changes from previous txs.
+    pub fn get_ttl_at_ledger_start(&self, key_hash: &Hash) -> Option<u32> {
+        self.ttl_bucket_list_snapshot.get(&key_hash.0).copied()
+    }
+
+    /// Capture the current TTL values as the bucket list snapshot.
+    ///
+    /// This should be called once at the start of each ledger, after loading
+    /// state from the bucket list but before executing any transactions.
+    /// The captured values will be used by Soroban for TTL lookups to ensure
+    /// consistent behavior with C++ stellar-core.
+    pub fn capture_ttl_bucket_list_snapshot(&mut self) {
+        self.ttl_bucket_list_snapshot.clear();
+        for (key_hash, ttl) in &self.ttl_entries {
+            self.ttl_bucket_list_snapshot
+                .insert(*key_hash, ttl.live_until_ledger_seq);
+        }
     }
 
     /// Get a mutable reference to a TTL entry.

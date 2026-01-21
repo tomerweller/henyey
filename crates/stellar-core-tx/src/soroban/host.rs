@@ -645,14 +645,20 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
 }
 
 /// Get the TTL for a ledger entry.
+///
+/// This function uses the bucket list TTL snapshot captured at ledger start,
+/// not the current in-memory TTL values. This ensures Soroban sees the same
+/// TTL values as C++ stellar-core, which uses the bucket list state at ledger
+/// start rather than reflecting changes from previous transactions in the same ledger.
 fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             // Compute key hash for TTL lookup
             let key_hash = compute_key_hash(key);
-            let ttl = state
-                .get_ttl(&key_hash)
-                .map(|ttl| ttl.live_until_ledger_seq);
+            // Use the bucket list snapshot for TTL lookup to match C++ behavior.
+            // This ensures transactions see TTL values at ledger start, not changes
+            // from previous transactions in the same ledger.
+            let ttl = state.get_ttl_at_ledger_start(&key_hash);
             if let Some(live_until) = ttl {
                 if live_until < current_ledger {
                     tracing::warn!(
@@ -666,18 +672,9 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
                         "Soroban entry TTL is EXPIRED"
                     );
                 }
-            } else {
-                // TTL entries may not be present in older bucket lists or for newly created entries
-                // that haven't been checkpointed yet. This is not an error condition.
-                tracing::debug!(
-                    key_type = if matches!(key, LedgerKey::ContractCode(_)) {
-                        "ContractCode"
-                    } else {
-                        "ContractData"
-                    },
-                    "Soroban entry has no TTL record in bucket list"
-                );
             }
+            // Note: TTL entries may be absent for newly created entries that haven't been
+            // checkpointed to the bucket list yet. This is expected and not an error.
             ttl
         }
         _ => None,
@@ -1373,6 +1370,7 @@ fn execute_host_function_p24(
             // Empty bytes for entries that don't need TTL (non-contract entries)
             Vec::new()
         };
+
         encoded_ttl_entries.push(ttl_bytes);
         Ok(())
     };
@@ -1558,6 +1556,25 @@ fn execute_host_function_p24(
     let rent_changes: Vec<LedgerEntryRentChange> =
         e2e_invoke::extract_rent_changes(&result.ledger_changes);
 
+    // Debug: print rent_changes for P24
+    if !rent_changes.is_empty() {
+        tracing::debug!(
+            rent_changes_count = rent_changes.len(),
+            "P24: Extracted rent changes"
+        );
+        for (i, rc) in rent_changes.iter().enumerate() {
+            tracing::debug!(
+                idx = i,
+                is_persistent = rc.is_persistent,
+                old_size = rc.old_size_bytes,
+                new_size = rc.new_size_bytes,
+                old_live_until = rc.old_live_until_ledger,
+                new_live_until = rc.new_live_until_ledger,
+                "P24: Rent change details"
+            );
+        }
+    }
+
     // Convert ledger changes to our format
     let storage_changes = result.ledger_changes
         .into_iter()
@@ -1601,6 +1618,12 @@ fn execute_host_function_p24(
         contract_events_size.saturating_add(return_value_size);
     let rent_fee_config = rent_fee_config_p25_to_p24(&soroban_config.rent_fee_config);
     let rent_fee = compute_rent_fee(&rent_changes, &rent_fee_config, context.sequence);
+    tracing::debug!(
+        computed_rent_fee = rent_fee,
+        rent_changes_count = rent_changes.len(),
+        ledger_seq = context.sequence,
+        "P24: Computed rent fee"
+    );
     let diagnostic_events = convert_diagnostic_events_p24(diagnostic_events);
 
     Ok(SorobanExecutionResult {
