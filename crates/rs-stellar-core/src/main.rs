@@ -3319,6 +3319,18 @@ async fn cmd_verify_execution(
                                 }
                             }
 
+                            // Apply fee refund to the executor's state AND delta.
+                            // For Soroban transactions, unused resources are refunded to the fee source.
+                            // This refund is tracked in result.fee_refund and must be applied to the
+                            // delta so the bucket list gets the correct final balance.
+                            // We use apply_refund_to_delta which updates both the in-memory state
+                            // and modifies the delta's updated_entries to reflect the refund.
+                            if result.fee_refund > 0 {
+                                let fee_source_id =
+                                    stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+                                executor.state_mut().apply_refund_to_delta(&fee_source_id, result.fee_refund);
+                            }
+
                             // Deep comparison of transaction meta if both are available
                             // For fee bump transactions with separate fee source, fee changes are
                             // already in the CDP meta, so we don't need to prepend them
@@ -3431,12 +3443,55 @@ async fn cmd_verify_execution(
                 // Get entries from our executor's delta
                 // created_entries = init (new entries), updated_entries = live (modified entries)
                 // deleted_keys = dead (removed entries)
+                //
+                // IMPORTANT: If an entry is created and then updated in the same ledger,
+                // it should appear ONLY in INIT (with its final state), not in LIVE.
+                // C++ stellar-core coalesces these into a single INIT entry.
                 let delta = executor.state().delta();
-                let (our_init, mut our_live, our_dead): (Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>) = (
-                    delta.created_entries().to_vec(),
-                    delta.updated_entries().to_vec(),
-                    delta.deleted_keys().to_vec(),
-                );
+                let created = delta.created_entries();
+                let updated = delta.updated_entries();
+                let our_dead = delta.deleted_keys().to_vec();
+
+                // Build a set of created keys for efficient lookup
+                let created_keys: std::collections::HashSet<_> = created
+                    .iter()
+                    .filter_map(|e| ledger_entry_to_key(e))
+                    .collect();
+
+                // Build a map of updated entries by key
+                let updated_by_key: std::collections::HashMap<_, _> = updated
+                    .iter()
+                    .filter_map(|e| ledger_entry_to_key(e).map(|k| (k, e.clone())))
+                    .collect();
+
+                // For INIT: use updated value if entry was both created and updated,
+                // otherwise use created value
+                let our_init: Vec<LedgerEntry> = created
+                    .iter()
+                    .map(|e| {
+                        if let Some(key) = ledger_entry_to_key(e) {
+                            updated_by_key.get(&key).cloned().unwrap_or_else(|| e.clone())
+                        } else {
+                            e.clone()
+                        }
+                    })
+                    .collect();
+
+                // For LIVE: exclude entries whose keys are in the created set,
+                // and deduplicate by key (keep only the final state for each key).
+                // If the same entry is updated multiple times in a ledger, we only
+                // want the last update for the bucket list.
+                let mut live_by_key: std::collections::HashMap<LedgerKey, LedgerEntry> =
+                    std::collections::HashMap::new();
+                for entry in updated.iter() {
+                    if let Some(key) = ledger_entry_to_key(entry) {
+                        if !created_keys.contains(&key) {
+                            // Later updates overwrite earlier ones (HashMap insert replaces)
+                            live_by_key.insert(key, entry.clone());
+                        }
+                    }
+                }
+                let mut our_live: Vec<LedgerEntry> = live_by_key.into_values().collect();
 
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = bucket_list.read().unwrap();
@@ -3827,6 +3882,16 @@ async fn cmd_verify_execution(
                                 println!("    CDP:  last_modified={}, data_type={:?}",
                                     cdp_entry.last_modified_ledger_seq,
                                     std::mem::discriminant(&cdp_entry.data));
+                                // Show account balance difference
+                                if let (
+                                    stellar_xdr::curr::LedgerEntryData::Account(our_acc),
+                                    stellar_xdr::curr::LedgerEntryData::Account(cdp_acc),
+                                ) = (&our_entry.data, &cdp_entry.data)
+                                {
+                                    println!("    OURS balance={}, seq={}", our_acc.balance, our_acc.seq_num.0);
+                                    println!("    CDP  balance={}, seq={}", cdp_acc.balance, cdp_acc.seq_num.0);
+                                    println!("    balance diff={}", our_acc.balance - cdp_acc.balance);
+                                }
                             }
                         }
                     } else {
