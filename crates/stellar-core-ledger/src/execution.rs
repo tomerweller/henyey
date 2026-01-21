@@ -285,6 +285,29 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         })
         .unwrap_or(0);
 
+    // Load contract size limits for entry validation (validateContractLedgerEntry)
+    let max_contract_size_bytes =
+        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractMaxSizeBytes(size) = cs {
+                    Some(size)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(64 * 1024); // 64 KB default
+
+    let max_contract_data_entry_size_bytes =
+        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractDataEntrySizeBytes(size) = cs {
+                    Some(size)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(64 * 1024); // 64 KB default
+
     // Load state archival TTL settings
     let (
         min_temp_entry_ttl,
@@ -381,6 +404,8 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         fee_config,
         rent_fee_config,
         tx_max_contract_events_size_bytes,
+        max_contract_size_bytes,
+        max_contract_data_entry_size_bytes,
     };
 
     // Log whether we found valid cost params

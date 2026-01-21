@@ -32,6 +32,10 @@ pub struct SorobanConfig {
     pub rent_fee_config: RentFeeConfiguration,
     /// Maximum size of contract events + return value per tx.
     pub tx_max_contract_events_size_bytes: u32,
+    /// Maximum CONTRACT_CODE entry size in bytes (from ConfigSettingId::ContractMaxSizeBytes).
+    pub max_contract_size_bytes: u32,
+    /// Maximum CONTRACT_DATA entry size in bytes (from ConfigSettingId::ContractDataEntrySizeBytes).
+    pub max_contract_data_entry_size_bytes: u32,
 }
 
 impl Default for SorobanConfig {
@@ -49,6 +53,8 @@ impl Default for SorobanConfig {
             fee_config: FeeConfiguration::default(),
             rent_fee_config: RentFeeConfiguration::default(),
             tx_max_contract_events_size_bytes: 0,
+            max_contract_size_bytes: 64 * 1024, // 64 KB default
+            max_contract_data_entry_size_bytes: 64 * 1024, // 64 KB default
         }
     }
 }
