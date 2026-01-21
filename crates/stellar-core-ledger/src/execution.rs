@@ -2593,6 +2593,16 @@ impl TransactionExecutor {
             soroban_return_value = None;
         } else {
             self.state.commit();
+
+            // Update module cache with any newly created contract code.
+            // This ensures subsequent transactions can use VmCachedInstantiation
+            // (cheap) instead of VmInstantiation (expensive) for contracts
+            // deployed in this transaction.
+            for entry in self.state.delta().created_entries() {
+                if let stellar_xdr::curr::LedgerEntryData::ContractCode(cc) = &entry.data {
+                    self.add_contract_to_cache(cc.code.as_slice());
+                }
+            }
         }
 
         let post_fee_changes = empty_entry_changes();
