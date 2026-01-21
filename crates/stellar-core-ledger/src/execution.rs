@@ -4750,6 +4750,11 @@ pub fn execute_transaction_set_with_fee_mode(
     let mut tx_result_metas = Vec::with_capacity(transactions.len());
 
     for (tx_index, (tx, tx_base_fee)) in transactions.iter().enumerate() {
+        // Snapshot the delta before starting each transaction.
+        // This preserves committed changes from previous transactions so they're
+        // not lost if this transaction fails and rolls back.
+        executor.state.snapshot_delta();
+
         let tx_fee = tx_base_fee.unwrap_or(base_fee);
         // Compute per-transaction PRNG seed: subSha256(basePrngSeed, txIndex)
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);

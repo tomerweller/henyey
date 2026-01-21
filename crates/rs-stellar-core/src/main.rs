@@ -3184,6 +3184,7 @@ async fn cmd_verify_execution(
                     stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
                 let inner_source_id =
                     stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
+
                 let pre_fee_state = if frame.is_fee_bump() && fee_source_id != inner_source_id {
                     let fee_source_key = stellar_xdr::curr::LedgerKey::Account(
                         stellar_xdr::curr::LedgerKeyAccount {
@@ -3246,6 +3247,11 @@ async fn cmd_verify_execution(
 
             // Phase 2: Apply all transactions (fees already deducted in phase 1)
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
+                // Snapshot the delta before starting each transaction.
+                // This preserves committed changes from previous transactions so they're
+                // not lost if this transaction fails and rolls back.
+                executor.state_mut().snapshot_delta();
+
                 // Compute PRNG seed for Soroban: SHA256(txSetHash || xdr(u64(txIndex)))
                 // C++ uses subSha256(baseSeed, static_cast<uint64_t>(index)) where
                 // xdr_to_opaque serializes the u64 as 8 bytes big-endian.
@@ -3325,6 +3331,48 @@ async fn cmd_verify_execution(
                             // delta so the bucket list gets the correct final balance.
                             // We use apply_refund_to_delta which updates both the in-memory state
                             // and modifies the delta's updated_entries to reflect the refund.
+
+                            // Debug: Extract CDP's refund from post_fee_meta
+                            let cdp_refund = if !tx_info.post_fee_meta.is_empty() {
+                                // post_fee_meta contains STATE/UPDATED pairs showing refund
+                                let mut state_balance: Option<i64> = None;
+                                let mut updated_balance: Option<i64> = None;
+                                for change in tx_info.post_fee_meta.iter() {
+                                    if let stellar_xdr::curr::LedgerEntryChange::State(e) = change {
+                                        if let stellar_xdr::curr::LedgerEntryData::Account(a) = &e.data {
+                                            state_balance = Some(a.balance);
+                                        }
+                                    }
+                                    if let stellar_xdr::curr::LedgerEntryChange::Updated(e) = change {
+                                        if let stellar_xdr::curr::LedgerEntryData::Account(a) = &e.data {
+                                            updated_balance = Some(a.balance);
+                                        }
+                                    }
+                                }
+                                match (state_balance, updated_balance) {
+                                    (Some(s), Some(u)) => u - s,
+                                    _ => 0,
+                                }
+                            } else {
+                                0
+                            };
+                            if result.fee_refund != cdp_refund {
+                                println!("    FEE REFUND MISMATCH: ours={}, cdp={}, diff={}",
+                                    result.fee_refund, cdp_refund, result.fee_refund - cdp_refund);
+
+                                // Extract rent_fee from CDP tx_meta if available
+                                if let stellar_xdr::curr::TransactionMeta::V4(v4) = &tx_info.meta {
+                                    if let Some(ref soroban_meta) = v4.soroban_meta {
+                                        if let stellar_xdr::curr::SorobanTransactionMetaExt::V1(ref ext) = soroban_meta.ext {
+                                            println!("    CDP soroban_meta: rent_fee_charged={}, refundable_fee_charged={}, non_refundable_fee_charged={}",
+                                                ext.rent_fee_charged,
+                                                ext.total_refundable_resource_fee_charged,
+                                                ext.total_non_refundable_resource_fee_charged);
+                                        }
+                                    }
+                                }
+                            }
+
                             if result.fee_refund > 0 {
                                 let fee_source_id =
                                     stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
@@ -3427,6 +3475,20 @@ async fn cmd_verify_execution(
                             println!("    TX {}: EXECUTION ERROR: {}", tx_idx, e);
                         }
                     }
+                } else {
+                    // Not in test range (catch-up mode) - still need to apply refunds
+                    // to ensure bucket list has correct balances.
+                    if let Ok(result) = exec_result {
+                        if result.fee_refund > 0 {
+                            let frame = stellar_core_tx::TransactionFrame::with_network(
+                                tx_info.envelope.clone(),
+                                stellar_core_common::NetworkId(config.network_id()),
+                            );
+                            let fee_source_id =
+                                stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+                            executor.state_mut().apply_refund_to_delta(&fee_source_id, result.fee_refund);
+                        }
+                    }
                 }
             }
             // Apply changes to bucket list for next ledger
@@ -3466,7 +3528,7 @@ async fn cmd_verify_execution(
 
                 // For INIT: use updated value if entry was both created and updated,
                 // otherwise use created value
-                let our_init: Vec<LedgerEntry> = created
+                let mut our_init: Vec<LedgerEntry> = created
                     .iter()
                     .map(|e| {
                         if let Some(key) = ledger_entry_to_key(e) {
@@ -3477,15 +3539,20 @@ async fn cmd_verify_execution(
                     })
                     .collect();
 
-                // For LIVE: exclude entries whose keys are in the created set,
+                // Build a set of deleted keys to exclude from live
+                let deleted_keys: std::collections::HashSet<_> = our_dead.iter().cloned().collect();
+
+                // For LIVE: exclude entries whose keys are in the created set OR deleted set,
                 // and deduplicate by key (keep only the final state for each key).
                 // If the same entry is updated multiple times in a ledger, we only
                 // want the last update for the bucket list.
+                // Also, if an entry was updated and then deleted (e.g., AccountMerge),
+                // it should only appear in DEAD, not in LIVE.
                 let mut live_by_key: std::collections::HashMap<LedgerKey, LedgerEntry> =
                     std::collections::HashMap::new();
                 for entry in updated.iter() {
                     if let Some(key) = ledger_entry_to_key(entry) {
-                        if !created_keys.contains(&key) {
+                        if !created_keys.contains(&key) && !deleted_keys.contains(&key) {
                             // Later updates overwrite earlier ones (HashMap insert replaces)
                             live_by_key.insert(key, entry.clone());
                         }
@@ -3608,6 +3675,42 @@ async fn cmd_verify_execution(
                 for upgrade in &upgrade_metas {
                     for change in upgrade.changes.iter() {
                         apply_change_with_prestate(&mut aggregator, &bl, change);
+                    }
+                }
+
+                // Also add upgrade changes to our_init/our_live for proper comparison
+                // Upgrade changes typically update ConfigSetting entries which need to
+                // be reflected in our delta vectors to match the CDP aggregator.
+                for upgrade in &upgrade_metas {
+                    for change in upgrade.changes.iter() {
+                        match change {
+                            LedgerEntryChange::Created(entry) => {
+                                // New entry from upgrade - add to our_init if not already there
+                                if let Some(key) = ledger_entry_to_key(entry) {
+                                    if !created_keys.contains(&key) {
+                                        our_init.push(entry.clone());
+                                    }
+                                }
+                            }
+                            LedgerEntryChange::Updated(entry) => {
+                                // Updated entry from upgrade - add to our_live
+                                if let Some(key) = ledger_entry_to_key(entry) {
+                                    // Check if this key was already in our_live
+                                    let already_in_live = our_live.iter().any(|e| {
+                                        ledger_entry_to_key(e).map(|k| k == key).unwrap_or(false)
+                                    });
+                                    if !already_in_live {
+                                        our_live.push(entry.clone());
+                                    }
+                                }
+                            }
+                            LedgerEntryChange::State(_)
+                            | LedgerEntryChange::Removed(_)
+                            | LedgerEntryChange::Restored(_) => {
+                                // State entries are pre-images, not changes
+                                // Removed and Restored are unlikely for upgrade changes
+                            }
+                        }
                     }
                 }
 
@@ -3898,6 +4001,75 @@ async fn cmd_verify_execution(
                         live_only_ours += 1;
                         if live_only_ours <= 3 {
                             println!("  LIVE only in OURS: {:?}", key);
+                            // Show account balance for debugging
+                            if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &our_entry.data {
+                                println!("    balance={}, seq={}", acc.balance, acc.seq_num.0);
+                            }
+                            // Check if this account is in any CDP fee_meta
+                            let mut in_fee_meta = false;
+                            for tx_info in &tx_processing {
+                                for change in tx_info.fee_meta.iter() {
+                                    let (entry, change_type) = match change {
+                                        stellar_xdr::curr::LedgerEntryChange::Updated(e) => (Some(e), "UPDATED"),
+                                        stellar_xdr::curr::LedgerEntryChange::Created(e) => (Some(e), "CREATED"),
+                                        stellar_xdr::curr::LedgerEntryChange::State(e) => (Some(e), "STATE"),
+                                        stellar_xdr::curr::LedgerEntryChange::Restored(e) => (Some(e), "RESTORED"),
+                                        stellar_xdr::curr::LedgerEntryChange::Removed(k) => {
+                                            if k == key {
+                                                println!("    IN CDP fee_meta (REMOVED)");
+                                            }
+                                            (None, "REMOVED")
+                                        },
+                                    };
+                                    if let Some(e) = entry {
+                                        if let Some(k) = ledger_entry_to_key(e) {
+                                            if &k == key {
+                                                in_fee_meta = true;
+                                                if let stellar_xdr::curr::LedgerEntryData::Account(a) = &e.data {
+                                                    println!("    IN CDP fee_meta ({}): balance={}", change_type, a.balance);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !in_fee_meta {
+                                println!("    NOT in CDP fee_meta");
+                            }
+                            // Also check tx_meta for this account
+                            for tx_info in &tx_processing {
+                                let changes = extract_changes_from_meta(&tx_info.meta);
+                                for change in changes.iter() {
+                                    let (entry, change_type) = match change {
+                                        stellar_xdr::curr::LedgerEntryChange::Updated(e) => (Some(e), "UPDATED"),
+                                        stellar_xdr::curr::LedgerEntryChange::State(e) => (Some(e), "STATE"),
+                                        _ => (None, "OTHER"),
+                                    };
+                                    if let Some(e) = entry {
+                                        if let Some(k) = ledger_entry_to_key(e) {
+                                            if &k == key {
+                                                if let stellar_xdr::curr::LedgerEntryData::Account(a) = &e.data {
+                                                    println!("    IN CDP tx_meta ({}): balance={}", change_type, a.balance);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Also check post_fee_meta
+                            for tx_info in &tx_processing {
+                                for change in tx_info.post_fee_meta.iter() {
+                                    if let stellar_xdr::curr::LedgerEntryChange::Updated(e) = change {
+                                        if let Some(k) = ledger_entry_to_key(e) {
+                                            if &k == key {
+                                                if let stellar_xdr::curr::LedgerEntryData::Account(a) = &e.data {
+                                                    println!("    IN CDP post_fee_meta: balance={}", a.balance);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

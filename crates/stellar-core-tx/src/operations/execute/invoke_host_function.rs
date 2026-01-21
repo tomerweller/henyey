@@ -66,27 +66,17 @@ pub fn execute_invoke_host_function(
         }
     };
 
-    // Dispatch based on host function type
-    match &op.host_function {
-        HostFunction::InvokeContract(_)
-        | HostFunction::CreateContract(_)
-        | HostFunction::CreateContractV2(_) => {
-            // For contract operations, use soroban-env-host
-            execute_contract_invocation(
-                op,
-                source,
-                state,
-                context,
-                soroban_data,
-                soroban_config,
-                module_cache,
-            )
-        }
-        HostFunction::UploadContractWasm(wasm) => {
-            // WASM upload can be handled locally without full host
-            execute_upload_wasm(wasm, source, state, context, soroban_data, soroban_config)
-        }
-    }
+    // All host functions go through soroban-env-host, matching C++ stellar-core behavior.
+    // This ensures rent calculation and other host-computed values are consistent.
+    execute_contract_invocation(
+        op,
+        source,
+        state,
+        context,
+        soroban_data,
+        soroban_config,
+        module_cache,
+    )
 }
 
 /// Execute a contract invocation using soroban-env-host.
@@ -311,12 +301,32 @@ fn execute_upload_wasm(
         hash: code_hash.clone(),
         code: wasm.clone(),
     };
-    state.create_contract_code(code_entry);
+    state.create_contract_code(code_entry.clone());
 
-    // Return success with the preimage hash
-    // Note: rent_fee is 0 for UploadContractWasm because the rent is computed
-    // separately based on the footprint write entries. The code entry rent is
-    // handled by the ledger execution layer.
+    // Compute rent_fee for the new ContractCode entry.
+    // We need to wrap it in a LedgerEntry to get the full XDR size.
+    let ledger_entry = LedgerEntry {
+        last_modified_ledger_seq: context.sequence,
+        data: stellar_xdr::curr::LedgerEntryData::ContractCode(code_entry),
+        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+    };
+    let entry_size_bytes = ledger_entry
+        .to_xdr(Limits::none())
+        .map(|bytes| bytes.len() as u32)
+        .unwrap_or(0);
+
+    // Contract code is persistent
+    let rent_fee = crate::soroban::compute_rent_fee_for_new_entry(
+        entry_size_bytes,
+        live_until,
+        true, // is_persistent
+        true, // is_code_entry
+        context.sequence,
+        soroban_config,
+        context.protocol_version,
+    );
+
+    // Return success with the preimage hash and computed rent_fee
     Ok(OperationExecutionResult::with_soroban_meta(
         make_result(InvokeHostFunctionResultCode::Success, result_hash),
         SorobanOperationMeta {
@@ -324,7 +334,7 @@ fn execute_upload_wasm(
             diagnostic_events: Vec::new(),
             return_value: Some(return_value),
             event_size_bytes: return_value_xdr_size,
-            rent_fee: 0,
+            rent_fee,
             live_bucket_list_restores: Vec::new(),
         },
     ))

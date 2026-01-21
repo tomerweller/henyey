@@ -202,6 +202,9 @@ pub struct LedgerStateManager {
     /// Snapshot of id_pool for rollback. When an ID is generated during a transaction
     /// that later fails, the id_pool must be restored to its pre-transaction value.
     id_pool_snapshot: Option<u64>,
+    /// Snapshot of delta for rollback. Preserves committed changes from previous
+    /// transactions so they're not lost when the current transaction fails.
+    delta_snapshot: Option<LedgerDelta>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +273,7 @@ impl LedgerStateManager {
             created_claimable_balances: HashSet::new(),
             created_liquidity_pools: HashSet::new(),
             id_pool_snapshot: None,
+            delta_snapshot: None,
         }
     }
 
@@ -495,6 +499,15 @@ impl LedgerStateManager {
         self.ledger_seq = ledger_seq;
     }
 
+    /// Snapshot the delta before starting a transaction.
+    ///
+    /// This preserves committed changes from previous transactions so they're not lost
+    /// if the current transaction fails and rolls back. Call this at the start of each
+    /// transaction before any modifications.
+    pub fn snapshot_delta(&mut self) {
+        self.delta_snapshot = Some(self.delta.clone());
+    }
+
     /// Clear all cached ledger entries.
     ///
     /// This clears all entry storage (accounts, trustlines, offers, etc.) while
@@ -521,6 +534,7 @@ impl LedgerStateManager {
         self.multi_op_mode = false;
         self.sponsorship_stack.clear();
         self.delta = LedgerDelta::new(self.ledger_seq);
+        self.delta_snapshot = None;
 
         self.modified_accounts.clear();
         self.modified_trustlines.clear();
@@ -3065,15 +3079,20 @@ impl LedgerStateManager {
         self.modified_claimable_balances.clear();
         self.modified_liquidity_pools.clear();
 
-        // Reset delta but preserve fee_charged.
-        // Fees are always collected even for failed transactions, and we accumulate
-        // them across all transactions in a ledger. The fee for the current transaction
-        // was already added during fee deduction phase (before operations ran), so
-        // we preserve it here to avoid losing it when resetting entry changes.
-        let fee_charged = self.delta.fee_charged();
-        self.delta = LedgerDelta::new(self.ledger_seq);
-        if fee_charged != 0 {
-            self.delta.add_fee(fee_charged);
+        // Restore delta from snapshot if available, otherwise reset it.
+        // This preserves committed changes from previous transactions in this ledger.
+        // The fee for the current transaction was already added during fee deduction
+        // phase (before operations ran) and is restored via restore_delta_entries()
+        // in execution.rs after rollback() returns.
+        if let Some(snapshot) = self.delta_snapshot.take() {
+            self.delta = snapshot;
+        } else {
+            // No snapshot - reset delta but preserve fee_charged.
+            let fee_charged = self.delta.fee_charged();
+            self.delta = LedgerDelta::new(self.ledger_seq);
+            if fee_charged != 0 {
+                self.delta.add_fee(fee_charged);
+            }
         }
     }
 
@@ -3081,6 +3100,11 @@ impl LedgerStateManager {
     pub fn commit(&mut self) {
         // Clear id_pool snapshot (the incremented value is now committed)
         self.id_pool_snapshot = None;
+
+        // NOTE: Do NOT clear delta_snapshot here. The delta_snapshot is used to preserve
+        // committed changes from PREVIOUS transactions in a ledger, so it should only
+        // be set/cleared at transaction boundaries (via snapshot_delta()) or when
+        // starting a new ledger (via clear_cached_entries()).
 
         // Clear all snapshots
         self.account_snapshots.clear();

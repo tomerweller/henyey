@@ -992,6 +992,72 @@ fn build_module_cache_for_footprint_p25(
     Some(cache)
 }
 
+/// Compute rent_fee for a newly created Soroban entry.
+///
+/// This is used by `execute_upload_wasm` to compute the rent fee for the new
+/// ContractCode entry being created, matching how C++ stellar-core computes
+/// rent fees via soroban-env-host.
+///
+/// # Arguments
+///
+/// * `entry_size_bytes` - The XDR size of the LedgerEntry being created
+/// * `live_until` - The live_until ledger sequence for the entry
+/// * `is_persistent` - Whether this is a persistent entry (true) or temporary (false)
+/// * `is_code_entry` - Whether this is a ContractCode entry (affects P25 rent calculation)
+/// * `current_ledger` - The current ledger sequence
+/// * `soroban_config` - Network configuration with rent fee parameters
+/// * `protocol_version` - The protocol version
+///
+/// # Returns
+///
+/// Returns the computed rent fee in stroops.
+pub fn compute_rent_fee_for_new_entry(
+    entry_size_bytes: u32,
+    live_until: u32,
+    is_persistent: bool,
+    is_code_entry: bool,
+    current_ledger: u32,
+    soroban_config: &SorobanConfig,
+    protocol_version: u32,
+) -> i64 {
+    // Create a rent change for a newly created entry:
+    // - old_size_bytes = 0 (new entry)
+    // - old_live_until_ledger = 0 (new entry)
+    // - new_size_bytes = entry XDR size
+    // - new_live_until_ledger = live_until
+
+    if protocol_version >= 25 {
+        use soroban_env_host25::fees::{
+            compute_rent_fee as compute_rent_fee_p25,
+            LedgerEntryRentChange as LedgerEntryRentChangeP25,
+        };
+
+        let rent_change = LedgerEntryRentChangeP25 {
+            is_persistent,
+            is_code_entry,
+            old_size_bytes: 0,
+            new_size_bytes: entry_size_bytes,
+            old_live_until_ledger: 0,
+            new_live_until_ledger: live_until,
+        };
+
+        // Use the P25 rent_fee_config directly from soroban_config
+        compute_rent_fee_p25(&[rent_change], &soroban_config.rent_fee_config, current_ledger)
+    } else {
+        let rent_change = LedgerEntryRentChange {
+            is_persistent,
+            is_code_entry,
+            old_size_bytes: 0,
+            new_size_bytes: entry_size_bytes,
+            old_live_until_ledger: 0,
+            new_live_until_ledger: live_until,
+        };
+
+        let rent_fee_config = rent_fee_config_p25_to_p24(&soroban_config.rent_fee_config);
+        compute_rent_fee(&[rent_change], &rent_fee_config, current_ledger)
+    }
+}
+
 /// Execute a Soroban host function using soroban-env-host's e2e_invoke API.
 ///
 /// This uses the same high-level API that C++ stellar-core uses, which handles
