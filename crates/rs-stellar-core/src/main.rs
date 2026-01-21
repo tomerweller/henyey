@@ -3356,7 +3356,8 @@ async fn cmd_verify_execution(
                             } else {
                                 0
                             };
-                            if result.fee_refund != cdp_refund {
+                            // Debug: show fee refund mismatch details when present
+                            if show_diff && result.fee_refund != cdp_refund {
                                 println!("    FEE REFUND MISMATCH: ours={}, cdp={}, diff={}",
                                     result.fee_refund, cdp_refund, result.fee_refund - cdp_refund);
 
