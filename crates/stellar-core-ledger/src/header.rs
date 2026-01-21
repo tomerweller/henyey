@@ -284,6 +284,7 @@ pub fn verify_skip_list(
 /// * `total_coins` - Updated total coins in circulation
 /// * `fee_pool` - Updated fee pool balance
 /// * `inflation_seq` - Inflation sequence counter
+/// * `stellar_value_ext` - The StellarValue extension from consensus (Basic or Signed)
 ///
 /// # Note
 ///
@@ -303,6 +304,7 @@ pub fn create_next_header(
     total_coins: i64,
     fee_pool: i64,
     inflation_seq: u32,
+    stellar_value_ext: stellar_xdr::curr::StellarValueExt,
 ) -> LedgerHeader {
     let new_seq = prev_header.ledger_seq + 1;
 
@@ -314,7 +316,7 @@ pub fn create_next_header(
             tx_set_hash: tx_set_hash.into(),
             close_time: stellar_xdr::curr::TimePoint(close_time),
             upgrades: stellar_xdr::curr::VecM::default(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
+            ext: stellar_value_ext,
         },
         tx_set_result_hash: tx_set_result_hash.into(),
         bucket_list_hash: bucket_list_hash.into(),

@@ -46,7 +46,7 @@ use stellar_core_crypto::{PublicKey, SecretKey};
 use stellar_core_ledger::LedgerManager;
 use stellar_core_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
-    Limits, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, StellarValue, TimePoint,
+    Limits, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, StellarValue, StellarValueExt, TimePoint,
     TransactionEnvelope, UpgradeType, Value, WriteXdr,
 };
 
@@ -1024,6 +1024,7 @@ impl Herder {
             tx_set_hash,
             tx_set,
             upgrades: stellar_value.upgrades.to_vec(),
+            stellar_value_ext: stellar_value.ext,
         })
     }
 
@@ -1435,6 +1436,9 @@ pub struct LedgerCloseInfo {
     pub tx_set: Option<TransactionSet>,
     /// Protocol upgrades.
     pub upgrades: Vec<UpgradeType>,
+    /// StellarValue extension (Basic or Signed).
+    /// This must match what the network used in consensus.
+    pub stellar_value_ext: StellarValueExt,
 }
 
 /// Statistics about the Herder.

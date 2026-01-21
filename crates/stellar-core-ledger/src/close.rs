@@ -24,8 +24,8 @@ use stellar_core_common::Hash256;
 use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade,
-    Limits, ScpHistoryEntry, TransactionEnvelope, TransactionResultPair, TransactionResultSet,
-    TransactionSet, WriteXdr,
+    Limits, ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
+    TransactionResultSet, TransactionSet, WriteXdr,
 };
 
 use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
@@ -48,6 +48,7 @@ use crate::snapshot::SnapshotHandle;
 /// ```ignore
 /// let close_data = LedgerCloseData::new(seq, tx_set, close_time, prev_hash)
 ///     .with_upgrades(upgrades)
+///     .with_stellar_value_ext(ext)
 ///     .with_scp_history(scp_entries);
 /// ```
 ///
@@ -84,6 +85,13 @@ pub struct LedgerCloseData {
     ///
     /// Used to verify chain continuity and prevent forks.
     pub prev_ledger_hash: Hash256,
+
+    /// StellarValue extension (Basic or Signed).
+    ///
+    /// This must match what the network used in consensus to produce the
+    /// correct ledger header hash. Validators sign their consensus values,
+    /// so this is typically `Signed` for live network operation.
+    pub stellar_value_ext: StellarValueExt,
 }
 
 impl LedgerCloseData {
@@ -101,6 +109,7 @@ impl LedgerCloseData {
             upgrades: Vec::new(),
             scp_history: Vec::new(),
             prev_ledger_hash,
+            stellar_value_ext: StellarValueExt::Basic,
         }
     }
 
@@ -119,6 +128,15 @@ impl LedgerCloseData {
     /// Attach SCP history entries for this ledger close.
     pub fn with_scp_history(mut self, scp_history: Vec<ScpHistoryEntry>) -> Self {
         self.scp_history = scp_history;
+        self
+    }
+
+    /// Set the StellarValue extension (Basic or Signed).
+    ///
+    /// This must match what the network used in consensus to produce the
+    /// correct ledger header hash.
+    pub fn with_stellar_value_ext(mut self, ext: StellarValueExt) -> Self {
+        self.stellar_value_ext = ext;
         self
     }
 

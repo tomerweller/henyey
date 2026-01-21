@@ -1496,6 +1496,7 @@ impl<'a> LedgerCloseContext<'a> {
             self.prev_header.total_coins + self.delta.total_coins_delta(),
             self.prev_header.fee_pool + self.delta.fee_pool_delta(),
             self.prev_header.inflation_seq,
+            self.close_data.stellar_value_ext.clone(),
         );
 
         // Apply upgrades to header fields (e.g., ledger_version, base_fee)

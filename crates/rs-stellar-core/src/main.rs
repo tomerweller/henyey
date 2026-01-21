@@ -3864,6 +3864,7 @@ async fn cmd_verify_execution(
                         tracked_total_coins, // Total coins typically stays constant
                         our_fee_pool,
                         prev_hdr.inflation_seq,
+                        cdp_header.scp_value.ext.clone(),
                     );
 
                     // Apply upgrades to match CDP header fields
@@ -3873,7 +3874,6 @@ async fn cmd_verify_execution(
                     computed_header.max_tx_set_size = cdp_header.max_tx_set_size;
                     computed_header.id_pool = cdp_header.id_pool;
                     computed_header.scp_value.upgrades = cdp_header.scp_value.upgrades.clone();
-                    computed_header.scp_value.ext = cdp_header.scp_value.ext.clone();
 
                     if let Ok(hash) = compute_header_hash(&computed_header) {
                         our_header_hash = hash;

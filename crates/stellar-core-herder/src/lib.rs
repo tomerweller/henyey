@@ -214,6 +214,7 @@ pub trait HerderCallback: Send + Sync {
     /// * `tx_set` - The agreed-upon transaction set
     /// * `close_time` - The ledger close time
     /// * `upgrades` - Any protocol upgrades to apply
+    /// * `stellar_value_ext` - The StellarValue extension (Basic or Signed) from consensus
     ///
     /// # Returns
     ///
@@ -224,6 +225,7 @@ pub trait HerderCallback: Send + Sync {
         tx_set: TransactionSet,
         close_time: u64,
         upgrades: Vec<stellar_xdr::curr::UpgradeType>,
+        stellar_value_ext: stellar_xdr::curr::StellarValueExt,
     ) -> Result<stellar_core_common::Hash256>;
 
     /// Called to validate a proposed transaction set before voting.

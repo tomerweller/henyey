@@ -84,13 +84,13 @@ use stellar_xdr::curr::{
     Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,
     LedgerScpMessages, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope, ScpHistoryEntry,
     ScpHistoryEntryV0, SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue,
-    SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody, SurveyResponseMessage,
-    TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
-    TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
-    TopologyResponseBodyV2, TransactionHistoryEntry, TransactionHistoryEntryExt,
-    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionMeta,
-    TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector, TxDemandVector,
-    UpgradeType, VecM, WriteXdr,
+    StellarValueExt, SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody,
+    SurveyResponseMessage, TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage,
+    TimeSlicedSurveyResponseMessage, TimeSlicedSurveyStartCollectingMessage,
+    TimeSlicedSurveyStopCollectingMessage, TopologyResponseBodyV2, TransactionHistoryEntry,
+    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+    TransactionMeta, TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector,
+    TxDemandVector, UpgradeType, VecM, WriteXdr,
 };
 use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 
@@ -3173,6 +3173,7 @@ impl App {
                 tx_set,
                 close_info.close_time,
                 close_info.upgrades.clone(),
+                close_info.stellar_value_ext.clone(),
             )
             .await
             {
@@ -6550,6 +6551,7 @@ impl HerderCallback for App {
         tx_set: stellar_core_herder::TransactionSet,
         close_time: u64,
         upgrades: Vec<UpgradeType>,
+        stellar_value_ext: StellarValueExt,
     ) -> stellar_core_herder::Result<stellar_core_common::Hash256> {
         let tx_summary = tx_set.summary();
         tracing::info!(
@@ -6577,7 +6579,8 @@ impl HerderCallback for App {
 
         // Create close data
         let mut close_data =
-            LedgerCloseData::new(ledger_seq, tx_set_variant.clone(), close_time, prev_hash);
+            LedgerCloseData::new(ledger_seq, tx_set_variant.clone(), close_time, prev_hash)
+                .with_stellar_value_ext(stellar_value_ext);
         let decoded_upgrades = decode_upgrades(upgrades);
         if !decoded_upgrades.is_empty() {
             close_data = close_data.with_upgrades(decoded_upgrades);
