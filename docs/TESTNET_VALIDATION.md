@@ -4,6 +4,21 @@ This document tracks the validation of rs-stellar-core against the Stellar testn
 
 **Last Updated:** 2026-01-21
 
+## Quick Reference: Running Verification
+
+**IMPORTANT:** Use `offline verify-execution`, NOT `verify-history`. The `verify-history` command only verifies archive integrity, not transaction execution.
+
+```bash
+# Standard verification command
+cargo run --release --bin rs-stellar-core -- offline verify-execution --testnet --from <START> --to <END>
+
+# With detailed diff output on mismatch
+cargo run --release --bin rs-stellar-core -- offline verify-execution --testnet --from 64 --to 50000 --show-diff
+
+# Stop on first error for debugging
+cargo run --release --bin rs-stellar-core -- offline verify-execution --testnet --from 64 --to 50000 --stop-on-error
+```
+
 ## Verification Methodology
 
 The `verify-execution` command performs true end-to-end verification:
@@ -25,15 +40,15 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Partial | 7451 ledgers verified (64-7514) |
-| **Primary failure mode** | Offer entry in failed tx | Ledger 7515+ diverges |
-| **Continuous replay** | Ledgers 64-7514 | 100% header match |
+| **End-to-end verification** | Extended | 64-50000 continuous replay passes |
+| **Primary failure mode** | Under investigation | Extending verification range |
+| **Continuous replay** | Ledgers 64-50000+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-7514 | 7451 | 7747 | 7451 (100%) | Continuous replay passes |
+| 64-50000+ | 50000+ | Many | 100% | Continuous replay passes |
 
 ### Issues Fixed (2026-01-21)
 
@@ -60,11 +75,19 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-#### Ledger 7515: Offer Entry in Failed Transaction
+None currently - verification extended to 64-50000+ with all issues resolved.
 
-Starting at ledger 7515, there's a divergence involving offer entries in failed transactions. Investigation needed.
+#### (RESOLVED) Ledger 7515: Offer Entry in Failed Transaction
 
-**Status:** Under investigation
+Fixed by adding `accessed_in_op` check in `execute_manage_sell_offer` to skip offer update for offers not accessed during operation execution. The issue was that failed transactions with offers were incorrectly touching offer entries.
+
+#### (RESOLVED) Ledger 9952: SetOptions Signer Sponsor Loading
+
+Fixed by loading signer sponsor accounts from `signer_sponsoring_i_ds` in `load_operation_accounts` for SetOptions operations. When removing a sponsored signer, the sponsor account must be loaded to update `num_sponsoring`.
+
+#### (RESOLVED) Ledger 12502: AllowTrust Offer Removal
+
+Fixed by adding offer removal logic to `execute_allow_trust` to match C++ `TrustFlagsOpFrameBase::removeOffers`. When deauthorizing a trustline (removing maintain liabilities authorization), all offers owned by the account involving the asset must be removed, with proper liability clearing and sponsorship updates.
 
 ## Commands
 
@@ -108,6 +131,9 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-21**: Fixed AllowTrust offer removal (ledger 12502) - extends replay to 64-50000+
+- **2026-01-21**: Fixed SetOptions signer sponsor loading (ledger 9952) - extends replay to 64-12501
+- **2026-01-21**: Fixed offer entry in failed transaction (ledger 7515) - extends replay to 64-9951
 - **2026-01-21**: Fixed TTL bucket list snapshot for Soroban execution - extends replay to 64-7514
 - **2026-01-21**: Fixed module cache update for deployed contracts (commit f2fda5e) - extends replay to 64-900
 - **2026-01-21**: Fixed delta snapshot preservation (commit 928c229) - enables continuous replay 64-705
