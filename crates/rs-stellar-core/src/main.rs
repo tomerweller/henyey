@@ -2865,6 +2865,8 @@ async fn cmd_verify_execution(
     let mut transactions_verified = 0u32;
     let mut transactions_matched = 0u32;
     let mut transactions_mismatched = 0u32;
+    let mut meta_matched = 0u32;
+    let mut meta_mismatched = 0u32;
     let mut phase1_fee_mismatches = 0u32;
     let mut ledgers_with_tx_mismatches = 0u32;
     let mut ledgers_with_header_mismatches = 0u32;
@@ -3320,8 +3322,7 @@ async fn cmd_verify_execution(
                             // Deep comparison of transaction meta if both are available
                             // For fee bump transactions with separate fee source, fee changes are
                             // already in the CDP meta, so we don't need to prepend them
-                            // Note: metadata comparison is out of scope; we only verify tx results + headers
-                            let (_meta_matches, _meta_diffs) = match &result.tx_meta {
+                            let (tx_meta_matches, meta_diffs) = match &result.tx_meta {
                                 Some(our_meta) => compare_transaction_meta(
                                     our_meta,
                                     &tx_info.meta,
@@ -3333,6 +3334,11 @@ async fn cmd_verify_execution(
                                     vec!["We produced no meta but CDP has some".to_string()],
                                 ),
                             };
+                            if tx_meta_matches {
+                                meta_matched += 1;
+                            } else {
+                                meta_mismatched += 1;
+                            }
 
                             // Compare full transaction results (operation results), not just success/failure.
                             // Metadata comparison is out of scope for verification.
@@ -3350,13 +3356,26 @@ async fn cmd_verify_execution(
                                         .as_ref()
                                         .map(|m| extract_changes_from_meta(m).len())
                                         .unwrap_or(0);
+                                    let meta_status = if tx_meta_matches {
+                                        "meta:OK"
+                                    } else {
+                                        "meta:DIFF"
+                                    };
                                     println!(
-                                        "    TX {}: {} (ops: {}, changes: {})",
+                                        "    TX {}: {} (ops: {}, changes: {}, {})",
                                         tx_idx,
                                         if result.success { "OK" } else { "FAILED" },
                                         result.operation_results.len(),
-                                        change_count
+                                        change_count,
+                                        meta_status
                                     );
+                                    // Report meta differences even when result matches
+                                    // (these can cause header hash mismatches)
+                                    if !tx_meta_matches && !meta_diffs.is_empty() {
+                                        for diff in &meta_diffs {
+                                            println!("      - Meta diff: {}", diff);
+                                        }
+                                    }
                                 }
                             } else {
                                 transactions_mismatched += 1;
@@ -3379,6 +3398,13 @@ async fn cmd_verify_execution(
                                 }
                                 if let Some(diff) = result_diff {
                                     println!("      - Result diff: {}", diff);
+                                }
+                                // Also report meta differences for mismatched transactions
+                                if !tx_meta_matches && !meta_diffs.is_empty() {
+                                    println!("      - Meta diffs ({}):", meta_diffs.len());
+                                    for diff in &meta_diffs {
+                                        println!("        {}", diff);
+                                    }
                                 }
                             }
                         }
@@ -4164,6 +4190,8 @@ async fn cmd_verify_execution(
         "  Phase 2 execution mismatched: {}",
         transactions_mismatched
     );
+    println!("  Transaction meta matched: {}", meta_matched);
+    println!("  Transaction meta mismatched: {}", meta_mismatched);
     println!(
         "  Ledgers with tx mismatches: {}",
         ledgers_with_tx_mismatches
@@ -4203,6 +4231,15 @@ async fn cmd_verify_execution(
             "WARNING: {} transactions had Phase 2 execution differences!",
             transactions_mismatched
         );
+    }
+
+    if meta_mismatched > 0 {
+        println!();
+        println!(
+            "WARNING: {} transactions had metadata differences (set comparison)!",
+            meta_mismatched
+        );
+        println!("Metadata differences can cause header hash mismatches even when execution results match.");
     }
 
     if header_mismatches > 0 {
