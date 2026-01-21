@@ -3516,12 +3516,17 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.claimable_balance_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.claimable_balances.get(&key).cloned() {
-                        // Only record update if entry actually changed from snapshot
-                        if &entry != snapshot_entry {
-                            let ledger_key =
-                                LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-                                    balance_id: entry.balance_id.clone(),
-                                });
+                        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                            balance_id: entry.balance_id.clone(),
+                        });
+                        // Record update if:
+                        // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                        //    This is important for sponsorship-only changes where the entry data doesn't change
+                        //    but the ext (sponsor) changes.
+                        // 2. Entry actually changed - always record real value changes
+                        let accessed_in_op = self.op_entry_snapshots.contains_key(&ledger_key);
+                        let should_record = accessed_in_op || &entry != snapshot_entry;
+                        if should_record {
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
                             let pre_state = if let Some(op_snapshot) =
@@ -3546,11 +3551,17 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.liquidity_pool_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.liquidity_pools.get(&key).cloned() {
-                        // Only record update if entry actually changed from snapshot
-                        if &entry != snapshot_entry {
-                            let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
-                                liquidity_pool_id: entry.liquidity_pool_id.clone(),
-                            });
+                        let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+                            liquidity_pool_id: entry.liquidity_pool_id.clone(),
+                        });
+                        // Record update if:
+                        // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                        //    This is important for sponsorship-only changes where the entry data doesn't change
+                        //    but the ext (sponsor) changes.
+                        // 2. Entry actually changed - always record real value changes
+                        let accessed_in_op = self.op_entry_snapshots.contains_key(&ledger_key);
+                        let should_record = accessed_in_op || &entry != snapshot_entry;
+                        if should_record {
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
                             let pre_state = if let Some(op_snapshot) =
@@ -4070,5 +4081,166 @@ mod tests {
         });
         let key4 = AssetKey::from_asset(&alphanum4);
         assert!(matches!(key4, AssetKey::CreditAlphanum4(_, _)));
+    }
+
+    /// Test that ClaimableBalance sponsorship-only changes are recorded in delta.
+    /// Regression test for ledger 80382 where RevokeSponsorship changed only the
+    /// sponsor of a ClaimableBalance entry but the modification was not recorded.
+    #[test]
+    fn test_claimable_balance_sponsorship_only_change_recorded_in_delta() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create a claimable balance ID
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([1u8; 32]));
+
+        // Create a claimable balance entry
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: create_test_account_id(1),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount: 1000000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+
+        // Create the claimable balance and set up initial sponsor
+        manager.create_claimable_balance(cb_entry.clone());
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+        let initial_sponsor = create_test_account_id(2);
+        manager.set_entry_sponsor(ledger_key.clone(), initial_sponsor);
+        manager.commit();
+
+        // Reset delta by creating a new manager with the same state
+        // (simulating the start of a new transaction)
+        manager.delta = LedgerDelta::new(100);
+
+        // Now simulate what happens during RevokeSponsorship:
+        // 1. Start operation snapshot mode
+        manager.begin_op_snapshot();
+
+        // 2. Access the claimable balance via get_claimable_balance_mut
+        //    This puts it into op_entry_snapshots
+        let _ = manager.get_claimable_balance_mut(&balance_id);
+
+        // 3. Change the sponsor (but not the entry data itself)
+        let new_sponsor = create_test_account_id(3);
+        manager.set_entry_sponsor(ledger_key.clone(), new_sponsor);
+
+        // 4. Apply modifications to delta (before end_op_snapshot, as in real execution)
+        manager.flush_modified_entries();
+
+        // 5. End operation snapshot
+        let _ = manager.end_op_snapshot();
+
+        // The claimable balance should be recorded in delta as updated
+        // even though only the sponsor changed (not the entry data)
+        let delta = manager.take_delta();
+
+        // Check that an update was recorded
+        assert!(
+            !delta.updated_entries().is_empty(),
+            "ClaimableBalance sponsorship-only change should be recorded in delta"
+        );
+
+        // Verify it's the claimable balance that was updated
+        let has_cb_update = delta.updated_entries().iter().any(|entry| {
+            matches!(
+                &entry.data,
+                LedgerEntryData::ClaimableBalance(cb) if cb.balance_id == balance_id
+            )
+        });
+        assert!(
+            has_cb_update,
+            "The updated entry should be the ClaimableBalance"
+        );
+    }
+
+    /// Test that LiquidityPool sponsorship-only changes are recorded in delta.
+    /// Same fix as ClaimableBalance, applied for consistency.
+    #[test]
+    fn test_liquidity_pool_sponsorship_only_change_recorded_in_delta() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create a liquidity pool ID
+        let pool_id = PoolId(Hash([2u8; 32]));
+
+        // Create a liquidity pool entry
+        let lp_entry = LiquidityPoolEntry {
+            liquidity_pool_id: pool_id.clone(),
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: LiquidityPoolConstantProductParameters {
+                        asset_a: Asset::Native,
+                        asset_b: Asset::CreditAlphanum4(AlphaNum4 {
+                            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                            issuer: create_test_account_id(1),
+                        }),
+                        fee: 30,
+                    },
+                    reserve_a: 1000000,
+                    reserve_b: 1000000,
+                    total_pool_shares: 1000000,
+                    pool_shares_trust_line_count: 1,
+                },
+            ),
+        };
+
+        // Create the liquidity pool and set up initial sponsor
+        manager.create_liquidity_pool(lp_entry.clone());
+        let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: pool_id.clone(),
+        });
+        let initial_sponsor = create_test_account_id(2);
+        manager.set_entry_sponsor(ledger_key.clone(), initial_sponsor);
+        manager.commit();
+
+        // Reset delta by creating a new one (simulating the start of a new transaction)
+        manager.delta = LedgerDelta::new(100);
+
+        // Now simulate what happens during RevokeSponsorship:
+        // 1. Start operation snapshot mode
+        manager.begin_op_snapshot();
+
+        // 2. Access the liquidity pool via get_liquidity_pool_mut
+        //    This puts it into op_entry_snapshots
+        let _ = manager.get_liquidity_pool_mut(&pool_id);
+
+        // 3. Change the sponsor (but not the entry data itself)
+        let new_sponsor = create_test_account_id(3);
+        manager.set_entry_sponsor(ledger_key.clone(), new_sponsor);
+
+        // 4. Apply modifications to delta (before end_op_snapshot, as in real execution)
+        manager.flush_modified_entries();
+
+        // 5. End operation snapshot
+        let _ = manager.end_op_snapshot();
+
+        // The liquidity pool should be recorded in delta as updated
+        // even though only the sponsor changed (not the entry data)
+        let delta = manager.take_delta();
+
+        // Check that an update was recorded
+        assert!(
+            !delta.updated_entries().is_empty(),
+            "LiquidityPool sponsorship-only change should be recorded in delta"
+        );
+
+        // Verify it's the liquidity pool that was updated
+        let has_lp_update = delta.updated_entries().iter().any(|entry| {
+            matches!(
+                &entry.data,
+                LedgerEntryData::LiquidityPool(lp) if lp.liquidity_pool_id == pool_id
+            )
+        });
+        assert!(
+            has_lp_update,
+            "The updated entry should be the LiquidityPool"
+        );
     }
 }
