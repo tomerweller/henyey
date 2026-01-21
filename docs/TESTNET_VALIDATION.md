@@ -25,75 +25,42 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | ❌ Failing | Transaction execution differences |
-| **Primary failure mode** | BadSequence | Sequence number mismatches |
-| **Root cause** | Under investigation | State divergence from checkpoint |
+| **End-to-end verification** | Partial | 642 ledgers verified (64-705) |
+| **Primary failure mode** | Soroban execution | Ledger 706+ diverges |
+| **Continuous replay** | Ledgers 64-705 | 100% header match |
 
-### Observed Issues
+### Verification Results
 
-#### 1. Transaction Execution Divergence
+| Range | Ledgers | Transactions | Header Matches | Notes |
+|-------|---------|--------------|----------------|-------|
+| 64-705 | 642 | 319 | 642 (100%) | Continuous replay passes |
 
-Starting from the very first ledger after any checkpoint, some transactions fail in our execution that CDP shows as successful:
+### Issues Fixed (2026-01-21)
 
-```
-# Ledger 499968 (first after checkpoint 499967):
-TX 0: MISMATCH - our: failed vs CDP: TxSuccess([Payment(Success)])
-  - Result diff: Operation count mismatch: ours=0, CDP=1
-```
+#### 1. INIT/LIVE Coalescing for Created+Updated Entries
 
-The transaction fails before executing operations (possibly precondition check), while CDP shows successful execution.
+When an entry is created by one transaction and updated by a subsequent transaction within the same ledger, the bucket list should see it as INIT (created), not LIVE (updated). Fixed in commit 4155cf9.
 
-#### 2. Cascade Effect
+#### 2. Fee Refund Application to Delta
 
-When our execution fails a transaction that should succeed:
-- State changes from that transaction are not applied (rollback)
-- Subsequent transactions may fail due to missing state
-- Account sequence numbers diverge
-- Bucket list hash diverges
+Soroban transactions that fail after fee deduction need their fee refund applied to the account balance in the delta. Fixed in commit 4155cf9.
 
-This explains the "Bad sequence" errors seen later - they're a symptom of earlier transactions failing when they should have succeeded.
+#### 3. Delta Snapshot Preservation Across Transaction Rollback
 
-#### 3. Root Cause Under Investigation
+When a transaction fails and rolls back, changes from previously committed transactions in the same ledger must be preserved. The `commit()` method was clearing the delta snapshot, but commit() is called multiple times within a single transaction (after fee deduction, sequence number updates, etc.). Fixed by not clearing delta_snapshot in commit() - only at transaction boundaries. Fixed in commit 928c229.
 
-The exact reason our execution fails these transactions is still being investigated. Potential causes:
-- Precondition checks being too strict
-- Source account lookup issues
-- State reading from bucket list vs executor cache
+### Known Issues
 
-### Verification Results by Range
+#### Ledger 706: Soroban Execution Divergence
 
-| Range | Ledgers | Header Matches | TX Matches | Notes |
-|-------|---------|----------------|------------|-------|
-| 64-100 | 37 | 37 (100%) | 0/0 | No transactions in range |
-| 64-1000 | 937 | 98 (10%) | 640/900 (71%) | First divergence at ledger 162 |
-| 499968-499970 | 3 | 0 (0%) | - | Divergence starts at first ledger after checkpoint |
-| 500000-500100 | 101 | 0 (0%) | 200/457 (44%) | BadSequence errors (cascade from earlier failures) |
+Starting at ledger 706, there's a Soroban execution divergence where our implementation returns `ResourceLimitExceeded` for a transaction that CDP shows as successful.
 
-## Investigation Plan
+**Status:** Under investigation
 
-### Hypothesis 1: Checkpoint State Mismatch
-
-The bucket list state loaded from history archive may not exactly match the state that C++ stellar-core had when executing these transactions.
-
-**Tests needed:**
-- [ ] Compare specific account entries between our bucket list and Horizon API
-- [ ] Verify sequence numbers at checkpoint boundaries
-
-### Hypothesis 2: Fee Charging Differences
-
-Our Phase 1 fee charging may produce different state changes than C++ stellar-core.
-
-**Tests needed:**
-- [ ] Compare fee_meta from our execution vs CDP
-- [ ] Check if fee source balances match after fee deduction
-
-### Hypothesis 3: Transaction Ordering
-
-Transactions may need to be executed in a specific order with CDP sync between them.
-
-**Tests needed:**
-- [ ] Verify transaction order matches CDP
-- [ ] Check if intra-ledger state consistency is the issue
+**Analysis needed:**
+- Compare Soroban budget/resource tracking
+- Verify host function metering matches C++ stellar-core
+- Check if P24/P25 protocol differences affect this transaction
 
 ## Commands
 
@@ -101,13 +68,16 @@ Transactions may need to be executed in a specific order with CDP sync between t
 
 ```bash
 # Verify a range of ledgers
-./target/debug/rs-stellar-core offline verify-execution --from 64 --to 1000
+./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705
 
 # Stop on first error
-./target/debug/rs-stellar-core offline verify-execution --from 64 --to 1000 --stop-on-error
+./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705 --stop-on-error
 
 # Quiet mode (summary only)
-./target/debug/rs-stellar-core offline verify-execution --from 64 --to 1000 -q
+./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705 -q
+
+# Show detailed diffs on mismatch
+./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705 --show-diff
 ```
 
 ### Diagnostic Output
@@ -128,5 +98,7 @@ Achieve 100% header match for the entire testnet history (ledger 64 to present) 
 
 ## History
 
+- **2026-01-21**: Fixed delta snapshot preservation (commit 928c229) - enables continuous replay 64-705
+- **2026-01-21**: Fixed INIT/LIVE coalescing and fee refund application (commit 4155cf9)
 - **2026-01-21**: Converted verify-execution to true end-to-end test (commit f786311)
 - **2026-01-21**: Created this validation document
