@@ -172,6 +172,9 @@ pub struct PeerInfo {
     pub ledger_version: u32,
     /// When this connection was established.
     pub connected_at: Instant,
+    /// Original address used to connect (for outbound connections).
+    /// This preserves the hostname if connecting by hostname.
+    pub original_address: Option<PeerAddress>,
 }
 
 /// A fully authenticated connection to a Stellar peer.
@@ -222,6 +225,7 @@ impl Peer {
                 overlay_version: 0,
                 ledger_version: 0,
                 connected_at: Instant::now(),
+                original_address: Some(addr.clone()),
             },
             state: PeerState::Connecting,
             connection,
@@ -255,6 +259,7 @@ impl Peer {
                 overlay_version: 0,
                 ledger_version: 0,
                 connected_at: Instant::now(),
+                original_address: None,
             },
             state: PeerState::Connecting,
             connection,

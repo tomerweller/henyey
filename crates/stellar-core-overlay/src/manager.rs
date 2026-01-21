@@ -445,7 +445,7 @@ impl OverlayManager {
                         }
                     }
 
-                    if Self::has_outbound_connection_to(&peers, addr) {
+                    if Self::has_outbound_connection_to(&peer_info_cache, addr) {
                         continue;
                     }
 
@@ -521,7 +521,7 @@ impl OverlayManager {
                         }
                     }
 
-                    if Self::has_outbound_connection_to(&peers, addr) {
+                    if Self::has_outbound_connection_to(&peer_info_cache, addr) {
                         continue;
                     }
 
@@ -916,27 +916,30 @@ impl OverlayManager {
     }
 
     fn has_outbound_connection_to(
-        peers: &DashMap<PeerId, Arc<TokioMutex<Peer>>>,
+        peer_info_cache: &DashMap<PeerId, PeerInfo>,
         addr: &PeerAddress,
     ) -> bool {
-        let ip = addr.host.parse::<IpAddr>().ok();
-        peers.iter().any(|entry| {
-            entry
-                .value()
-                .try_lock()
-                .map(|p| {
-                    if !p.is_connected() || !p.direction().we_called_remote() {
-                        return false;
-                    }
-                    if p.remote_addr().port() != addr.port {
-                        return false;
-                    }
-                    match ip {
-                        Some(ip) => p.remote_addr().ip() == ip,
-                        None => false,
-                    }
-                })
-                .unwrap_or(false)
+        peer_info_cache.iter().any(|entry| {
+            let info = entry.value();
+            // Only consider outbound connections (we called them)
+            if !info.direction.we_called_remote() {
+                return false;
+            }
+            // Check by original address first (handles hostnames correctly)
+            if let Some(ref orig) = info.original_address {
+                if orig.host == addr.host && orig.port == addr.port {
+                    return true;
+                }
+            }
+            // Fall back to IP comparison for backwards compatibility
+            if info.address.port() != addr.port {
+                return false;
+            }
+            let ip = addr.host.parse::<IpAddr>().ok();
+            match ip {
+                Some(ip) => info.address.ip() == ip,
+                None => false,
+            }
         })
     }
 
