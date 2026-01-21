@@ -5,11 +5,16 @@
 //! - SetTrustLineFlags
 
 use stellar_xdr::curr::{
-    AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, Liabilities,
-    OperationResult, OperationResultTr, SetTrustLineFlagsOp, SetTrustLineFlagsResult,
-    SetTrustLineFlagsResultCode, TrustLineEntry, TrustLineEntryExt, TrustLineFlags,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
+    AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, LedgerKey, LedgerKeyOffer,
+    Liabilities, OfferEntry, OperationResult, OperationResultTr, SetTrustLineFlagsOp,
+    SetTrustLineFlagsResult, SetTrustLineFlagsResultCode, TrustLineEntry, TrustLineEntryExt,
+    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
+use crate::operations::execute::offer_exchange::{
+    exchange_v10_without_price_error_thresholds, RoundingType,
+};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -104,6 +109,18 @@ pub fn execute_allow_trust(
     let setting_maintain_liabilities = new_flags & AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG != 0;
     if !auth_revocable && was_authorized && setting_maintain_liabilities {
         return Ok(make_allow_trust_result(AllowTrustResultCode::CantRevoke));
+    }
+
+    // Check if we need to remove offers (when revoking liabilities authorization)
+    // This matches C++ stellar-core behavior: when going from authorized-to-maintain-liabilities
+    // to not-authorized-to-maintain-liabilities, remove all offers by this account for this asset.
+    let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(trustline.flags);
+    let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
+
+    if was_authorized_to_maintain && !will_be_authorized_to_maintain {
+        // Remove all offers owned by the trustor that are buying or selling this asset
+        // This also handles liability release, subentry updates, and sponsorship
+        remove_offers_with_cleanup(state, &op.trustor, &asset);
     }
 
     // Update the trustline
@@ -214,7 +231,8 @@ pub fn execute_set_trust_line_flags(
 
     if was_authorized_to_maintain && !will_be_authorized_to_maintain {
         // Remove all offers owned by the trustor that are buying or selling this asset
-        state.remove_offers_by_account_and_asset(&op.trustor, &op.asset);
+        // This also handles liability release, subentry updates, and sponsorship
+        remove_offers_with_cleanup(state, &op.trustor, &op.asset);
         // Note: Pool share trustline redemption is not yet implemented.
         // The C++ code also redeems pool share trustlines here (removeOffersAndPoolShareTrustLines).
     }
@@ -276,6 +294,145 @@ fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
 fn is_trust_line_flag_auth_valid(flags: u32) -> bool {
     // Multiple auth flags can't be set simultaneously
     (flags & TRUSTLINE_AUTH_FLAGS) != TRUSTLINE_AUTH_FLAGS
+}
+
+/// Remove offers by account and asset with full cleanup.
+/// This handles:
+/// - Releasing liabilities on trustlines/accounts
+/// - Decrementing num_sub_entries on the seller account
+/// - Updating sponsorship counts if the offer was sponsored
+fn remove_offers_with_cleanup(
+    state: &mut LedgerStateManager,
+    account_id: &AccountId,
+    asset: &Asset,
+) {
+    // Get the offers that will be removed (returns the full offer data)
+    let removed_offers = state.remove_offers_by_account_and_asset(account_id, asset);
+
+    // For each removed offer, we need to:
+    // 1. Release liabilities
+    // 2. Decrement num_sub_entries
+    // 3. Handle sponsorship
+    for offer in &removed_offers {
+        // Release liabilities for this offer
+        release_offer_liabilities(state, offer);
+
+        // Handle sponsorship if the offer was sponsored
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: offer.seller_id.clone(),
+            offer_id: offer.offer_id,
+        });
+        if let Some(sponsor) = state.entry_sponsor(&ledger_key).cloned() {
+            let _ = state.update_num_sponsoring(&sponsor, -1);
+            let _ = state.update_num_sponsored(&offer.seller_id, -1);
+        }
+
+        // Decrement the seller account's num_sub_entries
+        if let Some(account) = state.get_account_mut(&offer.seller_id) {
+            if account.num_sub_entries > 0 {
+                account.num_sub_entries -= 1;
+            }
+        }
+    }
+}
+
+/// Calculate and release liabilities for a deleted offer.
+fn release_offer_liabilities(state: &mut LedgerStateManager, offer: &OfferEntry) {
+    // Calculate liabilities: selling_liab is the offer amount,
+    // buying_liab is what we'd receive at the offer price
+    let (selling_liab, buying_liab) = match offer_liabilities(&offer.amount, &offer.price) {
+        Ok((s, b)) => (s, b),
+        Err(_) => return, // Shouldn't happen for valid offers
+    };
+
+    // Release selling liability
+    if matches!(offer.selling, Asset::Native) {
+        if let Some(account) = state.get_account_mut(&offer.seller_id) {
+            let liab = ensure_account_liabilities(account);
+            liab.selling = liab.selling.saturating_sub(selling_liab);
+        }
+    } else if issuer_for_asset(&offer.selling) != Some(&offer.seller_id) {
+        if let Some(trustline) = state.get_trustline_mut(&offer.seller_id, &offer.selling) {
+            let liab = ensure_trustline_liabilities(trustline);
+            liab.selling = liab.selling.saturating_sub(selling_liab);
+        }
+    }
+
+    // Release buying liability
+    if matches!(offer.buying, Asset::Native) {
+        if let Some(account) = state.get_account_mut(&offer.seller_id) {
+            let liab = ensure_account_liabilities(account);
+            liab.buying = liab.buying.saturating_sub(buying_liab);
+        }
+    } else if issuer_for_asset(&offer.buying) != Some(&offer.seller_id) {
+        if let Some(trustline) = state.get_trustline_mut(&offer.seller_id, &offer.buying) {
+            let liab = ensure_trustline_liabilities(trustline);
+            liab.buying = liab.buying.saturating_sub(buying_liab);
+        }
+    }
+}
+
+/// Calculate the liabilities for a sell offer.
+fn offer_liabilities(amount: &i64, price: &stellar_xdr::curr::Price) -> Result<(i64, i64)> {
+    let res = exchange_v10_without_price_error_thresholds(
+        price.clone(),
+        *amount,
+        i64::MAX,
+        i64::MAX,
+        i64::MAX,
+        RoundingType::Normal,
+    )
+    .map_err(|_| crate::TxError::Internal("offer liability calculation failed".into()))?;
+    Ok((res.num_wheat_received, res.num_sheep_send))
+}
+
+/// Get the issuer of an asset, if any.
+fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
+    match asset {
+        Asset::Native => None,
+        Asset::CreditAlphanum4(a) => Some(&a.issuer),
+        Asset::CreditAlphanum12(a) => Some(&a.issuer),
+    }
+}
+
+/// Ensure account has a liabilities extension and return a mutable reference.
+fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
+    match &mut account.ext {
+        AccountEntryExt::V0 => {
+            account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V0,
+            });
+        }
+        AccountEntryExt::V1(_) => {}
+    }
+    match &mut account.ext {
+        AccountEntryExt::V1(v1) => &mut v1.liabilities,
+        AccountEntryExt::V0 => unreachable!("account liabilities not initialized"),
+    }
+}
+
+/// Ensure trustline has a liabilities extension and return a mutable reference.
+fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilities {
+    match &mut trustline.ext {
+        TrustLineEntryExt::V0 => {
+            trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            });
+        }
+        TrustLineEntryExt::V1(_) => {}
+    }
+    match &mut trustline.ext {
+        TrustLineEntryExt::V1(v1) => &mut v1.liabilities,
+        TrustLineEntryExt::V0 => unreachable!("trustline liabilities not initialized"),
+    }
 }
 
 #[cfg(test)]

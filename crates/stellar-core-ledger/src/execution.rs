@@ -1186,6 +1186,50 @@ impl TransactionExecutor {
         Ok(())
     }
 
+    /// Load all offers by an account for a specific asset.
+    ///
+    /// This is used when revoking trustline authorization - all offers for the
+    /// account/asset pair must be removed. The offers must first be loaded from
+    /// the snapshot so they can be deleted by the trustline flags operation.
+    pub fn load_offers_by_account_and_asset(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        asset: &Asset,
+    ) -> Result<()> {
+        let entries = snapshot.all_entries()?;
+        for entry in entries {
+            let LedgerEntryData::Offer(offer) = &entry.data else {
+                continue;
+            };
+            // Check if this offer is by the specified account
+            if &offer.seller_id != account_id {
+                continue;
+            }
+            // Check if this offer is buying or selling the specified asset
+            if offer.buying != *asset && offer.selling != *asset {
+                continue;
+            }
+            // Skip if already loaded
+            let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                seller_id: offer.seller_id.clone(),
+                offer_id: offer.offer_id,
+            });
+            if self.state.get_entry(&offer_key).is_some() {
+                continue;
+            }
+            // Skip if already deleted
+            if self.state.delta().deleted_keys().contains(&offer_key) {
+                continue;
+            }
+            // Load the offer
+            let offer = offer.clone();
+            self.state.load_entry(entry);
+            self.load_offer_dependencies(snapshot, &offer)?;
+        }
+        Ok(())
+    }
+
     /// Load a ledger entry from the snapshot into the state manager.
     ///
     /// This handles all entry types including contract data, contract code, and TTL entries.
@@ -2480,8 +2524,7 @@ impl TransactionExecutor {
                                 extract_hot_archive_restored_keys(soroban_data, op_type);
                             restored.hot_archive.extend(hot_archive);
                             // Collect for return to caller (for HotArchiveBucketList::add_batch)
-                            collected_hot_archive_keys
-                                .extend(restored.hot_archive.iter().cloned());
+                            collected_hot_archive_keys.extend(restored.hot_archive.iter().cloned());
                             (restored, soroban_data.map(|d| &d.resources.footprint))
                         } else {
                             (RestoredEntries::default(), None)
@@ -2692,6 +2735,10 @@ impl TransactionExecutor {
                 if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
                     self.load_trustline(snapshot, &op_data.trustor, &tl_asset)?;
                 }
+                // Load the trustor account - needed for num_sub_entries updates when removing offers
+                self.load_account(snapshot, &op_data.trustor)?;
+                // Load offers by account/asset so they can be removed if authorization is revoked
+                self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &asset)?;
             }
             OperationBody::Payment(op_data) => {
                 let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
@@ -2741,6 +2788,10 @@ impl TransactionExecutor {
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
                     self.load_trustline(snapshot, &op_data.trustor, &tl_asset)?;
                 }
+                // Load the trustor account - needed for num_sub_entries updates when removing offers
+                self.load_account(snapshot, &op_data.trustor)?;
+                // Load offers by account/asset so they can be removed if authorization is revoked
+                self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &op_data.asset)?;
             }
             OperationBody::Clawback(op_data) => {
                 let from_account = stellar_core_tx::muxed_to_account_id(&op_data.from);
