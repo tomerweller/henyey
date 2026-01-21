@@ -3361,12 +3361,18 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.offer_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.offers.get(&key).cloned() {
-                        // Only record update if entry actually changed from snapshot
-                        if &entry != snapshot_entry {
-                            let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-                                seller_id: entry.seller_id.clone(),
-                                offer_id: entry.offer_id,
-                            });
+                        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+                            seller_id: entry.seller_id.clone(),
+                            offer_id: entry.offer_id,
+                        });
+                        // Record update if:
+                        // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                        //    This is important for sponsorship-only changes where the entry data doesn't change
+                        //    but the ext (sponsor) changes.
+                        // 2. Entry actually changed - always record real value changes
+                        let accessed_in_op = self.op_entry_snapshots.contains_key(&ledger_key);
+                        let should_record = accessed_in_op || &entry != snapshot_entry;
+                        if should_record {
                             // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                             // Otherwise fall back to transaction-level snapshot
                             let pre_state = if let Some(op_snapshot) =
@@ -4242,5 +4248,81 @@ mod tests {
             has_lp_update,
             "The updated entry should be the LiquidityPool"
         );
+    }
+
+    /// Test that Offer sponsorship-only changes are recorded in delta.
+    /// Regression test for ledger 80387 where RevokeSponsorship changed only the
+    /// sponsor of an Offer entry but the modification was not recorded, causing
+    /// bucket list hash mismatch and a num_sponsoring underflow at ledger 80388.
+    #[test]
+    fn test_offer_sponsorship_only_change_recorded_in_delta() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create an offer entry
+        let seller_id = create_test_account_id(1);
+        let offer_entry = OfferEntry {
+            seller_id: seller_id.clone(),
+            offer_id: 1254, // Same offer ID as in the real testnet case
+            selling: Asset::Native,
+            buying: Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'X', b'X', b'X', b'Y']),
+                issuer: create_test_account_id(2),
+            }),
+            amount: 1000000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+
+        // Create the offer and set up initial sponsor
+        manager.create_offer(offer_entry.clone());
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id: 1254,
+        });
+        let initial_sponsor = create_test_account_id(2);
+        manager.set_entry_sponsor(ledger_key.clone(), initial_sponsor);
+        manager.commit();
+
+        // Reset delta by creating a new manager with the same state
+        // (simulating the start of a new transaction)
+        manager.delta = LedgerDelta::new(100);
+
+        // Now simulate what happens during RevokeSponsorship:
+        // 1. Start operation snapshot mode
+        manager.begin_op_snapshot();
+
+        // 2. Access the offer via get_offer_mut
+        //    This puts it into op_entry_snapshots
+        let _ = manager.get_offer_mut(&seller_id, 1254);
+
+        // 3. Change the sponsor (but not the entry data itself)
+        let new_sponsor = create_test_account_id(3);
+        manager.set_entry_sponsor(ledger_key.clone(), new_sponsor);
+
+        // 4. Apply modifications to delta (before end_op_snapshot, as in real execution)
+        manager.flush_modified_entries();
+
+        // 5. End operation snapshot
+        let _ = manager.end_op_snapshot();
+
+        // The offer should be recorded in delta as updated
+        // even though only the sponsor changed (not the entry data)
+        let delta = manager.take_delta();
+
+        // Check that an update was recorded
+        assert!(
+            !delta.updated_entries().is_empty(),
+            "Offer sponsorship-only change should be recorded in delta"
+        );
+
+        // Verify it's the offer that was updated
+        let has_offer_update = delta.updated_entries().iter().any(|entry| {
+            matches!(
+                &entry.data,
+                LedgerEntryData::Offer(offer) if offer.offer_id == 1254
+            )
+        });
+        assert!(has_offer_update, "The updated entry should be the Offer");
     }
 }
