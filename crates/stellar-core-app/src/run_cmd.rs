@@ -253,7 +253,37 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             tracing::info!("Watcher mode: skipping catchup");
         } else {
             tracing::info!("Node is behind, starting catchup");
+
+            // Start overlay network BEFORE catchup to receive tx_sets during catchup.
+            // This helps bridge the gap between catchup checkpoint and live consensus.
+            app.start_overlay().await?;
+
+            // Start a background task to cache messages during catchup.
+            let catchup_message_handle = app.start_catchup_message_caching().await;
+
+            // Start a background task to request SCP state after peers connect.
+            // This triggers peers to send us EXTERNALIZE messages which contain tx_set_hashes.
+            let scp_request_handle = {
+                let app_clone = Arc::clone(&app);
+                tokio::spawn(async move {
+                    // Wait for peers to complete handshake
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tracing::info!("Requesting SCP state during catchup");
+                    app_clone.request_scp_state_from_peers().await;
+                })
+            };
+
+            // Run catchup
             app.catchup(CatchupTarget::Current).await?;
+
+            // Wait for SCP state request to complete
+            let _ = scp_request_handle.await;
+
+            // Stop the catchup message caching task
+            if let Some(handle) = catchup_message_handle {
+                handle.abort();
+                tracing::info!("Stopped catchup message caching task");
+            }
         }
     }
 

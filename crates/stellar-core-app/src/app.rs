@@ -2073,10 +2073,21 @@ impl App {
     pub async fn run(&self) -> anyhow::Result<()> {
         tracing::info!("Starting main event loop");
 
-        // First, check if we need to catch up
+        // Start overlay network if not already started.
+        // (run_cmd may have already started it before catchup)
+        {
+            let overlay = self.overlay.lock().await;
+            if overlay.is_none() {
+                drop(overlay); // release lock before starting
+                self.start_overlay().await?;
+            }
+        }
+
+        // Get current ledger state (catchup was already done by run_cmd)
         let current_ledger = self.get_current_ledger().await?;
 
         if current_ledger == 0 {
+            // This shouldn't happen if run_cmd did catchup, but handle it just in case
             tracing::info!("No ledger state, running catchup first");
             let result = self.catchup(CatchupTarget::Current).await?;
             *self.current_ledger.write().await = result.ledger_seq;
@@ -2091,9 +2102,6 @@ impl App {
         self.herder.start_syncing();
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
-
-        // Start overlay network
-        self.start_overlay().await?;
 
         // Wait a short time for initial peer connections, then request SCP state
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2371,7 +2379,7 @@ impl App {
     }
 
     /// Start the overlay network.
-    async fn start_overlay(&self) -> anyhow::Result<()> {
+    pub async fn start_overlay(&self) -> anyhow::Result<()> {
         tracing::info!("Starting overlay network");
 
         self.store_config_peers();
@@ -2472,6 +2480,196 @@ impl App {
 
         *self.overlay.lock().await = Some(overlay);
         Ok(())
+    }
+
+    /// Start caching messages during catchup.
+    ///
+    /// Returns a JoinHandle that can be aborted when catchup completes.
+    /// This method starts a background task that caches GeneralizedTxSets
+    /// and requests tx_sets for EXTERNALIZE messages during catchup.
+    pub async fn start_catchup_message_caching(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let overlay = self.overlay.lock().await;
+        if let Some(ref o) = *overlay {
+            let message_rx = o.subscribe();
+            let app = Arc::clone(self);
+            Some(tokio::spawn(async move {
+                app.cache_messages_during_catchup_impl(message_rx).await;
+            }))
+        } else {
+            None
+        }
+    }
+
+    /// Cache messages during catchup to bridge the gap between catchup and live consensus.
+    ///
+    /// This runs in a background task during catchup:
+    /// 1. Caching GeneralizedTxSets received from peers
+    /// 2. Processing EXTERNALIZE messages to request their tx_sets
+    ///
+    /// This helps close the gap ledgers between catchup checkpoint and live consensus.
+    async fn cache_messages_during_catchup_impl(
+        &self,
+        mut message_rx: tokio::sync::broadcast::Receiver<OverlayMessage>,
+    ) {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Limits, ScpStatementPledges, TransactionPhase,
+            TxSetComponent, WriteXdr,
+        };
+
+        let mut cached_tx_sets = 0u32;
+        let mut requested_tx_sets = 0u32;
+        let mut recorded_externalized = 0u32;
+
+        loop {
+            match message_rx.recv().await {
+                Ok(msg) => {
+                    match msg.message {
+                        StellarMessage::GeneralizedTxSet(gen_tx_set) => {
+                            // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
+                            let xdr_bytes =
+                                match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Failed to encode GeneralizedTxSet to XDR");
+                                        continue;
+                                    }
+                                };
+                            let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+
+                            // Extract transactions from the GeneralizedTxSet
+                            let prev_hash = match &gen_tx_set {
+                                GeneralizedTransactionSet::V1(v1) => {
+                                    stellar_core_common::Hash256::from_bytes(
+                                        v1.previous_ledger_hash.0,
+                                    )
+                                }
+                            };
+
+                            let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> =
+                                match &gen_tx_set {
+                                    GeneralizedTransactionSet::V1(v1) => v1
+                                        .phases
+                                        .iter()
+                                        .flat_map(|phase| match phase {
+                                            TransactionPhase::V0(components) => components
+                                                .iter()
+                                                .flat_map(|component| match component {
+                                                    TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                                        comp,
+                                                    ) => comp.txs.to_vec(),
+                                                })
+                                                .collect::<Vec<_>>(),
+                                            TransactionPhase::V1(parallel) => parallel
+                                                .execution_stages
+                                                .iter()
+                                                .flat_map(|stage| {
+                                                    stage
+                                                        .0
+                                                        .iter()
+                                                        .flat_map(|cluster| cluster.0.to_vec())
+                                                })
+                                                .collect(),
+                                        })
+                                        .collect(),
+                                };
+
+                            let tx_set = stellar_core_herder::TransactionSet::with_generalized(
+                                prev_hash,
+                                hash,
+                                transactions,
+                                gen_tx_set,
+                            );
+
+                            // Cache it in herder (this will be available after catchup)
+                            self.herder.cache_tx_set(tx_set);
+                            cached_tx_sets += 1;
+
+                            tracing::debug!(
+                                cached_tx_sets,
+                                hash = %hash,
+                                "Cached tx_set during catchup"
+                            );
+                        }
+
+                        StellarMessage::ScpMessage(envelope) => {
+                            // For EXTERNALIZE messages, extract tx_set_hash, record, and request
+                            if let ScpStatementPledges::Externalize(ext) =
+                                &envelope.statement.pledges
+                            {
+                                let slot = envelope.statement.slot_index;
+                                let value = ext.commit.value.clone();
+
+                                // Record this externalized slot so we can apply it after catchup
+                                self.herder.scp_driver().record_externalized(slot, value);
+                                recorded_externalized += 1;
+                                tracing::info!(
+                                    slot,
+                                    "Recorded externalized slot during catchup"
+                                );
+
+                                if let Ok(sv) =
+                                    StellarValue::from_xdr(&ext.commit.value.0, Limits::none())
+                                {
+                                    let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+
+                                    // Check if we already have this tx_set
+                                    if !self.herder.has_tx_set(&tx_set_hash) {
+                                        // Register as pending and send GetTxSet request
+                                        self.herder
+                                            .scp_driver()
+                                            .request_tx_set(tx_set_hash, slot);
+
+                                        // Send GetTxSet request to the peer
+                                        let peer = msg.from_peer.clone();
+                                        let overlay = self.overlay.lock().await;
+                                        if let Some(ref overlay) = *overlay {
+                                            let request = StellarMessage::GetTxSet(
+                                                stellar_xdr::curr::Uint256(tx_set_hash.0),
+                                            );
+                                            if let Err(e) = overlay.send_to(&peer, request).await {
+                                                tracing::debug!(
+                                                    slot,
+                                                    peer = %peer,
+                                                    error = %e,
+                                                    "Failed to request tx set during catchup"
+                                                );
+                                            } else {
+                                                requested_tx_sets += 1;
+                                                tracing::info!(
+                                                    slot,
+                                                    hash = %tx_set_hash,
+                                                    peer = %peer,
+                                                    "Requested tx_set during catchup from EXTERNALIZE"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        _ => {
+                            // Ignore other message types during catchup
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "Catchup message receiver lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(
+            cached_tx_sets,
+            requested_tx_sets,
+            recorded_externalized,
+            "Finished caching messages during catchup"
+        );
     }
 
     /// Handle a message from the overlay network.
@@ -3661,7 +3859,7 @@ impl App {
     }
 
     /// Request SCP state from all connected peers.
-    async fn request_scp_state_from_peers(&self) {
+    pub async fn request_scp_state_from_peers(&self) {
         let overlay = self.overlay.lock().await;
         let overlay = match overlay.as_ref() {
             Some(o) => o,
