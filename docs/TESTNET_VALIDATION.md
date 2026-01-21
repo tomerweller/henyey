@@ -25,15 +25,15 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Partial | 642 ledgers verified (64-705) |
-| **Primary failure mode** | Soroban execution | Ledger 706+ diverges |
-| **Continuous replay** | Ledgers 64-705 | 100% header match |
+| **End-to-end verification** | Partial | 837 ledgers verified (64-900) |
+| **Primary failure mode** | Rent fee calculation | Ledger 901+ diverges |
+| **Continuous replay** | Ledgers 64-900 | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-705 | 642 | 319 | 642 (100%) | Continuous replay passes |
+| 64-900 | 837 | 588 | 837 (100%) | Continuous replay passes |
 
 ### Issues Fixed (2026-01-21)
 
@@ -51,16 +51,23 @@ When a transaction fails and rolls back, changes from previously committed trans
 
 ### Known Issues
 
-#### Ledger 706: Soroban Execution Divergence
+#### Ledger 901: Rent Fee Calculation Divergence
 
-Starting at ledger 706, there's a Soroban execution divergence where our implementation returns `ResourceLimitExceeded` for a transaction that CDP shows as successful.
+Starting at ledger 901, there's a rent fee calculation divergence. Our implementation computes a different fee refund than C++ stellar-core.
+
+**Example at ledger 901:**
+- Our refund: 53,783 stroops
+- CDP refund: 43,618 stroops
+- Difference: 10,165 stroops
+
+This causes the account balance to differ, which propagates to bucket list hash mismatch.
 
 **Status:** Under investigation
 
 **Analysis needed:**
-- Compare Soroban budget/resource tracking
-- Verify host function metering matches C++ stellar-core
-- Check if P24/P25 protocol differences affect this transaction
+- Compare rent fee calculation for extended/restored entries
+- Verify LedgerEntryRentChange construction matches C++ stellar-core
+- Check if P24 vs P25 rent calculation differs
 
 ## Commands
 
@@ -96,8 +103,15 @@ Achieve 100% header match for the entire testnet history (ledger 64 to present) 
 2. Correct bucket list update logic
 3. Correct header computation
 
+### Issues Fixed (2026-01-21)
+
+#### 4. Module Cache Update for Deployed Contracts
+
+When contracts are deployed via Soroban transactions, the contract code was written to state but not added to the module cache. This caused subsequent transactions to pay full VmInstantiation costs instead of using VmCachedInstantiation, leading to budget exceeded errors. Fixed in commit f2fda5e.
+
 ## History
 
+- **2026-01-21**: Fixed module cache update for deployed contracts (commit f2fda5e) - extends replay to 64-900
 - **2026-01-21**: Fixed delta snapshot preservation (commit 928c229) - enables continuous replay 64-705
 - **2026-01-21**: Fixed INIT/LIVE coalescing and fee refund application (commit 4155cf9)
 - **2026-01-21**: Converted verify-execution to true end-to-end test (commit f786311)
