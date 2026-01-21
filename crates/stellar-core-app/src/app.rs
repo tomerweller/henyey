@@ -2167,6 +2167,11 @@ impl App {
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
 
+        // Process any externalized slots recorded during catchup BEFORE entering the main loop.
+        // This ensures we buffer LedgerCloseInfo before new EXTERNALIZE messages trigger cleanup
+        // which would remove older externalized slots (only max_externalized_slots are kept).
+        self.process_externalized_slots().await;
+
         tracing::info!("Entering main event loop");
 
         // Add a short heartbeat interval for debugging
