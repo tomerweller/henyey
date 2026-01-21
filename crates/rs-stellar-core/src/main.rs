@@ -3513,7 +3513,7 @@ async fn cmd_verify_execution(
                 let delta = executor.state().delta();
                 let created = delta.created_entries();
                 let updated = delta.updated_entries();
-                let our_dead = delta.deleted_keys().to_vec();
+                let mut our_dead = delta.deleted_keys().to_vec();
 
                 // Build a set of created keys for efficient lookup
                 let created_keys: std::collections::HashSet<_> = created
@@ -3771,6 +3771,9 @@ async fn cmd_verify_execution(
                     });
                 let has_eviction_iter_change = aggregator.changes.contains_key(&eviction_iter_key);
 
+                // Track our own evicted keys from the scan (will be populated below)
+                let mut our_evicted_keys: Vec<stellar_xdr::curr::LedgerKey> = Vec::new();
+
                 // EvictionIterator handling:
                 // C++ always updates EvictionIterator in resolveBackgroundEvictionScan() and
                 // includes it in getAllEntries() output. CDP metadata doesn't include this
@@ -3833,6 +3836,13 @@ async fn cmd_verify_execution(
                         .scan_for_eviction_incremental(iter, seq, &settings)
                         .unwrap();
                     let updated_iter = scan_result.end_iterator;
+                    
+                    // Add evicted keys from our scan to our_dead
+                    // This is critical: C++ evicts entries based on TTL expiration during
+                    // the eviction scan. We must do the same using OUR scan results,
+                    // not the CDP metadata (which we only use for comparison).
+                    our_evicted_keys = scan_result.evicted_keys.clone();
+                    our_dead.extend(our_evicted_keys.clone());
 
                     let iter_entry = LedgerEntry {
                         last_modified_ledger_seq: seq,
@@ -4141,7 +4151,8 @@ async fn cmd_verify_execution(
                     let dead_keys: std::collections::HashSet<stellar_xdr::curr::LedgerKey> =
                         pre_eviction_dead.iter().cloned().collect();
 
-                    for key in &evicted_keys {
+                    // Use our evicted keys (from our eviction scan), NOT CDP's evicted_keys
+                    for key in &our_evicted_keys {
                         if matches!(key, stellar_xdr::curr::LedgerKey::Ttl(_)) {
                             continue;
                         }

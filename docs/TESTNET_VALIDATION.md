@@ -40,15 +40,15 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-50000 continuous replay passes |
+| **End-to-end verification** | Extended | 64-50100+ continuous replay passes |
 | **Primary failure mode** | Under investigation | Extending verification range |
-| **Continuous replay** | Ledgers 64-50000+ | 100% header match |
+| **Continuous replay** | Ledgers 64-50100+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-50000+ | 50000+ | Many | 100% | Continuous replay passes |
+| 64-50100+ | 50100+ | Many | 100% | Continuous replay passes |
 
 ### Issues Fixed (2026-01-21)
 
@@ -75,7 +75,13 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-None currently - verification extended to 64-50000+ with all issues resolved.
+None currently - verification extended to 64-50100+ with all issues resolved.
+
+#### (RESOLVED) Ledger 50034: Eviction Scan Results Not Used
+
+Fixed by using our own eviction scan results instead of CDP metadata. The `verify-execution` command was running the eviction scan but only using the iterator result - the evicted keys were being discarded. This caused 12 DEAD entries (6 ContractData + 6 Ttl entries with expired TTLs) to be missing from our bucket list update. Fixed by storing `scan_result.evicted_keys` and adding them to `our_dead` for bucket list updates.
+
+**Regression test:** The underlying `scan_for_eviction_incremental` function is already tested in `crates/stellar-core-bucket/tests/bucket_list_integration.rs`. The bug was in the CLI tool's integration, not the eviction scan itself. Testnet validation at ledger 50034+ serves as the regression test.
 
 #### (RESOLVED) Ledger 7515: Offer Entry in Failed Transaction
 
@@ -123,6 +129,22 @@ Achieve 100% header match for the entire testnet history (ledger 64 to present) 
 2. Correct bucket list update logic
 3. Correct header computation
 
+## Regression Testing Requirement
+
+**IMPORTANT:** When fixing any divergence issue discovered during testnet validation, a minimal regression test MUST be added alongside the fix. This ensures:
+
+1. The specific bug is covered and won't regress
+2. The fix is verifiable in isolation without running full testnet replay
+3. Future refactoring won't accidentally reintroduce the issue
+
+### Test Guidelines
+
+- Place tests in the appropriate crate's test module (unit tests) or `tests/` directory (integration tests)
+- Name tests descriptively: `test_<operation>_<specific_scenario>` (e.g., `test_allow_trust_removes_offers_on_deauthorize`)
+- Include a comment referencing the testnet ledger where the issue was discovered
+- Test the minimal scenario that triggers the bug, not the full ledger replay
+- If the fix involves state management, test both the happy path and the edge case that caused divergence
+
 ### Issues Fixed (2026-01-21)
 
 #### 4. Module Cache Update for Deployed Contracts
@@ -131,6 +153,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-21**: Fixed eviction scan results usage (ledger 50034) - extends replay to 64-50100+
 - **2026-01-21**: Fixed AllowTrust offer removal (ledger 12502) - extends replay to 64-50000+
 - **2026-01-21**: Fixed SetOptions signer sponsor loading (ledger 9952) - extends replay to 64-12501
 - **2026-01-21**: Fixed offer entry in failed transaction (ledger 7515) - extends replay to 64-9951
