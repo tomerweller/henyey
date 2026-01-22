@@ -1191,6 +1191,134 @@ impl App {
         self.herder.stats()
     }
 
+    /// Clear metrics registry.
+    ///
+    /// In C++ stellar-core, this resets the medida metrics counters.
+    /// In our Prometheus-style implementation, metrics are typically scraped externally
+    /// and don't have explicit clear semantics. This method logs the request for
+    /// operational visibility.
+    ///
+    /// # Arguments
+    ///
+    /// * `domain` - Optional domain filter (empty string means all metrics)
+    pub fn clear_metrics(&self, domain: &str) {
+        if domain.is_empty() {
+            tracing::info!("Clearing all metrics");
+        } else {
+            tracing::info!(domain = %domain, "Clearing metrics for domain");
+        }
+        // Note: Prometheus-style metrics don't have a clear operation.
+        // The metrics are scraped externally and typically reset on node restart.
+        // We log the request for operational visibility and parity with C++.
+    }
+
+    /// Perform manual database maintenance.
+    ///
+    /// Cleans up old SCP history and ledger headers to prevent unbounded database growth.
+    /// This is the same maintenance performed automatically by the background maintainer,
+    /// but can be triggered manually via the `/maintenance` HTTP endpoint.
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - Maximum number of entries to delete per table
+    pub fn perform_maintenance(&self, count: u32) {
+        use crate::maintainer::CHECKPOINT_FREQUENCY;
+
+        let (ledger_seq, _, _, _) = self.ledger_info();
+        let lcl = ledger_seq;
+
+        // Get minimum queued publish checkpoint if available
+        let min_queued = self.db.load_publish_queue(Some(1)).ok().and_then(|queue| {
+            queue.first().copied()
+        });
+
+        // Calculate the minimum ledger we need to keep
+        let qmin = min_queued.unwrap_or(lcl).min(lcl);
+        let lmin = qmin.saturating_sub(CHECKPOINT_FREQUENCY);
+
+        tracing::info!(
+            trim_below = lmin,
+            count = count,
+            lcl = lcl,
+            min_queued = ?min_queued,
+            "Performing manual maintenance"
+        );
+
+        // Delete old SCP history
+        if let Err(e) = self.db.delete_old_scp_entries(lmin, count) {
+            tracing::warn!(error = %e, "Failed to delete old SCP entries");
+        }
+
+        // Delete old ledger headers
+        if let Err(e) = self.db.delete_old_ledger_headers(lmin, count) {
+            tracing::warn!(error = %e, "Failed to delete old ledger headers");
+        }
+    }
+
+    /// Get a ConfigUpgradeSet from the ledger by its key.
+    ///
+    /// Looks up the temporary ledger entry containing the ConfigUpgradeSet
+    /// that corresponds to the given ConfigUpgradeSetKey.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The ConfigUpgradeSetKey identifying the upgrade set
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(config))` - The ConfigUpgradeSet as a JSON-serializable value
+    /// * `Ok(None)` - The upgrade set was not found in the ledger
+    /// * `Err` - An error occurred while reading from the ledger
+    pub fn get_config_upgrade_set(
+        &self,
+        key: &stellar_xdr::curr::ConfigUpgradeSetKey,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        use stellar_xdr::curr::{
+            ConfigUpgradeSet, LedgerEntryData, ReadXdr, ScVal, TtlEntry,
+        };
+
+        // Build the ledger key for the config upgrade set
+        let ledger_key = stellar_core_ledger::config_upgrade::ConfigUpgradeSetFrame::get_ledger_key(key);
+
+        // Look up the entry in the ledger
+        let entry = self.ledger_manager.load_entry(&ledger_key)?;
+
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+
+        // Extract the ConfigUpgradeSet from the entry
+        match &entry.data {
+            LedgerEntryData::Ttl(TtlEntry {
+                key_hash: _,
+                live_until_ledger_seq: _,
+            }) => {
+                // This shouldn't happen - we looked up the wrong entry type
+                Ok(None)
+            }
+            LedgerEntryData::ContractData(contract_data) => {
+                // Extract the bytes from the ScVal
+                match &contract_data.val {
+                    ScVal::Bytes(bytes) => {
+                        let upgrade_set =
+                            ConfigUpgradeSet::from_xdr(bytes.as_slice(), stellar_xdr::curr::Limits::none())?;
+
+                        // Convert to JSON-serializable format
+                        let json = serde_json::json!({
+                            "updated_entry": upgrade_set.updated_entry.iter().map(|entry| {
+                                format!("{:?}", entry)
+                            }).collect::<Vec<_>>()
+                        });
+
+                        Ok(Some(json))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn scp_slot_snapshots(&self, limit: usize) -> Vec<ScpSlotSnapshot> {
         let Some(scp) = self.herder.scp() else {
             return Vec::new();

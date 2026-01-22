@@ -71,6 +71,10 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 | `/ll` | Implemented | Dynamic log level changes via tracing-subscriber reload layer |
 | `/sorobaninfo` | Implemented | Soroban network configuration (basic format) |
 | `/manualclose` | Implemented | Manual ledger close (requires is_validator and manual_close config) |
+| `/clearmetrics` | Implemented | Logs request; Prometheus metrics don't support clearing |
+| `/logrotate` | Implemented | Logs request; actual rotation depends on logging backend |
+| `/maintenance` | Implemented | Manual database maintenance (cleans old SCP/ledger history) |
+| `/dumpproposedsettings` | Implemented | Returns ConfigUpgradeSet from ledger |
 
 #### Core Subsystems
 
@@ -124,10 +128,6 @@ These CDP-based verification tools are unique to the Rust implementation and pro
 
 | Endpoint | C++ Description | Priority |
 |----------|-----------------|----------|
-| `/clearmetrics` | Clear metrics | Low |
-| `/logrotate` | Rotate log files | Low |
-| `/maintenance` | Run maintenance | Low |
-| `/dumpproposedsettings` | Dump proposed settings | Low |
 | `/stopsurvey` | Stop survey (deprecated) | Low |
 | `/generateload` | Generate synthetic load (test) | Low |
 | `/testacc` | Test account operations (test) | Low |

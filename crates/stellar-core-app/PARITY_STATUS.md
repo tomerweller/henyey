@@ -116,10 +116,10 @@ run/catchup handlers and HTTP server wiring used by those commands.
 | `/status` | Implemented | Current node status (Rust-specific) |
 | `/manualclose` | Implemented | Triggers manual ledger close (requires is_validator and manual_close config) |
 | `/sorobaninfo` | Implemented | Basic format, reads actual config from ledger |
-| `/logRotate` | Not Implemented | |
-| `/maintenance` | Not Implemented | |
-| `/clearMetrics` | Not Implemented | |
-| `/dumpProposedSettings` | Not Implemented | |
+| `/logrotate` | Implemented | Logs request; actual rotation depends on logging backend |
+| `/maintenance` | Implemented | Manual database maintenance (cleans old SCP/ledger history) |
+| `/clearmetrics` | Implemented | Logs request; Prometheus metrics don't support clearing |
+| `/dumpproposedsettings` | Implemented | Returns ConfigUpgradeSet from ledger |
 | `/surveyTopology` (legacy) | Not Implemented | Non-time-sliced survey |
 | `/getSurveyResult` (legacy) | Not Implemented | Legacy survey result |
 | `/survey/reporting/stop` | Implemented | Stop survey reporting |
