@@ -501,14 +501,6 @@ impl HotArchiveBucketList {
             )));
         }
 
-        tracing::info!(
-            ledger_seq = ledger_seq,
-            protocol_version = protocol_version,
-            num_archived = archived_entries.len(),
-            num_restored = restored_keys.len(),
-            "hot_archive add_batch: input stats"
-        );
-
         // In C++, HotArchiveBucket::fresh() always creates a bucket with a metaentry,
         // even when there are no data entries. The metaentry is written in the
         // BucketOutputIterator constructor before any put() calls. So a bucket with
@@ -519,12 +511,6 @@ impl HotArchiveBucketList {
         // with at least a metaentry.
         let new_bucket =
             HotArchiveBucket::fresh(protocol_version, archived_entries, restored_keys)?;
-        tracing::info!(
-            ledger_seq = ledger_seq,
-            new_bucket_hash = %new_bucket.hash().to_hex(),
-            new_bucket_entries = new_bucket.len(),
-            "hot_archive add_batch: new bucket created"
-        );
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;

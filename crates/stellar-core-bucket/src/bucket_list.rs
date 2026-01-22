@@ -673,11 +673,6 @@ impl BucketList {
             ));
         }
 
-        tracing::debug!(
-            ledger_seq = ledger_seq,
-            "add_batch_internal: starting spill processing"
-        );
-
         // Step 1: Process spills from highest level down to level 1
         // This matches C++ stellar-core's BucketListBase::addBatchInternal
         //
@@ -729,12 +724,6 @@ impl BucketList {
                     normalize_init,
                     use_empty_curr,
                 )?;
-
-                tracing::info!(
-                    level = i,
-                    next_hash = %self.levels[i].next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string()),
-                    "Level prepared"
-                );
             }
         }
 
@@ -1028,6 +1017,18 @@ impl BucketList {
             let normalize_init = false; // C++ never normalizes INIT to LIVE during merges
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
+            // Log detailed merge parameters for debugging
+            tracing::info!(
+                level = i,
+                ledger = ledger,
+                merge_start_ledger = merge_start_ledger,
+                use_empty_curr = use_empty_curr,
+                level_curr_hash = %self.levels[i].curr.hash().to_hex(),
+                level_snap_hash = %self.levels[i].snap.hash().to_hex(),
+                prev_snap_hash = %prev_snap.hash().to_hex(),
+                "restart_merges: starting merge"
+            );
+
             // Start the merge with the previous level's snap
             self.levels[i].prepare_with_normalization(
                 merge_start_ledger,
@@ -1039,7 +1040,11 @@ impl BucketList {
                 use_empty_curr,
             )?;
 
-            tracing::debug!(level = i, "restart_merges: merge restarted successfully");
+            tracing::info!(
+                level = i,
+                next_hash = %self.levels[i].next.as_ref().map(|b| b.hash().to_hex()).unwrap_or_else(|| "None".to_string()),
+                "restart_merges: merge restarted successfully"
+            );
         }
 
         // Update the ledger sequence to the restored ledger
@@ -1252,8 +1257,8 @@ impl BucketList {
             };
 
             // Scan entries in this bucket starting from the offset
-            let (_entries_scanned, bytes_used, data_entries_evicted, finished_bucket) =
-                self.scan_bucket_region(
+            let (_entries_scanned, bytes_used, data_entries_evicted, finished_bucket) = self
+                .scan_bucket_region(
                     bucket,
                     &mut iter,
                     bytes_remaining,

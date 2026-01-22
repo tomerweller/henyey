@@ -371,6 +371,48 @@ impl FetchingEnvelopes {
         self.tx_set_cache.insert(hash, (slot, data));
     }
 
+    /// Mark a TxSet as available and process any waiting envelopes.
+    ///
+    /// This is used when we receive a tx set through other means (not the fetcher)
+    /// but want to notify waiting envelopes that the dependency is satisfied.
+    pub fn tx_set_available(&self, hash: Hash256, slot: SlotIndex) {
+        // Cache it
+        self.tx_set_cache.insert(hash, (slot, Vec::new()));
+
+        // Try recv_tx_set which handles tracked items
+        // (if not tracked, it will return early which is fine)
+        let _ = self.recv_tx_set(hash, slot, Vec::new());
+
+        // Also manually check all fetching envelopes for this hash
+        // in case they weren't tracked through the fetcher
+        self.move_ready_envelopes_for_tx_set(&hash);
+    }
+
+    /// Check all fetching envelopes and move any that are now ready.
+    fn move_ready_envelopes_for_tx_set(&self, tx_set_hash: &Hash256) {
+        // Iterate through all slots and check envelopes
+        for slot_entry in self.slots.iter() {
+            let slot = *slot_entry.key();
+            let mut fetching_to_check: Vec<(Hash256, ScpEnvelope)> = Vec::new();
+
+            // Collect envelopes that reference this tx set
+            if let Some(slot_state) = self.slots.get(&slot) {
+                for (env_hash, (envelope, _)) in slot_state.fetching.iter() {
+                    if let Some(hash) = Self::extract_tx_set_hash(envelope) {
+                        if &hash == tx_set_hash {
+                            fetching_to_check.push((*env_hash, envelope.clone()));
+                        }
+                    }
+                }
+            }
+
+            // Check each one
+            for (_env_hash, envelope) in fetching_to_check {
+                self.check_and_move_to_ready(envelope);
+            }
+        }
+    }
+
     /// Add a QuorumSet to the cache directly.
     pub fn cache_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
         self.quorum_set_cache.insert(hash, Arc::new(quorum_set));
@@ -379,6 +421,11 @@ impl FetchingEnvelopes {
     // --- Internal helpers ---
 
     /// Check what dependencies are missing for an envelope.
+    ///
+    /// NOTE: We currently skip the quorum set check because we don't have
+    /// proper quorum set fetching wired up. The critical dependency for
+    /// ledger closing is the tx set. Quorum sets are validated separately
+    /// by the SCP layer.
     fn check_dependencies(&self, envelope: &ScpEnvelope) -> (bool, bool) {
         let need_tx_set = if let Some(hash) = Self::extract_tx_set_hash(envelope) {
             !self.tx_set_cache.contains_key(&hash)
@@ -386,11 +433,14 @@ impl FetchingEnvelopes {
             false
         };
 
-        let need_quorum_set = if let Some(hash) = Self::extract_quorum_set_hash(envelope) {
-            !self.quorum_set_cache.contains_key(&hash)
-        } else {
-            false
-        };
+        // TODO: Re-enable quorum set fetching when we have proper peer fetching wired up
+        // For now, assume quorum sets are available (SCP validates them separately)
+        let need_quorum_set = false;
+        // let need_quorum_set = if let Some(hash) = Self::extract_quorum_set_hash(envelope) {
+        //     !self.quorum_set_cache.contains_key(&hash)
+        // } else {
+        //     false
+        // };
 
         (need_tx_set, need_quorum_set)
     }

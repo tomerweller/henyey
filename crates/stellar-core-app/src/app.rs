@@ -2913,6 +2913,33 @@ impl App {
                     EnvelopeState::InvalidSignature => {
                         tracing::warn!(slot, peer = %msg.from_peer, "SCP envelope with invalid signature");
                     }
+                    EnvelopeState::Fetching => {
+                        // Envelope is waiting for its tx set to be fetched.
+                        // Request the tx set from the peer that sent this envelope.
+                        tracing::info!(
+                            slot,
+                            peer = %msg.from_peer,
+                            "SCP envelope waiting for tx set"
+                        );
+                        if let Some(tx_set_hash) = tx_set_hash {
+                            let peer = msg.from_peer.clone();
+                            let overlay = self.overlay.lock().await;
+                            if let Some(ref overlay) = *overlay {
+                                let request = StellarMessage::GetTxSet(
+                                    stellar_xdr::curr::Uint256(tx_set_hash.0),
+                                );
+                                if let Err(e) = overlay.send_to(&peer, request).await {
+                                    tracing::debug!(
+                                        peer = %peer,
+                                        error = %e,
+                                        "Failed to request tx set for fetching envelope"
+                                    );
+                                }
+                            }
+                        }
+                        // Also request any other pending tx sets
+                        self.request_pending_tx_sets().await;
+                    }
                 }
             }
 

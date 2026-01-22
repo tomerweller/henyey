@@ -89,6 +89,8 @@ pub enum EnvelopeState {
     Valid,
     /// Envelope is for a future slot and was buffered for later processing.
     Pending,
+    /// Envelope is waiting for tx set to be fetched from peers.
+    Fetching,
     /// Envelope was already seen/processed.
     Duplicate,
     /// Envelope is for a slot older than our current tracking slot.
@@ -254,6 +256,13 @@ impl Herder {
         let pending_envelopes = PendingEnvelopes::new(pending_config);
         let fetching_envelopes = FetchingEnvelopes::with_defaults();
 
+        // Pre-cache the local quorum set in fetching_envelopes so envelopes
+        // referencing it don't wait for fetching.
+        if let Some(ref quorum_set) = config.local_quorum_set {
+            let qs_hash = Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO);
+            fetching_envelopes.cache_quorum_set(qs_hash, quorum_set.clone());
+        }
+
         // SCP is None for non-validators (they just observe)
         let slot_quorum_tracker =
             SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
@@ -324,6 +333,13 @@ impl Herder {
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
         let pending_envelopes = PendingEnvelopes::new(pending_config);
         let fetching_envelopes = FetchingEnvelopes::with_defaults();
+
+        // Pre-cache the local quorum set in fetching_envelopes so envelopes
+        // referencing it don't wait for fetching.
+        if let Some(ref quorum_set) = config.local_quorum_set {
+            let qs_hash = Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO);
+            fetching_envelopes.cache_quorum_set(qs_hash, quorum_set.clone());
+        }
 
         // Create SCP instance for validators
         let node_id = node_id_from_public_key(&config.node_public_key);
@@ -746,6 +762,10 @@ impl Herder {
     }
 
     /// Process an SCP envelope (internal).
+    ///
+    /// This follows the C++ stellar-core pattern: we only feed envelopes to SCP
+    /// after their tx sets are available. This ensures that when SCP externalizes
+    /// a slot, the tx set is already in cache and ready for ledger close.
     fn process_scp_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
         let slot = envelope.statement.slot_index;
 
@@ -753,6 +773,64 @@ impl Herder {
             "Processing SCP envelope for slot {} from {:?}",
             slot, envelope.statement.node_id
         );
+
+        // Check if we have the tx sets needed for this envelope.
+        // This is critical: we must not let SCP externalize until we have the tx set,
+        // otherwise we'll be stuck unable to close the ledger.
+        let tx_set_hashes = crate::herder_utils::get_tx_set_hashes_from_envelope(&envelope);
+        let mut missing_tx_sets = Vec::new();
+        for hash in &tx_set_hashes {
+            if !self.scp_driver.has_tx_set(hash) {
+                missing_tx_sets.push(*hash);
+            }
+        }
+
+        if !missing_tx_sets.is_empty() {
+            // Buffer this envelope until we get the tx set
+            debug!(
+                slot,
+                missing_count = missing_tx_sets.len(),
+                "Envelope waiting for tx set(s)"
+            );
+
+            // Use the fetching envelopes manager to track this
+            use crate::fetching_envelopes::RecvResult;
+
+            // Clone the envelope before passing to recv_envelope since it takes ownership
+            let envelope_clone = envelope.clone();
+            let result = self.fetching_envelopes.recv_envelope(envelope);
+
+            match result {
+                RecvResult::Ready => {
+                    // The fetching manager says it's ready (has all deps in its cache).
+                    // This can happen if the tx set was cached elsewhere.
+                    // Process it now.
+                    debug!(slot, "Envelope ready in fetching manager, processing now");
+                    return self.process_scp_envelope_with_tx_set(envelope_clone);
+                }
+                RecvResult::Fetching => {
+                    // Register pending tx set requests so the app can fetch them
+                    for hash in missing_tx_sets {
+                        self.scp_driver.request_tx_set(hash, slot);
+                    }
+                    return EnvelopeState::Fetching;
+                }
+                RecvResult::AlreadyProcessed => {
+                    return EnvelopeState::Duplicate;
+                }
+                RecvResult::Discarded => {
+                    return EnvelopeState::Invalid;
+                }
+            }
+        }
+
+        // All tx sets available - proceed with SCP processing
+        self.process_scp_envelope_with_tx_set(envelope)
+    }
+
+    /// Process an SCP envelope after confirming tx sets are available.
+    fn process_scp_envelope_with_tx_set(&self, envelope: ScpEnvelope) -> EnvelopeState {
+        let slot = envelope.statement.slot_index;
 
         // If we have SCP (validator mode), process through consensus
         if let Some(ref scp) = self.scp {
@@ -1316,13 +1394,59 @@ impl Herder {
 
     /// Receive a transaction set from the network.
     /// Returns the slot it was needed for, if any.
+    ///
+    /// This also processes any envelopes that were waiting for this tx set,
+    /// feeding them to SCP now that the dependency is satisfied.
     pub fn receive_tx_set(&self, tx_set: TransactionSet) -> Option<SlotIndex> {
-        self.scp_driver.receive_tx_set(tx_set)
+        let hash = tx_set.hash;
+        let slot = self.scp_driver.receive_tx_set(tx_set);
+
+        // Notify the fetching envelopes manager that this tx set is now available.
+        // Use the slot from scp_driver, or tracking_slot as fallback.
+        let notify_slot = slot.unwrap_or_else(|| *self.tracking_slot.read());
+        self.fetching_envelopes.tx_set_available(hash, notify_slot);
+
+        // Process any envelopes that became ready
+        self.process_ready_fetching_envelopes();
+
+        slot
+    }
+
+    /// Process envelopes that have become ready after tx set arrival.
+    ///
+    /// This is called after receiving a tx set to feed any buffered envelopes
+    /// to SCP now that their dependencies are satisfied.
+    pub fn process_ready_fetching_envelopes(&self) -> usize {
+        let ready_slots = self.fetching_envelopes.ready_slots();
+        let mut processed = 0;
+
+        for slot in ready_slots {
+            while let Some(envelope) = self.fetching_envelopes.pop(slot) {
+                debug!(slot, "Processing envelope that was waiting for tx set");
+                let _ = self.process_scp_envelope_with_tx_set(envelope);
+                processed += 1;
+            }
+        }
+
+        if processed > 0 {
+            info!(processed, "Processed envelopes after tx set arrival");
+        }
+
+        processed
     }
 
     /// Cache a transaction set directly.
+    ///
+    /// This also notifies the fetching envelopes manager, which may
+    /// process any waiting envelopes.
     pub fn cache_tx_set(&self, tx_set: TransactionSet) {
+        let hash = tx_set.hash;
         self.scp_driver.cache_tx_set(tx_set);
+
+        // Notify fetching envelopes and process any that become ready
+        let slot = *self.tracking_slot.read();
+        self.fetching_envelopes.tx_set_available(hash, slot);
+        self.process_ready_fetching_envelopes();
     }
 
     /// Check if a transaction set is cached.
