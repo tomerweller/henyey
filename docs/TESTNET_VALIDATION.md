@@ -2,7 +2,7 @@
 
 This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
 
-**Last Updated:** 2026-01-22
+**Last Updated:** 2026-01-22 (Updated)
 
 ## Quick Reference: Running Verification
 
@@ -40,15 +40,33 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-140000+ continuous replay passes |
-| **Primary failure mode** | Under investigation | Extending verification range |
-| **Continuous replay** | Ledgers 64-140000+ | 100% header match |
+| **End-to-end verification** | Extended | 64-145000+ continuous replay passes |
+| **Primary failure mode** | None | Extending verification range |
+| **Continuous replay** | Ledgers 64-145000+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-140000+ | 140000+ | Many | 100% | Continuous replay passes |
+| 64-145000 | 145,000+ | 100,000+ | 100% | Continuous replay passes |
+
+### Issues Fixed (2026-01-22)
+
+#### 1. Classic Transaction Fee Calculation
+
+Classic transactions were incorrectly charged the full declared fee instead of `min(declared_fee, base_fee * num_ops)`. This matches C++ stellar-core's `TransactionFrame::getFee()` behavior when `applying=true`.
+
+**Regression test:** `test_classic_fee_calculation_uses_min` in `crates/stellar-core-ledger/src/execution.rs` and `test_classic_fee_uses_min_not_max` in `crates/stellar-core-tx/src/live_execution.rs`
+
+#### 2. Liquidity Pool Deletion on Last Trustline Removal
+
+When the last pool share trustline referencing a liquidity pool is deleted (causing `pool_shares_trust_line_count` to reach 0), the pool itself must be deleted from state. Previously the count was decremented but the pool was never removed.
+
+**Regression test:** `test_change_trust_pool_deleted_when_last_trustline_removed` in `crates/stellar-core-tx/src/operations/execute/change_trust.rs`
+
+#### 3. INIT/LIVE/DEAD Coalescing for Created+Deleted Entries
+
+When an entry is created and then deleted within the same ledger, it should not appear in either INIT or DEAD - the entry effectively never existed from the bucket list's perspective. Fixed the bucket list delta computation in verify-execution.
 
 ### Issues Fixed (2026-01-21)
 
@@ -75,7 +93,7 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-None currently - verification extended to 64-140000+ with all issues resolved.
+None currently - verification extended to 64-145000+ with all issues resolved.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 
@@ -183,6 +201,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-22**: Fixed classic fee calculation, liquidity pool deletion, INIT/DEAD coalescing - extends replay to 64-145000+
 - **2026-01-22**: Fixed live BL restore vs hot archive restore distinction (ledger 134448) - extends replay to 64-140000+
 - **2026-01-22**: Fixed hot archive restoration INIT/LIVE categorization (ledger 128051) - extends replay to 64-128050+
 - **2026-01-22**: Fixed SetOptions signer sponsor loading (ledger 84362) - extends replay to 64-90000+

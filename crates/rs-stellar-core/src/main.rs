@@ -3531,6 +3531,18 @@ async fn cmd_verify_execution(
                     .filter_map(|e| ledger_entry_to_key(e))
                     .collect();
 
+                // Build a set of deleted keys
+                let deleted_keys: std::collections::HashSet<_> = our_dead.iter().cloned().collect();
+
+                // Apply coalescing rule: Created + Deleted = nothing
+                // If an entry was created and then deleted within the same ledger,
+                // it should not appear in INIT or DEAD (it never existed in the
+                // previous bucket list state).
+                let created_and_deleted: std::collections::HashSet<_> = created_keys
+                    .intersection(&deleted_keys)
+                    .cloned()
+                    .collect();
+
                 // Build a map of updated entries by key
                 let updated_by_key: std::collections::HashMap<_, _> = updated
                     .iter()
@@ -3538,20 +3550,24 @@ async fn cmd_verify_execution(
                     .collect();
 
                 // For INIT: use updated value if entry was both created and updated,
-                // otherwise use created value
+                // otherwise use created value. Exclude entries that were created+deleted.
                 let mut our_init: Vec<LedgerEntry> = created
                     .iter()
-                    .map(|e| {
-                        if let Some(key) = ledger_entry_to_key(e) {
-                            updated_by_key.get(&key).cloned().unwrap_or_else(|| e.clone())
-                        } else {
-                            e.clone()
+                    .filter_map(|e| {
+                        let key = ledger_entry_to_key(e)?;
+                        if created_and_deleted.contains(&key) {
+                            return None; // Created+Deleted = nothing
                         }
+                        Some(updated_by_key.get(&key).cloned().unwrap_or_else(|| e.clone()))
                     })
                     .collect();
 
-                // Build a set of deleted keys to exclude from live
-                let deleted_keys: std::collections::HashSet<_> = our_dead.iter().cloned().collect();
+                // For DEAD: exclude entries that were created+deleted
+                our_dead.retain(|k| !created_and_deleted.contains(k));
+
+                // NOTE: We use the ORIGINAL deleted_keys (built at line 3535) for LIVE filtering,
+                // not a filtered version. An entry that was updated+deleted should NOT appear
+                // in LIVE (only in DEAD). The our_dead.retain() above only affects DEAD output.
 
                 // For LIVE: exclude entries whose keys are in the created set OR deleted set,
                 // and deduplicate by key (keep only the final state for each key).

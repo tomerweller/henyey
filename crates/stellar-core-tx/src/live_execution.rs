@@ -393,21 +393,33 @@ pub fn process_fee_seq_num_fee_bump(
 }
 
 /// Calculate the fee to charge for a transaction.
+/// Calculate the fee to charge for a transaction.
+///
+/// This matches C++ stellar-core's `TransactionFrame::getFee()` behavior:
+/// - For Soroban: resourceFee + min(inclusionFee, adjustedFee)
+/// - For Classic: min(inclusionFee, adjustedFee)
+///
+/// Where adjustedFee = baseFee * numOperations and inclusionFee is the
+/// declared fee (minus resource fee for Soroban).
 fn calculate_fee_to_charge(
     frame: &TransactionFrame,
     _protocol_version: u32,
     base_fee_override: Option<i64>,
 ) -> i64 {
     let base_fee = base_fee_override.unwrap_or(100); // Default base fee
-    let op_count = frame.operation_count() as i64;
+    let op_count = std::cmp::max(1, frame.operation_count() as i64);
+    let adjusted_fee = base_fee * op_count;
 
     if frame.is_soroban() {
-        // Soroban transactions use the full declared fee
-        frame.fee() as i64
+        // Soroban: resourceFee + min(inclusionFee, adjustedFee)
+        let resource_fee = frame.declared_soroban_resource_fee();
+        let inclusion_fee = frame.inclusion_fee();
+        resource_fee + std::cmp::min(inclusion_fee, adjusted_fee)
     } else {
-        // Classic transactions: max(declared_fee, base_fee * op_count)
-        let min_fee = base_fee * op_count;
-        std::cmp::max(frame.fee() as i64, min_fee)
+        // Classic: min(inclusionFee, adjustedFee)
+        // The inclusion fee equals the full declared fee for classic transactions.
+        let inclusion_fee = frame.fee() as i64;
+        std::cmp::min(inclusion_fee, adjusted_fee)
     }
 }
 
@@ -947,18 +959,21 @@ mod tests {
             state.put_account(account);
         }
 
+        // Create a transaction with declared fee=200, 1 operation
+        // With default base_fee=100, the charged fee should be min(200, 100*1) = 100
         let frame = make_test_frame(account_id, 200, 2);
 
         let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
         assert!(result.should_apply);
-        assert_eq!(result.fee_charged, 200);
-        assert_eq!(ctx.fee_pool_delta(), 200);
+        // Fee charged is min(declared_fee=200, base_fee*ops=100*1) = 100
+        assert_eq!(result.fee_charged, 100);
+        assert_eq!(ctx.fee_pool_delta(), 100);
 
         // Check account balance was deducted
         if let Some(state) = ctx.state() {
             let updated_account = state.get_account(&make_account_id(1)).unwrap();
-            assert_eq!(updated_account.balance, 10_000_000 - 200);
+            assert_eq!(updated_account.balance, 10_000_000 - 100);
         }
     }
 
@@ -1121,17 +1136,58 @@ mod tests {
 
     #[test]
     fn test_calculate_fee_to_charge_classic() {
+        // Test 1: Declared fee (50) is less than base_fee * ops (100 * 1 = 100)
+        // Fee charged should be min(50, 100) = 50
         let account_id = make_account_id(1);
-        let frame = make_test_frame(account_id, 50, 1); // Fee of 50 with 1 operation
-
-        // With base fee of 100, should charge max(50, 100*1) = 100
+        let frame = make_test_frame(account_id, 50, 1);
         let fee = calculate_fee_to_charge(&frame, 21, Some(100));
-        assert_eq!(fee, 100);
+        assert_eq!(
+            fee, 50,
+            "Classic: min(declared=50, required=100) should be 50"
+        );
 
-        // With lower declared fee
+        // Test 2: Declared fee (200) is greater than base_fee * ops (100 * 1 = 100)
+        // Fee charged should be min(200, 100) = 100
         let frame2 = make_test_frame(make_account_id(1), 200, 1);
         let fee2 = calculate_fee_to_charge(&frame2, 21, Some(100));
-        assert_eq!(fee2, 200); // max(200, 100*1) = 200
+        assert_eq!(
+            fee2, 100,
+            "Classic: min(declared=200, required=100) should be 100"
+        );
+
+        // Test 3: Declared fee (500) with 3 operations, base fee 100
+        // required_fee = 100 * 3 = 300
+        // Fee charged should be min(500, 300) = 300
+        let frame3 = make_test_frame(make_account_id(1), 500, 1);
+        // Note: make_test_frame creates 1 op, so we use fee 500 for a single op tx
+        let fee3 = calculate_fee_to_charge(&frame3, 21, Some(100));
+        assert_eq!(
+            fee3, 100,
+            "Classic: min(declared=500, required=100) should be 100"
+        );
+
+        // Test 4: Declared fee exactly matches base_fee * ops
+        let frame4 = make_test_frame(make_account_id(1), 100, 1);
+        let fee4 = calculate_fee_to_charge(&frame4, 21, Some(100));
+        assert_eq!(
+            fee4, 100,
+            "Classic: min(declared=100, required=100) should be 100"
+        );
+    }
+
+    /// Regression test: Classic transactions should charge min(declared, required), not max
+    /// This matches C++ stellar-core's TransactionFrame::getFee() behavior when applying=true
+    #[test]
+    fn test_classic_fee_uses_min_not_max() {
+        // A user declaring a fee of 1,000,000 stroops for a 1-op transaction
+        // should only be charged base_fee * 1 = 100 stroops (assuming base_fee=100),
+        // NOT the full 1,000,000 they declared.
+        let frame = make_test_frame(make_account_id(1), 1_000_000, 1);
+        let fee = calculate_fee_to_charge(&frame, 21, Some(100));
+        assert_eq!(
+            fee, 100,
+            "Classic tx should charge min(1000000, 100*1)=100, not the declared fee"
+        );
     }
 
     #[test]

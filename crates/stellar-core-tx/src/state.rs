@@ -2772,6 +2772,43 @@ impl LedgerStateManager {
         }
     }
 
+    /// Delete a liquidity pool entry (when pool_shares_trust_line_count reaches 0).
+    pub fn delete_liquidity_pool(&mut self, pool_id: &PoolId) {
+        let key = pool_id_to_bytes(pool_id);
+        let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: pool_id.clone(),
+        });
+
+        // Save snapshot if not already saved
+        if !self.liquidity_pool_snapshots.contains_key(&key) {
+            let snapshot = self.liquidity_pools.get(&key).cloned();
+            self.liquidity_pool_snapshots.insert(key, snapshot);
+        }
+        self.capture_op_snapshot_for_key(&ledger_key);
+        self.snapshot_last_modified_key(&ledger_key);
+
+        // Get pre-state (current value BEFORE deletion)
+        let pre_state = self
+            .liquidity_pools
+            .get(&key)
+            .map(|e| self.liquidity_pool_to_ledger_entry(e));
+
+        // Record in delta with pre-state
+        if let Some(pre) = pre_state {
+            self.delta.record_delete(ledger_key.clone(), pre);
+        }
+
+        // Remove from state
+        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.liquidity_pools.remove(&key);
+        self.remove_last_modified_key(&ledger_key);
+
+        // Track modification (for proper rollback handling)
+        if !self.modified_liquidity_pools.contains(&key) {
+            self.modified_liquidity_pools.push(key);
+        }
+    }
+
     // ==================== Generic Entry Operations ====================
 
     /// Get an entry by LedgerKey (read-only).

@@ -488,14 +488,25 @@ fn manage_pool_on_deleted_trustline(
         _ => return true,
     };
 
-    let Some(pool) = state.get_liquidity_pool_mut(&pool_id) else {
-        return false;
+    // First, check if pool exists and get/decrement the count
+    let should_delete = {
+        let Some(pool) = state.get_liquidity_pool_mut(&pool_id) else {
+            return false;
+        };
+        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
+        if cp.pool_shares_trust_line_count == 0 {
+            return false;
+        }
+        cp.pool_shares_trust_line_count -= 1;
+        // Check if we should delete (count reached 0 after decrement)
+        cp.pool_shares_trust_line_count == 0
     };
-    let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
-    if cp.pool_shares_trust_line_count == 0 {
-        return false;
+
+    // Delete the pool if count reached 0 (matching C++ behavior)
+    if should_delete {
+        state.delete_liquidity_pool(&pool_id);
     }
-    cp.pool_shares_trust_line_count -= 1;
+
     true
 }
 
@@ -1138,5 +1149,109 @@ mod tests {
         let tl_b_after = state.get_trustline(&source_id, &asset_b).unwrap();
         assert_eq!(liquidity_pool_use_count(tl_a_after), 1);
         assert_eq!(liquidity_pool_use_count(tl_b_after), 1);
+    }
+
+    /// Regression test: When the last pool share trustline is deleted, the liquidity pool
+    /// itself should be deleted (pool_shares_trust_line_count reaches 0).
+    ///
+    /// This matches C++ stellar-core's behavior where removing the last trustline
+    /// that references a liquidity pool causes the pool to be removed from state.
+    #[test]
+    fn test_change_trust_pool_deleted_when_last_trustline_removed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+
+        // Create trustlines for both assets with pool_use_count=0 initially
+        let tl_a = trustline_with_pool_use_count(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            0,
+            10_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+            0,
+        );
+        let tl_b = trustline_with_pool_use_count(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            0,
+            10_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+            0,
+        );
+        state.create_trustline(tl_a);
+        state.create_trustline(tl_b);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 2;
+
+        // Create pool share trustline (this creates the pool with trust_line_count=1)
+        let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a: asset_a.clone(),
+                asset_b: asset_b.clone(),
+                fee: 30,
+            },
+        );
+        let pool_id = pool_id_from_params(&params);
+        let create_op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(params.clone()),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&create_op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Verify pool exists with trust_line_count=1
+        let pool = state.get_liquidity_pool(&pool_id);
+        assert!(pool.is_some(), "Pool should exist after creating trustline");
+        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.unwrap().body;
+        assert_eq!(
+            cp.pool_shares_trust_line_count, 1,
+            "Pool should have trust_line_count=1"
+        );
+
+        // Now delete the pool share trustline (limit=0)
+        let delete_op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(params),
+            limit: 0,
+        };
+
+        let result = execute_change_trust(&delete_op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Verify pool is deleted (trust_line_count reached 0)
+        let pool_after = state.get_liquidity_pool(&pool_id);
+        assert!(
+            pool_after.is_none(),
+            "Pool should be deleted when last trustline is removed"
+        );
+
+        // Verify the pool share trustline is also gone
+        let tl_asset = TrustLineAsset::PoolShare(pool_id);
+        let trustline_after = state.get_trustline_by_trustline_asset(&source_id, &tl_asset);
+        assert!(
+            trustline_after.is_none(),
+            "Pool share trustline should be deleted"
+        );
     }
 }
