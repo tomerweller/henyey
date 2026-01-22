@@ -5636,6 +5636,7 @@ fn extract_changes_from_meta(
 /// Returns (tx_changes, operation_changes) where:
 /// - tx_changes = tx_changes_before + tx_changes_after (includes real sequence bumps)
 /// - operation_changes = all changes from operation execution (may have polluted seq values)
+#[allow(dead_code)]
 fn extract_changes_by_source(
     meta: &stellar_xdr::curr::TransactionMeta,
 ) -> (

@@ -274,6 +274,8 @@ fn make_set_flags_result(code: SetTrustLineFlagsResultCode) -> OperationResult {
     OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(result))
 }
 
+/// Check if a trustline has any liabilities (buying or selling).
+#[allow(dead_code)]
 fn has_liabilities(trustline: &TrustLineEntry) -> bool {
     let liab = match &trustline.ext {
         TrustLineEntryExt::V0 => Liabilities {

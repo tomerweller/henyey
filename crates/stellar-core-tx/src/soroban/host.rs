@@ -1039,7 +1039,11 @@ pub fn compute_rent_fee_for_new_entry(
         };
 
         // Use the P25 rent_fee_config directly from soroban_config
-        compute_rent_fee_p25(&[rent_change], &soroban_config.rent_fee_config, current_ledger)
+        compute_rent_fee_p25(
+            &[rent_change],
+            &soroban_config.rent_fee_config,
+            current_ledger,
+        )
     } else {
         let rent_change = LedgerEntryRentChange {
             is_persistent,
@@ -1651,10 +1655,7 @@ fn execute_host_function_p25(
     existing_cache: Option<&ModuleCacheP25>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     use soroban_env_host25::{
-        budget::Budget,
-        e2e_invoke,
-        fees::{compute_rent_fee, LedgerEntryRentChange},
-        storage::SnapshotSource,
+        budget::Budget, e2e_invoke, fees::compute_rent_fee, storage::SnapshotSource,
     };
 
     // Helper to create error with zero consumed resources (for setup errors before budget exists)

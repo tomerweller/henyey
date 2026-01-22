@@ -5,7 +5,7 @@
 
 use stellar_xdr::curr::{
     AccountId, ContractCodeCostInputs, ContractCodeEntry, ContractCodeEntryExt,
-    ContractCodeEntryV1, ContractEvent, DiagnosticEvent, ExtensionPoint, Hash, HostFunction,
+    ContractCodeEntryV1, ContractEvent, DiagnosticEvent, ExtensionPoint, Hash,
     InvokeHostFunctionOp, InvokeHostFunctionResult, InvokeHostFunctionResultCode,
     InvokeHostFunctionSuccessPreImage, LedgerEntry, LedgerKey, LedgerKeyContractCode, Limits,
     OperationResult, OperationResultTr, ScVal, SorobanTransactionData, SorobanTransactionDataExt,
@@ -268,6 +268,10 @@ fn execute_contract_invocation(
 }
 
 /// Execute WASM upload.
+///
+/// Note: This function is currently unused because all host functions now go through
+/// soroban-env-host. Kept for reference and potential future use.
+#[allow(dead_code)]
 fn execute_upload_wasm(
     wasm: &stellar_xdr::curr::BytesM,
     _source: &AccountId,
@@ -404,6 +408,10 @@ fn execute_upload_wasm(
 /// This parses the WASM module and extracts various metrics needed for
 /// cost calculation, matching how C++ stellar-core (via soroban-env-host)
 /// computes these values.
+///
+/// Note: This function is currently unused because all host functions now go through
+/// soroban-env-host. Kept for reference and potential future use.
+#[allow(dead_code)]
 fn extract_wasm_cost_inputs(wasm: &[u8]) -> ContractCodeCostInputs {
     use wasmparser::{Parser, Payload::*};
 
@@ -1055,6 +1063,10 @@ fn is_archived_contract_entry(
 }
 
 /// Compute the hash of a contract code key for TTL lookup.
+///
+/// Note: This function is currently unused because all host functions now go through
+/// soroban-env-host. Kept for reference and potential future use.
+#[allow(dead_code)]
 fn compute_contract_code_key_hash(code_hash: &Hash) -> Hash {
     use sha2::{Digest, Sha256};
 
