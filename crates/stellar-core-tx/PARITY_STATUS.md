@@ -241,6 +241,20 @@ Corresponds to: `OperationFrame.h` enum `ThresholdLevel`
 | Write bytes checking | Post-execution validation | Full |
 | Event size checking | Max contract events size | Full |
 
+### Order Book Index (`state.rs`)
+
+| Component | Implementation | Status |
+|-----------|----------------|--------|
+| `OfferIndex` | BTreeMap-based index for O(log n) best offer lookup | Full |
+| `OfferDescriptor` | Price + offer_id key for sorting | Full |
+| `OfferKey` | Seller + offer_id for reverse lookup | Full |
+| `AssetPair` | (buying, selling) key for order books | Full |
+| Best offer query | `best_offer()`, `best_offer_filtered()` | Full |
+| Index maintenance | Automatic via `create_offer`, `update_offer`, `delete_offer` | Full |
+| Rollback support | Index rebuilt from restored offers on rollback | Full |
+
+This matches C++ stellar-core's `MultiOrderBook` functionality in `OrderBook.h/.cpp`.
+
 ## Not Implemented (By Design)
 
 ### Parallel Execution Infrastructure
@@ -360,7 +374,7 @@ The Rust crate supports both live execution and catchup/replay modes as first-cl
 | `operations/execute/sponsorship.rs` | 11 | Begin/end/revoke sponsorship |
 | `signature_checker.rs` | 11 | All signer types, weights |
 | `validation.rs` | 11 | Structure, fees, bounds, signatures |
-| `state.rs` | 8 | State management, snapshots |
+| `state.rs` | 18 | State management, snapshots, OfferIndex |
 | `operations/execute/path_payment.rs` | 8 | Strict send/receive |
 | `frame.rs` | 8 | Frame properties, hashing |
 | `operations/execute/account_merge.rs` | 5 | Merge with subentries |

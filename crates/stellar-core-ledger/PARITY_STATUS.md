@@ -111,6 +111,7 @@ This section documents the implementation status compared to the C++ upstream in
 #### Order Book Utilities (`offer.rs`)
 - [x] Offer sorting utilities (`isBetterOffer`, `OfferDescriptor`)
 - [x] Asset pair hash utilities (`AssetPairHash`, `AssetPair`)
+- [x] Offer cache for efficient orderbook operations (avoids bucket list scans)
 
 #### In-Memory Soroban State (`soroban_state.rs` -> `InMemorySorobanState.h/.cpp`)
 - [x] `InMemorySorobanState` - In-memory cache for contract data and code
@@ -138,7 +139,8 @@ This section documents the implementation status compared to the C++ upstream in
 
 #### Order Book Utilities (`LedgerTxn.h`)
 - [ ] **Inflation winners query** (`InflationWinner` struct)
-- [ ] **Best offer queries** for DEX matching
+- [x] **Best offer queries** for DEX matching (via `OfferIndex` in `stellar-core-tx`)
+- [x] **Offer cache** - Pre-loaded offers from bucket list with incremental updates
 
 #### Entry Restoration Tracking
 - [ ] **Restored entries tracking** (`RestoredEntries` struct) - Tracks entries restored from hot archive vs live bucket list
