@@ -325,6 +325,16 @@ pub struct LedgerManager {
     /// significantly improving performance for Soroban transactions by avoiding
     /// repeated compilation of the same contract code.
     module_cache: RwLock<Option<PersistentModuleCache>>,
+
+    /// Pre-loaded offer entries from the bucket list.
+    ///
+    /// This cache is populated once during initialization from the bucket list
+    /// and updated as offers are created/modified/deleted during ledger closes.
+    /// This avoids expensive full bucket list scans during orderbook operations.
+    offer_cache: Arc<RwLock<Vec<LedgerEntry>>>,
+
+    /// Flag indicating whether the offer cache has been populated.
+    offer_cache_initialized: Arc<RwLock<bool>>,
 }
 
 impl LedgerManager {
@@ -372,6 +382,8 @@ impl LedgerManager {
             invariants: RwLock::new(invariants),
             config,
             module_cache: RwLock::new(None),
+            offer_cache: Arc::new(RwLock::new(Vec::new())),
+            offer_cache_initialized: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -602,6 +614,11 @@ impl LedgerManager {
         // significantly improving performance for Soroban transactions.
         self.initialize_module_cache(header.ledger_version)?;
 
+        // Pre-load all offers from the bucket list into the offer cache.
+        // This is done once at initialization to avoid expensive bucket list scans
+        // during orderbook operations in each ledger close.
+        self.initialize_offer_cache()?;
+
         info!(
             ledger_seq,
             header_hash = %header_hash_hex,
@@ -729,6 +746,44 @@ impl LedgerManager {
 
         *self.module_cache.write() = Some(cache);
         Ok(())
+    }
+
+    /// Pre-load all offers from the bucket list into the offer cache.
+    ///
+    /// This is called once during initialization to avoid expensive bucket list
+    /// scans during orderbook operations. The offer cache is then maintained
+    /// incrementally as offers are created/updated/deleted.
+    fn initialize_offer_cache(&self) -> Result<()> {
+        let bucket_list = self.bucket_list.read();
+        let live_entries = bucket_list.live_entries().map_err(|e| {
+            LedgerError::Internal(format!("Failed to get live entries for offer cache: {}", e))
+        })?;
+
+        // Filter for offer entries only
+        let offers: Vec<LedgerEntry> = live_entries
+            .into_iter()
+            .filter(|entry| matches!(entry.data, LedgerEntryData::Offer(_)))
+            .collect();
+
+        let offer_count = offers.len();
+
+        // Store in cache
+        *self.offer_cache.write() = offers;
+        *self.offer_cache_initialized.write() = true;
+
+        info!(offer_count, "Initialized offer cache from bucket list");
+
+        Ok(())
+    }
+
+    /// Get a reference to the offer cache for use by snapshots.
+    pub fn offer_cache(&self) -> &Arc<RwLock<Vec<LedgerEntry>>> {
+        &self.offer_cache
+    }
+
+    /// Check if the offer cache has been initialized.
+    pub fn is_offer_cache_initialized(&self) -> bool {
+        *self.offer_cache_initialized.read()
     }
 
     /// Apply a ledger from history (replay mode).
@@ -890,8 +945,21 @@ impl LedgerManager {
         let header_lookup_fn: crate::snapshot::LedgerHeaderLookupFn =
             Arc::new(move |seq: u32| db.get_ledger_header(seq).map_err(LedgerError::from));
 
+        // Create entries function that uses the pre-loaded offer cache when available.
+        // This avoids expensive full bucket list scans during orderbook operations.
+        // The offer cache contains all offers pre-loaded at initialization and maintained
+        // incrementally, so we can use it for offer-related queries.
+        let offer_cache = self.offer_cache.clone();
+        let offer_cache_initialized = self.offer_cache_initialized.clone();
         let bucket_list_entries = self.bucket_list.clone();
         let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
+            // If offer cache is initialized, return only the cached offers.
+            // This is sufficient for orderbook operations which only need offers.
+            // For other full-state operations, fall back to bucket list scan.
+            if *offer_cache_initialized.read() {
+                return Ok(offer_cache.read().clone());
+            }
+            // Fall back to bucket list scan if offer cache not initialized
             bucket_list_entries
                 .read()
                 .live_entries()
@@ -968,6 +1036,59 @@ impl LedgerManager {
                     }
                     EntryChange::Deleted { .. } => {
                         cache.remove(&key_bytes);
+                    }
+                }
+            }
+        }
+
+        // Update offer cache with offer changes
+        if *self.offer_cache_initialized.read() {
+            let mut offer_cache = self.offer_cache.write();
+            for change in delta.changes() {
+                let key = change.key()?;
+                // Only process offer entries
+                if !matches!(key, LedgerKey::Offer(_)) {
+                    continue;
+                }
+
+                match change {
+                    EntryChange::Created(entry) => {
+                        if matches!(entry.data, LedgerEntryData::Offer(_)) {
+                            offer_cache.push(entry.clone());
+                        }
+                    }
+                    EntryChange::Updated { current: entry, .. } => {
+                        // Find and replace the existing offer
+                        if let LedgerEntryData::Offer(offer) = &entry.data {
+                            let seller_id = &offer.seller_id;
+                            let offer_id = offer.offer_id;
+                            if let Some(pos) = offer_cache.iter().position(|e| {
+                                if let LedgerEntryData::Offer(o) = &e.data {
+                                    o.seller_id == *seller_id && o.offer_id == offer_id
+                                } else {
+                                    false
+                                }
+                            }) {
+                                offer_cache[pos] = entry.clone();
+                            } else {
+                                // Offer not found, add it
+                                offer_cache.push(entry.clone());
+                            }
+                        }
+                    }
+                    EntryChange::Deleted { .. } => {
+                        // Remove the offer from cache
+                        if let LedgerKey::Offer(offer_key) = &key {
+                            let seller_id = &offer_key.seller_id;
+                            let offer_id = offer_key.offer_id;
+                            offer_cache.retain(|e| {
+                                if let LedgerEntryData::Offer(o) = &e.data {
+                                    !(o.seller_id == *seller_id && o.offer_id == offer_id)
+                                } else {
+                                    true
+                                }
+                            });
+                        }
                     }
                 }
             }

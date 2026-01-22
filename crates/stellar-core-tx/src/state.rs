@@ -91,6 +91,248 @@ impl AssetKey {
     }
 }
 
+// ==================== Offer Index ====================
+//
+// The OfferIndex provides O(log n) lookups for best offers by asset pair,
+// similar to C++ stellar-core's MultiOrderBook. This is critical for
+// performance when executing path payments and manage offer operations.
+
+use std::collections::BTreeMap;
+
+/// Descriptor for an offer used in the order book index.
+/// Offers are sorted by price (ascending) then offer ID (ascending).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferDescriptor {
+    /// Price as n/d ratio.
+    pub price: Price,
+    /// Unique offer identifier.
+    pub offer_id: i64,
+}
+
+impl OfferDescriptor {
+    /// Create a new offer descriptor from an offer entry.
+    pub fn from_offer(offer: &OfferEntry) -> Self {
+        Self {
+            price: offer.price.clone(),
+            offer_id: offer.offer_id,
+        }
+    }
+}
+
+/// Comparator for offers: lower price is better, then lower offer ID.
+impl Ord for OfferDescriptor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Use floating-point comparison to match C++ stellar-core behavior.
+        // The C++ code uses `double(price.n) / double(price.d)` for ordering.
+        let self_price = self.price.n as f64 / self.price.d as f64;
+        let other_price = other.price.n as f64 / other.price.d as f64;
+
+        match self_price.partial_cmp(&other_price) {
+            Some(std::cmp::Ordering::Equal) | None => self.offer_id.cmp(&other.offer_id),
+            Some(ord) => ord,
+        }
+    }
+}
+
+impl PartialOrd for OfferDescriptor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Key for an offer in the primary offers map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OfferKey {
+    /// Seller account ID (32 bytes).
+    pub seller: [u8; 32],
+    /// Offer ID.
+    pub offer_id: i64,
+}
+
+impl OfferKey {
+    /// Create a new offer key.
+    pub fn new(seller: [u8; 32], offer_id: i64) -> Self {
+        Self { seller, offer_id }
+    }
+
+    /// Create from an offer entry.
+    pub fn from_offer(offer: &OfferEntry) -> Self {
+        Self {
+            seller: account_id_to_bytes(&offer.seller_id),
+            offer_id: offer.offer_id,
+        }
+    }
+}
+
+/// Asset pair key for order book lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AssetPair {
+    /// Asset being bought.
+    pub buying: AssetKey,
+    /// Asset being sold.
+    pub selling: AssetKey,
+}
+
+impl AssetPair {
+    /// Create a new asset pair from XDR assets.
+    pub fn new(buying: &Asset, selling: &Asset) -> Self {
+        Self {
+            buying: AssetKey::from_asset(buying),
+            selling: AssetKey::from_asset(selling),
+        }
+    }
+}
+
+/// Order book for a single asset pair.
+/// Offers are stored in a BTreeMap sorted by (price, offer_id) for O(log n) best offer lookup.
+type OrderBook = BTreeMap<OfferDescriptor, OfferKey>;
+
+/// Index of all offers organized by asset pair for efficient best-offer queries.
+///
+/// This mirrors C++ stellar-core's MultiOrderBook structure. Each asset pair
+/// has its own order book (BTreeMap) where offers are sorted by price and offer ID.
+///
+/// # Performance
+///
+/// - `best_offer`: O(log n) where n is offers for the asset pair
+/// - `add_offer`: O(log n)
+/// - `remove_offer`: O(log n)
+/// - `update_offer`: O(log n) for same asset pair, O(log n + log m) if assets change
+#[derive(Debug, Clone, Default)]
+pub struct OfferIndex {
+    /// Order books keyed by (buying, selling) asset pair.
+    order_books: HashMap<AssetPair, OrderBook>,
+    /// Reverse index: offer key -> (asset pair, descriptor) for efficient removal.
+    offer_locations: HashMap<OfferKey, (AssetPair, OfferDescriptor)>,
+}
+
+impl OfferIndex {
+    /// Create a new empty offer index.
+    pub fn new() -> Self {
+        Self {
+            order_books: HashMap::new(),
+            offer_locations: HashMap::new(),
+        }
+    }
+
+    /// Add an offer to the index.
+    pub fn add_offer(&mut self, offer: &OfferEntry) {
+        let key = OfferKey::from_offer(offer);
+        let descriptor = OfferDescriptor::from_offer(offer);
+        let asset_pair = AssetPair::new(&offer.buying, &offer.selling);
+
+        // Add to order book
+        let order_book = self.order_books.entry(asset_pair.clone()).or_default();
+        order_book.insert(descriptor.clone(), key);
+
+        // Add to reverse index
+        self.offer_locations.insert(key, (asset_pair, descriptor));
+    }
+
+    /// Remove an offer from the index.
+    pub fn remove_offer(&mut self, seller: &AccountId, offer_id: i64) {
+        let key = OfferKey::new(account_id_to_bytes(seller), offer_id);
+
+        // Look up location in reverse index
+        if let Some((asset_pair, descriptor)) = self.offer_locations.remove(&key) {
+            // Remove from order book
+            if let Some(order_book) = self.order_books.get_mut(&asset_pair) {
+                order_book.remove(&descriptor);
+                // Clean up empty order books
+                if order_book.is_empty() {
+                    self.order_books.remove(&asset_pair);
+                }
+            }
+        }
+    }
+
+    /// Update an offer in the index.
+    ///
+    /// This handles the case where an offer's price or assets might change.
+    pub fn update_offer(&mut self, offer: &OfferEntry) {
+        // Remove old entry if exists
+        self.remove_offer(&offer.seller_id, offer.offer_id);
+        // Add with new values
+        self.add_offer(offer);
+    }
+
+    /// Get the best (lowest price) offer for an asset pair.
+    ///
+    /// Returns the offer key if one exists.
+    pub fn best_offer_key(&self, buying: &Asset, selling: &Asset) -> Option<OfferKey> {
+        let asset_pair = AssetPair::new(buying, selling);
+        self.order_books
+            .get(&asset_pair)
+            .and_then(|book| book.first_key_value())
+            .map(|(_, key)| *key)
+    }
+
+    /// Get the best offer for an asset pair, excluding specific offers.
+    ///
+    /// This is used during offer crossing when we need to skip offers
+    /// that have already been processed or belong to the same account.
+    pub fn best_offer_key_filtered<F>(
+        &self,
+        buying: &Asset,
+        selling: &Asset,
+        mut filter: F,
+    ) -> Option<OfferKey>
+    where
+        F: FnMut(&OfferKey) -> bool,
+    {
+        let asset_pair = AssetPair::new(buying, selling);
+        self.order_books.get(&asset_pair).and_then(|book| {
+            book.iter()
+                .find(|(_, key)| filter(key))
+                .map(|(_, key)| *key)
+        })
+    }
+
+    /// Iterate over all offers for an asset pair in price order.
+    pub fn offers_for_pair(
+        &self,
+        buying: &Asset,
+        selling: &Asset,
+    ) -> impl Iterator<Item = &OfferKey> {
+        let asset_pair = AssetPair::new(buying, selling);
+        self.order_books
+            .get(&asset_pair)
+            .into_iter()
+            .flat_map(|book| book.values())
+    }
+
+    /// Check if the index contains any offers for an asset pair.
+    pub fn has_offers(&self, buying: &Asset, selling: &Asset) -> bool {
+        let asset_pair = AssetPair::new(buying, selling);
+        self.order_books
+            .get(&asset_pair)
+            .is_some_and(|book| !book.is_empty())
+    }
+
+    /// Get the total number of offers in the index.
+    pub fn len(&self) -> usize {
+        self.offer_locations.len()
+    }
+
+    /// Check if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.offer_locations.is_empty()
+    }
+
+    /// Clear all offers from the index.
+    pub fn clear(&mut self) {
+        self.order_books.clear();
+        self.offer_locations.clear();
+    }
+
+    /// Get the number of asset pairs with offers.
+    pub fn num_asset_pairs(&self) -> usize {
+        self.order_books.len()
+    }
+}
+
+// ==================== End Offer Index ====================
+
 /// Ledger state manager for transaction execution.
 ///
 /// This provides read/write access to ledger entries during transaction
@@ -210,6 +452,9 @@ pub struct LedgerStateManager {
     /// Snapshot of delta for rollback. Preserves committed changes from previous
     /// transactions so they're not lost when the current transaction fails.
     delta_snapshot: Option<LedgerDelta>,
+    /// Index of offers by asset pair for efficient best-offer lookups.
+    /// This mirrors C++ stellar-core's MultiOrderBook structure.
+    offer_index: OfferIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +525,7 @@ impl LedgerStateManager {
             created_liquidity_pools: HashSet::new(),
             id_pool_snapshot: None,
             delta_snapshot: None,
+            offer_index: OfferIndex::new(),
         }
     }
 
@@ -524,6 +770,7 @@ impl LedgerStateManager {
         self.accounts.clear();
         self.trustlines.clear();
         self.offers.clear();
+        self.offer_index.clear();
         self.data_entries.clear();
         self.contract_data.clear();
         self.contract_code.clear();
@@ -1022,6 +1269,8 @@ impl LedgerStateManager {
                     seller_id: offer.seller_id.clone(),
                     offer_id: offer.offer_id,
                 });
+                // Add to offer index for efficient best-offer lookups
+                self.offer_index.add_offer(&offer);
                 self.offers.insert((seller_key, offer.offer_id), offer);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
@@ -1721,6 +1970,9 @@ impl LedgerStateManager {
         let ledger_entry = self.offer_to_ledger_entry(&entry);
         self.delta.record_create(ledger_entry);
 
+        // Add to offer index for efficient best-offer lookups
+        self.offer_index.add_offer(&entry);
+
         // Insert into state
         self.offers.insert(key, entry);
 
@@ -1764,6 +2016,9 @@ impl LedgerStateManager {
             self.delta.record_update(pre, post_state);
         }
 
+        // Update offer index (handles price/asset changes)
+        self.offer_index.update_offer(&entry);
+
         // Update state
         self.offers.insert(key, entry.clone());
 
@@ -1799,6 +2054,9 @@ impl LedgerStateManager {
             self.delta.record_delete(ledger_key.clone(), pre);
         }
 
+        // Remove from offer index
+        self.offer_index.remove_offer(seller_id, offer_id);
+
         // Remove from state
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.offers.remove(&key);
@@ -1811,15 +2069,19 @@ impl LedgerStateManager {
     }
 
     /// Get the best offer for a buying/selling pair (lowest price, then offer ID).
+    ///
+    /// Uses the offer index for O(log n) lookup instead of scanning all offers.
     pub fn best_offer(&self, buying: &Asset, selling: &Asset) -> Option<OfferEntry> {
-        self.offers
-            .values()
-            .filter(|offer| offer.buying == *buying && offer.selling == *selling)
-            .min_by(|a, b| compare_offer(a, b))
-            .cloned()
+        // Use the offer index for efficient lookup
+        if let Some(key) = self.offer_index.best_offer_key(buying, selling) {
+            return self.offers.get(&(key.seller, key.offer_id)).cloned();
+        }
+        None
     }
 
     /// Get the best offer for a buying/selling pair with an additional filter.
+    ///
+    /// Uses the offer index for efficient traversal in price order.
     pub fn best_offer_filtered<F>(
         &self,
         buying: &Asset,
@@ -1829,12 +2091,30 @@ impl LedgerStateManager {
     where
         F: FnMut(&OfferEntry) -> bool,
     {
-        self.offers
-            .values()
-            .filter(|offer| offer.buying == *buying && offer.selling == *selling)
-            .filter(|offer| keep(offer))
-            .min_by(|a, b| compare_offer(a, b))
-            .cloned()
+        // Use the offer index to iterate in price order
+        for offer_key in self.offer_index.offers_for_pair(buying, selling) {
+            if let Some(offer) = self.offers.get(&(offer_key.seller, offer_key.offer_id)) {
+                if keep(offer) {
+                    return Some(offer.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if offers exist for a specific asset pair.
+    pub fn has_offers_for_pair(&self, buying: &Asset, selling: &Asset) -> bool {
+        self.offer_index.has_offers(buying, selling)
+    }
+
+    /// Get the number of offers in the index.
+    pub fn offer_index_size(&self) -> usize {
+        self.offer_index.len()
+    }
+
+    /// Get the number of unique asset pairs with offers.
+    pub fn offer_index_num_pairs(&self) -> usize {
+        self.offer_index.num_asset_pairs()
     }
 
     /// Remove all offers owned by an account that are buying or selling a specific asset.
@@ -3056,6 +3336,14 @@ impl LedgerStateManager {
         }
         self.created_offers.clear();
 
+        // Rebuild the offer index from the restored offers.
+        // This is necessary because offers may have been created, modified, or deleted
+        // during the transaction that is being rolled back.
+        self.offer_index.clear();
+        for offer in self.offers.values() {
+            self.offer_index.add_offer(offer);
+        }
+
         // Restore data entry snapshots
         for (key, snapshot) in self.data_snapshots.drain() {
             if self.created_data.contains(&key) {
@@ -3785,10 +4073,13 @@ fn pool_id_to_bytes(pool_id: &PoolId) -> [u8; 32] {
     pool_id.0 .0
 }
 
+// These functions are kept for potential debugging use but are superseded by OfferIndex
+#[allow(dead_code)]
 fn compare_offer(lhs: &OfferEntry, rhs: &OfferEntry) -> std::cmp::Ordering {
     compare_price(&lhs.price, &rhs.price).then_with(|| lhs.offer_id.cmp(&rhs.offer_id))
 }
 
+#[allow(dead_code)]
 fn compare_price(lhs: &Price, rhs: &Price) -> std::cmp::Ordering {
     // Use floating-point comparison to match C++ stellar-core behavior.
     // The C++ code stores `price = double(price.n) / double(price.d)` in the database
@@ -4361,5 +4652,238 @@ mod tests {
             )
         });
         assert!(has_offer_update, "The updated entry should be the Offer");
+    }
+
+    // ==================== OfferIndex Tests ====================
+
+    fn create_test_offer(seller_seed: u8, offer_id: i64, price_n: i32, price_d: i32) -> OfferEntry {
+        OfferEntry {
+            seller_id: create_test_account_id(seller_seed),
+            offer_id,
+            selling: Asset::Native,
+            buying: Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: create_test_account_id(99),
+            }),
+            amount: 1000000,
+            price: Price {
+                n: price_n,
+                d: price_d,
+            },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_offer_index_add_and_best_offer() {
+        let mut index = OfferIndex::new();
+
+        // Add offers with different prices
+        let offer1 = create_test_offer(1, 100, 3, 1); // price = 3.0
+        let offer2 = create_test_offer(2, 200, 1, 1); // price = 1.0 (best)
+        let offer3 = create_test_offer(3, 300, 2, 1); // price = 2.0
+
+        index.add_offer(&offer1);
+        index.add_offer(&offer2);
+        index.add_offer(&offer3);
+
+        assert_eq!(index.len(), 3);
+
+        // Best offer should be the one with lowest price (offer2)
+        let best_key = index
+            .best_offer_key(&offer1.buying, &offer1.selling)
+            .unwrap();
+        assert_eq!(best_key.offer_id, 200);
+    }
+
+    #[test]
+    fn test_offer_index_best_offer_same_price_uses_offer_id() {
+        let mut index = OfferIndex::new();
+
+        // Add offers with same price, different offer IDs
+        let offer1 = create_test_offer(1, 300, 1, 1); // price = 1.0, id = 300
+        let offer2 = create_test_offer(2, 100, 1, 1); // price = 1.0, id = 100 (best)
+        let offer3 = create_test_offer(3, 200, 1, 1); // price = 1.0, id = 200
+
+        index.add_offer(&offer1);
+        index.add_offer(&offer2);
+        index.add_offer(&offer3);
+
+        // Best offer should be the one with lowest offer ID (offer2)
+        let best_key = index
+            .best_offer_key(&offer1.buying, &offer1.selling)
+            .unwrap();
+        assert_eq!(best_key.offer_id, 100);
+    }
+
+    #[test]
+    fn test_offer_index_remove_offer() {
+        let mut index = OfferIndex::new();
+
+        let offer1 = create_test_offer(1, 100, 2, 1); // price = 2.0
+        let offer2 = create_test_offer(2, 200, 1, 1); // price = 1.0 (best)
+
+        index.add_offer(&offer1);
+        index.add_offer(&offer2);
+
+        // Remove best offer
+        index.remove_offer(&offer2.seller_id, offer2.offer_id);
+
+        assert_eq!(index.len(), 1);
+
+        // Now offer1 should be best
+        let best_key = index
+            .best_offer_key(&offer1.buying, &offer1.selling)
+            .unwrap();
+        assert_eq!(best_key.offer_id, 100);
+    }
+
+    #[test]
+    fn test_offer_index_update_offer() {
+        let mut index = OfferIndex::new();
+
+        let offer1 = create_test_offer(1, 100, 2, 1); // price = 2.0
+        index.add_offer(&offer1);
+
+        // Update to better price
+        let mut updated_offer = offer1.clone();
+        updated_offer.price = Price { n: 1, d: 2 }; // price = 0.5
+        index.update_offer(&updated_offer);
+
+        assert_eq!(index.len(), 1);
+
+        // Verify the offer is still there with updated price
+        let best_key = index
+            .best_offer_key(&offer1.buying, &offer1.selling)
+            .unwrap();
+        assert_eq!(best_key.offer_id, 100);
+    }
+
+    #[test]
+    fn test_offer_index_different_asset_pairs() {
+        let mut index = OfferIndex::new();
+
+        let offer1 = create_test_offer(1, 100, 1, 1);
+
+        // Create offer for different asset pair
+        let mut offer2 = create_test_offer(2, 200, 1, 1);
+        offer2.buying = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'E', b'U', b'R', 0]),
+            issuer: create_test_account_id(98),
+        });
+
+        index.add_offer(&offer1);
+        index.add_offer(&offer2);
+
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.num_asset_pairs(), 2);
+
+        // Each asset pair should have its own best offer
+        let best1 = index
+            .best_offer_key(&offer1.buying, &offer1.selling)
+            .unwrap();
+        assert_eq!(best1.offer_id, 100);
+
+        let best2 = index
+            .best_offer_key(&offer2.buying, &offer2.selling)
+            .unwrap();
+        assert_eq!(best2.offer_id, 200);
+    }
+
+    #[test]
+    fn test_offer_index_empty() {
+        let index = OfferIndex::new();
+
+        let buying = Asset::Native;
+        let selling = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: create_test_account_id(99),
+        });
+
+        assert!(index.is_empty());
+        assert!(!index.has_offers(&buying, &selling));
+        assert!(index.best_offer_key(&buying, &selling).is_none());
+    }
+
+    #[test]
+    fn test_state_manager_best_offer_uses_index() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create offers with different prices
+        let offer1 = create_test_offer(1, 100, 3, 1); // price = 3.0
+        let offer2 = create_test_offer(2, 200, 1, 1); // price = 1.0 (best)
+        let offer3 = create_test_offer(3, 300, 2, 1); // price = 2.0
+
+        manager.create_offer(offer1.clone());
+        manager.create_offer(offer2.clone());
+        manager.create_offer(offer3.clone());
+
+        // Verify index stats
+        assert_eq!(manager.offer_index_size(), 3);
+
+        // Best offer should use the index
+        let best = manager.best_offer(&offer1.buying, &offer1.selling).unwrap();
+        assert_eq!(best.offer_id, 200);
+    }
+
+    #[test]
+    fn test_state_manager_best_offer_filtered() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let seller1 = create_test_account_id(1);
+        let seller2 = create_test_account_id(2);
+
+        // Create offers
+        let mut offer1 = create_test_offer(1, 100, 1, 1); // price = 1.0 (best but excluded)
+        offer1.seller_id = seller1.clone();
+        let mut offer2 = create_test_offer(2, 200, 2, 1); // price = 2.0 (second best)
+        offer2.seller_id = seller2.clone();
+
+        manager.create_offer(offer1.clone());
+        manager.create_offer(offer2.clone());
+
+        // Get best offer excluding seller1
+        let best = manager
+            .best_offer_filtered(&offer1.buying, &offer1.selling, |o| o.seller_id != seller1)
+            .unwrap();
+
+        assert_eq!(best.offer_id, 200);
+    }
+
+    #[test]
+    fn test_state_manager_offer_index_rollback() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer1 = create_test_offer(1, 100, 1, 1);
+        manager.create_offer(offer1.clone());
+        assert_eq!(manager.offer_index_size(), 1);
+
+        // Rollback should restore the index
+        manager.rollback();
+        assert_eq!(manager.offer_index_size(), 0);
+        assert!(manager
+            .best_offer(&offer1.buying, &offer1.selling)
+            .is_none());
+    }
+
+    #[test]
+    fn test_state_manager_offer_index_delete() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer1 = create_test_offer(1, 100, 2, 1);
+        let offer2 = create_test_offer(2, 200, 1, 1); // best
+
+        manager.create_offer(offer1.clone());
+        manager.create_offer(offer2.clone());
+
+        // Delete best offer
+        manager.delete_offer(&offer2.seller_id, offer2.offer_id);
+
+        assert_eq!(manager.offer_index_size(), 1);
+
+        // Now offer1 should be best
+        let best = manager.best_offer(&offer1.buying, &offer1.selling).unwrap();
+        assert_eq!(best.offer_id, 100);
     }
 }

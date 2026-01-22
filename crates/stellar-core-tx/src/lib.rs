@@ -169,7 +169,9 @@ pub use operations::{
 };
 
 // Re-export state types
-pub use state::{LedgerReader, LedgerStateManager};
+pub use state::{
+    AssetPair, LedgerReader, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey,
+};
 
 // Re-export meta builder types
 pub use meta_builder::{

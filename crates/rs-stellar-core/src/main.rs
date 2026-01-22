@@ -2860,6 +2860,21 @@ async fn cmd_verify_execution(
         }
     }
 
+    // Pre-load all offers from the bucket list for efficient orderbook operations.
+    // This avoids expensive full bucket list scans during path payment and manage offer operations.
+    // The cache is maintained incrementally as offers are created/modified/deleted.
+    let offer_cache: Arc<RwLock<Vec<stellar_xdr::curr::LedgerEntry>>> = {
+        let live_entries = bucket_list.read().unwrap().live_entries()?;
+        let offers: Vec<_> = live_entries
+            .into_iter()
+            .filter(|e| matches!(e.data, LedgerEntryData::Offer(_)))
+            .collect();
+        if !quiet {
+            println!("Offer cache: pre-loaded {} offers from bucket list", offers.len());
+        }
+        Arc::new(RwLock::new(offers))
+    };
+
     // Track results
     let mut ledgers_verified = 0u32;
     let mut transactions_verified = 0u32;
@@ -3039,20 +3054,16 @@ async fn cmd_verify_execution(
             > = std::sync::Arc::new(move |seq| Ok(header_map.get(&seq).cloned()));
             snapshot_handle.set_header_lookup(header_lookup);
 
-            // Add entries_fn to enable orderbook loading for path payments
-            let bucket_list_for_entries: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
+            // Add entries_fn to enable orderbook loading for path payments.
+            // Use the pre-loaded offer cache instead of scanning the bucket list each time.
+            // This significantly improves performance for ledgers with orderbook operations.
+            let offer_cache_for_entries = Arc::clone(&offer_cache);
             let entries_fn: Arc<
                 dyn Fn() -> stellar_core_ledger::Result<Vec<stellar_xdr::curr::LedgerEntry>>
                     + Send
                     + Sync,
             > = Arc::new(move || {
-                bucket_list_for_entries
-                    .read()
-                    .unwrap()
-                    .live_entries()
-                    .map_err(|e| {
-                        LedgerError::Internal(format!("Failed to get live entries: {}", e))
-                    })
+                Ok(offer_cache_for_entries.read().unwrap().clone())
             });
             snapshot_handle.set_entries_lookup(entries_fn);
 
@@ -4157,6 +4168,50 @@ async fn cmd_verify_execution(
 
                 // Use our execution results for bucket list update
                 let (all_init, all_live, all_dead) = (our_init, our_live, our_dead);
+
+                // Update the offer cache with offer changes from this ledger
+                {
+                    let mut cache = offer_cache.write().unwrap();
+                    
+                    // Add new offers (INIT entries)
+                    for entry in &all_init {
+                        if matches!(entry.data, LedgerEntryData::Offer(_)) {
+                            cache.push(entry.clone());
+                        }
+                    }
+                    
+                    // Update modified offers (LIVE entries)
+                    for entry in &all_live {
+                        if let LedgerEntryData::Offer(offer) = &entry.data {
+                            // Find and replace existing offer
+                            if let Some(pos) = cache.iter().position(|e| {
+                                if let LedgerEntryData::Offer(o) = &e.data {
+                                    o.seller_id == offer.seller_id && o.offer_id == offer.offer_id
+                                } else {
+                                    false
+                                }
+                            }) {
+                                cache[pos] = entry.clone();
+                            } else {
+                                // Not found, add it (shouldn't happen but be defensive)
+                                cache.push(entry.clone());
+                            }
+                        }
+                    }
+                    
+                    // Remove deleted offers
+                    for key in &all_dead {
+                        if let stellar_xdr::curr::LedgerKey::Offer(offer_key) = key {
+                            cache.retain(|e| {
+                                if let LedgerEntryData::Offer(o) = &e.data {
+                                    !(o.seller_id == offer_key.seller_id && o.offer_id == offer_key.offer_id)
+                                } else {
+                                    true
+                                }
+                            });
+                        }
+                    }
+                }
 
                 // Before evicting entries from the live bucket list, look up full entry data
                 // for persistent entries that need to go to the hot archive. Use the
