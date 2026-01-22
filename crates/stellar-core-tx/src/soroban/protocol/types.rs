@@ -52,8 +52,18 @@ pub struct LedgerEntryChange {
 /// TTL change information for a ledger entry.
 #[derive(Debug, Clone, Copy)]
 pub struct TtlChange {
+    /// The old live_until ledger number (before the change).
+    pub old_live_until_ledger: u32,
     /// The new live_until ledger number.
     pub new_live_until_ledger: u32,
+}
+
+impl TtlChange {
+    /// Returns true if the TTL was actually extended (new > old).
+    /// C++ stellar-core only emits TTL changes when TTL is extended.
+    pub fn is_extended(&self) -> bool {
+        self.new_live_until_ledger > self.old_live_until_ledger
+    }
 }
 
 /// An encoded contract event from execution.

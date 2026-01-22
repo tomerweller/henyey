@@ -40,19 +40,29 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-145000+ continuous replay passes |
-| **Primary failure mode** | None | Extending verification range |
-| **Continuous replay** | Ledgers 64-145000+ | 100% header match |
+| **End-to-end verification** | Extended | 64-182021 continuous replay passes |
+| **Primary failure mode** | P25 investigation | Investigating Protocol 25 transition |
+| **Continuous replay** | Ledgers 64-182021 | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-145000 | 145,000+ | 100,000+ | 100% | Continuous replay passes |
+| 64-182021 | 182,000+ | 120,000+ | 100% | Continuous replay passes |
 
 ### Issues Fixed (2026-01-22)
 
-#### 1. Classic Transaction Fee Calculation
+#### 1. TTL Emission Skipped When Value Unchanged (Ledger 182022)
+
+When a Soroban contract modifies data (e.g., ContractData), we were always emitting a TTL update to the bucket list, even when the TTL value hadn't actually changed. C++ stellar-core only emits bucket list updates when there's an actual change in value.
+
+At ledger 182022 TX 4, a ContractData entry was modified but its TTL remained 226129. We were emitting a redundant TTL update, causing 1 extra LIVE entry compared to C++ stellar-core (10 vs 9 LIVE entries).
+
+Fixed by checking if the new TTL value differs from the existing TTL before calling `state.update_ttl()`.
+
+**Regression test:** `test_apply_soroban_storage_change_skips_ttl_when_unchanged` in `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs`
+
+#### 2. Classic Transaction Fee Calculation
 
 Classic transactions were incorrectly charged the full declared fee instead of `min(declared_fee, base_fee * num_ops)`. This matches C++ stellar-core's `TransactionFrame::getFee()` behavior when `applying=true`.
 
@@ -93,7 +103,7 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-None currently - verification extended to 64-145000+ with all issues resolved.
+Investigating Protocol 25 transition (ledger 182079+) - some ledgers fail after the upgrade.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 
@@ -201,6 +211,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-22**: Fixed TTL emission when value unchanged (ledger 182022) - extends replay to 64-182021
 - **2026-01-22**: Fixed classic fee calculation, liquidity pool deletion, INIT/DEAD coalescing - extends replay to 64-145000+
 - **2026-01-22**: Fixed live BL restore vs hot archive restore distinction (ledger 134448) - extends replay to 64-140000+
 - **2026-01-22**: Fixed hot archive restoration INIT/LIVE categorization (ledger 128051) - extends replay to 64-128050+

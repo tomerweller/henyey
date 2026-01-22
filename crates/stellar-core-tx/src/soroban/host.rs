@@ -96,10 +96,15 @@ pub struct SorobanExecutionError {
 pub struct StorageChange {
     /// The ledger key.
     pub key: LedgerKey,
-    /// The new entry (None if deleted).
+    /// The new entry (None if deleted or read-only).
     pub new_entry: Option<LedgerEntry>,
     /// The new live_until ledger (for TTL).
     pub live_until: Option<u32>,
+    /// Whether the TTL was extended (new > old).
+    pub ttl_extended: bool,
+    /// Whether the entry was included due to rent calculations (old_entry_size_bytes_for_rent > 0).
+    /// Rent-related read-only entries should still emit TTL updates.
+    pub is_rent_related: bool,
 }
 
 /// Persistent module cache that can be reused across transactions.
@@ -1586,13 +1591,20 @@ fn execute_host_function_p24(
             // Include entries that:
             // 1. Have a new value (were created or modified), OR
             // 2. Are NOT read-only and have no new value (were deleted), OR
-            // 3. Have a TTL change (read-only entries with TTL bump)
-            // Skip read-only entries that weren't modified and have no TTL change.
+            // 3. Are involved in rent calculations (old_entry_size_bytes_for_rent > 0), OR
+            // 4. Have a TTL that was actually extended (new > old)
+            // Skip read-only entries that weren't modified, not involved in rent, and didn't have TTL extended.
+            // C++ stellar-core only includes TTL changes when TTL is extended.
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
-            let has_ttl_change = change.ttl_change.is_some();
+            let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
+            let ttl_extended = change
+                .ttl_change
+                .as_ref()
+                .map(|ttl| ttl.new_live_until_ledger > ttl.old_live_until_ledger)
+                .unwrap_or(false);
 
-            if is_modification || is_deletion || has_ttl_change {
+            if is_modification || is_deletion || ttl_extended {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change.encoded_new_value.and_then(|bytes| {
                     LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
@@ -1603,12 +1615,14 @@ fn execute_host_function_p24(
                     key,
                     new_entry,
                     live_until,
+                    ttl_extended,
+                    is_rent_related,
                 })
             } else {
                 tracing::info!(
                     key_type = ?LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok().map(|k| std::mem::discriminant(&k)),
                     read_only = change.read_only,
-                    "P24: Skipping ledger change (not modified/deleted/ttl-changed)"
+                    "P24: Skipping ledger change (not modified/deleted/rent-related/ttl-extended)"
                 );
                 None
             }
@@ -1999,13 +2013,20 @@ fn execute_host_function_p25(
             // Include entries that:
             // 1. Have a new value (were created or modified), OR
             // 2. Are NOT read-only and have no new value (were deleted), OR
-            // 3. Have a TTL change (read-only entries with TTL bump)
-            // Skip read-only entries that weren't modified and have no TTL change.
+            // 3. Are involved in rent calculations (old_entry_size_bytes_for_rent > 0), OR
+            // 4. Have a TTL that was actually extended (new > old)
+            // Skip read-only entries that weren't modified, not involved in rent, and didn't have TTL extended.
+            // C++ stellar-core only includes TTL changes when TTL is extended.
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
-            let has_ttl_change = change.ttl_change.is_some();
+            let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
+            let ttl_extended = change
+                .ttl_change
+                .as_ref()
+                .map(|ttl| ttl.new_live_until_ledger > ttl.old_live_until_ledger)
+                .unwrap_or(false);
 
-            if is_modification || is_deletion || has_ttl_change {
+            if is_modification || is_deletion || ttl_extended {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change
                     .encoded_new_value
@@ -2015,6 +2036,8 @@ fn execute_host_function_p25(
                     key,
                     new_entry,
                     live_until,
+                    ttl_extended,
+                    is_rent_related,
                 })
             } else {
                 None

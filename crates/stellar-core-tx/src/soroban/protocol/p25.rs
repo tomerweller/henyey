@@ -496,20 +496,30 @@ pub fn invoke_host_function(
     // Include entries that:
     // - Had their content modified (encoded_new_value.is_some())
     // - Are involved in rent calculations (old_entry_size_bytes_for_rent > 0)
-    // - Had their TTL extended (ttl_change.is_some())
+    // - Had their TTL actually extended (new > old)
+    // Note: C++ stellar-core only includes TTL changes when TTL is extended, not just
+    // when ttl_change is present. See extract_ledger_effects in soroban_proto_any.rs.
     let ledger_changes = result
         .ledger_changes
         .into_iter()
         .filter_map(|change| {
+            // Check if TTL was actually extended
+            let ttl_extended = change
+                .ttl_change
+                .as_ref()
+                .map(|ttl| ttl.new_live_until_ledger > ttl.old_live_until_ledger)
+                .unwrap_or(false);
+
             if change.encoded_new_value.is_some()
                 || change.old_entry_size_bytes_for_rent > 0
-                || change.ttl_change.is_some()
+                || ttl_extended
             {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change
                     .encoded_new_value
                     .and_then(|bytes| LedgerEntry::from_xdr(&bytes, Limits::none()).ok());
                 let ttl_change = change.ttl_change.map(|ttl| TtlChange {
+                    old_live_until_ledger: ttl.old_live_until_ledger,
                     new_live_until_ledger: ttl.new_live_until_ledger,
                 });
                 Some(LedgerEntryChange {

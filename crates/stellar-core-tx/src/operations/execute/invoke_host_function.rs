@@ -787,6 +787,15 @@ fn apply_soroban_storage_changes(
 
     // Apply all storage changes from the host
     for change in changes {
+        tracing::debug!(
+            key_type = ?std::mem::discriminant(&change.key),
+            has_new_entry = change.new_entry.is_some(),
+            has_live_until = change.live_until.is_some(),
+            live_until = ?change.live_until,
+            ttl_extended = change.ttl_extended,
+            is_rent_related = change.is_rent_related,
+            "Applying storage change"
+        );
         apply_soroban_storage_change(state, change, hot_archive_restored_keys);
     }
 
@@ -869,6 +878,12 @@ fn apply_soroban_storage_change(
                 }
             }
             stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                tracing::debug!(
+                    key_hash = ?ttl.key_hash,
+                    live_until = ttl.live_until_ledger_seq,
+                    existing = state.get_ttl(&ttl.key_hash).is_some(),
+                    "TTL emit: direct TTL entry"
+                );
                 if state.get_ttl(&ttl.key_hash).is_some() {
                     state.update_ttl(ttl.clone());
                 } else {
@@ -897,33 +912,52 @@ fn apply_soroban_storage_change(
         }
 
         // Apply TTL if present for contract entries.
-        // Only emit TTL changes when the TTL is actually being modified.
-        // C++ stellar-core does not emit TTL updates when only the data is modified.
+        // When data is modified (new_entry exists), always emit TTL if present.
+        // When data is NOT modified (TTL-only change), only emit TTL if it was extended.
+        // C++ stellar-core follows this same logic.
         //
         // For hot archive restores, the TTL entry is also being restored so we use create.
         // Note: TTL keys are not directly in archived_soroban_entries, but when the associated
         // data/code entry is restored, its TTL is also restored.
-        if let Some(live_until) = change.live_until {
-            if live_until == 0 {
-                return;
-            }
-            let key_hash = compute_key_hash(&change.key);
-            let existing_ttl = state.get_ttl(&key_hash);
-            let ttl_changed = existing_ttl
-                .map(|t| t.live_until_ledger_seq != live_until)
-                .unwrap_or(true); // New TTL = always emit
-
-            if ttl_changed {
+        //
+        // Skip TTL emission for TTL entries themselves - they were already handled above
+        // and computing key_hash of a TTL key would give the wrong hash.
+        if !matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
+            if let Some(live_until) = change.live_until {
+                if live_until == 0 {
+                    return;
+                }
+                let key_hash = compute_key_hash(&change.key);
+                let existing_ttl = state.get_ttl(&key_hash);
                 let ttl = TtlEntry {
-                    key_hash,
+                    key_hash: key_hash.clone(),
                     live_until_ledger_seq: live_until,
                 };
+
                 // For hot archive restores, the TTL entry is also being created
                 if is_hot_archive_restore {
+                    tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
                     state.create_ttl(ttl);
-                } else if existing_ttl.is_some() {
-                    state.update_ttl(ttl);
+                } else if let Some(existing) = existing_ttl {
+                    // Only emit TTL update if the value actually changed.
+                    // C++ stellar-core doesn't emit bucket list updates for unchanged values.
+                    if existing.live_until_ledger_seq != live_until {
+                        tracing::debug!(
+                            ?key_hash,
+                            live_until,
+                            old_live_until = existing.live_until_ledger_seq,
+                            "TTL emit: data modified, TTL changed"
+                        );
+                        state.update_ttl(ttl);
+                    } else {
+                        tracing::debug!(
+                            ?key_hash,
+                            live_until,
+                            "TTL skip: data modified but TTL unchanged"
+                        );
+                    }
                 } else {
+                    tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
                     state.create_ttl(ttl);
                 }
             }
@@ -934,17 +968,21 @@ fn apply_soroban_storage_change(
         }
         // TTL-only change: the data entry wasn't modified, but its TTL was bumped.
         // This happens when a contract reads an entry and its TTL gets auto-extended.
-        let key_hash = compute_key_hash(&change.key);
-        let existing_ttl = state.get_ttl(&key_hash);
-        let ttl_changed = existing_ttl
-            .map(|t| t.live_until_ledger_seq != live_until)
-            .unwrap_or(true);
-
-        if ttl_changed {
+        // Only emit when TTL was actually extended (new > old).
+        if change.ttl_extended {
+            let key_hash = compute_key_hash(&change.key);
+            let existing_ttl = state.get_ttl(&key_hash);
             let ttl = TtlEntry {
-                key_hash,
+                key_hash: key_hash.clone(),
                 live_until_ledger_seq: live_until,
             };
+            tracing::debug!(
+                ?key_hash,
+                live_until,
+                existing = existing_ttl.is_some(),
+                key_type = ?std::mem::discriminant(&change.key),
+                "TTL emit: ttl-only extended"
+            );
             if existing_ttl.is_some() {
                 state.update_ttl(ttl);
             } else {
@@ -1609,6 +1647,8 @@ mod tests {
             key: key.clone(),
             new_entry: Some(ledger_entry),
             live_until: Some(200),
+            ttl_extended: false,
+            is_rent_related: false,
         };
 
         let no_restored_keys = std::collections::HashSet::new();
@@ -1624,6 +1664,8 @@ mod tests {
             key,
             new_entry: None,
             live_until: None,
+            ttl_extended: false,
+            is_rent_related: false,
         };
 
         apply_soroban_storage_change(&mut state, &delete_change, &no_restored_keys);
@@ -1631,6 +1673,138 @@ mod tests {
             .get_contract_data(&contract_id, &contract_key, durability)
             .is_none());
         assert!(state.get_ttl(&ttl_key).is_none());
+    }
+
+    /// Regression test for ledger 182022: TTL emission should be skipped when data is modified
+    /// but TTL value remains unchanged.
+    ///
+    /// At ledger 182022 TX 4, a Soroban InvokeHostFunction modified a ContractData entry
+    /// but the TTL value remained the same (226129). We were incorrectly emitting a TTL
+    /// update to the bucket list, causing 1 extra LIVE entry compared to C++ stellar-core.
+    ///
+    /// C++ stellar-core only emits bucket list updates when there's an actual change in value.
+    /// This test verifies that when data is modified but TTL is unchanged, we don't emit
+    /// a redundant TTL update.
+    #[test]
+    fn test_apply_soroban_storage_change_skips_ttl_when_unchanged() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([2u8; 32])));
+        let contract_key = ScVal::U32(42);
+        let durability = ContractDataDurability::Persistent;
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+        });
+
+        let ttl_key_hash = compute_key_hash(&key);
+
+        // Pre-populate the TTL entry with value 226129 (simulates existing entry from bucket list)
+        let existing_ttl = TtlEntry {
+            key_hash: ttl_key_hash.clone(),
+            live_until_ledger_seq: 226129,
+        };
+        state.create_ttl(existing_ttl);
+
+        // Pre-populate the contract data entry
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::I32(100),
+        };
+        state.create_contract_data(cd_entry);
+
+        // Commit to make these "existing" entries
+        state.commit();
+
+        // Create a new state manager starting from this snapshot (simulating new ledger)
+        let mut state2 = LedgerStateManager::new(5_000_000, 100);
+
+        // Re-populate with the same entries (simulates loading from bucket list)
+        let existing_ttl = TtlEntry {
+            key_hash: ttl_key_hash.clone(),
+            live_until_ledger_seq: 226129,
+        };
+        state2.create_ttl(existing_ttl);
+
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::I32(100),
+        };
+        state2.create_contract_data(cd_entry);
+
+        // Commit to establish baseline
+        state2.commit();
+
+        // Now apply a storage change that modifies data but keeps TTL unchanged
+        let modified_entry = LedgerEntry {
+            last_modified_ledger_seq: 2,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract_id.clone(),
+                key: contract_key.clone(),
+                durability: durability.clone(),
+                val: ScVal::I32(200), // Different value
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let modify_change = StorageChange {
+            key: key.clone(),
+            new_entry: Some(modified_entry),
+            live_until: Some(226129), // Same TTL as before
+            ttl_extended: false,
+            is_rent_related: true, // This was true in the actual ledger
+        };
+
+        let no_restored_keys = std::collections::HashSet::new();
+        apply_soroban_storage_change(&mut state2, &modify_change, &no_restored_keys);
+
+        // Verify data was updated
+        let cd = state2
+            .get_contract_data(&contract_id, &contract_key, durability)
+            .unwrap();
+        assert_eq!(cd.val, ScVal::I32(200));
+
+        // Verify TTL value is still the same
+        let ttl = state2.get_ttl(&ttl_key_hash).unwrap();
+        assert_eq!(ttl.live_until_ledger_seq, 226129);
+
+        // The key assertion: the delta should have ContractData updated, but NOT TTL
+        let delta = state2.delta();
+
+        // Check if any entry in updated_entries is the ContractData
+        let contract_data_updated = delta.updated_entries().iter().any(|e| {
+            matches!(
+                &e.data,
+                LedgerEntryData::ContractData(cd)
+                if cd.contract == contract_id && cd.key == contract_key
+            )
+        });
+        assert!(
+            contract_data_updated,
+            "ContractData should be updated in delta"
+        );
+
+        // TTL should NOT be in updated (value didn't change)
+        let ttl_updated = delta.updated_entries().iter().any(|e| {
+            matches!(
+                &e.data,
+                LedgerEntryData::Ttl(ttl)
+                if ttl.key_hash == ttl_key_hash
+            )
+        });
+        assert!(
+            !ttl_updated,
+            "TTL should NOT be updated in delta when value is unchanged"
+        );
     }
 
     /// Regression test for ledger 83170: CONTRACT_DATA entry size validation.
@@ -1732,6 +1906,8 @@ mod tests {
             key,
             new_entry: Some(ledger_entry),
             live_until: Some(200),
+            ttl_extended: false,
+            is_rent_related: false,
         };
 
         let changes = vec![change];
@@ -1774,6 +1950,8 @@ mod tests {
             key,
             new_entry: Some(ledger_entry),
             live_until: Some(200),
+            ttl_extended: false,
+            is_rent_related: false,
         };
 
         let changes = vec![change];
@@ -1834,6 +2012,8 @@ mod tests {
             key: key.clone(),
             new_entry: Some(ledger_entry),
             live_until: Some(250000),
+            ttl_extended: false,
+            is_rent_related: false,
         };
 
         // Case 1: Entry exists in state, NOT in hot_archive_keys -> should use update (LIVE)
