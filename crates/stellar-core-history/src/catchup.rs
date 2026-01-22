@@ -337,6 +337,34 @@ impl CatchupManager {
         );
         let (mut bucket_list, mut hot_archive_bucket_list) =
             self.apply_buckets(&has, &buckets).await?;
+
+        // Restart any pending merges that should have been in progress at the checkpoint.
+        // This is critical for correct bucket list hash computation after catchup.
+        // The HAS at a checkpoint has all merge state=0 (no pending merges recorded),
+        // but merges may actually be in progress based on timing. restart_merges()
+        // recreates the correct merge state by looking at bucket sizes and ledger sequence.
+        // Use protocol version 25 as the minimum for hot archive support.
+        let protocol_version = 25u32;
+        bucket_list
+            .restart_merges(checkpoint_seq, protocol_version)
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
+            })?;
+        if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+            hot_archive
+                .restart_merges(checkpoint_seq, protocol_version)
+                .map_err(|e| {
+                    HistoryError::CatchupFailed(format!(
+                        "Failed to restart hot archive merges: {}",
+                        e
+                    ))
+                })?;
+        }
+        info!(
+            "Bucket list hash after restart_merges: {}",
+            bucket_list.hash()
+        );
+
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         // Step 5: Download ledger data from checkpoint to target
@@ -500,6 +528,30 @@ impl CatchupManager {
         );
         let (mut bucket_list, mut hot_archive_bucket_list) =
             self.apply_buckets(&data.has, &buckets).await?;
+
+        // Restart any pending merges that should have been in progress at the checkpoint.
+        // This is critical for correct bucket list hash computation after catchup.
+        let protocol_version = 25u32;
+        bucket_list
+            .restart_merges(checkpoint_seq, protocol_version)
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
+            })?;
+        if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+            hot_archive
+                .restart_merges(checkpoint_seq, protocol_version)
+                .map_err(|e| {
+                    HistoryError::CatchupFailed(format!(
+                        "Failed to restart hot archive merges: {}",
+                        e
+                    ))
+                })?;
+        }
+        info!(
+            "Bucket list hash after restart_merges: {}",
+            bucket_list.hash()
+        );
+
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
         // Step 5: Build ledger data from checkpoint files
