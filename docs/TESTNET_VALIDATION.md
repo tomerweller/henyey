@@ -40,15 +40,15 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-90000+ continuous replay passes |
+| **End-to-end verification** | Extended | 64-128050+ continuous replay passes |
 | **Primary failure mode** | Under investigation | Extending verification range |
-| **Continuous replay** | Ledgers 64-90000+ | 100% header match |
+| **Continuous replay** | Ledgers 64-128050+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-90000+ | 90000+ | Many | 100% | Continuous replay passes |
+| 64-128050+ | 128000+ | Many | 100% | Continuous replay passes |
 
 ### Issues Fixed (2026-01-21)
 
@@ -75,7 +75,17 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-None currently - verification extended to 64-90000+ with all issues resolved.
+None currently - verification extended to 64-128050+ with all issues resolved.
+
+#### (RESOLVED) Ledger 128051: Hot Archive Restoration INIT/LIVE Categorization
+
+When Soroban entries are restored from the hot archive (entries evicted and being auto-restored via `archived_soroban_entries` indices in `SorobanTransactionDataExt::V1`), they should be recorded as INIT (created) in the bucket list delta, not LIVE (updated).
+
+The bug was that `apply_soroban_storage_change` checked if an entry existed in state to decide create vs update. But entries loaded from the hot archive exist in state (loaded during Soroban execution setup), yet they're not in the live bucket list - they're being restored to it.
+
+Per CAP-0066, hot archive restored entries should appear as INIT in the bucket list delta because they are being added back to the live bucket list.
+
+**Regression test:** `test_hot_archive_restore_uses_create_not_update` in `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs`
 
 #### (RESOLVED) Ledger 84362: SetOptions Signer Sponsor Loading
 
@@ -159,6 +169,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-22**: Fixed hot archive restoration INIT/LIVE categorization (ledger 128051) - extends replay to 64-128050+
 - **2026-01-22**: Fixed SetOptions signer sponsor loading (ledger 84362) - extends replay to 64-90000+
 - **2026-01-21**: Fixed eviction scan results usage (ledger 50034) - extends replay to 64-50100+
 - **2026-01-21**: Fixed AllowTrust offer removal (ledger 12502) - extends replay to 64-50000+
