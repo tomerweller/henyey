@@ -57,21 +57,22 @@ use stellar_core_tx::{
     TxError, TxEventManager,
 };
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum12,
-    AlphaNum4, Asset, AssetCode, ClaimableBalanceEntry, ClaimableBalanceId, ConfigSettingEntry,
-    ConfigSettingId, ContractCostParams, ContractEvent, CreateClaimableBalanceResult,
-    DiagnosticEvent, ExtensionPoint, InflationResult, InnerTransactionResult,
-    InnerTransactionResultExt, InnerTransactionResultPair, InnerTransactionResultResult,
-    LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerHeader, LedgerKey,
-    LedgerKeyClaimableBalance, LedgerKeyConfigSetting, LedgerKeyLiquidityPool, Limits,
-    LiquidityPoolEntry, LiquidityPoolEntryBody, ManageBuyOfferResult, ManageSellOfferResult,
-    MuxedAccount, OfferEntry, Operation, OperationBody, OperationMetaV2, OperationResult,
-    OperationResultTr, PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId,
-    Preconditions, ScAddress, SignerKey, SorobanTransactionData, SorobanTransactionDataExt,
-    SorobanTransactionMetaExt, SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent,
-    TransactionEventStage, TransactionMeta, TransactionMetaV4, TransactionResult,
-    TransactionResultExt, TransactionResultMetaV1, TransactionResultPair, TransactionResultResult,
-    TrustLineAsset, TrustLineFlags, VecM, WriteXdr,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, AccountMergeResult,
+    AllowTrustOp, AlphaNum12, AlphaNum4, Asset, AssetCode, ClaimableBalanceEntry,
+    ClaimableBalanceId, ConfigSettingEntry, ConfigSettingId, ContractCostParams, ContractEvent,
+    CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint, InflationResult,
+    InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
+    InnerTransactionResultResult, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
+    LedgerEntryData, LedgerHeader, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
+    LedgerKeyLiquidityPool, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
+    ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation,
+    OperationBody, OperationMetaV2, OperationResult, OperationResultTr,
+    PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress,
+    SignerKey, SorobanTransactionData, SorobanTransactionDataExt, SorobanTransactionMetaExt,
+    SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
+    TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultExt,
+    TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset,
+    TrustLineFlags, VecM, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -2395,6 +2396,23 @@ impl TransactionExecutor {
 
         self.state.clear_sponsorship_stack();
 
+        // Pre-load sponsor accounts for BeginSponsoringFutureReserves operations.
+        // When a BeginSponsoringFutureReserves operation is followed by other operations
+        // (like SetOptions), those subsequent operations may need to update the sponsor's
+        // num_sponsoring count. We must load these sponsor accounts before the operation
+        // loop so they're available when needed.
+        for op in frame.operations().iter() {
+            if let OperationBody::BeginSponsoringFutureReserves(_) = &op.body {
+                // The sponsor is the source of the BeginSponsoringFutureReserves operation
+                let op_source_muxed = op
+                    .source_account
+                    .clone()
+                    .unwrap_or_else(|| frame.inner_source_account());
+                let sponsor_id = stellar_core_tx::muxed_to_account_id(&op_source_muxed);
+                self.load_account(snapshot, &sponsor_id)?;
+            }
+        }
+
         // Execute operations
         let mut operation_results = Vec::new();
         let num_ops = frame.operations().len();
@@ -2609,7 +2627,12 @@ impl TransactionExecutor {
                     Err(e) => {
                         self.state.end_op_snapshot();
                         all_success = false;
-                        warn!(error = %e, "Operation execution failed");
+                        warn!(
+                            error = %e,
+                            op_index = op_index,
+                            op_type = ?OperationType::from_body(&op.body),
+                            "Operation execution failed"
+                        );
                         operation_results.push(OperationResult::OpNotSupported);
                         op_changes.push(empty_entry_changes());
                         op_events.push(Vec::new());
@@ -3013,6 +3036,35 @@ impl TransactionExecutor {
                     RevokeSponsorshipOp::Signer(signer_key) => {
                         // Load the account that has the signer
                         self.load_account(snapshot, &signer_key.account_id)?;
+                    }
+                }
+            }
+            OperationBody::SetOptions(op_data) => {
+                // If SetOptions modifies signers and the source account has sponsored signers,
+                // we need to load those sponsor accounts so we can update their num_sponsoring.
+                if op_data.signer.is_some() {
+                    // Collect sponsor IDs from the source account's signer_sponsoring_i_ds
+                    let sponsor_ids: Vec<AccountId> = self
+                        .state
+                        .get_account(&op_source)
+                        .and_then(|account| {
+                            if let AccountEntryExt::V1(v1) = &account.ext {
+                                if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
+                                    return Some(
+                                        v2.signer_sponsoring_i_ds
+                                            .iter()
+                                            .filter_map(|s| s.0.clone())
+                                            .collect(),
+                                    );
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or_default();
+
+                    // Load each sponsor account
+                    for sponsor_id in &sponsor_ids {
+                        self.load_account(snapshot, sponsor_id)?;
                     }
                 }
             }

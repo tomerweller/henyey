@@ -20,19 +20,20 @@ use stellar_xdr::curr::{
     FeeBumpTransactionInnerTx, Hash, HashIdPreimage, HashIdPreimageContractId,
     InnerTransactionResultPair, Int128Parts, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
     LedgerEntryData, LedgerEntryExt, LedgerFootprint, LedgerKey, LedgerKeyClaimableBalance,
-    LedgerKeyContractCode,
-    LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl, Liabilities,
-    LiquidityPoolConstantProductParameters, LiquidityPoolDepositOp, LiquidityPoolEntry,
-    LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolWithdrawOp,
-    ManageSellOfferOp, ManageSellOfferResult, Memo, MuxedAccount, MuxedAccountMed25519, OfferEntry,
-    OfferEntryExt, Operation, OperationBody, OperationResult, OperationResultTr,
-    PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultSuccess,
-    PoolId, Preconditions, PreconditionsV2, Price, PublicKey, ScAddress, ScString, ScSymbol, ScVal,
-    SequenceNumber, SetTrustLineFlagsOp, Signature as XdrSignature, SignatureHint, SignerKey,
-    SorobanResources, SorobanTransactionData, SorobanTransactionDataExt, String32, StringM,
-    Thresholds, TimeBounds, TimePoint, Transaction, TransactionEnvelope, TransactionEventStage,
-    TransactionExt, TransactionMeta, TransactionResultResult, TransactionV1Envelope,
-    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags, TtlEntry, Uint256, VecM,
+    LedgerKeyContractCode, LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine,
+    LedgerKeyTtl, Liabilities, LiquidityPoolConstantProductParameters, LiquidityPoolDepositOp,
+    LiquidityPoolEntry, LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
+    LiquidityPoolWithdrawOp, ManageSellOfferOp, ManageSellOfferResult, Memo, MuxedAccount,
+    MuxedAccountMed25519, OfferEntry, OfferEntryExt, Operation, OperationBody, OperationResult,
+    OperationResultTr, PathPaymentStrictSendOp, PathPaymentStrictSendResult,
+    PathPaymentStrictSendResultSuccess, PoolId, Preconditions, PreconditionsV2, Price, PublicKey,
+    ScAddress, ScString, ScSymbol, ScVal, SequenceNumber, SetOptionsOp, SetOptionsResult,
+    SetTrustLineFlagsOp, Signature as XdrSignature, SignatureHint, Signer, SignerKey,
+    SorobanResources, SorobanTransactionData, SorobanTransactionDataExt, SponsorshipDescriptor,
+    String32, StringM, Thresholds, TimeBounds, TimePoint, Transaction, TransactionEnvelope,
+    TransactionEventStage, TransactionExt, TransactionMeta, TransactionResultResult,
+    TransactionV1Envelope, TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags,
+    TtlEntry, Uint256, VecM,
 };
 
 fn create_account_entry_with_last_modified(
@@ -3272,4 +3273,232 @@ fn test_apply_ledger_entry_changes_updates_module_cache() {
     // If we got here without panicking, the code path is exercised correctly.
     // The actual verification that this fix works is done via the integration test
     // (verify-execution from ledger 64 to 5000 shows 100% match after this fix).
+}
+
+/// Create an account entry with sponsored signers.
+/// Used to test SetOptions when the source account has signers sponsored by other accounts.
+fn create_account_entry_with_sponsored_signers(
+    account_id: AccountId,
+    seq_num: i64,
+    balance: i64,
+    signers: Vec<Signer>,
+    signer_sponsors: Vec<SponsorshipDescriptor>,
+    num_sponsored: u32,
+) -> (LedgerKey, LedgerEntry) {
+    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(seq_num),
+            num_sub_entries: signers.len() as u32,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: signers.try_into().unwrap(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored,
+                    num_sponsoring: 0,
+                    signer_sponsoring_i_ds: signer_sponsors.try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    (key, entry)
+}
+
+/// Create an account entry that is a sponsor (has num_sponsoring set).
+fn create_sponsor_account_entry(
+    account_id: AccountId,
+    seq_num: i64,
+    balance: i64,
+    num_sponsoring: u32,
+) -> (LedgerKey, LedgerEntry) {
+    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(seq_num),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored: 0,
+                    num_sponsoring,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    (key, entry)
+}
+
+/// Test that SetOptions correctly loads sponsor accounts when modifying signers
+/// on an account that has sponsored signers.
+///
+/// This is a regression test for a bug found during testnet replay at ledger 84362,
+/// where SetOptions would fail with "source account not found" when trying to
+/// remove a signer that was sponsored by another account (because the sponsor
+/// account wasn't loaded into state).
+#[test]
+fn test_set_options_loads_signer_sponsor_accounts() {
+    let source_secret = SecretKey::from_seed(&[200u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    // Create a sponsor account
+    let sponsor_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([201u8; 32])));
+
+    // Create a signer key that we'll remove
+    let signer_key = SignerKey::Ed25519(Uint256([202u8; 32]));
+    let signer = Signer {
+        key: signer_key.clone(),
+        weight: 1,
+    };
+
+    // Create the source account with a sponsored signer
+    let (source_key, source_entry) = create_account_entry_with_sponsored_signers(
+        source_id.clone(),
+        1,
+        50_000_000,
+        vec![signer],
+        vec![SponsorshipDescriptor(Some(sponsor_id.clone()))],
+        1, // num_sponsored = 1 (the signer is sponsored)
+    );
+
+    // Create the sponsor account with num_sponsoring = 1
+    let (sponsor_key, sponsor_entry) =
+        create_sponsor_account_entry(sponsor_id.clone(), 1, 50_000_000, 1);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(sponsor_key, sponsor_entry)
+        .expect("add sponsor")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    // Create SetOptions operation to remove the signer (weight = 0)
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: signer_key,
+                weight: 0, // Remove the signer
+            }),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+        None,
+    );
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // The operation should succeed
+    assert!(
+        result.success,
+        "SetOptions should succeed when removing a sponsored signer: {:?}",
+        result.failure
+    );
+
+    // Verify the operation result is Success
+    let op_result = result.operation_results.get(0).expect("operation result");
+    assert!(
+        matches!(
+            op_result,
+            OperationResult::OpInner(OperationResultTr::SetOptions(SetOptionsResult::Success))
+        ),
+        "Expected SetOptions Success, got {:?}",
+        op_result
+    );
+
+    // Verify the sponsor's num_sponsoring was decremented
+    let state = executor.state();
+    let sponsor_account = state.get_account(&sponsor_id).expect("sponsor account");
+    if let AccountEntryExt::V1(v1) = &sponsor_account.ext {
+        if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
+            assert_eq!(
+                v2.num_sponsoring, 0,
+                "Sponsor's num_sponsoring should be decremented to 0"
+            );
+        } else {
+            panic!("Expected V2 extension on sponsor account");
+        }
+    } else {
+        panic!("Expected V1 extension on sponsor account");
+    }
+
+    // Verify the source account's signer was removed
+    let source_account = state.get_account(&source_id).expect("source account");
+    assert!(
+        source_account.signers.is_empty(),
+        "Signer should have been removed"
+    );
 }

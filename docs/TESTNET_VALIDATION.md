@@ -2,7 +2,7 @@
 
 This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
 
-**Last Updated:** 2026-01-21
+**Last Updated:** 2026-01-22
 
 ## Quick Reference: Running Verification
 
@@ -40,15 +40,15 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-50100+ continuous replay passes |
+| **End-to-end verification** | Extended | 64-90000+ continuous replay passes |
 | **Primary failure mode** | Under investigation | Extending verification range |
-| **Continuous replay** | Ledgers 64-50100+ | 100% header match |
+| **Continuous replay** | Ledgers 64-90000+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-50100+ | 50100+ | Many | 100% | Continuous replay passes |
+| 64-90000+ | 90000+ | Many | 100% | Continuous replay passes |
 
 ### Issues Fixed (2026-01-21)
 
@@ -75,7 +75,13 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-None currently - verification extended to 64-50100+ with all issues resolved.
+None currently - verification extended to 64-90000+ with all issues resolved.
+
+#### (RESOLVED) Ledger 84362: SetOptions Signer Sponsor Loading
+
+When SetOptions modifies signers on an account that has existing sponsored signers (from previous transactions), we need to load those sponsor accounts into state so we can update their `num_sponsoring` count. The sponsor accounts weren't being loaded, causing a "source account not found" error. Fixed by loading signer sponsor accounts from `signer_sponsoring_i_ds` in `load_operation_accounts` for SetOptions operations.
+
+**Regression test:** `test_set_options_loads_signer_sponsor_accounts` in `crates/stellar-core-ledger/tests/transaction_execution.rs`
 
 #### (RESOLVED) Ledger 50034: Eviction Scan Results Not Used
 
@@ -153,6 +159,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-22**: Fixed SetOptions signer sponsor loading (ledger 84362) - extends replay to 64-90000+
 - **2026-01-21**: Fixed eviction scan results usage (ledger 50034) - extends replay to 64-50100+
 - **2026-01-21**: Fixed AllowTrust offer removal (ledger 12502) - extends replay to 64-50000+
 - **2026-01-21**: Fixed SetOptions signer sponsor loading (ledger 9952) - extends replay to 64-12501
