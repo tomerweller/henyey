@@ -2573,8 +2573,24 @@ impl TransactionExecutor {
                             }
 
                             // Also get hot archive keys for InvokeHostFunction
-                            let hot_archive =
+                            // NOTE: We must exclude live BL restore keys from the hot archive set.
+                            // Live BL restores are entries that exist in the live bucket list with
+                            // expired TTL but haven't been evicted yet - these are NOT hot archive
+                            // restores and should not be added to HotArchiveBucketList::add_batch.
+                            let mut hot_archive =
                                 extract_hot_archive_restored_keys(soroban_data, op_type);
+                            let ha_before = hot_archive.len();
+                            hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
+                            let ha_after = hot_archive.len();
+                            // Log when we filter out live BL restores (indicates distinction matters)
+                            if ha_before != ha_after {
+                                tracing::info!(
+                                    ha_before,
+                                    ha_after,
+                                    live_bl_count = restored.live_bucket_list.len(),
+                                    "Filtered live BL restores from hot archive keys"
+                                );
+                            }
                             restored.hot_archive.extend(hot_archive);
                             // Collect for return to caller (for HotArchiveBucketList::add_batch)
                             collected_hot_archive_keys.extend(restored.hot_archive.iter().cloned());
@@ -3357,41 +3373,17 @@ fn extract_hot_archive_restored_keys(
     }
 
     // Get the corresponding keys from the read_write footprint
+    // NOTE: Only add the main entry keys (ContractData/ContractCode), NOT the TTL keys.
+    // C++ stellar-core's HotArchiveBucketList::add_batch only receives the main entry keys,
+    // not TTL keys. TTL entries are handled separately in the live bucket list.
     let read_write = &data.resources.footprint.read_write;
     for index in archived_indices {
         if let Some(key) = read_write.get(index as usize) {
             keys.insert(key.clone());
-            // Also add the associated TTL key if it's a persistent entry
-            if let Some(ttl_key) = get_ttl_key_for_entry(key) {
-                keys.insert(ttl_key);
-            }
         }
     }
 
     keys
-}
-
-/// Get the TTL key for a persistent Soroban entry.
-fn get_ttl_key_for_entry(key: &LedgerKey) -> Option<LedgerKey> {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{LedgerKeyTtl, Limits, WriteXdr};
-
-    match key {
-        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-            // Compute the key hash for TTL lookup
-            if let Ok(bytes) = key.to_xdr(Limits::none()) {
-                let hash = Sha256::digest(&bytes);
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&hash);
-                Some(LedgerKey::Ttl(LedgerKeyTtl {
-                    key_hash: stellar_xdr::curr::Hash(hash_bytes),
-                }))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
 }
 
 fn emit_classic_events_for_operation(

@@ -40,15 +40,15 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-128050+ continuous replay passes |
+| **End-to-end verification** | Extended | 64-140000+ continuous replay passes |
 | **Primary failure mode** | Under investigation | Extending verification range |
-| **Continuous replay** | Ledgers 64-128050+ | 100% header match |
+| **Continuous replay** | Ledgers 64-140000+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Notes |
 |-------|---------|--------------|----------------|-------|
-| 64-128050+ | 128000+ | Many | 100% | Continuous replay passes |
+| 64-140000+ | 140000+ | Many | 100% | Continuous replay passes |
 
 ### Issues Fixed (2026-01-21)
 
@@ -75,7 +75,21 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-None currently - verification extended to 64-128050+ with all issues resolved.
+None currently - verification extended to 64-140000+ with all issues resolved.
+
+#### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
+
+When Soroban entries are restored, there are two types:
+1. **Hot archive restore** (`is_live_bl_restore=false`): Entry was evicted from live BL to hot archive
+2. **Live BL restore** (`is_live_bl_restore=true`): Entry still exists in live BL but has expired TTL
+
+The distinction matters for `HotArchiveBucketList::add_batch()` - only hot archive restores should be passed as `restored_keys`. Live BL restores should NOT be added to the hot archive because the entry never left the live bucket list.
+
+Two issues were fixed:
+1. **Live BL restore filtering**: The verify-execution command was extracting restored keys from CDP metadata which includes BOTH types. Fixed by using our execution's `hot_archive_restored_keys` which correctly filters out live BL restores.
+2. **TTL key exclusion**: The `extract_hot_archive_restored_keys` function was adding both main entry keys AND associated TTL keys. But C++ stellar-core's `isPersistentEntry()` only returns true for `CONTRACT_CODE` and `CONTRACT_DATA`, not TTL entries. Fixed by removing TTL key addition.
+
+**Regression test:** Ledgers 128051 (hot archive restore) and 134448 (live BL restore) serve as regression tests.
 
 #### (RESOLVED) Ledger 128051: Hot Archive Restoration INIT/LIVE Categorization
 
@@ -169,6 +183,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-22**: Fixed live BL restore vs hot archive restore distinction (ledger 134448) - extends replay to 64-140000+
 - **2026-01-22**: Fixed hot archive restoration INIT/LIVE categorization (ledger 128051) - extends replay to 64-128050+
 - **2026-01-22**: Fixed SetOptions signer sponsor loading (ledger 84362) - extends replay to 64-90000+
 - **2026-01-21**: Fixed eviction scan results usage (ledger 50034) - extends replay to 64-50100+

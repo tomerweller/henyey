@@ -3110,6 +3110,10 @@ async fn cmd_verify_execution(
             let mut ledger_matched = true;
             let mut ledger_tx_mismatch = false;
             let mut ledger_header_mismatch = false;
+            
+            // Collect hot archive restored keys from our execution
+            // (This is used instead of CDP's restored_keys to properly exclude live BL restores)
+            let mut our_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
 
             // Capture ledger-start TTL entries for all Soroban read footprint entries.
             // This is needed because when multiple transactions access the same entry,
@@ -3324,6 +3328,12 @@ async fn cmd_verify_execution(
                                     );
                                 }
                             }
+
+                            // Collect hot archive restored keys from our execution.
+                            // These are the keys that were actually restored from the hot archive
+                            // (excluding live BL restores which still exist in the live bucket list).
+                            // We use these instead of CDP metadata to correctly handle the distinction.
+                            our_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
 
                             // Apply fee refund to the executor's state AND delta.
                             // For Soroban transactions, unused resources are refunded to the fee source.
@@ -4188,11 +4198,26 @@ async fn cmd_verify_execution(
                 // Update hot archive bucket list
                 if cdp_header.ledger_version >= 23 {
                     if let Some(ref hot_archive) = hot_archive_bucket_list {
+                        // Debug: log when CDP and our restored keys differ
+                        if !restored_keys.is_empty() || !our_hot_archive_restored_keys.is_empty() {
+                            if restored_keys.len() != our_hot_archive_restored_keys.len() {
+                                tracing::info!(
+                                    ledger_seq = seq,
+                                    cdp_restored_count = restored_keys.len(),
+                                    our_restored_count = our_hot_archive_restored_keys.len(),
+                                    "Hot archive restored keys: CDP vs ours (difference = live BL restores)"
+                                );
+                            }
+                        }
+                        // Use OUR execution's hot archive restored keys, not CDP's.
+                        // CDP metadata includes both hot archive restores and live BL restores,
+                        // but only hot archive restores should be passed to add_batch.
+                        // Our execution correctly filters out live BL restores.
                         hot_archive.write().unwrap().add_batch(
                             seq,
                             cdp_header.ledger_version,
                             archived_entries,
-                            restored_keys,
+                            our_hot_archive_restored_keys.clone(),
                         )?;
                     }
                 }

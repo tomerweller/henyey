@@ -211,8 +211,12 @@ fn execute_contract_invocation(
             }
 
             // Apply storage changes back to our state.
-            // Extract keys being restored from hot archive - these must be recorded as INIT
-            let hot_archive_restored_keys = extract_archived_keys_from_soroban_data(soroban_data);
+            // Extract keys being restored from hot archive - these must be recorded as INIT.
+            // IMPORTANT: We must exclude live BL restores from this set because those entries
+            // are still in the live bucket list (just with expired TTL). Only true hot archive
+            // restores (entries that were evicted from live BL to hot archive) should use INIT.
+            let hot_archive_restored_keys =
+                extract_hot_archive_restored_keys(soroban_data, &result.live_bucket_list_restores);
             apply_soroban_storage_changes(
                 state,
                 &result.storage_changes,
@@ -703,16 +707,24 @@ fn build_soroban_operation_meta(
     }
 }
 
-/// Extract keys of entries being restored from the hot archive.
+/// Extract keys of entries being restored from the hot archive (NOT live BL).
 ///
 /// For InvokeHostFunction: `archived_soroban_entries` in `SorobanTransactionDataExt::V1`
-/// contains indices into the read_write footprint that point to entries being auto-restored
-/// from the hot archive.
+/// contains indices into the read_write footprint that point to entries being auto-restored.
+/// These can be either:
+/// 1. **Hot archive restores**: Entry was evicted from live BL to hot archive → use INIT
+/// 2. **Live BL restores**: Entry is still in live BL but has expired TTL → use LIVE
 ///
-/// Per CAP-0066, these entries should be recorded as INIT (created) in the bucket list delta,
-/// not LIVE (updated), because they are being restored to the live bucket list.
-fn extract_archived_keys_from_soroban_data(
+/// This function returns only the hot archive restored keys (excluding live BL restores).
+/// Per CAP-0066, hot archive restored entries should be recorded as INIT (created) in the
+/// bucket list delta because they are being added back to the live bucket list.
+///
+/// Live BL restores (entries with expired TTL but not yet evicted) are tracked separately
+/// in `live_bucket_list_restores` and should use LIVE (updated) because they already exist
+/// in the live bucket list - they just need their TTL refreshed.
+fn extract_hot_archive_restored_keys(
     soroban_data: &SorobanTransactionData,
+    live_bucket_list_restores: &[crate::soroban::protocol::LiveBucketListRestore],
 ) -> std::collections::HashSet<LedgerKey> {
     use std::collections::HashSet;
 
@@ -729,11 +741,20 @@ fn extract_archived_keys_from_soroban_data(
         return keys;
     }
 
-    // Get the corresponding keys from the read_write footprint
+    // Collect keys that are live BL restores (these should NOT be treated as hot archive restores)
+    let live_bl_restore_keys: HashSet<LedgerKey> = live_bucket_list_restores
+        .iter()
+        .map(|r| r.key.clone())
+        .collect();
+
+    // Get the corresponding keys from the read_write footprint, excluding live BL restores
     let read_write = &soroban_data.resources.footprint.read_write;
     for index in archived_indices {
         if let Some(key) = read_write.get(index as usize) {
-            keys.insert(key.clone());
+            // Only include if this is NOT a live BL restore
+            if !live_bl_restore_keys.contains(key) {
+                keys.insert(key.clone());
+            }
         }
     }
 
