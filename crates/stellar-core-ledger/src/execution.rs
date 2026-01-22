@@ -1488,10 +1488,15 @@ impl TransactionExecutor {
             base_fee as i64 * num_ops
         };
         let inclusion_fee = frame.inclusion_fee();
+        // For classic transactions, charge the full declared fee (not capped at required_fee).
+        // The declared fee must be >= required_fee for the tx to be valid, but if they declared
+        // more, we charge all of it. This matches C++ stellar-core's getFullFee() behavior.
+        // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
         let fee = if frame.is_soroban() {
             frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
         } else {
-            std::cmp::min(inclusion_fee, required_fee)
+            // Classic: charge the declared inclusion_fee (the full fee they specified)
+            inclusion_fee
         };
 
         if frame.is_fee_bump() {
@@ -2125,10 +2130,15 @@ impl TransactionExecutor {
             base_fee as i64 * num_ops
         };
         let inclusion_fee = frame.inclusion_fee();
+        // For classic transactions, charge the full declared fee (not capped at required_fee).
+        // The declared fee must be >= required_fee for the tx to be valid, but if they declared
+        // more, we charge all of it. This matches C++ stellar-core's getFullFee() behavior.
+        // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
         let mut fee = if frame.is_soroban() {
             frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
         } else {
-            std::cmp::min(inclusion_fee, required_fee)
+            // Classic: charge the declared inclusion_fee (the full fee they specified)
+            inclusion_fee
         };
 
         let mut preflight_failure = None;
@@ -2661,9 +2671,13 @@ impl TransactionExecutor {
             );
             self.state.rollback();
             restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
-            // Note: fee is already preserved by rollback() - no need to re-add.
-            // The fee was added during fee deduction phase and rollback() now preserves
-            // accumulated fees to avoid losing fees from previous failed transactions.
+            // Re-add the fee to the delta after rollback.
+            // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
+            // so we must explicitly re-add this transaction's fee to preserve it.
+            // This ensures failed transactions still contribute their fees to the fee pool.
+            if deduct_fee && fee > 0 {
+                self.state.delta_mut().add_fee(fee);
+            }
             if self.protocol_version >= 10 {
                 restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
                 restore_delta_entries(
