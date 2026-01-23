@@ -2,7 +2,7 @@
 
 This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
 
-**Last Updated:** 2026-01-22 (Updated)
+**Last Updated:** 2026-01-23
 
 ## Quick Reference: Running Verification
 
@@ -40,15 +40,36 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-182021 continuous replay passes |
+| **End-to-end verification** | Extended | 64-182021 and 625000+ ranges pass |
+| **Transaction meta verification** | Passing | 100% meta match in tested ranges |
 | **Primary failure mode** | P25 investigation | Investigating Protocol 25 transition |
 | **Continuous replay** | Ledgers 64-182021 | 100% header match |
 
 ### Verification Results
 
-| Range | Ledgers | Transactions | Header Matches | Notes |
-|-------|---------|--------------|----------------|-------|
-| 64-182021 | 182,000+ | 120,000+ | 100% | Continuous replay passes |
+| Range | Ledgers | Transactions | Header Matches | Meta Matches | Notes |
+|-------|---------|--------------|----------------|--------------|-------|
+| 64-182021 | 182,000+ | 120,000+ | 100% | 100% | Continuous replay passes |
+| 625215-625300 | 86 | 273 | 100% | 100% | Hot archive restore verification |
+| 626700-626751 | 52 | 91 | 100% | 100% | Latest available CDP data |
+
+### Issues Fixed (2026-01-23)
+
+#### 1. Read-Only TTL Changes Suppression in Transaction Meta
+
+In C++ stellar-core, TTL updates for entries whose corresponding data/code key is in the **read-only footprint** are NOT emitted in transaction metadata. Instead, they're accumulated in a separate buffer (`mRoTTLBumps`) and handled at different points (see `buildRoTTLSet` and `commitChangeFromSuccessfulOp` in `ParallelApplyUtils.cpp`). We were emitting `STATE Ttl` and `UPDATED Ttl` changes for these read-only TTL entries, causing metadata mismatches.
+
+**Fix:** Modified `build_entry_changes_with_hot_archive` to build a set of read-only TTL keys from the footprint and skip TTL updates for those keys.
+
+**Verification:** Ledgers 625215-625300 and 626700-626751 now pass with 100% meta match.
+
+#### 2. Hot Archive TTL Entry RESTORED Meta Emission
+
+When entries are restored from the hot archive, C++ stellar-core emits `LEDGER_ENTRY_RESTORED` for both the data/code entry AND its associated TTL entry. We were only emitting `RESTORED` for data/code entries but `CREATED` for TTL entries.
+
+**Fix:** Added TTL key computation for hot archive restores and updated `push_created_or_restored` to check both hot archive and live bucket list restored keys.
+
+**Verification:** Ledgers 625267-625270 (which contain hot archive restores) now pass with 100% meta match.
 
 ### Issues Fixed (2026-01-22)
 
@@ -211,6 +232,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-23**: Fixed read-only TTL meta suppression and hot archive TTL RESTORED meta - extends verification to 625000+ ledger ranges with 100% meta match
 - **2026-01-22**: Fixed TTL emission when value unchanged (ledger 182022) - extends replay to 64-182021
 - **2026-01-22**: Fixed classic fee calculation, liquidity pool deletion, INIT/DEAD coalescing - extends replay to 64-145000+
 - **2026-01-22**: Fixed live BL restore vs hot archive restore distinction (ledger 134448) - extends replay to 64-140000+

@@ -2585,9 +2585,30 @@ impl TransactionExecutor {
                                     "Filtered live BL restores from hot archive keys"
                                 );
                             }
+                            // For transaction meta purposes, also add the corresponding TTL keys.
+                            // When a ContractData/ContractCode entry is restored from hot archive,
+                            // its TTL entry should also be emitted as RESTORED (not CREATED).
+                            // NOTE: We don't add TTL keys to collected_hot_archive_keys because
+                            // HotArchiveBucketList::add_batch only receives data/code entries.
+                            use sha2::{Digest, Sha256};
+                            let ttl_keys: Vec<_> = hot_archive
+                                .iter()
+                                .filter_map(|key| {
+                                    // Compute key hash as SHA256 of key XDR
+                                    let key_bytes = key.to_xdr(Limits::none()).ok()?;
+                                    let key_hash =
+                                        stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                                    Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                                        key_hash,
+                                    }))
+                                })
+                                .collect();
+                            // Collect data/code keys only for HotArchiveBucketList::add_batch
+                            // (TTL keys are not added to hot archive bucket list)
+                            collected_hot_archive_keys.extend(hot_archive.iter().cloned());
+                            // Add all keys (including TTL) to restored.hot_archive for meta conversion
                             restored.hot_archive.extend(hot_archive);
-                            // Collect for return to caller (for HotArchiveBucketList::add_batch)
-                            collected_hot_archive_keys.extend(restored.hot_archive.iter().cloned());
+                            restored.hot_archive.extend(ttl_keys);
                             (restored, soroban_data.map(|d| &d.resources.footprint))
                         } else {
                             (RestoredEntries::default(), None)
@@ -3824,7 +3845,10 @@ fn build_entry_changes_with_hot_archive(
         restored: &RestoredEntries,
     ) {
         if let Ok(key) = crate::delta::entry_to_key(entry) {
-            if restored.hot_archive.contains(&key) {
+            // For hot archive restores and live bucket list restores (expired TTL),
+            // emit RESTORED instead of CREATED.
+            // This matches C++ stellar-core's processOpLedgerEntryChanges behavior.
+            if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
                 changes.push(LedgerEntryChange::Restored(entry.clone()));
                 return;
             }
@@ -3846,7 +3870,7 @@ fn build_entry_changes_with_hot_archive(
     // Key insight: change_order captures the execution sequence. For Soroban, we must preserve
     // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
     // (TTL, ContractData, ContractCode) by their associated key_hash to match C++ behavior.
-    if let Some(_fp) = footprint {
+    if let Some(fp) = footprint {
         use std::collections::HashSet;
 
         fn is_soroban_entry(entry: &LedgerEntry) -> bool {
@@ -3857,6 +3881,16 @@ fn build_entry_changes_with_hot_archive(
                     | stellar_xdr::curr::LedgerEntryData::ContractCode(_)
             )
         }
+
+        // Build set of read-only TTL keys. In C++ stellar-core, TTL updates for entries in the
+        // read-only footprint are NOT emitted in transaction meta (they're handled separately via
+        // mRoTTLBumps which are flushed at different points). We must skip emitting STATE/UPDATED
+        // for these TTL keys to match C++ behavior.
+        let ro_ttl_keys: HashSet<LedgerKey> = fp
+            .read_only
+            .iter()
+            .filter_map(stellar_core_bucket::get_ttl_key)
+            .collect();
 
         // Track which keys have been created (for deduplication)
         let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
@@ -3977,6 +4011,13 @@ fn build_entry_changes_with_hot_archive(
                     if idx < updated.len() {
                         let post_state = &updated[idx];
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
+                            // Skip TTL updates for entries in the read-only footprint.
+                            // In C++ stellar-core, these are accumulated in mRoTTLBumps and not
+                            // emitted in transaction meta. See buildRoTTLSet and
+                            // commitChangeFromSuccessfulOp in ParallelApplyUtils.cpp.
+                            if ro_ttl_keys.contains(&key) {
+                                continue;
+                            }
                             if restored.hot_archive.contains(&key)
                                 || restored.live_bucket_list.contains(&key)
                             {
