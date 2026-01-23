@@ -139,6 +139,45 @@ The missing account is the issuer of `USDPEND` token. TX 4 failed with `Payment(
 
 ---
 
+### F3: Hot Archive Entry Restoration Fails (Protocol 25)
+
+**Status**: Open (CRITICAL)  
+**Impact**: Causes hash mismatches on any ledger with entry restoration  
+**Added**: 2026-01-23
+
+**Description**:
+Protocol 25 introduced entry restoration from the hot archive. When a Soroban transaction attempts to restore archived entries, our implementation fails to find them in state, causing a bucket list hash mismatch.
+
+**Observed at**: Ledger 637593 (testnet)
+
+**Symptoms**:
+```
+P25: Transaction has archived entries to restore restored_count=3 restored_indices=[12, 13, 14]
+P25: Archived entry being restored but NOT FOUND in state idx=12 key_type=Discriminant(6)
+P25: Archived entry being restored but NOT FOUND in state idx=13 key_type=Discriminant(6)
+P25: Archived entry being restored but NOT FOUND in state idx=14 key_type=Discriminant(6)
+```
+
+The transaction then fails with `HostError: Error(WasmVm, InvalidAction)` because the entries it needs to restore are not available.
+
+**Root Cause**:
+The hot archive bucket list is populated during catchup, but the restoration lookup is failing. Either:
+1. The hot archive entries are not being indexed correctly
+2. The restoration lookup is searching the wrong data structure
+3. The hot archive bucket list hash is computed but the actual entries are not accessible
+
+**Impact**:
+- Any ledger with entry restoration will fail
+- Validator cannot sync past these ledgers
+- Re-catchup cannot recover (same failure repeats)
+
+**Files Involved**:
+- `crates/stellar-core-tx/src/soroban/host.rs` - Entry restoration logic
+- `crates/stellar-core-bucket/src/hot_archive.rs` - Hot archive bucket list
+- `crates/stellar-core-ledger/src/manager.rs` - Hot archive initialization
+
+---
+
 ## Observed Hash Mismatches
 
 This section logs ledger sequences where hash mismatches occurred during testnet validation. These are tracked to help identify patterns and root causes.
@@ -159,6 +198,16 @@ This section logs ledger sequences where hash mismatches occurred during testnet
 - Recovery via re-catchup was successful in both cases
 
 **Suspected Cause**: Related to M1 (Re-catchup causes state drift). After re-catchup, in-memory Soroban state may not be properly re-synchronized with the new bucket list state.
+
+### Session: 2026-01-23 15:48 - 15:51 UTC
+
+**Summary**: Hash mismatch immediately after fresh start due to F3 (hot archive restoration failure).
+
+| Ledger | Timestamp (UTC) | Our Hash (truncated) | Network Hash (truncated) | Cause |
+|--------|-----------------|----------------------|--------------------------|-------|
+| 637593 | 15:50:20 | `52917696...` | `b6ee1628...` | F3: Entry restoration failed |
+
+**Root Cause**: Ledger 637593 contained a transaction requiring restoration of 3 archived CONTRACT_DATA entries. Our hot archive lookup returned NOT FOUND for all 3 entries.
 
 ---
 
