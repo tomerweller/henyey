@@ -1642,70 +1642,55 @@ impl<'a> LedgerCloseContext<'a> {
                 });
 
                 if !has_window_entry {
-                    // Debug: count live entries in bucket list and compute size manually
-                    let mut contract_data_size: u64 = 0;
-                    let mut contract_code_size: u64 = 0;
-                    let mut contract_data_count: u64 = 0;
-                    let mut contract_code_count: u64 = 0;
-
-                    if let Ok(entries) = bucket_list.live_entries() {
-                        use stellar_xdr::curr::{Limits, WriteXdr};
-                        for entry in &entries {
-                            match &entry.data {
-                                LedgerEntryData::ContractData(_) => {
-                                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
-                                        contract_data_size += xdr_bytes.len() as u64;
-                                        contract_data_count += 1;
-                                    }
-                                }
-                                LedgerEntryData::ContractCode(_) => {
-                                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
-                                        contract_code_size += xdr_bytes.len() as u64;
-                                        contract_code_count += 1;
-                                    }
-                                }
-                                _ => {}
+                    // Check if this is a sample ledger before doing expensive computation
+                    // Sample period is typically 64 ledgers
+                    let archival_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
+                        stellar_xdr::curr::LedgerKeyConfigSetting {
+                            config_setting_id: stellar_xdr::curr::ConfigSettingId::StateArchival,
+                        },
+                    );
+                    let sample_period = bucket_list
+                        .get(&archival_key)
+                        .ok()
+                        .flatten()
+                        .and_then(|e| {
+                            if let LedgerEntryData::ConfigSetting(
+                                stellar_xdr::curr::ConfigSettingEntry::StateArchival(archival),
+                            ) = e.data
+                            {
+                                Some(archival.live_soroban_state_size_window_sample_period)
+                            } else {
+                                None
                             }
+                        })
+                        .unwrap_or(64); // Default to 64 if not found
+
+                    // Only compute state size on sample ledgers to avoid memory/CPU overhead
+                    let is_sample_ledger =
+                        sample_period > 0 && self.close_data.ledger_seq % sample_period == 0;
+
+                    if is_sample_ledger {
+                        let soroban_state_size =
+                            crate::execution::compute_soroban_state_size_from_bucket_list(
+                                &bucket_list,
+                                protocol_version,
+                            );
+
+                        if let Some(window_entry) =
+                            crate::execution::compute_state_size_window_entry(
+                                self.close_data.ledger_seq,
+                                protocol_version,
+                                &bucket_list,
+                                soroban_state_size,
+                            )
+                        {
+                            tracing::info!(
+                                ledger_seq = self.close_data.ledger_seq,
+                                soroban_state_size = soroban_state_size,
+                                "Adding state size window entry to live entries"
+                            );
+                            live_entries.push(window_entry);
                         }
-                    }
-
-                    let total_size = contract_data_size + contract_code_size;
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        contract_data_count = contract_data_count,
-                        contract_code_count = contract_code_count,
-                        contract_data_size = contract_data_size,
-                        contract_code_size = contract_code_size,
-                        total_size = total_size,
-                        "State size debug: computed from bucket list"
-                    );
-
-                    // Also check what the function returns (now with proper rent size for contract code)
-                    let fn_size = crate::execution::compute_soroban_state_size_from_bucket_list(
-                        &bucket_list,
-                        protocol_version,
-                    );
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        fn_size = fn_size,
-                        manual_xdr_size = total_size,
-                        "State size debug: function (with rent) vs manual (xdr only)"
-                    );
-
-                    let soroban_state_size = fn_size;
-
-                    if let Some(window_entry) = crate::execution::compute_state_size_window_entry(
-                        self.close_data.ledger_seq,
-                        protocol_version,
-                        &bucket_list,
-                        soroban_state_size,
-                    ) {
-                        tracing::info!(
-                            ledger_seq = self.close_data.ledger_seq,
-                            soroban_state_size = soroban_state_size,
-                            "Adding state size window entry to live entries"
-                        );
-                        live_entries.push(window_entry);
                     }
                 }
             }
