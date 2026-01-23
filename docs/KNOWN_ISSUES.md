@@ -139,6 +139,29 @@ The missing account is the issuer of `USDPEND` token. TX 4 failed with `Payment(
 
 ---
 
+## Observed Hash Mismatches
+
+This section logs ledger sequences where hash mismatches occurred during testnet validation. These are tracked to help identify patterns and root causes.
+
+### Session: 2026-01-23 15:08 - 15:33 UTC
+
+**Summary**: 4 hash mismatches out of 269 ledger closes (~1.5% failure rate). All recovered via automatic re-catchup.
+
+| Ledger | Timestamp (UTC) | Our Hash (truncated) | Network Hash (truncated) | Recovery |
+|--------|-----------------|----------------------|--------------------------|----------|
+| 637247 | 15:21:27 | `73b081a8...` | `24ccf15c...` | Re-catchup to 637248 |
+| 637308 | 15:26:32 | `d77061af...` | `2adeca8c...` | Re-catchup to 637312 |
+
+**Observations**:
+- Mismatches are NOT on sample ledgers (multiples of 64)
+- Ledger 637246 (mod 64 = 62) and 637307 (mod 64 = 59) were the ledgers with wrong hashes
+- Both occurred ~60-120 ledgers after a sample ledger
+- Recovery via re-catchup was successful in both cases
+
+**Suspected Cause**: Related to M1 (Re-catchup causes state drift). After re-catchup, in-memory Soroban state may not be properly re-synchronized with the new bucket list state.
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:
