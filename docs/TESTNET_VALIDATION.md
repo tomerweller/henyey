@@ -40,17 +40,18 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-360248 continuous replay passes |
+| **End-to-end verification** | Extended | 64-360500+ continuous replay passes |
 | **Transaction meta verification** | Passing | 100% header match in tested ranges |
-| **Primary failure mode** | F2 Bug | Issuer account missing in delta for failed TXs |
-| **Continuous replay** | Ledgers 64-360248 | 100% header match |
+| **Primary failure mode** | F2 Bug (partial) | Issuer account missing in delta at ledger 203280 |
+| **Continuous replay** | Ledgers 64-360500+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Meta Matches | Notes |
 |-------|---------|--------------|----------------|--------------|-------|
-| 64-360248 | 360,000+ | ~200,000+ | 100% | ~99% | Continuous replay passes |
-| 360249+ | - | - | FAILING | - | F2 bug: issuer account delta issue |
+| 64-203279 | 203,000+ | ~100,000+ | 100% | ~99% | Continuous replay passes |
+| 203280+ | - | - | FAILING | - | F2 bug: issuer account not loaded |
+| 360000-360500 | 501 | 2,449 | 100% | ~99% | Post-AccountMerge fix verified |
 | 450000-450500 | 501 | 2,216 | 100% | ~99% | Spot check (starts from checkpoint) |
 | 520000-520500 | 501 | 1,630 | 100% | ~99% | Spot check (starts from checkpoint) |
 | 637245-637315 | 71 | 427 | 100% | 100% | Bucket list ledger_seq fix verified |
@@ -168,6 +169,28 @@ Soroban transactions were seeing TTL values modified by previous transactions in
 - This caused TX1 to extract only 4 rent changes instead of 5, resulting in a 10,165 stroops fee refund difference
 
 Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries are first loaded from the bucket list, and using `get_ttl_at_ledger_start()` for Soroban execution instead of `get_ttl()`.
+
+### Issues Fixed (2026-01-23 - AccountMerge Delta Recording)
+
+#### AccountMerge Destination Not Recorded When Balance Unchanged
+
+When an `AccountMerge` operation transfers 0 balance from a source account to a destination account, the destination account was accessed via `get_account_mut()` but the balance didn't actually change. The `flush_all_accounts_except()` function was checking `&entry != snapshot_entry` to decide whether to record the update, which was `false` when the balance was unchanged.
+
+C++ stellar-core records STATE/UPDATED pairs for every account accessed during an operation, even if the data doesn't change. This is because `loadAccount` calls create access records regardless of modifications.
+
+**Fix:** Modified `flush_all_accounts_except()` in `state.rs` to check if the entry was accessed during the current operation via `op_entry_snapshots`:
+
+```rust
+let accessed_in_op = self.op_snapshots_active
+    && self.op_entry_snapshots.contains_key(&ledger_key);
+let should_record = accessed_in_op || self.multi_op_mode || &entry != snapshot_entry;
+```
+
+**Files changed:**
+- `crates/stellar-core-tx/src/state.rs` - `flush_all_accounts_except()` logic
+- `crates/stellar-core-tx/Cargo.toml` - Added `hex` dependency
+
+**Verification:** Ledgers 360000-360500 (501 ledgers, 2449 transactions) now pass with 100% header match. This includes ledger 360249 which previously failed due to missing account `2e824db9...` in the delta.
 
 ### Issues Fixed (2026-01-23 - Bucket List Ledger Sequence)
 
@@ -303,6 +326,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-23**: Fixed AccountMerge destination not recorded when balance unchanged - extends replay through 360000-360500+
 - **2026-01-23**: Fixed bucket list ledger_seq not set after catchup - caused hash mismatches ~60 ledgers after re-catchup
 - **2026-01-23**: Fixed CAP-0021 sequence number handling with minSeqNum gaps (ledger 28110) - sequence must be set to tx seq, not incremented
 - **2026-01-23**: Fixed Soroban transaction meta V1 extension, rent fee calculation, RO TTL meta suppression, hot archive TTL RESTORED - extends replay to 64-183000 with 100% meta match

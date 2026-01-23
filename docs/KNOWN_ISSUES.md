@@ -104,41 +104,34 @@ This implementation is designed for testnet synchronization only. It should not 
 
 ### F2: Offline Verification Delta Mismatch for Failed Transactions with Asset Issuers
 
-**Status**: Open (under investigation)  
+**Status**: Partially fixed  
 **Impact**: Bucket list hash mismatch at specific ledgers during offline verification  
-**Added**: 2026-01-23
+**Added**: 2026-01-23  
+**Partially Fixed**: 2026-01-23
 
 **Description**:
-When running offline `verify-execution`, certain ledgers show a bucket list hash mismatch due to missing LIVE entries in our delta compared to CDP metadata. The issue manifests when a transaction fails after partially executing operations that involve asset transfers.
+When running offline `verify-execution`, certain ledgers show a bucket list hash mismatch due to missing LIVE entries in our delta compared to CDP metadata. The issue manifests in two scenarios:
 
-**Observed at**: Ledgers 203280, 360249+ (testnet)
+1. **AccountMerge with 0 balance** (FIXED): When an AccountMerge transfers 0 balance, the destination account was accessed but unchanged, and we weren't recording it in the delta.
 
-**Symptoms**:
-- CDP expects 10 LIVE entries, we produce 9
-- Missing entry is the **issuer account** of an asset involved in a failed payment operation
-- The failed transaction's fee source IS correctly preserved in our delta
-- All transaction execution results match CDP (success/failure status correct)
+2. **Asset issuer accounts in failed transactions** (STILL OPEN): When a transaction fails after partially executing operations that involve asset transfers, the issuer account modification isn't in our delta.
 
-**Example**:
-```
-LIVE only in CDP: Account(94c035a17f8d6e30e27b5750f80ee88e6a1d8c9647058e4cff2a2401e9dbed15)
-DELTA COMPARISON: LIVE: ours=9, cdp=10, only_ours=0, only_cdp=1
-```
+**Observed at**: 
+- Ledger 360249+ (testnet) - **FIXED** (AccountMerge with 0 balance)
+- Ledger 203280 (testnet) - **STILL OPEN** (asset issuer account issue)
 
-The missing account is the issuer of `USDPEND` token. TX 4 failed with `Payment(NoTrust)` after the first payment operation succeeded, but the issuer account modification isn't in our delta.
+**Fix Applied for 360249+**:
+The `flush_all_accounts_except()` method now checks `op_entry_snapshots` to determine if an entry was accessed during the operation. If an entry was accessed (even if unchanged), it's now recorded in the delta. This matches C++ stellar-core behavior where `loadAccount` calls create STATE/UPDATED pairs regardless of whether the data changed.
 
-**Investigation Notes**:
-- Switched from two-phase (fee then execution) to single-phase execution (`deduct_fee=true`) - issue persists
-- The issue is NOT the fee source account rollback (that works correctly)
-- May be related to how payment operations update issuer accounts or how partial success is handled before rollback
-- At ledger 360249: Missing account `2e824db9...` in LIVE delta (CDP expects 9, we produce 8)
-- TX 1 at 360249 has meta diff for `065ef553...` account (STATE change missing)
-- This bug blocks continuous verification beyond ledger 360248
+**Remaining Issue at 203280**:
+- Missing account `94c035a17f8d6e30e27b5750f80ee88e6a1d8c9647058e4cff2a2401e9dbed15`
+- The account doesn't exist in our state when accessed via `get_account_mut`
+- This is a different bug - the account isn't being loaded properly, not a flush issue
 
 **Files Involved**:
+- `crates/stellar-core-tx/src/state.rs` - `flush_all_accounts_except()` (fixed)
 - `crates/rs-stellar-core/src/main.rs` - `cmd_verify_execution()` around line 3200
 - `crates/stellar-core-ledger/src/execution.rs` - Transaction execution and rollback
-- `crates/stellar-core-tx/src/operations/execute/payment.rs` - Payment operation
 
 ---
 

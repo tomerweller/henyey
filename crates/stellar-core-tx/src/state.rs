@@ -3800,11 +3800,19 @@ impl LedgerStateManager {
             if let Some(snapshot) = self.account_snapshots.get(&key) {
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.accounts.get(&key).cloned() {
-                        let should_record = self.multi_op_mode || &entry != snapshot_entry;
+                        // Build ledger key for op_snapshot lookup
+                        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+                            account_id: entry.account_id.clone(),
+                        });
+                        // Record update if:
+                        // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all loadAccount calls
+                        // 2. Entry actually changed - always record real value changes
+                        // 3. multi_op_mode is enabled - record every access for multi-op transactions
+                        let accessed_in_op = self.op_snapshots_active
+                            && self.op_entry_snapshots.contains_key(&ledger_key);
+                        let should_record =
+                            accessed_in_op || self.multi_op_mode || &entry != snapshot_entry;
                         if should_record {
-                            let ledger_key = LedgerKey::Account(LedgerKeyAccount {
-                                account_id: entry.account_id.clone(),
-                            });
                             let pre_state = if self.op_snapshots_active {
                                 self.op_entry_snapshots
                                     .get(&ledger_key)
