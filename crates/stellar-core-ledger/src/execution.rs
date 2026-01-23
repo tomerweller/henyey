@@ -5347,10 +5347,6 @@ pub fn compute_soroban_state_size_from_bucket_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
-        AccountId, AlphaNum4, Asset, AssetCode4, LedgerEntry, LedgerEntryChange, LedgerEntryData,
-        LedgerEntryExt, OfferEntry, OfferEntryExt, Price, PublicKey, Uint256,
-    };
 
     #[test]
     fn test_transaction_executor_creation() {
@@ -5367,40 +5363,6 @@ mod tests {
 
         assert_eq!(executor.ledger_seq, 100);
         assert_eq!(executor.close_time, 1234567890);
-    }
-
-    fn make_account_id(byte: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])))
-    }
-
-    fn make_asset(code: &[u8; 4], issuer: u8) -> Asset {
-        Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*code),
-            issuer: make_account_id(issuer),
-        })
-    }
-
-    fn make_offer(
-        offer_id: i64,
-        selling: Asset,
-        buying: Asset,
-        price: Price,
-        flags: u32,
-    ) -> LedgerEntry {
-        LedgerEntry {
-            last_modified_ledger_seq: 1,
-            data: LedgerEntryData::Offer(OfferEntry {
-                seller_id: make_account_id(9),
-                offer_id,
-                selling,
-                buying,
-                amount: 100,
-                price,
-                flags,
-                ext: OfferEntryExt::V0,
-            }),
-            ext: LedgerEntryExt::V0,
-        }
     }
 
     /// Regression test: Verify classic transaction fee calculation uses min(inclusion_fee, required_fee)
