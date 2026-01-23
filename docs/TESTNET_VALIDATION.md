@@ -40,22 +40,47 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-182021 and 625000+ ranges pass |
+| **End-to-end verification** | Extended | 64-183000 continuous replay passes |
 | **Transaction meta verification** | Passing | 100% meta match in tested ranges |
-| **Primary failure mode** | P25 investigation | Investigating Protocol 25 transition |
-| **Continuous replay** | Ledgers 64-182021 | 100% header match |
+| **Primary failure mode** | Investigating | Expanding range toward full testnet |
+| **Continuous replay** | Ledgers 64-183000 | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Meta Matches | Notes |
 |-------|---------|--------------|----------------|--------------|-------|
-| 64-182021 | 182,000+ | 120,000+ | 100% | 100% | Continuous replay passes |
+| 64-183000 | 183,000+ | 125,000+ | 100% | 100% | Continuous replay passes |
 | 625215-625300 | 86 | 273 | 100% | 100% | Hot archive restore verification |
 | 626700-626751 | 52 | 91 | 100% | 100% | Latest available CDP data |
 
 ### Issues Fixed (2026-01-23)
 
-#### 1. Read-Only TTL Changes Suppression in Transaction Meta
+#### 1. Soroban Transaction Meta Missing V1 Extension with Fee Values
+
+The `SorobanTransactionMetaExt` was always set to V0, but it should be V1 with fee tracking values (`total_non_refundable_resource_fee_charged`, `total_refundable_resource_fee_charged`, `rent_fee_charged`).
+
+Fixed by:
+- Adding `non_refundable_fee` field to `RefundableFeeTracker` in execution.rs
+- Modifying `build_transaction_meta()` to accept fee info and build `SorobanTransactionMetaExtV1`
+- Passing fee tracking values from the tracker to the meta builder
+
+#### 2. Rent Fee Double-Charging for Entries Touched by Multiple TXs in Same Ledger
+
+When multiple transactions in the same ledger touched the same Soroban entry, each TX was calculating rent based on the **ledger-start** TTL value. This caused TX N to pay rent for an entry that TX N-1 had already extended.
+
+For example at ledger 182057:
+- TX 6 extended an entry's TTL
+- TX 7 also touched the same entry and re-paid rent because it saw the old TTL value
+
+Fixed by changing `get_entry_ttl()` in `host.rs` to use the CURRENT TTL value (from `state.get_ttl()`) instead of the ledger-start TTL (from `state.get_ttl_at_ledger_start()`). This matches C++ stellar-core behavior where rent fee calculation uses live state.
+
+#### 3. Extra TTL Changes in Transaction Meta (augment_soroban_ttl_metadata)
+
+The `augment_soroban_ttl_metadata()` function was incorrectly adding TTL STATE+UPDATED changes by comparing ledger-start TTL vs current TTL. This caused extra changes to appear in transaction meta that weren't in the original CDP.
+
+Fixed by disabling the `augment_soroban_ttl_metadata()` call - the proper TTL changes are already emitted during transaction execution.
+
+#### 4. Read-Only TTL Changes Suppression in Transaction Meta
 
 In C++ stellar-core, TTL updates for entries whose corresponding data/code key is in the **read-only footprint** are NOT emitted in transaction metadata. Instead, they're accumulated in a separate buffer (`mRoTTLBumps`) and handled at different points (see `buildRoTTLSet` and `commitChangeFromSuccessfulOp` in `ParallelApplyUtils.cpp`). We were emitting `STATE Ttl` and `UPDATED Ttl` changes for these read-only TTL entries, causing metadata mismatches.
 
@@ -63,7 +88,7 @@ In C++ stellar-core, TTL updates for entries whose corresponding data/code key i
 
 **Verification:** Ledgers 625215-625300 and 626700-626751 now pass with 100% meta match.
 
-#### 2. Hot Archive TTL Entry RESTORED Meta Emission
+#### 5. Hot Archive TTL Entry RESTORED Meta Emission
 
 When entries are restored from the hot archive, C++ stellar-core emits `LEDGER_ENTRY_RESTORED` for both the data/code entry AND its associated TTL entry. We were only emitting `RESTORED` for data/code entries but `CREATED` for TTL entries.
 
@@ -124,7 +149,7 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 ### Known Issues
 
-Investigating Protocol 25 transition (ledger 182079+) - some ledgers fail after the upgrade.
+Currently expanding verification range - investigating any issues found beyond ledger 183000.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 
@@ -232,7 +257,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
-- **2026-01-23**: Fixed read-only TTL meta suppression and hot archive TTL RESTORED meta - extends verification to 625000+ ledger ranges with 100% meta match
+- **2026-01-23**: Fixed Soroban transaction meta V1 extension, rent fee calculation, RO TTL meta suppression, hot archive TTL RESTORED - extends replay to 64-183000 with 100% meta match
 - **2026-01-22**: Fixed TTL emission when value unchanged (ledger 182022) - extends replay to 64-182021
 - **2026-01-22**: Fixed classic fee calculation, liquidity pool deletion, INIT/DEAD coalescing - extends replay to 64-145000+
 - **2026-01-22**: Fixed live BL restore vs hot archive restore distinction (ledger 134448) - extends replay to 64-140000+
