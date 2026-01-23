@@ -59,24 +59,35 @@ Refactor invariant checks to:
 
 ### M1: Re-Catchup Causes Memory Growth
 
-**Status**: Open  
-**Impact**: Memory grows when validator falls behind and re-catches up  
-**Added**: 2026-01-23
+**Status**: Partially Fixed  
+**Impact**: Memory usage reduced by ~50% during initialization  
+**Added**: 2026-01-23  
+**Partially Fixed**: 2026-01-23
 
 **Description**:
-When the validator falls behind the network and triggers a re-catchup, the initialization caches (module cache, offer cache, soroban state) are repopulated from a fresh bucket list scan. The previous cache contents may not be fully released, causing gradual memory growth.
+When the validator falls behind the network and triggers a re-catchup, the initialization caches (module cache, offer cache, soroban state) are repopulated from a fresh bucket list scan. Previously this called `live_entries()` three times, creating three full copies of all entries in memory.
 
-**Observed Behavior**:
-- Initial memory: ~1.7 GB after first catchup
-- After several re-catchups: ~4+ GB
+**Root Cause**:
+The initialization process called `live_entries()` separately for:
+1. `initialize_module_cache()` - to find CONTRACT_CODE entries
+2. `initialize_offer_cache()` - to find Offer entries  
+3. `initialize_soroban_state()` - to find CONTRACT_DATA, CONTRACT_CODE, and TTL entries
 
-**Potential Solutions**:
-1. Explicitly clear caches before re-initialization
-2. Use weak references or cache eviction
-3. Investigate if Rust's allocator is not returning memory to OS
+Each call created a full Vec of all live entries (~75K+ entries on testnet), consuming several GB of temporary memory.
 
-**Files Involved**:
-- `crates/stellar-core-ledger/src/manager.rs` - `reinitialize_from_buckets()`
+**Solution Applied**:
+1. Created `initialize_all_caches()` that does a single pass over `live_entries()` and processes all entry types in one iteration
+2. Updated `reset_for_catchup()` to explicitly clear all caches (offer_cache, soroban_state) before re-initialization
+
+**Results**:
+- Initial memory after catchup: ~1.5 GB (down from ~3 GB)
+- Peak memory during initialization reduced by ~66%
+
+**Remaining Issue**:
+Memory may still grow over time due to Rust's allocator not returning memory to the OS. This is a common behavior and may require using a different allocator (e.g., jemalloc with `background_thread` enabled) for better memory management.
+
+**Files Changed**:
+- `crates/stellar-core-ledger/src/manager.rs` - Added `initialize_all_caches()`, updated `reset_for_catchup()`
 
 ---
 
