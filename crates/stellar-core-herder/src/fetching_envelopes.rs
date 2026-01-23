@@ -529,22 +529,24 @@ mod tests {
     }
 
     #[test]
-    fn test_recv_envelope_needs_quorum_set() {
+    fn test_recv_envelope_nomination_no_dependencies() {
         let fetching = FetchingEnvelopes::with_defaults();
 
         let envelope = make_test_envelope(100, 1);
         let result = fetching.recv_envelope(envelope);
 
-        // Should be fetching because we don't have the quorum set
-        assert_eq!(result, RecvResult::Fetching);
-        assert_eq!(fetching.fetching_count(), 1);
+        // Nomination envelopes don't have tx set dependencies
+        // and quorum set fetching is currently disabled, so envelope is ready
+        assert_eq!(result, RecvResult::Ready);
+        assert_eq!(fetching.ready_count(), 1);
     }
 
     #[test]
     fn test_recv_envelope_ready_when_cached() {
         let fetching = FetchingEnvelopes::with_defaults();
 
-        // Pre-cache the quorum set
+        // Pre-cache the quorum set (not strictly needed now since quorum set
+        // fetching is disabled, but kept for when it's re-enabled)
         let qs_hash = Hash256::from_bytes([1u8; 32]);
         let quorum_set = ScpQuorumSet {
             threshold: 1,
@@ -556,33 +558,28 @@ mod tests {
         let envelope = make_test_envelope(100, 1);
         let result = fetching.recv_envelope(envelope);
 
-        // Should be ready because we have the quorum set
+        // Should be ready because quorum set fetching is disabled for nominations
         assert_eq!(result, RecvResult::Ready);
         assert_eq!(fetching.ready_count(), 1);
     }
 
     #[test]
-    fn test_recv_quorum_set_moves_to_ready() {
+    fn test_cache_quorum_set() {
         let fetching = FetchingEnvelopes::with_defaults();
 
-        // Add envelope that needs quorum set
-        let envelope = make_test_envelope(100, 1);
-        let result = fetching.recv_envelope(envelope);
-        assert_eq!(result, RecvResult::Fetching);
-
-        // Receive the quorum set
+        // Verify we can cache and retrieve quorum sets
         let qs_hash = Hash256::from_bytes([1u8; 32]);
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
-        let received = fetching.recv_quorum_set(qs_hash, quorum_set);
-        assert!(received);
+        fetching.cache_quorum_set(qs_hash, quorum_set);
 
-        // Now should be ready
-        assert_eq!(fetching.ready_count(), 1);
-        assert_eq!(fetching.fetching_count(), 0);
+        assert!(fetching.has_quorum_set(&qs_hash));
+        let retrieved = fetching.get_quorum_set(&qs_hash);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().threshold, 1);
     }
 
     #[test]
