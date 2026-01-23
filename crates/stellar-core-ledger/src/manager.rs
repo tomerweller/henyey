@@ -1775,7 +1775,7 @@ impl<'a> LedgerCloseContext<'a> {
             let mut dead_entries = self.delta.dead_entries();
 
             // Log bucket list entries for debugging hash mismatch
-            tracing::info!(
+            tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 init_count = init_entries.len(),
                 live_count = live_entries.len(),
@@ -1871,7 +1871,7 @@ impl<'a> LedgerCloseContext<'a> {
                         "EvictionIterator ready"
                     );
 
-                    tracing::info!(
+                    tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
                         start_level = iter.bucket_list_level,
                         start_is_curr = iter.is_curr_bucket,
@@ -1891,7 +1891,7 @@ impl<'a> LedgerCloseContext<'a> {
                         .map_err(LedgerError::Bucket)?;
                     let eviction_duration = eviction_start.elapsed();
 
-                    tracing::info!(
+                    tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
                         bytes_scanned = eviction_result.bytes_scanned,
                         archived_count = eviction_result.archived_entries.len(),
@@ -2048,7 +2048,7 @@ impl<'a> LedgerCloseContext<'a> {
             // in sequence. In live mode, we may skip ledgers if there are no transactions
             // between consensus rounds. This ensures proper merge timing.
             let current_bl_ledger = bucket_list.ledger_seq();
-            tracing::info!(
+            tracing::debug!(
                 current_bl_ledger = current_bl_ledger,
                 target_ledger = self.close_data.ledger_seq,
                 needs_advance = current_bl_ledger < self.close_data.ledger_seq - 1,
@@ -2057,7 +2057,7 @@ impl<'a> LedgerCloseContext<'a> {
             if current_bl_ledger < self.close_data.ledger_seq - 1 {
                 let advance_from = current_bl_ledger + 1;
                 let advance_to = self.close_data.ledger_seq;
-                tracing::info!(
+                tracing::debug!(
                     current_bl_ledger = current_bl_ledger,
                     target_ledger = self.close_data.ledger_seq,
                     skipped_count = advance_to - advance_from,
@@ -2072,7 +2072,7 @@ impl<'a> LedgerCloseContext<'a> {
 
             // Log bucket list hash BEFORE add_batch
             let pre_add_batch_hash = bucket_list.hash();
-            tracing::info!(
+            tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 pre_add_batch_hash = %pre_add_batch_hash.to_hex(),
                 init_count = init_entries.len(),
@@ -2084,7 +2084,7 @@ impl<'a> LedgerCloseContext<'a> {
             // Detailed entry logging for debugging
             for (i, entry) in init_entries.iter().enumerate() {
                 let key = stellar_core_bucket::ledger_entry_to_key(entry);
-                tracing::info!(
+                tracing::trace!(
                     ledger_seq = self.close_data.ledger_seq,
                     idx = i,
                     entry_type = ?std::mem::discriminant(&entry.data),
@@ -2100,7 +2100,7 @@ impl<'a> LedgerCloseContext<'a> {
                     LedgerEntryData::ConfigSetting(cs) => Some(format!("{:?}", cs)),
                     _ => None,
                 };
-                tracing::info!(
+                tracing::trace!(
                     ledger_seq = self.close_data.ledger_seq,
                     idx = i,
                     entry_type = ?std::mem::discriminant(&entry.data),
@@ -2111,7 +2111,7 @@ impl<'a> LedgerCloseContext<'a> {
                 );
             }
             for (i, key) in dead_entries.iter().enumerate() {
-                tracing::info!(
+                tracing::trace!(
                     ledger_seq = self.close_data.ledger_seq,
                     idx = i,
                     key = ?key,
@@ -2130,7 +2130,7 @@ impl<'a> LedgerCloseContext<'a> {
 
             let live_hash = bucket_list.hash();
 
-            tracing::info!(
+            tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 post_add_batch_hash = %live_hash.to_hex(),
                 "Bucket list state after add_batch"
@@ -2143,7 +2143,7 @@ impl<'a> LedgerCloseContext<'a> {
                     // Advance hot archive through any skipped ledgers (same as live bucket list)
                     let current_hot_ledger = hot_archive.ledger_seq();
                     if current_hot_ledger < self.close_data.ledger_seq - 1 {
-                        tracing::info!(
+                        tracing::debug!(
                             current_hot_ledger = current_hot_ledger,
                             target_ledger = self.close_data.ledger_seq,
                             skipped_count = self.close_data.ledger_seq - current_hot_ledger - 1,
@@ -2174,7 +2174,7 @@ impl<'a> LedgerCloseContext<'a> {
                     bytes.copy_from_slice(&result);
                     let combined_hash = Hash256::from_bytes(bytes);
 
-                    tracing::info!(
+                    tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
                         live_hash = %live_hash.to_hex(),
                         pre_hot_hash = %pre_hot_hash.to_hex(),
@@ -2204,7 +2204,7 @@ impl<'a> LedgerCloseContext<'a> {
         // Log all inputs to create_next_header for debugging header mismatch
         let total_coins = self.prev_header.total_coins + self.delta.total_coins_delta();
         let fee_pool = self.prev_header.fee_pool + self.delta.fee_pool_delta();
-        tracing::info!(
+        tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             prev_header_hash = %self.prev_header_hash.to_hex(),
             prev_ledger_seq = self.prev_header.ledger_seq,
@@ -2291,7 +2291,7 @@ impl<'a> LedgerCloseContext<'a> {
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        tracing::error!(
+        tracing::debug!(
             ledger_seq = new_header.ledger_seq,
             header_xdr_len = header_xdr_bytes.len(),
             header_xdr_hex = %header_xdr_hex,

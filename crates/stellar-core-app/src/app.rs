@@ -2866,7 +2866,7 @@ impl App {
 
                 match self.herder.receive_scp_envelope(envelope) {
                     EnvelopeState::Valid => {
-                        tracing::info!(slot, tracking, "Processed SCP envelope (valid)");
+                        tracing::debug!(slot, tracking, "Processed SCP envelope (valid)");
                         // Signal heartbeat to sync recovery - consensus is making progress
                         self.sync_recovery_heartbeat();
 
@@ -2898,13 +2898,13 @@ impl App {
                         }
                     }
                     EnvelopeState::Pending => {
-                        tracing::info!(slot, tracking, "SCP envelope buffered for future slot");
+                        tracing::debug!(slot, tracking, "SCP envelope buffered for future slot");
                     }
                     EnvelopeState::Duplicate => {
                         // Expected, ignore silently
                     }
                     EnvelopeState::TooOld => {
-                        tracing::info!(slot, tracking, "SCP envelope too old");
+                        tracing::debug!(slot, tracking, "SCP envelope too old");
                     }
                     EnvelopeState::Invalid => {
                         tracing::warn!(slot, peer = %msg.from_peer, "Invalid SCP envelope");
@@ -2915,7 +2915,7 @@ impl App {
                     EnvelopeState::Fetching => {
                         // Envelope is waiting for its tx set to be fetched.
                         // Request the tx set from the peer that sent this envelope.
-                        tracing::info!(
+                        tracing::debug!(
                             slot,
                             peer = %msg.from_peer,
                             "SCP envelope waiting for tx set"
@@ -6285,7 +6285,7 @@ impl App {
             return;
         }
 
-        tracing::info!(
+        tracing::debug!(
             current_ledger,
             pending_count = pending_hashes.len(),
             hashes = ?pending_hashes.iter().map(|h| format!("{}...", &hex::encode(h.0)[..8])).collect::<Vec<_>>(),
@@ -6403,7 +6403,7 @@ impl App {
         };
 
         for (hash, peer_id) in requests {
-            tracing::info!(hash = %hash, peer = %peer_id, "Requesting tx set");
+            tracing::debug!(hash = %hash, peer = %peer_id, "Requesting tx set");
             let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
             if let Err(e) = overlay.send_to(&peer_id, request).await {
                 tracing::warn!(hash = %hash, peer = %peer_id, error = %e, "Failed to request TxSet");

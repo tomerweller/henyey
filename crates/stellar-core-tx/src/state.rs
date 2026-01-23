@@ -3018,7 +3018,7 @@ impl LedgerStateManager {
     /// the bucket list sees the final values.
     pub fn flush_deferred_ro_ttl_bumps(&mut self) {
         let bumps = std::mem::take(&mut self.deferred_ro_ttl_bumps);
-        tracing::info!(
+        tracing::debug!(
             count = bumps.len(),
             "flush_deferred_ro_ttl_bumps: starting flush"
         );
@@ -3031,7 +3031,7 @@ impl LedgerStateManager {
                         key_hash: key_hash.clone(),
                         live_until_ledger_seq: live_until,
                     };
-                    tracing::info!(
+                    tracing::debug!(
                         key_hash = ?key_hash,
                         old_live_until = existing.live_until_ledger_seq,
                         new_live_until = live_until,
