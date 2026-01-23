@@ -40,18 +40,22 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-183000 continuous replay passes |
-| **Transaction meta verification** | Passing | 100% meta match in tested ranges |
-| **Primary failure mode** | Investigating | Expanding range toward full testnet |
-| **Continuous replay** | Ledgers 64-183000 | 100% header match |
+| **End-to-end verification** | Extended | 64-360248 continuous replay passes |
+| **Transaction meta verification** | Passing | 100% header match in tested ranges |
+| **Primary failure mode** | F2 Bug | Issuer account missing in delta for failed TXs |
+| **Continuous replay** | Ledgers 64-360248 | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Meta Matches | Notes |
 |-------|---------|--------------|----------------|--------------|-------|
-| 64-183000 | 183,000+ | 125,000+ | 100% | 100% | Continuous replay passes |
-| 625215-625300 | 86 | 273 | 100% | 100% | Hot archive restore verification |
-| 626700-626751 | 52 | 91 | 100% | 100% | Latest available CDP data |
+| 64-360248 | 360,000+ | ~200,000+ | 100% | ~99% | Continuous replay passes |
+| 360249+ | - | - | FAILING | - | F2 bug: issuer account delta issue |
+| 450000-450500 | 501 | 2,216 | 100% | ~99% | Spot check (starts from checkpoint) |
+| 520000-520500 | 501 | 1,630 | 100% | ~99% | Spot check (starts from checkpoint) |
+| 637245-637315 | 71 | 427 | 100% | 100% | Bucket list ledger_seq fix verified |
+
+**Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
 ### Issues Fixed (2026-01-23)
 

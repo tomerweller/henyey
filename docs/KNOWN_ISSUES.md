@@ -111,7 +111,7 @@ This implementation is designed for testnet synchronization only. It should not 
 **Description**:
 When running offline `verify-execution`, certain ledgers show a bucket list hash mismatch due to missing LIVE entries in our delta compared to CDP metadata. The issue manifests when a transaction fails after partially executing operations that involve asset transfers.
 
-**Observed at**: Ledger 203280 (testnet)
+**Observed at**: Ledgers 203280, 360249+ (testnet)
 
 **Symptoms**:
 - CDP expects 10 LIVE entries, we produce 9
@@ -131,6 +131,9 @@ The missing account is the issuer of `USDPEND` token. TX 4 failed with `Payment(
 - Switched from two-phase (fee then execution) to single-phase execution (`deduct_fee=true`) - issue persists
 - The issue is NOT the fee source account rollback (that works correctly)
 - May be related to how payment operations update issuer accounts or how partial success is handled before rollback
+- At ledger 360249: Missing account `2e824db9...` in LIVE delta (CDP expects 9, we produce 8)
+- TX 1 at 360249 has meta diff for `065ef553...` account (STATE change missing)
+- This bug blocks continuous verification beyond ledger 360248
 
 **Files Involved**:
 - `crates/rs-stellar-core/src/main.rs` - `cmd_verify_execution()` around line 3200
