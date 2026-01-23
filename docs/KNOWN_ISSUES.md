@@ -141,40 +141,26 @@ The missing account is the issuer of `USDPEND` token. TX 4 failed with `Payment(
 
 ### F3: Hot Archive Entry Restoration Fails (Protocol 25)
 
-**Status**: Open (CRITICAL)  
+**Status**: FIXED (commit cbdd988)  
 **Impact**: Causes hash mismatches on any ledger with entry restoration  
-**Added**: 2026-01-23
+**Added**: 2026-01-23  
+**Fixed**: 2026-01-23
 
 **Description**:
 Protocol 25 introduced entry restoration from the hot archive. When a Soroban transaction attempts to restore archived entries, our implementation fails to find them in state, causing a bucket list hash mismatch.
 
 **Observed at**: Ledger 637593 (testnet)
 
-**Symptoms**:
-```
-P25: Transaction has archived entries to restore restored_count=3 restored_indices=[12, 13, 14]
-P25: Archived entry being restored but NOT FOUND in state idx=12 key_type=Discriminant(6)
-P25: Archived entry being restored but NOT FOUND in state idx=13 key_type=Discriminant(6)
-P25: Archived entry being restored but NOT FOUND in state idx=14 key_type=Discriminant(6)
-```
-
-The transaction then fails with `HostError: Error(WasmVm, InvalidAction)` because the entries it needs to restore are not available.
-
 **Root Cause**:
-The hot archive bucket list is populated during catchup, but the restoration lookup is failing. Either:
-1. The hot archive entries are not being indexed correctly
-2. The restoration lookup is searching the wrong data structure
-3. The hot archive bucket list hash is computed but the actual entries are not accessible
+The `LedgerSnapshotAdapterP25::get_archived()` method only looked in `LedgerStateManager` (live state). Evicted entries are no longer in the live state - they're in the `HotArchiveBucketList`. The lookup returned "NOT FOUND" causing transaction failures.
 
-**Impact**:
-- Any ledger with entry restoration will fail
-- Validator cannot sync past these ledgers
-- Re-catchup cannot recover (same failure repeats)
+**Solution**:
+Added `HotArchiveLookup` trait in `stellar-core-tx` to enable lookup of evicted entries without depending on `stellar-core-bucket`. The `LedgerSnapshotAdapterP25::get_archived()` method now falls back to the hot archive when an entry is not found in live state.
 
-**Files Involved**:
-- `crates/stellar-core-tx/src/soroban/host.rs` - Entry restoration logic
-- `crates/stellar-core-bucket/src/hot_archive.rs` - Hot archive bucket list
-- `crates/stellar-core-ledger/src/manager.rs` - Hot archive initialization
+**Files Changed**:
+- `crates/stellar-core-tx/src/soroban/mod.rs` - Added `HotArchiveLookup` trait
+- `crates/stellar-core-tx/src/soroban/host.rs` - Updated snapshot adapters with hot archive fallback
+- `crates/stellar-core-ledger/src/execution.rs` - Added `HotArchiveLookupImpl` wrapper
 
 ---
 
