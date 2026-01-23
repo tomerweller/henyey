@@ -144,7 +144,7 @@ The missing account is the issuer of `USDPEND` token. TX 4 failed with `Payment(
 
 ### F3: Hot Archive Entry Restoration Fails (Protocol 25)
 
-**Status**: FIXED (commit cbdd988)  
+**Status**: Partially Fixed (commit cbdd988) - see F4 for related issues  
 **Impact**: Causes hash mismatches on any ledger with entry restoration  
 **Added**: 2026-01-23  
 **Fixed**: 2026-01-23
@@ -160,10 +160,62 @@ The `LedgerSnapshotAdapterP25::get_archived()` method only looked in `LedgerStat
 **Solution**:
 Added `HotArchiveLookup` trait in `stellar-core-tx` to enable lookup of evicted entries without depending on `stellar-core-bucket`. The `LedgerSnapshotAdapterP25::get_archived()` method now falls back to the hot archive when an entry is not found in live state.
 
+**Note**: This fix addresses the restoration lookup path, but the underlying hot archive bucket list may still have issues with eviction (see F4). The fix has not been validated with actual restoration transactions since F4 prevents reaching them.
+
 **Files Changed**:
 - `crates/stellar-core-tx/src/soroban/mod.rs` - Added `HotArchiveLookup` trait
 - `crates/stellar-core-tx/src/soroban/host.rs` - Updated snapshot adapters with hot archive fallback
 - `crates/stellar-core-ledger/src/execution.rs` - Added `HotArchiveLookupImpl` wrapper
+
+---
+
+### F4: Eviction-Related Bucket List Hash Mismatch
+
+**Status**: Open (CRITICAL)  
+**Impact**: Causes hash mismatches on ledgers with entry eviction  
+**Added**: 2026-01-23
+
+**Description**:
+When entries are evicted from the live bucket list to the hot archive during ledger close, the computed bucket list hash diverges from the network's expected hash. This is a **different bug from F3** (restoration failure).
+
+**Observed at**: Ledgers 638670, 638737, 638938 (testnet)
+
+**Symptoms**:
+- Hash mismatch occurs on ledgers with `archived_count > 0` (eviction happening)
+- `restored_count = 0` (no restoration attempted)
+- The live bucket list hash is computed, but the combined hash differs from network
+- Re-catchup does not resolve - the same ledger fails again
+
+**Example from ledger 638938**:
+```
+Bucket list hash computation ledger_seq=638938 
+  live_hash=2a358bc79b162929bf430c00781f3a0cde90379cb59caeca35223be367624002 
+  pre_hot_hash=d01098b39647a140d57c03b600df49f2222b3c942765944fada47da18bcb92ff 
+  post_hot_hash=8a8a28f5af4de00aa947c32a97d9e413a99ac7ee02a3e35e0e1e98cedd8a0f58 
+  combined_hash=18d804eae377ae284491a299cf27583389c8cc41e0834562759eaa42aa6994e8 
+  archived_count=1 restored_count=0
+
+Hash mismatch:
+  our_hash=01a052e0c9d825e139b39f64d2c0bdbebc4b20402d65e4eb425a27ef1c62056b
+  network_prev_hash=49e7b351142d86d6fd882ff1e00ad288d4aa8a135ec8b2dc5b04574f3c9d483b
+```
+
+**Root Cause (suspected)**:
+The eviction process or hot archive bucket list update during eviction differs from C++ stellar-core. Possible issues:
+1. Hot archive entry format differs (Archived vs Live entry types)
+2. Hot archive bucket list merge timing differs
+3. Combined bucket list hash computation (live + hot archive) is wrong
+4. Evicted entries are being added to hot archive incorrectly
+
+**Investigation Notes**:
+- F3 fix (hot archive lookup for restoration) was implemented but these mismatches occur WITHOUT restoration
+- The `pre_hot_hash` → `post_hot_hash` change indicates hot archive is being modified
+- Need to compare eviction behavior with C++ stellar-core
+
+**Files Involved**:
+- `crates/stellar-core-ledger/src/manager.rs` - Eviction scan and hot archive update
+- `crates/stellar-core-bucket/src/hot_archive.rs` - Hot archive bucket list operations
+- `crates/stellar-core-bucket/src/bucket_list.rs` - Combined hash computation
 
 ---
 
@@ -199,6 +251,18 @@ This section logs ledger sequences where hash mismatches occurred during testnet
 | 637593 | 15:50:20 | `52917696...` | `b6ee1628...` | F3: Entry restoration failed |
 
 **Root Cause**: Ledger 637593 contained a transaction requiring restoration of 3 archived CONTRACT_DATA entries. Our hot archive lookup returned NOT FOUND for all 3 entries.
+
+### Session: 2026-01-23 16:44 - 17:44 UTC
+
+**Summary**: Multiple hash mismatches due to F4 (eviction-related bucket list hash mismatch).
+
+| Ledger | Timestamp (UTC) | Our Hash (truncated) | Network Hash (truncated) | Cause |
+|--------|-----------------|----------------------|--------------------------|-------|
+| 638670 | 17:20:16 | `1031bae8...` | `95868c1c...` | F4: Eviction hash mismatch |
+| 638737 | 17:25:47 | `4b477c50...` | `fbca4311...` | F4: Eviction hash mismatch |
+| 638938 | 17:42:38 | `01a052e0...` | `49e7b351...` | F4: Eviction hash mismatch |
+
+**Pattern**: All failing ledgers have `archived_count > 0` indicating entries were evicted to hot archive during that ledger close. No restoration was attempted (`restored_count = 0`).
 
 ---
 
