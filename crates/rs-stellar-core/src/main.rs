@@ -3329,14 +3329,20 @@ async fn cmd_verify_execution(
                                 stellar_core_common::NetworkId(config.network_id()),
                             );
                             if let Some(soroban_data) = frame.soroban_data() {
-                                if let Some(ref mut our_meta) = result.tx_meta {
-                                    augment_soroban_ttl_metadata(
-                                        our_meta,
-                                        &soroban_data.resources.footprint,
-                                        &ledger_start_ttls,
-                                        executor,
-                                        seq,
-                                    );
+                                if let Some(ref mut _our_meta) = result.tx_meta {
+                                    // DISABLED: This was incorrectly adding TTL changes from other
+                                    // transactions in the same ledger. The function compared
+                                    // ledger-start TTL vs current TTL, which meant if TX 6 changed
+                                    // an entry's TTL, TX 7 would also show that change if the entry
+                                    // was in TX 7's footprint.
+                                    // augment_soroban_ttl_metadata(
+                                    //     our_meta,
+                                    //     &soroban_data.resources.footprint,
+                                    //     &ledger_start_ttls,
+                                    //     executor,
+                                    //     seq,
+                                    // );
+                                    let _ = (&soroban_data, &ledger_start_ttls, seq);
                                 }
                             }
 
@@ -3386,12 +3392,40 @@ async fn cmd_verify_execution(
                                 if let stellar_xdr::curr::TransactionMeta::V4(v4) = &tx_info.meta {
                                     if let Some(ref soroban_meta) = v4.soroban_meta {
                                         if let stellar_xdr::curr::SorobanTransactionMetaExt::V1(ref ext) = soroban_meta.ext {
+                                            // Print CDP values
                                             println!("    CDP soroban_meta: rent_fee_charged={}, refundable_fee_charged={}, non_refundable_fee_charged={}",
                                                 ext.rent_fee_charged,
                                                 ext.total_refundable_resource_fee_charged,
                                                 ext.total_non_refundable_resource_fee_charged);
                                         }
                                     }
+                                }
+                                // Print our values from tx_meta
+                                if let Some(our_meta) = &result.tx_meta {
+                                    match our_meta {
+                                        stellar_xdr::curr::TransactionMeta::V4(our_v4) => {
+                                            if let Some(ref our_soroban_meta) = our_v4.soroban_meta {
+                                                if let stellar_xdr::curr::SorobanTransactionMetaExt::V1(ref our_ext) = our_soroban_meta.ext {
+                                                    println!("    OUR soroban_meta: rent_fee_charged={}, refundable_fee_charged={}, non_refundable_fee_charged={}",
+                                                        our_ext.rent_fee_charged,
+                                                        our_ext.total_refundable_resource_fee_charged,
+                                                        our_ext.total_non_refundable_resource_fee_charged);
+                                                } else {
+                                                    println!("    OUR soroban_meta: ext is V0");
+                                                }
+                                            } else {
+                                                println!("    OUR tx_meta is V4 but no soroban_meta");
+                                            }
+                                        }
+                                        stellar_xdr::curr::TransactionMeta::V3(_) => {
+                                            println!("    OUR tx_meta is V3");
+                                        }
+                                        _ => {
+                                            println!("    OUR tx_meta is other version");
+                                        }
+                                    }
+                                } else {
+                                    println!("    No tx_meta from our execution");
                                 }
                             }
 
@@ -3405,12 +3439,14 @@ async fn cmd_verify_execution(
                             // For fee bump transactions with separate fee source, fee changes are
                             // already in the CDP meta, so we don't need to prepend them
                             let (tx_meta_matches, meta_diffs) = match &result.tx_meta {
-                                Some(our_meta) => compare_transaction_meta(
-                                    our_meta,
-                                    &tx_info.meta,
-                                    None,
-                                    show_diff,
-                                ),
+                                Some(our_meta) => {
+                                    compare_transaction_meta(
+                                        our_meta,
+                                        &tx_info.meta,
+                                        None,
+                                        show_diff,
+                                    )
+                                },
                                 None => (
                                     false,
                                     vec!["We produced no meta but CDP has some".to_string()],
@@ -3523,6 +3559,11 @@ async fn cmd_verify_execution(
                     ConfigSettingEntry, ConfigSettingId, LedgerEntryChange, LedgerEntryData,
                     LedgerEntryExt,
                 };
+
+                // Flush deferred read-only TTL bumps to the delta before extracting entries
+                // for bucket list. These are TTL updates for read-only entries that were NOT
+                // included in transaction meta but MUST be written to the bucket list.
+                executor.state_mut().flush_deferred_ro_ttl_bumps();
 
                 // Get entries from our executor's delta
                 // created_entries = init (new entries), updated_entries = live (modified entries)
@@ -5379,7 +5420,7 @@ fn describe_change(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
             LedgerEntryData::ContractData(_) => "ContractData".to_string(),
             LedgerEntryData::ContractCode(_) => "ContractCode".to_string(),
             LedgerEntryData::ConfigSetting(_) => "ConfigSetting".to_string(),
-            LedgerEntryData::Ttl(_) => "Ttl".to_string(),
+            LedgerEntryData::Ttl(t) => format!("Ttl(key={:02x}{:02x}... live_until={})", t.key_hash.0[0], t.key_hash.0[1], t.live_until_ledger_seq),
         }
     }
 

@@ -786,7 +786,7 @@ fn apply_soroban_storage_changes(
     }
 
     // Apply all storage changes from the host
-    for change in changes {
+    for change in changes.iter() {
         tracing::debug!(
             key_type = ?std::mem::discriminant(&change.key),
             has_new_entry = change.new_entry.is_some(),
@@ -912,9 +912,18 @@ fn apply_soroban_storage_change(
         }
 
         // Apply TTL if present for contract entries.
-        // When data is modified (new_entry exists), always emit TTL if present.
-        // When data is NOT modified (TTL-only change), only emit TTL if it was extended.
-        // C++ stellar-core follows this same logic.
+        //
+        // CRITICAL: We must use the `ttl_extended` flag from the host to determine whether
+        // to emit a TTL update, NOT compare against our current state. This is because:
+        // 1. Multiple transactions in the same ledger may modify the same entry's TTL
+        // 2. The host computes ttl_extended based on the ledger state at the START of the ledger
+        // 3. Our state reflects changes from all previous transactions in this ledger
+        //
+        // Example: TX 5 extends TTL from 682237->700457, TX 7 also extends the same entry.
+        // - TX 7's host sees old_ttl=682237, new_ttl=700457, so ttl_extended=true
+        // - But our state already has 700457 from TX 5
+        // - If we compare against state, we'd skip emission (700457==700457)
+        // - But C++ emits it because from the ledger-start perspective, TTL WAS extended
         //
         // For hot archive restores, the TTL entry is also being restored so we use create.
         // Note: TTL keys are not directly in archived_soroban_entries, but when the associated
@@ -938,27 +947,37 @@ fn apply_soroban_storage_change(
                 if is_hot_archive_restore {
                     tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
                     state.create_ttl(ttl);
-                } else if let Some(existing) = existing_ttl {
-                    // Only emit TTL update if the value actually changed.
-                    // C++ stellar-core doesn't emit bucket list updates for unchanged values.
-                    if existing.live_until_ledger_seq != live_until {
+                } else if change.ttl_extended {
+                    // TTL was extended from the host's perspective (based on ledger-start state).
+                    // We must emit this update even if our current state already has this value
+                    // (e.g., from an earlier tx in the same ledger).
+                    if existing_ttl.is_some() {
                         tracing::debug!(
                             ?key_hash,
                             live_until,
-                            old_live_until = existing.live_until_ledger_seq,
-                            "TTL emit: data modified, TTL changed"
+                            ttl_extended = change.ttl_extended,
+                            "TTL emit: data modified, TTL extended"
                         );
                         state.update_ttl(ttl);
                     } else {
                         tracing::debug!(
                             ?key_hash,
                             live_until,
-                            "TTL skip: data modified but TTL unchanged"
+                            "TTL emit: new TTL entry (extended)"
                         );
+                        state.create_ttl(ttl);
                     }
-                } else {
+                } else if existing_ttl.is_none() {
+                    // New entry being created - emit TTL
                     tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
                     state.create_ttl(ttl);
+                } else {
+                    // TTL was NOT extended and entry already exists - skip emission
+                    tracing::debug!(
+                        ?key_hash,
+                        live_until,
+                        "TTL skip: data modified but TTL not extended"
+                    );
                 }
             }
         }
@@ -976,17 +995,34 @@ fn apply_soroban_storage_change(
                 key_hash: key_hash.clone(),
                 live_until_ledger_seq: live_until,
             };
-            tracing::debug!(
-                ?key_hash,
-                live_until,
-                existing = existing_ttl.is_some(),
-                key_type = ?std::mem::discriminant(&change.key),
-                "TTL emit: ttl-only extended"
-            );
-            if existing_ttl.is_some() {
-                state.update_ttl(ttl);
+
+            // Read-only TTL bumps: C++ includes them in transaction meta but defers state updates.
+            // Transaction meta is built from the op result (which has all TTL changes).
+            // State visibility is deferred so subsequent TXs don't see the bump.
+            // Per C++ stellar-core, RO TTL bumps ARE in transaction meta but deferred for state.
+            if change.is_read_only_ttl_bump {
+                tracing::debug!(
+                    ?key_hash,
+                    live_until,
+                    existing = existing_ttl.is_some(),
+                    "TTL RO bump: recording in delta for meta, deferring state update"
+                );
+                // Record in delta for transaction meta, but defer state update
+                // so subsequent TXs in this ledger don't see the bumped value
+                state.record_ro_ttl_bump_for_meta(&key_hash, live_until);
             } else {
-                state.create_ttl(ttl);
+                tracing::debug!(
+                    ?key_hash,
+                    live_until,
+                    existing = existing_ttl.is_some(),
+                    key_type = ?std::mem::discriminant(&change.key),
+                    "TTL emit: ttl-only extended"
+                );
+                if existing_ttl.is_some() {
+                    state.update_ttl(ttl);
+                } else {
+                    state.create_ttl(ttl);
+                }
             }
         }
     } else {
@@ -1649,6 +1685,7 @@ mod tests {
             live_until: Some(200),
             ttl_extended: false,
             is_rent_related: false,
+            is_read_only_ttl_bump: false,
         };
 
         let no_restored_keys = std::collections::HashSet::new();
@@ -1666,6 +1703,7 @@ mod tests {
             live_until: None,
             ttl_extended: false,
             is_rent_related: false,
+            is_read_only_ttl_bump: false,
         };
 
         apply_soroban_storage_change(&mut state, &delete_change, &no_restored_keys);
@@ -1762,6 +1800,7 @@ mod tests {
             live_until: Some(226129), // Same TTL as before
             ttl_extended: false,
             is_rent_related: true, // This was true in the actual ledger
+            is_read_only_ttl_bump: false,
         };
 
         let no_restored_keys = std::collections::HashSet::new();
@@ -1908,6 +1947,7 @@ mod tests {
             live_until: Some(200),
             ttl_extended: false,
             is_rent_related: false,
+            is_read_only_ttl_bump: false,
         };
 
         let changes = vec![change];
@@ -1952,6 +1992,7 @@ mod tests {
             live_until: Some(200),
             ttl_extended: false,
             is_rent_related: false,
+            is_read_only_ttl_bump: false,
         };
 
         let changes = vec![change];
@@ -2014,6 +2055,7 @@ mod tests {
             live_until: Some(250000),
             ttl_extended: false,
             is_rent_related: false,
+            is_read_only_ttl_bump: false,
         };
 
         // Case 1: Entry exists in state, NOT in hot_archive_keys -> should use update (LIVE)

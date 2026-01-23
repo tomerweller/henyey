@@ -69,10 +69,10 @@ use stellar_xdr::curr::{
     OperationBody, OperationMetaV2, OperationResult, OperationResultTr,
     PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress,
     SignerKey, SorobanTransactionData, SorobanTransactionDataExt, SorobanTransactionMetaExt,
-    SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
-    TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultExt,
-    TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset,
-    TrustLineFlags, VecM, WriteXdr,
+    SorobanTransactionMetaExtV1, SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent,
+    TransactionEventStage, TransactionMeta, TransactionMetaV4, TransactionResult,
+    TransactionResultExt, TransactionResultMetaV1, TransactionResultPair, TransactionResultResult,
+    TrustLineAsset, TrustLineFlags, VecM, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -552,6 +552,7 @@ pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNet
 }
 
 struct RefundableFeeTracker {
+    non_refundable_fee: i64,
     max_refundable_fee: i64,
     consumed_event_size_bytes: u32,
     consumed_rent_fee: i64,
@@ -559,8 +560,9 @@ struct RefundableFeeTracker {
 }
 
 impl RefundableFeeTracker {
-    fn new(max_refundable_fee: i64) -> Self {
+    fn new(non_refundable_fee: i64, max_refundable_fee: i64) -> Self {
         Self {
+            non_refundable_fee,
             max_refundable_fee,
             consumed_event_size_bytes: 0,
             consumed_rent_fee: 0,
@@ -2160,7 +2162,10 @@ impl TransactionExecutor {
             .unwrap_or((0, 0));
             let declared_fee = frame.declared_soroban_resource_fee();
             let max_refundable_fee = declared_fee.saturating_sub(non_refundable_fee);
-            Some(RefundableFeeTracker::new(max_refundable_fee))
+            Some(RefundableFeeTracker::new(
+                non_refundable_fee,
+                max_refundable_fee,
+            ))
         } else {
             None
         };
@@ -2743,7 +2748,14 @@ impl TransactionExecutor {
 
         let post_fee_changes = empty_entry_changes();
         let mut fee_refund = 0i64;
+        let mut soroban_fee_info = None;
         if let Some(tracker) = refundable_fee_tracker {
+            // Extract fee tracking info for soroban meta before consuming tracker
+            soroban_fee_info = Some((
+                tracker.non_refundable_fee,
+                tracker.consumed_refundable_fee,
+                tracker.consumed_rent_fee,
+            ));
             let refund = tracker.refund_amount();
             // For protocol < 23, apply refund immediately to the transaction's delta.
             // For protocol >= 23, refund is applied after ALL transactions in the tx set,
@@ -2772,7 +2784,19 @@ impl TransactionExecutor {
             tx_events,
             soroban_return_value,
             diagnostic_events,
+            soroban_fee_info,
         );
+
+        // Debug: verify meta structure immediately after building
+        if let TransactionMeta::V4(v4) = &tx_meta {
+            let ops_sum: usize = v4.operations.iter().map(|op| op.changes.len()).sum();
+            tracing::debug!(
+                "execute_transaction: meta built - tx_changes_before={}, ops_changes_sum={}, tx_changes_after={}",
+                v4.tx_changes_before.len(),
+                ops_sum,
+                v4.tx_changes_after.len()
+            );
+        }
 
         Ok(TransactionExecutionResult {
             success: all_success,
@@ -3832,6 +3856,101 @@ fn build_entry_changes_with_hot_archive(
     restored: &RestoredEntries,
     footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
 ) -> LedgerEntryChanges {
+    // Debug: log all vectors sizes and entry types
+    fn entry_type_name(entry: &LedgerEntry) -> &'static str {
+        match &entry.data {
+            stellar_xdr::curr::LedgerEntryData::Account(_) => "Account",
+            stellar_xdr::curr::LedgerEntryData::Trustline(_) => "Trustline",
+            stellar_xdr::curr::LedgerEntryData::Offer(_) => "Offer",
+            stellar_xdr::curr::LedgerEntryData::Data(_) => "Data",
+            stellar_xdr::curr::LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance",
+            stellar_xdr::curr::LedgerEntryData::LiquidityPool(_) => "LiquidityPool",
+            stellar_xdr::curr::LedgerEntryData::ContractData(_) => "ContractData",
+            stellar_xdr::curr::LedgerEntryData::ContractCode(_) => "ContractCode",
+            stellar_xdr::curr::LedgerEntryData::ConfigSetting(_) => "ConfigSetting",
+            stellar_xdr::curr::LedgerEntryData::Ttl(_) => "Ttl",
+        }
+    }
+
+    // Log all created entries
+    tracing::debug!(
+        "build_entry_changes: VECTORS created={}, updated={}, deleted={}, change_order={}",
+        created.len(),
+        updated.len(),
+        deleted.len(),
+        change_order.len()
+    );
+    for (i, entry) in created.iter().enumerate() {
+        tracing::debug!(
+            "build_entry_changes: created[{}] = {}",
+            i,
+            entry_type_name(entry)
+        );
+    }
+    for (i, entry) in updated.iter().enumerate() {
+        tracing::debug!(
+            "build_entry_changes: updated[{}] = {}",
+            i,
+            entry_type_name(entry)
+        );
+    }
+    // Log change_order
+    for (i, change_ref) in change_order.iter().enumerate() {
+        tracing::debug!(
+            "build_entry_changes: change_order[{}] = {:?}",
+            i,
+            change_ref
+        );
+    }
+
+    // Debug: log all created entries to see TTL
+    for (i, entry) in created.iter().enumerate() {
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+            tracing::debug!(
+                "build_entry_changes: CREATED vector contains TTL at idx={}, key_hash={:x?}, live_until={}",
+                i,
+                &ttl.key_hash.0[..8],
+                ttl.live_until_ledger_seq
+            );
+        }
+    }
+    // Debug: log all updated entries to see if any are TTL
+    for (i, entry) in updated.iter().enumerate() {
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+            tracing::debug!(
+                "build_entry_changes: UPDATED vector contains TTL at idx={}, key_hash={:x?}, live_until={}",
+                i,
+                &ttl.key_hash.0[..8],
+                ttl.live_until_ledger_seq
+            );
+        }
+    }
+    // Debug: log change_order
+    for (i, change_ref) in change_order.iter().enumerate() {
+        match change_ref {
+            stellar_core_tx::ChangeRef::Created(idx) => {
+                if *idx < created.len() {
+                    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &created[*idx].data {
+                        tracing::debug!(
+                            "build_entry_changes: change_order[{}] = Created({}) -> TTL key_hash={:x?}, live_until={}",
+                            i, idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
+                        );
+                    }
+                }
+            }
+            stellar_core_tx::ChangeRef::Updated(idx) => {
+                if *idx < updated.len() {
+                    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &updated[*idx].data {
+                        tracing::debug!(
+                            "build_entry_changes: change_order[{}] = Updated({}) -> TTL key_hash={:x?}, live_until={}",
+                            i, idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
         crate::delta::entry_to_key(entry)
             .ok()
@@ -4010,6 +4129,13 @@ fn build_entry_changes_with_hot_archive(
                 ChangeGroup::SingleUpdate { idx } => {
                     if idx < updated.len() {
                         let post_state = &updated[idx];
+                        // Debug: trace when processing TTL update
+                        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
+                            tracing::debug!(
+                                "build_entry_changes: SingleUpdate processing TTL idx={}, key_hash={:x?}, live_until={}",
+                                idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
+                            );
+                        }
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
                             // Skip TTL updates for entries in the read-only footprint.
                             // In C++ stellar-core, these are accumulated in mRoTTLBumps and not
@@ -4032,6 +4158,26 @@ fn build_entry_changes_with_hot_archive(
                                         .cloned()
                                         .or_else(|| state.snapshot_entry(&key))
                                 };
+                                // Debug: trace TTL pre_state
+                                if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) =
+                                    &post_state.data
+                                {
+                                    if let Some(ref state_entry) = pre_state {
+                                        if let stellar_xdr::curr::LedgerEntryData::Ttl(pre_ttl) =
+                                            &state_entry.data
+                                        {
+                                            tracing::debug!(
+                                                "build_entry_changes: TTL STATE+UPDATED: pre live_until={}, post live_until={}",
+                                                pre_ttl.live_until_ledger_seq, ttl.live_until_ledger_seq
+                                            );
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "build_entry_changes: TTL UPDATED without pre_state! key_hash={:x?}",
+                                            &ttl.key_hash.0[..8]
+                                        );
+                                    }
+                                }
                                 if let Some(state_entry) = pre_state {
                                     changes.push(LedgerEntryChange::State(state_entry));
                                 }
@@ -4253,6 +4399,18 @@ fn build_entry_changes_with_hot_archive(
         }
     }
 
+    // Debug: log final output
+    for (i, change) in changes.iter().enumerate() {
+        let change_type = match change {
+            LedgerEntryChange::State(_) => "STATE",
+            LedgerEntryChange::Created(_) => "CREATED",
+            LedgerEntryChange::Updated(_) => "UPDATED",
+            LedgerEntryChange::Restored(_) => "RESTORED",
+            LedgerEntryChange::Removed(_) => "REMOVED",
+        };
+        tracing::debug!("build_entry_changes: OUTPUT[{}] = {}", i, change_type);
+    }
+
     LedgerEntryChanges(changes.try_into().unwrap_or_default())
 }
 
@@ -4267,7 +4425,17 @@ fn build_transaction_meta(
     tx_events: Vec<TransactionEvent>,
     soroban_return_value: Option<stellar_xdr::curr::ScVal>,
     diagnostic_events: Vec<DiagnosticEvent>,
+    soroban_fee_info: Option<(i64, i64, i64)>, // (non_refundable, refundable_consumed, rent_consumed)
 ) -> TransactionMeta {
+    // Debug: log tx_changes_before and op_changes counts
+    let tx_before_count = tx_changes_before.len();
+    let op_counts: Vec<usize> = op_changes.iter().map(|c| c.len()).collect();
+    let total_op_changes: usize = op_counts.iter().sum();
+    tracing::debug!(
+        "build_transaction_meta: tx_changes_before={}, op_changes={:?}, total_op_changes={}, grand_total={}",
+        tx_before_count, op_counts, total_op_changes, tx_before_count + total_op_changes
+    );
+
     let operations: Vec<OperationMetaV2> = op_changes
         .into_iter()
         .zip(op_events)
@@ -4280,8 +4448,19 @@ fn build_transaction_meta(
 
     let has_soroban = soroban_return_value.is_some() || !diagnostic_events.is_empty();
     let soroban_meta = if has_soroban {
+        let ext =
+            if let Some((non_refundable, refundable_consumed, rent_consumed)) = soroban_fee_info {
+                SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
+                    ext: ExtensionPoint::V0,
+                    total_non_refundable_resource_fee_charged: non_refundable,
+                    total_refundable_resource_fee_charged: refundable_consumed,
+                    rent_fee_charged: rent_consumed,
+                })
+            } else {
+                SorobanTransactionMetaExt::V0
+            };
         Some(SorobanTransactionMetaV2 {
-            ext: SorobanTransactionMetaExt::V0,
+            ext,
             return_value: soroban_return_value,
         })
     } else {
@@ -4307,6 +4486,7 @@ fn empty_transaction_meta() -> TransactionMeta {
         Vec::new(),
         None,
         Vec::new(),
+        None,
     )
 }
 
@@ -5020,6 +5200,11 @@ pub fn execute_transaction_set_with_fee_mode(
             );
         }
     }
+
+    // Flush deferred read-only TTL bumps to the delta before applying to bucket list.
+    // These are TTL updates for read-only entries that were NOT included in transaction
+    // meta but MUST be written to the bucket list.
+    executor.state_mut().flush_deferred_ro_ttl_bumps();
 
     // Apply all changes to the delta
     executor.apply_to_delta(snapshot, delta)?;

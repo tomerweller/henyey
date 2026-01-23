@@ -384,6 +384,12 @@ impl OperationMetaBuilder {
         if !self.enabled {
             return;
         }
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+            tracing::debug!(
+                key_hash = ?ttl.key_hash,
+                "OperationMetaBuilder::record_create for Ttl"
+            );
+        }
         self.changes.push(LedgerEntryChange::Created(entry));
     }
 
@@ -393,6 +399,12 @@ impl OperationMetaBuilder {
     pub fn record_update(&mut self, pre_state: LedgerEntry, post_state: LedgerEntry) {
         if !self.enabled {
             return;
+        }
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
+            tracing::debug!(
+                key_hash = ?ttl.key_hash,
+                "OperationMetaBuilder::record_update for Ttl"
+            );
         }
         self.changes.push(LedgerEntryChange::State(pre_state));
         self.changes.push(LedgerEntryChange::Updated(post_state));

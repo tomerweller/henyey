@@ -188,6 +188,12 @@ impl LedgerDelta {
 
     /// Record a created entry.
     pub fn record_create(&mut self, entry: LedgerEntry) {
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+            tracing::debug!(
+                key_hash = ?ttl.key_hash,
+                "LedgerDelta::record_create for Ttl"
+            );
+        }
         let idx = self.created.len();
         self.created.push(entry);
         self.change_order.push(ChangeRef::Created(idx));
@@ -198,10 +204,43 @@ impl LedgerDelta {
     /// `pre_state` is the entry value BEFORE the modification.
     /// `post_state` is the entry value AFTER the modification.
     pub fn record_update(&mut self, pre_state: LedgerEntry, post_state: LedgerEntry) {
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
+            tracing::debug!(
+                key_hash = ?ttl.key_hash,
+                "LedgerDelta::record_update for Ttl"
+            );
+        }
         let idx = self.updated.len();
         self.update_states.push(pre_state);
         self.updated.push(post_state);
         self.change_order.push(ChangeRef::Updated(idx));
+    }
+
+    /// Update a TTL entry that was previously created in the same transaction.
+    ///
+    /// This is used when a TTL is extended after creation - we want the CREATED
+    /// entry to reflect the final value, not the initial value, without emitting
+    /// a separate STATE+UPDATED pair.
+    pub fn update_created_ttl(
+        &mut self,
+        key_hash: &stellar_xdr::curr::Hash,
+        ttl_entry: &stellar_xdr::curr::TtlEntry,
+    ) {
+        use stellar_xdr::curr::LedgerEntryData;
+
+        // Find the TTL entry in created with matching key_hash
+        for entry in &mut self.created {
+            if let LedgerEntryData::Ttl(ttl) = &entry.data {
+                if ttl.key_hash == *key_hash {
+                    // Update the TTL value in the created entry
+                    entry.data = LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
+                        key_hash: key_hash.clone(),
+                        live_until_ledger_seq: ttl_entry.live_until_ledger_seq,
+                    });
+                    return;
+                }
+            }
+        }
     }
 
     /// Record a deleted entry with its pre-state.

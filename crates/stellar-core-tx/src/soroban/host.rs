@@ -105,6 +105,11 @@ pub struct StorageChange {
     /// Whether the entry was included due to rent calculations (old_entry_size_bytes_for_rent > 0).
     /// Rent-related read-only entries should still emit TTL updates.
     pub is_rent_related: bool,
+    /// Whether this is a read-only entry with only a TTL change (no data modification).
+    /// Such changes should be applied to state (bucket list) but NOT included in transaction meta.
+    /// This matches C++ stellar-core's behavior per CAP-0063: read-only TTL bumps are accumulated
+    /// separately and flushed at write barriers, not in individual transaction meta.
+    pub is_read_only_ttl_bump: bool,
 }
 
 /// Persistent module cache that can be reused across transactions.
@@ -651,19 +656,28 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
 
 /// Get the TTL for a ledger entry.
 ///
-/// This function uses the bucket list TTL snapshot captured at ledger start,
-/// not the current in-memory TTL values. This ensures Soroban sees the same
-/// TTL values as C++ stellar-core, which uses the bucket list state at ledger
-/// start rather than reflecting changes from previous transactions in the same ledger.
+/// This function returns the CURRENT TTL value (after any modifications by earlier
+/// transactions in this ledger), not the ledger-start TTL. This matches C++ stellar-core
+/// behavior where the Soroban host computes rent fees based on the current state.
+///
+/// If TX 6 extends an entry's TTL from 682237 → 700457, TX 7 accessing the same entry
+/// will see old_live_until=700457 (the post-TX-6 value) and NOT pay rent for the extension.
+/// This is the correct behavior because only one transaction should pay rent for a TTL
+/// extension in a given ledger.
+///
+/// Note: TTL emission determination (whether to emit TTL to bucket list) still
+/// needs to compare against ledger-start TTL, which is handled separately in
+/// the storage_changes filter.
 fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             // Compute key hash for TTL lookup
             let key_hash = compute_key_hash(key);
-            // Use the bucket list snapshot for TTL lookup to match C++ behavior.
-            // This ensures transactions see TTL values at ledger start, not changes
-            // from previous transactions in the same ledger.
-            let ttl = state.get_ttl_at_ledger_start(&key_hash);
+            // Use CURRENT TTL for rent fee calculation. This matches C++ stellar-core
+            // behavior where the Soroban host computes rent fees based on the current state.
+            // If an earlier transaction already extended the TTL, we should see the new value
+            // and not pay rent for it again.
+            let ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
             if let Some(live_until) = ttl {
                 if live_until < current_ledger {
                     tracing::warn!(
@@ -1588,35 +1602,71 @@ fn execute_host_function_p24(
     let storage_changes = result.ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // Include entries that:
-            // 1. Have a new value (were created or modified), OR
-            // 2. Are NOT read-only and have no new value (were deleted), OR
-            // 3. Are involved in rent calculations (old_entry_size_bytes_for_rent > 0), OR
-            // 4. Have a TTL that was actually extended (new > old)
-            // Skip read-only entries that weren't modified, not involved in rent, and didn't have TTL extended.
-            // C++ stellar-core only includes TTL changes when TTL is extended.
+            // C++ stellar-core behavior for transaction meta emission:
+            //
+            // 1. For read-WRITE entries: Include in meta if modified, deleted, or TTL extended
+            // 2. For read-ONLY entries: TTL-only changes should be applied to state (bucket list)
+            //    but NOT included in transaction meta. C++ accumulates read-only TTL bumps
+            //    separately (mRoTTLBumps) and flushes them at write barriers, NOT in individual
+            //    transaction meta. This is per CAP-0063.
+            //
+            // We track read-only TTL bumps with is_read_only_ttl_bump flag so they can be:
+            // - Applied to state (bucket list correctness)
+            // - Filtered out when building transaction meta
+            
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
-            let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
+            
+            // Determine if TTL was extended from the LEDGER-START perspective.
+            // We pass current TTL to the host for rent calculation, but for emission
+            // determination we need to compare against ledger-start TTL.
             let ttl_extended = change
                 .ttl_change
                 .as_ref()
-                .map(|ttl| ttl.new_live_until_ledger > ttl.old_live_until_ledger)
+                .map(|ttl| {
+                    // Compare new TTL against ledger-start TTL, not host's old_live_until
+                    let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok();
+                    if let Some(ref key) = key {
+                        let key_hash = compute_key_hash(key);
+                        let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
+                        ttl.new_live_until_ledger > ledger_start_ttl
+                    } else {
+                        // Fallback to host's comparison if we can't decode the key
+                        ttl.new_live_until_ledger > ttl.old_live_until_ledger
+                    }
+                })
                 .unwrap_or(false);
+            
+            // A read-only TTL bump is when:
+            // - Entry is read-only
+            // - Entry wasn't modified (no encoded_new_value)
+            // - TTL was extended
+            // These should be applied to state but NOT included in transaction meta.
+            let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
+            
+            // Include entries that:
+            // 1. Have a new value (were created or modified), OR
+            // 2. Are NOT read-only and have no new value (were deleted), OR
+            // 3. Have a TTL that was extended (for bucket list updates)
+            // Note: read-only TTL bumps ARE included (for state/bucket list) but marked
+            // so they can be filtered from transaction meta.
+            let should_include = is_modification || is_deletion || ttl_extended;
 
-            if is_modification || is_deletion || ttl_extended {
+            if should_include {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
                 let new_entry = change.encoded_new_value.and_then(|bytes| {
                     LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
                 });
                 // Get TTL from ttl_change if present
                 let live_until = change.ttl_change.map(|ttl| ttl.new_live_until_ledger);
+                let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
                 Some(StorageChange {
                     key,
                     new_entry,
                     live_until,
                     ttl_extended,
                     is_rent_related,
+                    is_read_only_ttl_bump,
                 })
             } else {
                 tracing::info!(
@@ -2010,21 +2060,39 @@ fn execute_host_function_p25(
         .ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // Include entries that:
-            // 1. Have a new value (were created or modified), OR
-            // 2. Are NOT read-only and have no new value (were deleted), OR
-            // 3. Are involved in rent calculations (old_entry_size_bytes_for_rent > 0), OR
-            // 4. Have a TTL that was actually extended (new > old)
-            // Skip read-only entries that weren't modified, not involved in rent, and didn't have TTL extended.
-            // C++ stellar-core only includes TTL changes when TTL is extended.
+            // C++ stellar-core behavior for transaction meta emission:
+            //
+            // 1. For read-WRITE entries: Include in meta if modified, deleted, or TTL extended
+            // 2. For read-ONLY entries: TTL-only changes should be applied to state (bucket list)
+            //    but NOT included in transaction meta. C++ accumulates read-only TTL bumps
+            //    separately (mRoTTLBumps) and flushes them at write barriers, NOT in individual
+            //    transaction meta. This is per CAP-0063.
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
             let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
+
+            // Determine if TTL was extended from the LEDGER-START perspective.
             let ttl_extended = change
                 .ttl_change
                 .as_ref()
-                .map(|ttl| ttl.new_live_until_ledger > ttl.old_live_until_ledger)
+                .map(|ttl| {
+                    // Compare new TTL against ledger-start TTL, not host's old_live_until
+                    let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok();
+                    if let Some(ref key) = key {
+                        let key_hash = compute_key_hash(key);
+                        let ledger_start_ttl =
+                            state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
+                        ttl.new_live_until_ledger > ledger_start_ttl
+                    } else {
+                        // Fallback to host's comparison if we can't decode the key
+                        ttl.new_live_until_ledger > ttl.old_live_until_ledger
+                    }
+                })
                 .unwrap_or(false);
+
+            // A read-only TTL bump is when entry is read-only, wasn't modified, but TTL extended.
+            // These should be applied to state but NOT included in transaction meta.
+            let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
 
             if is_modification || is_deletion || ttl_extended {
                 let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
@@ -2038,6 +2106,7 @@ fn execute_host_function_p25(
                     live_until,
                     ttl_extended,
                     is_rent_related,
+                    is_read_only_ttl_bump,
                 })
             } else {
                 None
