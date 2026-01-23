@@ -910,6 +910,53 @@ impl TransactionExecutor {
         Ok(false)
     }
 
+    /// Load an account from the snapshot into state WITHOUT recording it for transaction changes.
+    /// This matches C++ stellar-core's `loadAccountWithoutRecord()` behavior, used when an account
+    /// only needs to be checked for existence (e.g., issuer validation in ChangeTrust).
+    /// The account is loaded into state so operations can check existence, but it won't appear
+    /// in the transaction meta STATE/UPDATED changes.
+    pub fn load_account_without_record(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+    ) -> Result<bool> {
+        // First check if the account is already in state
+        if self.state.get_account(account_id).is_some() {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: found in state");
+            return Ok(true);
+        }
+
+        let key_bytes = account_id_to_key(account_id);
+
+        // Check if we've already tried to load from snapshot
+        if self.loaded_accounts.contains_key(&key_bytes) {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: already tried, not found");
+            return Ok(false);
+        }
+
+        // Mark as attempted
+        self.loaded_accounts.insert(key_bytes, true);
+
+        // Try to load from snapshot
+        let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            tracing::trace!(
+                account = ?account_id,
+                "load_account_without_record: found in bucket list"
+            );
+            // Load entry WITHOUT recording - use load_entry_without_snapshot which doesn't
+            // capture a snapshot for change tracking
+            self.state.load_entry_without_snapshot(entry);
+            return Ok(true);
+        }
+
+        tracing::debug!(account = %account_id_to_strkey(account_id), "load_account_without_record: NOT FOUND in bucket list");
+        Ok(false)
+    }
+
     fn available_balance_for_fee(&self, account: &AccountEntry) -> Result<i64> {
         let min_balance = self
             .state
@@ -3072,25 +3119,28 @@ impl TransactionExecutor {
                 if let Some(ref tl_asset) = tl_asset {
                     self.load_trustline(snapshot, &op_source, tl_asset)?;
                 }
-                // Load issuer account for non-pool-share assets
+                // Load issuer account for non-pool-share assets WITHOUT recording.
+                // C++ stellar-core uses loadAccountWithoutRecord() for ChangeTrust issuer check
+                // which doesn't record the access in transaction changes.
+                // We still need to load the account into state so the existence check works.
                 match &op_data.line {
                     stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
                         let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
                         tracing::debug!(
                             asset_code = %asset_code,
                             issuer = ?a.issuer,
-                            "ChangeTrust: loading issuer for CreditAlphanum4"
+                            "ChangeTrust: loading issuer for CreditAlphanum4 (without record)"
                         );
-                        self.load_account(snapshot, &a.issuer)?;
+                        self.load_account_without_record(snapshot, &a.issuer)?;
                     }
                     stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
                         let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
                         tracing::debug!(
                             asset_code = %asset_code,
                             issuer = ?a.issuer,
-                            "ChangeTrust: loading issuer for CreditAlphanum12"
+                            "ChangeTrust: loading issuer for CreditAlphanum12 (without record)"
                         );
-                        self.load_account(snapshot, &a.issuer)?;
+                        self.load_account_without_record(snapshot, &a.issuer)?;
                     }
                     stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
                         // Compute pool ID and load the liquidity pool

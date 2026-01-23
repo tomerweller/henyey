@@ -1396,6 +1396,55 @@ impl LedgerStateManager {
         }
     }
 
+    /// Load a single entry into state WITHOUT setting up change tracking.
+    /// This matches C++ stellar-core's `loadWithoutRecord()` behavior.
+    /// Use this for entries that only need existence checks, not modification tracking.
+    ///
+    /// IMPORTANT: Entries loaded this way will NOT appear in transaction meta changes
+    /// unless they are subsequently accessed via `get_*_mut()` or `record_*_access()`.
+    pub fn load_entry_without_snapshot(&mut self, entry: LedgerEntry) {
+        let sponsor = sponsorship_from_entry_ext(&entry);
+        let has_sponsorship_ext = matches!(entry.ext, LedgerEntryExt::V1(_));
+        let last_modified = entry.last_modified_ledger_seq;
+        match entry.data {
+            LedgerEntryData::Account(account) => {
+                let key = account_id_to_bytes(&account.account_id);
+                let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+                    account_id: account.account_id.clone(),
+                });
+                // Insert account but do NOT save snapshot or mark as modified
+                self.accounts.insert(key, account);
+                self.entry_last_modified
+                    .insert(ledger_key.clone(), last_modified);
+                if has_sponsorship_ext {
+                    self.entry_sponsorship_ext.insert(ledger_key.clone());
+                }
+                if let Some(sponsor) = sponsor {
+                    self.entry_sponsorships.insert(ledger_key, sponsor);
+                }
+            }
+            // For other entry types, delegate to regular load_entry since they don't
+            // have the same snapshotting concern
+            other => {
+                let entry = LedgerEntry {
+                    last_modified_ledger_seq: last_modified,
+                    data: other,
+                    ext: if has_sponsorship_ext {
+                        LedgerEntryExt::V1(stellar_xdr::curr::LedgerEntryExtensionV1 {
+                            sponsoring_id: sponsor
+                                .map(|s| SponsorshipDescriptor(Some(s)))
+                                .unwrap_or(SponsorshipDescriptor(None)),
+                            ext: stellar_xdr::curr::LedgerEntryExtensionV1Ext::V0,
+                        })
+                    } else {
+                        LedgerEntryExt::V0
+                    },
+                };
+                self.load_entry(entry);
+            }
+        }
+    }
+
     // ==================== Account Operations ====================
 
     /// Load an account by ID and return a reference to it.
