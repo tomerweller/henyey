@@ -96,36 +96,41 @@ This implementation is designed for testnet synchronization only. It should not 
 
 ---
 
-### F2: Offline Verification Delta Mismatch for Failed Transactions with Asset Issuers
+### F2: Offline Verification Delta Mismatch for Accessed-But-Unchanged Accounts
 
-**Status**: Partially fixed  
-**Impact**: Bucket list hash mismatch at specific ledgers during offline verification  
+**Status**: FIXED  
+**Impact**: Was causing bucket list hash mismatch at specific ledgers during offline verification  
 **Added**: 2026-01-23  
-**Partially Fixed**: 2026-01-23
+**Fixed**: 2026-01-23
 
 **Description**:
-When running offline `verify-execution`, certain ledgers show a bucket list hash mismatch due to missing LIVE entries in our delta compared to CDP metadata. The issue manifests in two scenarios:
+When running offline `verify-execution`, certain ledgers showed a bucket list hash mismatch due to missing LIVE entries in our delta compared to CDP metadata. The issue manifested in scenarios where accounts were accessed but unchanged.
+
+**Root Causes (All Fixed)**:
 
 1. **AccountMerge with 0 balance** (FIXED): When an AccountMerge transfers 0 balance, the destination account was accessed but unchanged, and we weren't recording it in the delta.
 
-2. **Asset issuer accounts in failed transactions** (STILL OPEN): When a transaction fails after partially executing operations that involve asset transfers, the issuer account modification isn't in our delta.
+2. **CreateClaimableBalance with different op source** (FIXED): When `CreateClaimableBalance` has an operation source different from the transaction source (e.g., issuer account), C++ stellar-core calls `loadSourceAccount()` which records the access. We weren't calling `record_account_access()` for the source.
+
+3. **AllowTrust/SetTrustLineFlags issuer account** (FIXED): Similar to above, the issuer account needs to be recorded when accessed.
 
 **Observed at**: 
-- Ledger 360249+ (testnet) - **FIXED** (AccountMerge with 0 balance)
-- Ledger 203280 (testnet) - **STILL OPEN** (asset issuer account issue)
+- Ledger 360249 (testnet) - AccountMerge with 0 balance
+- Ledger 203280 (testnet) - CreateClaimableBalance with issuer as op source
 
-**Fix Applied for 360249+**:
-The `flush_all_accounts_except()` method now checks `op_entry_snapshots` to determine if an entry was accessed during the operation. If an entry was accessed (even if unchanged), it's now recorded in the delta. This matches C++ stellar-core behavior where `loadAccount` calls create STATE/UPDATED pairs regardless of whether the data changed.
+**Fix Applied**:
+1. The `flush_all_accounts_except()` method now checks `op_entry_snapshots` to determine if an entry was accessed during the operation.
+2. Added `record_account_access()` method to `LedgerStateManager` that explicitly marks an account as accessed even if not modified.
+3. Added `record_account_access()` calls in `execute_create_claimable_balance()`, `execute_allow_trust()`, and `execute_set_trust_line_flags()` to match C++ `loadSourceAccount()` behavior.
 
-**Remaining Issue at 203280**:
-- Missing account `94c035a17f8d6e30e27b5750f80ee88e6a1d8c9647058e4cff2a2401e9dbed15`
-- The account doesn't exist in our state when accessed via `get_account_mut`
-- This is a different bug - the account isn't being loaded properly, not a flush issue
+**Files Changed**:
+- `crates/stellar-core-tx/src/state.rs` - Added `record_account_access()` method, updated `flush_all_accounts_except()`
+- `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs` - Call `record_account_access()` for source
+- `crates/stellar-core-tx/src/operations/execute/trust_flags.rs` - Call `record_account_access()` for source
 
-**Files Involved**:
-- `crates/stellar-core-tx/src/state.rs` - `flush_all_accounts_except()` (fixed)
-- `crates/rs-stellar-core/src/main.rs` - `cmd_verify_execution()` around line 3200
-- `crates/stellar-core-ledger/src/execution.rs` - Transaction execution and rollback
+**Regression Test**: `test_create_claimable_balance_records_source_account_access` in `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
+
+**Verification**: Ledgers 64-203500+ now pass with 0 header mismatches
 
 ---
 

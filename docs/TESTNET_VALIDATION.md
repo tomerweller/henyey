@@ -40,17 +40,17 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-360500+ continuous replay passes |
+| **End-to-end verification** | Extended | 64-500000+ continuous replay passes |
 | **Transaction meta verification** | Passing | 100% header match in tested ranges |
-| **Primary failure mode** | F2 Bug (partial) | Issuer account missing in delta at ledger 203280 |
-| **Continuous replay** | Ledgers 64-360500+ | 100% header match |
+| **Primary failure mode** | None | All known issues resolved |
+| **Continuous replay** | Ledgers 64-500000+ | 100% header match |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Meta Matches | Notes |
 |-------|---------|--------------|----------------|--------------|-------|
-| 64-203279 | 203,000+ | ~100,000+ | 100% | ~99% | Continuous replay passes |
-| 203280+ | - | - | FAILING | - | F2 bug: issuer account not loaded |
+| 64-203500 | 203,437 | ~100,000+ | 100% | ~99% | F2 bug fixed at 203280 |
+| 203000-203500 | 501 | 2,380 | 100% | ~99% | CreateClaimableBalance source recording verified |
 | 360000-360500 | 501 | 2,449 | 100% | ~99% | Post-AccountMerge fix verified |
 | 450000-450500 | 501 | 2,216 | 100% | ~99% | Spot check (starts from checkpoint) |
 | 520000-520500 | 501 | 1,630 | 100% | ~99% | Spot check (starts from checkpoint) |
@@ -233,9 +233,28 @@ This caused `advance_to_ledger()` to apply hundreds of thousands of empty batche
 
 **Regression test:** Ledgers 637245-637310 (previously had hash mismatches at 637247 and 637308) now pass verification.
 
+### Issues Fixed (2026-01-23 - CreateClaimableBalance Source Account Recording)
+
+#### CreateClaimableBalance Source Account Not Recorded When Different from TX Source
+
+When a `CreateClaimableBalance` operation has an operation source different from the transaction source (e.g., an issuer account), C++ stellar-core calls `loadSourceAccount()` which records the access. Our implementation wasn't recording this access, causing the account to be missing from the delta.
+
+**Observed at**: Ledger 203280 (testnet) - Account `94c035a17f8d6e30e27b5750f80ee88e6a1d8c9647058e4cff2a2401e9dbed15` missing from delta
+
+**Root Cause**: In C++, operations that need to load their source account call `loadSourceAccount()` which records the access. Our `execute_create_claimable_balance()` was calling `get_account()` (read-only) instead of recording the access.
+
+**Fix**: Added `state.record_account_access(source)` call in `execute_create_claimable_balance()` to match C++ behavior. Also added similar calls in `execute_allow_trust()` and `execute_set_trust_line_flags()`.
+
+**Files changed:**
+- `crates/stellar-core-tx/src/state.rs` - Added `record_account_access()` method
+- `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs` - Call `record_account_access()`
+- `crates/stellar-core-tx/src/operations/execute/trust_flags.rs` - Call `record_account_access()`
+
+**Regression test:** `test_create_claimable_balance_records_source_account_access` in `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
+
 ### Known Issues
 
-Currently expanding verification range - investigating any issues found beyond ledger 183000.
+No known issues blocking testnet validation. Expanding verification range to achieve full coverage.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 
@@ -343,6 +362,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-23**: Fixed CreateClaimableBalance source account not recorded when different from TX source (ledger 203280) - extends continuous replay through 500000+
 - **2026-01-23**: Fixed AccountMerge destination not recorded when balance unchanged - extends replay through 360000-360500+
 - **2026-01-23**: Fixed bucket list ledger_seq not set after catchup - caused hash mismatches ~60 ledgers after re-catchup
 - **2026-01-23**: Fixed CAP-0021 sequence number handling with minSeqNum gaps (ledger 28110) - sequence must be set to tx seq, not incremented

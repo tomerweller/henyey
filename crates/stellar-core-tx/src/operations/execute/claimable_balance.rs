@@ -79,7 +79,8 @@ pub fn execute_create_claimable_balance(
         }
     }
 
-    // Check source account exists
+    // Check source account exists (C++ calls loadSourceAccount which records access)
+    state.record_account_access(source);
     let account = match state.get_account(source) {
         Some(a) => a.clone(),
         None => {
@@ -1200,5 +1201,72 @@ mod tests {
             }
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    /// Regression test for F2 bug at ledger 203280: when CreateClaimableBalance has an
+    /// operation source different from the transaction source, the source account must
+    /// be recorded in the delta (matching C++ stellar-core's loadSourceAccount behavior).
+    #[test]
+    fn test_create_claimable_balance_records_source_account_access() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        // Create two accounts: op_source (issuer) and tx_source
+        let op_source_id = create_test_account_id(1); // Operation source (issuer)
+        let tx_source_id = create_test_account_id(2); // Transaction source (different)
+        let claimant_id = create_test_account_id(3);
+
+        state.create_account(create_test_account(op_source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(tx_source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(claimant_id.clone(), 10_000_000));
+
+        // Start operation snapshot to track changes
+        state.set_multi_op_mode(true);
+        state.begin_op_snapshot();
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        let op = CreateClaimableBalanceOp {
+            asset: Asset::Native,
+            amount: 10_000_000,
+            claimants: vec![claimant].try_into().unwrap(),
+        };
+
+        // Execute with op_source different from tx_source
+        let result = execute_create_claimable_balance(
+            &op,
+            &op_source_id, // Operation source
+            &tx_source_id, // Transaction source (different)
+            123,
+            0,
+            &mut state,
+            &context,
+        );
+        assert!(result.is_ok());
+
+        // Flush to delta
+        state.flush_modified_entries();
+
+        // The op_source account should be in the delta even though it's different
+        // from tx_source. This is the fix for F2 bug at ledger 203280.
+        let delta = state.delta();
+        let updated_entries = delta.updated_entries();
+
+        // Find the op_source account in updated entries
+        let op_source_in_delta = updated_entries.iter().any(|entry| {
+            if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+                acc.account_id == op_source_id
+            } else {
+                false
+            }
+        });
+
+        assert!(
+            op_source_in_delta,
+            "Operation source account should be recorded in delta when different from tx source"
+        );
     }
 }

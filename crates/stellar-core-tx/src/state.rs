@@ -1446,6 +1446,40 @@ impl LedgerStateManager {
         }
     }
 
+    /// Record that an account was accessed during operation execution.
+    ///
+    /// This captures an op snapshot for the account so it appears in the delta
+    /// even if only read (not modified). This matches C++ stellar-core behavior
+    /// where `load()` records entries vs `loadWithoutRecord()` which doesn't.
+    ///
+    /// Use this when an operation loads an account that must appear in the
+    /// transaction meta (e.g., issuer account in AllowTrust/SetTrustLineFlags).
+    pub fn record_account_access(&mut self, account_id: &AccountId) {
+        let key = account_id_to_bytes(account_id);
+        // Only record if account exists in state
+        if !self.accounts.contains_key(&key) {
+            return;
+        }
+        // Save snapshot if not already saved (same as get_account_mut)
+        if !self
+            .account_snapshots
+            .get(&key)
+            .is_some_and(|s| s.is_some())
+        {
+            let snapshot = self.accounts.get(&key).cloned();
+            self.account_snapshots.insert(key, snapshot);
+        }
+        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        self.capture_op_snapshot_for_key(&ledger_key);
+        self.snapshot_last_modified_key(&ledger_key);
+        // Track as "modified" so it gets flushed to delta
+        if !self.modified_accounts.contains(&key) {
+            self.modified_accounts.push(key);
+        }
+    }
+
     /// Create a new account entry.
     pub fn create_account(&mut self, entry: AccountEntry) {
         let key = account_id_to_bytes(&entry.account_id);

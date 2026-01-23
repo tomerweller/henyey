@@ -47,6 +47,10 @@ pub fn execute_allow_trust(
         }
     };
 
+    // Record that we accessed the issuer account - this ensures it appears in the
+    // transaction meta even if not modified (matches C++ load() behavior)
+    state.record_account_access(source);
+
     // Check if issuer has AUTH_REQUIRED flag (only for protocol versions before 16)
     // In protocol 16+, this check was removed as part of CAP-0035.
     if context.protocol_version < 16 && issuer.flags & AUTH_REQUIRED_FLAG == 0 {
@@ -149,6 +153,10 @@ pub fn execute_set_trust_line_flags(
             ));
         }
     };
+
+    // Record that we accessed the issuer account - this ensures it appears in the
+    // transaction meta even if not modified (matches C++ load() behavior)
+    state.record_account_access(source);
 
     // The source must be the issuer of the asset
     let issuer = match &op.asset {
