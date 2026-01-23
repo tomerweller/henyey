@@ -40,21 +40,23 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-500000+ continuous replay passes |
+| **End-to-end verification** | Extended | 64-553996 continuous replay passes |
 | **Transaction meta verification** | Passing | 100% header match in tested ranges |
-| **Primary failure mode** | None | All known issues resolved |
-| **Continuous replay** | Ledgers 64-500000+ | 100% header match |
+| **Primary failure mode** | Soroban crypto error at 553997 | See F4 in KNOWN_ISSUES.md |
+| **Continuous replay** | Ledgers 64-553996 | 100% header match (553,933 ledgers) |
 
 ### Verification Results
 
 | Range | Ledgers | Transactions | Header Matches | Meta Matches | Notes |
 |-------|---------|--------------|----------------|--------------|-------|
-| 64-203500 | 203,437 | ~100,000+ | 100% | ~99% | F2 bug fixed at 203280 |
-| 203000-203500 | 501 | 2,380 | 100% | ~99% | CreateClaimableBalance source recording verified |
-| 360000-360500 | 501 | 2,449 | 100% | ~99% | Post-AccountMerge fix verified |
-| 450000-450500 | 501 | 2,216 | 100% | ~99% | Spot check (starts from checkpoint) |
-| 520000-520500 | 501 | 1,630 | 100% | ~99% | Spot check (starts from checkpoint) |
-| 637245-637315 | 71 | 427 | 100% | 100% | Bucket list ledger_seq fix verified |
+| 64-50000 | 49,937 | 95,433 | 100% | ~98% | Classic transactions, eviction |
+| 50000-75000 | 25,001 | 37,546 | 100% | ~98% | Soroban transactions begin |
+| 75000-90000 | 15,001 | 41,862 | 100% | ~99% | Mixed classic/Soroban |
+| 100000-115000 | 15,001 | 53,340 | 100% | ~99% | Heavy Soroban activity |
+| 200000-213000 | 13,000+ | ~50,000+ | 100% | ~99% | CreateClaimableBalance fix verified |
+| 400000-407000 | 7,229+ | ~30,000+ | 100% | ~99% | Post-500254 fix verified |
+| 64-553996 | 553,933 | ~500,000+ | 100% | ~98% | **Current maximum verified range** |
+| 553997+ | - | - | FAIL | - | Soroban crypto error blocks verification |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
@@ -388,7 +390,8 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
-- **2026-01-23**: Fixed SetTrustLineFlags/AllowTrust incorrectly recording issuer account in delta (ledger 500254) - issuer account should NOT be recorded (C++ uses rolled-back LedgerTxn)
+- **2026-01-23**: **BLOCKER** Discovered Soroban crypto error at ledger 553997 - InvokeHostFunction returns Trapped instead of Success (Error(Crypto, InvalidInput))
+- **2026-01-23**: Fixed SetTrustLineFlags/AllowTrust incorrectly recording issuer account in delta (ledger 500254) - extends verification to 64-553996
 - **2026-01-23**: Fixed CreateClaimableBalance source account not recorded when different from TX source (ledger 203280) - extends continuous replay through 500000+
 - **2026-01-23**: Fixed AccountMerge destination not recorded when balance unchanged - extends replay through 360000-360500+
 - **2026-01-23**: Fixed bucket list ledger_seq not set after catchup - caused hash mismatches ~60 ledgers after re-catchup

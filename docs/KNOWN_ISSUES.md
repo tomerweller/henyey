@@ -182,7 +182,49 @@ Protocol 25 introduced entry restoration from the hot archive. When a Soroban tr
 
 ---
 
-### F4: Eviction-Related Bucket List Hash Mismatch
+### F4: Soroban Crypto Error - InvokeHostFunction Returns Trapped Instead of Success
+
+**Status**: Open  
+**Impact**: Causes bucket list hash divergence starting at ledger 553997  
+**Added**: 2026-01-23
+
+**Description**:
+A Soroban smart contract call that should succeed is failing with a crypto validation error in our implementation.
+
+**Observed at**: Ledger 553997, TX 3 (testnet)
+
+**Error**:
+```
+HostError: Error(Crypto, InvalidInput)
+```
+
+**Symptoms**:
+- Transaction hash: `f01b261e34872176e5bdd59d3717970075c4b7d4658fe29b1eb6c7e5167d64bd`
+- Our result: `InvokeHostFunction(Trapped)`
+- CDP expected: `InvokeHostFunction(Success(Hash(...)))`
+- Fee refund mismatch: 79 stroops (ours=38808, cdp=38729)
+- Account `GBEIZFTPTQGD4BKAKH32ZWPFW3D4JB3RNWHYD6CJLFIC767OGPVW6YVT` balance differs
+
+**Root Cause**:
+Unknown - requires investigation of the Soroban host crypto functions. The contract is calling a crypto operation that should succeed but our validation is returning InvalidInput.
+
+**Impact**:
+- Verification passes for ledgers 64-553996 (553,933 ledgers)
+- Verification fails at ledger 553997 and cascades from there
+- All subsequent ledgers have header mismatches due to state divergence
+
+**Next Steps**:
+1. Identify which Soroban crypto host function is being called
+2. Compare our validation logic with C++ stellar-core's Soroban host
+3. Check if this is a secp256k1, ed25519, or other crypto operation
+
+**Files Involved**:
+- `crates/stellar-core-tx/src/soroban/` - Soroban host implementation
+- `soroban-env-host/` (upstream) - May need to check for version differences
+
+---
+
+### F5: Eviction-Related Bucket List Hash Mismatch
 
 **Status**: Pending Re-validation (may be resolved by F3 fix)  
 **Impact**: Was causing hash mismatches on ledgers with entry eviction  
