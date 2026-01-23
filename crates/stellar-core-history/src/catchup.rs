@@ -53,17 +53,12 @@ use crate::{
     replay::{self, LedgerReplayResult, ReplayConfig, ReplayedLedgerState},
     verify, CatchupOutput, CatchupResult, HistoryError, Result,
 };
-use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use stellar_core_bucket::{BucketList, BucketManager, HotArchiveBucketList};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
-use stellar_core_invariant::{
-    CloseTimeNondecreasing, ConservationOfLumens, InvariantContext, InvariantManager,
-    LastModifiedLedgerSeqMatchesHeader, LedgerEntryIsValid, LedgerSeqIncrement,
-    LiabilitiesMatchOffers, OrderBookIsNotCrossed,
-};
+
 use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::{
@@ -1730,25 +1725,6 @@ impl CatchupManager {
             None
         };
 
-        let invariants = if self.replay_config.verify_invariants {
-            let mut manager = InvariantManager::new();
-            manager.add(LedgerSeqIncrement);
-            manager.add(CloseTimeNondecreasing);
-            // Note: BucketListHashMatchesHeader is NOT added during replay because:
-            // 1. We verify bucket list hash at checkpoints in replay_ledger_with_execution
-            // 2. Per-ledger verification would fail during replay since we don't have
-            //    TransactionMeta, which means our re-executed entries may differ slightly
-            //    from C++ stellar-core's entries
-            manager.add(ConservationOfLumens);
-            manager.add(LedgerEntryIsValid);
-            manager.add(LiabilitiesMatchOffers);
-            manager.add(OrderBookIsNotCrossed);
-            manager.add(LastModifiedLedgerSeqMatchesHeader);
-            Some(manager)
-        } else {
-            None
-        };
-
         for (i, data) in ledger_data.iter().enumerate() {
             self.progress.current_ledger = data.header.ledger_seq;
 
@@ -1766,37 +1742,6 @@ impl CatchupManager {
 
             // Update eviction iterator for next ledger
             eviction_iterator = result.eviction_iterator;
-            if let (Some(prev_header), Some(manager)) = (last_header.as_ref(), invariants.as_ref())
-            {
-                let full_entries = bucket_list.live_entries()?;
-                let bucket_list_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
-                    let mut hasher = sha2::Sha256::new();
-                    hasher.update(bucket_list.hash().as_bytes());
-                    hasher.update(hot_archive.hash().as_bytes());
-                    let result = hasher.finalize();
-                    let mut bytes = [0u8; 32];
-                    bytes.copy_from_slice(&result);
-                    Hash256::from_bytes(bytes)
-                } else {
-                    bucket_list.hash()
-                };
-                let ctx = InvariantContext {
-                    prev_header,
-                    curr_header: &data.header,
-                    bucket_list_hash,
-                    fee_pool_delta: result.fee_pool_delta,
-                    total_coins_delta: result.total_coins_delta,
-                    changes: &result.changes,
-                    full_entries: Some(&full_entries),
-                    op_events: None,
-                };
-                manager.check_all(&ctx).map_err(|err| {
-                    HistoryError::CatchupFailed(format!(
-                        "replay invariant failed at ledger {}: {}",
-                        data.header.ledger_seq, err
-                    ))
-                })?;
-            }
 
             debug!(
                 "Replayed ledger {}/{}: {} txs, {} ops",
@@ -1961,7 +1906,6 @@ impl CatchupManagerBuilder {
         manager.replay_config = ReplayConfig {
             verify_results: self.options.verify_headers,
             verify_bucket_list: self.options.verify_buckets,
-            verify_invariants: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: true,

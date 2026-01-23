@@ -13,7 +13,6 @@ stellar-core-crypto.workspace = true
 stellar-core-db.workspace = true
 stellar-core-bucket.workspace = true
 stellar-core-tx.workspace = true
-stellar-core-invariant.workspace = true
 soroban-env-host-p25.workspace = true
 
 # Serialization

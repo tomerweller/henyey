@@ -43,10 +43,7 @@ use soroban_env_host_p25::fees::{
 use stellar_core_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_crypto::account_id_to_strkey;
-use stellar_core_invariant::{
-    ConstantProductInvariant, InvariantContext, InvariantManager,
-    LedgerEntryChange as InvariantLedgerEntryChange, LiabilitiesMatchOffers, OrderBookIsNotCrossed,
-};
+
 use stellar_core_tx::{
     make_account_address, make_claimable_balance_address, make_muxed_account_address,
     operations::OperationType,
@@ -63,7 +60,7 @@ use stellar_xdr::curr::{
     CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint, InflationResult,
     InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
     InnerTransactionResultResult, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
-    LedgerEntryData, LedgerHeader, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
+    LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
     LedgerKeyLiquidityPool, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
     ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation,
     OperationBody, OperationMetaV2, OperationResult, OperationResultTr,
@@ -729,8 +726,6 @@ pub struct TransactionExecutor {
     soroban_config: SorobanConfig,
     /// Classic event configuration.
     classic_events: ClassicEventConfig,
-    /// Optional operation-level invariants runner.
-    op_invariants: Option<OperationInvariantRunner>,
     /// Optional persistent module cache for Soroban WASM compilation.
     /// This cache is populated once from the bucket list and reused across transactions.
     module_cache: Option<PersistentModuleCache>,
@@ -751,7 +746,6 @@ impl TransactionExecutor {
         id_pool: u64,
         soroban_config: SorobanConfig,
         classic_events: ClassicEventConfig,
-        op_invariants: Option<OperationInvariantRunner>,
     ) -> Self {
         let mut state = LedgerStateManager::new(base_reserve as i64, ledger_seq);
         state.set_id_pool(id_pool);
@@ -765,7 +759,6 @@ impl TransactionExecutor {
             loaded_accounts: HashMap::new(),
             soroban_config,
             classic_events,
-            op_invariants,
             module_cache: None,
             hot_archive: None,
         }
@@ -2498,7 +2491,6 @@ impl TransactionExecutor {
         // for every accessed entry per operation, even if values are identical.
         // For single-operation transactions, it only records if values changed.
         self.state.set_multi_op_mode(num_ops > 1);
-        let op_invariant_snapshot = self.op_invariants.as_ref().map(|runner| runner.snapshot());
 
         let tx_seq = frame.sequence_number();
         // Collect hot archive restored keys across all operations (Protocol 23+)
@@ -2719,10 +2711,6 @@ impl TransactionExecutor {
                             }
                         }
 
-                        if let Some(runner) = self.op_invariants.as_mut() {
-                            runner.apply_and_check(&op_changes_local, &op_events_final)?;
-                        }
-
                         if all_success {
                             op_changes.push(op_changes_local);
                             op_events.push(op_events_final);
@@ -2783,11 +2771,6 @@ impl TransactionExecutor {
                     &signer_updated,
                     &signer_deleted,
                 );
-            }
-            if let (Some(runner), Some(snapshot)) =
-                (self.op_invariants.as_mut(), op_invariant_snapshot)
-            {
-                runner.restore(snapshot);
             }
             op_changes.clear();
             op_events.clear();
@@ -3765,105 +3748,6 @@ fn restore_delta_entries(
         if i < updated.len() {
             delta.record_delete(key.clone(), updated[i].clone());
         }
-    }
-}
-
-pub struct OperationInvariantRunner {
-    manager: InvariantManager,
-    entries: HashMap<Vec<u8>, LedgerEntry>,
-    header: LedgerHeader,
-}
-
-impl OperationInvariantRunner {
-    pub fn new(
-        entries: Vec<LedgerEntry>,
-        header: LedgerHeader,
-        _network_id: NetworkId,
-    ) -> Result<Self> {
-        let mut manager = InvariantManager::new();
-        manager.add(LiabilitiesMatchOffers);
-        manager.add(OrderBookIsNotCrossed);
-        manager.add(ConstantProductInvariant);
-        // Note: EventsAreConsistentWithEntryDiffs is NOT added because during replay
-        // we don't have TransactionMeta, which means our generated events and entry
-        // diffs may not match C++ stellar-core's authoritative values.
-
-        let mut map = HashMap::new();
-        for entry in entries {
-            let key = crate::delta::entry_to_key(&entry)?;
-            let key_bytes = key.to_xdr(Limits::none())?;
-            map.insert(key_bytes, entry);
-        }
-
-        Ok(Self {
-            manager,
-            entries: map,
-            header,
-        })
-    }
-
-    fn snapshot(&self) -> HashMap<Vec<u8>, LedgerEntry> {
-        self.entries.clone()
-    }
-
-    fn restore(&mut self, snapshot: HashMap<Vec<u8>, LedgerEntry>) {
-        self.entries = snapshot;
-    }
-
-    fn apply_and_check(
-        &mut self,
-        changes: &LedgerEntryChanges,
-        op_events: &[ContractEvent],
-    ) -> Result<()> {
-        let mut invariant_changes = Vec::new();
-        for change in changes.0.iter() {
-            match change {
-                LedgerEntryChange::Created(entry)
-                | LedgerEntryChange::Updated(entry)
-                | LedgerEntryChange::State(entry)
-                | LedgerEntryChange::Restored(entry) => {
-                    let key = crate::delta::entry_to_key(entry)?;
-                    let key_bytes = key.to_xdr(Limits::none())?;
-                    let previous = self.entries.get(&key_bytes).cloned();
-                    self.entries.insert(key_bytes, entry.clone());
-                    match previous {
-                        Some(prev) => invariant_changes.push(InvariantLedgerEntryChange::Updated {
-                            previous: Box::new(prev),
-                            current: Box::new(entry.clone()),
-                        }),
-                        None => invariant_changes.push(InvariantLedgerEntryChange::Created {
-                            current: Box::new(entry.clone()),
-                        }),
-                    }
-                }
-                LedgerEntryChange::Removed(key) => {
-                    let key_bytes = key.to_xdr(Limits::none())?;
-                    if let Some(previous) = self.entries.remove(&key_bytes) {
-                        invariant_changes.push(InvariantLedgerEntryChange::Deleted {
-                            previous: Box::new(previous),
-                        });
-                    }
-                }
-            }
-        }
-
-        if invariant_changes.is_empty() {
-            return Ok(());
-        }
-
-        let entries: Vec<LedgerEntry> = self.entries.values().cloned().collect();
-        let ctx = InvariantContext {
-            prev_header: &self.header,
-            curr_header: &self.header,
-            bucket_list_hash: Hash256::ZERO,
-            fee_pool_delta: 0,
-            total_coins_delta: 0,
-            changes: &invariant_changes,
-            full_entries: Some(&entries),
-            op_events: Some(op_events),
-        };
-        self.manager.check_all(&ctx)?;
-        Ok(())
     }
 }
 
@@ -5092,7 +4976,6 @@ pub fn execute_transaction_set(
     soroban_config: SorobanConfig,
     soroban_base_prng_seed: [u8; 32],
     classic_events: ClassicEventConfig,
-    op_invariants: Option<OperationInvariantRunner>,
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
 ) -> Result<(
@@ -5115,7 +4998,6 @@ pub fn execute_transaction_set(
         soroban_config,
         soroban_base_prng_seed,
         classic_events,
-        op_invariants,
         true,
         module_cache,
         hot_archive,
@@ -5151,7 +5033,6 @@ pub fn execute_transaction_set_with_fee_mode(
     soroban_config: SorobanConfig,
     soroban_base_prng_seed: [u8; 32],
     classic_events: ClassicEventConfig,
-    op_invariants: Option<OperationInvariantRunner>,
     deduct_fee: bool,
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
@@ -5172,7 +5053,6 @@ pub fn execute_transaction_set_with_fee_mode(
         id_pool,
         soroban_config,
         classic_events,
-        op_invariants,
     );
     // Set the module cache if provided for better Soroban performance
     if let Some(cache) = module_cache {
@@ -5483,7 +5363,6 @@ mod tests {
             0,
             SorobanConfig::default(),
             ClassicEventConfig::default(),
-            None,
         );
 
         assert_eq!(executor.ledger_seq, 100);
@@ -5522,28 +5401,6 @@ mod tests {
             }),
             ext: LedgerEntryExt::V0,
         }
-    }
-
-    #[test]
-    fn test_operation_invariant_runner_detects_crossed_order_book() {
-        let asset_a = make_asset(b"ABCD", 1);
-        let asset_b = make_asset(b"WXYZ", 2);
-
-        let ask = make_offer(1, asset_a.clone(), asset_b.clone(), Price { n: 1, d: 1 }, 0);
-        let bid = make_offer(2, asset_b.clone(), asset_a.clone(), Price { n: 1, d: 1 }, 0);
-
-        let runner =
-            OperationInvariantRunner::new(vec![ask], LedgerHeader::default(), NetworkId::testnet())
-                .unwrap();
-        let mut runner = runner;
-
-        let changes = LedgerEntryChanges(
-            vec![LedgerEntryChange::Created(bid)]
-                .try_into()
-                .unwrap_or_default(),
-        );
-
-        assert!(runner.apply_and_check(&changes, &[]).is_err());
     }
 
     /// Regression test: Verify classic transaction fee calculation uses min(inclusion_fee, required_fee)

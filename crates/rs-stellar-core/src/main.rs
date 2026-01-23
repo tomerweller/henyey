@@ -1949,7 +1949,6 @@ async fn cmd_replay_bucket_list(
     let _replay_config = ReplayConfig {
         verify_results: false,
         verify_bucket_list: true,
-        verify_invariants: false,
         emit_classic_events: false,
         backfill_stellar_asset_events: false,
         run_eviction: hot_archive_bucket_list.is_some(),
@@ -3103,7 +3102,6 @@ async fn cmd_verify_execution(
                     starting_id_pool, // Use previous ledger's id_pool
                     soroban_config,
                     ClassicEventConfig::default(),
-                    None, // No invariant checking for now
                 );
                 // Set the persistent module cache if available
                 if let Some(ref cache) = module_cache {

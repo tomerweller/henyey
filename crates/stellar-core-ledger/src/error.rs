@@ -17,7 +17,7 @@ use thiserror::Error;
 /// - **State errors**: `NotInitialized`, `AlreadyInitialized`, `EntryNotFound`
 /// - **Validation errors**: `InvalidSequence`, `HashMismatch`, `InvalidHeaderChain`
 /// - **Close errors**: `InvalidLedgerClose`, `DuplicateEntry`, `MissingEntry`
-/// - **External errors**: `Database`, `Bucket`, `Invariant`, `Xdr`
+/// - **External errors**: `Database`, `Bucket`, `Xdr`
 /// - **Internal errors**: `Serialization`, `Snapshot`, `Internal`
 #[derive(Debug, Error)]
 pub enum LedgerError {
@@ -66,14 +66,6 @@ pub enum LedgerError {
     /// Error from bucket list operations.
     #[error("bucket error: {0}")]
     Bucket(#[from] stellar_core_bucket::BucketError),
-
-    /// Ledger invariant violation detected.
-    ///
-    /// Invariants ensure ledger state consistency (e.g., conservation
-    /// of lumens, valid entry structures). A violation indicates a
-    /// serious bug in transaction processing.
-    #[error("invariant error: {0}")]
-    Invariant(#[from] stellar_core_invariant::InvariantError),
 
     /// XDR encoding or decoding error.
     #[error("XDR error: {0}")]

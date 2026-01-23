@@ -459,7 +459,6 @@ fn test_execute_transaction_missing_operation() {
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
-        None,
     );
 
     let result = executor
@@ -526,7 +525,6 @@ fn test_execute_transaction_time_bounds_too_early() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -599,7 +597,6 @@ fn test_execute_transaction_min_seq_num_precondition() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -676,7 +673,6 @@ fn test_execute_transaction_min_seq_num_relaxed_sequence() {
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -755,7 +751,6 @@ fn test_execute_transaction_strict_sequence_without_min_seq_num() {
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -835,7 +830,6 @@ fn test_execute_transaction_min_seq_age_precondition() {
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -910,7 +904,6 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -984,7 +977,6 @@ fn test_execute_transaction_extra_signers_missing() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1127,7 +1119,6 @@ fn test_operation_failure_rolls_back_changes() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1203,7 +1194,6 @@ fn test_classic_events_emitted_for_payment() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1314,7 +1304,6 @@ fn test_classic_events_payment_with_muxed_destination() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1413,7 +1402,6 @@ fn test_classic_events_payment_with_memo_data() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1517,7 +1505,6 @@ fn test_classic_events_payment_memo_precedence() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1607,7 +1594,6 @@ fn test_classic_events_emitted_for_account_merge() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1705,7 +1691,6 @@ fn test_classic_events_emitted_for_create_account() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1805,7 +1790,6 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -1929,7 +1913,6 @@ fn test_classic_events_emitted_for_claim_claimable_balance() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -2044,7 +2027,6 @@ fn test_classic_events_emitted_for_allow_trust() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -2152,7 +2134,6 @@ fn test_classic_events_emitted_for_set_trustline_flags() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -2266,7 +2247,6 @@ fn test_classic_events_emitted_for_clawback() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -2381,7 +2361,6 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -2512,7 +2491,6 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -2659,7 +2637,6 @@ fn test_classic_events_emitted_for_liquidity_pool_withdraw() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -2859,7 +2836,6 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -3011,7 +2987,6 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -3170,7 +3145,6 @@ fn test_soroban_refund_event_after_all_txs() {
         0,
         SorobanConfig::default(),
         classic_events,
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -3221,7 +3195,6 @@ fn test_apply_ledger_entry_changes_updates_module_cache() {
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
-        None,
     );
     executor.set_module_cache(module_cache);
 
@@ -3455,7 +3428,6 @@ fn test_set_options_loads_signer_sponsor_accounts() {
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
-        None,
     );
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
@@ -3584,7 +3556,6 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
         SorobanConfig::default(),
         [0u8; 32], // soroban_base_prng_seed
         ClassicEventConfig::default(),
-        None,                  // op_invariants
         None,                  // module_cache
         Some(hot_archive_arc), // hot_archive - the key parameter being tested
     );

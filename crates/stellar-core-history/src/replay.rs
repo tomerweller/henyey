@@ -49,10 +49,9 @@ use crate::{verify, HistoryError, Result};
 use sha2::{Digest, Sha256};
 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
-use stellar_core_invariant::LedgerEntryChange;
 use stellar_core_ledger::{
-    execution::{execute_transaction_set, load_soroban_config, OperationInvariantRunner},
-    prepend_fee_event, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
+    execution::{execute_transaction_set, load_soroban_config},
+    prepend_fee_event, EntryChange, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
     TransactionSetVariant,
 };
 use stellar_core_tx::soroban::PersistentModuleCache;
@@ -123,11 +122,10 @@ pub struct LedgerReplayResult {
     /// Keys of entries to mark as deleted with `DEADENTRY` flag.
     pub dead_entries: Vec<LedgerKey>,
 
-    /// Detailed change records for invariant checking.
+    /// Detailed change records for state tracking.
     ///
-    /// This provides before/after state for each changed entry,
-    /// which is needed by some invariants (e.g., conservation of lumens).
-    pub changes: Vec<LedgerEntryChange>,
+    /// This provides before/after state for each changed entry.
+    pub changes: Vec<EntryChange>,
 
     /// Updated eviction iterator position after this ledger.
     ///
@@ -156,12 +154,6 @@ pub struct ReplayConfig {
     /// reconstruction. Verification only runs at checkpoint boundaries
     /// (ledger % 64 == 63) because intermediate states may differ.
     pub verify_bucket_list: bool,
-
-    /// Run ledger invariants after each ledger.
-    ///
-    /// Invariants check properties like conservation of lumens,
-    /// valid ledger entry structure, and sequence number progression.
-    pub verify_invariants: bool,
 
     /// Emit classic contract events during replay.
     ///
@@ -199,7 +191,6 @@ impl Default for ReplayConfig {
             // authoritative verification of correct ledger state.
             verify_results: false,
             verify_bucket_list: true,
-            verify_invariants: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: true,
@@ -373,18 +364,6 @@ pub fn replay_ledger_with_execution(
         load_state_archival_settings(&snapshot).unwrap_or(config.eviction_settings);
     // Use transaction set hash as base PRNG seed for Soroban execution
     let soroban_base_prng_seed = tx_set.hash();
-    let op_invariants = if config.verify_invariants {
-        let entries = bucket_list.live_entries().map_err(|e| {
-            HistoryError::CatchupFailed(format!("failed to build op invariants state: {}", e))
-        })?;
-        Some(
-            OperationInvariantRunner::new(entries, header.clone(), *network_id).map_err(|e| {
-                HistoryError::CatchupFailed(format!("failed to build op invariants state: {}", e))
-            })?,
-        )
-    } else {
-        None
-    };
     let classic_events = stellar_core_tx::ClassicEventConfig {
         emit_classic_events: config.emit_classic_events,
         backfill_stellar_asset_events: config.backfill_stellar_asset_events,
@@ -403,7 +382,6 @@ pub fn replay_ledger_with_execution(
             soroban_config,
             soroban_base_prng_seed.0,
             classic_events.clone(),
-            op_invariants,
             module_cache,
             None, // Hot archive not needed during replay - state is from history archives
         )
@@ -454,30 +432,14 @@ pub fn replay_ledger_with_execution(
     // During replay, our re-execution may calculate fees differently than the original
     // execution (e.g., due to subtle parity differences). The historical fee_pool in
     // the header was computed using the original fee_charged values, so we need to
-    // use those values for the invariant check to pass.
+    // use those values for correct state tracking.
     let fee_pool_delta = if let Some(expected_results) = expected_tx_results {
         expected_results.iter().map(|r| r.result.fee_charged).sum()
     } else {
         delta.fee_pool_delta()
     };
     let total_coins_delta = delta.total_coins_delta();
-    let changes = delta
-        .changes()
-        .map(|change| match change {
-            stellar_core_ledger::EntryChange::Created(entry) => LedgerEntryChange::Created {
-                current: Box::new(entry.clone()),
-            },
-            stellar_core_ledger::EntryChange::Updated { previous, current } => {
-                LedgerEntryChange::Updated {
-                    previous: Box::new(previous.clone()),
-                    current: Box::new(current.clone()),
-                }
-            }
-            stellar_core_ledger::EntryChange::Deleted { previous } => LedgerEntryChange::Deleted {
-                previous: Box::new(previous.clone()),
-            },
-        })
-        .collect::<Vec<_>>();
+    let changes = delta.changes().cloned().collect::<Vec<_>>();
     let init_entries = delta.init_entries();
     let live_entries = delta.live_entries();
     let dead_entries = delta.dead_entries();
@@ -1136,7 +1098,6 @@ mod tests {
         let config = ReplayConfig {
             verify_results: false, // Skip verification for test
             verify_bucket_list: false,
-            verify_invariants: false,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: false,
@@ -1180,7 +1141,6 @@ mod tests {
         // produces different results than C++ stellar-core
         assert!(!config.verify_results);
         assert!(config.verify_bucket_list);
-        assert!(config.verify_invariants);
     }
 
     #[test]
@@ -1264,7 +1224,6 @@ mod tests {
         let config = ReplayConfig {
             verify_results: false,
             verify_bucket_list: true,
-            verify_invariants: false,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: false,
@@ -1296,7 +1255,6 @@ mod tests {
         let config = ReplayConfig {
             verify_results: true,
             verify_bucket_list: false,
-            verify_invariants: false,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: false,
@@ -1331,7 +1289,6 @@ mod tests {
         let config = ReplayConfig {
             verify_results: true,
             verify_bucket_list: false,
-            verify_invariants: false,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: false,

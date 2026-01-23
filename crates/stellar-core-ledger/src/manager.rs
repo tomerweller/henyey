@@ -11,7 +11,6 @@
 //! - **State Management**: Maintaining the current ledger header and entry cache
 //! - **Bucket List Integration**: Updating the Merkle tree of ledger entries
 //! - **Transaction Execution**: Coordinating transaction processing via [`LedgerCloseContext`]
-//! - **Invariant Validation**: Enforcing ledger invariants on every close
 //! - **Snapshot Management**: Providing consistent point-in-time views for queries
 //!
 //! # Thread Safety
@@ -32,8 +31,8 @@ use crate::{
     },
     delta::{EntryChange, LedgerDelta},
     execution::{
-        execute_transaction_set, load_soroban_network_info, OperationInvariantRunner,
-        SorobanNetworkInfo, TransactionExecutionResult,
+        execute_transaction_set, load_soroban_network_info, SorobanNetworkInfo,
+        TransactionExecutionResult,
     },
     header::{compute_header_hash, create_next_header},
     snapshot::{LedgerSnapshot, SnapshotHandle, SnapshotManager},
@@ -47,12 +46,6 @@ use stellar_core_bucket::{
 };
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::Database;
-use stellar_core_invariant::{
-    AccountSubEntriesCountIsValid, BucketListHashMatchesHeader, CloseTimeNondecreasing,
-    ConservationOfLumens, ConstantProductInvariant, Invariant, InvariantContext, InvariantManager,
-    LastModifiedLedgerSeqMatchesHeader, LedgerEntryChange, LedgerEntryIsValid, LedgerSeqIncrement,
-    LiabilitiesMatchOffers, OrderBookIsNotCrossed, SponsorshipCountIsValid,
-};
 use stellar_core_tx::soroban::PersistentModuleCache;
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
@@ -189,13 +182,6 @@ pub struct LedgerManagerConfig {
     /// where hash verification is not needed.
     pub validate_bucket_hash: bool,
 
-    /// Whether to validate ledger invariants on every close.
-    ///
-    /// Invariants include conservation of lumens, valid entry states,
-    /// and consistent sub-entry counts. Disable for performance in
-    /// trusted replay scenarios.
-    pub validate_invariants: bool,
-
     /// Whether to persist ledger state to the database.
     ///
     /// When enabled, ledger headers and other metadata are written to
@@ -220,7 +206,6 @@ impl Default for LedgerManagerConfig {
         Self {
             max_snapshots: 10,
             validate_bucket_hash: true,
-            validate_invariants: true,
             persist_to_db: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
@@ -261,7 +246,6 @@ struct LedgerState {
 /// - **Entry Cache**: In-memory cache of recently accessed entries for
 ///   fast lookups during transaction processing
 /// - **Database**: Persistent storage for ledger headers and metadata
-/// - **Invariant Manager**: Validates ledger state consistency
 /// - **Snapshot Manager**: Provides point-in-time views for concurrent access
 ///
 /// # Initialization
@@ -313,9 +297,6 @@ pub struct LedgerManager {
     /// Manager for point-in-time snapshots.
     snapshots: SnapshotManager,
 
-    /// Manager for ledger invariant validation.
-    invariants: RwLock<InvariantManager>,
-
     /// Configuration options.
     config: LedgerManagerConfig,
 
@@ -361,18 +342,6 @@ impl LedgerManager {
         config: LedgerManagerConfig,
     ) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
-        let mut invariants = InvariantManager::new();
-        invariants.add(LedgerSeqIncrement);
-        invariants.add(CloseTimeNondecreasing);
-        invariants.add(BucketListHashMatchesHeader);
-        invariants.add(ConservationOfLumens);
-        invariants.add(LedgerEntryIsValid);
-        invariants.add(SponsorshipCountIsValid);
-        invariants.add(AccountSubEntriesCountIsValid);
-        invariants.add(LiabilitiesMatchOffers);
-        invariants.add(OrderBookIsNotCrossed);
-        invariants.add(ConstantProductInvariant);
-        invariants.add(LastModifiedLedgerSeqMatchesHeader);
 
         Self {
             db,
@@ -387,7 +356,6 @@ impl LedgerManager {
             }),
             entry_cache: RwLock::new(HashMap::new()),
             snapshots: SnapshotManager::new(config.max_snapshots),
-            invariants: RwLock::new(invariants),
             config,
             module_cache: RwLock::new(None),
             offer_cache: Arc::new(RwLock::new(Vec::new())),
@@ -1497,11 +1465,6 @@ impl LedgerManager {
         }
     }
 
-    /// Register an additional invariant to enforce on ledger close.
-    pub fn add_invariant<I: Invariant + 'static>(&self, invariant: I) {
-        self.invariants.write().add(invariant);
-    }
-
     /// Get Soroban network configuration information.
     ///
     /// Returns the Soroban-related configuration settings from the current ledger
@@ -1679,17 +1642,6 @@ impl<'a> LedgerCloseContext<'a> {
             return Ok(vec![]);
         }
 
-        let op_invariants = if self.manager.config.validate_invariants {
-            let entries = self.manager.bucket_list.read().live_entries()?;
-            Some(OperationInvariantRunner::new(
-                entries,
-                self.prev_header.clone(),
-                self.manager.network_id,
-            )?)
-        } else {
-            None
-        };
-
         // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
         let soroban_config =
             crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version);
@@ -1723,7 +1675,6 @@ impl<'a> LedgerCloseContext<'a> {
                 soroban_config,
                 soroban_base_prng_seed.0,
                 classic_events,
-                op_invariants,
                 module_cache,
                 hot_archive,
             )?;
@@ -2348,40 +2299,6 @@ impl<'a> LedgerCloseContext<'a> {
         );
         let header_hash = compute_header_hash(&new_header)?;
 
-        if self.manager.config.validate_invariants {
-            let full_entries = {
-                let bucket_list = self.manager.bucket_list.read();
-                bucket_list.live_entries()?
-            };
-            let changes = self
-                .delta
-                .changes()
-                .map(|change| match change {
-                    EntryChange::Created(entry) => LedgerEntryChange::Created {
-                        current: Box::new(entry.clone()),
-                    },
-                    EntryChange::Updated { previous, current } => LedgerEntryChange::Updated {
-                        previous: Box::new(previous.clone()),
-                        current: Box::new(current.clone()),
-                    },
-                    EntryChange::Deleted { previous } => LedgerEntryChange::Deleted {
-                        previous: Box::new(previous.clone()),
-                    },
-                })
-                .collect::<Vec<_>>();
-            let ctx = InvariantContext {
-                prev_header: &self.prev_header,
-                curr_header: &new_header,
-                bucket_list_hash,
-                fee_pool_delta: self.delta.fee_pool_delta(),
-                total_coins_delta: self.delta.total_coins_delta(),
-                changes: &changes,
-                full_entries: Some(&full_entries),
-                op_events: None,
-            };
-            self.manager.invariants.read().check_all(&ctx)?;
-        }
-
         // Record stats
         let entries_created = self.delta.changes().filter(|c| c.is_created()).count();
         let entries_updated = self.delta.changes().filter(|c| c.is_updated()).count();
@@ -2547,7 +2464,6 @@ mod tests {
         let config = LedgerManagerConfig::default();
         assert_eq!(config.max_snapshots, 10);
         assert!(config.validate_bucket_hash);
-        assert!(config.validate_invariants);
         assert!(config.persist_to_db);
     }
 

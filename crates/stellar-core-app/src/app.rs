@@ -733,10 +733,6 @@ impl App {
             LedgerManagerConfig {
                 max_snapshots: 10,
                 validate_bucket_hash: true,
-                // Disable invariants to avoid full bucket list scans every ledger.
-                // Invariant checking requires live_entries() which scans ~70k entries.
-                // TODO: Optimize invariant checks to not require full state scan.
-                validate_invariants: false,
                 persist_to_db: true,
                 emit_classic_events: config.events.emit_classic_events,
                 backfill_stellar_asset_events: config.events.backfill_stellar_asset_events,

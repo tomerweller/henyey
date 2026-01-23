@@ -15,7 +15,6 @@ members = [
     "crates/stellar-core-tx",
     "crates/stellar-core-work",
     "crates/stellar-core-historywork",
-    "crates/stellar-core-invariant",
 ]
 
 [workspace.package]
@@ -57,7 +56,6 @@ stellar-core-ledger = { path = "crates/stellar-core-ledger" }
 stellar-core-tx = { path = "crates/stellar-core-tx" }
 stellar-core-work = { path = "crates/stellar-core-work" }
 stellar-core-historywork = { path = "crates/stellar-core-historywork" }
-stellar-core-invariant = { path = "crates/stellar-core-invariant" }
 
 # Crypto - pure Rust implementations
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }

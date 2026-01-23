@@ -1281,9 +1281,10 @@ mod tests {
             auth: vec![].try_into().unwrap(),
         };
 
-        let result =
-            execute_invoke_host_function(&op, &source, &mut state, &context, None, &config, None)
-                .expect("invoke host function");
+        let result = execute_invoke_host_function(
+            &op, &source, &mut state, &context, None, &config, None, None,
+        )
+        .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -1333,6 +1334,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
             None,
         )
         .expect("invoke host function");
@@ -1414,6 +1416,7 @@ mod tests {
             Some(&soroban_data),
             &config,
             None,
+            None,
         )
         .expect("invoke host function");
 
@@ -1492,6 +1495,7 @@ mod tests {
             Some(&soroban_data),
             &config,
             None,
+            None,
         )
         .expect("invoke host function");
 
@@ -1546,6 +1550,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
             None,
         )
         .expect("invoke host function");
