@@ -1805,9 +1805,75 @@ impl<'a> LedgerCloseContext<'a> {
                 }
             }
 
+            // Update state size window (Protocol 20+)
+            // IMPORTANT: Per C++ stellar-core, we snapshot the state size BEFORE flushing
+            // the updated entries into in-memory state. So the snapshot taken at ledger N
+            // will have the state size for ledger N-1. This is a protocol implementation detail.
+            if protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION {
+                // Check if window entry was already added by transaction execution
+                let has_window_entry = live_entries.iter().any(|e| {
+                    matches!(
+                        &e.data,
+                        LedgerEntryData::ConfigSetting(
+                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                        )
+                    )
+                });
+
+                if !has_window_entry {
+                    // Check if this is a sample ledger before computing window entry
+                    // Sample period is typically 64 ledgers
+                    let archival_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
+                        stellar_xdr::curr::LedgerKeyConfigSetting {
+                            config_setting_id: stellar_xdr::curr::ConfigSettingId::StateArchival,
+                        },
+                    );
+                    let sample_period = bucket_list
+                        .get(&archival_key)
+                        .ok()
+                        .flatten()
+                        .and_then(|e| {
+                            if let LedgerEntryData::ConfigSetting(
+                                stellar_xdr::curr::ConfigSettingEntry::StateArchival(archival),
+                            ) = e.data
+                            {
+                                Some(archival.live_soroban_state_size_window_sample_period)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(64); // Default to 64 if not found
+
+                    // Only compute state size on sample ledgers
+                    let is_sample_ledger =
+                        sample_period > 0 && self.close_data.ledger_seq % sample_period == 0;
+
+                    if is_sample_ledger {
+                        // Use in-memory Soroban state total_size() - this is the state BEFORE
+                        // this ledger's changes are applied (matching C++ behavior)
+                        let soroban_state_size = self.manager.soroban_state.read().total_size();
+
+                        if let Some(window_entry) =
+                            crate::execution::compute_state_size_window_entry(
+                                self.close_data.ledger_seq,
+                                protocol_version,
+                                &bucket_list,
+                                soroban_state_size,
+                            )
+                        {
+                            tracing::info!(
+                                ledger_seq = self.close_data.ledger_seq,
+                                soroban_state_size = soroban_state_size,
+                                "Adding state size window entry to live entries (from in-memory state)"
+                            );
+                            live_entries.push(window_entry);
+                        }
+                    }
+                }
+            }
+
             // Update in-memory Soroban state with changes from this ledger.
-            // This must happen BEFORE computing state size window so the total_size()
-            // reflects the current ledger's state.
+            // This happens AFTER computing state size window (see comment above).
             if protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION {
                 // Load rent config for accurate code size calculation
                 let rent_config = self.manager.load_soroban_rent_config(&bucket_list);
@@ -1849,70 +1915,6 @@ impl<'a> LedgerCloseContext<'a> {
                     code_count = soroban_state.contract_code_count(),
                     "Updated in-memory Soroban state"
                 );
-            }
-
-            // Update state size window (Protocol 20+)
-            // This uses the in-memory Soroban state total_size() instead of scanning bucket list
-            if protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION {
-                // Check if window entry was already added by transaction execution
-                let has_window_entry = live_entries.iter().any(|e| {
-                    matches!(
-                        &e.data,
-                        LedgerEntryData::ConfigSetting(
-                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
-                        )
-                    )
-                });
-
-                if !has_window_entry {
-                    // Check if this is a sample ledger before computing window entry
-                    // Sample period is typically 64 ledgers
-                    let archival_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
-                        stellar_xdr::curr::LedgerKeyConfigSetting {
-                            config_setting_id: stellar_xdr::curr::ConfigSettingId::StateArchival,
-                        },
-                    );
-                    let sample_period = bucket_list
-                        .get(&archival_key)
-                        .ok()
-                        .flatten()
-                        .and_then(|e| {
-                            if let LedgerEntryData::ConfigSetting(
-                                stellar_xdr::curr::ConfigSettingEntry::StateArchival(archival),
-                            ) = e.data
-                            {
-                                Some(archival.live_soroban_state_size_window_sample_period)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(64); // Default to 64 if not found
-
-                    // Only compute state size on sample ledgers
-                    let is_sample_ledger =
-                        sample_period > 0 && self.close_data.ledger_seq % sample_period == 0;
-
-                    if is_sample_ledger {
-                        // Use in-memory Soroban state total_size() instead of scanning bucket list
-                        let soroban_state_size = self.manager.soroban_state.read().total_size();
-
-                        if let Some(window_entry) =
-                            crate::execution::compute_state_size_window_entry(
-                                self.close_data.ledger_seq,
-                                protocol_version,
-                                &bucket_list,
-                                soroban_state_size,
-                            )
-                        {
-                            tracing::info!(
-                                ledger_seq = self.close_data.ledger_seq,
-                                soroban_state_size = soroban_state_size,
-                                "Adding state size window entry to live entries (from in-memory state)"
-                            );
-                            live_entries.push(window_entry);
-                        }
-                    }
-                }
             }
 
             // CRITICAL: Advance the bucket list through any skipped ledgers.
