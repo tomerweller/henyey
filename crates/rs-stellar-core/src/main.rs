@@ -2882,7 +2882,6 @@ async fn cmd_verify_execution(
     let mut transactions_mismatched = 0u32;
     let mut meta_matched = 0u32;
     let mut meta_mismatched = 0u32;
-    let mut phase1_fee_mismatches = 0u32;
     let mut ledgers_with_tx_mismatches = 0u32;
     let mut ledgers_with_header_mismatches = 0u32;
     let mut ledgers_with_both_mismatches = 0u32;
@@ -3180,87 +3179,17 @@ async fn cmd_verify_execution(
                 }
             }
 
-            // Two-phase transaction processing matching C++ stellar-core:
-            // Phase 1: Process all fees first (modifies state for all fee sources)
-            // Phase 2: Apply all transactions (with deduct_fee=false since fees already processed)
+            // Single-phase transaction processing matching online execution.
+            // This ensures offline verification uses the same code path as production,
+            // including proper fee handling and rollback behavior for failed transactions.
+            //
+            // Previously we used a two-phase approach (Phase 1: fee deduction, Phase 2: execution
+            // with deduct_fee=false), but this caused divergence when transactions failed -
+            // the fee source account modification wasn't properly preserved in the delta after
+            // rollback because the rollback code expects fee_created/fee_updated to be populated
+            // (which only happens when deduct_fee=true).
 
-            // Phase 1: Process fees for all transactions and compare with CDP
-            // Also save pre-fee state for fee sources to use in Phase 2 metadata
-            let mut phase1_mismatches = 0;
-            let mut fee_source_pre_states: Vec<Option<stellar_xdr::curr::LedgerEntry>> = Vec::new();
-            for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
-                // For fee bump transactions with separate fee source, save the pre-fee state
-                // This is needed for the STATE entry in Phase 2's tx_changes_before
-                let frame = stellar_core_tx::TransactionFrame::with_network(
-                    tx_info.envelope.clone(),
-                    stellar_core_common::NetworkId(config.network_id()),
-                );
-                let fee_source_id =
-                    stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
-                let inner_source_id =
-                    stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
-
-                let pre_fee_state = if frame.is_fee_bump() && fee_source_id != inner_source_id {
-                    let fee_source_key = stellar_xdr::curr::LedgerKey::Account(
-                        stellar_xdr::curr::LedgerKeyAccount {
-                            account_id: fee_source_id.clone(),
-                        },
-                    );
-                    executor.get_entry(&fee_source_key)
-                } else {
-                    None
-                };
-                fee_source_pre_states.push(pre_fee_state);
-
-                // Use per-tx base_fee from transaction set if available (for surge pricing)
-                // otherwise fall back to header's base_fee
-                let effective_base_fee = tx_info.base_fee.unwrap_or(cdp_header.base_fee);
-
-                let fee_result = executor.process_fee_only(
-                    &snapshot_handle,
-                    &tx_info.envelope,
-                    effective_base_fee,
-                );
-
-                // Compare our Phase 1 fee changes with CDP's fee_meta
-                if in_test_range {
-                    let our_fee_changes: Vec<_> = match &fee_result {
-                        Ok((changes, _fee)) => changes.iter().cloned().collect(),
-                        Err(_) => vec![],
-                    };
-                    let cdp_fee_changes: Vec<_> = tx_info.fee_meta.iter().cloned().collect();
-
-                    let (fee_matches, fee_diffs) =
-                        compare_entry_changes(&our_fee_changes, &cdp_fee_changes);
-                    if !fee_matches {
-                        phase1_mismatches += 1;
-                        if show_diff {
-                            println!("    TX {} Phase 1 FEE MISMATCH:", tx_idx);
-                            println!(
-                                "      Our fee changes: {}, CDP fee changes: {}",
-                                our_fee_changes.len(),
-                                cdp_fee_changes.len()
-                            );
-                            for diff in fee_diffs.iter().take(5) {
-                                println!("      - {}", diff);
-                            }
-                        }
-                    }
-                }
-
-                // We use our own execution results, so no CDP sync here
-            }
-
-            // Accumulate Phase 1 fee mismatches
-            if in_test_range {
-                phase1_fee_mismatches += phase1_mismatches as u32;
-            }
-
-            // Post-transaction fee processing (e.g., Soroban refunds) is recorded
-            // separately in CDP's post_tx_apply_fee_processing. For protocol 23+,
-            // these refunds are applied after all transactions in the ledger.
-
-            // Phase 2: Apply all transactions (fees already deducted in phase 1)
+            // Execute all transactions with single-phase fee+execution
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Snapshot the delta before starting each transaction.
                 // This preserves committed changes from previous transactions so they're
@@ -3278,21 +3207,18 @@ async fn cmd_verify_execution(
                     Some(*hash.as_bytes())
                 };
 
-                // Execute the transaction without fee deduction (fees processed in phase 1)
-                // Pass the pre-fee state for fee bump transactions so the STATE entry
-                // in tx_changes_before shows the correct pre-fee value
-                let fee_source_pre_state = fee_source_pre_states.get(tx_idx).cloned().flatten();
-
                 // Use per-tx base_fee from transaction set if available (for surge pricing)
                 let effective_base_fee = tx_info.base_fee.unwrap_or(cdp_header.base_fee);
 
-                let exec_result = executor.execute_transaction_with_fee_mode_and_pre_state(
+                // Execute with deduct_fee=true for proper fee handling and rollback behavior.
+                // This matches online execution and ensures failed transactions still have
+                // their fee source account modification preserved in the delta.
+                let exec_result = executor.execute_transaction_with_fee_mode(
                     &snapshot_handle,
                     &tx_info.envelope,
                     effective_base_fee,
                     prng_seed,
-                    false, // deduct_fee = false - fees already processed
-                    fee_source_pre_state,
+                    true, // deduct_fee = true - single-phase execution matching online
                 );
 
                 // Check if CDP transaction succeeded
@@ -4588,19 +4514,8 @@ async fn cmd_verify_execution(
     println!("Transaction Execution Verification Complete");
     println!("  Ledgers verified: {}", ledgers_verified);
     println!("  Transactions verified: {}", transactions_verified);
-    println!(
-        "  Phase 1 fee calculations matched: {}",
-        transactions_verified - phase1_fee_mismatches
-    );
-    println!(
-        "  Phase 1 fee calculations mismatched: {}",
-        phase1_fee_mismatches
-    );
-    println!("  Phase 2 execution matched: {}", transactions_matched);
-    println!(
-        "  Phase 2 execution mismatched: {}",
-        transactions_mismatched
-    );
+    println!("  Execution matched: {}", transactions_matched);
+    println!("  Execution mismatched: {}", transactions_mismatched);
     println!("  Transaction meta matched: {}", meta_matched);
     println!("  Transaction meta mismatched: {}", meta_mismatched);
     println!(
@@ -4628,18 +4543,10 @@ async fn cmd_verify_execution(
         header_mismatches
     );
 
-    if phase1_fee_mismatches > 0 {
-        println!();
-        println!(
-            "WARNING: {} transactions had Phase 1 fee calculation differences!",
-            phase1_fee_mismatches
-        );
-    }
-
     if transactions_mismatched > 0 {
         println!();
         println!(
-            "WARNING: {} transactions had Phase 2 execution differences!",
+            "WARNING: {} transactions had execution differences!",
             transactions_mismatched
         );
     }

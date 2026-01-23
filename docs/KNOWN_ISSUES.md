@@ -102,6 +102,43 @@ This implementation is designed for testnet synchronization only. It should not 
 
 ---
 
+### F2: Offline Verification Delta Mismatch for Failed Transactions with Asset Issuers
+
+**Status**: Open (under investigation)  
+**Impact**: Bucket list hash mismatch at specific ledgers during offline verification  
+**Added**: 2026-01-23
+
+**Description**:
+When running offline `verify-execution`, certain ledgers show a bucket list hash mismatch due to missing LIVE entries in our delta compared to CDP metadata. The issue manifests when a transaction fails after partially executing operations that involve asset transfers.
+
+**Observed at**: Ledger 203280 (testnet)
+
+**Symptoms**:
+- CDP expects 10 LIVE entries, we produce 9
+- Missing entry is the **issuer account** of an asset involved in a failed payment operation
+- The failed transaction's fee source IS correctly preserved in our delta
+- All transaction execution results match CDP (success/failure status correct)
+
+**Example**:
+```
+LIVE only in CDP: Account(94c035a17f8d6e30e27b5750f80ee88e6a1d8c9647058e4cff2a2401e9dbed15)
+DELTA COMPARISON: LIVE: ours=9, cdp=10, only_ours=0, only_cdp=1
+```
+
+The missing account is the issuer of `USDPEND` token. TX 4 failed with `Payment(NoTrust)` after the first payment operation succeeded, but the issuer account modification isn't in our delta.
+
+**Investigation Notes**:
+- Switched from two-phase (fee then execution) to single-phase execution (`deduct_fee=true`) - issue persists
+- The issue is NOT the fee source account rollback (that works correctly)
+- May be related to how payment operations update issuer accounts or how partial success is handled before rollback
+
+**Files Involved**:
+- `crates/rs-stellar-core/src/main.rs` - `cmd_verify_execution()` around line 3200
+- `crates/stellar-core-ledger/src/execution.rs` - Transaction execution and rollback
+- `crates/stellar-core-tx/src/operations/execute/payment.rs` - Payment operation
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:
