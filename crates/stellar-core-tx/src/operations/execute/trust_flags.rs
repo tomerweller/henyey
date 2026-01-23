@@ -40,16 +40,15 @@ pub fn execute_allow_trust(
     context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the issuer)
+    // NOTE: C++ stellar-core loads the source account in a nested LedgerTxn (ltxSource)
+    // that gets rolled back, so the source account access is NOT recorded in the
+    // transaction changes. We use get_account() (read-only) to match this behavior.
     let issuer = match state.get_account(source) {
         Some(a) => a.clone(),
         None => {
             return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
         }
     };
-
-    // Record that we accessed the issuer account - this ensures it appears in the
-    // transaction meta even if not modified (matches C++ load() behavior)
-    state.record_account_access(source);
 
     // Check if issuer has AUTH_REQUIRED flag (only for protocol versions before 16)
     // In protocol 16+, this check was removed as part of CAP-0035.
@@ -145,6 +144,9 @@ pub fn execute_set_trust_line_flags(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the issuer)
+    // NOTE: C++ stellar-core loads the source account in a nested LedgerTxn (ltxSource)
+    // that gets rolled back, so the source account access is NOT recorded in the
+    // transaction changes. We use get_account() (read-only) to match this behavior.
     let source_account = match state.get_account(source) {
         Some(a) => a.clone(),
         None => {
@@ -153,10 +155,6 @@ pub fn execute_set_trust_line_flags(
             ));
         }
     };
-
-    // Record that we accessed the issuer account - this ensures it appears in the
-    // transaction meta even if not modified (matches C++ load() behavior)
-    state.record_account_access(source);
 
     // The source must be the issuer of the asset
     let issuer = match &op.asset {
@@ -712,5 +710,166 @@ mod tests {
         // Verify the flag was set
         let tl = state.get_trustline(&trustor_id, &asset).unwrap();
         assert_eq!(tl.flags & AUTHORIZED_FLAG, AUTHORIZED_FLAG);
+    }
+
+    /// Regression test: Verify that SetTrustLineFlags does NOT record the issuer account
+    /// in the delta when the issuer calls it on someone else's trustline.
+    ///
+    /// C++ stellar-core loads the source account in a nested LedgerTxn that gets rolled back,
+    /// so the source account access is NOT recorded in the transaction changes. We need to
+    /// match this behavior to avoid bucket list hash mismatches.
+    ///
+    /// This test was added to prevent regression of the bug fixed for ledger 500254+
+    /// where the issuer account was incorrectly appearing in the LIVE delta.
+    #[test]
+    fn test_set_trust_line_flags_does_not_record_issuer_in_delta() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let trustor_id = create_test_account_id(1);
+
+        // Create issuer with AUTH_REVOCABLE so we can test flag changes
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 10_000_000, 0));
+
+        // Create the asset and trustline (authorized)
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        let trustline = TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 0,
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline);
+
+        // Clear modification tracking from setup
+        state.commit();
+
+        // Now execute SetTrustLineFlags to revoke authorization
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset.clone(),
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Flush changes to delta
+        state.flush_modified_entries();
+
+        // Get the delta's updated entries
+        let delta = state.delta();
+        let updated_entries = delta.updated_entries();
+
+        // The issuer account should NOT be in the updated entries
+        // Only the trustline should be recorded as updated
+        for entry in updated_entries {
+            if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+                // Check this isn't the issuer account
+                assert_ne!(
+                    acc.account_id, issuer_id,
+                    "Issuer account should NOT be in updated_entries for SetTrustLineFlags"
+                );
+            }
+        }
+
+        // The trustline SHOULD be in the updated entries (it was updated)
+        let has_trustline = updated_entries.iter().any(|e| {
+            matches!(&e.data, stellar_xdr::curr::LedgerEntryData::Trustline(tl)
+                if tl.account_id == trustor_id)
+        });
+        assert!(
+            has_trustline,
+            "Trustline should be in updated_entries after SetTrustLineFlags"
+        );
+    }
+
+    /// Regression test: Verify that AllowTrust does NOT record the issuer account
+    /// in the delta when the issuer calls it on someone else's trustline.
+    #[test]
+    fn test_allow_trust_does_not_record_issuer_in_delta() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let trustor_id = create_test_account_id(1);
+
+        // Create issuer with AUTH_REQUIRED and AUTH_REVOCABLE
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 10_000_000, 0));
+
+        // Create trustline (authorized)
+        state.create_trustline(create_test_trustline_with_liabilities(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+            0,
+            0,
+        ));
+
+        // Clear modification tracking from setup
+        state.commit();
+
+        // Execute AllowTrust to revoke authorization
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
+            authorize: 0, // Revoke
+        };
+
+        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Flush changes to delta
+        state.flush_modified_entries();
+
+        // Get the delta's updated entries
+        let delta = state.delta();
+        let updated_entries = delta.updated_entries();
+
+        // The issuer account should NOT be in the updated entries
+        for entry in updated_entries {
+            if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+                assert_ne!(
+                    acc.account_id, issuer_id,
+                    "Issuer account should NOT be in updated_entries for AllowTrust"
+                );
+            }
+        }
+
+        // The trustline SHOULD be in the updated entries
+        let has_trustline = updated_entries.iter().any(|e| {
+            matches!(&e.data, stellar_xdr::curr::LedgerEntryData::Trustline(tl)
+                if tl.account_id == trustor_id)
+        });
+        assert!(
+            has_trustline,
+            "Trustline should be in updated_entries after AllowTrust"
+        );
     }
 }

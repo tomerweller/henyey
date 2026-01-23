@@ -233,6 +233,33 @@ This caused `advance_to_ledger()` to apply hundreds of thousands of empty batche
 
 **Regression test:** Ledgers 637245-637310 (previously had hash mismatches at 637247 and 637308) now pass verification.
 
+### Issues Fixed (2026-01-23 - SetTrustLineFlags/AllowTrust Issuer Recording)
+
+#### SetTrustLineFlags/AllowTrust Should NOT Record Issuer Account in Delta
+
+When `SetTrustLineFlags` or `AllowTrust` is called by an issuer on another account's trustline, the issuer account was incorrectly being recorded in the transaction delta (appearing in LIVE entries). This caused bucket list hash mismatches.
+
+**Observed at**: Ledger 500254 (testnet) - Account `58ddce3f677cb3acb852f50752c4e7bcc2e8318f46701b1811903f8d5beae65f` appearing in our LIVE delta but not in CDP
+
+**Root Cause**: We had added `state.record_account_access(source)` calls to both `execute_allow_trust()` and `execute_set_trust_line_flags()` thinking it matched C++ behavior. However, C++ stellar-core loads the source account in a **nested LedgerTxn** (`ltxSource`) that gets rolled back:
+
+```cpp
+LedgerTxn ltxSource(ltx); // ltxSource will be rolled back
+auto header = ltxSource.loadHeader();
+auto sourceAccountEntry = loadSourceAccount(ltxSource, header);
+```
+
+This means the source account access is NOT recorded in the transaction changes.
+
+**Fix**: Removed `state.record_account_access(source)` calls from both functions. The code now uses `state.get_account(source)` (read-only) which doesn't record the access.
+
+**Files changed:**
+- `crates/stellar-core-tx/src/operations/execute/trust_flags.rs` - Removed `record_account_access()` calls
+
+**Regression tests:**
+- `test_set_trust_line_flags_does_not_record_issuer_in_delta`
+- `test_allow_trust_does_not_record_issuer_in_delta`
+
 ### Issues Fixed (2026-01-23 - CreateClaimableBalance Source Account Recording)
 
 #### CreateClaimableBalance Source Account Not Recorded When Different from TX Source
@@ -243,12 +270,11 @@ When a `CreateClaimableBalance` operation has an operation source different from
 
 **Root Cause**: In C++, operations that need to load their source account call `loadSourceAccount()` which records the access. Our `execute_create_claimable_balance()` was calling `get_account()` (read-only) instead of recording the access.
 
-**Fix**: Added `state.record_account_access(source)` call in `execute_create_claimable_balance()` to match C++ behavior. Also added similar calls in `execute_allow_trust()` and `execute_set_trust_line_flags()`.
+**Fix**: Added `state.record_account_access(source)` call in `execute_create_claimable_balance()` to match C++ behavior.
 
 **Files changed:**
 - `crates/stellar-core-tx/src/state.rs` - Added `record_account_access()` method
 - `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs` - Call `record_account_access()`
-- `crates/stellar-core-tx/src/operations/execute/trust_flags.rs` - Call `record_account_access()`
 
 **Regression test:** `test_create_claimable_balance_records_source_account_access` in `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
 
@@ -362,6 +388,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-23**: Fixed SetTrustLineFlags/AllowTrust incorrectly recording issuer account in delta (ledger 500254) - issuer account should NOT be recorded (C++ uses rolled-back LedgerTxn)
 - **2026-01-23**: Fixed CreateClaimableBalance source account not recorded when different from TX source (ledger 203280) - extends continuous replay through 500000+
 - **2026-01-23**: Fixed AccountMerge destination not recorded when balance unchanged - extends replay through 360000-360500+
 - **2026-01-23**: Fixed bucket list ledger_seq not set after catchup - caused hash mismatches ~60 ledgers after re-catchup

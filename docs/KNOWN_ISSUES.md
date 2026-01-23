@@ -115,7 +115,7 @@ This implementation is designed for testnet synchronization only. It should not 
 **Fixed**: 2026-01-23
 
 **Description**:
-When running offline `verify-execution`, certain ledgers showed a bucket list hash mismatch due to missing LIVE entries in our delta compared to CDP metadata. The issue manifested in scenarios where accounts were accessed but unchanged.
+When running offline `verify-execution`, certain ledgers showed a bucket list hash mismatch due to missing or extra LIVE entries in our delta compared to CDP metadata. The issues involved subtle differences in when accounts should be recorded as modified.
 
 **Root Causes (All Fixed)**:
 
@@ -123,25 +123,30 @@ When running offline `verify-execution`, certain ledgers showed a bucket list ha
 
 2. **CreateClaimableBalance with different op source** (FIXED): When `CreateClaimableBalance` has an operation source different from the transaction source (e.g., issuer account), C++ stellar-core calls `loadSourceAccount()` which records the access. We weren't calling `record_account_access()` for the source.
 
-3. **AllowTrust/SetTrustLineFlags issuer account** (FIXED): Similar to above, the issuer account needs to be recorded when accessed.
+3. **AllowTrust/SetTrustLineFlags issuer account** (FIXED - removed recording): Initially we added `record_account_access()` for these operations, but this was WRONG. C++ stellar-core loads the source account in a **nested LedgerTxn** that gets rolled back, so the source account access is NOT recorded. Fixed by removing the `record_account_access()` calls.
 
 **Observed at**: 
 - Ledger 360249 (testnet) - AccountMerge with 0 balance
 - Ledger 203280 (testnet) - CreateClaimableBalance with issuer as op source
+- Ledger 500254 (testnet) - SetTrustLineFlags was incorrectly recording issuer
 
 **Fix Applied**:
 1. The `flush_all_accounts_except()` method now checks `op_entry_snapshots` to determine if an entry was accessed during the operation.
 2. Added `record_account_access()` method to `LedgerStateManager` that explicitly marks an account as accessed even if not modified.
-3. Added `record_account_access()` calls in `execute_create_claimable_balance()`, `execute_allow_trust()`, and `execute_set_trust_line_flags()` to match C++ `loadSourceAccount()` behavior.
+3. Added `record_account_access()` call in `execute_create_claimable_balance()` to match C++ `loadSourceAccount()` behavior.
+4. **REMOVED** `record_account_access()` calls from `execute_allow_trust()` and `execute_set_trust_line_flags()` because C++ uses a rolled-back nested transaction for issuer loading.
 
 **Files Changed**:
 - `crates/stellar-core-tx/src/state.rs` - Added `record_account_access()` method, updated `flush_all_accounts_except()`
 - `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs` - Call `record_account_access()` for source
-- `crates/stellar-core-tx/src/operations/execute/trust_flags.rs` - Call `record_account_access()` for source
+- `crates/stellar-core-tx/src/operations/execute/trust_flags.rs` - Uses `get_account()` (read-only), NOT `record_account_access()`
 
-**Regression Test**: `test_create_claimable_balance_records_source_account_access` in `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
+**Regression Tests**:
+- `test_create_claimable_balance_records_source_account_access` in `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
+- `test_set_trust_line_flags_does_not_record_issuer_in_delta` in `crates/stellar-core-tx/src/operations/execute/trust_flags.rs`
+- `test_allow_trust_does_not_record_issuer_in_delta` in `crates/stellar-core-tx/src/operations/execute/trust_flags.rs`
 
-**Verification**: Ledgers 64-203500+ now pass with 0 header mismatches
+**Verification**: Ledgers 64-501000+ now pass with 0 header mismatches
 
 ---
 
