@@ -862,13 +862,41 @@ impl LedgerManager {
 
         // Validate previous hash
         if close_data.prev_ledger_hash != state.header_hash {
-            // Describe the StellarValueExt for logging
+            // Describe the StellarValueExt for logging with details
             let stellar_value_ext_desc = match &state.header.scp_value.ext {
                 stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
-                stellar_xdr::curr::StellarValueExt::Signed(_) => "Signed".to_string(),
+                stellar_xdr::curr::StellarValueExt::Signed(sig) => {
+                    let node_id_bytes = match &sig.node_id.0 {
+                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+                    };
+                    format!(
+                        "Signed(node_id={}, sig_len={})",
+                        Hash256::from_bytes(node_id_bytes).to_hex(),
+                        sig.signature.len()
+                    )
+                }
             };
 
+            // Compute recomputed hash to verify
+            use stellar_xdr::curr::{Limits, WriteXdr};
+            let header_xdr = state.header.to_xdr(Limits::none()).unwrap_or_default();
+            let header_xdr_hex = Hash256::from_bytes({
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&header_xdr[..std::cmp::min(32, header_xdr.len())]);
+                arr
+            })
+            .to_hex();
+            tracing::error!(
+                header_xdr_first_32_bytes = %header_xdr_hex,
+                header_xdr_len = header_xdr.len(),
+                "Header XDR bytes for debugging"
+            );
+
             // Debug: Log header details to help diagnose hash mismatch
+            let skip_list_0 = Hash256::from(state.header.skip_list[0].clone()).to_hex();
+            let skip_list_1 = Hash256::from(state.header.skip_list[1].clone()).to_hex();
+            let skip_list_2 = Hash256::from(state.header.skip_list[2].clone()).to_hex();
+            let skip_list_3 = Hash256::from(state.header.skip_list[3].clone()).to_hex();
             tracing::error!(
                 current_seq = state.header.ledger_seq,
                 close_seq = close_data.ledger_seq,
@@ -889,6 +917,10 @@ impl LedgerManager {
                 header_base_fee = state.header.base_fee,
                 header_base_reserve = state.header.base_reserve,
                 header_max_tx_set_size = state.header.max_tx_set_size,
+                skip_list_0 = %skip_list_0,
+                skip_list_1 = %skip_list_1,
+                skip_list_2 = %skip_list_2,
+                skip_list_3 = %skip_list_3,
                 "Hash mismatch - our computed header hash differs from network's prev_ledger_hash"
             );
             return Err(LedgerError::HashMismatch {
@@ -1438,6 +1470,46 @@ impl<'a> LedgerCloseContext<'a> {
             let init_entries = self.delta.init_entries();
             let mut live_entries = self.delta.live_entries();
             let mut dead_entries = self.delta.dead_entries();
+
+            // Log bucket list entries for debugging hash mismatch
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                init_count = init_entries.len(),
+                live_count = live_entries.len(),
+                dead_count = dead_entries.len(),
+                "Bucket list entries from delta"
+            );
+
+            // Log first few entries for debugging
+            for (i, entry) in init_entries.iter().take(5).enumerate() {
+                let key = crate::delta::entry_to_key(entry).ok();
+                tracing::debug!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    index = i,
+                    key = ?key,
+                    last_modified = entry.last_modified_ledger_seq,
+                    "INIT entry"
+                );
+            }
+            for (i, entry) in live_entries.iter().take(5).enumerate() {
+                let key = crate::delta::entry_to_key(entry).ok();
+                tracing::debug!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    index = i,
+                    key = ?key,
+                    last_modified = entry.last_modified_ledger_seq,
+                    "LIVE entry"
+                );
+            }
+            for (i, key) in dead_entries.iter().take(5).enumerate() {
+                tracing::debug!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    index = i,
+                    key = ?key,
+                    "DEAD entry"
+                );
+            }
+
             tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Got delta entries");
 
             // Run incremental eviction scan for Protocol 23+
@@ -1556,6 +1628,164 @@ impl<'a> LedgerCloseContext<'a> {
                 }
             }
 
+            // Update state size window (Protocol 20+)
+            // This must happen before add_batch to compute window from current state
+            if protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION {
+                // Check if window entry was already added by transaction execution
+                let has_window_entry = live_entries.iter().any(|e| {
+                    matches!(
+                        &e.data,
+                        LedgerEntryData::ConfigSetting(
+                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                        )
+                    )
+                });
+
+                if !has_window_entry {
+                    // Debug: count live entries in bucket list and compute size manually
+                    let mut contract_data_size: u64 = 0;
+                    let mut contract_code_size: u64 = 0;
+                    let mut contract_data_count: u64 = 0;
+                    let mut contract_code_count: u64 = 0;
+
+                    if let Ok(entries) = bucket_list.live_entries() {
+                        use stellar_xdr::curr::{Limits, WriteXdr};
+                        for entry in &entries {
+                            match &entry.data {
+                                LedgerEntryData::ContractData(_) => {
+                                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
+                                        contract_data_size += xdr_bytes.len() as u64;
+                                        contract_data_count += 1;
+                                    }
+                                }
+                                LedgerEntryData::ContractCode(_) => {
+                                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
+                                        contract_code_size += xdr_bytes.len() as u64;
+                                        contract_code_count += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    let total_size = contract_data_size + contract_code_size;
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        contract_data_count = contract_data_count,
+                        contract_code_count = contract_code_count,
+                        contract_data_size = contract_data_size,
+                        contract_code_size = contract_code_size,
+                        total_size = total_size,
+                        "State size debug: computed from bucket list"
+                    );
+
+                    // Also check what the function returns (now with proper rent size for contract code)
+                    let fn_size = crate::execution::compute_soroban_state_size_from_bucket_list(
+                        &bucket_list,
+                        protocol_version,
+                    );
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        fn_size = fn_size,
+                        manual_xdr_size = total_size,
+                        "State size debug: function (with rent) vs manual (xdr only)"
+                    );
+
+                    let soroban_state_size = fn_size;
+
+                    if let Some(window_entry) = crate::execution::compute_state_size_window_entry(
+                        self.close_data.ledger_seq,
+                        protocol_version,
+                        &bucket_list,
+                        soroban_state_size,
+                    ) {
+                        tracing::info!(
+                            ledger_seq = self.close_data.ledger_seq,
+                            soroban_state_size = soroban_state_size,
+                            "Adding state size window entry to live entries"
+                        );
+                        live_entries.push(window_entry);
+                    }
+                }
+            }
+
+            // CRITICAL: Advance the bucket list through any skipped ledgers.
+            // The bucket list merge algorithm depends on being called for every ledger
+            // in sequence. In live mode, we may skip ledgers if there are no transactions
+            // between consensus rounds. This ensures proper merge timing.
+            let current_bl_ledger = bucket_list.ledger_seq();
+            tracing::info!(
+                current_bl_ledger = current_bl_ledger,
+                target_ledger = self.close_data.ledger_seq,
+                needs_advance = current_bl_ledger < self.close_data.ledger_seq - 1,
+                "Checking if bucket list advance is needed"
+            );
+            if current_bl_ledger < self.close_data.ledger_seq - 1 {
+                let advance_from = current_bl_ledger + 1;
+                let advance_to = self.close_data.ledger_seq;
+                tracing::info!(
+                    current_bl_ledger = current_bl_ledger,
+                    target_ledger = self.close_data.ledger_seq,
+                    skipped_count = advance_to - advance_from,
+                    "Advancing bucket list through empty ledgers"
+                );
+                bucket_list.advance_to_ledger(
+                    self.close_data.ledger_seq,
+                    protocol_version,
+                    BucketListType::Live,
+                )?;
+            }
+
+            // Log bucket list hash BEFORE add_batch
+            let pre_add_batch_hash = bucket_list.hash();
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                pre_add_batch_hash = %pre_add_batch_hash.to_hex(),
+                init_count = init_entries.len(),
+                live_count = live_entries.len(),
+                dead_count = dead_entries.len(),
+                "Bucket list state before add_batch"
+            );
+
+            // Detailed entry logging for debugging
+            for (i, entry) in init_entries.iter().enumerate() {
+                let key = stellar_core_bucket::ledger_entry_to_key(entry);
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    idx = i,
+                    entry_type = ?std::mem::discriminant(&entry.data),
+                    key = ?key,
+                    last_modified = entry.last_modified_ledger_seq,
+                    "INIT entry"
+                );
+            }
+            for (i, entry) in live_entries.iter().enumerate() {
+                let key = stellar_core_bucket::ledger_entry_to_key(entry);
+                // For ConfigSetting entries, log the data for comparison
+                let config_data = match &entry.data {
+                    LedgerEntryData::ConfigSetting(cs) => Some(format!("{:?}", cs)),
+                    _ => None,
+                };
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    idx = i,
+                    entry_type = ?std::mem::discriminant(&entry.data),
+                    key = ?key,
+                    last_modified = entry.last_modified_ledger_seq,
+                    config_data = ?config_data,
+                    "LIVE entry"
+                );
+            }
+            for (i, key) in dead_entries.iter().enumerate() {
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    idx = i,
+                    key = ?key,
+                    "DEAD entry"
+                );
+            }
+
             bucket_list.add_batch(
                 self.close_data.ledger_seq,
                 protocol_version,
@@ -1567,10 +1797,29 @@ impl<'a> LedgerCloseContext<'a> {
 
             let live_hash = bucket_list.hash();
 
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                post_add_batch_hash = %live_hash.to_hex(),
+                "Bucket list state after add_batch"
+            );
+
             // For Protocol 23+, update hot archive and combine bucket list hashes
             if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
                 let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
                 if let Some(ref mut hot_archive) = *hot_archive_guard {
+                    // Advance hot archive through any skipped ledgers (same as live bucket list)
+                    let current_hot_ledger = hot_archive.ledger_seq();
+                    if current_hot_ledger < self.close_data.ledger_seq - 1 {
+                        tracing::info!(
+                            current_hot_ledger = current_hot_ledger,
+                            target_ledger = self.close_data.ledger_seq,
+                            skipped_count = self.close_data.ledger_seq - current_hot_ledger - 1,
+                            "Advancing hot archive bucket list through empty ledgers"
+                        );
+                        hot_archive
+                            .advance_to_ledger(self.close_data.ledger_seq, protocol_version)?;
+                    }
+
                     // Add archived entries to hot archive bucket list
                     // Must call add_batch even with empty entries to maintain spill consistency
                     // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
@@ -1619,6 +1868,31 @@ impl<'a> LedgerCloseContext<'a> {
             }
         };
 
+        // Log all inputs to create_next_header for debugging header mismatch
+        let total_coins = self.prev_header.total_coins + self.delta.total_coins_delta();
+        let fee_pool = self.prev_header.fee_pool + self.delta.fee_pool_delta();
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            prev_header_hash = %self.prev_header_hash.to_hex(),
+            prev_ledger_seq = self.prev_header.ledger_seq,
+            close_time = self.close_data.close_time,
+            tx_set_hash = %self.close_data.tx_set_hash().to_hex(),
+            bucket_list_hash = %bucket_list_hash.to_hex(),
+            tx_result_hash = %tx_result_hash.to_hex(),
+            prev_total_coins = self.prev_header.total_coins,
+            total_coins_delta = self.delta.total_coins_delta(),
+            total_coins = total_coins,
+            prev_fee_pool = self.prev_header.fee_pool,
+            fee_pool_delta = self.delta.fee_pool_delta(),
+            fee_pool = fee_pool,
+            inflation_seq = self.prev_header.inflation_seq,
+            prev_ledger_version = self.prev_header.ledger_version,
+            prev_base_fee = self.prev_header.base_fee,
+            prev_base_reserve = self.prev_header.base_reserve,
+            prev_max_tx_set_size = self.prev_header.max_tx_set_size,
+            "Header creation inputs"
+        );
+
         // Create the new header
         let mut new_header = create_next_header(
             &self.prev_header,
@@ -1627,8 +1901,8 @@ impl<'a> LedgerCloseContext<'a> {
             self.close_data.tx_set_hash(),
             bucket_list_hash,
             tx_result_hash,
-            self.prev_header.total_coins + self.delta.total_coins_delta(),
-            self.prev_header.fee_pool + self.delta.fee_pool_delta(),
+            total_coins,
+            fee_pool,
             self.prev_header.inflation_seq,
             self.close_data.stellar_value_ext.clone(),
         );
@@ -1677,7 +1951,19 @@ impl<'a> LedgerCloseContext<'a> {
 
         new_header.id_pool = self.id_pool;
 
-        // Compute header hash
+        // Compute header hash - add detailed XDR logging for debugging
+        use stellar_xdr::curr::{Limits, WriteXdr};
+        let header_xdr_bytes = new_header.to_xdr(Limits::none())?;
+        let header_xdr_hex: String = header_xdr_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        tracing::error!(
+            ledger_seq = new_header.ledger_seq,
+            header_xdr_len = header_xdr_bytes.len(),
+            header_xdr_hex = %header_xdr_hex,
+            "Full header XDR for hash debugging"
+        );
         let header_hash = compute_header_hash(&new_header)?;
 
         if self.manager.config.validate_invariants {

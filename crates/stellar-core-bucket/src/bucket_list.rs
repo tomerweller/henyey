@@ -736,6 +736,67 @@ impl BucketList {
         Ok(())
     }
 
+    /// Advance the bucket list from its current ledger to a target ledger by
+    /// applying empty batches for all intermediate ledgers.
+    ///
+    /// This is required because the bucket list merge algorithm depends on being
+    /// called for every ledger in sequence. The spill boundaries and merge timing
+    /// are determined by the ledger sequence number.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_ledger` - The ledger to advance to (exclusive of actual changes)
+    /// * `protocol_version` - Protocol version for empty batches
+    /// * `bucket_list_type` - Type of bucket list (Live)
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if successful, or an error if the target is not greater than current.
+    pub fn advance_to_ledger(
+        &mut self,
+        target_ledger: u32,
+        protocol_version: u32,
+        bucket_list_type: BucketListType,
+    ) -> Result<()> {
+        let current = self.ledger_seq;
+        if target_ledger <= current {
+            // Nothing to do - we're already at or past this ledger
+            return Ok(());
+        }
+
+        // Apply empty batches for each intermediate ledger
+        // This maintains the correct merge timing in the bucket list
+        tracing::info!(
+            current = current,
+            target_ledger = target_ledger,
+            count = target_ledger - current - 1,
+            "advance_to_ledger: applying empty batches"
+        );
+        for seq in (current + 1)..target_ledger {
+            tracing::debug!(
+                from_ledger = current,
+                to_ledger = target_ledger,
+                current_seq = seq,
+                "Advancing bucket list through empty ledger"
+            );
+            self.add_batch(
+                seq,
+                protocol_version,
+                bucket_list_type.clone(),
+                Vec::new(), // empty init
+                Vec::new(), // empty live
+                Vec::new(), // empty dead
+            )?;
+        }
+        tracing::info!(
+            current = current,
+            target_ledger = target_ledger,
+            "advance_to_ledger: completed"
+        );
+
+        Ok(())
+    }
+
     /// Round down `value` to the nearest multiple of `modulus`.
     fn round_down(value: u32, modulus: u32) -> u32 {
         if modulus == 0 {

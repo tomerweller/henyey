@@ -4256,14 +4256,29 @@ async fn cmd_verify_execution(
 
                 drop(bl);
 
+                // Detailed entry logging for debugging (to compare with live mode)
+                println!("  OFFLINE DEBUG: Ledger {} add_batch entries:", seq);
+                println!("    init_count={}, live_count={}, dead_count={}", all_init.len(), all_live.len(), all_dead.len());
+                for (i, entry) in all_init.iter().enumerate() {
+                    let key = ledger_entry_to_key(entry);
+                    println!("    INIT[{}]: key={:?} last_modified={}", i, key, entry.last_modified_ledger_seq);
+                }
+                for (i, entry) in all_live.iter().enumerate() {
+                    let key = ledger_entry_to_key(entry);
+                    println!("    LIVE[{}]: key={:?} last_modified={}", i, key, entry.last_modified_ledger_seq);
+                }
+                for (i, key) in all_dead.iter().enumerate() {
+                    println!("    DEAD[{}]: key={:?}", i, key);
+                }
+
                 // Apply to bucket list
                 bucket_list.write().unwrap().add_batch(
                     seq,
                     cdp_header.ledger_version,
                     BucketListType::Live,
-                    all_init,
-                    all_live,
-                    all_dead,
+                    all_init.clone(),
+                    all_live.clone(),
+                    all_dead.clone(),
                 )?;
 
                 // Update hot archive bucket list
@@ -4326,6 +4341,16 @@ async fn cmd_verify_execution(
                 };
                 let expected_bucket_list_hash = Hash256::from(cdp_header.bucket_list_hash.0);
                 let bucket_list_matches = our_bucket_list_hash == expected_bucket_list_hash;
+
+                // Debug logging for bucket list hash comparison
+                println!("  DEBUG: Ledger {} bucket list hash computation:", seq);
+                println!("    live_hash: {}", our_live_hash.to_hex());
+                if let Some(hot_hash) = our_hot_hash {
+                    println!("    hot_hash: {}", hot_hash.to_hex());
+                }
+                println!("    combined_hash: {}", our_bucket_list_hash.to_hex());
+                println!("    expected_hash: {}", expected_bucket_list_hash.to_hex());
+                println!("    matches: {}", bucket_list_matches);
 
                 // 2. Compute fee pool: previous fee_pool + fees charged this ledger
                 let fees_this_ledger: i64 = tx_processing

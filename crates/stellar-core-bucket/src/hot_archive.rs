@@ -518,6 +518,46 @@ impl HotArchiveBucketList {
         Ok(())
     }
 
+    /// Advance the hot archive bucket list from its current ledger to a target ledger
+    /// by applying empty batches for all intermediate ledgers.
+    ///
+    /// This is required because the bucket list merge algorithm depends on being
+    /// called for every ledger in sequence.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_ledger` - The ledger to advance to (exclusive of actual changes)
+    /// * `protocol_version` - Protocol version for empty batches
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if successful, or an error if the target is not greater than current.
+    pub fn advance_to_ledger(&mut self, target_ledger: u32, protocol_version: u32) -> Result<()> {
+        let current = self.ledger_seq;
+        if target_ledger <= current {
+            // Nothing to do - we're already at or past this ledger
+            return Ok(());
+        }
+
+        // Apply empty batches for each intermediate ledger
+        for seq in (current + 1)..target_ledger {
+            tracing::trace!(
+                from_ledger = current,
+                to_ledger = target_ledger,
+                current_seq = seq,
+                "Advancing hot archive bucket list through empty ledger"
+            );
+            self.add_batch(
+                seq,
+                protocol_version,
+                Vec::new(), // empty archived entries
+                Vec::new(), // empty restored keys
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn add_batch_internal(
         &mut self,
         ledger_seq: u32,

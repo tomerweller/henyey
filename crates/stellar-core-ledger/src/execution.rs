@@ -5045,6 +5045,161 @@ pub fn execute_transaction_set_with_fee_mode(
     ))
 }
 
+/// Compute the state size window update entry for a ledger close.
+///
+/// This implements the C++ `maybeSnapshotSorobanStateSize` logic, which updates the
+/// `LiveSorobanStateSizeWindow` config setting on each sample period.
+///
+/// # Arguments
+///
+/// * `seq` - Current ledger sequence number
+/// * `protocol_version` - Current protocol version
+/// * `bucket_list` - Bucket list to read current window state from
+/// * `soroban_state_size` - Total size of Soroban state in bytes (contracts + data)
+///
+/// # Returns
+///
+/// The updated window entry if a change is needed, or None if no update is required.
+pub fn compute_state_size_window_entry(
+    seq: u32,
+    protocol_version: u32,
+    bucket_list: &stellar_core_bucket::BucketList,
+    soroban_state_size: u64,
+) -> Option<LedgerEntry> {
+    use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
+    use stellar_xdr::curr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerEntryExt, LedgerKey,
+        LedgerKeyConfigSetting, VecM,
+    };
+
+    if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
+        return None;
+    }
+
+    // Load state archival settings to get sample period and size
+    let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    });
+    let archival_entry = bucket_list.get(&archival_key).ok()??;
+    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival)) =
+        archival_entry.data
+    else {
+        return None;
+    };
+
+    let sample_period = archival.live_soroban_state_size_window_sample_period;
+    let sample_size = archival.live_soroban_state_size_window_sample_size as usize;
+    if sample_period == 0 || sample_size == 0 {
+        return None;
+    }
+
+    // Load current window state
+    let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+    });
+    let window_entry = bucket_list.get(&window_key).ok()??;
+    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) =
+        window_entry.data
+    else {
+        return None;
+    };
+
+    let mut window_vec: Vec<u64> = window.into();
+    if window_vec.is_empty() {
+        return None;
+    }
+
+    // Check if window size needs to be adjusted
+    let mut changed = false;
+    if window_vec.len() != sample_size {
+        if sample_size < window_vec.len() {
+            let remove_count = window_vec.len() - sample_size;
+            window_vec.drain(0..remove_count);
+        } else {
+            let oldest = window_vec[0];
+            let insert_count = sample_size - window_vec.len();
+            for _ in 0..insert_count {
+                window_vec.insert(0, oldest);
+            }
+        }
+        changed = true;
+    }
+
+    // Update window on sample ledgers
+    if seq % sample_period == 0 {
+        if !window_vec.is_empty() {
+            window_vec.remove(0);
+            window_vec.push(soroban_state_size);
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let window_vecm: VecM<u64> = window_vec.try_into().ok()?;
+
+    Some(LedgerEntry {
+        last_modified_ledger_seq: seq,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+            window_vecm,
+        )),
+        ext: LedgerEntryExt::V0,
+    })
+}
+
+/// Compute the total size of Soroban state from the bucket list.
+///
+/// This sums the byte sizes of all CONTRACT_DATA and CONTRACT_CODE entries
+/// in the bucket list. For Protocol 23+, this is used for state size tracking.
+///
+/// For CONTRACT_DATA entries, the size is the XDR serialized size.
+/// For CONTRACT_CODE entries, the size includes both the XDR size and the
+/// in-memory compiled module size (computed via soroban-env-host's
+/// `entry_size_for_rent` function). This matches the C++ stellar-core behavior
+/// which uses `contractCodeSizeForRent()` -> `ledgerEntrySizeForRent()` ->
+/// `rust_bridge::contract_code_memory_size_for_rent()`.
+///
+/// Note: This is a relatively expensive operation as it requires iterating
+/// through all live entries in the bucket list and computing compiled module
+/// sizes for contract code entries.
+pub fn compute_soroban_state_size_from_bucket_list(
+    bucket_list: &stellar_core_bucket::BucketList,
+    protocol_version: u32,
+) -> u64 {
+    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
+    use stellar_xdr::curr::{LedgerEntryData, Limits, WriteXdr};
+
+    let mut total_size: u64 = 0;
+
+    if let Ok(entries) = bucket_list.live_entries() {
+        for entry in &entries {
+            match &entry.data {
+                LedgerEntryData::ContractData(_) => {
+                    // Contract data uses XDR size
+                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
+                        total_size += xdr_bytes.len() as u64;
+                    }
+                }
+                LedgerEntryData::ContractCode(_) => {
+                    // Contract code uses entry_size_for_rent which includes
+                    // the compiled module memory cost for Protocol 23+
+                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
+                        let xdr_size = xdr_bytes.len() as u32;
+                        let rent_size =
+                            entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size);
+                        total_size += rent_size as u64;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    total_size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

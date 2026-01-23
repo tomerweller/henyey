@@ -3302,6 +3302,15 @@ impl App {
             };
 
             let tx_set = close_info.tx_set.clone().expect("tx set present");
+            // Log our current header hash vs what network expects
+            let our_header_hash = self.ledger_manager.current_header_hash();
+            tracing::info!(
+                ledger_seq = next_seq,
+                our_header_hash = %our_header_hash.to_hex(),
+                network_prev_hash = %tx_set.previous_ledger_hash.to_hex(),
+                matches = our_header_hash == tx_set.previous_ledger_hash,
+                "Pre-close hash comparison"
+            );
             if tx_set.hash != close_info.tx_set_hash {
                 tracing::error!(
                     ledger_seq = next_seq,
@@ -3319,6 +3328,7 @@ impl App {
                 ledger_seq = next_seq,
                 tx_count = tx_set.transactions.len(),
                 close_time = close_info.close_time,
+                prev_ledger_hash = %tx_set.previous_ledger_hash.to_hex(),
                 "Applying buffered ledger"
             );
 
