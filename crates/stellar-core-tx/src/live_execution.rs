@@ -301,7 +301,7 @@ pub fn process_fee_seq_num(
 
         // Update sequence number for pre-protocol 10 (only if applying)
         if should_apply && protocol_version < FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY {
-            update_sequence_number(state, &source_account_id)?;
+            update_sequence_number(state, &source_account_id, frame.sequence_number())?;
         }
     }
 
@@ -445,12 +445,19 @@ fn charge_fee_to_account(
 }
 
 /// Update sequence number for an account.
-fn update_sequence_number(state: &mut LedgerStateManager, account_id: &AccountId) -> Result<()> {
+///
+/// CAP-0021: Sets the account's seq_num to the transaction's seq_num.
+/// This handles the case where minSeqNum allows sequence gaps.
+fn update_sequence_number(
+    state: &mut LedgerStateManager,
+    account_id: &AccountId,
+    tx_seq_num: i64,
+) -> Result<()> {
     let account = state
         .get_account_mut(account_id)
         .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", account_id)))?;
 
-    account.seq_num.0 += 1;
+    account.seq_num = stellar_xdr::curr::SequenceNumber(tx_seq_num);
     Ok(())
 }
 
@@ -712,7 +719,7 @@ pub fn process_seq_num(frame: &TransactionFrame, ctx: &mut LiveExecutionContext)
         .state_mut()
         .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
 
-    update_sequence_number(state, &source_account_id)
+    update_sequence_number(state, &source_account_id, frame.sequence_number())
 }
 
 // ============================================================================
@@ -1131,6 +1138,41 @@ mod tests {
         if let Some(state) = ctx.state() {
             let account = state.get_account(&account_id).unwrap();
             assert_eq!(account.seq_num.0, 5);
+        }
+    }
+
+    /// CAP-0021 regression test: Sequence number should be set to tx's seq_num, not incremented.
+    ///
+    /// When minSeqNum is used, transactions can have sequence gaps (tx seq > account seq + 1).
+    /// The account's final sequence must equal the transaction's sequence number.
+    ///
+    /// Bug found: At ledger 28110, a transaction with minSeqNum had:
+    ///   - account_seq = 120722940755968
+    ///   - tx_seq = 120722940755970 (gap of 1)
+    /// We incorrectly set account seq to 968+1=969 instead of 970.
+    #[test]
+    fn test_process_seq_num_with_sequence_gap_cap_0021() {
+        let mut ctx = make_test_context_with_state(21);
+        let account_id = make_account_id(1);
+        // Account has seq 100, but tx uses seq 105 (gap allowed by minSeqNum)
+        let account = make_account_entry(account_id.clone(), 10_000_000, 100);
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(account);
+        }
+
+        // Transaction has seq_num 105 (not 101) - simulating minSeqNum gap
+        let frame = make_test_frame(account_id.clone(), 200, 105);
+
+        process_seq_num(&frame, &mut ctx).unwrap();
+
+        // CAP-0021: Account seq_num should be set to tx's seq_num (105), NOT account_seq + 1 (101)
+        if let Some(state) = ctx.state() {
+            let updated_account = state.get_account(&account_id).unwrap();
+            assert_eq!(
+                updated_account.seq_num.0, 105,
+                "CAP-0021: Account seq should equal tx seq (105), not account_seq+1 (101)"
+            );
         }
     }
 

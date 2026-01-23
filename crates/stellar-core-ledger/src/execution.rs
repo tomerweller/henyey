@@ -1544,7 +1544,8 @@ impl TransactionExecutor {
         // For protocol < 10, sequence bump happens during fee processing
         if self.protocol_version < 10 {
             if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-                acc.seq_num.0 += 1;
+                // Set the account's seq_num to the transaction's seq_num
+                acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
                 stellar_core_tx::state::update_account_seq_info(
                     acc,
                     self.ledger_seq,
@@ -2195,7 +2196,10 @@ impl TransactionExecutor {
             }
             if self.protocol_version < 10 {
                 if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-                    acc.seq_num.0 += 1;
+                    // CAP-0021: Set the account's seq_num to the transaction's seq_num.
+                    // This handles the case where minSeqNum allows sequence gaps - the
+                    // account's final seq must be the tx's seq, not just account_seq + 1.
+                    acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
                     stellar_core_tx::state::update_account_seq_info(
                         acc,
                         self.ledger_seq,
@@ -2319,7 +2323,10 @@ impl TransactionExecutor {
             let seq_state_override = self.state.get_entry(&inner_source_key);
 
             if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-                acc.seq_num.0 += 1;
+                // CAP-0021: Set the account's seq_num to the transaction's seq_num.
+                // This handles the case where minSeqNum allows sequence gaps - the
+                // account's final seq must be the tx's seq, not just account_seq + 1.
+                acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
                 stellar_core_tx::state::update_account_seq_info(
                     acc,
                     self.ledger_seq,

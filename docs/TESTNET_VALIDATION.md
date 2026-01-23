@@ -55,7 +55,25 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 ### Issues Fixed (2026-01-23)
 
-#### 1. Soroban Transaction Meta Missing V1 Extension with Fee Values
+#### 1. CAP-0021 Sequence Number Handling with minSeqNum Gaps
+
+When transactions use `minSeqNum` (from CAP-0021 / PreconditionsV2), they can have sequence numbers higher than `account.seq_num + 1`. The account's final sequence must be set to the **transaction's sequence number**, not `account.seq_num + 1`.
+
+At ledger 28110, a transaction had:
+- `account_seq = 120722940755968`
+- `tx_seq = 120722940755970` (gap of 1, allowed by minSeqNum=0)
+
+We incorrectly set account seq to 968+1=969 instead of 970.
+
+**Fix:** Changed all sequence number updates to use `acc.seq_num = tx.sequence_number()` instead of `acc.seq_num += 1`. This matches C++ stellar-core's `processSeqNum()` which does `sourceAccount.seqNum = getSeqNum()`.
+
+**Files changed:**
+- `crates/stellar-core-ledger/src/execution.rs` - 3 locations
+- `crates/stellar-core-tx/src/live_execution.rs` - `update_sequence_number()` function
+
+**Regression test:** `test_process_seq_num_with_sequence_gap_cap_0021` in `crates/stellar-core-tx/src/live_execution.rs`
+
+#### 2. Soroban Transaction Meta Missing V1 Extension with Fee Values
 
 The `SorobanTransactionMetaExt` was always set to V0, but it should be V1 with fee tracking values (`total_non_refundable_resource_fee_charged`, `total_refundable_resource_fee_charged`, `rent_fee_charged`).
 
@@ -257,6 +275,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-23**: Fixed CAP-0021 sequence number handling with minSeqNum gaps (ledger 28110) - sequence must be set to tx seq, not incremented
 - **2026-01-23**: Fixed Soroban transaction meta V1 extension, rent fee calculation, RO TTL meta suppression, hot archive TTL RESTORED - extends replay to 64-183000 with 100% meta match
 - **2026-01-22**: Fixed TTL emission when value unchanged (ledger 182022) - extends replay to 64-182021
 - **2026-01-22**: Fixed classic fee calculation, liquidity pool deletion, INIT/DEAD coalescing - extends replay to 64-145000+
