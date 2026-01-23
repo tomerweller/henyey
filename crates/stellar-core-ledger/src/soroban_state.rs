@@ -1057,7 +1057,7 @@ mod tests {
         let entry = make_contract_data_entry([1u8; 32]);
 
         state.create_contract_data(entry).unwrap();
-        let initial_size = state.contract_data_state_size;
+        let _initial_size = state.contract_data_state_size;
 
         let mut updated_entry = make_contract_data_entry([1u8; 32]);
         if let LedgerEntryData::ContractData(cd) = &mut updated_entry.data {

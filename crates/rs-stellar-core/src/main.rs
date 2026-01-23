@@ -4826,6 +4826,7 @@ fn compare_tx_results(
 ///
 /// This enables consistent sorting since C++ stellar-core uses UnorderedMap with
 /// a random hash mixer, producing non-deterministic ordering across runs.
+#[allow(dead_code)]
 fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (Vec<u8>, u8, [u8; 32]) {
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, Limits, WriteXdr};
@@ -4932,6 +4933,7 @@ fn change_sort_key(change: &stellar_xdr::curr::LedgerEntryChange) -> (Vec<u8>, u
 /// `(matches, differences)` where:
 /// - `matches` is true if the lists are semantically equivalent
 /// - `differences` contains descriptions of any mismatches
+#[allow(dead_code)]
 fn compare_entry_changes(
     our_changes: &[stellar_xdr::curr::LedgerEntryChange],
     cdp_changes: &[stellar_xdr::curr::LedgerEntryChange],
@@ -4998,6 +5000,7 @@ fn compare_entry_changes(
 /// C++ stellar-core produces STATE (ledger-start) / UPDATED (current) pairs for ALL
 /// entries in the read footprint whose TTL changed during the ledger, even if the
 /// specific transaction didn't change the TTL. This function adds those missing entries.
+#[allow(dead_code)]
 fn augment_soroban_ttl_metadata(
     meta: &mut stellar_xdr::curr::TransactionMeta,
     footprint: &stellar_xdr::curr::LedgerFootprint,
@@ -5351,6 +5354,7 @@ fn describe_change(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
 }
 
 /// Describe a LedgerEntryChange with detailed values for debugging.
+#[allow(dead_code)]
 fn describe_change_detailed(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
     use stellar_xdr::curr::{LedgerEntry, LedgerEntryChange, LedgerEntryData};
 

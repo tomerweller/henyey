@@ -142,7 +142,7 @@ async fn test_retry_then_success() {
         event_tx: None,
     });
 
-    scheduler.add_work(
+    let _ = scheduler.add_work(
         Box::new(RetryWork {
             name: "retry".to_string(),
             attempts: Arc::clone(&attempts),
@@ -218,7 +218,7 @@ async fn test_work_callback() {
         log: Arc::clone(&log),
     });
     let wrapped = WorkWithCallback::new(work, Arc::clone(&callback));
-    scheduler.add_work(Box::new(wrapped), vec![], 0);
+    let _ = scheduler.add_work(Box::new(wrapped), vec![], 0);
 
     scheduler.run_until_done().await;
 
@@ -275,7 +275,7 @@ async fn test_metrics_snapshot() {
         event_tx: None,
     });
 
-    scheduler.add_work(
+    let _ = scheduler.add_work(
         Box::new(LogWork {
             name: "metrics".to_string(),
             log: Arc::new(Mutex::new(Vec::new())),

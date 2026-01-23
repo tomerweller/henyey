@@ -467,7 +467,7 @@ mod tests {
         }
 
         // Before window check triggers
-        let stats = tracker.get_drift_stats();
+        let _stats = tracker.get_drift_stats();
         // Window should have been cleared since size == 10
         // Let's verify by checking the tracker state
         assert_eq!(tracker.window_len(), 0);

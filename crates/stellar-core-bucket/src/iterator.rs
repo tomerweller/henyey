@@ -913,7 +913,7 @@ mod tests {
             let entry = BucketEntry::Live(make_account_entry([i; 32], i as i64 * 100));
             writer.put(entry).unwrap();
         }
-        let (_, write_hash, _) = writer.finish().unwrap();
+        let (_, _write_hash, _) = writer.finish().unwrap();
 
         // Read and compute hash
         let reader = BucketInputIterator::open(&path).unwrap();

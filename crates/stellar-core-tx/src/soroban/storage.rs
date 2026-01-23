@@ -258,6 +258,7 @@ impl Footprint {
     }
 
     /// Convert from XDR footprint.
+    #[allow(dead_code)]
     pub fn from_xdr(footprint: &stellar_xdr::curr::LedgerFootprint) -> Self {
         Self {
             read_only: footprint.read_only.iter().cloned().collect(),
@@ -266,6 +267,7 @@ impl Footprint {
     }
 
     /// Convert to XDR footprint.
+    #[allow(dead_code)]
     pub fn to_xdr(&self) -> stellar_xdr::curr::LedgerFootprint {
         stellar_xdr::curr::LedgerFootprint {
             read_only: self.read_only.clone().try_into().unwrap_or_default(),

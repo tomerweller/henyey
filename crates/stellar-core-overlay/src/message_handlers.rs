@@ -595,7 +595,7 @@ mod tests {
         dispatcher.stop_fetching_below(150, 0);
 
         // Tracker should still exist (env2 is at slot 200)
-        let stats = dispatcher.stats();
+        let _stats = dispatcher.stats();
         // The tracker is either empty or has one envelope
     }
 }

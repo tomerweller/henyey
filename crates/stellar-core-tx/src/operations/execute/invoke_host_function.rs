@@ -2085,7 +2085,7 @@ mod tests {
 
             // Since we just created it, the entry is tracked as created.
             // Apply a change WITHOUT hot_archive_keys - it should use update since entry exists
-            let no_restored_keys: std::collections::HashSet<LedgerKey> =
+            let _no_restored_keys: std::collections::HashSet<LedgerKey> =
                 std::collections::HashSet::new();
 
             // Check the logic path: get_contract_data returns Some, so without hot_archive_keys

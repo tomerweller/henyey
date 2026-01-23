@@ -497,8 +497,8 @@ mod tests {
     use super::*;
     use stellar_core_common::Hash256;
     use stellar_xdr::curr::{
-        DecoratedSignature, EnvelopeType, Memo, MuxedAccount, Operation, OperationBody,
-        Preconditions, SequenceNumber, Signature, SignatureHint, Transaction, TransactionEnvelope,
+        DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+        SequenceNumber, Signature, SignatureHint, Transaction, TransactionEnvelope,
         TransactionV1Envelope, Uint256,
     };
 

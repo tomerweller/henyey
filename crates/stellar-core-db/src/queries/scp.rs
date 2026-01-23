@@ -530,7 +530,7 @@ mod tests {
         assert!(deleted > 0);
 
         // Delete remaining old entries
-        let deleted = conn.delete_old_scp_entries(5, 100).unwrap();
+        let _deleted = conn.delete_old_scp_entries(5, 100).unwrap();
         // May have deleted more from both tables
 
         // Verify old entries are gone (1-5)

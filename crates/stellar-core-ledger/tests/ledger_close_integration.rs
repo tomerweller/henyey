@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use stellar_core_bucket::{BucketList, BucketManager};
+use stellar_core_bucket::BucketList;
 use stellar_core_common::Hash256;
 use stellar_core_db::Database;
 use stellar_core_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};

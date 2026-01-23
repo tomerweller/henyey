@@ -338,6 +338,7 @@ impl SurgePricingPriorityQueue {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn count_txs_resources(
         &self,
         txs: &[QueuedTransaction],
@@ -498,6 +499,7 @@ impl SurgePricingPriorityQueue {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn get_most_top_txs_within_limits(
         mut self,
         txs: Vec<QueuedTransaction>,

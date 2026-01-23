@@ -472,6 +472,7 @@ mod tests {
             self.is_applying.store(applying, Ordering::SeqCst);
         }
 
+        #[allow(dead_code)]
         fn set_tracking(&self, tracking: bool) {
             self.is_tracking.store(tracking, Ordering::SeqCst);
         }

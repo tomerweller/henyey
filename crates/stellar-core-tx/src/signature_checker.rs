@@ -403,7 +403,7 @@ mod tests {
     use stellar_core_crypto::{sign_hash, SecretKey};
     use stellar_xdr::curr::{
         AccountEntry, AccountEntryExt, AccountId, PublicKey as XdrPublicKey,
-        Signature as XdrSignature, SignatureHint, Thresholds, Uint256, VecM,
+        Signature as XdrSignature, SignatureHint, Thresholds, Uint256,
     };
 
     fn create_test_hash() -> Hash256 {
