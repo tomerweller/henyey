@@ -335,6 +335,14 @@ pub struct LedgerManager {
 
     /// Flag indicating whether the offer cache has been populated.
     offer_cache_initialized: Arc<RwLock<bool>>,
+
+    /// In-memory Soroban state for Protocol 20+ contract data/code tracking.
+    ///
+    /// This tracks all CONTRACT_DATA, CONTRACT_CODE, and TTL entries in memory,
+    /// maintaining cumulative size totals that are updated incrementally during
+    /// ledger close. This avoids expensive full bucket list scans for state
+    /// size computation (used for LiveSorobanStateSizeWindow).
+    soroban_state: Arc<crate::soroban_state::SharedSorobanState>,
 }
 
 impl LedgerManager {
@@ -384,6 +392,7 @@ impl LedgerManager {
             module_cache: RwLock::new(None),
             offer_cache: Arc::new(RwLock::new(Vec::new())),
             offer_cache_initialized: Arc::new(RwLock::new(false)),
+            soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
         }
     }
 
@@ -424,6 +433,20 @@ impl LedgerManager {
     /// Get the current header hash.
     pub fn current_header_hash(&self) -> Hash256 {
         self.state.read().header_hash
+    }
+
+    /// Get the in-memory Soroban state size (CONTRACT_DATA + CONTRACT_CODE).
+    ///
+    /// This returns the incrementally tracked total size, avoiding expensive
+    /// bucket list scans. The size includes the compiled module memory cost
+    /// for CONTRACT_CODE entries (Protocol 23+).
+    pub fn soroban_state_size(&self) -> u64 {
+        self.soroban_state.read().total_size()
+    }
+
+    /// Get a reference to the shared Soroban state.
+    pub fn soroban_state(&self) -> &Arc<crate::soroban_state::SharedSorobanState> {
+        &self.soroban_state
     }
 
     /// Get the SCP timing configuration from the current ledger state.
@@ -619,6 +642,11 @@ impl LedgerManager {
         // during orderbook operations in each ledger close.
         self.initialize_offer_cache()?;
 
+        // Initialize in-memory Soroban state from bucket list.
+        // This tracks CONTRACT_DATA, CONTRACT_CODE, and TTL entries with cumulative
+        // size totals that are updated incrementally during ledger close.
+        self.initialize_soroban_state(header.ledger_version, ledger_seq)?;
+
         info!(
             ledger_seq,
             header_hash = %header_hash_hex,
@@ -774,6 +802,155 @@ impl LedgerManager {
         info!(offer_count, "Initialized offer cache from bucket list");
 
         Ok(())
+    }
+
+    /// Initialize the in-memory Soroban state from CONTRACT_DATA, CONTRACT_CODE, and TTL entries.
+    ///
+    /// This scans the bucket list once during initialization to populate the state cache.
+    /// After initialization, the state is maintained incrementally during ledger close.
+    fn initialize_soroban_state(&self, protocol_version: u32, ledger_seq: u32) -> Result<()> {
+        use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
+
+        if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
+            // Soroban not supported at this protocol version
+            return Ok(());
+        }
+
+        let bucket_list = self.bucket_list.read();
+        let live_entries = bucket_list.live_entries().map_err(|e| {
+            LedgerError::Internal(format!(
+                "Failed to get live entries for soroban state: {}",
+                e
+            ))
+        })?;
+
+        // Load rent config for accurate code size calculation
+        let rent_config = self.load_soroban_rent_config(&bucket_list);
+
+        let mut soroban_state = self.soroban_state.write();
+        soroban_state.clear();
+
+        // First pass: collect all CONTRACT_DATA and CONTRACT_CODE entries
+        let mut data_count = 0u64;
+        let mut code_count = 0u64;
+        let mut ttl_count = 0u64;
+
+        for entry in &live_entries {
+            match &entry.data {
+                LedgerEntryData::ContractData(_) => {
+                    if let Err(e) = soroban_state.create_contract_data(entry.clone()) {
+                        tracing::warn!(error = %e, "Failed to add contract data to soroban state");
+                    } else {
+                        data_count += 1;
+                    }
+                }
+                LedgerEntryData::ContractCode(_) => {
+                    if let Err(e) = soroban_state.create_contract_code(
+                        entry.clone(),
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::warn!(error = %e, "Failed to add contract code to soroban state");
+                    } else {
+                        code_count += 1;
+                    }
+                }
+                LedgerEntryData::Ttl(ttl) => {
+                    let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                        key_hash: ttl.key_hash.clone(),
+                    };
+                    let ttl_data = crate::soroban_state::TtlData::new(
+                        ttl.live_until_ledger_seq,
+                        entry.last_modified_ledger_seq,
+                    );
+                    if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
+                        tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
+                    } else {
+                        ttl_count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let total_size = soroban_state.total_size();
+        let stats = soroban_state.stats();
+
+        info!(
+            ledger_seq,
+            data_count,
+            code_count,
+            ttl_count,
+            total_size,
+            contract_data_size = stats.contract_data_size,
+            contract_code_size = stats.contract_code_size,
+            pending_ttl_count = stats.pending_ttl_count,
+            "Initialized in-memory Soroban state from bucket list"
+        );
+
+        Ok(())
+    }
+
+    /// Load Soroban rent config from bucket list for code size calculation.
+    fn load_soroban_rent_config(
+        &self,
+        bucket_list: &BucketList,
+    ) -> Option<crate::soroban_state::SorobanRentConfig> {
+        // Load CPU cost params
+        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
+        });
+        let cpu_params = bucket_list.get(&cpu_key).ok()?.and_then(|e| {
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+            ) = e.data
+            {
+                Some(params)
+            } else {
+                None
+            }
+        })?;
+
+        // Load memory cost params
+        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
+        });
+        let mem_params = bucket_list.get(&mem_key).ok()?.and_then(|e| {
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+            ) = e.data
+            {
+                Some(params)
+            } else {
+                None
+            }
+        })?;
+
+        // Load compute settings for limits
+        let compute_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractComputeV0,
+        });
+        let (tx_max_instructions, tx_max_memory_bytes) =
+            bucket_list.get(&compute_key).ok()?.and_then(|e| {
+                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(
+                    compute,
+                )) = e.data
+                {
+                    Some((
+                        compute.tx_max_instructions as u64,
+                        compute.tx_memory_limit as u64,
+                    ))
+                } else {
+                    None
+                }
+            })?;
+
+        Some(crate::soroban_state::SorobanRentConfig {
+            cpu_cost_params: cpu_params,
+            mem_cost_params: mem_params,
+            tx_max_instructions,
+            tx_max_memory_bytes,
+        })
     }
 
     /// Get a reference to the offer cache for use by snapshots.
@@ -1628,8 +1805,54 @@ impl<'a> LedgerCloseContext<'a> {
                 }
             }
 
+            // Update in-memory Soroban state with changes from this ledger.
+            // This must happen BEFORE computing state size window so the total_size()
+            // reflects the current ledger's state.
+            if protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION {
+                // Load rent config for accurate code size calculation
+                let rent_config = self.manager.load_soroban_rent_config(&bucket_list);
+                let mut soroban_state = self.manager.soroban_state.write();
+
+                // Process init entries (creates)
+                for entry in &init_entries {
+                    if let Err(e) = soroban_state.process_entry_create(
+                        entry,
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::trace!(error = %e, "Failed to process init entry in soroban state");
+                    }
+                }
+
+                // Process live entries (updates)
+                for entry in &live_entries {
+                    if let Err(e) = soroban_state.process_entry_update(
+                        entry,
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::trace!(error = %e, "Failed to process live entry in soroban state");
+                    }
+                }
+
+                // Process dead entries (deletes)
+                for key in &dead_entries {
+                    if let Err(e) = soroban_state.process_entry_delete(key) {
+                        tracing::trace!(error = %e, "Failed to process dead entry in soroban state");
+                    }
+                }
+
+                tracing::debug!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    total_size = soroban_state.total_size(),
+                    data_count = soroban_state.contract_data_count(),
+                    code_count = soroban_state.contract_code_count(),
+                    "Updated in-memory Soroban state"
+                );
+            }
+
             // Update state size window (Protocol 20+)
-            // This must happen before add_batch to compute window from current state
+            // This uses the in-memory Soroban state total_size() instead of scanning bucket list
             if protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION {
                 // Check if window entry was already added by transaction execution
                 let has_window_entry = live_entries.iter().any(|e| {
@@ -1642,7 +1865,7 @@ impl<'a> LedgerCloseContext<'a> {
                 });
 
                 if !has_window_entry {
-                    // Check if this is a sample ledger before doing expensive computation
+                    // Check if this is a sample ledger before computing window entry
                     // Sample period is typically 64 ledgers
                     let archival_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
                         stellar_xdr::curr::LedgerKeyConfigSetting {
@@ -1665,16 +1888,13 @@ impl<'a> LedgerCloseContext<'a> {
                         })
                         .unwrap_or(64); // Default to 64 if not found
 
-                    // Only compute state size on sample ledgers to avoid memory/CPU overhead
+                    // Only compute state size on sample ledgers
                     let is_sample_ledger =
                         sample_period > 0 && self.close_data.ledger_seq % sample_period == 0;
 
                     if is_sample_ledger {
-                        let soroban_state_size =
-                            crate::execution::compute_soroban_state_size_from_bucket_list(
-                                &bucket_list,
-                                protocol_version,
-                            );
+                        // Use in-memory Soroban state total_size() instead of scanning bucket list
+                        let soroban_state_size = self.manager.soroban_state.read().total_size();
 
                         if let Some(window_entry) =
                             crate::execution::compute_state_size_window_entry(
@@ -1687,7 +1907,7 @@ impl<'a> LedgerCloseContext<'a> {
                             tracing::info!(
                                 ledger_seq = self.close_data.ledger_seq,
                                 soroban_state_size = soroban_state_size,
-                                "Adding state size window entry to live entries"
+                                "Adding state size window entry to live entries (from in-memory state)"
                             );
                             live_entries.push(window_entry);
                         }

@@ -801,7 +801,7 @@ impl InMemorySorobanState {
     }
 
     /// Process a single entry creation.
-    fn process_entry_create(
+    pub fn process_entry_create(
         &mut self,
         entry: &LedgerEntry,
         protocol_version: u32,
@@ -818,7 +818,7 @@ impl InMemorySorobanState {
     }
 
     /// Process a single entry update.
-    fn process_entry_update(
+    pub fn process_entry_update(
         &mut self,
         entry: &LedgerEntry,
         protocol_version: u32,
@@ -862,7 +862,7 @@ impl InMemorySorobanState {
     }
 
     /// Process a single entry deletion.
-    fn process_entry_delete(&mut self, key: &LedgerKey) -> Result<()> {
+    pub fn process_entry_delete(&mut self, key: &LedgerKey) -> Result<()> {
         match key {
             LedgerKey::ContractData(cd) => {
                 // Ignore error if entry doesn't exist
