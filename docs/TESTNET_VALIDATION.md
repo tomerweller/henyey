@@ -165,6 +165,30 @@ Soroban transactions were seeing TTL values modified by previous transactions in
 
 Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries are first loaded from the bucket list, and using `get_ttl_at_ledger_start()` for Soroban execution instead of `get_ttl()`.
 
+### Issues Fixed (2026-01-23 - Bucket List Ledger Sequence)
+
+#### Bucket List ledger_seq Not Set After Catchup
+
+After restoring a bucket list from history archive via `restore_from_hashes()`, the `ledger_seq` field was set to 0. When closing the next ledger, the code checks if the bucket list needs to be advanced:
+
+```rust
+let current_bl_ledger = bucket_list.ledger_seq(); // Returns 0 after catchup!
+if current_bl_ledger < self.close_data.ledger_seq - 1 {
+    bucket_list.advance_to_ledger(...); // Tries to advance from 0 to N!
+}
+```
+
+This caused `advance_to_ledger()` to apply hundreds of thousands of empty batches (from ledger 1 to N-1), completely corrupting the bucket list structure. The corruption manifested ~60 ledgers later when merge timing caused hash mismatches.
+
+**Fix:** Added `set_ledger_seq()` method to both `BucketList` and `HotArchiveBucketList`, and call it after bucket list initialization in `initialize_from_buckets()` to set the correct ledger sequence.
+
+**Files changed:**
+- `crates/stellar-core-bucket/src/bucket_list.rs` - Added `set_ledger_seq()` method
+- `crates/stellar-core-bucket/src/hot_archive.rs` - Added `set_ledger_seq()` method
+- `crates/stellar-core-ledger/src/manager.rs` - Call `set_ledger_seq(header.ledger_seq)` after initialization
+
+**Regression test:** Ledgers 637245-637310 (previously had hash mismatches at 637247 and 637308) now pass verification.
+
 ### Known Issues
 
 Currently expanding verification range - investigating any issues found beyond ledger 183000.
@@ -275,6 +299,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-23**: Fixed bucket list ledger_seq not set after catchup - caused hash mismatches ~60 ledgers after re-catchup
 - **2026-01-23**: Fixed CAP-0021 sequence number handling with minSeqNum gaps (ledger 28110) - sequence must be set to tx seq, not incremented
 - **2026-01-23**: Fixed Soroban transaction meta V1 extension, rent fee calculation, RO TTL meta suppression, hot archive TTL RESTORED - extends replay to 64-183000 with 100% meta match
 - **2026-01-22**: Fixed TTL emission when value unchanged (ledger 182022) - extends replay to 64-182021

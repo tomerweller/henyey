@@ -619,6 +619,17 @@ impl LedgerManager {
         // Update state
         *self.bucket_list.write() = bucket_list;
         *self.hot_archive_bucket_list.write() = hot_archive_bucket_list;
+
+        // Set the ledger sequence on bucket lists after restoring from history archive.
+        // restore_from_hashes() sets ledger_seq to 0, but we need it set to the actual
+        // ledger sequence to ensure proper bucket list advancement behavior. Without this,
+        // advance_to_ledger() would try to advance from ledger 0 to the current ledger,
+        // applying hundreds of thousands of empty batches and corrupting the bucket list.
+        self.bucket_list.write().set_ledger_seq(header.ledger_seq);
+        if let Some(ref mut habl) = *self.hot_archive_bucket_list.write() {
+            habl.set_ledger_seq(header.ledger_seq);
+        }
+
         state.header = header.clone();
         state.header_hash = header_hash;
         state.initialized = true;

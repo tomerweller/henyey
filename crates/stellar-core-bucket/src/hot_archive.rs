@@ -466,6 +466,16 @@ impl HotArchiveBucketList {
         self.ledger_seq
     }
 
+    /// Set the ledger sequence.
+    ///
+    /// This is used after restoring a bucket list from history archive hashes
+    /// to set the correct ledger sequence. The `restore_from_hashes` method
+    /// sets ledger_seq to 0, so callers must set it to the actual ledger
+    /// sequence to ensure proper bucket list advancement behavior.
+    pub fn set_ledger_seq(&mut self, ledger_seq: u32) {
+        self.ledger_seq = ledger_seq;
+    }
+
     /// Get a reference to all levels.
     pub fn levels(&self) -> &[HotArchiveBucketLevel] {
         &self.levels

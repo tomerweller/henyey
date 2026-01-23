@@ -197,7 +197,9 @@ This section logs ledger sequences where hash mismatches occurred during testnet
 - Both occurred ~60-120 ledgers after a sample ledger
 - Recovery via re-catchup was successful in both cases
 
-**Suspected Cause**: Related to M1 (Re-catchup causes state drift). After re-catchup, in-memory Soroban state may not be properly re-synchronized with the new bucket list state.
+**Root Cause (FIXED)**: The `restore_from_hashes()` method in bucket list sets `ledger_seq` to 0 after catchup. This caused `advance_to_ledger()` to erroneously apply hundreds of thousands of empty batches (from ledger 1 to N-1), corrupting the bucket list structure. The corruption manifested ~60 ledgers later when merge timing caused hash mismatches.
+
+**Fix**: Set `bucket_list.set_ledger_seq(header.ledger_seq)` after restoring bucket lists in `initialize_from_buckets()`. See commit for details.
 
 ### Session: 2026-01-23 15:48 - 15:51 UTC
 
