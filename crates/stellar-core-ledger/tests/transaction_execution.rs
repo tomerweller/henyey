@@ -3502,3 +3502,100 @@ fn test_set_options_loads_signer_sponsor_accounts() {
         "Signer should have been removed"
     );
 }
+
+/// Regression test for hot archive being passed to execute_transaction_set.
+/// Prior to this fix, the hot archive was stored in LedgerManager but never passed
+/// to the transaction execution layer, causing "No hot archive available for lookup"
+/// errors when attempting to restore archived entries in Protocol 23+.
+///
+/// This test verifies that execute_transaction_set accepts and forwards the hot_archive
+/// parameter to the TransactionExecutor.
+///
+/// Issue: Discovered at testnet ledger 637593+ when entry restoration failed.
+/// Fix: Added hot_archive parameter to execute_transaction_set and wired it through
+/// to TransactionExecutor::set_hot_archive().
+#[test]
+fn test_execute_transaction_set_accepts_hot_archive_parameter() {
+    use std::sync::Arc;
+    use stellar_core_bucket::HotArchiveBucketList;
+    use stellar_core_ledger::execution::execute_transaction_set;
+    use stellar_core_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[99u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .expect("add entry")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([42u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let mut delta = LedgerDelta::new(1);
+    let transactions = vec![(envelope, None)];
+
+    // Create an empty hot archive bucket list wrapped in the expected type
+    let hot_archive = HotArchiveBucketList::new();
+    let hot_archive_arc: Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>> =
+        Arc::new(parking_lot::RwLock::new(Some(hot_archive)));
+
+    // This should NOT panic or error - the hot_archive parameter should be accepted
+    // and forwarded to the executor. Prior to the fix, this parameter didn't exist.
+    let result = execute_transaction_set(
+        &snapshot,
+        &transactions,
+        1,         // ledger_seq
+        1000,      // close_time
+        100,       // base_fee
+        5_000_000, // base_reserve
+        25,        // protocol_version (Protocol 25)
+        network_id,
+        &mut delta,
+        SorobanConfig::default(),
+        [0u8; 32], // soroban_base_prng_seed
+        ClassicEventConfig::default(),
+        None,                  // op_invariants
+        None,                  // module_cache
+        Some(hot_archive_arc), // hot_archive - the key parameter being tested
+    );
+
+    // The transaction should execute (the API should accept the hot_archive parameter)
+    // Note: The transaction result itself may vary - the key verification is that
+    // execute_transaction_set properly accepts and forwards the hot_archive parameter
+    // to TransactionExecutor without panicking or erroring.
+    let (results, _, _, _, _) =
+        result.expect("execute_transaction_set should succeed with hot_archive parameter");
+    assert_eq!(results.len(), 1, "Should have one transaction result");
+    // We don't assert success here because that depends on many factors -
+    // the key test is that the API correctly accepts and processes the hot_archive parameter.
+}

@@ -3109,9 +3109,17 @@ async fn cmd_verify_execution(
                 if let Some(ref cache) = module_cache {
                     new_executor.set_module_cache(cache.clone());
                 }
-                // Set the hot archive for Protocol 23+ entry restoration
+                // Set the hot archive for Protocol 23+ entry restoration.
+                // Note: The executor expects Arc<parking_lot::RwLock<Option<...>>> but main.rs
+                // uses Arc<std::sync::RwLock<...>>. For offline verification, we create a
+                // compatible wrapper by cloning the hot archive into the expected type.
                 if let Some(ref hot_archive) = hot_archive_bucket_list {
-                    new_executor.set_hot_archive(hot_archive.clone());
+                    use stellar_core_bucket::HotArchiveBucketList;
+                    let hot_archive_for_exec: std::sync::Arc<::parking_lot::RwLock<Option<HotArchiveBucketList>>> = 
+                        std::sync::Arc::new(
+                            ::parking_lot::RwLock::new(Some(hot_archive.read().unwrap().clone()))
+                        );
+                    new_executor.set_hot_archive(hot_archive_for_exec);
                 }
                 executor = Some(new_executor);
             }

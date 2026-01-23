@@ -87,11 +87,13 @@ use stellar_core_bucket::HotArchiveBucketList;
 /// This allows the ledger execution layer to look up archived entries without
 /// requiring the tx layer to depend on the bucket crate.
 pub struct HotArchiveLookupImpl {
-    hot_archive: std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>,
+    hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
 }
 
 impl HotArchiveLookupImpl {
-    pub fn new(hot_archive: std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>) -> Self {
+    pub fn new(
+        hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
+    ) -> Self {
         Self { hot_archive }
     }
 }
@@ -99,7 +101,8 @@ impl HotArchiveLookupImpl {
 impl stellar_core_tx::soroban::HotArchiveLookup for HotArchiveLookupImpl {
     fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
         // Use the hot archive bucket list's get method
-        let hot_archive = self.hot_archive.read().unwrap();
+        let guard = self.hot_archive.read();
+        let hot_archive = guard.as_ref()?;
         match hot_archive.get(key) {
             Ok(Some(entry)) => Some(entry.clone()),
             Ok(None) => None,
@@ -734,7 +737,7 @@ pub struct TransactionExecutor {
     /// Optional hot archive bucket list for Protocol 23+ entry restoration.
     /// This enables looking up entries that have been evicted from the live bucket list
     /// and are waiting to be restored.
-    hot_archive: Option<std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
 }
 
 impl TransactionExecutor {
@@ -774,7 +777,7 @@ impl TransactionExecutor {
     /// live bucket list and need to be restored during Soroban transaction execution.
     pub fn set_hot_archive(
         &mut self,
-        hot_archive: std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>,
+        hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
     ) {
         self.hot_archive = Some(hot_archive);
     }
@@ -5091,6 +5094,7 @@ pub fn execute_transaction_set(
     classic_events: ClassicEventConfig,
     op_invariants: Option<OperationInvariantRunner>,
     module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
 ) -> Result<(
     Vec<TransactionExecutionResult>,
     Vec<TransactionResultPair>,
@@ -5114,6 +5118,7 @@ pub fn execute_transaction_set(
         op_invariants,
         true,
         module_cache,
+        hot_archive,
     )
 }
 
@@ -5149,6 +5154,7 @@ pub fn execute_transaction_set_with_fee_mode(
     op_invariants: Option<OperationInvariantRunner>,
     deduct_fee: bool,
     module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
 ) -> Result<(
     Vec<TransactionExecutionResult>,
     Vec<TransactionResultPair>,
@@ -5171,6 +5177,10 @@ pub fn execute_transaction_set_with_fee_mode(
     // Set the module cache if provided for better Soroban performance
     if let Some(cache) = module_cache {
         executor.set_module_cache(cache.clone());
+    }
+    // Set the hot archive for Protocol 23+ entry restoration
+    if let Some(ha) = hot_archive {
+        executor.set_hot_archive(ha);
     }
 
     let mut results = Vec::with_capacity(transactions.len());

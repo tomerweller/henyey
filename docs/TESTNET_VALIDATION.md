@@ -60,7 +60,24 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 ### Issues Fixed (2026-01-23)
 
-#### 1. CAP-0021 Sequence Number Handling with minSeqNum Gaps
+#### 1. Hot Archive Not Passed to Transaction Execution (Ledger 637593+)
+
+The hot archive bucket list was stored in `LedgerManager` but never passed to the transaction execution layer. This caused "No hot archive available for lookup" errors when Protocol 23+ transactions attempted to restore archived entries.
+
+**Root Cause**: The `execute_transaction_set()` function created a `TransactionExecutor` but never called `set_hot_archive()` on it, even though the hot archive was available in `LedgerManager`.
+
+**Fix**: Added `hot_archive` parameter to `execute_transaction_set()` and `execute_transaction_set_with_fee_mode()`, and wired it through from `LedgerCloseContext::apply_transactions()`.
+
+**Files changed:**
+- `crates/stellar-core-ledger/src/execution.rs` - Added hot_archive parameter, updated `HotArchiveLookupImpl` types
+- `crates/stellar-core-ledger/src/manager.rs` - Pass hot archive to execute_transaction_set
+- `crates/stellar-core-history/src/replay.rs` - Pass None (not needed during replay)
+- `crates/rs-stellar-core/src/main.rs` - Create compatible wrapper for offline verification
+- `crates/rs-stellar-core/Cargo.toml` - Added parking_lot dependency
+
+**Regression test:** `test_execute_transaction_set_accepts_hot_archive_parameter` in `crates/stellar-core-ledger/tests/transaction_execution.rs`
+
+#### 2. CAP-0021 Sequence Number Handling with minSeqNum Gaps
 
 When transactions use `minSeqNum` (from CAP-0021 / PreconditionsV2), they can have sequence numbers higher than `account.seq_num + 1`. The account's final sequence must be set to the **transaction's sequence number**, not `account.seq_num + 1`.
 

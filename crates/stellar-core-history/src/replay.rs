@@ -405,6 +405,7 @@ pub fn replay_ledger_with_execution(
             classic_events.clone(),
             op_invariants,
             module_cache,
+            None, // Hot archive not needed during replay - state is from history archives
         )
         .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 

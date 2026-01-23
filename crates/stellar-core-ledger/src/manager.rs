@@ -1546,6 +1546,10 @@ impl<'a> LedgerCloseContext<'a> {
         let module_cache_guard = self.manager.module_cache.read();
         let module_cache = module_cache_guard.as_ref();
 
+        // Get the hot archive for Protocol 23+ entry restoration.
+        // We pass the Arc directly - the execution layer will check if it contains Some.
+        let hot_archive = Some(self.manager.hot_archive_bucket_list.clone());
+
         let (results, tx_results, mut tx_result_metas, id_pool, hot_archive_restored_keys) =
             execute_transaction_set(
                 &self.snapshot,
@@ -1562,6 +1566,7 @@ impl<'a> LedgerCloseContext<'a> {
                 classic_events,
                 op_invariants,
                 module_cache,
+                hot_archive,
             )?;
         if classic_events.events_enabled(self.prev_header.ledger_version) {
             for (idx, ((envelope, _), meta)) in transactions

@@ -72,4 +72,7 @@ tempfile.workspace = true
 # Directories
 dirs = "5"
 
+# Synchronization
+parking_lot.workspace = true
+
 [dev-dependencies]
