@@ -79,11 +79,13 @@ use crate::Result;
 /// * `soroban_data` - The Soroban transaction data
 /// * `soroban_config` - The Soroban network configuration with cost parameters
 /// * `module_cache` - Optional persistent module cache for reusing compiled WASM
+/// * `hot_archive` - Optional hot archive lookup for Protocol 23+ entry restoration
 ///
 /// # Returns
 ///
 /// Returns the operation result with the function's return value on success,
 /// or a specific failure reason.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_invoke_host_function(
     op: &InvokeHostFunctionOp,
     source: &AccountId,
@@ -92,6 +94,7 @@ pub fn execute_invoke_host_function(
     soroban_data: Option<&SorobanTransactionData>,
     soroban_config: &SorobanConfig,
     module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
 ) -> Result<OperationExecutionResult> {
     // Validate we have Soroban data for footprint
     let soroban_data = match soroban_data {
@@ -114,6 +117,7 @@ pub fn execute_invoke_host_function(
         soroban_data,
         soroban_config,
         module_cache,
+        hot_archive,
     )
 }
 
@@ -126,6 +130,7 @@ fn execute_contract_invocation(
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
     module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
 ) -> Result<OperationExecutionResult> {
     use crate::soroban::execute_host_function_with_cache;
 
@@ -166,6 +171,7 @@ fn execute_contract_invocation(
         soroban_data,
         soroban_config,
         module_cache,
+        hot_archive,
     ) {
         Ok(result) => {
             // C++ stellar-core check: event size (done first in collectEvents before

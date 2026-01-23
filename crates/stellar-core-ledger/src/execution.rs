@@ -80,6 +80,41 @@ use crate::delta::LedgerDelta;
 use crate::snapshot::SnapshotHandle;
 use crate::{LedgerError, Result};
 
+use stellar_core_bucket::HotArchiveBucketList;
+
+/// Wrapper around HotArchiveBucketList that implements the HotArchiveLookup trait.
+///
+/// This allows the ledger execution layer to look up archived entries without
+/// requiring the tx layer to depend on the bucket crate.
+pub struct HotArchiveLookupImpl {
+    hot_archive: std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>,
+}
+
+impl HotArchiveLookupImpl {
+    pub fn new(hot_archive: std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>) -> Self {
+        Self { hot_archive }
+    }
+}
+
+impl stellar_core_tx::soroban::HotArchiveLookup for HotArchiveLookupImpl {
+    fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        // Use the hot archive bucket list's get method
+        let hot_archive = self.hot_archive.read().unwrap();
+        match hot_archive.get(key) {
+            Ok(Some(entry)) => Some(entry.clone()),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    key_type = ?std::mem::discriminant(key),
+                    "Hot archive lookup failed"
+                );
+                None
+            }
+        }
+    }
+}
+
 /// Soroban network configuration information for the /sorobaninfo endpoint.
 ///
 /// This struct contains all the Soroban-related configuration settings from
@@ -696,6 +731,10 @@ pub struct TransactionExecutor {
     /// Optional persistent module cache for Soroban WASM compilation.
     /// This cache is populated once from the bucket list and reused across transactions.
     module_cache: Option<PersistentModuleCache>,
+    /// Optional hot archive bucket list for Protocol 23+ entry restoration.
+    /// This enables looking up entries that have been evicted from the live bucket list
+    /// and are waiting to be restored.
+    hot_archive: Option<std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>>,
 }
 
 impl TransactionExecutor {
@@ -725,7 +764,19 @@ impl TransactionExecutor {
             classic_events,
             op_invariants,
             module_cache: None,
+            hot_archive: None,
         }
+    }
+
+    /// Set the hot archive bucket list for Protocol 23+ entry restoration.
+    ///
+    /// When set, the executor can look up entries that have been evicted from the
+    /// live bucket list and need to be restored during Soroban transaction execution.
+    pub fn set_hot_archive(
+        &mut self,
+        hot_archive: std::sync::Arc<std::sync::RwLock<HotArchiveBucketList>>,
+    ) {
+        self.hot_archive = Some(hot_archive);
     }
 
     /// Set the persistent module cache for WASM compilation.
@@ -3164,6 +3215,16 @@ impl TransactionExecutor {
         soroban_data: Option<&stellar_xdr::curr::SorobanTransactionData>,
     ) -> std::result::Result<stellar_core_tx::operations::execute::OperationExecutionResult, TxError>
     {
+        // Create a hot archive lookup wrapper if hot archive is available
+        let hot_archive_lookup;
+        let hot_archive_ref: Option<&dyn stellar_core_tx::soroban::HotArchiveLookup> =
+            if let Some(ref ha) = self.hot_archive {
+                hot_archive_lookup = HotArchiveLookupImpl::new(ha.clone());
+                Some(&hot_archive_lookup)
+            } else {
+                None
+            };
+
         // Use the central operation dispatcher which handles all operation types
         stellar_core_tx::operations::execute::execute_operation_with_soroban(
             op,
@@ -3176,6 +3237,7 @@ impl TransactionExecutor {
             soroban_data,
             Some(&self.soroban_config),
             self.module_cache.as_ref(),
+            hot_archive_ref,
         )
     }
 

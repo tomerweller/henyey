@@ -196,10 +196,11 @@ impl PersistentModuleCache {
     }
 }
 
-/// Adapter that provides snapshot access to our ledger state for Soroban.
+/// Adapter that provides snapshot access to our ledger state for Soroban (P24).
 pub struct LedgerSnapshotAdapter<'a> {
     state: &'a LedgerStateManager,
     current_ledger: u32,
+    hot_archive: Option<&'a dyn super::HotArchiveLookup>,
 }
 
 impl<'a> LedgerSnapshotAdapter<'a> {
@@ -207,11 +208,28 @@ impl<'a> LedgerSnapshotAdapter<'a> {
         Self {
             state,
             current_ledger,
+            hot_archive: None,
+        }
+    }
+
+    /// Create a new snapshot adapter with hot archive lookup capability.
+    pub fn with_hot_archive(
+        state: &'a LedgerStateManager,
+        current_ledger: u32,
+        hot_archive: Option<&'a dyn super::HotArchiveLookup>,
+    ) -> Self {
+        Self {
+            state,
+            current_ledger,
+            hot_archive,
         }
     }
 
     /// Get an archived entry without checking TTL.
     /// Used for entries that are being restored from the hot archive.
+    ///
+    /// This method first checks the live state (for entries with expired TTL but not yet evicted),
+    /// then falls back to the hot archive bucket list (for truly evicted entries).
     pub fn get_archived(
         &self,
         key: &Rc<soroban_env_host24::xdr::LedgerKey>,
@@ -277,18 +295,39 @@ impl<'a> LedgerSnapshotAdapter<'a> {
             _ => None,
         };
 
-        match entry {
-            Some(e) => {
-                let entry = convert_ledger_entry_to_p24(&e).ok_or_else(|| {
+        // If entry found in live state, return it
+        if let Some(e) = entry {
+            let entry = convert_ledger_entry_to_p24(&e).ok_or_else(|| {
+                HostErrorP24::from(soroban_env_host24::Error::from_type_and_code(
+                    soroban_env_host24::xdr::ScErrorType::Context,
+                    soroban_env_host24::xdr::ScErrorCode::InternalError,
+                ))
+            })?;
+            return Ok(Some((Rc::new(entry), live_until)));
+        }
+
+        // Entry not found in live state - try the hot archive bucket list.
+        // This handles the case where the entry was evicted from the live bucket list
+        // and is now in the hot archive, waiting to be restored.
+        if let Some(hot_archive) = self.hot_archive {
+            if let Some(archived_entry) = hot_archive.get(&current_key) {
+                tracing::debug!(
+                    key_type = ?std::mem::discriminant(&current_key),
+                    "P24: Found archived entry in hot archive bucket list"
+                );
+                // Convert to P24 format
+                let entry = convert_ledger_entry_to_p24(&archived_entry).ok_or_else(|| {
                     HostErrorP24::from(soroban_env_host24::Error::from_type_and_code(
                         soroban_env_host24::xdr::ScErrorType::Context,
                         soroban_env_host24::xdr::ScErrorCode::InternalError,
                     ))
                 })?;
-                Ok(Some((Rc::new(entry), live_until)))
+                // Hot archive entries have no TTL (they are archived/expired)
+                return Ok(Some((Rc::new(entry), None)));
             }
-            None => Ok(None),
         }
+
+        Ok(None)
     }
 
     /// Get an archived entry and check if it's a live BL restore.
@@ -457,6 +496,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 pub struct LedgerSnapshotAdapterP25<'a> {
     state: &'a LedgerStateManager,
     current_ledger: u32,
+    hot_archive: Option<&'a dyn super::HotArchiveLookup>,
 }
 
 impl<'a> LedgerSnapshotAdapterP25<'a> {
@@ -464,11 +504,28 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         Self {
             state,
             current_ledger,
+            hot_archive: None,
+        }
+    }
+
+    /// Create a new snapshot adapter with hot archive lookup capability.
+    pub fn with_hot_archive(
+        state: &'a LedgerStateManager,
+        current_ledger: u32,
+        hot_archive: Option<&'a dyn super::HotArchiveLookup>,
+    ) -> Self {
+        Self {
+            state,
+            current_ledger,
+            hot_archive,
         }
     }
 
     /// Get an archived entry without checking TTL.
     /// Used for entries that are being restored from the hot archive.
+    ///
+    /// This method first checks the live state (for entries with expired TTL but not yet evicted),
+    /// then falls back to the hot archive bucket list (for truly evicted entries).
     pub fn get_archived(
         &self,
         key: &Rc<LedgerKey>,
@@ -496,7 +553,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                     ext: LedgerEntryExt::V0,
                 }),
             LedgerKey::ContractData(cd_key) => {
-                // No TTL check for archived entries
+                // No TTL check for archived entries - first try live state
                 self.state
                     .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
@@ -506,7 +563,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                     })
             }
             LedgerKey::ContractCode(cc_key) => {
-                // No TTL check for archived entries
+                // No TTL check for archived entries - first try live state
                 self.state
                     .get_contract_code(&cc_key.hash)
                     .map(|code| LedgerEntry {
@@ -527,10 +584,26 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
             _ => None,
         };
 
-        match entry {
-            Some(e) => Ok(Some((Rc::new(e), live_until))),
-            None => Ok(None),
+        // If entry found in live state, return it
+        if let Some(e) = entry {
+            return Ok(Some((Rc::new(e), live_until)));
         }
+
+        // Entry not found in live state - try the hot archive bucket list.
+        // This handles the case where the entry was evicted from the live bucket list
+        // and is now in the hot archive, waiting to be restored.
+        if let Some(hot_archive) = self.hot_archive {
+            if let Some(archived_entry) = hot_archive.get(key.as_ref()) {
+                tracing::debug!(
+                    key_type = ?std::mem::discriminant(key.as_ref()),
+                    "P25: Found archived entry in hot archive bucket list"
+                );
+                // Hot archive entries have no TTL (they are archived/expired)
+                return Ok(Some((Rc::new(archived_entry), None)));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Get an archived entry and check if it's a live BL restore.
@@ -1116,6 +1189,7 @@ pub fn execute_host_function(
         soroban_data,
         soroban_config,
         None,
+        None,
     )
 }
 
@@ -1135,6 +1209,7 @@ pub fn execute_host_function(
 /// * `soroban_data` - Soroban transaction data with footprint and resources
 /// * `soroban_config` - Network configuration with cost parameters
 /// * `module_cache` - Optional pre-populated module cache for WASM reuse
+/// * `hot_archive` - Optional hot archive lookup for Protocol 23+ entry restoration
 #[allow(clippy::too_many_arguments)]
 pub fn execute_host_function_with_cache(
     host_function: &HostFunction,
@@ -1145,6 +1220,7 @@ pub fn execute_host_function_with_cache(
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
     module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<&dyn super::HotArchiveLookup>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     if context.protocol_version >= 25 {
         let p25_cache = module_cache.and_then(|c| c.as_p25());
@@ -1157,6 +1233,7 @@ pub fn execute_host_function_with_cache(
             soroban_data,
             soroban_config,
             p25_cache,
+            hot_archive,
         );
     }
     let p24_cache = module_cache.and_then(|c| c.as_p24());
@@ -1169,6 +1246,7 @@ pub fn execute_host_function_with_cache(
         soroban_data,
         soroban_config,
         p24_cache,
+        hot_archive,
     )
 }
 
@@ -1182,6 +1260,7 @@ fn execute_host_function_p24(
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
     existing_cache: Option<&ModuleCache>,
+    hot_archive: Option<&dyn super::HotArchiveLookup>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     // Helper to create error with zero consumed resources (for setup errors before budget exists)
     let make_setup_error = |e: HostErrorP25| SorobanExecutionError {
@@ -1321,8 +1400,8 @@ fn execute_host_function_p24(
     let restored_indices_set: std::collections::HashSet<u32> =
         restored_rw_entry_indices.iter().copied().collect();
 
-    // Create snapshot adapter to get ledger entries
-    let snapshot = LedgerSnapshotAdapter::new(state, context.sequence);
+    // Create snapshot adapter with hot archive access for Protocol 23+ entry restoration
+    let snapshot = LedgerSnapshotAdapter::with_hot_archive(state, context.sequence, hot_archive);
 
     // Collect and encode ledger entries from the footprint
     // IMPORTANT: e2e_invoke expects exactly one TTL entry for each ledger entry (they are zipped)
@@ -1717,6 +1796,7 @@ fn execute_host_function_p25(
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
     existing_cache: Option<&ModuleCacheP25>,
+    hot_archive: Option<&dyn super::HotArchiveLookup>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     use soroban_env_host25::{
         budget::Budget, e2e_invoke, fees::compute_rent_fee, storage::SnapshotSource,
@@ -1835,7 +1915,8 @@ fn execute_host_function_p25(
     let restored_indices_set: std::collections::HashSet<u32> =
         restored_rw_entry_indices.iter().copied().collect();
 
-    let snapshot = LedgerSnapshotAdapterP25::new(state, context.sequence);
+    // Create snapshot with hot archive access for Protocol 23+ entry restoration
+    let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(state, context.sequence, hot_archive);
 
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();

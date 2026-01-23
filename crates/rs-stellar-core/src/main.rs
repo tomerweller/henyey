@@ -3109,6 +3109,10 @@ async fn cmd_verify_execution(
                 if let Some(ref cache) = module_cache {
                     new_executor.set_module_cache(cache.clone());
                 }
+                // Set the hot archive for Protocol 23+ entry restoration
+                if let Some(ref hot_archive) = hot_archive_bucket_list {
+                    new_executor.set_hot_archive(hot_archive.clone());
+                }
                 executor = Some(new_executor);
             }
 

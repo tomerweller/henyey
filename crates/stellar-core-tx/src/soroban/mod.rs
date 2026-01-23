@@ -98,3 +98,44 @@ pub use host::{
     PersistentModuleCache, SorobanExecutionError, SorobanExecutionResult, StorageChange,
 };
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
+
+use stellar_xdr::curr::{LedgerEntry, LedgerKey};
+
+/// Trait for looking up archived entries from the hot archive.
+///
+/// This trait provides dependency inversion between `stellar-core-tx` (which executes
+/// transactions) and `stellar-core-bucket`/`stellar-core-ledger` (which manage the
+/// hot archive bucket list).
+///
+/// # Protocol 23+ Hot Archive
+///
+/// Starting from Protocol 23, persistent Soroban entries (ContractData, ContractCode)
+/// that expire are moved to the "hot archive" bucket list rather than being deleted.
+/// These entries can be restored via the `RestoreFootprint` operation or auto-restored
+/// when marked in `SorobanTransactionDataExt::V1::archived_soroban_entries`.
+///
+/// When a transaction needs to restore an archived entry:
+/// 1. The entry may still be in the live bucket list with an expired TTL ("live BL restore")
+/// 2. The entry may have been fully evicted to the hot archive ("hot archive restore")
+///
+/// This trait handles case (2) by providing lookups into the hot archive bucket list.
+pub trait HotArchiveLookup: Send + Sync {
+    /// Look up an entry in the hot archive.
+    ///
+    /// Returns `Some(entry)` if the key exists in the hot archive as an `Archived` entry.
+    /// Returns `None` if the key is not found or exists as a `Live` marker (restored).
+    fn get(&self, key: &LedgerKey) -> Option<LedgerEntry>;
+}
+
+/// A no-op implementation of HotArchiveLookup that always returns None.
+///
+/// This is used when:
+/// - Hot archive is not available (e.g., pre-Protocol 23)
+/// - Running in a context where hot archive lookups are not needed
+pub struct NoHotArchive;
+
+impl HotArchiveLookup for NoHotArchive {
+    fn get(&self, _key: &LedgerKey) -> Option<LedgerEntry> {
+        None
+    }
+}

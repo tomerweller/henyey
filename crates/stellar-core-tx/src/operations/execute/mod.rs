@@ -311,6 +311,7 @@ pub fn execute_operation(
         None,
         None,
         None, // No module cache for simple execution
+        None, // No hot archive for simple execution
     )
 }
 
@@ -326,6 +327,7 @@ pub fn execute_operation(
 ///   produce incorrect results.
 /// * `module_cache` - Optional persistent module cache for reusing compiled WASM
 ///   across transactions. Significantly improves performance for contracts.
+/// * `hot_archive` - Optional hot archive lookup for Protocol 23+ entry restoration
 #[allow(clippy::too_many_arguments)]
 pub fn execute_operation_with_soroban(
     op: &Operation,
@@ -338,6 +340,7 @@ pub fn execute_operation_with_soroban(
     soroban_data: Option<&SorobanTransactionData>,
     soroban_config: Option<&SorobanConfig>,
     module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
 ) -> Result<OperationExecutionResult> {
     // Get the actual source for this operation
     // If the operation has an explicit source, use it; otherwise use the transaction source
@@ -390,6 +393,7 @@ pub fn execute_operation_with_soroban(
                 soroban_data,
                 config,
                 module_cache,
+                hot_archive,
             )
         }
         OperationBody::ExtendFootprintTtl(op_data) => {
