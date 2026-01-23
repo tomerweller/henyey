@@ -1151,9 +1151,20 @@ impl LedgerManager {
 
         let snapshot = LedgerSnapshot::new(state.header.clone(), state.header_hash, entries);
 
-        // Create a lookup function that queries the bucket list
+        // Create a lookup function that checks in-memory Soroban state first for O(1) access,
+        // then falls back to bucket list for non-Soroban types or cache misses.
+        // This optimization provides O(1) lookups for CONTRACT_DATA, CONTRACT_CODE, and TTL
+        // entries instead of O(log n) bucket list B-tree traversals.
+        let soroban_state_lookup = self.soroban_state.clone();
         let bucket_list_lookup = self.bucket_list.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            // Check in-memory Soroban state first for Soroban entry types
+            if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
+                if let Some(entry) = soroban_state_lookup.read().get(key) {
+                    return Ok(Some((*entry).clone()));
+                }
+            }
+            // Fall back to bucket list for non-Soroban types or if not found in memory
             bucket_list_lookup
                 .read()
                 .get(key)
