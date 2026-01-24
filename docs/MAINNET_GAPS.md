@@ -22,10 +22,9 @@ The project explicitly states it's "an educational experiment and **not** produc
 | # | Gap | Impact | Effort | Priority |
 |---|-----|--------|--------|----------|
 | 1 | **No parallel transaction execution** | Validators will fall behind on high-throughput ledgers | High | P0 |
-| 2 | **No shared WASM module cache** | Severe Soroban performance penalty (recompiles every TX) | Medium | P0 |
-| 3 | **Insufficient metrics/monitoring** | Cannot monitor production operation | Medium | P1 |
-| 4 | **No QuorumIntersection v2** | Cannot perform network safety analysis at scale | Medium | P1 |
-| 5 | **Memory usage validation** | ~4.8GB after 18min on testnet; need long-term stability verification | Low | P2 |
+| 2 | **Insufficient metrics/monitoring** | Cannot monitor production operation | Medium | P1 |
+| 3 | **No QuorumIntersection v2** | Cannot perform network safety analysis at scale | Medium | P1 |
+| 4 | **Memory usage validation** | ~4.8GB after 18min on testnet; need long-term stability verification | Low | P2 |
 
 ---
 
@@ -70,7 +69,7 @@ Gaps:
 - **Externalize lag tracking** - getExternalizeLag(), per-node timers
 - **TxSet validity caching** - RandomEvictionCache for validation results
 
-### 3. Ledger Operations (~85% parity)
+### 3. Ledger Operations (~90% parity)
 
 **Status: Core Complete, Performance Gaps**
 
@@ -84,10 +83,10 @@ Implemented:
 - Eviction scanning
 - Invariant validation
 - LedgerCloseMeta V2 generation
+- **PersistentModuleCache** - Shared WASM module cache initialized from bucket list on catchup, new contracts added during execution
 
 Gaps:
 - **Parallel transaction execution** - Critical for validator performance
-- **Shared WASM module cache** - Soroban compilation cache
 - **Nested transaction support** - LedgerTxn parent/child rollback
 
 ### 4. History/Catchup (~85% parity)
@@ -192,7 +191,8 @@ Only 3 TODO comments exist in production code:
    - Historical snapshot query methods (minor feature)
 
 2. `crates/stellar-core-history/src/catchup.rs:1740`
-   - Module cache initialization for catchup performance
+   - Module cache not passed during catchup replay (performance optimization)
+   - Note: Module cache IS properly initialized after catchup completes
 
 3. `crates/stellar-core-herder/src/fetching_envelopes.rs:436`
    - Quorum set fetching from peers
@@ -210,7 +210,7 @@ Only 3 TODO comments exist in production code:
 | stellar-core-overlay | **~88%** | VirtualClock, LoopbackPeer |
 | stellar-core-herder | **~82%** | Parallel TxSet, QuorumIntersection v2 |
 | stellar-core-history | **~85%** | Online catchup, FutureBucket |
-| stellar-core-ledger | **~85%** | Parallel apply, Module cache |
+| stellar-core-ledger | **~90%** | Parallel apply |
 | stellar-core-historywork | **~82%** | Metrics, archive failover |
 | stellar-core-app | **~75%** | Metrics, ProcessManager |
 | rs-stellar-core CLI | **~88%** | Some utility commands |
@@ -221,55 +221,51 @@ Only 3 TODO comments exist in production code:
 
 ### Phase 1: Performance (Required)
 
-1. **Implement shared WASM module cache**
-   - Cache compiled Soroban contracts
-   - Significant performance improvement for repeat executions
-
-2. **Implement parallel transaction execution**
+1. **Implement parallel transaction execution**
    - Required for keeping up with mainnet throughput
    - Soroban parallel stages support
 
-3. **Memory profiling and optimization**
+2. **Memory profiling and optimization**
    - Long-term stability testing
    - Leak detection
 
 ### Phase 2: Observability (Required)
 
-4. **Full metrics suite**
+3. **Full metrics suite**
    - Prometheus counters, gauges, histograms
    - Ledger close timing, TX execution stats
    - SCP participation metrics
 
-5. **Structured logging improvements**
+4. **Structured logging improvements**
    - Reduce noise in steady-state operation
    - Add correlation IDs for tracing
 
-6. **Health check endpoints**
+5. **Health check endpoints**
    - Readiness/liveness probes
    - Sync status API
 
 ### Phase 3: Safety Analysis (Required)
 
-7. **QuorumIntersection v2**
+6. **QuorumIntersection v2**
    - SAT-solver based analysis
    - Network split detection
    - Critical node identification
 
 ### Phase 4: Validation
 
-8. **Extended mainnet observer testing**
+7. **Extended mainnet observer testing**
    - Run as observer for weeks
    - Verify state consistency with C++ nodes
 
-9. **Testnet validator stress testing**
+8. **Testnet validator stress testing**
    - High-throughput scenarios
    - Network partition simulation
 
-10. **Third-party security review**
-    - Consensus implementation audit
-    - Cryptographic review
+9. **Third-party security review**
+   - Consensus implementation audit
+   - Cryptographic review
 
-11. **Remove "not production-grade" disclaimer**
+10. **Remove "not production-grade" disclaimer**
     - Update README and documentation
     - Production support commitment
 
@@ -316,4 +312,4 @@ Only 3 TODO comments exist in production code:
 ---
 
 *Last updated: January 2026*
-*Based on commit: d1f8151 (Reduce buffered catchup log spam)*
+*Based on commit: 93b335b (Module cache confirmed active in live validator)*
