@@ -647,6 +647,18 @@ impl RefundableFeeTracker {
             0
         }
     }
+
+    /// Reset all consumed fee values to zero.
+    ///
+    /// This mirrors C++ stellar-core's `RefundableFeeTracker::resetConsumedFee()` which is called
+    /// by `MutableTransactionResultBase::setError()` when a transaction fails. When a transaction
+    /// fails for any reason (including InsufficientRefundableFee), C++ resets the consumed fee
+    /// tracker so that the full `max_refundable_fee` is refunded to the user.
+    fn reset(&mut self) {
+        self.consumed_event_size_bytes = 0;
+        self.consumed_rent_fee = 0;
+        self.consumed_refundable_fee = 0;
+    }
 }
 
 fn compute_soroban_resource_fee(
@@ -2855,6 +2867,13 @@ impl TransactionExecutor {
             op_events.clear();
             diagnostic_events.clear();
             soroban_return_value = None;
+
+            // Reset the refundable fee tracker when transaction fails.
+            // This mirrors C++ stellar-core's behavior where setError() calls resetConsumedFee(),
+            // ensuring the full max_refundable_fee is refunded on any transaction failure.
+            if let Some(tracker) = refundable_fee_tracker.as_mut() {
+                tracker.reset();
+            }
         } else {
             self.state.commit();
 

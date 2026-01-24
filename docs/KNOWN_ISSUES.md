@@ -335,6 +335,42 @@ The fix for F6 (rent fee double-charge) added `actual_restored_indices` to `Soro
 
 ---
 
+### F8: Fee Refund Not Applied for Failed Soroban Transactions
+
+**Status**: FIXED  
+**Impact**: Was causing fee refund mismatch and bucket list hash divergence  
+**Added**: 2026-01-24  
+**Fixed**: 2026-01-24
+
+**Description**:
+When a Soroban transaction fails (e.g., due to `InsufficientRefundableFee`), the full `max_refundable_fee` should be refunded to the user. Our implementation was returning a 0 refund because the `consumed_refundable_fee` had already been set to a value exceeding `max_refundable_fee` before the failure was detected.
+
+**Observed at**: Ledger 224398 (testnet) - TX 7 failed with InsufficientRefundableFee
+
+**Symptoms**:
+- Fee refund mismatch: ours=0 vs cdp=47153 (diff=-47153)
+- CDP soroban_meta: rent_fee_charged=0, refundable_fee_charged=0, non_refundable_fee_charged=125890
+- Account balance diff: -47153 stroops
+
+**Root Cause**:
+In `RefundableFeeTracker::consume()`, when the second check fails (total consumed > max refundable), `consumed_refundable_fee` has already been set to the exceeded value. Then `refund_amount()` returns `max - consumed = negative → 0` instead of the full refund.
+
+C++ stellar-core has a `resetConsumedFee()` method in `MutableTransactionResultBase` that is called by `setError()` when any error code is set. This resets all consumed fees to 0, so the refund becomes `max_refundable_fee - 0 = max_refundable_fee`.
+
+**Solution**:
+1. Added `reset()` method to `RefundableFeeTracker` that mirrors C++ `resetConsumedFee()`:
+   - Resets `consumed_event_size_bytes` to 0
+   - Resets `consumed_rent_fee` to 0
+   - Resets `consumed_refundable_fee` to 0
+2. Call `tracker.reset()` in the `!all_success` branch when a transaction fails, before computing the refund
+
+**Files Changed**:
+- `crates/stellar-core-ledger/src/execution.rs` - Added `reset()` method and call it on transaction failure
+
+**Verification**: Ledger 224398 and range 224395-224400 now pass with 0 header mismatches.
+
+---
+
 ## Observed Hash Mismatches
 
 This section logs ledger sequences where hash mismatches occurred during testnet validation. These are tracked to help identify patterns and root causes.
