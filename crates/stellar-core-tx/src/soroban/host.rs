@@ -1638,6 +1638,13 @@ fn execute_host_function_p24(
     // Track entries restored from live BucketList (expired TTL but not yet evicted)
     let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
 
+    // Build the ACTUAL list of indices being restored in THIS transaction.
+    // The transaction envelope's archived_soroban_entries may list indices that were
+    // already restored by a previous transaction in the same ledger. We only want to
+    // tell the host about entries that are ACTUALLY being restored now.
+    // This matches C++ stellar-core's previouslyRestoredFromHotArchive() check.
+    let mut actual_restored_indices: Vec<u32> = Vec::new();
+
     for (idx, key) in soroban_data
         .resources
         .footprint
@@ -1661,25 +1668,50 @@ fn execute_host_function_p24(
                 .get_archived_with_restore_info(&Rc::new(key_p24), key)
                 .map_err(|e| make_setup_error(convert_host_error_p24_to_p25(e)))?;
             if let Some((entry, live_until, live_bl_restore)) = result {
-                // For restored entries, pass the RESTORED TTL to the host, not the old expired TTL.
-                // This matches C++ behavior where restoredLiveUntilLedger = ledgerSeq + minPersistentTTL - 1
-                // is passed to the host for auto-restored entries.
-                let restored_live_until =
-                    Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
-                tracing::info!(
-                    idx = idx,
-                    key_type = ?std::mem::discriminant(key),
-                    old_live_until = ?live_until,
-                    restored_live_until = ?restored_live_until,
-                    current_ledger = context.sequence,
-                    is_live_bl_restore = live_bl_restore.is_some(),
-                    "P24: Archived entry found for restoration"
-                );
-                add_entry(key, &entry, restored_live_until)?;
+                // Check if this entry is ACTUALLY archived (needs restoration).
+                // An entry is considered archived if:
+                // 1. It has no TTL (live_until is None) - from hot archive
+                // 2. Its TTL is expired (live_until < current_ledger) - live BL restore
+                //
+                // If the entry has a valid TTL >= current_ledger, it was already restored
+                // by a previous transaction in this ledger and should be treated as live.
+                let is_actually_archived = match live_until {
+                    None => true,                      // From hot archive
+                    Some(lu) => lu < context.sequence, // Live BL with expired TTL
+                };
 
-                // Track live BL restorations
-                if let Some(restore) = live_bl_restore {
-                    live_bl_restores.push(restore);
+                if is_actually_archived {
+                    // Entry is actually being restored - use restored TTL
+                    let restored_live_until =
+                        Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
+                    tracing::info!(
+                        idx = idx,
+                        key_type = ?std::mem::discriminant(key),
+                        old_live_until = ?live_until,
+                        restored_live_until = ?restored_live_until,
+                        current_ledger = context.sequence,
+                        is_live_bl_restore = live_bl_restore.is_some(),
+                        "P24: Archived entry found for restoration"
+                    );
+                    add_entry(key, &entry, restored_live_until)?;
+
+                    // Track this index as actually being restored
+                    actual_restored_indices.push(idx as u32);
+
+                    // Track live BL restorations
+                    if let Some(restore) = live_bl_restore {
+                        live_bl_restores.push(restore);
+                    }
+                } else {
+                    // Entry is already live (restored by previous TX in this ledger).
+                    // Treat it as a normal live entry, don't add to restored indices.
+                    tracing::debug!(
+                        idx = idx,
+                        key_type = ?std::mem::discriminant(key),
+                        live_until = ?live_until,
+                        "P24: Entry marked for restore but already live (restored by earlier TX)"
+                    );
+                    add_entry(key, &entry, live_until)?;
                 }
             } else {
                 tracing::warn!(
@@ -1702,7 +1734,8 @@ fn execute_host_function_p24(
     tracing::debug!(
         ledger_entries_count = encoded_ledger_entries.len(),
         ttl_entries_count = encoded_ttl_entries.len(),
-        restored_count = restored_rw_entry_indices.len(),
+        envelope_restored_count = restored_rw_entry_indices.len(),
+        actual_restored_count = actual_restored_indices.len(),
         live_bl_restore_count = live_bl_restores.len(),
         "P24: Prepared entries for e2e_invoke"
     );
@@ -1733,7 +1766,7 @@ fn execute_host_function_p24(
         true, // enable_diagnostics
         &encoded_host_fn,
         &encoded_resources,
-        &restored_rw_entry_indices,
+        &actual_restored_indices,
         &encoded_source,
         encoded_auth_entries.iter(),
         ledger_info,
@@ -2136,6 +2169,13 @@ fn execute_host_function_p25(
     // Track entries restored from live BucketList (expired TTL but not yet evicted)
     let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
 
+    // Build the ACTUAL list of indices being restored in THIS transaction.
+    // The transaction envelope's archived_soroban_entries may list indices that were
+    // already restored by a previous transaction in the same ledger. We only want to
+    // tell the host about entries that are ACTUALLY being restored now.
+    // This matches C++ stellar-core's previouslyRestoredFromHotArchive() check.
+    let mut actual_restored_indices: Vec<u32> = Vec::new();
+
     for (idx, key) in soroban_data
         .resources
         .footprint
@@ -2150,24 +2190,49 @@ fn execute_host_function_p25(
                 .get_archived_with_restore_info(&Rc::new(key.clone()))
                 .map_err(make_setup_error)?;
             if let Some((entry, live_until, live_bl_restore)) = result {
-                // For restored entries, pass the RESTORED TTL to the host, not the old expired TTL.
-                // This matches C++ behavior where restoredLiveUntilLedger = ledgerSeq + minPersistentTTL - 1
-                // is passed to the host for auto-restored entries.
-                let restored_live_until =
-                    Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
-                tracing::info!(
-                    idx = idx,
-                    key_type = ?std::mem::discriminant(key),
-                    old_live_until = ?live_until,
-                    restored_live_until = ?restored_live_until,
-                    is_live_bl_restore = live_bl_restore.is_some(),
-                    "P25: Archived entry found for restoration"
-                );
-                add_entry(key, entry.as_ref(), restored_live_until)?;
+                // Check if this entry is ACTUALLY archived (needs restoration).
+                // An entry is considered archived if:
+                // 1. It has no TTL (live_until is None) - from hot archive
+                // 2. Its TTL is expired (live_until < current_ledger) - live BL restore
+                //
+                // If the entry has a valid TTL >= current_ledger, it was already restored
+                // by a previous transaction in this ledger and should be treated as live.
+                let is_actually_archived = match live_until {
+                    None => true,                      // From hot archive
+                    Some(lu) => lu < context.sequence, // Live BL with expired TTL
+                };
 
-                // Track live BL restorations
-                if let Some(restore) = live_bl_restore {
-                    live_bl_restores.push(restore);
+                if is_actually_archived {
+                    // Entry is actually being restored - use restored TTL
+                    let restored_live_until =
+                        Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
+                    tracing::info!(
+                        idx = idx,
+                        key_type = ?std::mem::discriminant(key),
+                        old_live_until = ?live_until,
+                        restored_live_until = ?restored_live_until,
+                        is_live_bl_restore = live_bl_restore.is_some(),
+                        "P25: Archived entry found for restoration"
+                    );
+                    add_entry(key, entry.as_ref(), restored_live_until)?;
+
+                    // Track this index as actually being restored
+                    actual_restored_indices.push(idx as u32);
+
+                    // Track live BL restorations
+                    if let Some(restore) = live_bl_restore {
+                        live_bl_restores.push(restore);
+                    }
+                } else {
+                    // Entry is already live (restored by previous TX in this ledger).
+                    // Treat it as a normal live entry, don't add to restored indices.
+                    tracing::debug!(
+                        idx = idx,
+                        key_type = ?std::mem::discriminant(key),
+                        live_until = ?live_until,
+                        "P25: Entry marked for restore but already live (restored by earlier TX)"
+                    );
+                    add_entry(key, entry.as_ref(), live_until)?;
                 }
             } else {
                 tracing::warn!(
@@ -2187,7 +2252,8 @@ fn execute_host_function_p25(
     tracing::debug!(
         ledger_entries_count = encoded_ledger_entries.len(),
         ttl_entries_count = encoded_ttl_entries.len(),
-        restored_count = restored_rw_entry_indices.len(),
+        envelope_restored_count = restored_rw_entry_indices.len(),
+        actual_restored_count = actual_restored_indices.len(),
         live_bl_restore_count = live_bl_restores.len(),
         "P25: Prepared entries for e2e_invoke"
     );
@@ -2218,7 +2284,7 @@ fn execute_host_function_p25(
         true,
         &encoded_host_fn,
         &encoded_resources,
-        &restored_rw_entry_indices,
+        &actual_restored_indices,
         &encoded_source,
         encoded_auth_entries.iter(),
         ledger_info,

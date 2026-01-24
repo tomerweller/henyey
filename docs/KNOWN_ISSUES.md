@@ -260,6 +260,45 @@ Modified `apply_soroban_storage_change` to:
 
 ---
 
+### F6: Rent Fee Double-Charged for Entries Already Restored by Earlier TX
+
+**Status**: FIXED  
+**Impact**: Was causing 24M stroops fee refund mismatch and bucket list hash divergence  
+**Added**: 2026-01-24  
+**Fixed**: 2026-01-24
+
+**Description**:
+When multiple transactions in the same ledger reference the same archived entry for restoration (via `archived_soroban_entries` in the transaction envelope), only the FIRST transaction should charge restoration rent. Subsequent transactions should treat the entry as already live.
+
+**Observed at**: Ledger 617809 (testnet) - Two transactions both list the same ContractCode at index 4 for restoration
+
+**Symptoms**:
+- Fee refund mismatch: ours=3,621,585 vs cdp=27,636,621 (diff=-24,015,036)
+- rent_fee_charged: ours=24,073,057 vs cdp=58,021
+- The ContractCode was ~740KB, so charging full restoration rent twice produced a massive overcharge
+
+**Root Cause**:
+The `archived_soroban_entries` field in the transaction envelope lists indices that NEED restoration when the TX was created and simulated. But if an earlier TX in the same ledger already restored the entry, the later TX should NOT charge restoration rent for it.
+
+Our code was blindly passing all `archived_soroban_entries` indices to the soroban-env-host's `invoke_host_function()`. The host then built a `restored_keys` set from these indices and computed rent as if EVERY entry at those indices was a new restoration.
+
+C++ stellar-core has a `previouslyRestoredFromHotArchive()` check that skips entries already restored by earlier TXs in the same ledger.
+
+**Solution**:
+Build an `actual_restored_indices` list instead of using the envelope's `archived_soroban_entries` directly. For each index, check if the entry is ACTUALLY archived at this point:
+- `live_until = None` → Entry is from hot archive (truly archived, needs restoration)
+- `live_until < current_ledger` → Entry has expired TTL (live BL restore, needs restoration)
+- `live_until >= current_ledger` → Entry was already restored by a previous TX (treat as live, NO restoration rent)
+
+Pass only `actual_restored_indices` to `invoke_host_function()`.
+
+**Files Changed**:
+- `crates/stellar-core-tx/src/soroban/host.rs` - Both P24 and P25 code paths updated
+
+**Verification**: Ledger 617809-617810 now pass with 0 header mismatches.
+
+---
+
 ## Observed Hash Mismatches
 
 This section logs ledger sequences where hash mismatches occurred during testnet validation. These are tracked to help identify patterns and root causes.

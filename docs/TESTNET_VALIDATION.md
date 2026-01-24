@@ -76,6 +76,26 @@ When Soroban transactions restore entries from the hot archive, the entries shou
 
 **Regression test:** `test_hot_archive_restore_uses_create_not_update`
 
+#### 2. Rent Fee Double-Charged for Entries Already Restored by Earlier TX (Ledger 617809)
+
+When multiple transactions in the same ledger reference the same archived entry for restoration, only the FIRST transaction should charge restoration rent. The second transaction should treat the entry as already live.
+
+**Root Cause**: The `archived_soroban_entries` field in the transaction envelope lists indices that NEED restoration when the TX was created. But if an earlier TX in the same ledger already restored the entry, the later TX should NOT charge restoration rent. Our code was blindly passing all `archived_soroban_entries` indices to the soroban-env-host, which computed rent as if EVERY restoration was new.
+
+**Observed symptoms**:
+- Fee refund mismatch: ours=3,621,585 vs cdp=27,636,621 (diff=-24,015,036)
+- rent_fee_charged: ours=24,073,057 vs cdp=58,021
+
+**Fix**: Build an `actual_restored_indices` list instead of using the envelope's `archived_soroban_entries` directly. Check if each entry is ACTUALLY archived:
+- `live_until = None` → Entry is from hot archive (truly archived)
+- `live_until < current_ledger` → Entry has expired TTL (live BL restore)
+- `live_until >= current_ledger` → Entry was already restored by a previous TX (treat as live)
+
+This matches C++ stellar-core's `previouslyRestoredFromHotArchive()` check.
+
+**Files changed:**
+- `crates/stellar-core-tx/src/soroban/host.rs` - Both P24 and P25 code paths
+
 #### 2. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
 
 Soroban contracts calling `bn254_multi_pairing_check` were failing with "bn254 G1: point not on curve" because we were using a pre-release soroban-env-host revision (`0a0c2df`, Nov 5, 2025) with incorrect BN254 G1/G2 point encoding.
@@ -313,17 +333,7 @@ When a `CreateClaimableBalance` operation has an operation source different from
 
 ### Known Issues
 
-#### Fee Refund Mismatch (Under Investigation)
-
-At ledger 617809, there's an account balance difference of -24,015,036 stroops between our execution and CDP. This is shown as "FEE REFUND MISMATCH" in the output. The transaction metas match perfectly (100%), but the final account balance differs, causing a bucket list hash mismatch.
-
-**Observed at**: Ledger 617809 (testnet)
-- Account: `72c42356096020ac28c75e9504dce7e275054e51d02334bbf08bf6b9b5002e68`
-- Our balance: 94,653,174,713
-- CDP balance: 94,677,189,749  
-- Difference: -24,015,036 stroops
-
-This appears to be a fee calculation issue unrelated to hot archive restoration.
+No known issues at this time. All previously tracked issues have been resolved.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 
