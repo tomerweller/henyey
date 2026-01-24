@@ -3667,6 +3667,23 @@ impl App {
             Err(_) => return,
         };
 
+        // Cooldown check: if we recently attempted catchup (which may have skipped because
+        // we're already past the latest checkpoint), don't retry immediately. Use the same
+        // cooldown as the archive cache to avoid hammering the archive while waiting for
+        // the next checkpoint to be published.
+        let recently_caught_up = self
+            .last_catchup_completed_at
+            .read()
+            .await
+            .is_some_and(|t| t.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS);
+        if recently_caught_up {
+            tracing::debug!(
+                current_ledger,
+                "Skipping missing txset catchup: waiting for next checkpoint (cooldown active)"
+            );
+            return;
+        }
+
         // Check if we're already catching up
         if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
             tracing::debug!("Catchup already in progress, skipping missing txset catchup");
@@ -3734,11 +3751,16 @@ impl App {
                     );
                     self.try_apply_buffered_ledgers().await;
                 } else {
-                    // Catchup was skipped (already at or past target)
-                    // Don't reset tx_set tracking - preserve pending requests
-                    tracing::info!(
-                        ledger_seq = result.ledger_seq,
-                        "Missing tx_set catchup skipped (already at target); preserving tx_set tracking"
+                    // Catchup was skipped (already at or past target checkpoint)
+                    // This means we're past the latest published checkpoint but can't close
+                    // ledgers because peers don't have the tx sets. We need to wait for the
+                    // next checkpoint to be published to the archive.
+                    let next_checkpoint = (result.ledger_seq / CHECKPOINT_FREQUENCY + 1) * CHECKPOINT_FREQUENCY + CHECKPOINT_FREQUENCY - 1;
+                    tracing::warn!(
+                        current_ledger = result.ledger_seq,
+                        next_checkpoint,
+                        cooldown_secs = ARCHIVE_CHECKPOINT_CACHE_SECS,
+                        "Waiting for next checkpoint: past latest published checkpoint but tx sets unavailable from peers"
                     );
                 }
                 // Record catchup completion time for cooldown (always, even if skipped)
@@ -3872,14 +3894,15 @@ impl App {
                                 .has_stale_pending_tx_set(TX_SET_UNAVAILABLE_TIMEOUT_SECS);
                             let recovery_failed = state.recovery_attempts >= 2;
 
-                            // Cooldown: don't use fast timeout if we just completed catchup
-                            // This prevents catching up to the same checkpoint repeatedly
-                            const CATCHUP_COOLDOWN_SECS: u64 = 15;
+                            // Cooldown: don't use fast timeout if we just completed catchup.
+                            // This prevents catching up to the same checkpoint repeatedly.
+                            // Use the archive cache TTL as the cooldown since that's the minimum
+                            // time needed for a new checkpoint to potentially be available.
                             let recently_caught_up = self
                                 .last_catchup_completed_at
                                 .read()
                                 .await
-                                .is_some_and(|t| t.elapsed().as_secs() < CATCHUP_COOLDOWN_SECS);
+                                .is_some_and(|t| t.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS);
 
                             let use_fast_timeout = !recently_caught_up
                                 && (all_peers_exhausted || has_stale_requests || recovery_failed);
