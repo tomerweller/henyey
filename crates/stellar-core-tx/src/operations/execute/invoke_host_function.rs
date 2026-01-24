@@ -272,8 +272,13 @@ fn execute_contract_invocation(
             // IMPORTANT: We must exclude live BL restores from this set because those entries
             // are still in the live bucket list (just with expired TTL). Only true hot archive
             // restores (entries that were evicted from live BL to hot archive) should use INIT.
-            let hot_archive_restored_keys =
-                extract_hot_archive_restored_keys(soroban_data, &result.live_bucket_list_restores);
+            // ALSO: We use actual_restored_indices which filters out entries already restored
+            // by a previous transaction in this ledger.
+            let hot_archive_restored_keys = extract_hot_archive_restored_keys(
+                soroban_data,
+                &result.actual_restored_indices,
+                &result.live_bucket_list_restores,
+            );
             apply_soroban_storage_changes(
                 state,
                 &result.storage_changes,
@@ -787,22 +792,22 @@ fn build_soroban_operation_meta(
 /// Live BL restores (entries with expired TTL but not yet evicted) are tracked separately
 /// in `live_bucket_list_restores` and should use LIVE (updated) because they already exist
 /// in the live bucket list - they just need their TTL refreshed.
+///
+/// IMPORTANT: Uses `actual_restored_indices` from the execution result, NOT the raw
+/// `archived_soroban_entries` from the transaction envelope. This is because if an earlier
+/// transaction in the same ledger already restored an entry, the later transaction should
+/// NOT treat it as a hot archive restore (it's already live). The host invocation logic
+/// filters out already-restored entries when building `actual_restored_indices`.
 fn extract_hot_archive_restored_keys(
     soroban_data: &SorobanTransactionData,
+    actual_restored_indices: &[u32],
     live_bucket_list_restores: &[crate::soroban::protocol::LiveBucketListRestore],
 ) -> std::collections::HashSet<LedgerKey> {
     use std::collections::HashSet;
 
     let mut keys = HashSet::new();
 
-    let archived_indices: Vec<u32> = match &soroban_data.ext {
-        SorobanTransactionDataExt::V1(ext) => {
-            ext.archived_soroban_entries.iter().copied().collect()
-        }
-        SorobanTransactionDataExt::V0 => Vec::new(),
-    };
-
-    if archived_indices.is_empty() {
+    if actual_restored_indices.is_empty() {
         return keys;
     }
 
@@ -812,10 +817,13 @@ fn extract_hot_archive_restored_keys(
         .map(|r| r.key.clone())
         .collect();
 
-    // Get the corresponding keys from the read_write footprint, excluding live BL restores
+    // Get the corresponding keys from the read_write footprint, excluding live BL restores.
+    // We use actual_restored_indices which is already filtered to only include entries
+    // that are ACTUALLY being restored in THIS transaction (not already restored by
+    // a previous transaction in this ledger).
     let read_write = &soroban_data.resources.footprint.read_write;
-    for index in archived_indices {
-        if let Some(key) = read_write.get(index as usize) {
+    for index in actual_restored_indices {
+        if let Some(key) = read_write.get(*index as usize) {
             // Only include if this is NOT a live BL restore
             if !live_bl_restore_keys.contains(key) {
                 keys.insert(key.clone());

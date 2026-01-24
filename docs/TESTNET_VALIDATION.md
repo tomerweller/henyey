@@ -57,6 +57,7 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 400000-407000 | 7,229+ | ~30,000+ | 100% | ~99% | Post-500254 fix verified |
 | 553996-553998 | 3 | 14 | 100% | 100% | BN254 crypto fix verified |
 | 617808-617812 | 5 | 22 | Pending | 100% | Hot archive restore fix verified (meta OK) |
+| 250000-253000 | 3,001 | 8,091 | 100% | ~99% | Extra RESTORED fix verified |
 | 64-617812+ | 617,749+ | ~600,000+ | 100% | ~98% | **Hot archive fix allows further expansion** |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
@@ -95,6 +96,29 @@ This matches C++ stellar-core's `previouslyRestoredFromHotArchive()` check.
 
 **Files changed:**
 - `crates/stellar-core-tx/src/soroban/host.rs` - Both P24 and P25 code paths
+
+#### 3. Extra RESTORED Changes for Entries Already Restored by Earlier TX (Ledger 252453)
+
+When multiple transactions in the same ledger restore the same archived entry, ONLY the first transaction should emit RESTORED changes in its transaction meta. Subsequent transactions should treat the entry as already live and emit UPDATED changes instead.
+
+**Root Cause**: The `extract_hot_archive_restored_keys` function in `invoke_host_function.rs` used the raw `archived_soroban_entries` indices from the transaction envelope instead of using the `actual_restored_indices` that are filtered during host invocation.
+
+**Observed symptoms**:
+- Meta diff: Change count mismatch: ours=12, expected=8
+- Extra RESTORED ContractCode and TTL entries
+- Error: "contract code already exists" when applying changes
+
+**Fix**: 
+1. Added `actual_restored_indices` field to `SorobanExecutionResult` struct
+2. Updated both P24 and P25 code paths to populate this field
+3. Modified `extract_hot_archive_restored_keys` to take `actual_restored_indices` as a parameter
+4. Updated the call site to pass `result.actual_restored_indices`
+
+**Files changed:**
+- `crates/stellar-core-tx/src/soroban/host.rs` - Added field to struct, populated in P24/P25 paths
+- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Updated function signature and call site
+
+**Verification**: Ledger 252453 and range 250000-253000 pass with 0 header mismatches.
 
 #### 2. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
 
@@ -441,8 +465,9 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-24**: Fixed extra RESTORED changes for entries already restored by earlier TX (ledger 252453) - extends verification to 250000-253000
+- **2026-01-24**: Fixed rent fee double-charge for entries already restored by earlier TX (ledger 617809)
 - **2026-01-24**: Fixed hot archive restoration emitting CREATED instead of RESTORED (ledger 617809) - extends meta verification to 617812+
-- **2026-01-24**: Investigating fee refund mismatch causing account balance difference at ledger 617809
 - **2026-01-23**: **BLOCKER** Discovered Soroban crypto error at ledger 553997 - InvokeHostFunction returns Trapped instead of Success (Error(Crypto, InvalidInput))
 - **2026-01-23**: Fixed SetTrustLineFlags/AllowTrust incorrectly recording issuer account in delta (ledger 500254) - extends verification to 64-553996
 - **2026-01-23**: Fixed CreateClaimableBalance source account not recorded when different from TX source (ledger 203280) - extends continuous replay through 500000+

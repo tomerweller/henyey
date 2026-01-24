@@ -84,6 +84,11 @@ pub struct SorobanExecutionResult {
     pub rent_fee: i64,
     /// Entries restored from the live BucketList (expired TTL but not yet evicted).
     pub live_bucket_list_restores: Vec<super::protocol::LiveBucketListRestore>,
+    /// Indices of entries ACTUALLY restored from hot archive in THIS transaction.
+    /// This is a subset of the transaction envelope's archived_soroban_entries,
+    /// excluding entries that were already restored by a previous transaction
+    /// in the same ledger. Used to determine whether to emit INIT vs LIVE changes.
+    pub actual_restored_indices: Vec<u32>,
 }
 
 /// Error from Soroban execution that includes consumed resources.
@@ -1949,6 +1954,7 @@ fn execute_host_function_p24(
         contract_events_and_return_value_size,
         rent_fee,
         live_bucket_list_restores: live_bl_restores,
+        actual_restored_indices,
     })
 }
 
@@ -2450,6 +2456,7 @@ fn execute_host_function_p25(
         contract_events_and_return_value_size,
         rent_fee,
         live_bucket_list_restores: live_bl_restores,
+        actual_restored_indices,
     })
 }
 

@@ -299,6 +299,42 @@ Pass only `actual_restored_indices` to `invoke_host_function()`.
 
 ---
 
+### F7: Extra RESTORED Changes for Entries Already Restored by Earlier TX
+
+**Status**: FIXED  
+**Impact**: Was causing extra RESTORED changes in TX meta and "contract code already exists" errors  
+**Added**: 2026-01-24  
+**Fixed**: 2026-01-24
+
+**Description**:
+When multiple transactions in the same ledger restore the same archived entry, ONLY the first transaction should emit RESTORED changes in its transaction meta. Subsequent transactions should treat the entry as already live and emit UPDATED changes instead. Our code was incorrectly emitting RESTORED for ALL transactions that listed the entry in their `archived_soroban_entries`.
+
+**Observed at**: Ledger 252453 (testnet) - TX 21 was emitting 4 extra RESTORED changes
+
+**Symptoms**:
+- Extra RESTORED changes in transaction meta (count mismatch: ours=12, expected=8)
+- Extra RESTORED ContractCode and TTL entries
+- Error: "contract code already exists" when applying changes
+
+**Root Cause**:
+The `extract_hot_archive_restored_keys` function in `invoke_host_function.rs` used the raw `archived_soroban_entries` indices from the transaction envelope. But it should use the `actual_restored_indices` that are filtered during host invocation - entries already restored by earlier TXs are excluded from this filtered list.
+
+The fix for F6 (rent fee double-charge) added `actual_restored_indices` to `SorobanExecutionResult`, but this information wasn't propagated to the `extract_hot_archive_restored_keys` call site.
+
+**Solution**:
+1. Added `actual_restored_indices` field to `SorobanExecutionResult` struct
+2. Updated both P24 and P25 code paths to populate this field
+3. Modified `extract_hot_archive_restored_keys` to take `actual_restored_indices` as a parameter instead of reading from `soroban_data.ext.archived_soroban_entries`
+4. Updated the call site to pass `result.actual_restored_indices`
+
+**Files Changed**:
+- `crates/stellar-core-tx/src/soroban/host.rs` - Added field to struct and populated in both P24/P25 paths
+- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Updated function signature and call site
+
+**Verification**: Ledger 252453 and range 250000-253000 now pass with 0 header mismatches.
+
+---
+
 ## Observed Hash Mismatches
 
 This section logs ledger sequences where hash mismatches occurred during testnet validation. These are tracked to help identify patterns and root causes.
