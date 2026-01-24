@@ -2680,23 +2680,47 @@ impl TransactionExecutor {
                                 extract_hot_archive_restored_keys(soroban_data, op_type);
                             let ha_before = hot_archive.len();
                             hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
-                            let ha_after = hot_archive.len();
-                            // Log when we filter out live BL restores (indicates distinction matters)
+                            let ha_after_live_bl = hot_archive.len();
+
+                            // Also exclude keys that were listed in archived_soroban_entries but
+                            // were already restored by a previous TX in this ledger. These entries
+                            // go into `updated` (not `created`) because they already exist in state.
+                            // We only want RESTORED emission for entries actually being created/restored
+                            // in THIS transaction.
+                            let created_keys: HashSet<LedgerKey> = delta_changes
+                                .created
+                                .iter()
+                                .filter_map(|entry| crate::delta::entry_to_key(entry).ok())
+                                .collect();
+                            // For transaction meta emission: only emit RESTORED for keys in created
+                            let hot_archive_for_meta: HashSet<LedgerKey> = hot_archive
+                                .iter()
+                                .filter(|k| created_keys.contains(k))
+                                .cloned()
+                                .collect();
+                            let ha_after = hot_archive_for_meta.len();
+                            // Keep original set for bucket list operations
+                            let hot_archive_for_bucket_list = hot_archive;
+                            // Log when we filter out entries
                             if ha_before != ha_after {
                                 tracing::info!(
                                     ha_before,
+                                    ha_after_live_bl,
                                     ha_after,
                                     live_bl_count = restored.live_bucket_list.len(),
-                                    "Filtered live BL restores from hot archive keys"
+                                    created_count = created_keys.len(),
+                                    "Filtered hot archive keys: live BL restores and already-restored entries"
                                 );
                             }
                             // For transaction meta purposes, also add the corresponding TTL keys.
                             // When a ContractData/ContractCode entry is restored from hot archive,
                             // its TTL entry should also be emitted as RESTORED (not CREATED).
+                            // Use the filtered set (hot_archive_for_meta) which only includes entries
+                            // actually being created/restored in this TX.
                             // NOTE: We don't add TTL keys to collected_hot_archive_keys because
                             // HotArchiveBucketList::add_batch only receives data/code entries.
                             use sha2::{Digest, Sha256};
-                            let ttl_keys: Vec<_> = hot_archive
+                            let ttl_keys: Vec<_> = hot_archive_for_meta
                                 .iter()
                                 .filter_map(|key| {
                                     // Compute key hash as SHA256 of key XDR
@@ -2709,10 +2733,18 @@ impl TransactionExecutor {
                                 })
                                 .collect();
                             // Collect data/code keys only for HotArchiveBucketList::add_batch
-                            // (TTL keys are not added to hot archive bucket list)
-                            collected_hot_archive_keys.extend(hot_archive.iter().cloned());
-                            // Add all keys (including TTL) to restored.hot_archive for meta conversion
-                            restored.hot_archive.extend(hot_archive);
+                            // Use full set (hot_archive_for_bucket_list) because we still need
+                            // to mark these as restored even if another TX already restored them.
+                            // Actually, for bucket list, we should also filter - only add entries
+                            // that were actually created (not already in live BL from earlier TX).
+                            collected_hot_archive_keys.extend(
+                                hot_archive_for_bucket_list
+                                    .iter()
+                                    .filter(|k| created_keys.contains(k))
+                                    .cloned(),
+                            );
+                            // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
+                            restored.hot_archive.extend(hot_archive_for_meta);
                             restored.hot_archive.extend(ttl_keys);
                             (restored, soroban_data.map(|d| &d.resources.footprint))
                         } else {

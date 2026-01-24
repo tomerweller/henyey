@@ -40,10 +40,10 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-553998+ continuous replay passes |
-| **Transaction meta verification** | Passing | 100% header match in tested ranges |
-| **Primary failure mode** | Testing in progress | BN254 crypto bug fixed (2026-01-24) |
-| **Continuous replay** | Ledgers 64-553998+ | 100% header match, expanding range |
+| **End-to-end verification** | Extended | 64-617812+ continuous replay passes (meta) |
+| **Transaction meta verification** | Passing | 100% meta match in tested ranges |
+| **Primary failure mode** | Fee refund mismatch | Investigating account balance differences |
+| **Continuous replay** | Ledgers 64-617812+ | Meta matches, expanding range |
 
 ### Verification Results
 
@@ -56,13 +56,27 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 200000-213000 | 13,000+ | ~50,000+ | 100% | ~99% | CreateClaimableBalance fix verified |
 | 400000-407000 | 7,229+ | ~30,000+ | 100% | ~99% | Post-500254 fix verified |
 | 553996-553998 | 3 | 14 | 100% | 100% | BN254 crypto fix verified |
-| 64-553998+ | 553,935+ | ~500,000+ | 100% | ~98% | **BN254 fix allows further expansion** |
+| 617808-617812 | 5 | 22 | Pending | 100% | Hot archive restore fix verified (meta OK) |
+| 64-617812+ | 617,749+ | ~600,000+ | 100% | ~98% | **Hot archive fix allows further expansion** |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
 ### Issues Fixed (2026-01-24)
 
-#### 1. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
+#### 1. Hot Archive Restoration Emitting CREATED Instead of RESTORED (Ledger 617809)
+
+When Soroban transactions restore entries from the hot archive, the entries should be emitted as `RESTORED` in transaction meta and recorded as `INIT` in the bucket list. Instead, they were incorrectly going through the `update` path.
+
+**Root Cause**: In `apply_soroban_storage_change`, the code checked `state.get_contract_code().is_some()` to decide create vs update. But archived entries are pre-loaded into state from `InMemorySorobanState` before Soroban execution, causing `entry_exists = true` even for first restoration.
+
+**Fix**: Check if entry was already created in the **delta** (by a previous TX in same ledger) instead of checking state existence. Added `key_already_created_in_delta()` and `ttl_already_created_in_delta()` helpers.
+
+**Files changed:**
+- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs`
+
+**Regression test:** `test_hot_archive_restore_uses_create_not_update`
+
+#### 2. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
 
 Soroban contracts calling `bn254_multi_pairing_check` were failing with "bn254 G1: point not on curve" because we were using a pre-release soroban-env-host revision (`0a0c2df`, Nov 5, 2025) with incorrect BN254 G1/G2 point encoding.
 
@@ -299,7 +313,17 @@ When a `CreateClaimableBalance` operation has an operation source different from
 
 ### Known Issues
 
-No known issues blocking testnet validation. Expanding verification range to achieve full coverage.
+#### Fee Refund Mismatch (Under Investigation)
+
+At ledger 617809, there's an account balance difference of -24,015,036 stroops between our execution and CDP. This is shown as "FEE REFUND MISMATCH" in the output. The transaction metas match perfectly (100%), but the final account balance differs, causing a bucket list hash mismatch.
+
+**Observed at**: Ledger 617809 (testnet)
+- Account: `72c42356096020ac28c75e9504dce7e275054e51d02334bbf08bf6b9b5002e68`
+- Our balance: 94,653,174,713
+- CDP balance: 94,677,189,749  
+- Difference: -24,015,036 stroops
+
+This appears to be a fee calculation issue unrelated to hot archive restoration.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 
@@ -407,6 +431,8 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-24**: Fixed hot archive restoration emitting CREATED instead of RESTORED (ledger 617809) - extends meta verification to 617812+
+- **2026-01-24**: Investigating fee refund mismatch causing account balance difference at ledger 617809
 - **2026-01-23**: **BLOCKER** Discovered Soroban crypto error at ledger 553997 - InvokeHostFunction returns Trapped instead of Success (Error(Crypto, InvalidInput))
 - **2026-01-23**: Fixed SetTrustLineFlags/AllowTrust incorrectly recording issuer account in delta (ledger 500254) - extends verification to 64-553996
 - **2026-01-23**: Fixed CreateClaimableBalance source account not recorded when different from TX source (ledger 203280) - extends continuous replay through 500000+

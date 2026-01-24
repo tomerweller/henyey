@@ -226,51 +226,37 @@ Updated `Cargo.toml` to use soroban-env-host v25.0.0 (`d2ff024b72f7f3f75737402ac
 
 ---
 
-### F5: Eviction-Related Bucket List Hash Mismatch
+### F5: Hot Archive Restoration Emitting CREATED Instead of RESTORED
 
-**Status**: Pending Re-validation (may be resolved by F3 fix)  
-**Impact**: Was causing hash mismatches on ledgers with entry eviction  
-**Added**: 2026-01-23
+**Status**: FIXED  
+**Impact**: Was causing transaction meta mismatch and bucket list hash divergence  
+**Added**: 2026-01-23  
+**Fixed**: 2026-01-24
 
 **Description**:
-When entries are evicted from the live bucket list to the hot archive during ledger close, the computed bucket list hash diverges from the network's expected hash. This was originally thought to be a **different bug from F3** (restoration failure), but may have been caused by the same root issue (hot archive not being passed to execution).
+When a Soroban transaction restores entries from the hot archive, the ContractCode/ContractData entries and their associated TTL entries should be emitted as `LEDGER_ENTRY_RESTORED` in transaction meta and recorded as `INIT` in the bucket list delta. Instead, they were being emitted as `LEDGER_ENTRY_CREATED` for the main entry and `LEDGER_ENTRY_CREATED` for TTL entries.
 
-**Observed at**: Ledgers 638670, 638737, 638938 (testnet)
+**Observed at**: Ledger 617809 (testnet) - TX 2 restores a ContractCode entry
 
-**Symptoms**:
-- Hash mismatch occurs on ledgers with `archived_count > 0` (eviction happening)
-- `restored_count = 0` (no restoration attempted)
-- The live bucket list hash is computed, but the combined hash differs from network
-- Re-catchup does not resolve - the same ledger fails again
+**Root Cause**:
+In `apply_soroban_storage_change`, the code checked `state.get_contract_code().is_some()` to decide whether to call `create` or `update`. But archived entries are pre-loaded into state from `InMemorySorobanState` (via `load_soroban_footprint`) before Soroban execution. The in-memory cache doesn't filter by TTL, so expired/archived entries appear as "existing" in state even though they're not in the live bucket list.
 
-**Example from ledger 638938**:
-```
-Bucket list hash computation ledger_seq=638938 
-  live_hash=2a358bc79b162929bf430c00781f3a0cde90379cb59caeca35223be367624002 
-  pre_hot_hash=d01098b39647a140d57c03b600df49f2222b3c942765944fada47da18bcb92ff 
-  post_hot_hash=8a8a28f5af4de00aa947c32a97d9e413a99ac7ee02a3e35e0e1e98cedd8a0f58 
-  combined_hash=18d804eae377ae284491a299cf27583389c8cc41e0834562759eaa42aa6994e8 
-  archived_count=1 restored_count=0
+This caused `entry_exists = true` for the first hot archive restoration, making the code call `update` instead of `create`. The entry went to `LIVE` (updated) instead of `INIT` (created).
 
-Hash mismatch:
-  our_hash=01a052e0c9d825e139b39f64d2c0bdbebc4b20402d65e4eb425a27ef1c62056b
-  network_prev_hash=49e7b351142d86d6fd882ff1e00ad288d4aa8a135ec8b2dc5b04574f3c9d483b
-```
+**Solution**:
+Instead of checking if an entry exists in state, check if the entry was already **created in the delta** by a previous transaction in the same ledger. Added two helper functions:
+- `key_already_created_in_delta()` - checks ContractData/ContractCode keys
+- `ttl_already_created_in_delta()` - checks TTL keys
 
-**Status Update (2026-01-23)**:
-The F3 fix (wiring hot archive through to execution) resulted in **137+ consecutive ledger closes with 0 hash mismatches** during live testnet validation. This suggests F4 may have been a downstream effect of F3 (missing hot archive context affecting transaction execution, which then affected eviction/hash computation).
+Modified `apply_soroban_storage_change` to:
+1. For hot archive restores: check `key_already_created_in_delta()` instead of `state.get_*().is_some()`
+2. First restoration → call `create_*` (records as INIT)
+3. Subsequent access by another TX → call `update_*` (records as LIVE)
 
-**Next Steps**:
-- Continue monitoring live testnet validation for any recurrence
-- If mismatches reappear, investigate eviction-specific issues:
-  1. Hot archive entry format differences (Archived vs Live entry types)
-  2. Hot archive bucket list merge timing
-  3. Combined bucket list hash computation (live + hot archive)
+**Files Changed**:
+- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Added helpers, fixed create/update logic
 
-**Files Involved**:
-- `crates/stellar-core-ledger/src/manager.rs` - Eviction scan and hot archive update
-- `crates/stellar-core-bucket/src/hot_archive.rs` - Hot archive bucket list operations
-- `crates/stellar-core-bucket/src/bucket_list.rs` - Combined hash computation
+**Regression Test**: `test_hot_archive_restore_uses_create_not_update` updated to use `load_entry` (no delta tracking) instead of `create_contract_data` (adds to delta).
 
 ---
 

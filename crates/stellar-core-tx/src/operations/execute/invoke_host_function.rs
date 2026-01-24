@@ -19,6 +19,57 @@ fn is_soroban_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
+/// Check if a key was already created in the delta (by a previous TX in this ledger).
+///
+/// This is used for hot archive restoration to distinguish between:
+/// - First restoration: entry should be recorded as INIT (create)
+/// - Subsequent access: entry was already restored, should be LIVE (update)
+///
+/// We can't use state.get_*().is_some() because archived entries are pre-loaded
+/// into state from InMemorySorobanState before Soroban execution.
+fn key_already_created_in_delta(delta: &crate::apply::LedgerDelta, key: &LedgerKey) -> bool {
+    use stellar_xdr::curr::LedgerEntryData;
+
+    for entry in delta.created_entries() {
+        let entry_key = match &entry.data {
+            LedgerEntryData::ContractData(cd) => {
+                LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+                    contract: cd.contract.clone(),
+                    key: cd.key.clone(),
+                    durability: cd.durability,
+                })
+            }
+            LedgerEntryData::ContractCode(cc) => {
+                LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                    hash: cc.hash.clone(),
+                })
+            }
+            _ => continue,
+        };
+        if entry_key == *key {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a TTL entry with the given key hash was already created in the delta.
+fn ttl_already_created_in_delta(
+    delta: &crate::apply::LedgerDelta,
+    key_hash: &stellar_xdr::curr::Hash,
+) -> bool {
+    use stellar_xdr::curr::LedgerEntryData;
+
+    for entry in delta.created_entries() {
+        if let LedgerEntryData::Ttl(ttl) = &entry.data {
+            if ttl.key_hash == *key_hash {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Validate CONTRACT_CODE and CONTRACT_DATA entry sizes against network config limits.
 ///
 /// This matches C++ stellar-core's `validateContractLedgerEntry()` in TransactionUtils.cpp.
@@ -853,33 +904,48 @@ fn apply_soroban_storage_change(
     // Check if this entry is being restored from the hot archive.
     // Hot archive restored entries must be recorded as INIT (created) in the bucket list delta,
     // not LIVE (updated), because they are being restored to the live bucket list.
-    // The entry exists in state because it was loaded from the hot archive during Soroban
-    // execution setup, but it's not in the live bucket list yet.
     let is_hot_archive_restore = hot_archive_restored_keys.contains(&change.key);
 
     if let Some(entry) = &change.new_entry {
         // Handle contract data and code entries.
         match &entry.data {
             stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                // For hot archive restores, always use create to record as INIT
-                if is_hot_archive_restore {
-                    state.create_contract_data(cd.clone());
-                } else if state
+                // For hot archive restores, check if the entry was already created in the delta
+                // (by a previous TX in this ledger). We can't use state.get_*().is_some() because
+                // archived entries are pre-loaded into state from InMemorySorobanState.
+                let entry_exists_in_state = state
                     .get_contract_data(&cd.contract, &cd.key, cd.durability)
-                    .is_some()
-                {
+                    .is_some();
+                let already_restored = is_hot_archive_restore
+                    && key_already_created_in_delta(state.delta(), &change.key);
+
+                if is_hot_archive_restore && !already_restored {
+                    // First restoration from hot archive - use create to record as INIT
+                    state.create_contract_data(cd.clone());
+                } else if entry_exists_in_state || already_restored {
+                    // Entry exists (either in live BL or already restored) - update
                     state.update_contract_data(cd.clone());
                 } else {
+                    // New entry (not a restore, not existing) - create
                     state.create_contract_data(cd.clone());
                 }
             }
             stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
-                // For hot archive restores, always use create to record as INIT
-                if is_hot_archive_restore {
+                // For hot archive restores, check if the entry was already created in the delta
+                // (by a previous TX in this ledger). We can't use state.get_*().is_some() because
+                // archived entries are pre-loaded into state from InMemorySorobanState.
+                let entry_exists_in_state = state.get_contract_code(&cc.hash).is_some();
+                let already_restored = is_hot_archive_restore
+                    && key_already_created_in_delta(state.delta(), &change.key);
+
+                if is_hot_archive_restore && !already_restored {
+                    // First restoration from hot archive - use create to record as INIT
                     state.create_contract_code(cc.clone());
-                } else if state.get_contract_code(&cc.hash).is_some() {
+                } else if entry_exists_in_state || already_restored {
+                    // Entry exists (either in live BL or already restored) - update
                     state.update_contract_code(cc.clone());
                 } else {
+                    // New entry (not a restore, not existing) - create
                     state.create_contract_code(cc.clone());
                 }
             }
@@ -949,10 +1015,24 @@ fn apply_soroban_storage_change(
                     live_until_ledger_seq: live_until,
                 };
 
-                // For hot archive restores, the TTL entry is also being created
-                if is_hot_archive_restore {
+                // For hot archive restores, check if the TTL was already created in the delta
+                // (by a previous TX in this ledger). We can't use existing_ttl.is_some() because
+                // TTLs are pre-loaded from InMemorySorobanState.
+                let ttl_already_restored = is_hot_archive_restore
+                    && ttl_already_created_in_delta(state.delta(), &key_hash);
+
+                if is_hot_archive_restore && !ttl_already_restored {
+                    // First restoration from hot archive - create TTL
                     tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
                     state.create_ttl(ttl);
+                } else if is_hot_archive_restore && ttl_already_restored {
+                    // TTL was already restored by earlier TX - update
+                    tracing::debug!(
+                        ?key_hash,
+                        live_until,
+                        "TTL emit: already restored, updating"
+                    );
+                    state.update_ttl(ttl);
                 } else if change.ttl_extended {
                     // TTL was extended from the host's perspective (based on ledger-start state).
                     // We must emit this update even if our current state already has this value
@@ -2102,23 +2182,41 @@ mod tests {
         // Case 2: Entry exists in state AND in hot_archive_keys -> should use create (INIT)
         // This is the key fix: even though entry exists in state, if it's in hot_archive_keys,
         // we must use create to record it as INIT for the bucket list.
+        //
+        // In production, archived entries are loaded from InMemorySorobanState via load_entry,
+        // which does NOT add to delta. The entry exists in state but NOT in delta.created.
         {
             let mut state = LedgerStateManager::new(5_000_000, 100);
 
-            // Pre-populate entry in state
-            state.create_contract_data(cd_entry.clone());
+            // Pre-populate entry in state using load_entry (like InMemorySorobanState does).
+            // This does NOT add to delta - the entry just exists in state.
+            state.load_entry(LedgerEntry {
+                last_modified_ledger_seq: 128051,
+                data: LedgerEntryData::ContractData(cd_entry.clone()),
+                ext: LedgerEntryExt::V0,
+            });
+
+            // Verify entry is in state but NOT in delta
+            assert!(
+                state
+                    .get_contract_data(&contract_id, &contract_key, durability.clone())
+                    .is_some(),
+                "Entry should exist in state"
+            );
+            assert_eq!(
+                state.delta().created_entries().len(),
+                0,
+                "Delta should be empty before apply"
+            );
 
             // Now apply with hot_archive_keys containing the key
             let mut hot_archive_keys = std::collections::HashSet::new();
             hot_archive_keys.insert(key.clone());
 
-            // The delta currently has the initial create. Apply the storage change.
             apply_soroban_storage_change(&mut state, &change, &hot_archive_keys);
 
-            // With hot_archive_keys, even though entry already existed in state,
-            // apply_soroban_storage_change should use create_contract_data, adding to created.
-            // The delta should have 2 created entries (the initial setup + the "restored" one)
-            // But the important thing is that the hot archive restoration path uses create.
+            // With hot_archive_keys and entry NOT in delta.created,
+            // apply_soroban_storage_change should use create_contract_data.
             let created_count = state
                 .delta()
                 .created_entries()
@@ -2132,11 +2230,10 @@ mod tests {
                 })
                 .count();
 
-            // Should be 2: one from initial create_contract_data, one from apply_soroban_storage_change
-            // with hot_archive_keys (which forces create path)
+            // Should be 1: the hot archive restore creates a new entry in delta
             assert_eq!(
-                created_count, 2,
-                "With hot archive keys, entry should be recorded as INIT (created), so we expect 2 creates"
+                created_count, 1,
+                "With hot archive keys, entry should be recorded as INIT (created)"
             );
 
             // And should NOT be in updated
@@ -2159,12 +2256,17 @@ mod tests {
             );
         }
 
-        // Case 3: Entry exists, NOT in hot_archive_keys -> should use update (LIVE)
+        // Case 3: Entry exists in state (pre-loaded), NOT in hot_archive_keys -> should use update (LIVE)
+        // This simulates a normal live bucket list entry that was loaded for Soroban execution.
         {
             let mut state = LedgerStateManager::new(5_000_000, 100);
 
-            // Pre-populate entry in state
-            state.create_contract_data(cd_entry.clone());
+            // Pre-populate entry in state using load_entry (simulates snapshot lookup)
+            state.load_entry(LedgerEntry {
+                last_modified_ledger_seq: 128051,
+                data: LedgerEntryData::ContractData(cd_entry.clone()),
+                ext: LedgerEntryExt::V0,
+            });
 
             // Now apply WITHOUT hot_archive_keys
             let no_restored_keys: std::collections::HashSet<LedgerKey> =
@@ -2172,7 +2274,6 @@ mod tests {
             apply_soroban_storage_change(&mut state, &change, &no_restored_keys);
 
             // Without hot_archive_keys, entry exists, so should call update_contract_data
-            // The delta should have 1 created (initial) + 1 updated (from apply)
             let created_count = state
                 .delta()
                 .created_entries()
@@ -2187,8 +2288,8 @@ mod tests {
                 .count();
 
             assert_eq!(
-                created_count, 1,
-                "Without hot archive keys, only initial create should be in created (not the apply)"
+                created_count, 0,
+                "Without hot archive keys, entry should NOT be in created"
             );
 
             let updated_count = state
