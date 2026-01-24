@@ -2,7 +2,7 @@
 
 This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
 
-**Last Updated:** 2026-01-23
+**Last Updated:** 2026-01-24
 
 ## Quick Reference: Running Verification
 
@@ -40,10 +40,10 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-553996 continuous replay passes |
+| **End-to-end verification** | Extended | 64-553998+ continuous replay passes |
 | **Transaction meta verification** | Passing | 100% header match in tested ranges |
-| **Primary failure mode** | Soroban crypto error at 553997 | See F4 in KNOWN_ISSUES.md |
-| **Continuous replay** | Ledgers 64-553996 | 100% header match (553,933 ledgers) |
+| **Primary failure mode** | Testing in progress | BN254 crypto bug fixed (2026-01-24) |
+| **Continuous replay** | Ledgers 64-553998+ | 100% header match, expanding range |
 
 ### Verification Results
 
@@ -55,14 +55,31 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 100000-115000 | 15,001 | 53,340 | 100% | ~99% | Heavy Soroban activity |
 | 200000-213000 | 13,000+ | ~50,000+ | 100% | ~99% | CreateClaimableBalance fix verified |
 | 400000-407000 | 7,229+ | ~30,000+ | 100% | ~99% | Post-500254 fix verified |
-| 64-553996 | 553,933 | ~500,000+ | 100% | ~98% | **Current maximum verified range** |
-| 553997+ | - | - | FAIL | - | Soroban crypto error blocks verification |
+| 553996-553998 | 3 | 14 | 100% | 100% | BN254 crypto fix verified |
+| 64-553998+ | 553,935+ | ~500,000+ | 100% | ~98% | **BN254 fix allows further expansion** |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
+### Issues Fixed (2026-01-24)
+
+#### 1. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
+
+Soroban contracts calling `bn254_multi_pairing_check` were failing with "bn254 G1: point not on curve" because we were using a pre-release soroban-env-host revision (`0a0c2df`, Nov 5, 2025) with incorrect BN254 G1/G2 point encoding.
+
+**Root Cause**: The pre-release had wrong byte order for field elements and G2 extension fields serialized as (c0, c1) instead of (c1, c0) per CAP-74/EVM specs.
+
+**Fix**: Updated to soroban-env-host v25.0.0 (`d2ff024b`, Dec 4, 2025) which includes the BN254 encoding fix (commit `cf58d535`). Required XDR conversion functions due to stellar-xdr version differences.
+
+**Files changed:**
+- `Cargo.toml` - Updated soroban-env-host-p25 and soroban-env-common-p25 revisions
+- `crates/stellar-core-tx/src/soroban/host.rs` - P25 XDR conversion, SnapshotSource impl
+- `crates/stellar-core-tx/src/soroban/protocol/p25.rs` - P25 XDR conversion, SnapshotSource impl
+- `crates/stellar-core-tx/src/operations/execute/mod.rs` - `convert_ledger_entry_to_p25`
+- `crates/stellar-core-ledger/src/soroban_state.rs` - `convert_ledger_entry_to_p25`
+
 ### Issues Fixed (2026-01-23)
 
-#### 1. Hot Archive Not Passed to Transaction Execution (Ledger 637593+)
+#### 2. Hot Archive Not Passed to Transaction Execution (Ledger 637593+)
 
 The hot archive bucket list was stored in `LedgerManager` but never passed to the transaction execution layer. This caused "No hot archive available for lookup" errors when Protocol 23+ transactions attempted to restore archived entries.
 

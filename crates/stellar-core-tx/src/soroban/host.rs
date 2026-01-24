@@ -30,12 +30,18 @@ use soroban_env_host25::{
     ModuleCache as ModuleCacheP25,
 };
 
-// Both soroban-env-host v25 and our code use stellar-xdr v25, so we can use types directly
+// Note: soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io,
+// while our workspace uses a git revision of stellar-xdr. We need to convert
+// between the two via XDR serialization when crossing the boundary.
 use stellar_xdr::curr::{
     AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
 };
+
+// Type aliases for soroban-env-host P25's XDR types (from stellar-xdr 25.0.0)
+type P25LedgerKey = soroban_env_host25::xdr::LedgerKey;
+type P25LedgerEntry = soroban_env_host25::xdr::LedgerEntry;
 
 use super::error::convert_host_error_p24_to_p25;
 use super::SorobanConfig;
@@ -525,15 +531,95 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         }
     }
 
+    /// Get an entry using our workspace XDR types (for internal use).
+    /// This is separate from the `SnapshotSource::get()` trait impl which uses
+    /// soroban-env-host's XDR types.
+    pub fn get_local(
+        &self,
+        key: &LedgerKey,
+    ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostErrorP25> {
+        // For ContractData and ContractCode, check TTL first.
+        // If TTL has expired, the entry is considered to be in the hot archive
+        // and not accessible. This mimics C++ stellar-core behavior.
+        let live_until = get_entry_ttl(self.state, key, self.current_ledger);
+
+        let entry = match key {
+            LedgerKey::Account(account_key) => {
+                self.state
+                    .get_account(&account_key.account_id)
+                    .map(|acc| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::Account(acc.clone()),
+                        ext: LedgerEntryExt::V0,
+                    })
+            }
+            LedgerKey::Trustline(tl_key) => self
+                .state
+                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
+                .map(|tl| LedgerEntry {
+                    last_modified_ledger_seq: self.current_ledger,
+                    data: LedgerEntryData::Trustline(tl.clone()),
+                    ext: LedgerEntryExt::V0,
+                }),
+            LedgerKey::ContractData(cd_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        return Ok(None);
+                    }
+                }
+                self.state
+                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                    .map(|cd| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::ContractData(cd.clone()),
+                        ext: LedgerEntryExt::V0,
+                    })
+            }
+            LedgerKey::ContractCode(cc_key) => {
+                // Check if entry has expired TTL - if so, it's archived and not accessible
+                if let Some(ttl) = live_until {
+                    if ttl < self.current_ledger {
+                        return Ok(None);
+                    }
+                }
+                self.state
+                    .get_contract_code(&cc_key.hash)
+                    .map(|code| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::ContractCode(code.clone()),
+                        ext: LedgerEntryExt::V0,
+                    })
+            }
+            LedgerKey::Ttl(ttl_key) => {
+                self.state
+                    .get_ttl(&ttl_key.key_hash)
+                    .map(|ttl| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::Ttl(ttl.clone()),
+                        ext: LedgerEntryExt::V0,
+                    })
+            }
+            _ => None,
+        };
+
+        match entry {
+            Some(e) => Ok(Some((Rc::new(e), live_until))),
+            None => Ok(None),
+        }
+    }
+
     /// Get an archived entry without checking TTL.
     /// Used for entries that are being restored from the hot archive.
     ///
     /// This method first checks the live state (for entries with expired TTL but not yet evicted),
     /// then falls back to the hot archive bucket list (for truly evicted entries).
+    ///
+    /// Returns entries in our workspace XDR types (not soroban-env-host's types).
     pub fn get_archived(
         &self,
         key: &Rc<LedgerKey>,
-    ) -> Result<Option<soroban_env_host25::storage::EntryWithLiveUntil>, HostErrorP25> {
+    ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostErrorP25> {
         // Get TTL but don't check if it's expired - this is for archived entries
         let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
 
@@ -611,7 +697,9 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     }
 
     /// Get an archived entry and check if it's a live BL restore.
-    /// Returns (entry, live_until, is_live_bl_restore, ttl_entry_if_live_bl).
+    /// Returns (entry, live_until, live_bl_restore_info).
+    ///
+    /// Returns entries in our workspace XDR types (not soroban-env-host's types).
     pub fn get_archived_with_restore_info(
         &self,
         key: &Rc<LedgerKey>,
@@ -657,14 +745,19 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
 impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'a> {
     fn get(
         &self,
-        key: &Rc<LedgerKey>,
+        key: &Rc<P25LedgerKey>,
     ) -> Result<Option<soroban_env_host25::storage::EntryWithLiveUntil>, HostErrorP25> {
+        // Convert P25 key to our workspace XDR type
+        let Some(local_key) = convert_ledger_key_from_p25(key.as_ref()) else {
+            return Ok(None);
+        };
+
         // For ContractData and ContractCode, check TTL first.
         // If TTL has expired, the entry is considered to be in the hot archive
         // and not accessible. This mimics C++ stellar-core behavior.
-        let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
+        let live_until = get_entry_ttl(self.state, &local_key, self.current_ledger);
 
-        let entry = match key.as_ref() {
+        let entry = match &local_key {
             LedgerKey::Account(account_key) => {
                 self.state
                     .get_account(&account_key.account_id)
@@ -724,8 +817,17 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
             _ => None,
         };
 
+        // Convert the entry to P25 XDR type
         match entry {
-            Some(e) => Ok(Some((Rc::new(e), live_until))),
+            Some(e) => {
+                let p25_entry = convert_ledger_entry_to_p25(&e).ok_or_else(|| {
+                    HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                        soroban_env_host25::xdr::ScErrorType::Context,
+                        soroban_env_host25::xdr::ScErrorCode::InternalError,
+                    ))
+                })?;
+                Ok(Some((Rc::new(p25_entry), live_until)))
+            }
             None => Ok(None),
         }
     }
@@ -814,6 +916,33 @@ fn convert_contract_cost_params_to_p24(
     soroban_env_host24::xdr::ContractCostParams::from_xdr(
         &bytes,
         soroban_env_host24::xdr::Limits::none(),
+    )
+    .ok()
+}
+
+// P25 XDR conversion functions (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)
+fn convert_ledger_key_from_p25(key: &P25LedgerKey) -> Option<LedgerKey> {
+    let bytes =
+        soroban_env_host25::xdr::WriteXdr::to_xdr(key, soroban_env_host25::xdr::Limits::none())
+            .ok()?;
+    LedgerKey::from_xdr(&bytes, Limits::none()).ok()
+}
+
+fn convert_ledger_entry_to_p25(entry: &LedgerEntry) -> Option<P25LedgerEntry> {
+    use soroban_env_host25::xdr::ReadXdr as _;
+    let bytes = entry.to_xdr(Limits::none()).ok()?;
+    soroban_env_host25::xdr::LedgerEntry::from_xdr(&bytes, soroban_env_host25::xdr::Limits::none())
+        .ok()
+}
+
+fn convert_contract_cost_params_to_p25(
+    params: &stellar_xdr::curr::ContractCostParams,
+) -> Option<soroban_env_host25::xdr::ContractCostParams> {
+    use soroban_env_host25::xdr::ReadXdr as _;
+    let bytes = params.to_xdr(Limits::none()).ok()?;
+    soroban_env_host25::xdr::ContractCostParams::from_xdr(
+        &bytes,
+        soroban_env_host25::xdr::Limits::none(),
     )
     .ok()
 }
@@ -1802,9 +1931,7 @@ fn execute_host_function_p25(
     existing_cache: Option<&ModuleCacheP25>,
     hot_archive: Option<&dyn super::HotArchiveLookup>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
-    use soroban_env_host25::{
-        budget::Budget, e2e_invoke, fees::compute_rent_fee, storage::SnapshotSource,
-    };
+    use soroban_env_host25::{budget::Budget, e2e_invoke, fees::compute_rent_fee};
 
     // Helper to create error with zero consumed resources (for setup errors before budget exists)
     let make_setup_error = |e: HostErrorP25| SorobanExecutionError {
@@ -1820,13 +1947,26 @@ fn execute_host_function_p25(
     let memory_limit = soroban_config.tx_max_memory_bytes;
 
     let budget = if soroban_config.has_valid_cost_params() {
-        Budget::try_from_configs(
-            instruction_limit,
-            memory_limit,
-            soroban_config.cpu_cost_params.clone(),
-            soroban_config.mem_cost_params.clone(),
-        )
-        .map_err(make_setup_error)?
+        let cpu_params = convert_contract_cost_params_to_p25(&soroban_config.cpu_cost_params)
+            .ok_or_else(|| {
+                make_setup_error(HostErrorP25::from(
+                    soroban_env_host25::Error::from_type_and_code(
+                        soroban_env_host25::xdr::ScErrorType::Context,
+                        soroban_env_host25::xdr::ScErrorCode::InternalError,
+                    ),
+                ))
+            })?;
+        let mem_params = convert_contract_cost_params_to_p25(&soroban_config.mem_cost_params)
+            .ok_or_else(|| {
+                make_setup_error(HostErrorP25::from(
+                    soroban_env_host25::Error::from_type_and_code(
+                        soroban_env_host25::xdr::ScErrorType::Context,
+                        soroban_env_host25::xdr::ScErrorCode::InternalError,
+                    ),
+                ))
+            })?;
+        Budget::try_from_configs(instruction_limit, memory_limit, cpu_params, mem_params)
+            .map_err(make_setup_error)?
     } else {
         tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
         Budget::default()
@@ -1980,11 +2120,8 @@ fn execute_host_function_p25(
     };
 
     for key in soroban_data.resources.footprint.read_only.iter() {
-        if let Some((entry, live_until)) = snapshot
-            .get(&Rc::new(key.clone()))
-            .map_err(make_setup_error)?
-        {
-            add_entry(key, &entry, live_until)?;
+        if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
+            add_entry(key, entry.as_ref(), live_until)?;
         }
     }
 
@@ -2026,7 +2163,7 @@ fn execute_host_function_p25(
                     is_live_bl_restore = live_bl_restore.is_some(),
                     "P25: Archived entry found for restoration"
                 );
-                add_entry(key, &entry, restored_live_until)?;
+                add_entry(key, entry.as_ref(), restored_live_until)?;
 
                 // Track live BL restorations
                 if let Some(restore) = live_bl_restore {
@@ -2041,11 +2178,8 @@ fn execute_host_function_p25(
             }
         } else {
             // Normal entry - use standard TTL-filtered lookup
-            if let Some((entry, live_until)) = snapshot
-                .get(&Rc::new(key.clone()))
-                .map_err(make_setup_error)?
-            {
-                add_entry(key, &entry, live_until)?;
+            if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
+                add_entry(key, entry.as_ref(), live_until)?;
             }
         }
     }
@@ -2099,12 +2233,24 @@ fn execute_host_function_p25(
         Err(e) => {
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
             let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
-            tracing::debug!(
+            tracing::warn!(
                 cpu_consumed = cpu_insns_consumed,
                 mem_consumed = mem_bytes_consumed,
                 diagnostic_events = diagnostic_events.len(),
+                error = %e,
                 "P25: Soroban e2e_invoke failed"
             );
+            // Log diagnostic events for debugging crypto errors
+            for (i, event) in diagnostic_events.iter().enumerate() {
+                use soroban_env_host25::xdr::WriteXdr as _;
+                if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {
+                    tracing::warn!(
+                        event_idx = i,
+                        event_hex = hex::encode(&encoded),
+                        "P25: Diagnostic event"
+                    );
+                }
+            }
             return Err(SorobanExecutionError {
                 host_error: e,
                 cpu_insns_consumed,
@@ -2121,6 +2267,24 @@ fn execute_host_function_p25(
         Err(ref e) => {
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
             let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
+            tracing::warn!(
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
+                diagnostic_events = diagnostic_events.len(),
+                error = %e,
+                "P25: Soroban invoke_result error"
+            );
+            // Log diagnostic events for debugging crypto errors
+            for (i, event) in diagnostic_events.iter().enumerate() {
+                use soroban_env_host25::xdr::WriteXdr as _;
+                if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {
+                    tracing::warn!(
+                        event_idx = i,
+                        event_hex = hex::encode(&encoded),
+                        "P25: Diagnostic event from invoke_result error"
+                    );
+                }
+            }
             return Err(SorobanExecutionError {
                 host_error: e.clone(),
                 cpu_insns_consumed,

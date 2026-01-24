@@ -59,6 +59,15 @@ use tracing::{debug, trace};
 
 use crate::{LedgerError, Result};
 
+/// Convert a LedgerEntry to soroban-env-host P25's XDR type.
+/// This is needed because soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io,
+/// while our workspace uses a git revision of stellar-xdr.
+fn convert_ledger_entry_to_p25(entry: &LedgerEntry) -> Option<soroban_xdr_p25::LedgerEntry> {
+    use soroban_xdr_p25::ReadXdr as _;
+    let bytes = entry.to_xdr(Limits::none()).ok()?;
+    soroban_xdr_p25::LedgerEntry::from_xdr(&bytes, soroban_xdr_p25::Limits::none()).ok()
+}
+
 /// TTL data co-located with contract entries.
 ///
 /// This structure stores the essential TTL information alongside
@@ -730,7 +739,10 @@ impl InMemorySorobanState {
             return entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size);
         }
         let budget = build_rent_budget(rent_config);
-        entry_size_for_rent_p25(&budget, entry, xdr_size).unwrap_or(xdr_size)
+        // Convert to P25 XDR type (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)
+        convert_ledger_entry_to_p25(entry)
+            .and_then(|p25_entry| entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).ok())
+            .unwrap_or(xdr_size)
     }
 
     /// Update state with new entries from a ledger close.

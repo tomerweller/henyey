@@ -184,43 +184,45 @@ Protocol 25 introduced entry restoration from the hot archive. When a Soroban tr
 
 ### F4: Soroban Crypto Error - InvokeHostFunction Returns Trapped Instead of Success
 
-**Status**: Open  
-**Impact**: Causes bucket list hash divergence starting at ledger 553997  
-**Added**: 2026-01-23
+**Status**: RESOLVED  
+**Impact**: Was causing bucket list hash divergence starting at ledger 553997  
+**Added**: 2026-01-23  
+**Resolved**: 2026-01-24
 
 **Description**:
-A Soroban smart contract call that should succeed is failing with a crypto validation error in our implementation.
+A Soroban smart contract call that should succeed was failing with a crypto validation error in our implementation. The contract was calling `bn254_multi_pairing_check` which returned "bn254 G1: point not on curve".
 
 **Observed at**: Ledger 553997, TX 3 (testnet)
 
-**Error**:
+**Error** (before fix):
 ```
 HostError: Error(Crypto, InvalidInput)
+"bn254 G1: point not on curve"
 ```
 
-**Symptoms**:
-- Transaction hash: `f01b261e34872176e5bdd59d3717970075c4b7d4658fe29b1eb6c7e5167d64bd`
-- Our result: `InvokeHostFunction(Trapped)`
-- CDP expected: `InvokeHostFunction(Success(Hash(...)))`
-- Fee refund mismatch: 79 stroops (ours=38808, cdp=38729)
-- Account `GBEIZFTPTQGD4BKAKH32ZWPFW3D4JB3RNWHYD6CJLFIC767OGPVW6YVT` balance differs
-
 **Root Cause**:
-Unknown - requires investigation of the Soroban host crypto functions. The contract is calling a crypto operation that should succeed but our validation is returning InvalidInput.
+We were using a pre-release version of soroban-env-host (git revision `0a0c2df`, Nov 5, 2025) which had incorrect BN254 G1/G2 point encoding/decoding:
+- Field elements were using wrong byte order
+- G2 extension field elements were serialized as (c0, c1) instead of (c1, c0)
 
-**Impact**:
-- Verification passes for ledgers 64-553996 (553,933 ledgers)
-- Verification fails at ledger 553997 and cascades from there
-- All subsequent ledgers have header mismatches due to state divergence
+This was fixed in upstream commit `cf58d535` ("Fix BN254 G1/G2 Point Encoding and Decoding #1614", Nov 25, 2025), which was included in soroban-env-host v25.0.0 (tag `d2ff024b`, Dec 4, 2025).
 
-**Next Steps**:
-1. Identify which Soroban crypto host function is being called
-2. Compare our validation logic with C++ stellar-core's Soroban host
-3. Check if this is a secp256k1, ed25519, or other crypto operation
+C++ stellar-core v25.1.0 uses the fixed v25.0.0 version, so testnet validators accept the BN254 operations that our pre-release version rejected.
 
-**Files Involved**:
-- `crates/stellar-core-tx/src/soroban/` - Soroban host implementation
-- `soroban-env-host/` (upstream) - May need to check for version differences
+**Resolution**:
+Updated `Cargo.toml` to use soroban-env-host v25.0.0 (`d2ff024b72f7f3f75737402ac74ca5d0093a4690`) which includes the BN254 encoding fix. This required API compatibility changes due to XDR version differences:
+- soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io
+- Our workspace uses a git revision of stellar-xdr
+- Added XDR serialization/deserialization conversion functions at the boundary
+
+**Files Modified**:
+- `Cargo.toml` - Updated soroban-env-host-p25 and soroban-env-common-p25 revisions
+- `crates/stellar-core-tx/src/soroban/host.rs` - Added P25 XDR type aliases and conversion functions, updated `SnapshotSource` impl
+- `crates/stellar-core-tx/src/soroban/protocol/p25.rs` - Added conversion functions, updated `SnapshotSource` impl
+- `crates/stellar-core-tx/src/operations/execute/mod.rs` - Added `convert_ledger_entry_to_p25`
+- `crates/stellar-core-ledger/src/soroban_state.rs` - Added `convert_ledger_entry_to_p25`
+
+**Verification**: Ledgers 553996-553998 now pass verification successfully.
 
 ---
 

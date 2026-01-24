@@ -159,9 +159,22 @@ pub fn entry_size_for_rent_by_protocol(
             .unwrap_or(entry_xdr_size)
     } else {
         let budget = soroban_env_host25::budget::Budget::default();
-        soroban_env_host25::e2e_invoke::entry_size_for_rent(&budget, entry, entry_xdr_size)
+        convert_ledger_entry_to_p25(entry)
+            .and_then(|entry| {
+                soroban_env_host25::e2e_invoke::entry_size_for_rent(&budget, &entry, entry_xdr_size)
+                    .ok()
+            })
             .unwrap_or(entry_xdr_size)
     }
+}
+
+fn convert_ledger_entry_to_p25(
+    entry: &stellar_xdr::curr::LedgerEntry,
+) -> Option<soroban_env_host25::xdr::LedgerEntry> {
+    use soroban_env_host25::xdr::ReadXdr as _;
+    let bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
+    soroban_env_host25::xdr::LedgerEntry::from_xdr(&bytes, soroban_env_host25::xdr::Limits::none())
+        .ok()
 }
 
 fn convert_ledger_entry_to_p24(

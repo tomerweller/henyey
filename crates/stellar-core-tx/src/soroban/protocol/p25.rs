@@ -3,6 +3,10 @@
 //! This module provides Soroban execution for protocol version 25.
 //! It uses soroban-env-host-p25 which is pinned to the exact git revision
 //! used by C++ stellar-core for protocol 25.
+//!
+//! Note: soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io,
+//! while our workspace uses a git revision of stellar-xdr. We convert between
+//! the two via XDR serialization when crossing the boundary.
 
 use std::rc::Rc;
 
@@ -27,8 +31,9 @@ use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 
-// Type alias for entry with TTL from the snapshot source
-type EntryWithLiveUntil = (Rc<LedgerEntry>, Option<u32>);
+// Type aliases for soroban-env-host P25's XDR types (from stellar-xdr 25.0.0)
+type P25LedgerKey = soroban_env_host_p25::xdr::LedgerKey;
+type P25LedgerEntry = soroban_env_host_p25::xdr::LedgerEntry;
 
 /// Adapter that provides snapshot access to our ledger state for Soroban.
 struct LedgerSnapshotAdapter<'a> {
@@ -43,18 +48,88 @@ impl<'a> LedgerSnapshotAdapter<'a> {
             current_ledger,
         }
     }
+
+    /// Get an entry using our workspace XDR types (for internal use).
+    /// This is separate from the `SnapshotSource::get()` trait impl which uses
+    /// soroban-env-host's XDR types.
+    fn get_local(
+        &self,
+        key: &LedgerKey,
+    ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostError> {
+        let live_until = get_entry_ttl(self.state, key, self.current_ledger);
+
+        let entry = match key {
+            LedgerKey::Account(account_key) => {
+                self.state
+                    .get_account(&account_key.account_id)
+                    .map(|acc| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::Account(acc.clone()),
+                        ext: LedgerEntryExt::V0,
+                    })
+            }
+            LedgerKey::Trustline(tl_key) => self
+                .state
+                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
+                .map(|tl| LedgerEntry {
+                    last_modified_ledger_seq: self.current_ledger,
+                    data: LedgerEntryData::Trustline(tl.clone()),
+                    ext: LedgerEntryExt::V0,
+                }),
+            LedgerKey::ContractData(cd_key) => self
+                .state
+                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                .map(|cd| LedgerEntry {
+                    last_modified_ledger_seq: self.current_ledger,
+                    data: LedgerEntryData::ContractData(cd.clone()),
+                    ext: LedgerEntryExt::V0,
+                }),
+            LedgerKey::ContractCode(cc_key) => {
+                self.state
+                    .get_contract_code(&cc_key.hash)
+                    .map(|code| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::ContractCode(code.clone()),
+                        ext: LedgerEntryExt::V0,
+                    })
+            }
+            LedgerKey::Ttl(ttl_key) => {
+                self.state
+                    .get_ttl(&ttl_key.key_hash)
+                    .map(|ttl| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::Ttl(ttl.clone()),
+                        ext: LedgerEntryExt::V0,
+                    })
+            }
+            _ => None,
+        };
+
+        match entry {
+            Some(e) => Ok(Some((Rc::new(e), live_until))),
+            None => Ok(None),
+        }
+    }
 }
 
 impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
-    fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
+    fn get(
+        &self,
+        key: &Rc<P25LedgerKey>,
+    ) -> Result<Option<soroban_env_host_p25::storage::EntryWithLiveUntil>, HostError> {
+        // Convert P25 key to our workspace XDR type
+        let Some(local_key) = convert_ledger_key_from_p25(key.as_ref()) else {
+            return Ok(None);
+        };
+
         // For ContractData and ContractCode, check TTL first.
         // If TTL has expired, the entry is considered to be in the hot archive
         // and not accessible (unless being explicitly restored).
         // This mimics C++ stellar-core behavior where archived entries are not
         // in the live bucket list.
-        let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
+        let live_until = get_entry_ttl(self.state, &local_key, self.current_ledger);
 
-        let entry = match key.as_ref() {
+        let entry = match &local_key {
             LedgerKey::Account(account_key) => {
                 self.state
                     .get_account(&account_key.account_id)
@@ -107,8 +182,17 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
             _ => None,
         };
 
+        // Convert the entry to P25 XDR type
         match entry {
-            Some(e) => Ok(Some((Rc::new(e), live_until))),
+            Some(e) => {
+                let p25_entry = convert_ledger_entry_to_p25(&e).ok_or_else(|| {
+                    HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+                        soroban_env_host_p25::xdr::ScErrorType::Context,
+                        soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                    ))
+                })?;
+                Ok(Some((Rc::new(p25_entry), live_until)))
+            }
             None => Ok(None),
         }
     }
@@ -158,6 +242,36 @@ fn compute_key_hash(key: &LedgerKey) -> Hash {
         hasher.update(&bytes);
     }
     Hash(hasher.finalize().into())
+}
+
+// P25 XDR conversion functions (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)
+fn convert_ledger_key_from_p25(key: &P25LedgerKey) -> Option<LedgerKey> {
+    let bytes =
+        soroban_env_host_p25::xdr::WriteXdr::to_xdr(key, soroban_env_host_p25::xdr::Limits::none())
+            .ok()?;
+    LedgerKey::from_xdr(&bytes, Limits::none()).ok()
+}
+
+fn convert_ledger_entry_to_p25(entry: &LedgerEntry) -> Option<P25LedgerEntry> {
+    use soroban_env_host_p25::xdr::ReadXdr as _;
+    let bytes = entry.to_xdr(Limits::none()).ok()?;
+    soroban_env_host_p25::xdr::LedgerEntry::from_xdr(
+        &bytes,
+        soroban_env_host_p25::xdr::Limits::none(),
+    )
+    .ok()
+}
+
+fn convert_contract_cost_params_to_p25(
+    params: &stellar_xdr::curr::ContractCostParams,
+) -> Option<soroban_env_host_p25::xdr::ContractCostParams> {
+    use soroban_env_host_p25::xdr::ReadXdr as _;
+    let bytes = params.to_xdr(Limits::none()).ok()?;
+    soroban_env_host_p25::xdr::ContractCostParams::from_xdr(
+        &bytes,
+        soroban_env_host_p25::xdr::Limits::none(),
+    )
+    .ok()
 }
 
 /// Result of fetching an entry for restoration.
@@ -279,12 +393,21 @@ pub fn invoke_host_function(
     let memory_limit = soroban_config.tx_max_memory_bytes * 2;
 
     let budget = if soroban_config.has_valid_cost_params() {
-        Budget::try_from_configs(
-            instruction_limit,
-            memory_limit,
-            soroban_config.cpu_cost_params.clone(),
-            soroban_config.mem_cost_params.clone(),
-        )?
+        let cpu_params = convert_contract_cost_params_to_p25(&soroban_config.cpu_cost_params)
+            .ok_or_else(|| {
+                HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+                    soroban_env_host_p25::xdr::ScErrorType::Context,
+                    soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                ))
+            })?;
+        let mem_params = convert_contract_cost_params_to_p25(&soroban_config.mem_cost_params)
+            .ok_or_else(|| {
+                HostError::from(soroban_env_host_p25::Error::from_type_and_code(
+                    soroban_env_host_p25::xdr::ScErrorType::Context,
+                    soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                ))
+            })?;
+        Budget::try_from_configs(instruction_limit, memory_limit, cpu_params, mem_params)?
     } else {
         tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
         Budget::default()
@@ -413,8 +536,8 @@ pub fn invoke_host_function(
         };
 
     for key in soroban_data.resources.footprint.read_only.iter() {
-        if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
-            add_entry(key, &entry, live_until)?;
+        if let Some((entry, live_until)) = snapshot.get_local(key)? {
+            add_entry(key, entry.as_ref(), live_until)?;
         }
     }
 
@@ -450,8 +573,8 @@ pub fn invoke_host_function(
             }
         } else {
             // Normal entry - use standard TTL-filtered lookup
-            if let Some((entry, live_until)) = snapshot.get(&Rc::new(key.clone()))? {
-                add_entry(key, &entry, live_until)?;
+            if let Some((entry, live_until)) = snapshot.get_local(key)? {
+                add_entry(key, entry.as_ref(), live_until)?;
             }
         }
     }

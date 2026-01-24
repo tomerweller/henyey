@@ -38,9 +38,9 @@ soroban-env-host-p24 = { package = "soroban-env-host", git = "https://github.com
 soroban-env-common-p24 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
 
 # Soroban host for Protocol 25 (supports protocol 25+)
-# Using exact git revision from stellar-core v25 for deterministic replay
-soroban-env-host-p25 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "0a0c2df704edeb3cdafabfcc759eddccd6775337" }
-soroban-env-common-p25 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "0a0c2df704edeb3cdafabfcc759eddccd6775337" }
+# Using v25.0.0 tag which includes the BN254 encoding fix (cf58d535)
+soroban-env-host-p25 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "d2ff024b72f7f3f75737402ac74ca5d0093a4690" }
+soroban-env-common-p25 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "d2ff024b72f7f3f75737402ac74ca5d0093a4690" }
 
 # Workspace crates
 stellar-core-common = { path = "crates/stellar-core-common" }
