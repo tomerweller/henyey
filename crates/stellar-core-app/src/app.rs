@@ -333,6 +333,8 @@ pub struct App {
     /// Tracks when all peers have been exhausted for a tx set (all said DontHave or disconnected).
     /// When this is true, we use a faster timeout to trigger catchup.
     tx_set_all_peers_exhausted: AtomicBool,
+    /// Tx set hashes we've already logged "all peers exhausted" warning for (to avoid spam).
+    tx_set_exhausted_warned: RwLock<HashSet<Hash256>>,
     /// When we detected consensus is stuck (for timeout detection).
     /// Stores (current_ledger, first_buffered, stuck_start_time, last_recovery_attempt).
     consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
@@ -840,6 +842,7 @@ impl App {
             tx_set_dont_have: RwLock::new(HashMap::new()),
             tx_set_last_request: RwLock::new(HashMap::new()),
             tx_set_all_peers_exhausted: AtomicBool::new(false),
+            tx_set_exhausted_warned: RwLock::new(HashSet::new()),
             consensus_stuck_state: RwLock::new(None),
             last_catchup_completed_at: RwLock::new(None),
             cached_archive_checkpoint: RwLock::new(None),
@@ -3932,6 +3935,8 @@ impl App {
                                 // Reset the exhausted flag since we're triggering catchup
                                 self.tx_set_all_peers_exhausted
                                     .store(false, Ordering::SeqCst);
+                                // Also clear the warned set so we can warn again if it happens after catchup
+                                self.tx_set_exhausted_warned.write().await.clear();
                                 ConsensusStuckAction::TriggerCatchup
                             } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
                                 state.last_recovery_attempt = now;
@@ -6779,73 +6784,88 @@ impl App {
         peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         let now = Instant::now();
-        let requests: Vec<(Hash256, stellar_core_overlay::PeerId)> = {
+        let (requests, newly_exhausted): (Vec<(Hash256, stellar_core_overlay::PeerId)>, Vec<(Hash256, usize, usize)>) = {
             let mut dont_have = self.tx_set_dont_have.write().await;
             let pending_set: HashSet<Hash256> = pending_hashes.iter().copied().collect();
             dont_have.retain(|hash, _| pending_set.contains(hash));
             let mut last_request = self.tx_set_last_request.write().await;
             last_request.retain(|hash, _| pending_set.contains(hash));
+            let exhausted_warned = self.tx_set_exhausted_warned.read().await;
 
-            pending_hashes
-                .iter()
-                .filter_map(|hash| {
-                    if !self.herder.needs_tx_set(hash) {
-                        return None;
-                    }
-                    let throttle = std::time::Duration::from_millis(200);
-                    let mut request_state =
-                        last_request
-                            .get(hash)
-                            .cloned()
-                            .unwrap_or(TxSetRequestState {
-                                last_request: now.checked_sub(throttle).unwrap_or(now),
-                                next_peer_offset: 0,
-                            });
-                    if now.duration_since(request_state.last_request) < throttle {
-                        return None;
-                    }
-                    let start_idx =
-                        Self::tx_set_start_index(hash, peers.len(), request_state.next_peer_offset);
-                    let eligible_peer = match dont_have.get_mut(hash) {
-                        Some(set) => {
-                            let mut found = None;
-                            for offset in 0..peers.len() {
-                                let idx = (start_idx + offset) % peers.len();
-                                let peer = &peers[idx];
-                                if !set.contains(peer) {
-                                    found = Some(peer);
-                                    break;
-                                }
+            let mut reqs = Vec::new();
+            let mut exhausted = Vec::new();
+
+            for hash in &pending_hashes {
+                if !self.herder.needs_tx_set(hash) {
+                    continue;
+                }
+                let throttle = std::time::Duration::from_millis(200);
+                let mut request_state =
+                    last_request
+                        .get(hash)
+                        .cloned()
+                        .unwrap_or(TxSetRequestState {
+                            last_request: now.checked_sub(throttle).unwrap_or(now),
+                            next_peer_offset: 0,
+                        });
+                if now.duration_since(request_state.last_request) < throttle {
+                    continue;
+                }
+                let start_idx =
+                    Self::tx_set_start_index(hash, peers.len(), request_state.next_peer_offset);
+                let eligible_peer = match dont_have.get_mut(hash) {
+                    Some(set) => {
+                        let mut found = None;
+                        for offset in 0..peers.len() {
+                            let idx = (start_idx + offset) % peers.len();
+                            let peer = &peers[idx];
+                            if !set.contains(peer) {
+                                found = Some(peer);
+                                break;
                             }
-                            if found.is_none() {
-                                // All peers have said DontHave for this tx set.
-                                // Don't retry - trigger faster catchup instead.
-                                tracing::warn!(
-                                    hash = %hash,
-                                    peers_asked = set.len(),
-                                    total_peers = peers.len(),
-                                    "All peers exhausted for tx set - triggering faster catchup"
-                                );
-                                self.tx_set_all_peers_exhausted
-                                    .store(true, Ordering::SeqCst);
-                                // Don't clear the set or return a peer - stop requesting this tx set
-                                // until catchup or tx_set tracking is reset.
-                            }
-                            found
                         }
-                        None => peers.get(start_idx),
-                    };
+                        if found.is_none() {
+                            // All peers have said DontHave for this tx set.
+                            // Track for warning (only if not already warned).
+                            if !exhausted_warned.contains(hash) {
+                                exhausted.push((*hash, set.len(), peers.len()));
+                            }
+                            self.tx_set_all_peers_exhausted
+                                .store(true, Ordering::SeqCst);
+                            // Don't clear the set or return a peer - stop requesting this tx set
+                            // until catchup or tx_set tracking is reset.
+                        }
+                        found
+                    }
+                    None => peers.get(start_idx),
+                };
 
-                    eligible_peer.cloned().map(|peer_id| {
-                        request_state.last_request = now;
-                        request_state.next_peer_offset =
-                            request_state.next_peer_offset.saturating_add(1);
-                        last_request.insert(*hash, request_state);
-                        (*hash, peer_id)
-                    })
-                })
-                .collect()
+                if let Some(peer_id) = eligible_peer.cloned() {
+                    request_state.last_request = now;
+                    request_state.next_peer_offset =
+                        request_state.next_peer_offset.saturating_add(1);
+                    last_request.insert(*hash, request_state);
+                    reqs.push((*hash, peer_id));
+                }
+            }
+
+            (reqs, exhausted)
         };
+
+        // Log warnings for newly exhausted tx sets (only once per hash)
+        if !newly_exhausted.is_empty() {
+            let mut exhausted_warned = self.tx_set_exhausted_warned.write().await;
+            for (hash, peers_asked, total_peers) in &newly_exhausted {
+                if exhausted_warned.insert(*hash) {
+                    tracing::warn!(
+                        hash = %hash,
+                        peers_asked,
+                        total_peers,
+                        "All peers exhausted for tx set - triggering faster catchup"
+                    );
+                }
+            }
+        }
 
         for (hash, peer_id) in requests {
             tracing::debug!(hash = %hash, peer = %peer_id, "Requesting tx set");
