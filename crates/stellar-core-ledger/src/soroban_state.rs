@@ -1342,4 +1342,70 @@ mod tests {
         assert_eq!(map_entry.ttl_data.live_until_ledger_seq, 500000);
         assert_eq!(state.pending_ttls.len(), 0);
     }
+
+    /// Regression test: Creating a ContractCode that already exists should fail.
+    ///
+    /// This tests the scenario from ledger 306338 where InvokeHostFunction restores
+    /// ContractCode from hot archive, but the same WASM code (same hash) is already
+    /// in soroban_state because another contract uses it. The caller must check for
+    /// existence and use update_contract_code instead of create_contract_code.
+    #[test]
+    fn test_create_duplicate_contract_code_fails() {
+        let mut state = InMemorySorobanState::new();
+
+        // Create a contract code entry
+        let code_hash = [42u8; 32];
+        let entry = make_contract_code_entry(code_hash);
+        state.create_contract_code(entry.clone(), 25, None).unwrap();
+
+        // Attempting to create the same code again should fail
+        let result = state.create_contract_code(entry, 25, None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("contract code already exists"));
+    }
+
+    /// Regression test: Creating ContractData that already exists should fail.
+    ///
+    /// Similar to ContractCode, ContractData entries restored from hot archive
+    /// might already exist in soroban_state. The caller must check for existence.
+    #[test]
+    fn test_create_duplicate_contract_data_fails() {
+        let mut state = InMemorySorobanState::new();
+
+        // Create a contract data entry
+        let entry = make_contract_data_entry([42u8; 32]);
+        state.create_contract_data(entry.clone()).unwrap();
+
+        // Attempting to create the same data again should fail
+        let result = state.create_contract_data(entry);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("contract data already exists"));
+    }
+
+    /// Test that process_entry_update handles the case where entry doesn't exist
+    /// by creating it (used when moving entries from INIT to LIVE for soroban_state).
+    #[test]
+    fn test_process_entry_update_creates_if_not_exists() {
+        let mut state = InMemorySorobanState::new();
+
+        // ContractCode update when entry doesn't exist should create it
+        let code_entry = make_contract_code_entry([42u8; 32]);
+        state
+            .process_entry_update(&code_entry, 25, None)
+            .expect("should create code entry");
+        assert_eq!(state.contract_code_count(), 1);
+
+        // ContractData update when entry doesn't exist should create it
+        let data_entry = make_contract_data_entry([43u8; 32]);
+        state
+            .process_entry_update(&data_entry, 25, None)
+            .expect("should create data entry");
+        assert_eq!(state.contract_data_count(), 1);
+    }
 }

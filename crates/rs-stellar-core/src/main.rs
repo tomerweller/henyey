@@ -3539,27 +3539,101 @@ async fn cmd_verify_execution(
 
                 // For INIT: use updated value if entry was both created and updated,
                 // otherwise use created value. Exclude entries that were created+deleted.
-                let mut our_init: Vec<LedgerEntry> = created
-                    .iter()
-                    .filter_map(|e| {
-                        let key = ledger_entry_to_key(e)?;
-                        if created_and_deleted.contains(&key) {
-                            return None; // Created+Deleted = nothing
-                        }
-                        Some(updated_by_key.get(&key).cloned().unwrap_or_else(|| e.clone()))
-                    })
-                    .collect();
+                // Also collect entries that need to be moved from INIT to LIVE (because they
+                // already exist in soroban_state).
+                let mut our_init: Vec<LedgerEntry> = Vec::new();
+                let mut moved_to_live: Vec<LedgerEntry> = Vec::new();
+                for e in created.iter() {
+                    let key = match ledger_entry_to_key(e) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    if created_and_deleted.contains(&key) {
+                        continue; // Created+Deleted = nothing
+                    }
+                    let entry = updated_by_key.get(&key).cloned().unwrap_or_else(|| e.clone());
 
-                // Add hot archive restored entries (ContractData/ContractCode) to our_init.
-                // These entries were loaded from hot archive via prefetch and are not in the
-                // delta's created_entries, but they need to be processed by soroban_state
-                // so the corresponding TTL entries can be attached.
+                    // Check if ContractCode or ContractData already exists in soroban_state.
+                    // This can happen when restoring from hot archive:
+                    // - ContractCode may still be live because another contract uses the same WASM
+                    // - ContractData may already exist if a previous TX in this ledger restored it
+                    let already_in_soroban_state = match &entry.data {
+                        stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                            let code_key = stellar_xdr::curr::LedgerKeyContractCode {
+                                hash: cc.hash.clone(),
+                            };
+                            soroban_state.get_contract_code(&code_key).is_some()
+                        }
+                        stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                            let data_key = stellar_xdr::curr::LedgerKeyContractData {
+                                contract: cd.contract.clone(),
+                                key: cd.key.clone(),
+                                durability: cd.durability,
+                            };
+                            soroban_state.get_contract_data(&data_key).is_some()
+                        }
+                        _ => false,
+                    };
+
+                    if already_in_soroban_state {
+                        // Entry exists in soroban_state - move to LIVE for update
+                        moved_to_live.push(entry);
+                    } else {
+                        our_init.push(entry);
+                    }
+                }
+
+                // Add hot archive restored entries (ContractData/ContractCode) to our_init or our_live.
+                // These entries were loaded from hot archive via prefetch. They might already be
+                // in the delta's created_entries (from apply_soroban_storage_change), so we need
+                // to check for duplicates before adding.
+                //
+                // IMPORTANT: ContractCode entries may already exist in soroban_state if another
+                // contract uses the same WASM code. In that case, we must add them to our_live
+                // (for update) rather than our_init (for create), otherwise soroban_state will
+                // reject the duplicate.
+                let our_init_keys: std::collections::HashSet<_> = our_init
+                    .iter()
+                    .filter_map(|e| ledger_entry_to_key(e))
+                    .collect();
+                let mut hot_archive_live_entries: Vec<LedgerEntry> = Vec::new();
                 for key in &our_hot_archive_restored_keys {
+                    // Skip if already in our_init (added from delta's created entries)
+                    if our_init_keys.contains(key) {
+                        continue;
+                    }
+
                     if let Some(entry) = executor.state().get_entry(key) {
                         // Update last_modified_ledger_seq to current ledger
                         let mut entry = entry.clone();
                         entry.last_modified_ledger_seq = seq;
-                        our_init.push(entry);
+
+                        // Check if ContractCode/ContractData already exists in soroban_state
+                        let already_exists = match &entry.data {
+                            stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                                let code_key = stellar_xdr::curr::LedgerKeyContractCode {
+                                    hash: cc.hash.clone(),
+                                };
+                                soroban_state.get_contract_code(&code_key).is_some()
+                            }
+                            stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                                let data_key = stellar_xdr::curr::LedgerKeyContractData {
+                                    contract: cd.contract.clone(),
+                                    key: cd.key.clone(),
+                                    durability: cd.durability,
+                                };
+                                soroban_state.get_contract_data(&data_key).is_some()
+                            }
+                            _ => false,
+                        };
+
+                        if already_exists {
+                            // Entry exists in soroban_state - treat as update (LIVE)
+                            hot_archive_live_entries.push(entry);
+                        } else {
+                            // Entry doesn't exist - treat as create (INIT)
+                            our_init.push(entry);
+                        }
                     }
                 }
 
@@ -3587,6 +3661,12 @@ async fn cmd_verify_execution(
                     }
                 }
                 let mut our_live: Vec<LedgerEntry> = live_by_key.into_values().collect();
+
+                // Add hot archive entries that already exist in soroban_state to our_live
+                our_live.extend(hot_archive_live_entries);
+
+                // Add entries that were moved from our_init because they already exist in soroban_state
+                our_live.extend(moved_to_live);
 
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = bucket_list.read().unwrap();
