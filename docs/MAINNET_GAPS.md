@@ -21,10 +21,10 @@ The project explicitly states it's "an educational experiment and **not** produc
 
 | # | Gap | Impact | Effort | Priority |
 |---|-----|--------|--------|----------|
-| 1 | **No parallel transaction execution** | Validators will fall behind on high-throughput ledgers | High | P0 |
-| 2 | **Insufficient metrics/monitoring** | Cannot monitor production operation | Medium | P1 |
-| 3 | **No QuorumIntersection v2** | Cannot perform network safety analysis at scale | Medium | P1 |
-| 4 | **Memory usage validation** | ~4.8GB after 18min on testnet; need long-term stability verification | Low | P2 |
+| 1 | **Bucket list fully in memory** | Mainnet state (~60M entries) would require 50+ GB RAM | Very High | P0 |
+| 2 | **No parallel transaction execution** | Validators will fall behind on high-throughput ledgers | High | P0 |
+| 3 | **Insufficient metrics/monitoring** | Cannot monitor production operation | Medium | P1 |
+| 4 | **No QuorumIntersection v2** | Cannot perform network safety analysis at scale | Medium | P1 |
 
 ---
 
@@ -71,7 +71,7 @@ Gaps:
 
 ### 3. Ledger Operations (~90% parity)
 
-**Status: Core Complete, Performance Gaps**
+**Status: Core Complete, Critical Memory Gap**
 
 Implemented:
 - Ledger close pipeline
@@ -86,6 +86,7 @@ Implemented:
 - **PersistentModuleCache** - Shared WASM module cache initialized from bucket list on catchup, new contracts added during execution
 
 Gaps:
+- **Bucket list fully in memory** - See [Bucket List Memory Architecture](#bucket-list-memory-architecture-critical) below
 - **Parallel transaction execution** - Critical for validator performance
 - **Nested transaction support** - LedgerTxn parent/child rollback
 
@@ -271,6 +272,91 @@ Only 3 TODO comments exist in production code:
 
 ---
 
+## Bucket List Memory Architecture (CRITICAL)
+
+### The Problem
+
+The current implementation loads the **entire bucket list into memory** after catchup, making mainnet operation impossible without major architectural changes.
+
+**Mainnet scale:**
+- ~60 million ledger entries
+- ~10-20+ GB of bucket data (uncompressed)
+- Would require **50+ GB RAM** with current approach
+
+**Testnet (for comparison):**
+- ~5 GB RAM for ~70k Soroban entries + ~3k offers
+- Manageable because testnet state is much smaller
+
+### Current rs-stellar-core Behavior
+
+After catchup completes, `initialize_all_caches()` calls `live_entries()` which:
+
+1. **Iterates ALL buckets** across all 11 levels
+2. **Materializes ALL entries** into a `Vec<LedgerEntry>`
+3. **Builds multiple in-memory caches:**
+   - `entry_cache` - HashMap of all ledger entries
+   - `offer_cache` - All DEX offers
+   - `soroban_state` - All Soroban entries (contracts, data, code, TTLs)
+   - `module_cache` - Compiled WASM modules
+
+**Code path:** `crates/stellar-core-ledger/src/manager.rs:614-620`
+
+```rust
+// Initialize all caches in a single pass over live_entries().
+// This is a significant memory optimization - previously we called live_entries()
+// three times... The single-pass approach reduces peak memory usage by ~66%.
+self.initialize_all_caches(header.ledger_version, ledger_seq)?;
+```
+
+Even with the "optimization," this still loads everything into memory.
+
+### Upstream C++ Behavior (BucketListDB)
+
+The C++ stellar-core uses a fundamentally different approach:
+
+1. **Buckets stored on disk** as `bucket-<hash>.xdr` files
+2. **Two index types** per bucket:
+   - `IndividualIndex` - Full key→offset map for small buckets (< 250 MB)
+   - `RangeIndex` - Page-based index with bloom filter for large buckets
+3. **On-demand disk reads** - Entries loaded only when accessed
+4. **RandomEvictionCache** - LRU cache for frequently accessed entries
+5. **No full materialization** - `live_entries()` equivalent doesn't exist for normal operation
+
+**Key config options in C++:**
+- `BUCKETLIST_DB_INDEX_CUTOFF` - Bucket size threshold (default 250 MB)
+- `BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT` - Page size for RangeIndex
+- `BUCKETLIST_DB_MEMORY_FOR_CACHING` - Memory budget for entry cache
+
+### Required Changes for Mainnet
+
+1. **Implement BucketListDB pattern:**
+   - Keep buckets on disk after catchup
+   - Build persistent indexes (IndividualIndex + RangeIndex)
+   - Bloom filters for fast negative lookups
+
+2. **Remove `live_entries()` dependency:**
+   - Lazy initialization of caches
+   - On-demand loading for offer cache, soroban state
+   - Streaming iteration instead of materialization
+
+3. **Add entry caching layer:**
+   - RandomEvictionCache with configurable memory budget
+   - Cache frequently accessed accounts/contracts
+   - Evict based on access patterns
+
+4. **Persist bucket indexes:**
+   - Save indexes to disk (`.index` files)
+   - Reload on startup without re-scanning buckets
+
+**Estimated effort:** 4-6 weeks for a production-ready implementation
+
+### Workarounds (Not Recommended)
+
+- **More RAM**: Requires 64+ GB RAM machines for mainnet
+- **Swap**: Would be extremely slow, not viable for consensus timing
+
+---
+
 ## Architecture Differences from C++
 
 ### Concurrency Model
@@ -312,4 +398,4 @@ Only 3 TODO comments exist in production code:
 ---
 
 *Last updated: January 2026*
-*Based on commit: 93b335b (Module cache confirmed active in live validator)*
+*Based on commit: ed6002a (Added bucket list memory gap documentation)*
