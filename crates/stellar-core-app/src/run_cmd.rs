@@ -173,6 +173,9 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Create the application
     let app = Arc::new(App::new(config).await?);
 
+    // Set the weak self reference for spawning tasks from &self methods
+    app.set_self_arc().await;
+
     // Set up shutdown handling
     let shutdown_app = app.clone();
     let shutdown_handle = tokio::spawn(async move {
@@ -448,6 +451,7 @@ impl NodeRunner {
     /// Create a new node runner.
     pub async fn new(config: AppConfig, options: RunOptions) -> anyhow::Result<Self> {
         let app = Arc::new(App::new(config).await?);
+        app.set_self_arc().await;
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {

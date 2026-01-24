@@ -118,6 +118,13 @@ impl SyncRecoveryHandle {
         let _ = self.sender.send(SyncRecoveryCommand::StartTracking).await;
     }
 
+    /// Try to start tracking (non-blocking).
+    pub fn try_start_tracking(&self) -> bool {
+        self.sender
+            .try_send(SyncRecoveryCommand::StartTracking)
+            .is_ok()
+    }
+
     /// Set whether ledger application is in progress.
     pub async fn set_applying_ledger(&self, applying: bool) {
         let _ = self

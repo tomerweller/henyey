@@ -122,6 +122,10 @@ const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
 /// Matches C++ stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
 
+/// How long to cache the archive checkpoint before re-querying.
+/// This prevents repeated network calls to the archive when we're stuck.
+const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
+
 fn build_generalized_tx_set(
     tx_set: &stellar_core_herder::TransactionSet,
 ) -> Option<stellar_xdr::curr::GeneralizedTransactionSet> {
@@ -334,6 +338,8 @@ pub struct App {
     consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
     /// When catchup last completed (for cooldown).
     last_catchup_completed_at: RwLock<Option<Instant>>,
+    /// Cached archive checkpoint (ledger, queried_at) to avoid repeated network calls.
+    cached_archive_checkpoint: RwLock<Option<(u32, Instant)>>,
     /// SCP latency samples for surveys.
     scp_latency: RwLock<ScpLatencyTracker>,
 
@@ -377,6 +383,10 @@ pub struct App {
     ping_inflight: RwLock<HashMap<Hash256, PingInfo>>,
     /// In-flight ping hash per peer.
     peer_ping_inflight: RwLock<HashMap<stellar_core_overlay::PeerId, Hash256>>,
+
+    /// Weak reference to self for spawning background tasks from &self methods.
+    /// Set via `set_self_arc` after wrapping in Arc.
+    self_arc: RwLock<std::sync::Weak<Self>>,
 }
 
 #[derive(Debug)]
@@ -832,6 +842,7 @@ impl App {
             tx_set_all_peers_exhausted: AtomicBool::new(false),
             consensus_stuck_state: RwLock::new(None),
             last_catchup_completed_at: RwLock::new(None),
+            cached_archive_checkpoint: RwLock::new(None),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: RwLock::new(SurveyScheduler::new()),
             survey_nonce: RwLock::new(1),
@@ -849,6 +860,7 @@ impl App {
             ping_counter: AtomicU64::new(0),
             ping_inflight: RwLock::new(HashMap::new()),
             peer_ping_inflight: RwLock::new(HashMap::new()),
+            self_arc: RwLock::new(std::sync::Weak::new()),
         })
     }
 
@@ -1894,8 +1906,8 @@ impl App {
         // Determine target ledger
         let target_ledger = match target {
             CatchupTarget::Current => {
-                // Query archive for latest checkpoint
-                self.get_latest_checkpoint().await?
+                // Query archive for latest checkpoint (use cache to avoid repeated network calls)
+                self.get_cached_archive_checkpoint().await?
             }
             CatchupTarget::Ledger(seq) => seq,
             CatchupTarget::Checkpoint(checkpoint) => checkpoint * 64,
@@ -1964,12 +1976,48 @@ impl App {
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
 
+        // Update cache with the ledger we caught up to (it's a checkpoint)
+        {
+            let mut cache = self.cached_archive_checkpoint.write().await;
+            *cache = Some((output.result.ledger_seq, Instant::now()));
+        }
+
         Ok(CatchupResult {
             ledger_seq: output.result.ledger_seq,
             ledger_hash: output.result.ledger_hash,
             buckets_applied: output.result.buckets_downloaded,
             ledgers_replayed: output.result.ledgers_applied,
         })
+    }
+
+    /// Get the latest checkpoint from history archives, using a cache to avoid repeated network calls.
+    /// The cache is valid for ARCHIVE_CHECKPOINT_CACHE_SECS.
+    async fn get_cached_archive_checkpoint(&self) -> anyhow::Result<u32> {
+        // Check cache first
+        {
+            let cache = self.cached_archive_checkpoint.read().await;
+            if let Some((checkpoint, queried_at)) = *cache {
+                if queried_at.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS {
+                    tracing::debug!(
+                        checkpoint,
+                        age_secs = queried_at.elapsed().as_secs(),
+                        "Using cached archive checkpoint"
+                    );
+                    return Ok(checkpoint);
+                }
+            }
+        }
+
+        // Cache miss or expired, query archive
+        let checkpoint = self.get_latest_checkpoint().await?;
+
+        // Update cache
+        {
+            let mut cache = self.cached_archive_checkpoint.write().await;
+            *cache = Some((checkpoint, Instant::now()));
+        }
+
+        Ok(checkpoint)
     }
 
     /// Get the latest checkpoint from history archives.
@@ -2241,6 +2289,9 @@ impl App {
             self.set_state(AppState::Synced).await;
         }
 
+        // Start sync recovery tracking to enable the consensus stuck timer
+        self.start_sync_recovery_tracking();
+
         // Get message receiver from overlay
         let message_rx = {
             let overlay = self.overlay.lock().await;
@@ -2262,7 +2313,14 @@ impl App {
             loop {
                 match message_rx.recv().await {
                     Ok(overlay_msg) => {
+                        // Log GeneralizedTxSet forwarding for debugging
+                        if let StellarMessage::GeneralizedTxSet(ref ts) = overlay_msg.message {
+                            let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                            let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+                            tracing::info!(hash = %hash, "BRIDGE: Forwarding GeneralizedTxSet from broadcast to mpsc");
+                        }
                         if overlay_tx.send(overlay_msg).is_err() {
+                            tracing::warn!("BRIDGE: Failed to send to overlay_tx (receiver dropped)");
                             break;
                         }
                     }
@@ -2270,6 +2328,7 @@ impl App {
                         tracing::warn!(skipped = n, "Overlay receiver lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("BRIDGE: Broadcast channel closed");
                         break;
                     }
                 }
@@ -2316,7 +2375,13 @@ impl App {
                                 StellarMessage::ScpMessage(_) => "SCP",
                                 StellarMessage::Transaction(_) => "TX",
                                 StellarMessage::TxSet(_) => "TxSet",
-                                StellarMessage::GeneralizedTxSet(_) => "GeneralizedTxSet",
+                                StellarMessage::GeneralizedTxSet(ref ts) => {
+                                    // Log the hash for debugging tx_set processing issues
+                                    let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                    let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+                                    tracing::info!(hash = %hash, "MAIN_LOOP: Received GeneralizedTxSet from mpsc");
+                                    "GeneralizedTxSet"
+                                },
                                 StellarMessage::GetTxSet(_) => "GetTxSet",
                                 StellarMessage::Hello(_) => "Hello",
                                 StellarMessage::Peers(_) => "Peers",
@@ -2361,6 +2426,23 @@ impl App {
 
                 // Consensus timer - trigger ledger close for validators and process externalized
                 _ = consensus_interval.tick() => {
+                    // IMPORTANT: Drain pending overlay messages FIRST before any catchup evaluation.
+                    // This ensures tx_sets that arrived via broadcast are processed before we
+                    // decide whether to trigger catchup due to missing tx_sets.
+                    let mut drained = 0;
+                    while let Ok(overlay_msg) = overlay_rx.try_recv() {
+                        drained += 1;
+                        if let StellarMessage::GeneralizedTxSet(ref ts) = overlay_msg.message {
+                            let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                            let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+                            tracing::info!(hash = %hash, drained, "DRAIN: Processing GeneralizedTxSet before consensus tick");
+                        }
+                        self.handle_overlay_message(overlay_msg).await;
+                    }
+                    if drained > 0 {
+                        tracing::debug!(drained, "Drained pending overlay messages before consensus tick");
+                    }
+
                     // Check if SyncRecoveryManager requested recovery
                     if self.sync_recovery_pending.swap(false, Ordering::SeqCst) {
                         // SyncRecoveryManager triggered recovery - perform it now
@@ -2605,6 +2687,101 @@ impl App {
                 }
             }
         }
+
+        // Register direct callback for tx_sets to bypass the broadcast channel queue.
+        // This is critical for timely tx_set processing - the broadcast channel can have
+        // 1000+ messages queued, causing tx_sets to be processed minutes late.
+        let herder_clone = self.herder.clone();
+        let tx_set_callback: stellar_core_overlay::TxSetCallback = std::sync::Arc::new(
+            move |_peer_id: stellar_core_overlay::PeerId,
+                  gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet| {
+                use stellar_core_herder::TransactionSet;
+                use stellar_xdr::curr::{
+                    GeneralizedTransactionSet, TransactionPhase, TxSetComponent, WriteXdr,
+                };
+
+                // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
+                let xdr_bytes = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::error!(error = %e, "DIRECT_TX_SET: Failed to encode GeneralizedTxSet to XDR");
+                        return;
+                    }
+                };
+                let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+
+                tracing::info!(
+                    hash = %hash,
+                    "DIRECT_TX_SET: Processing tx_set immediately via callback"
+                );
+
+                // Extract transactions from GeneralizedTransactionSet
+                let prev_hash = match &gen_tx_set {
+                    GeneralizedTransactionSet::V1(v1) => {
+                        stellar_core_common::Hash256::from_bytes(v1.previous_ledger_hash.0)
+                    }
+                };
+
+                let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> = match &gen_tx_set {
+                    GeneralizedTransactionSet::V1(v1) => {
+                        v1.phases
+                            .iter()
+                            .flat_map(|phase| match phase {
+                                TransactionPhase::V0(components) => components
+                                    .iter()
+                                    .flat_map(|component| match component {
+                                        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                                            comp.txs.to_vec()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>(),
+                                TransactionPhase::V1(parallel) => parallel
+                                    .execution_stages
+                                    .iter()
+                                    .flat_map(|stage| stage.0.iter().flat_map(|cluster| cluster.0.to_vec()))
+                                    .collect(),
+                            })
+                            .collect()
+                    }
+                };
+
+                let internal_tx_set = TransactionSet {
+                    hash,
+                    previous_ledger_hash: prev_hash,
+                    transactions,
+                    generalized_tx_set: Some(gen_tx_set.clone()),
+                };
+
+                // Check if we need this tx_set
+                if !herder_clone.needs_tx_set(&internal_tx_set.hash) {
+                    tracing::debug!(
+                        hash = %internal_tx_set.hash,
+                        "DIRECT_TX_SET: TxSet not pending, but caching anyway"
+                    );
+                }
+
+                // Directly call receive_tx_set on the herder
+                let received_slot = herder_clone.receive_tx_set(internal_tx_set.clone());
+                if let Some(slot) = received_slot {
+                    tracing::info!(
+                        slot,
+                        hash = %internal_tx_set.hash,
+                        "DIRECT_TX_SET: Received pending TxSet for slot"
+                    );
+                    // Note: We can't call process_externalized_slots here because we don't have
+                    // async context. The main loop will pick this up on the next tick.
+                    // But the critical thing is the tx_set is now in the herder's cache.
+                } else {
+                    tracing::debug!(
+                        hash = %internal_tx_set.hash,
+                        "DIRECT_TX_SET: TxSet cached (not pending for any slot)"
+                    );
+                }
+            },
+        );
+        overlay.set_tx_set_callback(tx_set_callback);
+        tracing::info!("Registered direct tx_set callback on overlay");
+
         overlay.start().await?;
 
         let peer_count = overlay.peer_count();
@@ -2612,6 +2789,41 @@ impl App {
 
         *self.overlay.lock().await = Some(overlay);
         Ok(())
+    }
+
+    /// Set the weak reference to self for spawning background tasks.
+    /// Must be called after wrapping App in Arc.
+    pub async fn set_self_arc(self: &Arc<Self>) {
+        *self.self_arc.write().await = Arc::downgrade(self);
+    }
+
+    /// Start caching messages during catchup using the stored weak reference.
+    /// This can be called from `&self` methods unlike `start_catchup_message_caching`.
+    ///
+    /// Returns a JoinHandle that can be aborted when catchup completes.
+    async fn start_catchup_message_caching_from_self(
+        &self,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        tracing::info!("Attempting to start catchup message caching from self_arc");
+        let weak = self.self_arc.read().await;
+        let app = match weak.upgrade() {
+            Some(arc) => {
+                tracing::info!("Successfully upgraded self_arc weak reference");
+                arc
+            }
+            None => {
+                tracing::warn!("Failed to upgrade self_arc weak reference for message caching");
+                return None;
+            }
+        };
+        drop(weak); // Release the read lock before calling async method
+        let handle = app.start_catchup_message_caching().await;
+        if handle.is_some() {
+            tracing::info!("Started catchup message caching task from self_arc");
+        } else {
+            tracing::warn!("Failed to start catchup message caching task (overlay not available?)");
+        }
+        handle
     }
 
     /// Start caching messages during catchup.
@@ -3008,12 +3220,31 @@ impl App {
                     let hash = Hash256::from_bytes(dont_have.req_hash.0);
                     let mut map = self.tx_set_dont_have.write().await;
                     map.entry(hash).or_default().insert(msg.from_peer.clone());
+                    
+                    // Check if all connected peers have reported DontHave for this tx_set
+                    let dont_have_count = map.get(&hash).map(|s| s.len()).unwrap_or(0);
+                    let peer_count = self.get_peer_count().await;
+                    let all_peers_dont_have = dont_have_count >= peer_count && peer_count > 0;
+                    
                     if self.herder.needs_tx_set(&hash) {
-                        let mut last_request = self.tx_set_last_request.write().await;
-                        last_request.remove(&hash);
-                        drop(last_request);
-                        drop(map);
-                        self.request_pending_tx_sets().await;
+                        if all_peers_dont_have {
+                            // All peers don't have this tx_set - trigger catchup
+                            tracing::warn!(
+                                hash = %hash,
+                                dont_have_count,
+                                peer_count,
+                                "All peers reported DontHave for needed TxSet; triggering catchup"
+                            );
+                            drop(map);
+                            // Signal that we need to catchup due to unavailable tx_set
+                            self.trigger_catchup_due_to_missing_txset().await;
+                        } else {
+                            let mut last_request = self.tx_set_last_request.write().await;
+                            last_request.remove(&hash);
+                            drop(last_request);
+                            drop(map);
+                            self.request_pending_tx_sets().await;
+                        }
                     }
                 }
                 if is_ping {
@@ -3391,6 +3622,98 @@ impl App {
         }
     }
 
+    /// Trigger catchup when all peers report DontHave for a needed tx_set.
+    /// This handles the case where we're stuck with a small gap (< checkpoint)
+    /// but can't make progress because the tx_set is no longer available from peers.
+    async fn trigger_catchup_due_to_missing_txset(&self) {
+        let current_ledger = match self.get_current_ledger().await {
+            Ok(seq) => seq,
+            Err(_) => return,
+        };
+
+        // Check if we're already catching up
+        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
+            tracing::debug!("Catchup already in progress, skipping missing txset catchup");
+            return;
+        }
+
+        tracing::info!(
+            current_ledger,
+            "Triggering catchup due to missing tx_set from all peers"
+        );
+
+        // Clear the dont_have tracking since we're going to catchup
+        {
+            let mut dont_have = self.tx_set_dont_have.write().await;
+            dont_have.clear();
+        }
+
+        // Start caching messages during catchup to capture tx_sets for gap ledgers
+        let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
+
+        // Use CatchupTarget::Current to get the latest checkpoint from archive
+        let catchup_result = self.catchup(CatchupTarget::Current).await;
+
+        // Stop the catchup message caching task
+        if let Some(handle) = catchup_message_handle {
+            handle.abort();
+            tracing::debug!("Stopped catchup message caching task (missing txset catchup)");
+        }
+
+        self.catchup_in_progress.store(false, Ordering::SeqCst);
+
+        match catchup_result {
+            Ok(result) => {
+                // Check if catchup was skipped (already at target) vs actually performed work
+                let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
+
+                if catchup_did_work {
+                    *self.current_ledger.write().await = result.ledger_seq;
+                    *self.last_processed_slot.write().await = result.ledger_seq as u64;
+                    self.clear_tx_advert_history(result.ledger_seq).await;
+                    self.herder.bootstrap(result.ledger_seq);
+                    // Purge old externalized slots to prevent matching new tx_sets to old slots
+                    self.herder.purge_slots_below(result.ledger_seq as u64);
+                    let cleaned = self
+                        .herder
+                        .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
+                    if cleaned > 0 {
+                        tracing::info!(
+                            cleaned,
+                            "Dropped stale pending tx set requests after missing txset catchup"
+                        );
+                    }
+                    // Reset tx_set tracking to give pending requests a fresh chance
+                    // Only do this when catchup actually did work - if it skipped,
+                    // we should preserve pending tx_set requests so they can be matched
+                    self.reset_tx_set_tracking_after_catchup().await;
+                    if self.is_validator {
+                        self.set_state(AppState::Validating).await;
+                    } else {
+                        self.set_state(AppState::Synced).await;
+                    }
+                    tracing::info!(
+                        ledger_seq = result.ledger_seq,
+                        "Catchup due to missing tx_set completed"
+                    );
+                    self.try_apply_buffered_ledgers().await;
+                } else {
+                    // Catchup was skipped (already at or past target)
+                    // Don't reset tx_set tracking - preserve pending requests
+                    tracing::info!(
+                        ledger_seq = result.ledger_seq,
+                        "Missing tx_set catchup skipped (already at target); preserving tx_set tracking"
+                    );
+                }
+                // Record catchup completion time for cooldown (always, even if skipped)
+                *self.last_catchup_completed_at.write().await = Some(Instant::now());
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "Catchup due to missing tx_set failed");
+            }
+        }
+    }
+
     async fn maybe_start_buffered_catchup(&self) {
         let current_ledger = match self.get_current_ledger().await {
             Ok(seq) => seq,
@@ -3650,9 +3973,9 @@ impl App {
         }
 
         // When using CatchupTarget::Current, check if the archive has a newer checkpoint.
-        // We need to actually query the archive rather than assuming no newer checkpoint exists.
+        // Use the cached checkpoint to avoid repeated network calls that block the main loop.
         if use_current_target && is_checkpoint_ledger(current_ledger) {
-            match self.get_latest_checkpoint().await {
+            match self.get_cached_archive_checkpoint().await {
                 Ok(latest_checkpoint) => {
                     if latest_checkpoint <= current_ledger {
                         tracing::info!(
@@ -3700,42 +4023,66 @@ impl App {
             "Starting buffered catchup"
         );
 
+        // Start caching messages during catchup to capture tx_sets for gap ledgers
+        let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
+
         let catchup_target = if use_current_target {
             CatchupTarget::Current
         } else {
             CatchupTarget::Ledger(target)
         };
         let catchup_result = self.catchup(catchup_target).await;
+
+        // Stop the catchup message caching task
+        if let Some(handle) = catchup_message_handle {
+            handle.abort();
+            tracing::debug!("Stopped catchup message caching task (buffered catchup)");
+        }
+
         self.catchup_in_progress.store(false, Ordering::SeqCst);
 
         match catchup_result {
             Ok(result) => {
-                *self.current_ledger.write().await = result.ledger_seq;
-                *self.last_processed_slot.write().await = result.ledger_seq as u64;
-                self.clear_tx_advert_history(result.ledger_seq).await;
-                self.herder.bootstrap(result.ledger_seq);
-                // Purge old externalized slots to prevent matching new tx_sets to old slots
-                self.herder.purge_slots_below(result.ledger_seq as u64);
-                let cleaned = self
-                    .herder
-                    .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
-                if cleaned > 0 {
+                // Check if catchup was skipped (already at target) vs actually performed work
+                let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
+
+                if catchup_did_work {
+                    *self.current_ledger.write().await = result.ledger_seq;
+                    *self.last_processed_slot.write().await = result.ledger_seq as u64;
+                    self.clear_tx_advert_history(result.ledger_seq).await;
+                    self.herder.bootstrap(result.ledger_seq);
+                    // Purge old externalized slots to prevent matching new tx_sets to old slots
+                    self.herder.purge_slots_below(result.ledger_seq as u64);
+                    let cleaned = self
+                        .herder
+                        .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
+                    if cleaned > 0 {
+                        tracing::info!(
+                            cleaned,
+                            "Dropped stale pending tx set requests after catchup"
+                        );
+                    }
+                    // Reset tx_set tracking to give pending requests a fresh chance
+                    // Only do this when catchup actually did work - if it skipped,
+                    // we should preserve pending tx_set requests so they can be matched
+                    self.reset_tx_set_tracking_after_catchup().await;
+                    if self.is_validator {
+                        self.set_state(AppState::Validating).await;
+                    } else {
+                        self.set_state(AppState::Synced).await;
+                    }
+                    tracing::info!(ledger_seq = result.ledger_seq, "Buffered catchup complete");
+                    self.try_apply_buffered_ledgers().await;
+                } else {
+                    // Catchup was skipped (already at or past target)
+                    // Don't reset tx_set tracking - preserve pending requests
                     tracing::info!(
-                        cleaned,
-                        "Dropped stale pending tx set requests after catchup"
+                        ledger_seq = result.ledger_seq,
+                        "Buffered catchup skipped (already at target); preserving tx_set tracking"
                     );
                 }
-                // Reset tx_set tracking to give pending requests a fresh chance
-                self.reset_tx_set_tracking_after_catchup().await;
-                if self.is_validator {
-                    self.set_state(AppState::Validating).await;
-                } else {
-                    self.set_state(AppState::Synced).await;
-                }
-                // Record catchup completion time for cooldown
+                // Record catchup completion time for cooldown (always, even if skipped)
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
-                tracing::info!(ledger_seq = result.ledger_seq, "Buffered catchup complete");
-                self.try_apply_buffered_ledgers().await;
             }
             Err(err) => {
                 tracing::error!(error = %err, "Buffered catchup failed");
@@ -3774,40 +4121,64 @@ impl App {
             "Starting externalized catchup"
         );
 
+        // Start caching messages during catchup to capture tx_sets for gap ledgers
+        let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
+
         let catchup_result = self.catchup(CatchupTarget::Ledger(target)).await;
+
+        // Stop the catchup message caching task
+        if let Some(handle) = catchup_message_handle {
+            handle.abort();
+            tracing::debug!("Stopped catchup message caching task (externalized catchup)");
+        }
+
         self.catchup_in_progress.store(false, Ordering::SeqCst);
 
         match catchup_result {
             Ok(result) => {
-                *self.current_ledger.write().await = result.ledger_seq;
-                *self.last_processed_slot.write().await = result.ledger_seq as u64;
-                self.clear_tx_advert_history(result.ledger_seq).await;
-                self.herder.bootstrap(result.ledger_seq);
-                // Purge old externalized slots to prevent matching new tx_sets to old slots
-                self.herder.purge_slots_below(result.ledger_seq as u64);
-                let cleaned = self
-                    .herder
-                    .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
-                if cleaned > 0 {
+                // Check if catchup was skipped (already at target) vs actually performed work
+                let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
+
+                if catchup_did_work {
+                    *self.current_ledger.write().await = result.ledger_seq;
+                    *self.last_processed_slot.write().await = result.ledger_seq as u64;
+                    self.clear_tx_advert_history(result.ledger_seq).await;
+                    self.herder.bootstrap(result.ledger_seq);
+                    // Purge old externalized slots to prevent matching new tx_sets to old slots
+                    self.herder.purge_slots_below(result.ledger_seq as u64);
+                    let cleaned = self
+                        .herder
+                        .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
+                    if cleaned > 0 {
+                        tracing::info!(
+                            cleaned,
+                            "Dropped stale pending tx set requests after catchup"
+                        );
+                    }
+                    // Reset tx_set tracking to give pending requests a fresh chance
+                    // Only do this when catchup actually did work - if it skipped,
+                    // we should preserve pending tx_set requests so they can be matched
+                    self.reset_tx_set_tracking_after_catchup().await;
+                    if self.is_validator {
+                        self.set_state(AppState::Validating).await;
+                    } else {
+                        self.set_state(AppState::Synced).await;
+                    }
                     tracing::info!(
-                        cleaned,
-                        "Dropped stale pending tx set requests after catchup"
+                        ledger_seq = result.ledger_seq,
+                        "Externalized catchup complete"
+                    );
+                    self.try_apply_buffered_ledgers().await;
+                } else {
+                    // Catchup was skipped (already at or past target)
+                    // Don't reset tx_set tracking - preserve pending requests
+                    tracing::info!(
+                        ledger_seq = result.ledger_seq,
+                        "Externalized catchup skipped (already at target); preserving tx_set tracking"
                     );
                 }
-                // Reset tx_set tracking to give pending requests a fresh chance
-                self.reset_tx_set_tracking_after_catchup().await;
-                if self.is_validator {
-                    self.set_state(AppState::Validating).await;
-                } else {
-                    self.set_state(AppState::Synced).await;
-                }
-                // Record catchup completion time for cooldown
+                // Record catchup completion time for cooldown (always, even if skipped)
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
-                tracing::info!(
-                    ledger_seq = result.ledger_seq,
-                    "Externalized catchup complete"
-                );
-                self.try_apply_buffered_ledgers().await;
             }
             Err(err) => {
                 tracing::error!(error = %err, "Externalized catchup failed");
@@ -6454,6 +6825,12 @@ impl App {
         Ok(0)
     }
 
+    /// Get the number of connected peers.
+    async fn get_peer_count(&self) -> usize {
+        let overlay = self.overlay.lock().await;
+        overlay.as_ref().map(|o| o.peer_count()).unwrap_or(0)
+    }
+
     /// Signal the application to shut down.
     pub fn shutdown(&self) {
         tracing::info!("Shutdown requested");
@@ -6968,6 +7345,17 @@ impl App {
     pub fn sync_recovery_heartbeat(&self) {
         if let Some(handle) = self.sync_recovery_handle.read().as_ref() {
             let _ = handle.try_tracking_heartbeat();
+        }
+    }
+
+    /// Start tracking in the sync recovery manager.
+    ///
+    /// This should be called after bootstrap to enable the consensus stuck timer.
+    pub fn start_sync_recovery_tracking(&self) {
+        if let Some(handle) = self.sync_recovery_handle.read().as_ref() {
+            if handle.try_start_tracking() {
+                tracing::info!("Started sync recovery tracking");
+            }
         }
     }
 

@@ -95,6 +95,10 @@ pub struct PeerSnapshot {
     pub stats: PeerStatsSnapshot,
 }
 
+/// Callback for handling tx_sets directly (bypassing the broadcast channel).
+/// This allows synchronous handling of tx_sets to avoid queue delays.
+pub type TxSetCallback = Arc<dyn Fn(PeerId, stellar_xdr::curr::GeneralizedTransactionSet) + Send + Sync>;
+
 /// Central manager for all peer connections in the overlay network.
 ///
 /// The overlay manager is the main entry point for networking operations.
@@ -162,6 +166,8 @@ pub struct OverlayManager {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Cache of peer info for connected peers (lock-free access).
     peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+    /// Direct callback for tx_sets (bypasses broadcast channel for low latency).
+    tx_set_callback: Arc<RwLock<Option<TxSetCallback>>>,
 }
 
 impl OverlayManager {
@@ -193,6 +199,7 @@ impl OverlayManager {
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             shutdown_tx: Some(shutdown_tx),
             peer_info_cache: Arc::new(DashMap::new()),
+            tx_set_callback: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -235,6 +242,7 @@ impl OverlayManager {
         let dropped_authenticated_peers = Arc::clone(&self.dropped_authenticated_peers);
         let banned_peers = Arc::clone(&self.banned_peers);
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
+        let tx_set_callback = Arc::clone(&self.tx_set_callback);
         let auth_timeout = self.config.auth_timeout_secs;
         let peer_event_tx = self.config.peer_event_tx.clone();
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
@@ -265,6 +273,7 @@ impl OverlayManager {
                                 let dropped_authenticated_peers = Arc::clone(&dropped_authenticated_peers);
                                 let banned_peers = Arc::clone(&banned_peers);
                                 let peer_info_cache = Arc::clone(&peer_info_cache);
+                                let tx_set_callback_clone = tx_set_callback.read().clone();
 
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
@@ -332,6 +341,7 @@ impl OverlayManager {
                                                 message_tx,
                                                 flood_gate,
                                                 running,
+                                                tx_set_callback_clone,
                                             ).await;
 
                                             // Cleanup
@@ -399,6 +409,7 @@ impl OverlayManager {
         let dropped_authenticated_peers = Arc::clone(&self.dropped_authenticated_peers);
         let banned_peers = Arc::clone(&self.banned_peers);
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
+        let tx_set_callback = Arc::clone(&self.tx_set_callback);
         let preferred_peers = self.config.preferred_peers.clone();
         let target_outbound = self.config.target_outbound_peers;
         let max_outbound = self.config.max_outbound_peers;
@@ -464,6 +475,7 @@ impl OverlayManager {
                     let running = Arc::clone(&running);
                     let peer_handles = Arc::clone(&peer_handles);
                     let timeout = connect_timeout.max(auth_timeout);
+                    let tx_set_callback_clone = tx_set_callback.read().clone();
 
                     match Self::connect_outbound_inner(
                         &addr,
@@ -482,6 +494,7 @@ impl OverlayManager {
                         Arc::clone(&banned_peers),
                         peer_event_tx.clone(),
                         Arc::clone(&peer_info_cache),
+                        tx_set_callback_clone,
                     )
                     .await
                     {
@@ -539,6 +552,7 @@ impl OverlayManager {
                     let running = Arc::clone(&running);
                     let peer_handles = Arc::clone(&peer_handles);
                     let timeout = connect_timeout.max(auth_timeout);
+                    let tx_set_callback_clone = tx_set_callback.read().clone();
 
                     match Self::connect_outbound_inner(
                         &addr,
@@ -557,6 +571,7 @@ impl OverlayManager {
                         Arc::clone(&banned_peers),
                         peer_event_tx.clone(),
                         Arc::clone(&peer_info_cache),
+                        tx_set_callback_clone,
                     )
                     .await
                     {
@@ -583,6 +598,7 @@ impl OverlayManager {
         message_tx: broadcast::Sender<OverlayMessage>,
         flood_gate: Arc<FloodGate>,
         running: Arc<AtomicBool>,
+        tx_set_callback: Option<TxSetCallback>,
     ) {
         // Flow control: track messages received and send SendMoreExtended frequently
         // Peers disconnect if we don't send enough flow control messages
@@ -715,6 +731,16 @@ impl OverlayManager {
                                 &stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
                             ))
                         );
+                        // CRITICAL: Call the direct callback IMMEDIATELY to avoid queue delays.
+                        // This is the fix for the tx_set sync issue - bypasses the broadcast channel.
+                        if let Some(ref callback) = tx_set_callback {
+                            info!("OVERLAY: Invoking direct tx_set callback for hash={}",
+                                hex::encode(sha2::Sha256::digest(
+                                    &stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
+                                ))
+                            );
+                            callback(peer_id.clone(), ts.clone());
+                        }
                     }
                     StellarMessage::DontHave(dh) => {
                         info!(
@@ -783,6 +809,7 @@ impl OverlayManager {
             .config
             .connect_timeout_secs
             .max(self.config.auth_timeout_secs);
+        let tx_set_callback = self.tx_set_callback.read().clone();
         Self::connect_outbound_inner(
             addr,
             self.local_node.clone(),
@@ -800,6 +827,7 @@ impl OverlayManager {
             Arc::clone(&self.banned_peers),
             self.config.peer_event_tx.clone(),
             Arc::clone(&self.peer_info_cache),
+            tx_set_callback,
         )
         .await
     }
@@ -961,6 +989,7 @@ impl OverlayManager {
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
         peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
         peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+        tx_set_callback: Option<TxSetCallback>,
     ) -> Result<PeerId> {
         let peer = match Peer::connect(addr, local_node, timeout_secs).await {
             Ok(peer) => peer,
@@ -1021,7 +1050,7 @@ impl OverlayManager {
         let peer_info_cache_clone = Arc::clone(&peer_info_cache);
 
         let handle = tokio::spawn(async move {
-            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, flood_gate, running).await;
+            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, flood_gate, running, tx_set_callback).await;
             peers_clone.remove(&peer_id_clone);
             peer_info_cache_clone.remove(&peer_id_clone);
             dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
@@ -1236,6 +1265,18 @@ impl OverlayManager {
         *known = peers;
     }
 
+    /// Set a callback to be invoked immediately when a GeneralizedTxSet is received.
+    /// This bypasses the broadcast channel for low-latency tx_set processing.
+    pub fn set_tx_set_callback(&self, callback: TxSetCallback) {
+        let mut cb = self.tx_set_callback.write();
+        *cb = Some(callback);
+    }
+
+    /// Get a clone of the tx_set callback (for use in spawned tasks).
+    pub fn get_tx_set_callback(&self) -> Option<TxSetCallback> {
+        self.tx_set_callback.read().clone()
+    }
+
     /// Replace the peers used for Peers advertisements.
     pub fn set_advertised_peers(
         &self,
@@ -1351,6 +1392,7 @@ impl OverlayManager {
         let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
         let peer_event_tx = self.config.peer_event_tx.clone();
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
+        let tx_set_callback = self.tx_set_callback.read().clone();
 
         let peer_handle = tokio::spawn(async move {
             match Peer::connect(&addr, local_node, connect_timeout).await {
@@ -1385,7 +1427,7 @@ impl OverlayManager {
                     }
 
                     // Run peer loop
-                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, flood_gate, running)
+                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, flood_gate, running, tx_set_callback)
                         .await;
 
                     // Cleanup

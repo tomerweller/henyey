@@ -104,7 +104,7 @@ pub use item_fetcher::{
     ItemFetcher, ItemFetcherConfig, ItemFetcherStats, ItemType, NextPeerResult, PendingRequest,
     Tracker,
 };
-pub use manager::{OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
+pub use manager::{OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot, TxSetCallback};
 pub use message_handlers::{MessageDispatcher, MessageDispatcherStats, TxSetData};
 pub use metrics::{Counter, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot};
 pub use peer::{Peer, PeerInfo, PeerSender, PeerState, PeerStats, PeerStatsSnapshot};

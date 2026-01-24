@@ -685,6 +685,54 @@ impl Herder {
                 self.advance_tracking_slot(slot);
 
                 return EnvelopeState::Valid;
+            } else if lcl.map_or(false, |l| slot > l && slot <= current_slot) {
+                // Gap slot: between LCL and tracking_slot
+                // This happens when we fast-forwarded tracking_slot but haven't closed
+                // the intermediate ledgers. Accept EXTERNALIZE from trusted validators
+                // to fill the gap.
+                let sender = &envelope.statement.node_id;
+                let in_quorum = self
+                    .quorum_tracker
+                    .read()
+                    .is_node_definitely_in_quorum(sender);
+                if !in_quorum {
+                    debug!(
+                        slot,
+                        current_slot,
+                        lcl = lcl.unwrap_or(0),
+                        sender = ?sender,
+                        "Rejecting gap slot EXTERNALIZE from node not in quorum"
+                    );
+                    return EnvelopeState::Invalid;
+                }
+
+                // Record this externalization so we can close the gap ledger
+                info!(
+                    slot,
+                    current_slot,
+                    lcl = lcl.unwrap_or(0),
+                    "Accepting EXTERNALIZE for gap slot from trusted validator"
+                );
+
+                let value = ext.commit.value.clone();
+
+                // Request the tx_set for this gap slot so we can close it
+                if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
+                    let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                    let is_new = self.scp_driver.request_tx_set(tx_set_hash, slot);
+                    info!(slot, hash = %tx_set_hash, is_new, "Requesting tx set for gap slot");
+                } else {
+                    warn!(slot, "Failed to parse StellarValue from gap slot EXTERNALIZE");
+                }
+
+                self.scp_driver.record_externalized(slot, value.clone());
+
+                // Inform the SCP library about this externalization
+                if let Some(ref scp) = self.scp {
+                    scp.force_externalize(slot, value);
+                }
+
+                return EnvelopeState::Valid;
             }
         }
 
@@ -855,6 +903,44 @@ impl Herder {
                             self.scp_driver.record_externalized(slot, value.clone());
                             self.scp_driver
                                 .cleanup_externalized(self.config.max_externalized_slots);
+
+                            // Store for next round's priority calculation
+                            *self.prev_value.write() = value;
+
+                            // Advance tracking slot
+                            self.advance_tracking_slot(slot);
+                        }
+                    } else if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
+                        &envelope.statement.pledges
+                    {
+                        // SCP didn't reach consensus internally, but we received an EXTERNALIZE
+                        // envelope for a slot that hasn't been externalized yet. This handles
+                        // the case where we're a validator not in the network's quorum - we can
+                        // still follow the network's consensus by accepting EXTERNALIZE messages
+                        // from trusted nodes (sender already verified to be in our transitive quorum).
+                        //
+                        // This is safe because:
+                        // 1. The sender's signature was verified
+                        // 2. The sender is in our transitive quorum (checked in receive_scp_envelope)
+                        // 3. EXTERNALIZE messages represent finalized consensus
+                        //
+                        // The condition slot == tracking ensures we only do this for the "next"
+                        // slot we're trying to close, not for slots way in the future (which
+                        // would be caught by the fast-forward path).
+                        let tracking = self.tracking_slot();
+                        if slot == tracking {
+                            info!(
+                                slot,
+                                sender = ?envelope.statement.node_id,
+                                "Accepting EXTERNALIZE from trusted validator (following network consensus)"
+                            );
+                            let value = ext.commit.value.clone();
+                            self.scp_driver.record_externalized(slot, value.clone());
+                            self.scp_driver
+                                .cleanup_externalized(self.config.max_externalized_slots);
+
+                            // Force SCP to externalize so it's consistent
+                            scp.force_externalize(slot, value.clone());
 
                             // Store for next round's priority calculation
                             *self.prev_value.write() = value;
