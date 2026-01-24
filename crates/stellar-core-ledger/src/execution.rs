@@ -5533,4 +5533,49 @@ mod tests {
             "Soroban fee should be resourceFee + min(inclusionFee, adjustedFee)"
         );
     }
+
+    /// Regression test for F8: Fee refund on failed Soroban transactions
+    ///
+    /// When a Soroban transaction fails (e.g., InsufficientRefundableFee), the full
+    /// max_refundable_fee should be refunded. This test verifies that reset() properly
+    /// clears consumed values so refund_amount() returns the full max_refundable_fee.
+    ///
+    /// This mirrors C++ stellar-core's behavior where setError() calls resetConsumedFee().
+    ///
+    /// Observed at ledger 224398 TX 7: fee refund was 0, expected 47153 stroops.
+    #[test]
+    fn test_refundable_fee_tracker_reset_on_failure() {
+        let non_refundable_fee = 125_890;
+        let max_refundable_fee = 47_153;
+
+        let mut tracker = RefundableFeeTracker::new(non_refundable_fee, max_refundable_fee);
+
+        // Simulate consuming fees that would exceed max_refundable_fee
+        // (This would happen when consume() fails the InsufficientRefundableFee check)
+        tracker.consumed_event_size_bytes = 1000;
+        tracker.consumed_rent_fee = 50_000;
+        tracker.consumed_refundable_fee = 60_000; // Exceeds max_refundable_fee
+
+        // Before reset, refund_amount should be 0 (because consumed > max)
+        assert_eq!(
+            tracker.refund_amount(),
+            0,
+            "refund should be 0 when consumed > max"
+        );
+
+        // Reset the tracker (as done when transaction fails)
+        tracker.reset();
+
+        // After reset, consumed values should all be 0
+        assert_eq!(tracker.consumed_event_size_bytes, 0);
+        assert_eq!(tracker.consumed_rent_fee, 0);
+        assert_eq!(tracker.consumed_refundable_fee, 0);
+
+        // Now refund_amount should return the full max_refundable_fee
+        assert_eq!(
+            tracker.refund_amount(),
+            max_refundable_fee,
+            "refund should be full max_refundable_fee after reset"
+        );
+    }
 }

@@ -120,7 +120,32 @@ When multiple transactions in the same ledger restore the same archived entry, O
 
 **Verification**: Ledger 252453 and range 250000-253000 pass with 0 header mismatches.
 
-#### 2. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
+#### 4. Fee Refund Not Applied for Failed Soroban Transactions (Ledger 224398)
+
+When a Soroban transaction fails (e.g., due to `InsufficientRefundableFee`), the full `max_refundable_fee` should be refunded. Our implementation was returning 0 refund because the `consumed_refundable_fee` had already been set to a value exceeding `max_refundable_fee` before failure detection.
+
+**Root Cause**: In `RefundableFeeTracker::consume()`, when the second check fails (`consumed > max`), `consumed_refundable_fee` has already been updated. Then `refund_amount()` returns 0 because `max - consumed` is negative.
+
+C++ stellar-core calls `resetConsumedFee()` in `setError()` when any error is set, which resets all consumed fees to 0, making the refund equal to the full `max_refundable_fee`.
+
+**Observed symptoms**:
+- Fee refund mismatch: ours=0 vs cdp=47153 (diff=-47153)
+- CDP soroban_meta: rent_fee_charged=0, refundable_fee_charged=0, non_refundable_fee_charged=125890
+- Account balance diff: -47153 stroops
+
+**Fix**:
+1. Added `reset()` method to `RefundableFeeTracker` that mirrors C++ `resetConsumedFee()`:
+   - Resets `consumed_event_size_bytes`, `consumed_rent_fee`, and `consumed_refundable_fee` to 0
+2. Call `tracker.reset()` in the `!all_success` branch when a transaction fails, before computing the refund
+
+**Files changed:**
+- `crates/stellar-core-ledger/src/execution.rs` - Added `reset()` method and call it on transaction failure
+
+**Regression test:** `test_refundable_fee_tracker_reset_on_failure` in `crates/stellar-core-ledger/src/execution.rs`
+
+**Verification**: Ledger 224398 and range 224395-224400 pass with 0 header mismatches.
+
+#### 5. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
 
 Soroban contracts calling `bn254_multi_pairing_check` were failing with "bn254 G1: point not on curve" because we were using a pre-release soroban-env-host revision (`0a0c2df`, Nov 5, 2025) with incorrect BN254 G1/G2 point encoding.
 
@@ -465,6 +490,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-24**: Fixed fee refund not applied for failed Soroban transactions (ledger 224398) - extends verification to 200000-300000
 - **2026-01-24**: Fixed extra RESTORED changes for entries already restored by earlier TX (ledger 252453) - extends verification to 250000-253000
 - **2026-01-24**: Fixed rent fee double-charge for entries already restored by earlier TX (ledger 617809)
 - **2026-01-24**: Fixed hot archive restoration emitting CREATED instead of RESTORED (ledger 617809) - extends meta verification to 617812+
