@@ -2694,21 +2694,10 @@ impl App {
         let herder_clone = self.herder.clone();
         let tx_set_callback: stellar_core_overlay::TxSetCallback = std::sync::Arc::new(
             move |_peer_id: stellar_core_overlay::PeerId,
+                  hash: stellar_core_common::Hash256,
                   gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet| {
                 use stellar_core_herder::TransactionSet;
-                use stellar_xdr::curr::{
-                    GeneralizedTransactionSet, TransactionPhase, TxSetComponent, WriteXdr,
-                };
-
-                // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
-                let xdr_bytes = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::error!(error = %e, "DIRECT_TX_SET: Failed to encode GeneralizedTxSet to XDR");
-                        return;
-                    }
-                };
-                let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
+                use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TxSetComponent};
 
                 tracing::info!(
                     hash = %hash,
@@ -2781,6 +2770,53 @@ impl App {
         );
         overlay.set_tx_set_callback(tx_set_callback);
         tracing::info!("Registered direct tx_set callback on overlay");
+
+        // Register direct callback for quorum_sets to avoid queue delays
+        let herder_clone2 = self.herder.clone();
+        let db_clone = self.db.clone();
+        let ledger_manager_clone = self.ledger_manager.clone();
+        let quorum_set_callback: stellar_core_overlay::QuorumSetCallback = std::sync::Arc::new(
+            move |_peer_id: stellar_core_overlay::PeerId,
+                  hash: stellar_core_common::Hash256,
+                  quorum_set: stellar_xdr::curr::ScpQuorumSet| {
+                tracing::info!(
+                    hash = %hash,
+                    "DIRECT_QS: Processing quorum_set immediately via callback"
+                );
+
+                // Store in database
+                if let Err(e) = db_clone.store_scp_quorum_set(
+                    &hash,
+                    ledger_manager_clone.current_ledger_seq(),
+                    &quorum_set,
+                ) {
+                    tracing::warn!(error = %e, "DIRECT_QS: Failed to store quorum set");
+                }
+
+                // Notify fetching_envelopes that we received this quorum set
+                let was_needed = herder_clone2.recv_quorum_set(hash, quorum_set.clone());
+                if was_needed {
+                    tracing::info!(
+                        hash = %hash,
+                        "DIRECT_QS: QuorumSet was needed by fetching_envelopes"
+                    );
+                }
+
+                // Get pending node_ids and store for them
+                let node_ids = herder_clone2.get_pending_quorum_set_node_ids(&hash);
+                for node_id in &node_ids {
+                    tracing::debug!(
+                        hash = %hash,
+                        node_id = ?node_id,
+                        "DIRECT_QS: Storing quorum set for node"
+                    );
+                    herder_clone2.store_quorum_set(node_id, quorum_set.clone());
+                }
+                herder_clone2.clear_quorum_set_request(&hash);
+            },
+        );
+        overlay.set_quorum_set_callback(quorum_set_callback);
+        tracing::info!("Registered direct quorum_set callback on overlay");
 
         overlay.start().await?;
 

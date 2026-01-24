@@ -97,7 +97,13 @@ pub struct PeerSnapshot {
 
 /// Callback for handling tx_sets directly (bypassing the broadcast channel).
 /// This allows synchronous handling of tx_sets to avoid queue delays.
-pub type TxSetCallback = Arc<dyn Fn(PeerId, stellar_xdr::curr::GeneralizedTransactionSet) + Send + Sync>;
+/// Parameters: (peer_id, hash, tx_set)
+pub type TxSetCallback = Arc<dyn Fn(PeerId, stellar_core_common::Hash256, stellar_xdr::curr::GeneralizedTransactionSet) + Send + Sync>;
+
+/// Callback for handling quorum sets directly (bypassing the broadcast channel).
+/// This allows synchronous handling of quorum sets to avoid queue delays.
+/// Parameters: (peer_id, hash, quorum_set)
+pub type QuorumSetCallback = Arc<dyn Fn(PeerId, stellar_core_common::Hash256, stellar_xdr::curr::ScpQuorumSet) + Send + Sync>;
 
 /// Central manager for all peer connections in the overlay network.
 ///
@@ -168,6 +174,12 @@ pub struct OverlayManager {
     peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
     /// Direct callback for tx_sets (bypasses broadcast channel for low latency).
     tx_set_callback: Arc<RwLock<Option<TxSetCallback>>>,
+    /// Direct callback for quorum sets (bypasses broadcast channel for low latency).
+    quorum_set_callback: Arc<RwLock<Option<QuorumSetCallback>>>,
+    /// Dedup set for tx_sets that have been processed via callback (to avoid duplicate processing).
+    processed_tx_sets: Arc<DashMap<stellar_core_common::Hash256, std::time::Instant>>,
+    /// Dedup set for quorum_sets that have been processed via callback (to avoid duplicate processing).
+    processed_quorum_sets: Arc<DashMap<stellar_core_common::Hash256, std::time::Instant>>,
 }
 
 impl OverlayManager {
@@ -200,6 +212,9 @@ impl OverlayManager {
             shutdown_tx: Some(shutdown_tx),
             peer_info_cache: Arc::new(DashMap::new()),
             tx_set_callback: Arc::new(RwLock::new(None)),
+            quorum_set_callback: Arc::new(RwLock::new(None)),
+            processed_tx_sets: Arc::new(DashMap::new()),
+            processed_quorum_sets: Arc::new(DashMap::new()),
         })
     }
 
@@ -243,6 +258,9 @@ impl OverlayManager {
         let banned_peers = Arc::clone(&self.banned_peers);
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let tx_set_callback = Arc::clone(&self.tx_set_callback);
+        let quorum_set_callback = Arc::clone(&self.quorum_set_callback);
+        let processed_tx_sets = Arc::clone(&self.processed_tx_sets);
+        let processed_quorum_sets = Arc::clone(&self.processed_quorum_sets);
         let auth_timeout = self.config.auth_timeout_secs;
         let peer_event_tx = self.config.peer_event_tx.clone();
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
@@ -274,6 +292,9 @@ impl OverlayManager {
                                 let banned_peers = Arc::clone(&banned_peers);
                                 let peer_info_cache = Arc::clone(&peer_info_cache);
                                 let tx_set_callback_clone = tx_set_callback.read().clone();
+                                let quorum_set_callback_clone = quorum_set_callback.read().clone();
+                                let processed_tx_sets_clone = Arc::clone(&processed_tx_sets);
+                                let processed_quorum_sets_clone = Arc::clone(&processed_quorum_sets);
 
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
@@ -342,6 +363,9 @@ impl OverlayManager {
                                                 flood_gate,
                                                 running,
                                                 tx_set_callback_clone,
+                                                quorum_set_callback_clone,
+                                                processed_tx_sets_clone,
+                                                processed_quorum_sets_clone,
                                             ).await;
 
                                             // Cleanup
@@ -410,6 +434,9 @@ impl OverlayManager {
         let banned_peers = Arc::clone(&self.banned_peers);
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let tx_set_callback = Arc::clone(&self.tx_set_callback);
+        let quorum_set_callback = Arc::clone(&self.quorum_set_callback);
+        let processed_tx_sets = Arc::clone(&self.processed_tx_sets);
+        let processed_quorum_sets = Arc::clone(&self.processed_quorum_sets);
         let preferred_peers = self.config.preferred_peers.clone();
         let target_outbound = self.config.target_outbound_peers;
         let max_outbound = self.config.max_outbound_peers;
@@ -476,6 +503,7 @@ impl OverlayManager {
                     let peer_handles = Arc::clone(&peer_handles);
                     let timeout = connect_timeout.max(auth_timeout);
                     let tx_set_callback_clone = tx_set_callback.read().clone();
+                    let quorum_set_callback_clone = quorum_set_callback.read().clone();
 
                     match Self::connect_outbound_inner(
                         &addr,
@@ -495,6 +523,9 @@ impl OverlayManager {
                         peer_event_tx.clone(),
                         Arc::clone(&peer_info_cache),
                         tx_set_callback_clone,
+                        quorum_set_callback_clone,
+                        Arc::clone(&processed_tx_sets),
+                        Arc::clone(&processed_quorum_sets),
                     )
                     .await
                     {
@@ -553,6 +584,7 @@ impl OverlayManager {
                     let peer_handles = Arc::clone(&peer_handles);
                     let timeout = connect_timeout.max(auth_timeout);
                     let tx_set_callback_clone = tx_set_callback.read().clone();
+                    let quorum_set_callback_clone = quorum_set_callback.read().clone();
 
                     match Self::connect_outbound_inner(
                         &addr,
@@ -572,6 +604,9 @@ impl OverlayManager {
                         peer_event_tx.clone(),
                         Arc::clone(&peer_info_cache),
                         tx_set_callback_clone,
+                        quorum_set_callback_clone,
+                        Arc::clone(&processed_tx_sets),
+                        Arc::clone(&processed_quorum_sets),
                     )
                     .await
                     {
@@ -599,6 +634,9 @@ impl OverlayManager {
         flood_gate: Arc<FloodGate>,
         running: Arc<AtomicBool>,
         tx_set_callback: Option<TxSetCallback>,
+        quorum_set_callback: Option<QuorumSetCallback>,
+        processed_tx_sets: Arc<DashMap<stellar_core_common::Hash256, std::time::Instant>>,
+        processed_quorum_sets: Arc<DashMap<stellar_core_common::Hash256, std::time::Instant>>,
     ) {
         // Flow control: track messages received and send SendMoreExtended frequently
         // Peers disconnect if we don't send enough flow control messages
@@ -724,22 +762,47 @@ impl OverlayManager {
                         );
                     }
                     StellarMessage::GeneralizedTxSet(ts) => {
+                        // Compute hash once for logging, dedup, and callback
+                        let hash = stellar_core_common::Hash256::hash_xdr(ts)
+                            .unwrap_or(stellar_core_common::Hash256::ZERO);
                         info!(
                             "OVERLAY: Received GeneralizedTxSet from {} hash={}",
                             peer_id,
-                            hex::encode(sha2::Sha256::digest(
-                                &stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
-                            ))
+                            hash
                         );
                         // CRITICAL: Call the direct callback IMMEDIATELY to avoid queue delays.
                         // This is the fix for the tx_set sync issue - bypasses the broadcast channel.
+                        // Dedup: Only process if not already processed recently
                         if let Some(ref callback) = tx_set_callback {
-                            info!("OVERLAY: Invoking direct tx_set callback for hash={}",
-                                hex::encode(sha2::Sha256::digest(
-                                    &stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
-                                ))
-                            );
-                            callback(peer_id.clone(), ts.clone());
+                            if !processed_tx_sets.contains_key(&hash) {
+                                processed_tx_sets.insert(hash, std::time::Instant::now());
+                                info!("OVERLAY: Invoking direct tx_set callback for hash={}", hash);
+                                callback(peer_id.clone(), hash, ts.clone());
+                            } else {
+                                debug!("OVERLAY: Skipping duplicate tx_set callback for hash={}", hash);
+                            }
+                        }
+                    }
+                    StellarMessage::ScpQuorumset(qs) => {
+                        // Compute hash using XDR serialization (same as stellar_core_scp::hash_quorum_set)
+                        let hash = stellar_core_common::Hash256::hash_xdr(qs)
+                            .unwrap_or(stellar_core_common::Hash256::ZERO);
+                        info!(
+                            "OVERLAY: Received ScpQuorumset from {} hash={}",
+                            peer_id,
+                            hash
+                        );
+                        // CRITICAL: Call the direct callback IMMEDIATELY to avoid queue delays.
+                        // This is the fix for the quorum_set sync issue - bypasses the broadcast channel.
+                        // Dedup: Only process if not already processed recently
+                        if let Some(ref callback) = quorum_set_callback {
+                            if !processed_quorum_sets.contains_key(&hash) {
+                                processed_quorum_sets.insert(hash, std::time::Instant::now());
+                                info!("OVERLAY: Invoking direct quorum_set callback for hash={}", hash);
+                                callback(peer_id.clone(), hash, qs.clone());
+                            } else {
+                                debug!("OVERLAY: Skipping duplicate quorum_set callback for hash={}", hash);
+                            }
                         }
                     }
                     StellarMessage::DontHave(dh) => {
@@ -810,6 +873,7 @@ impl OverlayManager {
             .connect_timeout_secs
             .max(self.config.auth_timeout_secs);
         let tx_set_callback = self.tx_set_callback.read().clone();
+        let quorum_set_callback = self.quorum_set_callback.read().clone();
         Self::connect_outbound_inner(
             addr,
             self.local_node.clone(),
@@ -828,6 +892,9 @@ impl OverlayManager {
             self.config.peer_event_tx.clone(),
             Arc::clone(&self.peer_info_cache),
             tx_set_callback,
+            quorum_set_callback,
+            Arc::clone(&self.processed_tx_sets),
+            Arc::clone(&self.processed_quorum_sets),
         )
         .await
     }
@@ -990,6 +1057,9 @@ impl OverlayManager {
         peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
         peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
         tx_set_callback: Option<TxSetCallback>,
+        quorum_set_callback: Option<QuorumSetCallback>,
+        processed_tx_sets: Arc<DashMap<stellar_core_common::Hash256, std::time::Instant>>,
+        processed_quorum_sets: Arc<DashMap<stellar_core_common::Hash256, std::time::Instant>>,
     ) -> Result<PeerId> {
         let peer = match Peer::connect(addr, local_node, timeout_secs).await {
             Ok(peer) => peer,
@@ -1050,7 +1120,7 @@ impl OverlayManager {
         let peer_info_cache_clone = Arc::clone(&peer_info_cache);
 
         let handle = tokio::spawn(async move {
-            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, flood_gate, running, tx_set_callback).await;
+            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, flood_gate, running, tx_set_callback, quorum_set_callback, processed_tx_sets, processed_quorum_sets).await;
             peers_clone.remove(&peer_id_clone);
             peer_info_cache_clone.remove(&peer_id_clone);
             dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
@@ -1277,6 +1347,18 @@ impl OverlayManager {
         self.tx_set_callback.read().clone()
     }
 
+    /// Set a callback to be invoked immediately when an ScpQuorumset is received.
+    /// This bypasses the broadcast channel for low-latency quorum_set processing.
+    pub fn set_quorum_set_callback(&self, callback: QuorumSetCallback) {
+        let mut cb = self.quorum_set_callback.write();
+        *cb = Some(callback);
+    }
+
+    /// Get a clone of the quorum_set callback (for use in spawned tasks).
+    pub fn get_quorum_set_callback(&self) -> Option<QuorumSetCallback> {
+        self.quorum_set_callback.read().clone()
+    }
+
     /// Replace the peers used for Peers advertisements.
     pub fn set_advertised_peers(
         &self,
@@ -1393,6 +1475,9 @@ impl OverlayManager {
         let peer_event_tx = self.config.peer_event_tx.clone();
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let tx_set_callback = self.tx_set_callback.read().clone();
+        let quorum_set_callback = self.quorum_set_callback.read().clone();
+        let processed_tx_sets = Arc::clone(&self.processed_tx_sets);
+        let processed_quorum_sets = Arc::clone(&self.processed_quorum_sets);
 
         let peer_handle = tokio::spawn(async move {
             match Peer::connect(&addr, local_node, connect_timeout).await {
@@ -1427,7 +1512,7 @@ impl OverlayManager {
                     }
 
                     // Run peer loop
-                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, flood_gate, running, tx_set_callback)
+                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, flood_gate, running, tx_set_callback, quorum_set_callback, processed_tx_sets, processed_quorum_sets)
                         .await;
 
                     // Cleanup
