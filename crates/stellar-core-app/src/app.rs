@@ -3751,6 +3751,19 @@ impl App {
     }
 
     async fn maybe_start_buffered_catchup(&self) {
+        // Early cooldown check: if we recently skipped catchup due to no newer checkpoint,
+        // skip re-evaluating. This prevents log spam when multiple SCP messages arrive
+        // after catchup completion and before the next checkpoint is available.
+        const EVALUATION_COOLDOWN_SECS: u64 = 2;
+        let recently_skipped = self
+            .last_catchup_completed_at
+            .read()
+            .await
+            .is_some_and(|t| t.elapsed().as_secs() < EVALUATION_COOLDOWN_SECS);
+        if recently_skipped {
+            return;
+        }
+
         let current_ledger = match self.get_current_ledger().await {
             Ok(seq) => seq,
             Err(_) => return,
@@ -3768,7 +3781,7 @@ impl App {
             }
         };
 
-        tracing::info!(
+        tracing::debug!(
             current_ledger,
             first_buffered,
             last_buffered,
@@ -4014,7 +4027,9 @@ impl App {
             match self.get_cached_archive_checkpoint().await {
                 Ok(latest_checkpoint) => {
                     if latest_checkpoint <= current_ledger {
-                        tracing::info!(
+                        // This is expected behavior after catchup - archive hasn't published
+                        // the next checkpoint yet. Use debug level to avoid log spam.
+                        tracing::debug!(
                             current_ledger,
                             latest_checkpoint,
                             first_buffered,
