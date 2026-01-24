@@ -92,6 +92,19 @@ pub struct SorobanOperationMeta {
     /// Entries restored from the live BucketList (expired TTL but not yet evicted).
     /// These need RESTORED ledger entry changes emitted in transaction meta.
     pub live_bucket_list_restores: Vec<crate::soroban::protocol::LiveBucketListRestore>,
+    /// Entries restored from the hot archive (for RestoreFootprint).
+    /// These need RESTORED ledger entry changes emitted in transaction meta.
+    /// Contains both the key and the entry value.
+    pub hot_archive_restores: Vec<HotArchiveRestore>,
+}
+
+/// Entry restored from the hot archive.
+#[derive(Debug, Clone)]
+pub struct HotArchiveRestore {
+    /// The key of the restored entry.
+    pub key: stellar_xdr::curr::LedgerKey,
+    /// The restored entry value.
+    pub entry: stellar_xdr::curr::LedgerEntry,
 }
 
 pub struct OperationExecutionResult {
@@ -232,6 +245,7 @@ fn rent_changes_from_snapshots(
     let mut changes = Vec::new();
     for snapshot in snapshots {
         let Some(entry) = state.get_entry(&snapshot.key) else {
+            tracing::debug!(?snapshot.key, "rent_changes_from_snapshots: entry not found, skipping");
             continue;
         };
         let entry_xdr = entry
@@ -244,7 +258,18 @@ fn rent_changes_from_snapshots(
             .get_ttl(&key_hash)
             .map(|ttl| ttl.live_until_ledger_seq)
             .unwrap_or(snapshot.old_live_until);
+
+        tracing::debug!(
+            ?snapshot.key,
+            old_size_bytes = snapshot.old_size_bytes,
+            new_size_bytes,
+            old_live_until = snapshot.old_live_until,
+            new_live_until,
+            "rent_changes_from_snapshots: processing entry"
+        );
+
         if new_live_until <= snapshot.old_live_until && new_size_bytes <= snapshot.old_size_bytes {
+            tracing::debug!(?snapshot.key, "rent_changes_from_snapshots: no change needed, skipping");
             continue;
         }
         changes.push(RentChange {
@@ -256,6 +281,10 @@ fn rent_changes_from_snapshots(
             new_live_until_ledger: new_live_until,
         });
     }
+    tracing::debug!(
+        changes_count = changes.len(),
+        "rent_changes_from_snapshots: total changes"
+    );
     changes
 }
 
@@ -277,7 +306,7 @@ fn compute_rent_fee_by_protocol(
     config: &soroban_env_host25::fees::RentFeeConfiguration,
     ledger_seq: u32,
 ) -> i64 {
-    if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
+    let fee = if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
         let changes: Vec<soroban_env_host24::fees::LedgerEntryRentChange> = rent_changes
             .iter()
             .map(|change| soroban_env_host24::fees::LedgerEntryRentChange {
@@ -289,8 +318,16 @@ fn compute_rent_fee_by_protocol(
                 new_live_until_ledger: change.new_live_until_ledger,
             })
             .collect();
-        let config = rent_fee_config_p25_to_p24(config);
-        soroban_env_host24::fees::compute_rent_fee(&changes, &config, ledger_seq)
+        let p24_config = rent_fee_config_p25_to_p24(config);
+        tracing::debug!(
+            fee_per_write_1kb = p24_config.fee_per_write_1kb,
+            fee_per_rent_1kb = p24_config.fee_per_rent_1kb,
+            fee_per_write_entry = p24_config.fee_per_write_entry,
+            persistent_rent_rate_denominator = p24_config.persistent_rent_rate_denominator,
+            temporary_rent_rate_denominator = p24_config.temporary_rent_rate_denominator,
+            "compute_rent_fee_by_protocol: P24 config"
+        );
+        soroban_env_host24::fees::compute_rent_fee(&changes, &p24_config, ledger_seq)
     } else {
         let changes: Vec<soroban_env_host25::fees::LedgerEntryRentChange> = rent_changes
             .iter()
@@ -304,7 +341,15 @@ fn compute_rent_fee_by_protocol(
             })
             .collect();
         soroban_env_host25::fees::compute_rent_fee(&changes, config, ledger_seq)
-    }
+    };
+    tracing::debug!(
+        rent_fee = fee,
+        changes_count = rent_changes.len(),
+        protocol_version,
+        ledger_seq,
+        "compute_rent_fee_by_protocol: computed rent fee"
+    );
+    fee
 }
 
 pub fn execute_operation(
@@ -449,6 +494,7 @@ pub fn execute_operation_with_soroban(
                     event_size_bytes: 0,
                     rent_fee,
                     live_bucket_list_restores: Vec::new(),
+                    hot_archive_restores: Vec::new(),
                 });
             }
             Ok(exec)
@@ -456,20 +502,135 @@ pub fn execute_operation_with_soroban(
         OperationBody::RestoreFootprint(op_data) => {
             let default_config = SorobanConfig::default();
             let config = soroban_config.unwrap_or(&default_config);
-            let snapshots = soroban_data
-                .map(|data| {
-                    let mut keys = Vec::new();
-                    keys.extend(data.resources.footprint.read_only.iter().cloned());
-                    keys.extend(data.resources.footprint.read_write.iter().cloned());
-                    rent_snapshot_for_keys(&keys, state, context.protocol_version)
-                })
-                .unwrap_or_default();
+            // For RestoreFootprint, we need to track which entries are ACTUALLY restored.
+            // C++ stellar-core only computes rent for entries that need restoration (not already live).
+            //
+            // Per C++ RestoreFootprintOpFrame::doApply():
+            // 1. If TTL exists and isLive (TTL >= current_ledger) -> skip (already live)
+            // 2. If no TTL exists -> check hot archive
+            //    - If hot archive entry found -> include (restore from hot archive)
+            //    - If no hot archive entry -> skip (entry doesn't exist)
+            // 3. If TTL exists but expired (TTL < current_ledger) -> include (restore from live BL)
+            let mut snapshots = Vec::new();
+            let mut hot_archive_restores = Vec::new();
+            if let Some(data) = soroban_data {
+                tracing::debug!(
+                    read_write_count = data.resources.footprint.read_write.len(),
+                    current_ledger = context.sequence,
+                    "RestoreFootprint: checking entries"
+                );
+                for key in data.resources.footprint.read_write.iter() {
+                    // Only compute rent for entries that need restoration
+                    let key_hash = ledger_key_hash(key);
+                    let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
+
+                    tracing::debug!(
+                        ?key,
+                        ?current_ttl,
+                        current_ledger = context.sequence,
+                        "RestoreFootprint: checking entry TTL"
+                    );
+
+                    // Case 1: TTL exists and entry is live -> skip
+                    if let Some(ttl) = current_ttl {
+                        if ttl >= context.sequence {
+                            tracing::debug!(?key, ttl, "RestoreFootprint: skipping live entry");
+                            continue;
+                        }
+                        // Case 3: TTL exists but expired -> restore from live bucket list
+                        if let Some(entry) = state.get_entry(key) {
+                            let entry_xdr = entry
+                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                .unwrap_or_default();
+                            let entry_size = entry_size_for_rent_by_protocol(
+                                context.protocol_version,
+                                &entry,
+                                entry_xdr.len() as u32,
+                            );
+                            tracing::debug!(
+                                ?key,
+                                entry_size,
+                                old_live_until = ttl,
+                                "RestoreFootprint: adding expired entry to rent snapshots"
+                            );
+                            let (is_persistent, is_code_entry) = match key {
+                                stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
+                                stellar_xdr::curr::LedgerKey::ContractData(cd) => (
+                                    cd.durability
+                                        == stellar_xdr::curr::ContractDataDurability::Persistent,
+                                    false,
+                                ),
+                                _ => (false, false),
+                            };
+                            snapshots.push(RentSnapshot {
+                                key: key.clone(),
+                                is_persistent,
+                                is_code_entry,
+                                old_size_bytes: entry_size,
+                                old_live_until: ttl,
+                            });
+                        }
+                    } else {
+                        // Case 2: No TTL -> check hot archive
+                        // Per C++ createEntryRentChangeWithoutModification():
+                        // When entryLiveUntilLedger is std::nullopt (no previous TTL):
+                        //   - old_size_bytes = 0
+                        //   - old_live_until_ledger = 0
+                        // This is different from expired entries where we use the actual old size.
+                        if let Some(ha) = hot_archive {
+                            if let Some(entry) = ha.get(key) {
+                                tracing::debug!(
+                                    ?key,
+                                    "RestoreFootprint: adding hot archive entry to rent snapshots (old_size=0)"
+                                );
+                                let (is_persistent, is_code_entry) = match key {
+                                    stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
+                                    stellar_xdr::curr::LedgerKey::ContractData(cd) => (
+                                        cd.durability
+                                            == stellar_xdr::curr::ContractDataDurability::Persistent,
+                                        false,
+                                    ),
+                                    _ => (false, false),
+                                };
+                                snapshots.push(RentSnapshot {
+                                    key: key.clone(),
+                                    is_persistent,
+                                    is_code_entry,
+                                    old_size_bytes: 0, // Hot archive entries: old_size_bytes = 0
+                                    old_live_until: 0, // Hot archive entries: old_live_until = 0
+                                });
+                                // Track this entry for RESTORED metadata emission
+                                hot_archive_restores.push(HotArchiveRestore {
+                                    key: key.clone(),
+                                    entry: entry.clone(),
+                                });
+                            } else {
+                                tracing::debug!(
+                                    ?key,
+                                    "RestoreFootprint: entry not in hot archive, skipping"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                ?key,
+                                "RestoreFootprint: no hot archive available, skipping"
+                            );
+                        }
+                    }
+                }
+                tracing::debug!(
+                    snapshots_count = snapshots.len(),
+                    hot_archive_count = hot_archive_restores.len(),
+                    "RestoreFootprint: final snapshots count"
+                );
+            }
             let result = restore_footprint::execute_restore_footprint(
                 op_data,
                 &op_source,
                 state,
                 context,
                 soroban_data,
+                config.min_persistent_entry_ttl,
             )?;
             let mut exec = OperationExecutionResult::new(result);
             if matches!(
@@ -493,6 +654,7 @@ pub fn execute_operation_with_soroban(
                     event_size_bytes: 0,
                     rent_fee,
                     live_bucket_list_restores: Vec::new(),
+                    hot_archive_restores,
                 });
             }
             Ok(exec)

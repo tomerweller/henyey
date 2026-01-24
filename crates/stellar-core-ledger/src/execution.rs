@@ -354,6 +354,14 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
     ) = load_config_setting(snapshot, ConfigSettingId::StateArchival)
         .and_then(|cs| {
             if let ConfigSettingEntry::StateArchival(archival) = cs {
+                tracing::debug!(
+                    min_temp_ttl = archival.min_temporary_ttl,
+                    min_persistent_ttl = archival.min_persistent_ttl,
+                    max_entry_ttl = archival.max_entry_ttl,
+                    persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator,
+                    temp_rent_rate_denominator = archival.temp_rent_rate_denominator,
+                    "load_soroban_config: StateArchival settings from ledger"
+                );
                 Some((
                     archival.min_temporary_ttl,
                     archival.min_persistent_ttl,
@@ -394,6 +402,16 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
     };
     let fee_per_rent_1kb =
         compute_rent_write_fee_per_1kb(average_soroban_state_size, &rent_write_config);
+
+    tracing::debug!(
+        fee_per_rent_1kb,
+        average_soroban_state_size,
+        state_target_size_bytes = soroban_state_target_size_bytes,
+        rent_fee_1kb_state_size_low,
+        rent_fee_1kb_state_size_high,
+        soroban_state_rent_fee_growth_factor,
+        "load_soroban_config: computed fee_per_rent_1kb"
+    );
 
     // Protocol version-dependent fee selection matching C++ rustBridgeFeeConfiguration():
     // - For protocol >= 23: use fee_write_1kb (flat rate from ContractLedgerCostExtV0)
@@ -622,6 +640,12 @@ impl RefundableFeeTracker {
         // This matches C++ stellar-core's consumeRefundableSorobanResources which checks
         // if (mMaximumRefundableFee < mConsumedRentFee) before computing events fee.
         if self.consumed_rent_fee > self.max_refundable_fee {
+            tracing::warn!(
+                consumed_rent_fee = self.consumed_rent_fee,
+                max_refundable_fee = self.max_refundable_fee,
+                rent_fee = rent_fee,
+                "InsufficientRefundableFee: rent_fee exceeds max"
+            );
             return false;
         }
 
@@ -637,7 +661,18 @@ impl RefundableFeeTracker {
         self.consumed_refundable_fee = self.consumed_rent_fee.saturating_add(refundable_fee);
 
         // Second check: total consumed (rent + events) must not exceed max refundable fee.
-        self.consumed_refundable_fee <= self.max_refundable_fee
+        if self.consumed_refundable_fee > self.max_refundable_fee {
+            tracing::warn!(
+                consumed_refundable_fee = self.consumed_refundable_fee,
+                max_refundable_fee = self.max_refundable_fee,
+                consumed_rent_fee = self.consumed_rent_fee,
+                refundable_fee = refundable_fee,
+                event_size_bytes = self.consumed_event_size_bytes,
+                "InsufficientRefundableFee: total consumed exceeds max"
+            );
+            return false;
+        }
+        true
     }
 
     fn refund_amount(&self) -> i64 {
@@ -2683,13 +2718,25 @@ impl TransactionExecutor {
                                 }
                             }
 
-                            // Also get hot archive keys for InvokeHostFunction
+                            // Get hot archive keys from two sources:
+                            // 1. For InvokeHostFunction: extracted from archived_soroban_entries
+                            // 2. For RestoreFootprint: from soroban_meta.hot_archive_restores
                             // NOTE: We must exclude live BL restore keys from the hot archive set.
                             // Live BL restores are entries that exist in the live bucket list with
                             // expired TTL but haven't been evicted yet - these are NOT hot archive
                             // restores and should not be added to HotArchiveBucketList::add_batch.
                             let mut hot_archive =
                                 extract_hot_archive_restored_keys(soroban_data, op_type);
+                            // For RestoreFootprint, get hot archive keys and entries from the meta
+                            if let Some(meta) = &op_exec.soroban_meta {
+                                for ha_restore in &meta.hot_archive_restores {
+                                    hot_archive.insert(ha_restore.key.clone());
+                                    // Also store the entry for RESTORED meta emission
+                                    restored
+                                        .hot_archive_entries
+                                        .insert(ha_restore.key.clone(), ha_restore.entry.clone());
+                                }
+                            }
                             let ha_before = hot_archive.len();
                             hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
                             let ha_after_live_bl = hot_archive.len();
@@ -2705,14 +2752,26 @@ impl TransactionExecutor {
                                 .filter_map(|entry| crate::delta::entry_to_key(entry).ok())
                                 .collect();
                             // For transaction meta emission: only emit RESTORED for keys in created
-                            let hot_archive_for_meta: HashSet<LedgerKey> = hot_archive
-                                .iter()
-                                .filter(|k| created_keys.contains(k))
-                                .cloned()
-                                .collect();
-                            let ha_after = hot_archive_for_meta.len();
                             // Keep original set for bucket list operations
-                            let hot_archive_for_bucket_list = hot_archive;
+                            let hot_archive_for_bucket_list = hot_archive.clone();
+                            // For RestoreFootprint, the data entries are prefetched from hot archive
+                            // into state, so they won't be in `created_keys` (only the TTL is created).
+                            // We need to emit RESTORED for all hot archive keys without filtering.
+                            // For InvokeHostFunction, we filter by created_keys because the auto-restore
+                            // creates the entries during execution.
+                            let hot_archive_for_meta: HashSet<LedgerKey> =
+                                if op_type == OperationType::RestoreFootprint {
+                                    // Don't filter - all hot archive keys should emit RESTORED
+                                    hot_archive.clone()
+                                } else {
+                                    // Filter by created_keys for InvokeHostFunction
+                                    hot_archive
+                                        .iter()
+                                        .filter(|k| created_keys.contains(k))
+                                        .cloned()
+                                        .collect()
+                                };
+                            let ha_after = hot_archive_for_meta.len();
                             // Log when we filter out entries
                             if ha_before != ha_after {
                                 tracing::info!(
@@ -2721,6 +2780,9 @@ impl TransactionExecutor {
                                     ha_after,
                                     live_bl_count = restored.live_bucket_list.len(),
                                     created_count = created_keys.len(),
+                                    ?hot_archive,
+                                    ?created_keys,
+                                    op_type = ?op_type,
                                     "Filtered hot archive keys: live BL restores and already-restored entries"
                                 );
                             }
@@ -2745,16 +2807,25 @@ impl TransactionExecutor {
                                 })
                                 .collect();
                             // Collect data/code keys only for HotArchiveBucketList::add_batch
-                            // Use full set (hot_archive_for_bucket_list) because we still need
-                            // to mark these as restored even if another TX already restored them.
-                            // Actually, for bucket list, we should also filter - only add entries
+                            // For RestoreFootprint: the data/code entries come from hot_archive_restores
+                            // and are prefetched into state (not in created_keys). We should include all
+                            // of them since they're the entries actually being restored.
+                            // For InvokeHostFunction: filter by created_keys to only include entries
                             // that were actually created (not already in live BL from earlier TX).
-                            collected_hot_archive_keys.extend(
-                                hot_archive_for_bucket_list
-                                    .iter()
-                                    .filter(|k| created_keys.contains(k))
-                                    .cloned(),
-                            );
+                            if op_type == OperationType::RestoreFootprint {
+                                // For RestoreFootprint, include all hot archive entries
+                                // (they're already filtered by live BL above)
+                                collected_hot_archive_keys
+                                    .extend(hot_archive_for_bucket_list.iter().cloned());
+                            } else {
+                                // For InvokeHostFunction, filter by created_keys
+                                collected_hot_archive_keys.extend(
+                                    hot_archive_for_bucket_list
+                                        .iter()
+                                        .filter(|k| created_keys.contains(k))
+                                        .cloned(),
+                                );
+                            }
                             // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
                             restored.hot_archive.extend(hot_archive_for_meta);
                             restored.hot_archive.extend(ttl_keys);
@@ -2774,6 +2845,7 @@ impl TransactionExecutor {
                             &op_snapshots,
                             &restored_entries,
                             footprint,
+                            self.ledger_seq,
                         );
 
                         let mut op_events_final = Vec::new();
@@ -3518,6 +3590,10 @@ struct RestoredEntries {
     /// Keys restored from hot archive (evicted entries).
     /// These will have CREATED changes that should be converted to RESTORED.
     hot_archive: HashSet<LedgerKey>,
+    /// For hot archive restores, maps data/code keys to their entry values.
+    /// These are needed to emit RESTORED for data/code that wasn't directly modified
+    /// (e.g., RestoreFootprint only creates TTL, but data entry needs RESTORED).
+    hot_archive_entries: HashMap<LedgerKey, LedgerEntry>,
     /// Keys restored from live BucketList (expired TTL but not yet evicted).
     /// TTL entries will have STATE+UPDATED that should be converted to RESTORED.
     /// Associated data/code entries need RESTORED meta added even if not modified.
@@ -3883,6 +3959,7 @@ fn build_entry_changes_with_state_overrides(
         state_overrides,
         &empty_restored,
         None,
+        0, // ledger_seq not used for non-operation changes
     )
 }
 
@@ -3912,6 +3989,7 @@ fn build_entry_changes_with_hot_archive(
     state_overrides: &HashMap<LedgerKey, LedgerEntry>,
     restored: &RestoredEntries,
     footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
+    current_ledger_seq: u32,
 ) -> LedgerEntryChanges {
     // Debug: log all vectors sizes and entry types
     fn entry_type_name(entry: &LedgerEntry) -> &'static str {
@@ -4453,6 +4531,36 @@ fn build_entry_changes_with_hot_archive(
 
         if !already_processed {
             changes.push(LedgerEntryChange::Restored(entry.clone()));
+        }
+    }
+
+    // For hot archive restores (RestoreFootprint), add RESTORED changes for data/code entries
+    // that weren't directly modified (the entry is prefetched from hot archive, only TTL is created).
+    // This is similar to live BL restores above.
+    // When emitting RESTORED, we must update last_modified_ledger_seq to the current ledger,
+    // matching C++ stellar-core behavior.
+    for (key, entry) in &restored.hot_archive_entries {
+        // Skip if this key was already processed (appears in updated or created)
+        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+        let already_processed = changes.iter().any(|change| {
+            let change_key = match change {
+                LedgerEntryChange::State(e)
+                | LedgerEntryChange::Created(e)
+                | LedgerEntryChange::Updated(e)
+                | LedgerEntryChange::Restored(e) => crate::delta::entry_to_key(e).ok(),
+                LedgerEntryChange::Removed(k) => Some(k.clone()),
+            };
+            change_key
+                .and_then(|k| k.to_xdr(Limits::none()).ok())
+                .map(|b| b == key_bytes)
+                .unwrap_or(false)
+        });
+
+        if !already_processed {
+            // Clone the entry and update last_modified_ledger_seq to current ledger
+            let mut restored_entry = entry.clone();
+            restored_entry.last_modified_ledger_seq = current_ledger_seq;
+            changes.push(LedgerEntryChange::Restored(restored_entry));
         }
     }
 

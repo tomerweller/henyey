@@ -435,6 +435,68 @@ This section logs ledger sequences where hash mismatches occurred during testnet
 
 ---
 
+### F9: RestoreFootprint Hot Archive Keys Not Returned for soroban_state Tracking
+
+**Status**: FIXED  
+**Impact**: Was causing "pending TTLs not empty after update" error and verification failure  
+**Added**: 2026-01-24  
+**Fixed**: 2026-01-24
+
+**Description**:
+When `RestoreFootprint` restored entries from the hot archive, the data/code keys were not being returned in `hot_archive_restored_keys`. This caused the in-memory `soroban_state` tracking (in `main.rs` verify-execution) to fail with "pending TTLs not empty after update: 1 remaining".
+
+The issue was that TTL entries were created for hot archive restores, but the corresponding ContractData entries weren't being added to `our_init`, so soroban_state couldn't pair them.
+
+**Observed at**: Ledger 327974 (testnet) - TX 3 RestoreFootprint from hot archive
+
+**Symptoms**:
+- Error: "pending TTLs not empty after update: 1 remaining"
+- Pending TTL key_hash didn't match any contract data being created
+- Verification would fail even though transaction metadata matched
+
+**Root Cause**:
+In `execution.rs`, when collecting `collected_hot_archive_keys`, the code filtered by `created_keys`:
+
+```rust
+collected_hot_archive_keys.extend(
+    hot_archive_for_bucket_list
+        .iter()
+        .filter(|k| created_keys.contains(k))
+        .cloned(),
+);
+```
+
+For RestoreFootprint operations, data/code entries are **prefetched** from the hot archive into state (not created by the transaction's delta). Only TTL entries are created by the delta. So the filter removed all the data/code keys, leaving `hot_archive_restored_keys` empty.
+
+This meant the restored data entries weren't added to `our_init` in main.rs, so soroban_state couldn't pair the TTL entries with their corresponding data entries.
+
+**Solution**:
+Modified the hot archive key collection to NOT filter by `created_keys` for RestoreFootprint operations:
+
+```rust
+if op_type == OperationType::RestoreFootprint {
+    // For RestoreFootprint, include all hot archive entries
+    collected_hot_archive_keys.extend(hot_archive_for_bucket_list.iter().cloned());
+} else {
+    // For InvokeHostFunction, filter by created_keys
+    collected_hot_archive_keys.extend(
+        hot_archive_for_bucket_list
+            .iter()
+            .filter(|k| created_keys.contains(k))
+            .cloned(),
+    );
+}
+```
+
+**Files Changed**:
+- `crates/stellar-core-ledger/src/execution.rs` - Conditional filtering for RestoreFootprint
+
+**Regression Test**: `test_restore_footprint_hot_archive_ttl_pairing` in `crates/stellar-core-ledger/src/soroban_state.rs`
+
+**Verification**: Ledger 327974 and range 327900-328100 (201 ledgers, 911 transactions) now pass with 0 header mismatches.
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:

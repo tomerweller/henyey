@@ -3550,6 +3550,19 @@ async fn cmd_verify_execution(
                     })
                     .collect();
 
+                // Add hot archive restored entries (ContractData/ContractCode) to our_init.
+                // These entries were loaded from hot archive via prefetch and are not in the
+                // delta's created_entries, but they need to be processed by soroban_state
+                // so the corresponding TTL entries can be attached.
+                for key in &our_hot_archive_restored_keys {
+                    if let Some(entry) = executor.state().get_entry(key) {
+                        // Update last_modified_ledger_seq to current ledger
+                        let mut entry = entry.clone();
+                        entry.last_modified_ledger_seq = seq;
+                        our_init.push(entry);
+                    }
+                }
+
                 // For DEAD: exclude entries that were created+deleted
                 our_dead.retain(|k| !created_and_deleted.contains(k));
 
@@ -5337,7 +5350,19 @@ fn describe_change(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
             }
             LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance".to_string(),
             LedgerEntryData::LiquidityPool(_) => "LiquidityPool".to_string(),
-            LedgerEntryData::ContractData(_) => "ContractData".to_string(),
+            LedgerEntryData::ContractData(cd) => {
+                // Show contract and key type for debugging
+                let contract_hex = match &cd.contract {
+                    stellar_xdr::curr::ScAddress::Contract(c) => hex::encode(&c.0.0[0..4]),
+                    stellar_xdr::curr::ScAddress::Account(a) => {
+                        match &a.0 {
+                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(pk) => hex::encode(&pk.0[0..4]),
+                        }
+                    }
+                    _ => "other".to_string(),
+                };
+                format!("ContractData(contract={}...)", contract_hex)
+            }
             LedgerEntryData::ContractCode(_) => "ContractCode".to_string(),
             LedgerEntryData::ConfigSetting(_) => "ConfigSetting".to_string(),
             LedgerEntryData::Ttl(t) => format!("Ttl(key={:02x}{:02x}... live_until={})", t.key_hash.0[0], t.key_hash.0[1], t.live_until_ledger_seq),
@@ -5345,11 +5370,11 @@ fn describe_change(change: &stellar_xdr::curr::LedgerEntryChange) -> String {
     }
 
     match change {
-        LedgerEntryChange::Created(entry) => format!("CREATED {}", describe_entry(&entry.data)),
-        LedgerEntryChange::Updated(entry) => format!("UPDATED {}", describe_entry(&entry.data)),
+        LedgerEntryChange::Created(entry) => format!("CREATED {} (mod={})", describe_entry(&entry.data), entry.last_modified_ledger_seq),
+        LedgerEntryChange::Updated(entry) => format!("UPDATED {} (mod={})", describe_entry(&entry.data), entry.last_modified_ledger_seq),
         LedgerEntryChange::Removed(key) => format!("REMOVED {:?}", key),
-        LedgerEntryChange::State(entry) => format!("STATE {}", describe_entry(&entry.data)),
-        LedgerEntryChange::Restored(entry) => format!("RESTORED {}", describe_entry(&entry.data)),
+        LedgerEntryChange::State(entry) => format!("STATE {} (mod={})", describe_entry(&entry.data), entry.last_modified_ledger_seq),
+        LedgerEntryChange::Restored(entry) => format!("RESTORED {} (mod={})", describe_entry(&entry.data), entry.last_modified_ledger_seq),
     }
 }
 

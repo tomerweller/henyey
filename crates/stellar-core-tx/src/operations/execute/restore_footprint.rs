@@ -12,9 +12,6 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 
-/// Default TTL extension for restored entries (in ledgers).
-const DEFAULT_RESTORE_TTL: u32 = 518400; // ~30 days at 5-second ledger close
-
 /// Execute a RestoreFootprint operation.
 ///
 /// This operation restores archived entries that have expired TTLs,
@@ -27,6 +24,7 @@ const DEFAULT_RESTORE_TTL: u32 = 518400; // ~30 days at 5-second ledger close
 /// * `state` - The ledger state manager
 /// * `context` - The ledger context
 /// * `soroban_data` - The Soroban transaction data containing the footprint
+/// * `min_persistent_entry_ttl` - Minimum persistent entry TTL from Soroban config
 ///
 /// # Returns
 ///
@@ -37,6 +35,7 @@ pub fn execute_restore_footprint(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
+    min_persistent_entry_ttl: u32,
 ) -> Result<OperationResult> {
     // Get the footprint from Soroban transaction data
     let footprint = match soroban_data {
@@ -57,8 +56,12 @@ pub fn execute_restore_footprint(
     }
 
     // Calculate the new TTL for restored entries
+    // Per C++ RestoreFootprintOpFrame.cpp line 115-116:
+    //   restoredLiveUntilLedger = ledgerSeq + archivalSettings.minPersistentTTL - 1
     let current_ledger = context.sequence;
-    let new_ttl = current_ledger.saturating_add(DEFAULT_RESTORE_TTL);
+    let new_ttl = current_ledger
+        .saturating_add(min_persistent_entry_ttl)
+        .saturating_sub(1);
 
     // Restore all entries in the read-write footprint
     // (RestoreFootprint only restores entries that are in read-write)
@@ -167,6 +170,9 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::*;
 
+    /// Default min persistent TTL for tests (matches testnet config)
+    const TEST_MIN_PERSISTENT_TTL: u32 = 120960;
+
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
     }
@@ -185,7 +191,14 @@ mod tests {
             ext: ExtensionPoint::V0,
         };
 
-        let result = execute_restore_footprint(&op, &source, &mut state, &context, None);
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            None,
+            TEST_MIN_PERSISTENT_TTL,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -220,8 +233,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_restore_footprint(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            TEST_MIN_PERSISTENT_TTL,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -260,8 +279,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_restore_footprint(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            TEST_MIN_PERSISTENT_TTL,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -302,8 +327,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_restore_footprint(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            TEST_MIN_PERSISTENT_TTL,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {

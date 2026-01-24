@@ -796,6 +796,14 @@ impl InMemorySorobanState {
 
         // Check invariant: pending_ttls should be empty after each update
         if !self.pending_ttls.is_empty() {
+            // Log which pending TTLs remain for debugging
+            for (key_hash, ttl_data) in &self.pending_ttls {
+                tracing::error!(
+                    key_hash = %format!("{:02x?}", &key_hash[..8]),
+                    live_until = ttl_data.live_until_ledger_seq,
+                    "Remaining pending TTL"
+                );
+            }
             return Err(LedgerError::InvalidEntry(format!(
                 "pending TTLs not empty after update: {} remaining",
                 self.pending_ttls.len()
@@ -1008,7 +1016,7 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         ContractCodeEntry, ContractCodeEntryExt, ContractDataDurability, ContractDataEntry,
-        ContractId, ExtensionPoint, Hash, ScAddress, ScVal,
+        ContractId, ExtensionPoint, Hash, LedgerEntryExt, ScAddress, ScVal,
     };
 
     fn make_contract_address() -> ScAddress {
@@ -1268,5 +1276,70 @@ mod tests {
             let read = shared.read();
             assert_eq!(read.contract_data_count(), 1);
         }
+    }
+
+    /// Test that update_state correctly pairs TTL entries with data entries
+    /// when data entries are added to init_entries (simulates RestoreFootprint
+    /// from hot archive where data entries are prefetched and added to init).
+    ///
+    /// This is a regression test for the bug fixed in ledger 327974 TX 3 where
+    /// RestoreFootprint from hot archive was failing with "pending TTLs not empty".
+    #[test]
+    fn test_restore_footprint_hot_archive_ttl_pairing() {
+        let mut state = InMemorySorobanState::new();
+
+        // Simulate initial state with some existing entries
+        let existing_entry = make_contract_data_entry([0u8; 32]);
+        state.create_contract_data(existing_entry).unwrap();
+
+        // Create a TTL entry for the data that will be "restored" from hot archive
+        let restored_key = LedgerKeyContractData {
+            contract: make_contract_address(),
+            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                [42u8; 32].to_vec().try_into().unwrap(),
+            )),
+            durability: ContractDataDurability::Persistent,
+        };
+        let key_hash = InMemorySorobanState::contract_data_key_hash(&restored_key);
+
+        // Create the TTL entry that would come from RestoreFootprint execution
+        let ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: Hash(key_hash),
+                live_until_ledger_seq: 500000, // Extended TTL
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Create the data entry that would come from hot archive prefetch
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: make_contract_address(),
+                key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                    [42u8; 32].to_vec().try_into().unwrap(),
+                )),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::I32(12345),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Simulate update_state with BOTH the TTL and data entry in init_entries.
+        // The TTL entry may be processed before the data entry, so it should go
+        // to pending_ttls and then be adopted when the data entry is created.
+        // Order matters here - TTL first, then data (worst case for the bug).
+        let init_entries = vec![ttl_entry, data_entry];
+
+        state
+            .update_state(100, &init_entries, &[], &[], 25, None)
+            .expect("update_state should succeed - TTL should pair with data entry");
+
+        // Verify the entry was created with correct TTL
+        let map_entry = state.get_contract_data(&restored_key).unwrap();
+        assert_eq!(map_entry.ttl_data.live_until_ledger_seq, 500000);
+        assert_eq!(state.pending_ttls.len(), 0);
     }
 }

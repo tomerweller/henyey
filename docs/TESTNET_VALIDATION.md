@@ -54,6 +54,7 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 75000-90000 | 15,001 | 41,862 | 100% | ~99% | Mixed classic/Soroban |
 | 100000-115000 | 15,001 | 53,340 | 100% | ~99% | Heavy Soroban activity |
 | 200000-213000 | 13,000+ | ~50,000+ | 100% | ~99% | CreateClaimableBalance fix verified |
+| 327900-328100 | 201 | 911 | 100% | ~99% | RestoreFootprint hot archive fix verified |
 | 400000-407000 | 7,229+ | ~30,000+ | 100% | ~99% | Post-500254 fix verified |
 | 553996-553998 | 3 | 14 | 100% | 100% | BN254 crypto fix verified |
 | 617808-617812 | 5 | 22 | Pending | 100% | Hot archive restore fix verified (meta OK) |
@@ -63,6 +64,53 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
 ### Issues Fixed (2026-01-24)
+
+#### 0. RestoreFootprint Hot Archive Keys Not Returned for soroban_state Tracking (Ledger 327974)
+
+When `RestoreFootprint` restored entries from the hot archive, the data/code keys were not being returned in `hot_archive_restored_keys`, causing the in-memory soroban_state tracking to fail with "pending TTLs not empty after update: 1 remaining".
+
+**Root Cause**: In `execution.rs`, when collecting `collected_hot_archive_keys`, the code filtered by `created_keys`:
+
+```rust
+collected_hot_archive_keys.extend(
+    hot_archive_for_bucket_list
+        .iter()
+        .filter(|k| created_keys.contains(k))
+        .cloned(),
+);
+```
+
+For RestoreFootprint operations, data/code entries are **prefetched** from the hot archive into state (not created by the transaction's delta). Only TTL entries are created by the delta. So the filter removed all the data/code keys.
+
+This meant the restored data entries weren't added to `our_init` in main.rs, so soroban_state couldn't pair the TTL entries with their corresponding data entries.
+
+**Observed symptoms**:
+- Error: "pending TTLs not empty after update: 1 remaining"
+- Pending TTL key_hash didn't match any contract data being created
+
+**Fix**: Modified the hot archive key collection to NOT filter by `created_keys` for RestoreFootprint operations:
+
+```rust
+if op_type == OperationType::RestoreFootprint {
+    // For RestoreFootprint, include all hot archive entries
+    collected_hot_archive_keys.extend(hot_archive_for_bucket_list.iter().cloned());
+} else {
+    // For InvokeHostFunction, filter by created_keys
+    collected_hot_archive_keys.extend(
+        hot_archive_for_bucket_list
+            .iter()
+            .filter(|k| created_keys.contains(k))
+            .cloned(),
+    );
+}
+```
+
+**Files changed:**
+- `crates/stellar-core-ledger/src/execution.rs` - Conditional filtering for RestoreFootprint
+
+**Regression test:** `test_restore_footprint_hot_archive_ttl_pairing` in `crates/stellar-core-ledger/src/soroban_state.rs`
+
+**Verification**: Ledger 327974 and range 327900-328100 (201 ledgers, 911 transactions) pass with 0 header mismatches.
 
 #### 1. Hot Archive Restoration Emitting CREATED Instead of RESTORED (Ledger 617809)
 
@@ -490,6 +538,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-24**: Fixed RestoreFootprint hot archive keys not returned for soroban_state tracking (ledger 327974) - enables verification of 327900-328100+
 - **2026-01-24**: Fixed fee refund not applied for failed Soroban transactions (ledger 224398) - extends verification to 200000-300000
 - **2026-01-24**: Fixed extra RESTORED changes for entries already restored by earlier TX (ledger 252453) - extends verification to 250000-253000
 - **2026-01-24**: Fixed rent fee double-charge for entries already restored by earlier TX (ledger 617809)
