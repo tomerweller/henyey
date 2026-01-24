@@ -59,13 +59,40 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 553996-553998 | 3 | 14 | 100% | 100% | BN254 crypto fix verified |
 | 617808-617812 | 5 | 22 | Pending | 100% | Hot archive restore fix verified (meta OK) |
 | 250000-253000 | 3,001 | 8,091 | 100% | ~99% | Extra RESTORED fix verified |
+| 300000-312750 | 12,751 | ~40,000+ | 100% | ~99% | Duplicate entry fix verified |
 | 64-617812+ | 617,749+ | ~600,000+ | 100% | ~98% | **Hot archive fix allows further expansion** |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
 ### Issues Fixed (2026-01-24)
 
-#### 0. RestoreFootprint Hot Archive Keys Not Returned for soroban_state Tracking (Ledger 327974)
+#### 0. Duplicate Entry Error When Restoring Hot Archive Entries (Ledger 306338)
+
+When `InvokeHostFunction` restores entries from the hot archive, ContractCode or ContractData may already exist in `soroban_state` (e.g., shared WASM code used by multiple contracts, or entries restored from checkpoint). Instead of creating duplicates (which fails with "already exists" error), we now detect existing entries and update them instead.
+
+**Root Cause**: In `main.rs` verify-execution, when building `our_init` from the delta's `created` entries, we call `soroban_state.create_contract_code()` or `create_contract_data()`. These fail if the entry already exists. But for hot archive restores, the same ContractCode might be used by multiple contracts (same WASM hash), or ContractData might have been initialized from a checkpoint.
+
+**Observed symptoms**:
+- Error: "contract code already exists" or "contract data already exists"
+- Occurred when InvokeHostFunction restored a ContractCode with the same hash as an existing one
+
+**Fix**: When building `our_init` from delta's `created` entries, check if each ContractCode/ContractData already exists in `soroban_state`:
+- If exists: move to `moved_to_live` vector (will be updated, not created)
+- If not exists: add to `our_init` (will be created)
+
+Also skip entries already in `our_init` when processing `our_hot_archive_restored_keys` to avoid duplicates.
+
+**Files changed:**
+- `crates/rs-stellar-core/src/main.rs` - Duplicate detection and handling
+
+**Regression tests:** 
+- `test_create_duplicate_contract_code_fails` - Verifies error on duplicate code
+- `test_create_duplicate_contract_data_fails` - Verifies error on duplicate data
+- `test_process_entry_update_creates_if_not_exists` - Verifies update creates if missing
+
+**Verification**: Ledgers 306337-306340 and range 300000-312750 (12,751 ledgers) pass with 0 header mismatches.
+
+#### 1. RestoreFootprint Hot Archive Keys Not Returned for soroban_state Tracking (Ledger 327974)
 
 When `RestoreFootprint` restored entries from the hot archive, the data/code keys were not being returned in `hot_archive_restored_keys`, causing the in-memory soroban_state tracking to fail with "pending TTLs not empty after update: 1 remaining".
 
@@ -112,7 +139,7 @@ if op_type == OperationType::RestoreFootprint {
 
 **Verification**: Ledger 327974 and range 327900-328100 (201 ledgers, 911 transactions) pass with 0 header mismatches.
 
-#### 1. Hot Archive Restoration Emitting CREATED Instead of RESTORED (Ledger 617809)
+#### 2. Hot Archive Restoration Emitting CREATED Instead of RESTORED (Ledger 617809)
 
 When Soroban transactions restore entries from the hot archive, the entries should be emitted as `RESTORED` in transaction meta and recorded as `INIT` in the bucket list. Instead, they were incorrectly going through the `update` path.
 
@@ -125,7 +152,7 @@ When Soroban transactions restore entries from the hot archive, the entries shou
 
 **Regression test:** `test_hot_archive_restore_uses_create_not_update`
 
-#### 2. Rent Fee Double-Charged for Entries Already Restored by Earlier TX (Ledger 617809)
+#### 3. Rent Fee Double-Charged for Entries Already Restored by Earlier TX (Ledger 617809)
 
 When multiple transactions in the same ledger reference the same archived entry for restoration, only the FIRST transaction should charge restoration rent. The second transaction should treat the entry as already live.
 
@@ -145,7 +172,7 @@ This matches C++ stellar-core's `previouslyRestoredFromHotArchive()` check.
 **Files changed:**
 - `crates/stellar-core-tx/src/soroban/host.rs` - Both P24 and P25 code paths
 
-#### 3. Extra RESTORED Changes for Entries Already Restored by Earlier TX (Ledger 252453)
+#### 4. Extra RESTORED Changes for Entries Already Restored by Earlier TX (Ledger 252453)
 
 When multiple transactions in the same ledger restore the same archived entry, ONLY the first transaction should emit RESTORED changes in its transaction meta. Subsequent transactions should treat the entry as already live and emit UPDATED changes instead.
 
@@ -168,7 +195,7 @@ When multiple transactions in the same ledger restore the same archived entry, O
 
 **Verification**: Ledger 252453 and range 250000-253000 pass with 0 header mismatches.
 
-#### 4. Fee Refund Not Applied for Failed Soroban Transactions (Ledger 224398)
+#### 5. Fee Refund Not Applied for Failed Soroban Transactions (Ledger 224398)
 
 When a Soroban transaction fails (e.g., due to `InsufficientRefundableFee`), the full `max_refundable_fee` should be refunded. Our implementation was returning 0 refund because the `consumed_refundable_fee` had already been set to a value exceeding `max_refundable_fee` before failure detection.
 
@@ -193,7 +220,7 @@ C++ stellar-core calls `resetConsumedFee()` in `setError()` when any error is se
 
 **Verification**: Ledger 224398 and range 224395-224400 pass with 0 header mismatches.
 
-#### 5. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
+#### 6. BN254 Crypto Error - soroban-env-host Pre-release Bug (Ledger 553997+)
 
 Soroban contracts calling `bn254_multi_pairing_check` were failing with "bn254 G1: point not on curve" because we were using a pre-release soroban-env-host revision (`0a0c2df`, Nov 5, 2025) with incorrect BN254 G1/G2 point encoding.
 
@@ -538,6 +565,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-24**: Fixed duplicate entry error when restoring hot archive entries (ledger 306338) - enables verification of 300000-312750+
 - **2026-01-24**: Fixed RestoreFootprint hot archive keys not returned for soroban_state tracking (ledger 327974) - enables verification of 327900-328100+
 - **2026-01-24**: Fixed fee refund not applied for failed Soroban transactions (ledger 224398) - extends verification to 200000-300000
 - **2026-01-24**: Fixed extra RESTORED changes for entries already restored by earlier TX (ledger 252453) - extends verification to 250000-253000

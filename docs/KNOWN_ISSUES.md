@@ -497,6 +497,48 @@ if op_type == OperationType::RestoreFootprint {
 
 ---
 
+### F10: Duplicate Entry Error When Restoring Hot Archive Entries
+
+**Status**: FIXED  
+**Impact**: Was causing "contract code already exists" or "contract data already exists" errors  
+**Added**: 2026-01-24  
+**Fixed**: 2026-01-24
+
+**Description**:
+When `InvokeHostFunction` restores entries from the hot archive, ContractCode or ContractData may already exist in `soroban_state` (e.g., shared WASM code used by multiple contracts, or entries restored from checkpoint). The code was attempting to create these entries again, which failed with "already exists" error.
+
+**Observed at**: Ledger 306338 (testnet)
+
+**Symptoms**:
+- Error: "contract code already exists" or "contract data already exists"
+- Occurred when InvokeHostFunction restored a ContractCode with the same hash as an existing one
+- The same WASM code can be used by multiple contracts (same hash)
+
+**Root Cause**:
+In `main.rs` verify-execution, when building `our_init` from the delta's `created` entries, we call `soroban_state.create_contract_code()` or `create_contract_data()`. These fail if the entry already exists. But for hot archive restores:
+1. The same ContractCode might be used by multiple contracts (same WASM hash)
+2. ContractData might have been initialized from a checkpoint
+3. An earlier TX in the same ledger might have already restored the entry
+
+**Solution**:
+When building `our_init` from delta's `created` entries, check if each ContractCode/ContractData already exists in `soroban_state`:
+- If exists: move to `moved_to_live` vector (will be updated, not created)
+- If not exists: add to `our_init` (will be created)
+
+Also skip entries already in `our_init` when processing `our_hot_archive_restored_keys` to avoid duplicates.
+
+**Files Changed**:
+- `crates/rs-stellar-core/src/main.rs` - Duplicate detection and handling
+
+**Regression Tests**:
+- `test_create_duplicate_contract_code_fails` - Verifies error on duplicate code
+- `test_create_duplicate_contract_data_fails` - Verifies error on duplicate data  
+- `test_process_entry_update_creates_if_not_exists` - Verifies update creates if missing
+
+**Verification**: Ledgers 306337-306340 and range 300000-312750 (12,751 ledgers) pass with 0 header mismatches.
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:
