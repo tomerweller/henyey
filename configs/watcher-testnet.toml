@@ -1,0 +1,75 @@
+# rs-stellar-core Testnet Watcher Configuration
+#
+# Watcher mode: observes the network without participating in consensus
+# Run: rs-stellar-core --config configs/watcher-testnet.toml run --watcher
+
+[node]
+# Node display name (for logging)
+name = "rs-stellar-core-watcher"
+
+# Run as watcher (non-validator)
+is_validator = false
+
+# Maximum transactions to include in a proposed set
+max_tx_set_size = 100
+
+# Quorum set for observing consensus
+[node.quorum_set]
+# Threshold percentage (0-100)
+# 67% means we need 2 of 3 validators to agree
+threshold_percent = 67
+
+# SDF Testnet validators
+validators = [
+    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
+    "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
+    "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z"
+]
+
+[network]
+# Network passphrase - MUST match network
+passphrase = "Test SDF Network ; September 2015"
+
+[database]
+# Path to SQLite database file
+path = "watcher-testnet.db"
+
+# Connection pool size
+pool_size = 10
+
+[history]
+# History archives for catchup
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[[history.archives]]
+name = "sdf2"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_002"
+
+[[history.archives]]
+name = "sdf3"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_003"
+
+[overlay]
+# Port to listen on for peer connections
+peer_port = 11626
+
+# Maximum inbound/outbound peer connections
+max_inbound_peers = 64
+max_outbound_peers = 8
+target_outbound_peers = 8
+
+# Known peers to connect to on startup
+known_peers = [
+    "core-testnet1.stellar.org:11625",
+    "core-testnet2.stellar.org:11625",
+    "core-testnet3.stellar.org:11625"
+]
+
+[logging]
+# Log level: "error", "warn", "info", "debug", "trace"
+level = "info"
+
+# Log format: "text", "json"
+format = "text"

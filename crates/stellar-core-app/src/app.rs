@@ -1975,6 +1975,16 @@ impl App {
         progress.set_phase(crate::logging::CatchupPhase::Complete);
         progress.summary();
 
+        // Clear bucket manager cache to release memory after catchup.
+        // The bucket files are still on disk if needed, but we don't need to
+        // keep them in RAM. With frequent catchups, this cache can grow unbounded.
+        let cache_size_before = self.bucket_manager.cache_size();
+        self.bucket_manager.clear_cache();
+        tracing::info!(
+            cache_size_before,
+            "Cleared bucket manager cache after catchup"
+        );
+
         // Reset the tx set exhausted flag after catchup - fresh start
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
