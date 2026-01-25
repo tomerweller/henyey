@@ -539,6 +539,125 @@ Also skip entries already in `our_init` when processing `our_hot_archive_restore
 
 ---
 
+### F11: Persistent Module Cache Not Updated for Newly Deployed Contracts
+
+**Status**: FIXED  
+**Impact**: Was causing Soroban budget exceeded errors for contracts deployed after checkpoint  
+**Added**: 2026-01-25  
+**Fixed**: 2026-01-25
+
+**Description**:
+In the offline `verify-execution` command, the persistent module cache was populated once from the initial checkpoint's bucket list and never updated. Contracts deployed after the checkpoint were missing from the cache, causing `VmInstantiation` (expensive) instead of `VmCachedInstantiation` (cheap), leading to budget exceeded errors.
+
+**Observed at**: Ledger 328879 (testnet) - TX 5 InvokeHostFunction failed with ResourceLimitExceeded
+
+**Symptoms**:
+- `ResourceLimitExceeded` (Budget ExceededLimit)
+- CPU consumed: 4,928,529 vs limit: 4,910,269 (over by ~0.4%)
+- Transaction succeeded in CDP but failed in our execution
+
+**Root Cause**:
+The module cache was built from contract code entries at the initial checkpoint (e.g., 328831) and never updated. Any contracts deployed between the checkpoint and a later ledger (e.g., 328879) would not be in the cache. Without a cached module, the soroban-env-host charges full `VmInstantiation` cost instead of `VmCachedInstantiation`, causing budget overflow.
+
+C++ stellar-core's `LedgerManagerImpl::addAnyContractsToModuleCache()` is called during the commit phase of each ledger to add newly deployed contracts to the cache.
+
+**Solution**:
+After `soroban_state.update_state()` for each ledger in verify-execution, iterate over `all_init` and `all_live` entries and call `module_cache.add_contract()` for any `ContractCode` entries. This matches upstream behavior.
+
+**Files Changed**:
+- `crates/rs-stellar-core/src/main.rs` - Added module cache update after soroban_state update
+
+**Verification**: Ledger 328879 and range 300000-365311 pass with 0 header mismatches.
+
+---
+
+### F12: SetOptions Missing Inflation Destination Validation
+
+**Status**: FIXED  
+**Impact**: Was causing SetOptions to succeed when it should return InvalidInflation  
+**Added**: 2026-01-25  
+**Fixed**: 2026-01-25
+
+**Description**:
+The `SetOptions` operation was not validating that the inflation destination account exists on the ledger (unless it's the source account itself). This allowed setting an inflation destination to a non-existent account, which C++ stellar-core rejects with `SET_OPTIONS_INVALID_INFLATION`.
+
+**Observed at**: Ledger 329805 (testnet) - TX 4 SetOptions
+
+**Symptoms**:
+- Our result: `SetOptions(Success)`
+- CDP result: `TxFailed([SetOptions(InvalidInflation)])`
+- State divergence and cascading header mismatches
+
+**Root Cause**:
+In C++ stellar-core's `SetOptionsOpFrame::doApply()` (line 133-144 of `.upstream-v25/src/transactions/SetOptionsOpFrame.cpp`):
+```cpp
+if (mSetOptions.inflationDest)
+{
+    AccountID inflationID = *mSetOptions.inflationDest;
+    if (!(inflationID == getSourceID()))
+    {
+        if (!stellar::loadAccountWithoutRecord(ltx, inflationID))
+        {
+            innerResult(res).code(SET_OPTIONS_INVALID_INFLATION);
+            return false;
+        }
+    }
+    account.inflationDest.activate() = inflationID;
+}
+```
+
+Our Rust implementation was missing this validation - it unconditionally set the inflation destination without checking existence.
+
+**Solution**:
+Added validation before setting inflation destination:
+```rust
+if let Some(ref inflation_dest) = op.inflation_dest {
+    if inflation_dest != source {
+        if state.get_account(inflation_dest).is_none() {
+            return Ok(make_result(SetOptionsResultCode::InvalidInflation));
+        }
+    }
+}
+```
+
+**Files Changed**:
+- `crates/stellar-core-tx/src/operations/execute/set_options.rs` - Added inflation destination validation and 3 regression tests
+
+**Regression Tests**:
+- `test_set_options_inflation_dest_nonexistent_account`
+- `test_set_options_inflation_dest_self`
+- `test_set_options_inflation_dest_existing_account`
+
+**Verification**: Ledger 329805 and range 329804-329810 pass with 0 header mismatches.
+
+---
+
+### F13: Bucket List Hash Divergence at Large Merge Points
+
+**Status**: Under Investigation  
+**Impact**: Bucket list hash diverges at major merge points after extended replay  
+**Added**: 2026-01-25
+
+**Description**:
+When running verify-execution over extended ranges (e.g., 300000-400000), all transaction executions match but the bucket list hash diverges at major merge points (where multiple levels spill simultaneously).
+
+**Observed at**: Ledger 365312 (testnet) - levels 0-7 all spill
+
+**Symptoms**:
+- All transaction executions match (0 TX mismatches)
+- All individual ledger header hashes match until the merge point
+- At 365312 (level 0-7 merge), bucket list hash diverges
+- Starting from a closer checkpoint (365248) passes verification
+- Metadata shows `last_modified_ledger_seq` differences for some account entries
+
+**Root Cause (Hypothesized)**:
+Account entry `last_modified_ledger_seq` values diverge in some edge cases (possibly fee refund application or accessed-but-unchanged account recording). The differences are small enough not to affect individual ledger hashes but accumulate in bucket list entries over many ledgers. When a large merge combines entries from many levels, the divergent `last_modified_ledger_seq` values cause a hash mismatch.
+
+**Workaround**:
+Start verification from checkpoints closer to the target range. The divergence appears to require accumulation over thousands of ledgers.
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:

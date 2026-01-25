@@ -2,7 +2,7 @@
 
 This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
 
-**Last Updated:** 2026-01-24
+**Last Updated:** 2026-01-25
 
 ## Quick Reference: Running Verification
 
@@ -61,8 +61,54 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 250000-253000 | 3,001 | 8,091 | 100% | ~99% | Extra RESTORED fix verified |
 | 300000-312750 | 12,751 | ~40,000+ | 100% | ~99% | Duplicate entry fix verified |
 | 64-617812+ | 617,749+ | ~600,000+ | 100% | ~98% | **Hot archive fix allows further expansion** |
+| 300000-365311 | 65,312 | ~200,000+ | 100% | ~98% | Module cache + SetOptions inflation fixes |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
+
+### Issues Fixed (2026-01-25)
+
+#### 1. Persistent Module Cache Not Updated for Newly Deployed Contracts (Ledger 328879)
+
+When contracts are deployed via Soroban transactions, they need to be added to the persistent module cache so subsequent transactions can use `VmCachedInstantiation` (cheap) instead of `VmInstantiation` (expensive) for execution.
+
+**Root Cause**: In the offline `verify-execution` command, the module cache was populated once from the initial checkpoint's bucket list and never updated. Contracts deployed after the checkpoint were missing from the cache, causing budget exceeded errors.
+
+**Observed symptoms**:
+- `ResourceLimitExceeded` (Budget ExceededLimit) for Soroban transactions
+- CPU consumed exceeded CPU limit by ~0.4% (18,260 instructions over)
+- Transaction succeeded in CDP but failed in our execution
+
+**Fix**: After `soroban_state.update_state()` for each ledger, iterate over `all_init` and `all_live` entries and add any new `ContractCode` entries to the persistent module cache. This matches upstream C++ `addAnyContractsToModuleCache()` behavior during the commit phase.
+
+**Files changed:**
+- `crates/rs-stellar-core/src/main.rs` - Add module cache update after soroban_state update
+
+**Regression test:** `test_apply_ledger_entry_changes_updates_module_cache` in `crates/stellar-core-ledger/tests/transaction_execution.rs` (existing test covers the code path)
+
+**Verification**: Ledger 328879 and range 300000-365311 (65,312 ledgers) pass with 0 header mismatches.
+
+#### 2. SetOptions Missing Inflation Destination Validation (Ledger 329805)
+
+The `SetOptions` operation was not validating that the inflation destination account exists on the ledger.
+
+**Root Cause**: In C++ stellar-core, `SetOptionsOpFrame::doApply()` calls `loadAccountWithoutRecord()` to verify the inflation destination exists (unless it's the source account itself). Our Rust implementation unconditionally accepted any `AccountId` without validation.
+
+**Observed symptoms**:
+- Our result: `SetOptions(Success)`
+- CDP result: `SetOptions(InvalidInflation)`
+- Missing validation caused state divergence
+
+**Fix**: Added validation before setting inflation destination: if `inflation_dest` differs from `source`, check that `state.get_account(inflation_dest)` returns Some. If not found, return `make_result(SetOptionsResultCode::InvalidInflation)`.
+
+**Files changed:**
+- `crates/stellar-core-tx/src/operations/execute/set_options.rs` - Added inflation destination validation
+
+**Regression tests:**
+- `test_set_options_inflation_dest_nonexistent_account` - Verifies InvalidInflation for non-existent
+- `test_set_options_inflation_dest_self` - Verifies success for self-reference
+- `test_set_options_inflation_dest_existing_account` - Verifies success for existing account
+
+**Verification**: Ledger 329805 and range 329804-329810 pass with 0 header mismatches.
 
 ### Issues Fixed (2026-01-24)
 
@@ -457,7 +503,21 @@ When a `CreateClaimableBalance` operation has an operation source different from
 
 ### Known Issues
 
-No known issues at this time. All previously tracked issues have been resolved.
+#### Bucket List Hash Divergence at Large Merge Points (Ledger 365312+)
+
+**Status**: Under Investigation
+
+Starting from checkpoint 364479, the bucket list hash diverges at ledger 365312, which is a major merge point (levels 0-7 spill). All transaction executions match (0 TX mismatches), but accumulated `last_modified_ledger_seq` differences in account entries cause the bucket list hash to diverge.
+
+**Observed symptoms**:
+- All 65,000+ transactions execute correctly (execution results match)
+- Header hash matches until ledger 365312
+- At ledger 365312 (checkpoint boundary with level 0-7 merge), bucket list hash diverges
+- Starting from a closer checkpoint (365248) passes verification
+
+**Likely cause**: Account entry `last_modified_ledger_seq` propagation differs from CDP expectations in some edge cases. The differences accumulate over many ledgers and only become visible when large bucket merges combine the state.
+
+**Workaround**: Verification passes when starting from checkpoints closer to the target range. The issue appears to be related to state accumulation over extended ranges.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 
@@ -565,6 +625,8 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-25**: Fixed SetOptions missing inflation destination validation (ledger 329805) - extends verification to 329810+
+- **2026-01-25**: Fixed persistent module cache not updated for newly deployed contracts (ledger 328879) - extends verification to 328900+
 - **2026-01-24**: Fixed duplicate entry error when restoring hot archive entries (ledger 306338) - enables verification of 300000-312750+
 - **2026-01-24**: Fixed RestoreFootprint hot archive keys not returned for soroban_state tracking (ledger 327974) - enables verification of 327900-328100+
 - **2026-01-24**: Fixed fee refund not applied for failed Soroban transactions (ledger 224398) - extends verification to 200000-300000

@@ -4025,6 +4025,32 @@ async fn cmd_verify_execution(
                             Some(&rent_config),
                         )
                         .map_err(|e| anyhow::anyhow!("soroban state update failed: {}", e))?;
+
+                    // Update persistent module cache with newly deployed contracts.
+                    // This matches C++ stellar-core's commit-phase behavior where
+                    // addAnyContractsToModuleCache() is called after all transactions
+                    // in a ledger are applied, ensuring newly deployed contracts are
+                    // available in the cache for the next ledger's execution.
+                    if let Some(ref cache) = module_cache {
+                        let mut contracts_added = 0;
+                        for entry in all_init.iter().chain(all_live.iter()) {
+                            if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
+                                if cache.add_contract(
+                                    contract_code.code.as_slice(),
+                                    cdp_header.ledger_version,
+                                ) {
+                                    contracts_added += 1;
+                                }
+                            }
+                        }
+                        if contracts_added > 0 {
+                            tracing::debug!(
+                                ledger_seq = seq,
+                                contracts_added,
+                                "Updated module cache with new contracts"
+                            );
+                        }
+                    }
                 }
 
                 // Diagnostic logging: compare our execution vs CDP metadata

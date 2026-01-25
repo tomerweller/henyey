@@ -156,6 +156,18 @@ pub fn execute_set_options(
     let (current_num_sponsoring, current_num_sponsored) =
         sponsorship_counts_for_account_entry(source_account);
 
+    // Validate inflation destination: if specified and not the source account itself,
+    // the destination account must exist on the ledger.
+    // This matches C++ stellar-core's SetOptionsOpFrame::doApply() which calls
+    // loadAccountWithoutRecord() and returns SET_OPTIONS_INVALID_INFLATION if not found.
+    if let Some(ref inflation_dest) = op.inflation_dest {
+        if inflation_dest != source {
+            if state.get_account(inflation_dest).is_none() {
+                return Ok(make_result(SetOptionsResultCode::InvalidInflation));
+            }
+        }
+    }
+
     // Now apply changes to the account
     let source_account_mut = state
         .get_account_mut(source)
@@ -841,5 +853,110 @@ mod tests {
 
         let account = state.get_account(&source_id).unwrap();
         assert_eq!(account.home_domain.to_string(), "stellar.org");
+    }
+
+    #[test]
+    fn test_set_options_inflation_dest_nonexistent_account() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Set inflation destination to a non-existent account
+        let nonexistent_id = create_test_account_id(99);
+        let op = SetOptionsOp {
+            inflation_dest: Some(nonexistent_id),
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(matches!(r, SetOptionsResult::InvalidInflation));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_set_options_inflation_dest_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Setting inflation destination to self should always succeed (no existence check)
+        let op = SetOptionsOp {
+            inflation_dest: Some(source_id.clone()),
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(matches!(r, SetOptionsResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        let account = state.get_account(&source_id).unwrap();
+        assert_eq!(account.inflation_dest, Some(source_id));
+    }
+
+    #[test]
+    fn test_set_options_inflation_dest_existing_account() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        // Setting inflation destination to an existing account should succeed
+        let op = SetOptionsOp {
+            inflation_dest: Some(dest_id.clone()),
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(matches!(r, SetOptionsResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        let account = state.get_account(&source_id).unwrap();
+        assert_eq!(account.inflation_dest, Some(dest_id));
     }
 }
