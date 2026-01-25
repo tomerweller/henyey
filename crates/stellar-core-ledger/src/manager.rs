@@ -2071,6 +2071,20 @@ impl<'a> LedgerCloseContext<'a> {
                     if let Err(e) = soroban_state.process_entry_delete(key) {
                         tracing::trace!(error = %e, "Failed to process dead entry in soroban state");
                     }
+
+                    // Remove evicted contract code from the module cache to prevent
+                    // unbounded memory growth.
+                    if let LedgerKey::ContractCode(cc) = key {
+                        let module_cache_guard = self.manager.module_cache.read();
+                        if let Some(cache) = module_cache_guard.as_ref() {
+                            if cache.remove_contract(&cc.hash.0) {
+                                tracing::debug!(
+                                    hash = ?cc.hash,
+                                    "Removed evicted contract code from module cache"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 tracing::debug!(

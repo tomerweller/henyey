@@ -190,6 +190,25 @@ impl PersistentModuleCache {
         }
     }
 
+    /// Remove a contract code entry from the cache by its hash.
+    ///
+    /// This should be called when contract code is evicted (TTL expired) to
+    /// prevent unbounded growth of the module cache.
+    ///
+    /// Returns true if the module was found and removed, false otherwise.
+    pub fn remove_contract(&self, hash: &[u8; 32]) -> bool {
+        match self {
+            PersistentModuleCache::P24(cache) => {
+                let contract_id = soroban_env_host24::xdr::Hash(*hash);
+                cache.remove_module(&contract_id).ok().flatten().is_some()
+            }
+            PersistentModuleCache::P25(cache) => {
+                let contract_id = soroban_env_host25::xdr::Hash(*hash);
+                cache.remove_module(&contract_id).ok().flatten().is_some()
+            }
+        }
+    }
+
     /// Get the P24 cache if this is a P24 cache.
     pub fn as_p24(&self) -> Option<&ModuleCache> {
         match self {
