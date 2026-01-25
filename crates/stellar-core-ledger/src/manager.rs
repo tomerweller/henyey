@@ -38,8 +38,8 @@ use crate::{
     snapshot::{LedgerSnapshot, SnapshotHandle, SnapshotManager},
     LedgerError, Result,
 };
+use indexmap::IndexMap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::Arc;
 use stellar_core_bucket::{
     BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
@@ -175,6 +175,15 @@ pub struct LedgerManagerConfig {
     /// Set to 0 to disable snapshot retention (not recommended for production).
     pub max_snapshots: usize,
 
+    /// Maximum number of entries to keep in the entry cache.
+    ///
+    /// When the cache exceeds this limit, the oldest entries (by insertion
+    /// order) are evicted. This prevents unbounded memory growth during
+    /// long-running validator operation.
+    ///
+    /// Set to 0 to disable caching. Default is 100,000 entries.
+    pub max_entry_cache_size: usize,
+
     /// Whether to validate bucket list hashes against header values.
     ///
     /// When enabled, the computed bucket list hash is verified against the
@@ -205,6 +214,7 @@ impl Default for LedgerManagerConfig {
     fn default() -> Self {
         Self {
             max_snapshots: 10,
+            max_entry_cache_size: 100_000,
             validate_bucket_hash: true,
             persist_to_db: true,
             emit_classic_events: false,
@@ -291,8 +301,9 @@ pub struct LedgerManager {
 
     /// In-memory cache of recently accessed ledger entries.
     ///
-    /// Keys are XDR-encoded LedgerKey bytes.
-    entry_cache: RwLock<HashMap<Vec<u8>, LedgerEntry>>,
+    /// Keys are XDR-encoded LedgerKey bytes. Uses IndexMap to maintain
+    /// insertion order for FIFO eviction when the cache exceeds max_entry_cache_size.
+    entry_cache: RwLock<IndexMap<Vec<u8>, LedgerEntry>>,
 
     /// Manager for point-in-time snapshots.
     snapshots: SnapshotManager,
@@ -354,7 +365,7 @@ impl LedgerManager {
                 header_hash: Hash256::ZERO,
                 initialized: false,
             }),
-            entry_cache: RwLock::new(HashMap::new()),
+            entry_cache: RwLock::new(IndexMap::new()),
             snapshots: SnapshotManager::new(config.max_snapshots),
             config,
             module_cache: RwLock::new(None),
@@ -462,9 +473,20 @@ impl LedgerManager {
         // Then check the bucket list
         let entry = self.bucket_list.read().get(key)?;
 
-        // Cache the result if found
+        // Cache the result if found, with eviction if needed
         if let Some(ref entry) = entry {
-            self.entry_cache.write().insert(key_bytes, entry.clone());
+            let mut cache = self.entry_cache.write();
+            cache.insert(key_bytes, entry.clone());
+
+            // Evict oldest entries if cache exceeds limit
+            let max_size = self.config.max_entry_cache_size;
+            if max_size > 0 && cache.len() > max_size {
+                let to_remove = cache.len() - max_size;
+                // Remove oldest entries (from front of IndexMap)
+                for _ in 0..to_remove {
+                    cache.shift_remove_index(0);
+                }
+            }
         }
 
         Ok(entry)
@@ -1262,8 +1284,16 @@ impl LedgerManager {
     /// The snapshot includes a lookup function for entries not in the cache,
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
+        use std::collections::HashMap;
+
         let state = self.state.read();
-        let entries = self.entry_cache.read().clone();
+        // Convert IndexMap to HashMap for the snapshot
+        let entries: HashMap<Vec<u8>, LedgerEntry> = self
+            .entry_cache
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
         let snapshot = LedgerSnapshot::new(state.header.clone(), state.header_hash, entries);
 
@@ -1382,8 +1412,17 @@ impl LedgerManager {
                         cache.insert(key_bytes, entry.clone());
                     }
                     EntryChange::Deleted { .. } => {
-                        cache.remove(&key_bytes);
+                        cache.swap_remove(&key_bytes);
                     }
+                }
+            }
+
+            // Evict oldest entries if cache exceeds limit
+            let max_size = self.config.max_entry_cache_size;
+            if max_size > 0 && cache.len() > max_size {
+                let to_remove = cache.len() - max_size;
+                for _ in 0..to_remove {
+                    cache.shift_remove_index(0);
                 }
             }
         }

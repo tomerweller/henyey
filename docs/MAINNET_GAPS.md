@@ -22,9 +22,10 @@ The project explicitly states it's "an educational experiment and **not** produc
 | # | Gap | Impact | Effort | Priority |
 |---|-----|--------|--------|----------|
 | 1 | **Bucket list fully in memory** | Mainnet state (~60M entries) would require 50+ GB RAM | Very High | P0 |
-| 2 | **No parallel transaction execution** | Validators will fall behind on high-throughput ledgers | High | P0 |
-| 3 | **Insufficient metrics/monitoring** | Cannot monitor production operation | Medium | P1 |
-| 4 | **No QuorumIntersection v2** | Cannot perform network safety analysis at scale | Medium | P1 |
+| 2 | **Memory growth during operation** | Memory grows 4-5x over hours, requires periodic restarts | Medium | P0 |
+| 3 | **No parallel transaction execution** | Validators will fall behind on high-throughput ledgers | High | P0 |
+| 4 | **Insufficient metrics/monitoring** | Cannot monitor production operation | Medium | P1 |
+| 5 | **No QuorumIntersection v2** | Cannot perform network safety analysis at scale | Medium | P1 |
 
 ---
 
@@ -269,6 +270,72 @@ Only 3 TODO comments exist in production code:
 10. **Remove "not production-grade" disclaimer**
     - Update README and documentation
     - Production support commitment
+
+---
+
+## Memory Growth During Operation (CRITICAL)
+
+### Observed Behavior
+
+During extended testnet validator operation (5+ hours), memory usage grows continuously:
+
+| Time | RSS Memory | Notes |
+|------|------------|-------|
+| Start | ~5 GB | After initial catchup |
+| +5 hours | ~23 GB | 35.5% of 64 GB system |
+
+This represents a **~4.6x increase** in memory usage over 5 hours of operation.
+
+### Contributing Factors
+
+1. **Repeated catchups reload bucket list entries**
+   - Each catchup calls `live_entries()` which loads all entries into memory
+   - 186 catchups observed in 5 hours (excessive, ~1 every 1.6 minutes)
+   - Entries may accumulate if not properly released between catchups
+
+2. **Hash mismatch triggers catchup cycles**
+   - 14 hash mismatches observed causing validator to fall out of sync
+   - Each mismatch triggers a full catchup, reloading all state
+   - Root cause: intermittent parity issues with ledger header computation
+
+3. **Potential unbounded growth in tracking structures**
+   - `tx_set_dont_have: HashMap` - tracks tx sets peers don't have
+   - `tx_set_last_request: HashMap` - tracks last request times
+   - `tx_set_exhausted_warned: HashSet` - tracks warned tx sets
+   - SCP slot tracking may retain old externalized slots
+   - Buffered ledger data may not be fully released
+
+4. **Module cache growth**
+   - WASM modules compiled and cached during execution
+   - No eviction policy for infrequently used contracts
+
+### Symptoms
+
+- RSS memory grows monotonically during operation
+- No corresponding increase in active ledger entries
+- Memory not released after catchup completes
+- Eventually leads to OOM or swap thrashing
+
+### Required Investigation
+
+1. ~~**Profile memory allocation** - Identify which structures are growing~~ (Done)
+2. **Add memory metrics** - Track cache sizes, entry counts over time
+3. ~~**Implement cache eviction** - Bound memory usage for caches~~ (Done - entry_cache now has FIFO eviction)
+4. **Fix hash mismatch root cause** - Reduce catchup frequency
+5. **Ensure proper cleanup** - Release old slot data, tx sets, etc.
+
+### Fixes Applied
+
+1. **Entry cache eviction** (Jan 2026)
+   - Added `max_entry_cache_size` configuration (default: 100,000 entries)
+   - Implemented FIFO eviction using `IndexMap` to maintain insertion order
+   - Oldest entries are evicted when cache exceeds limit
+   - This bounds the entry cache memory growth during normal operation
+
+### Mitigation (Current)
+
+- Periodic validator restart to reclaim memory
+- Monitor RSS and restart when approaching memory limits
 
 ---
 

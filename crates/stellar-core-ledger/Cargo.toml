@@ -25,6 +25,7 @@ tracing.workspace = true
 # Utilities
 parking_lot.workspace = true
 sha2.workspace = true
+indexmap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
