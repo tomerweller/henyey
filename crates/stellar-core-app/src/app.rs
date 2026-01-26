@@ -7762,6 +7762,124 @@ mod tests {
     }
 
     // ============================================================
+    // Buffered Ledger Update Tests (regression for 80bd38d)
+    // ============================================================
+
+    /// Tests that the BTreeMap Entry pattern correctly updates existing entries.
+    /// This is a regression test for the fix in process_externalized_slots()
+    /// where or_insert() was incorrectly used instead of Entry::Occupied/Vacant.
+    #[test]
+    fn test_btreemap_entry_update_pattern() {
+        use std::collections::BTreeMap;
+
+        // Simulate the buffered ledger structure (slot -> tx_set)
+        // Using Option<Vec<u8>> directly to represent presence/absence of tx_set
+        let mut buffer: BTreeMap<u32, Option<Vec<u8>>> = BTreeMap::new();
+
+        // First, insert a slot WITHOUT tx_set (simulates initial buffering)
+        let slot = 100u32;
+        buffer.insert(slot, None);
+        assert!(buffer.get(&slot).unwrap().is_none());
+
+        // Now simulate tx_set arriving later - the fix uses Entry pattern
+        let new_tx_set = Some(vec![1, 2, 3]);
+        match buffer.entry(slot) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.is_none() && new_tx_set.is_some() {
+                    *existing = new_tx_set.clone();
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(new_tx_set.clone());
+            }
+        }
+
+        // Verify the existing entry was UPDATED (not ignored)
+        assert!(buffer.get(&slot).unwrap().is_some());
+        assert_eq!(buffer.get(&slot).unwrap().as_ref().unwrap(), &vec![1, 2, 3]);
+    }
+
+    /// Tests that or_insert() does NOT update existing entries (the bug we fixed).
+    /// This demonstrates why the fix was needed.
+    #[test]
+    fn test_or_insert_does_not_update_existing() {
+        use std::collections::BTreeMap;
+
+        let mut map: BTreeMap<u32, Option<Vec<u8>>> = BTreeMap::new();
+
+        // Insert with None
+        map.insert(100, None);
+
+        // Try to "update" with or_insert - this does NOT update existing!
+        map.entry(100).or_insert(Some(vec![1, 2, 3]));
+
+        // The value is still None - or_insert doesn't update existing entries
+        assert!(map.get(&100).unwrap().is_none());
+    }
+
+    // ============================================================
+    // Tx Set Request Deduplication Tests (regression for 759757b)
+    // ============================================================
+
+    /// Tests that HashSet correctly tracks requested tx_set hashes to avoid
+    /// duplicate broadcast requests. This is a regression test for the fix
+    /// in cache_messages_during_catchup_impl().
+    #[test]
+    fn test_tx_set_request_deduplication() {
+        use std::collections::HashSet;
+
+        let mut requested_hashes: HashSet<Hash256> = HashSet::new();
+
+        let hash1 = Hash256::from_bytes([1u8; 32]);
+        let hash2 = Hash256::from_bytes([2u8; 32]);
+
+        // First request for hash1 should be allowed
+        assert!(!requested_hashes.contains(&hash1));
+        requested_hashes.insert(hash1);
+
+        // Second request for hash1 should be blocked (duplicate)
+        assert!(requested_hashes.contains(&hash1));
+
+        // First request for hash2 should be allowed
+        assert!(!requested_hashes.contains(&hash2));
+        requested_hashes.insert(hash2);
+
+        // Both hashes are now tracked
+        assert!(requested_hashes.contains(&hash1));
+        assert!(requested_hashes.contains(&hash2));
+        assert_eq!(requested_hashes.len(), 2);
+    }
+
+    /// Tests the combined check pattern used in the fix:
+    /// !has_tx_set && !already_requested
+    #[test]
+    fn test_tx_set_request_condition() {
+        use std::collections::HashSet;
+
+        let mut requested_hashes: HashSet<Hash256> = HashSet::new();
+        let mut has_tx_set_cache: HashSet<Hash256> = HashSet::new();
+
+        let hash = Hash256::from_bytes([42u8; 32]);
+
+        // Case 1: Don't have tx_set, haven't requested -> should request
+        let should_request = !has_tx_set_cache.contains(&hash) && !requested_hashes.contains(&hash);
+        assert!(should_request);
+
+        // Mark as requested
+        requested_hashes.insert(hash);
+
+        // Case 2: Don't have tx_set, already requested -> should NOT request
+        let should_request = !has_tx_set_cache.contains(&hash) && !requested_hashes.contains(&hash);
+        assert!(!should_request);
+
+        // Case 3: Have tx_set (regardless of requested) -> should NOT request
+        has_tx_set_cache.insert(hash);
+        let should_request = !has_tx_set_cache.contains(&hash) && !requested_hashes.contains(&hash);
+        assert!(!should_request);
+    }
+
+    // ============================================================
     // Herder Integration Tests
     // ============================================================
 

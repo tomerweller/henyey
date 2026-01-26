@@ -204,6 +204,33 @@ run/catchup handlers and HTTP server wiring used by those commands.
 | SCP state broadcast | Implemented | Request and broadcast SCP state |
 | Out-of-sync recovery | Implemented | Via `SyncRecoveryManager` |
 | Automatic catchup on stuck | Implemented | Falls back to catchup |
+| Buffered ledger tx_set updates | Implemented | Entry pattern for late-arriving tx_sets |
+| Broadcast tx_set requests during catchup | Implemented | Request from all peers, not just sender |
+
+## Bug Fixes and Improvements
+
+### Catchup Gap Recovery (January 2026)
+
+Two related issues were fixed to improve recovery after catchup completes:
+
+1. **Buffered tx_set update fix** (`80bd38d`): When a slot is buffered without its tx_set
+   (because the tx_set hasn't arrived yet), and the tx_set arrives later, the buffered
+   entry was not being updated. This was caused by using `or_insert()` which doesn't
+   update existing entries. Fixed by using the `Entry::Occupied/Vacant` pattern to
+   properly update existing entries when tx_sets arrive.
+
+2. **Broadcast tx_set requests to all peers** (`759757b`): During catchup, when
+   EXTERNALIZE messages arrive for future slots, the validator now broadcasts GetTxSet
+   requests to ALL connected peers instead of just the message sender. This increases
+   the probability of receiving tx_sets before they are evicted from peer caches,
+   helping bridge the gap between catchup checkpoint and live consensus.
+
+**Root cause**: After catchup completes at a checkpoint boundary (e.g., ledger 690303),
+the network may be 20-30 slots ahead. The validator needs tx_sets for these "gap" slots
+to close ledgers. Previously, tx_set requests went only to the peer that sent the
+EXTERNALIZE message, but that peer might have already evicted the tx_set from cache.
+By requesting from all peers and properly updating buffered entries, the validator
+can now successfully bridge this gap.
 
 ## Architectural Differences
 
