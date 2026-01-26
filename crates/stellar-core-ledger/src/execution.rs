@@ -2588,7 +2588,10 @@ impl TransactionExecutor {
 
         let tx_seq = frame.sequence_number();
         // Collect hot archive restored keys across all operations (Protocol 23+)
-        let mut collected_hot_archive_keys: Vec<LedgerKey> = Vec::new();
+        // Use HashSet to deduplicate: when multiple TXs in the same ledger restore
+        // the same entry (e.g., same ContractCode), it should only be sent to
+        // HotArchiveBucketList::add_batch once as a single Live marker.
+        let mut collected_hot_archive_keys: HashSet<LedgerKey> = HashSet::new();
 
         if let Some(preflight_failure) = preflight_failure {
             all_success = false;
@@ -3020,7 +3023,8 @@ impl TransactionExecutor {
             tx_meta: Some(tx_meta),
             fee_changes: Some(fee_changes),
             post_fee_changes: Some(post_fee_changes),
-            hot_archive_restored_keys: collected_hot_archive_keys,
+            // Convert HashSet back to Vec for the return type
+            hot_archive_restored_keys: collected_hot_archive_keys.into_iter().collect(),
         })
     }
 

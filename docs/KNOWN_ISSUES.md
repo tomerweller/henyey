@@ -796,6 +796,67 @@ Added `is_issuer()` helper function and updated multiple code paths:
 
 ---
 
+### F16: Duplicate Hot Archive Restored Keys Causing Multiple Live Entries
+
+**Status**: FIXED  
+**Impact**: Was causing duplicate LIVE entries in bucket list for shared ContractCode  
+**Added**: 2026-01-26  
+**Fixed**: 2026-01-26
+
+**Description**:
+When multiple transactions in the same ledger restore the same entry from hot archive (e.g., shared ContractCode used by multiple contracts), the entry was being added to `collected_hot_archive_keys` and `our_live` multiple times. This caused duplicate LIVE entries to be sent to the bucket list.
+
+**Observed at**: Ledger 635730 (testnet) - 15 transactions restoring the same ContractCode
+
+**Symptoms**:
+- LIVE entries contained the same ContractCode 15+ times
+- `our_restored_count=15` when it should be 2 (deduplicated)
+- Bucket list hash mismatch due to duplicate entries
+
+**Root Cause (Three Parts)**:
+
+1. **collected_hot_archive_keys as Vec**: In `execution.rs`, `collected_hot_archive_keys` was a `Vec<LedgerKey>`. When multiple transactions in the same ledger restored the same key, it was added multiple times.
+
+2. **our_hot_archive_restored_keys as Vec**: In `main.rs`, `our_hot_archive_restored_keys` was a `Vec<LedgerKey>`. When aggregating across transactions, duplicates accumulated.
+
+3. **our_live not deduplicated**: When building `our_live` from `live_by_key`, `hot_archive_live_entries`, and `moved_to_live`, entries from the latter two could duplicate entries already in `live_by_key`.
+
+**Solution**:
+
+1. In `execution.rs`: Changed `collected_hot_archive_keys` from `Vec` to `HashSet`:
+```rust
+let mut collected_hot_archive_keys: HashSet<LedgerKey> = HashSet::new();
+```
+
+2. In `main.rs`: Changed `our_hot_archive_restored_keys` from `Vec` to `HashSet`:
+```rust
+let mut our_hot_archive_restored_keys: std::collections::HashSet<LedgerKey> = std::collections::HashSet::new();
+```
+
+3. In `main.rs`: Deduplicate when adding to `our_live` using HashMap entry API:
+```rust
+for entry in hot_archive_live_entries {
+    if let Some(key) = ledger_entry_to_key(&entry) {
+        live_by_key.entry(key).or_insert(entry);
+    }
+}
+for entry in moved_to_live {
+    if let Some(key) = ledger_entry_to_key(&entry) {
+        live_by_key.entry(key).or_insert(entry);
+    }
+}
+```
+
+**Files Changed**:
+- `crates/stellar-core-ledger/src/execution.rs` - Changed `collected_hot_archive_keys` to HashSet
+- `crates/rs-stellar-core/src/main.rs` - Changed `our_hot_archive_restored_keys` to HashSet, deduplicated `our_live` entries
+
+**Verification**: Ledgers 603325 and 610541 (previously fixed) still pass. This fix prevents duplicate entries in future similar scenarios.
+
+**Note**: Ledger 635730 still has a separate issue (CDP vs ours restored_keys discrepancy) that requires further investigation. This fix resolved the duplicate entries but the remaining mismatch is about whether entries should be classified as hot archive restores.
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:

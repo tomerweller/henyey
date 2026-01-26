@@ -3199,7 +3199,9 @@ async fn cmd_verify_execution(
             
             // Collect hot archive restored keys from our execution
             // (This is used instead of CDP's restored_keys to properly exclude live BL restores)
-            let mut our_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
+            // Use HashSet to deduplicate: when multiple TXs in the same ledger restore
+            // the same entry (e.g., same ContractCode), it should only appear once.
+            let mut our_hot_archive_restored_keys: std::collections::HashSet<LedgerKey> = std::collections::HashSet::new();
 
             // Capture ledger-start TTL entries for all Soroban read footprint entries.
             // This is needed because when multiple transactions access the same entry,
@@ -3736,13 +3738,26 @@ async fn cmd_verify_execution(
                         }
                     }
                 }
-                let mut our_live: Vec<LedgerEntry> = live_by_key.into_values().collect();
-
-                // Add hot archive entries that already exist in soroban_state to our_live
-                our_live.extend(hot_archive_live_entries);
+                
+                // Add hot archive entries that already exist in soroban_state to live_by_key
+                // (deduplicating with entries already present from the delta's updated)
+                for entry in hot_archive_live_entries {
+                    if let Some(key) = ledger_entry_to_key(&entry) {
+                        // Only add if not already in live_by_key (delta's updated takes precedence)
+                        live_by_key.entry(key).or_insert(entry);
+                    }
+                }
 
                 // Add entries that were moved from our_init because they already exist in soroban_state
-                our_live.extend(moved_to_live);
+                // (deduplicating with entries already present)
+                for entry in moved_to_live {
+                    if let Some(key) = ledger_entry_to_key(&entry) {
+                        // Only add if not already in live_by_key
+                        live_by_key.entry(key).or_insert(entry);
+                    }
+                }
+                
+                let mut our_live: Vec<LedgerEntry> = live_by_key.into_values().collect();
 
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = bucket_list.read().unwrap();
@@ -4471,11 +4486,12 @@ async fn cmd_verify_execution(
                         // CDP metadata includes both hot archive restores and live BL restores,
                         // but only hot archive restores should be passed to add_batch.
                         // Our execution correctly filters out live BL restores.
+                        // Convert HashSet to Vec for add_batch.
                         hot_archive.write().unwrap().add_batch(
                             seq,
                             cdp_header.ledger_version,
                             archived_entries,
-                            our_hot_archive_restored_keys.clone(),
+                            our_hot_archive_restored_keys.iter().cloned().collect(),
                         )?;
                     }
                 }
