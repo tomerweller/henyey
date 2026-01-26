@@ -53,6 +53,15 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock;
 
+/// Get current RSS memory usage in MB (Linux only).
+fn get_rss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| pages * 4096 / 1024 / 1024)
+        .unwrap_or(0)
+}
+
 use stellar_core_bucket::BucketManager;
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::{
@@ -1904,7 +1913,8 @@ impl App {
 
         let progress = Arc::new(CatchupProgress::new());
 
-        tracing::info!(?target, "Starting catchup");
+        let rss_catchup_start = get_rss_mb();
+        tracing::info!(?target, rss_mb = rss_catchup_start, "Starting catchup");
 
         // Determine target ledger
         let target_ledger = match target {
@@ -1944,6 +1954,9 @@ impl App {
             .run_catchup_work(target_ledger, progress.clone())
             .await?;
 
+        let rss_after_catchup_work = get_rss_mb();
+        tracing::info!(rss_mb = rss_after_catchup_work, delta = rss_after_catchup_work as i64 - rss_catchup_start as i64, "catchup: after run_catchup_work");
+
         // Initialize ledger manager with catchup results.
         // This validates that the bucket list hash matches the ledger header.
         // Pass the pre-computed header hash from the history archive - this is authoritative.
@@ -1967,8 +1980,11 @@ impl App {
                 .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
         }
 
+        let rss_after_init = get_rss_mb();
         tracing::info!(
             ledger_seq = output.result.ledger_seq,
+            rss_mb = rss_after_init,
+            delta = rss_after_init as i64 - rss_after_catchup_work as i64,
             "Ledger manager initialized from catchup"
         );
 
@@ -1980,8 +1996,13 @@ impl App {
         // keep them in RAM. With frequent catchups, this cache can grow unbounded.
         let cache_size_before = self.bucket_manager.cache_size();
         self.bucket_manager.clear_cache();
+
+        let rss_after_cache_clear = get_rss_mb();
         tracing::info!(
             cache_size_before,
+            rss_mb = rss_after_cache_clear,
+            delta = rss_after_cache_clear as i64 - rss_after_init as i64,
+            total_catchup_delta = rss_after_cache_clear as i64 - rss_catchup_start as i64,
             "Cleared bucket manager cache after catchup"
         );
 
@@ -5409,6 +5430,28 @@ impl App {
         for adverts in adverts_by_peer.values_mut() {
             adverts.clear_below(ledger_seq);
         }
+
+        // Clean up old tx demand history entries (older than 5 minutes)
+        const MAX_TX_DEMAND_AGE_SECS: u64 = 300;
+        let cutoff = Instant::now() - std::time::Duration::from_secs(MAX_TX_DEMAND_AGE_SECS);
+        let mut history = self.tx_demand_history.write().await;
+        history.retain(|_, entry| entry.last_demanded > cutoff);
+
+        // Clean up old tx set dont have entries (older than 2 minutes)
+        const MAX_TX_SET_DONT_HAVE_AGE_SECS: u64 = 120;
+        let cutoff_short =
+            Instant::now() - std::time::Duration::from_secs(MAX_TX_SET_DONT_HAVE_AGE_SECS);
+        let mut dont_have = self.tx_set_dont_have.write().await;
+        // Note: tx_set_dont_have doesn't have timestamps, so we clear it periodically
+        // to prevent unbounded growth. Clear entries for any old tx set hashes.
+        // In practice this map should stay small since tx set requests are resolved quickly.
+        if dont_have.len() > 100 {
+            dont_have.clear();
+        }
+
+        // Clean up old tx set last request entries (older than 2 minutes)
+        let mut last_request = self.tx_set_last_request.write().await;
+        last_request.retain(|_, state| state.last_request > cutoff_short);
     }
 
     async fn record_tx_pull_latency(&self, hash: Hash256, peer: &stellar_core_overlay::PeerId) {
@@ -7344,6 +7387,36 @@ impl HerderCallback for App {
             hash = %result.header_hash.to_hex(),
             "Ledger closed successfully"
         );
+
+        // Log cache diagnostics every 10 ledgers to help identify memory leaks
+        if ledger_seq % 10 == 0 {
+            let rss_mb = get_rss_mb();
+            let scp_caches = self.herder.scp_driver_cache_sizes();
+            let (fetching_tx_sets, fetching_quorum_sets, fetching_slots) =
+                self.herder.fetching_cache_sizes();
+            let tx_dont_have_size = self.tx_set_dont_have.read().await.len();
+            let tx_last_request_size = self.tx_set_last_request.read().await.len();
+            let tx_adverts_size = self.tx_adverts_by_peer.read().await.len();
+            let tx_demand_size = self.tx_demand_history.read().await.len();
+            tracing::info!(
+                ledger_seq,
+                rss_mb,
+                scp_tx_set_cache = scp_caches.tx_set_cache,
+                scp_pending_tx_sets = scp_caches.pending_tx_sets,
+                scp_pending_quorum_sets = scp_caches.pending_quorum_sets,
+                scp_externalized = scp_caches.externalized,
+                scp_quorum_sets = scp_caches.quorum_sets,
+                scp_quorum_sets_by_hash = scp_caches.quorum_sets_by_hash,
+                fetching_tx_sets,
+                fetching_quorum_sets,
+                fetching_slots,
+                tx_dont_have_size,
+                tx_last_request_size,
+                tx_adverts_size,
+                tx_demand_size,
+                "Cache diagnostics"
+            );
+        }
 
         tracing::debug!(ledger_seq, "Ledger close function returning");
         Ok(result.header_hash)

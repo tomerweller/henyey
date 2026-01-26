@@ -59,6 +59,15 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info};
 
+/// Get current RSS memory usage in MB (Linux only).
+fn get_rss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| pages * 4096 / 1024 / 1024)
+        .unwrap_or(0)
+}
+
 /// Prepend a fee event to transaction metadata.
 ///
 /// This adds a "NewFee" event at the beginning of the transaction's event list
@@ -708,23 +717,90 @@ impl LedgerManager {
     }
 
     fn reset_for_catchup(&self) {
+        let rss_start = get_rss_mb();
+        info!(rss_mb = rss_start, "reset_for_catchup: START");
+
         // Clear bucket lists
         *self.bucket_list.write() = BucketList::default();
+        let rss_after_bucket_list = get_rss_mb();
+        info!(
+            rss_mb = rss_after_bucket_list,
+            delta = rss_after_bucket_list as i64 - rss_start as i64,
+            "reset_for_catchup: after bucket_list clear"
+        );
+
         *self.hot_archive_bucket_list.write() = None;
+        let rss_after_hot_archive = get_rss_mb();
+        info!(
+            rss_mb = rss_after_hot_archive,
+            delta = rss_after_hot_archive as i64 - rss_after_bucket_list as i64,
+            "reset_for_catchup: after hot_archive clear"
+        );
 
         // Clear all caches to release memory before re-initialization
         self.entry_cache.write().clear();
+        let rss_after_entry_cache = get_rss_mb();
+        info!(
+            rss_mb = rss_after_entry_cache,
+            delta = rss_after_entry_cache as i64 - rss_after_hot_archive as i64,
+            "reset_for_catchup: after entry_cache clear"
+        );
+
         self.snapshots.clear();
-        *self.module_cache.write() = None;
+        let rss_after_snapshots = get_rss_mb();
+        info!(
+            rss_mb = rss_after_snapshots,
+            delta = rss_after_snapshots as i64 - rss_after_entry_cache as i64,
+            "reset_for_catchup: after snapshots clear"
+        );
+
+        // Explicitly drop old module cache to verify it's released
+        let old_module_cache = self.module_cache.write().take();
+        if old_module_cache.is_some() {
+            drop(old_module_cache);
+            let rss_after_module_cache_drop = get_rss_mb();
+            info!(
+                rss_mb = rss_after_module_cache_drop,
+                delta = rss_after_module_cache_drop as i64 - rss_after_snapshots as i64,
+                "reset_for_catchup: after module_cache DROP"
+            );
+        } else {
+            info!(
+                rss_mb = get_rss_mb(),
+                "reset_for_catchup: module_cache was None"
+            );
+        }
+        let rss_after_module_cache = get_rss_mb();
+
         self.offer_cache.write().clear();
+        let rss_after_offer_cache = get_rss_mb();
+        info!(
+            rss_mb = rss_after_offer_cache,
+            delta = rss_after_offer_cache as i64 - rss_after_module_cache as i64,
+            "reset_for_catchup: after offer_cache clear"
+        );
+
         *self.offer_cache_initialized.write() = false;
         self.soroban_state.write().clear();
+        let rss_after_soroban_state = get_rss_mb();
+        info!(
+            rss_mb = rss_after_soroban_state,
+            delta = rss_after_soroban_state as i64 - rss_after_offer_cache as i64,
+            "reset_for_catchup: after soroban_state clear"
+        );
 
         // Reset state
         let mut state = self.state.write();
         state.header = create_genesis_header();
         state.header_hash = Hash256::ZERO;
         state.initialized = false;
+
+        let rss_end = get_rss_mb();
+        info!(
+            rss_mb = rss_end,
+            total_delta = rss_end as i64 - rss_start as i64,
+            "reset_for_catchup: END"
+        );
     }
 
     /// Initialize the persistent module cache from CONTRACT_CODE entries in the bucket list.
@@ -976,6 +1052,12 @@ impl LedgerManager {
     fn initialize_all_caches(&self, protocol_version: u32, ledger_seq: u32) -> Result<()> {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
 
+        let rss_start = get_rss_mb();
+        info!(
+            rss_mb = rss_start,
+            ledger_seq, "initialize_all_caches: START"
+        );
+
         let bucket_list = self.bucket_list.read();
 
         // Load rent config before iterating (uses point lookups, not full scan)
@@ -987,6 +1069,12 @@ impl LedgerManager {
         } else {
             None
         };
+        let rss_after_module_cache_create = get_rss_mb();
+        info!(
+            rss_mb = rss_after_module_cache_create,
+            delta = rss_after_module_cache_create as i64 - rss_start as i64,
+            "initialize_all_caches: after module_cache create (empty)"
+        );
 
         // Clear and prepare soroban state
         let mut soroban_state = self.soroban_state.write();
@@ -1008,6 +1096,14 @@ impl LedgerManager {
                 e
             ))
         })?;
+        let entry_count = live_entries.len();
+        let rss_after_live_entries = get_rss_mb();
+        info!(
+            rss_mb = rss_after_live_entries,
+            delta = rss_after_live_entries as i64 - rss_after_module_cache_create as i64,
+            entry_count,
+            "initialize_all_caches: after live_entries()"
+        );
 
         for entry in live_entries {
             match &entry.data {
@@ -1072,9 +1168,24 @@ impl LedgerManager {
             }
         }
 
+        let rss_after_iteration = get_rss_mb();
+        info!(
+            rss_mb = rss_after_iteration,
+            delta = rss_after_iteration as i64 - rss_after_live_entries as i64,
+            contracts_added,
+            "initialize_all_caches: after iteration (module cache populated)"
+        );
+
         // Drop bucket list lock before acquiring write locks
         drop(bucket_list);
         drop(soroban_state);
+
+        let rss_after_drops = get_rss_mb();
+        info!(
+            rss_mb = rss_after_drops,
+            delta = rss_after_drops as i64 - rss_after_iteration as i64,
+            "initialize_all_caches: after dropping bucket_list and soroban_state locks"
+        );
 
         // Store module cache
         *self.module_cache.write() = module_cache;
@@ -1086,6 +1197,7 @@ impl LedgerManager {
 
         // Log initialization stats
         let soroban_stats = self.soroban_state.read().stats();
+        let rss_end = get_rss_mb();
         info!(
             ledger_seq,
             contracts_added,
@@ -1096,6 +1208,8 @@ impl LedgerManager {
             total_soroban_size =
                 soroban_stats.contract_data_size + soroban_stats.contract_code_size,
             pending_ttl_count = soroban_stats.pending_ttl_count,
+            rss_mb = rss_end,
+            total_delta = rss_end as i64 - rss_start as i64,
             "Initialized all caches from bucket list (single pass)"
         );
 

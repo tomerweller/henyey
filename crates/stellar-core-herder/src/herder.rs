@@ -1211,6 +1211,11 @@ impl Herder {
             scp.purge_slots(slot.saturating_sub(10));
         }
 
+        // Clean up old fetching envelopes and cached tx sets (keep a small buffer)
+        // Keep the current slot and 2 slots back for any late envelopes
+        let keep_slot = slot.saturating_sub(2);
+        self.fetching_envelopes.erase_below(slot, keep_slot);
+
         // Clean up old data
         self.cleanup();
     }
@@ -1630,6 +1635,20 @@ impl Herder {
     /// Check if we have a cached QuorumSet in the fetching envelopes cache.
     pub fn has_fetching_quorum_set(&self, hash: &Hash256) -> bool {
         self.fetching_envelopes.has_quorum_set(hash)
+    }
+
+    /// Get SCP driver cache sizes for diagnostics.
+    pub fn scp_driver_cache_sizes(&self) -> crate::scp_driver::ScpDriverCacheSizes {
+        self.scp_driver.cache_sizes()
+    }
+
+    /// Get fetching envelopes cache sizes for diagnostics.
+    pub fn fetching_cache_sizes(&self) -> (usize, usize, usize) {
+        (
+            self.fetching_envelopes.tx_set_cache_size(),
+            self.fetching_envelopes.quorum_set_cache_size(),
+            self.fetching_envelopes.slots_count(),
+        )
     }
 }
 

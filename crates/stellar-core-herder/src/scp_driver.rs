@@ -137,6 +137,23 @@ pub struct PendingQuorumSet {
     pub node_ids: HashSet<NodeId>,
 }
 
+/// Cache sizes for diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct ScpDriverCacheSizes {
+    /// Cached transaction sets.
+    pub tx_set_cache: usize,
+    /// Pending transaction set requests.
+    pub pending_tx_sets: usize,
+    /// Pending quorum set requests.
+    pub pending_quorum_sets: usize,
+    /// Externalized slots.
+    pub externalized: usize,
+    /// Quorum sets by node ID.
+    pub quorum_sets: usize,
+    /// Quorum sets by hash.
+    pub quorum_sets_by_hash: usize,
+}
+
 /// SCP driver that integrates consensus with the Herder.
 ///
 /// This manages:
@@ -662,6 +679,43 @@ impl ScpDriver {
     /// Get the cache size.
     pub fn tx_set_cache_size(&self) -> usize {
         self.tx_set_cache.len()
+    }
+
+    /// Get the pending tx sets count.
+    pub fn pending_tx_sets_size(&self) -> usize {
+        self.pending_tx_sets.len()
+    }
+
+    /// Get the pending quorum sets count.
+    pub fn pending_quorum_sets_size(&self) -> usize {
+        self.pending_quorum_sets.len()
+    }
+
+    /// Get the externalized slots count.
+    pub fn externalized_size(&self) -> usize {
+        self.externalized.read().len()
+    }
+
+    /// Get the quorum sets count (by node ID).
+    pub fn quorum_sets_size(&self) -> usize {
+        self.quorum_sets.len()
+    }
+
+    /// Get the quorum sets by hash count.
+    pub fn quorum_sets_by_hash_size(&self) -> usize {
+        self.quorum_sets_by_hash.len()
+    }
+
+    /// Get all cache sizes for diagnostics.
+    pub fn cache_sizes(&self) -> ScpDriverCacheSizes {
+        ScpDriverCacheSizes {
+            tx_set_cache: self.tx_set_cache.len(),
+            pending_tx_sets: self.pending_tx_sets.len(),
+            pending_quorum_sets: self.pending_quorum_sets.len(),
+            externalized: self.externalized.read().len(),
+            quorum_sets: self.quorum_sets.len(),
+            quorum_sets_by_hash: self.quorum_sets_by_hash.len(),
+        }
     }
 
     /// Clear old externalized slots.

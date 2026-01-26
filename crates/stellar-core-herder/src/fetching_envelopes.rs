@@ -53,6 +53,10 @@ pub struct FetchingConfig {
     pub quorum_set_fetcher_config: ItemFetcherConfig,
     /// Maximum slots to track.
     pub max_slots: usize,
+    /// Maximum tx sets to cache. Once exceeded, older slots' tx sets are evicted.
+    pub max_tx_set_cache: usize,
+    /// Maximum quorum sets to cache. Once exceeded, oldest entries are evicted.
+    pub max_quorum_set_cache: usize,
 }
 
 impl Default for FetchingConfig {
@@ -61,6 +65,8 @@ impl Default for FetchingConfig {
             tx_set_fetcher_config: ItemFetcherConfig::default(),
             quorum_set_fetcher_config: ItemFetcherConfig::default(),
             max_slots: 12,
+            max_tx_set_cache: 100,
+            max_quorum_set_cache: 100,
         }
     }
 }
@@ -71,6 +77,8 @@ impl Default for FetchingConfig {
 /// this manager starts fetching it from peers. Once received, envelopes
 /// waiting for that data become ready for processing.
 pub struct FetchingEnvelopes {
+    /// Configuration.
+    config: FetchingConfig,
     /// Per-slot envelope state.
     slots: DashMap<SlotIndex, SlotEnvelopes>,
     /// TxSet fetcher.
@@ -111,6 +119,7 @@ impl FetchingEnvelopes {
                 ItemType::QuorumSet,
                 config.quorum_set_fetcher_config.clone(),
             ),
+            config,
             slots: DashMap::new(),
             tx_set_cache: DashMap::new(),
             quorum_set_cache: DashMap::new(),
@@ -212,6 +221,9 @@ impl FetchingEnvelopes {
 
         self.stats.write().tx_sets_received += 1;
 
+        // Evict old entries if cache is full
+        self.evict_tx_set_cache_if_full(slot);
+
         // Cache the TxSet
         self.tx_set_cache.insert(hash, (slot, data));
 
@@ -243,6 +255,9 @@ impl FetchingEnvelopes {
         }
 
         self.stats.write().quorum_sets_received += 1;
+
+        // Evict old entries if cache is full
+        self.evict_quorum_set_cache_if_full();
 
         // Cache the QuorumSet
         self.quorum_set_cache.insert(hash, Arc::new(quorum_set));
@@ -311,6 +326,28 @@ impl FetchingEnvelopes {
             self.slots.remove(&slot);
         }
 
+        // Evict old tx sets from cache (keeps memory bounded)
+        let tx_sets_to_remove: Vec<Hash256> = self
+            .tx_set_cache
+            .iter()
+            .filter(|e| e.value().0 < slot_index && e.value().0 != slot_to_keep)
+            .map(|e| *e.key())
+            .collect();
+
+        let evicted_count = tx_sets_to_remove.len();
+        for hash in tx_sets_to_remove {
+            self.tx_set_cache.remove(&hash);
+        }
+
+        if evicted_count > 0 {
+            debug!(
+                evicted = evicted_count,
+                slot_index,
+                remaining = self.tx_set_cache.len(),
+                "Evicted old TxSets from cache in erase_below"
+            );
+        }
+
         // Tell fetchers to stop fetching for old slots
         self.tx_set_fetcher
             .stop_fetching_below(slot_index, slot_to_keep);
@@ -328,6 +365,21 @@ impl FetchingEnvelopes {
     /// Get statistics.
     pub fn stats(&self) -> FetchingStats {
         self.stats.read().clone()
+    }
+
+    /// Get the number of cached TxSets.
+    pub fn tx_set_cache_size(&self) -> usize {
+        self.tx_set_cache.len()
+    }
+
+    /// Get the number of cached QuorumSets.
+    pub fn quorum_set_cache_size(&self) -> usize {
+        self.quorum_set_cache.len()
+    }
+
+    /// Get the number of slots being tracked.
+    pub fn slots_count(&self) -> usize {
+        self.slots.len()
     }
 
     /// Get the number of envelopes being fetched.
@@ -368,6 +420,7 @@ impl FetchingEnvelopes {
 
     /// Add a TxSet to the cache directly (e.g., locally created).
     pub fn cache_tx_set(&self, hash: Hash256, slot: SlotIndex, data: Vec<u8>) {
+        self.evict_tx_set_cache_if_full(slot);
         self.tx_set_cache.insert(hash, (slot, data));
     }
 
@@ -376,7 +429,8 @@ impl FetchingEnvelopes {
     /// This is used when we receive a tx set through other means (not the fetcher)
     /// but want to notify waiting envelopes that the dependency is satisfied.
     pub fn tx_set_available(&self, hash: Hash256, slot: SlotIndex) {
-        // Cache it
+        // Cache it (eviction handled in cache_tx_set)
+        self.evict_tx_set_cache_if_full(slot);
         self.tx_set_cache.insert(hash, (slot, Vec::new()));
 
         // Try recv_tx_set which handles tracked items
@@ -415,10 +469,58 @@ impl FetchingEnvelopes {
 
     /// Add a QuorumSet to the cache directly.
     pub fn cache_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
+        self.evict_quorum_set_cache_if_full();
         self.quorum_set_cache.insert(hash, Arc::new(quorum_set));
     }
 
     // --- Internal helpers ---
+
+    /// Evict old tx set cache entries if the cache is full.
+    /// Evicts entries from the oldest slots first.
+    fn evict_tx_set_cache_if_full(&self, current_slot: SlotIndex) {
+        if self.tx_set_cache.len() < self.config.max_tx_set_cache {
+            return;
+        }
+
+        // Find the oldest slot entry to evict
+        let mut oldest_slot = current_slot;
+        let mut oldest_hash = None;
+
+        for entry in self.tx_set_cache.iter() {
+            if entry.value().0 < oldest_slot {
+                oldest_slot = entry.value().0;
+                oldest_hash = Some(*entry.key());
+            }
+        }
+
+        if let Some(hash) = oldest_hash {
+            self.tx_set_cache.remove(&hash);
+            debug!(
+                evicted_slot = oldest_slot,
+                cache_size = self.tx_set_cache.len(),
+                "Evicted old TxSet from cache"
+            );
+        }
+    }
+
+    /// Evict old quorum set cache entries if the cache is full.
+    /// Simply removes a random entry since quorum sets don't have slot info.
+    fn evict_quorum_set_cache_if_full(&self) {
+        if self.quorum_set_cache.len() < self.config.max_quorum_set_cache {
+            return;
+        }
+
+        // Remove any entry
+        if let Some(entry) = self.quorum_set_cache.iter().next() {
+            let hash = *entry.key();
+            drop(entry); // Release the iterator before removing
+            self.quorum_set_cache.remove(&hash);
+            debug!(
+                cache_size = self.quorum_set_cache.len(),
+                "Evicted old QuorumSet from cache"
+            );
+        }
+    }
 
     /// Check what dependencies are missing for an envelope.
     ///
