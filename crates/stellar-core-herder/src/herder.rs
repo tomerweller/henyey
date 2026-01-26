@@ -539,6 +539,71 @@ impl Herder {
         self.slot_quorum_tracker.read().is_v_blocking(slot)
     }
 
+    /// Get all slots that have achieved v-blocking status, sorted descending.
+    pub fn get_v_blocking_slots(&self) -> Vec<SlotIndex> {
+        self.slot_quorum_tracker.read().get_v_blocking_slots()
+    }
+
+    /// Perform out-of-sync recovery by purging old slots.
+    ///
+    /// This mirrors C++ stellar-core's `outOfSyncRecovery()` function.
+    /// When we're out of sync, we scan v-blocking slots from highest to lowest
+    /// and purge all slots more than LEDGER_VALIDITY_BRACKET (100) behind
+    /// the highest v-blocking slot.
+    ///
+    /// Returns the slot we purged below, or None if no purging was done.
+    pub fn out_of_sync_recovery(&self, lcl: u64) -> Option<u64> {
+        const LEDGER_VALIDITY_BRACKET: u64 = 100;
+
+        // Don't call this when tracking normally
+        if self.state() == HerderState::Tracking {
+            return None;
+        }
+
+        let v_blocking_slots = self.get_v_blocking_slots();
+        if v_blocking_slots.is_empty() {
+            return None;
+        }
+
+        // Find the slot to purge below: 100 slots behind the highest v-blocking slot
+        let mut max_slots_ahead = LEDGER_VALIDITY_BRACKET;
+        let mut purge_slot = None;
+
+        for slot in v_blocking_slots {
+            max_slots_ahead = max_slots_ahead.saturating_sub(1);
+            if max_slots_ahead == 0 {
+                purge_slot = Some(slot);
+                break;
+            }
+        }
+
+        if let Some(purge_slot) = purge_slot {
+            info!(purge_slot, "Out-of-sync recovery: purging slots below");
+
+            // Calculate slot_to_keep (for checkpoint preservation, keep last checkpoint)
+            let checkpoint_frequency = 64u64;
+            let last_checkpoint = (lcl / checkpoint_frequency) * checkpoint_frequency;
+
+            self.fetching_envelopes
+                .erase_below(purge_slot, last_checkpoint);
+
+            // Clear slot quorum tracker entries below purge_slot
+            self.slot_quorum_tracker.write().clear_slots_below(purge_slot);
+
+            // Purge SCP state
+            if let Some(ref scp) = self.scp {
+                scp.purge_slots(purge_slot.saturating_sub(1));
+            }
+
+            // Purge externalized values and pending tx set requests
+            self.scp_driver.purge_slots_below(purge_slot);
+
+            return Some(purge_slot);
+        }
+
+        None
+    }
+
     /// Bootstrap the Herder after catchup.
     ///
     /// This transitions the Herder from Syncing to Tracking state,
@@ -616,16 +681,20 @@ impl Herder {
         if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
             &envelope.statement.pledges
         {
+            // Extract value and tx_set_hash upfront before any potential move
+            let value = ext.commit.value.clone();
+            let tx_set_hash = if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
+                Hash256::from_bytes(sv.tx_set_hash.0)
+            } else {
+                warn!(slot, "Failed to parse StellarValue from EXTERNALIZE");
+                return EnvelopeState::Invalid;
+            };
+
             // Only request tx sets for slots we haven't already closed via catchup
             if lcl.map_or(true, |l| slot > l) {
-                // Extract tx set hash from the externalized value and request it immediately
-                // This ensures we request tx sets as soon as we learn about them, not after externalization
-                if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
-                    let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                    // Request this tx set immediately - don't wait for ledger close
-                    if self.scp_driver.request_tx_set(tx_set_hash, slot) {
-                        info!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
-                    }
+                // Request this tx set immediately - don't wait for ledger close
+                if self.scp_driver.request_tx_set(tx_set_hash, slot) {
+                    info!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
                 }
             }
 
@@ -661,13 +730,43 @@ impl Herder {
                     return EnvelopeState::Invalid;
                 }
 
+                // CRITICAL: Don't externalize without the tx_set!
+                // Like C++ stellar-core, we must wait until the tx_set is available before
+                // recording externalization. Otherwise we create buffered ledgers that can
+                // never close (no tx_set to apply).
+                if !self.scp_driver.has_tx_set(&tx_set_hash) {
+                    debug!(
+                        slot,
+                        hash = %tx_set_hash,
+                        "Fast-forward EXTERNALIZE waiting for tx_set"
+                    );
+                    // Buffer this envelope until tx_set arrives
+                    use crate::fetching_envelopes::RecvResult;
+                    let result = self.fetching_envelopes.recv_envelope(envelope);
+                    match result {
+                        RecvResult::Ready => {
+                            // tx_set is in fetching cache, proceed below
+                            debug!(slot, "EXTERNALIZE ready after fetching check");
+                        }
+                        RecvResult::Fetching => {
+                            // Request already made above, wait for it
+                            return EnvelopeState::Fetching;
+                        }
+                        RecvResult::AlreadyProcessed => {
+                            return EnvelopeState::Duplicate;
+                        }
+                        RecvResult::Discarded => {
+                            return EnvelopeState::Invalid;
+                        }
+                    }
+                }
+
                 // Fast-forward to this slot using the externalized value
                 info!(
                     slot,
                     current_slot, "Fast-forwarding using EXTERNALIZE from network"
                 );
 
-                let value = ext.commit.value.clone();
                 self.scp_driver.record_externalized(slot, value.clone());
                 self.scp_driver
                     .cleanup_externalized(self.config.max_externalized_slots);
@@ -706,6 +805,40 @@ impl Herder {
                     return EnvelopeState::Invalid;
                 }
 
+                // Request the tx_set for this gap slot so we can close it
+                let is_new = self.scp_driver.request_tx_set(tx_set_hash, slot);
+                if is_new {
+                    info!(slot, hash = %tx_set_hash, "Requesting tx set for gap slot");
+                }
+
+                // CRITICAL: Don't externalize without the tx_set!
+                // Like C++ stellar-core, we must wait until the tx_set is available.
+                if !self.scp_driver.has_tx_set(&tx_set_hash) {
+                    debug!(
+                        slot,
+                        hash = %tx_set_hash,
+                        "Gap slot EXTERNALIZE waiting for tx_set"
+                    );
+                    // Buffer this envelope until tx_set arrives
+                    use crate::fetching_envelopes::RecvResult;
+                    let result = self.fetching_envelopes.recv_envelope(envelope);
+                    match result {
+                        RecvResult::Ready => {
+                            // tx_set is in fetching cache, proceed
+                            debug!(slot, "Gap EXTERNALIZE ready after fetching check");
+                        }
+                        RecvResult::Fetching => {
+                            return EnvelopeState::Fetching;
+                        }
+                        RecvResult::AlreadyProcessed => {
+                            return EnvelopeState::Duplicate;
+                        }
+                        RecvResult::Discarded => {
+                            return EnvelopeState::Invalid;
+                        }
+                    }
+                }
+
                 // Record this externalization so we can close the gap ledger
                 info!(
                     slot,
@@ -713,17 +846,6 @@ impl Herder {
                     lcl = lcl.unwrap_or(0),
                     "Accepting EXTERNALIZE for gap slot from trusted validator"
                 );
-
-                let value = ext.commit.value.clone();
-
-                // Request the tx_set for this gap slot so we can close it
-                if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
-                    let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                    let is_new = self.scp_driver.request_tx_set(tx_set_hash, slot);
-                    info!(slot, hash = %tx_set_hash, is_new, "Requesting tx set for gap slot");
-                } else {
-                    warn!(slot, "Failed to parse StellarValue from gap slot EXTERNALIZE");
-                }
 
                 self.scp_driver.record_externalized(slot, value.clone());
 

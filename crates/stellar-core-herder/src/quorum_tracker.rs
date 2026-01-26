@@ -104,6 +104,11 @@ impl SlotQuorumTracker {
         self.slot_nodes.remove(&slot);
     }
 
+    /// Remove entries for all slots below a given slot.
+    pub fn clear_slots_below(&mut self, min_slot: SlotIndex) {
+        self.slot_nodes.retain(|&slot, _| slot >= min_slot);
+    }
+
     /// Check if we have a quorum for a slot.
     pub fn has_quorum<F>(&self, slot: SlotIndex, get_qs: F) -> bool
     where
@@ -131,6 +136,32 @@ impl SlotQuorumTracker {
             None => return false,
         };
         is_v_blocking(local, nodes)
+    }
+
+    /// Get all slots that have achieved v-blocking status, sorted descending by slot.
+    ///
+    /// This is used for out-of-sync recovery to find slots to purge.
+    pub fn get_v_blocking_slots(&self) -> Vec<SlotIndex> {
+        let local = match &self.local_quorum_set {
+            Some(qs) => qs,
+            None => return vec![],
+        };
+
+        let mut v_blocking_slots: Vec<SlotIndex> = self
+            .slot_nodes
+            .iter()
+            .filter_map(|(slot, nodes)| {
+                if is_v_blocking(local, nodes) {
+                    Some(*slot)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort descending (highest slot first)
+        v_blocking_slots.sort_unstable_by(|a, b| b.cmp(a));
+        v_blocking_slots
     }
 
     fn prune(&mut self) {

@@ -2638,6 +2638,21 @@ impl App {
                             self.request_scp_state_from_peers().await;
                         }
                     }
+
+                    // Out-of-sync recovery: purge old slots when we're too far behind.
+                    // This mirrors C++ stellar-core's outOfSyncRecovery() behavior.
+                    // When we have v-blocking slots that are >100 ahead of older slots,
+                    // purge the old slots to free memory and allow recovery.
+                    if !self.herder.state().can_receive_scp() || !heard_from_quorum {
+                        if let Some(purge_slot) = self.herder.out_of_sync_recovery(ledger as u64) {
+                            tracing::info!(
+                                purge_slot,
+                                ledger,
+                                tracking_slot,
+                                "Out-of-sync recovery: purged old slots"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3330,16 +3345,22 @@ impl App {
                     
                     if self.herder.needs_tx_set(&hash) {
                         if all_peers_dont_have {
-                            // All peers don't have this tx_set - trigger catchup
-                            tracing::warn!(
+                            // All peers don't have this tx_set - log but DON'T trigger catchup.
+                            // Like C++ stellar-core, we rely on slot eviction to eventually
+                            // clean up old slots when we're >100 slots behind the highest
+                            // v-blocking slot. Triggering catchup on DontHave creates loops
+                            // because catchup targets checkpoints, leaving gaps that also
+                            // get DontHave responses.
+                            tracing::info!(
                                 hash = %hash,
                                 dont_have_count,
                                 peer_count,
-                                "All peers reported DontHave for needed TxSet; triggering catchup"
+                                "All peers reported DontHave for needed TxSet; relying on slot eviction"
                             );
                             drop(map);
-                            // Signal that we need to catchup due to unavailable tx_set
-                            self.trigger_catchup_due_to_missing_txset().await;
+                            // Reset request tracking to allow retry later
+                            let mut last_request = self.tx_set_last_request.write().await;
+                            last_request.remove(&hash);
                         } else {
                             let mut last_request = self.tx_set_last_request.write().await;
                             last_request.remove(&hash);
@@ -3766,119 +3787,10 @@ impl App {
         }
     }
 
-    /// Trigger catchup when all peers report DontHave for a needed tx_set.
-    /// This handles the case where we're stuck with a small gap (< checkpoint)
-    /// but can't make progress because the tx_set is no longer available from peers.
-    async fn trigger_catchup_due_to_missing_txset(&self) {
-        let current_ledger = match self.get_current_ledger().await {
-            Ok(seq) => seq,
-            Err(_) => return,
-        };
-
-        // Cooldown check: if we recently attempted catchup (which may have skipped because
-        // we're already past the latest checkpoint), don't retry immediately. Use the same
-        // cooldown as the archive cache to avoid hammering the archive while waiting for
-        // the next checkpoint to be published.
-        let recently_caught_up = self
-            .last_catchup_completed_at
-            .read()
-            .await
-            .is_some_and(|t| t.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS);
-        if recently_caught_up {
-            tracing::debug!(
-                current_ledger,
-                "Skipping missing txset catchup: waiting for next checkpoint (cooldown active)"
-            );
-            return;
-        }
-
-        // Check if we're already catching up
-        if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
-            tracing::debug!("Catchup already in progress, skipping missing txset catchup");
-            return;
-        }
-
-        tracing::info!(
-            current_ledger,
-            "Triggering catchup due to missing tx_set from all peers"
-        );
-
-        // Clear the dont_have tracking since we're going to catchup
-        {
-            let mut dont_have = self.tx_set_dont_have.write().await;
-            dont_have.clear();
-        }
-
-        // Start caching messages during catchup to capture tx_sets for gap ledgers
-        let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
-
-        // Use CatchupTarget::Current to get the latest checkpoint from archive
-        let catchup_result = self.catchup(CatchupTarget::Current).await;
-
-        // Stop the catchup message caching task
-        if let Some(handle) = catchup_message_handle {
-            handle.abort();
-            tracing::debug!("Stopped catchup message caching task (missing txset catchup)");
-        }
-
-        self.catchup_in_progress.store(false, Ordering::SeqCst);
-
-        match catchup_result {
-            Ok(result) => {
-                // Check if catchup was skipped (already at target) vs actually performed work
-                let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
-
-                if catchup_did_work {
-                    *self.current_ledger.write().await = result.ledger_seq;
-                    *self.last_processed_slot.write().await = result.ledger_seq as u64;
-                    self.clear_tx_advert_history(result.ledger_seq).await;
-                    self.herder.bootstrap(result.ledger_seq);
-                    // Purge old externalized slots to prevent matching new tx_sets to old slots
-                    self.herder.purge_slots_below(result.ledger_seq as u64);
-                    let cleaned = self
-                        .herder
-                        .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
-                    if cleaned > 0 {
-                        tracing::info!(
-                            cleaned,
-                            "Dropped stale pending tx set requests after missing txset catchup"
-                        );
-                    }
-                    // Reset tx_set tracking to give pending requests a fresh chance
-                    // Only do this when catchup actually did work - if it skipped,
-                    // we should preserve pending tx_set requests so they can be matched
-                    self.reset_tx_set_tracking_after_catchup().await;
-                    if self.is_validator {
-                        self.set_state(AppState::Validating).await;
-                    } else {
-                        self.set_state(AppState::Synced).await;
-                    }
-                    tracing::info!(
-                        ledger_seq = result.ledger_seq,
-                        "Catchup due to missing tx_set completed"
-                    );
-                    self.try_apply_buffered_ledgers().await;
-                } else {
-                    // Catchup was skipped (already at or past target checkpoint)
-                    // This means we're past the latest published checkpoint but can't close
-                    // ledgers because peers don't have the tx sets. We need to wait for the
-                    // next checkpoint to be published to the archive.
-                    let next_checkpoint = (result.ledger_seq / CHECKPOINT_FREQUENCY + 1) * CHECKPOINT_FREQUENCY + CHECKPOINT_FREQUENCY - 1;
-                    tracing::warn!(
-                        current_ledger = result.ledger_seq,
-                        next_checkpoint,
-                        cooldown_secs = ARCHIVE_CHECKPOINT_CACHE_SECS,
-                        "Waiting for next checkpoint: past latest published checkpoint but tx sets unavailable from peers"
-                    );
-                }
-                // Record catchup completion time for cooldown (always, even if skipped)
-                *self.last_catchup_completed_at.write().await = Some(Instant::now());
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "Catchup due to missing tx_set failed");
-            }
-        }
-    }
+    // NOTE: trigger_catchup_due_to_missing_txset was removed.
+    // We now rely on slot eviction (out_of_sync_recovery) instead of triggering catchup
+    // when all peers report DontHave. This matches C++ stellar-core behavior and avoids
+    // catchup loops that occur when catchup targets checkpoints, leaving gaps.
 
     async fn maybe_start_buffered_catchup(&self) {
         // Early cooldown check: if we recently skipped catchup due to no newer checkpoint,
