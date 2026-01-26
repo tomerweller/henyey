@@ -69,12 +69,36 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 620000-635729 | 15,730 | ~60,000+ | 100% | ~98% | Duplicate hot archive key fix verified |
 | 635729-635745 | 17 | 250+ | 100% | ~99% | Hot archive actual_restored_indices fix verified (ledger 635730) |
 | 635740-635741 | 2 | 9 | 100% | ~99% | Hot archive catch-up mode fix verified (F18) |
+| 647350-647355 | 6 | 30+ | 100% | ~99% | CreateClaimableBalance check order fix verified (F19) |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
 ### Issues Fixed (2026-01-26)
 
-#### 1. Hot Archive Restoration Using Envelope Instead of Actual Restored Indices (Ledger 635730)
+#### 1. CreateClaimableBalance Check Order (Ledger 647352)
+
+The `CreateClaimableBalance` operation was incorrectly checking sponsor reserve (LowReserve) before available balance (Underfunded). C++ stellar-core checks available balance FIRST using the CURRENT minimum balance (without new sponsorship), then checks sponsor reserve AFTER balance deduction.
+
+**Root Cause**: Our code was including `sponsorship_multiplier` in the available balance check when `sponsor == source`. This caused us to return `Underfunded` when the balance check should pass but the reserve check should fail.
+
+**Observed symptoms**:
+- Our result: `CreateClaimableBalance(Underfunded)`
+- CDP result: `CreateClaimableBalance(LowReserve)`
+
+**Fix**: 
+1. Changed available balance check to NOT include sponsorship (matching C++ `getAvailableBalance`)
+2. Moved sponsor reserve check (LowReserve) to AFTER balance deduction
+
+**Files changed:**
+- `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
+
+**Regression tests:**
+- `test_create_claimable_balance_low_reserve_after_underfunded_check`
+- `test_create_claimable_balance_underfunded`
+
+**Verification**: Ledgers 647350-647355 pass with 0 header mismatches.
+
+#### 2. Hot Archive Restoration Using Envelope Instead of Actual Restored Indices (Ledger 635730)
 
 The `extract_hot_archive_restored_keys` function in `execution.rs` was incorrectly using raw `archived_soroban_entries` from the transaction envelope to determine hot archive restorations. Entries listed in `archived_soroban_entries` may have already been restored by a previous transaction in the same ledger.
 
@@ -725,6 +749,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-26**: Fixed CreateClaimableBalance check order (F19) - Underfunded before LowReserve (ledger 647352) - extends verification to 647355+
 - **2026-01-26**: Fixed hot archive restored keys not collected during catch-up mode (F18) - enables verification from any ledger within checkpoint range
 - **2026-01-26**: Fixed duplicate hot archive restored keys causing multiple LIVE entries (ledger 635730 partial fix) - extends verification to 635729
 - **2026-01-26**: Fixed hot archive restored entries then deleted should not go to live bucket list DEAD (ledgers 603325, 610541) - extends verification to 646000+

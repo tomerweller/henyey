@@ -977,6 +977,63 @@ Added collection of hot archive restored keys in the catch-up mode branch:
 
 ---
 
+### F19: CreateClaimableBalance Check Order (Underfunded Before LowReserve)
+
+**Status**: FIXED  
+**Impact**: Was returning Underfunded when CDP expected LowReserve  
+**Added**: 2026-01-26  
+**Fixed**: 2026-01-26
+
+**Description**:
+The `CreateClaimableBalance` operation was incorrectly checking sponsor reserve (LowReserve) before available balance (Underfunded). In C++ stellar-core, the available balance check happens FIRST using the CURRENT minimum balance (without the new sponsorship), and the sponsor reserve check happens AFTER the balance is deducted.
+
+**Observed at**: Ledger 647352 (testnet)
+
+**Symptoms**:
+- Our result: `CreateClaimableBalance(Underfunded)`
+- CDP result: `CreateClaimableBalance(LowReserve)`
+- The sponsor had enough balance for the claimable balance amount but not enough reserve for the new sponsorship
+
+**Root Cause**:
+In C++ stellar-core's `CreateClaimableBalanceOpFrame::doApply()`:
+1. First calls `getAvailableBalance(sourceAccount)` which computes `balance - minBalance(CURRENT_state)`
+   - **Key**: `minBalance` does NOT include the new sponsorship being created
+2. If `available < amount`, returns `UNDERFUNDED`
+3. Deducts the balance via `addBalance`
+4. Calls `createEntryWithPossibleSponsorship` which checks sponsor reserve → `LOW_RESERVE`
+
+Our code was incorrectly including `sponsorship_multiplier` in the available balance check when `sponsor == source`, causing us to return `Underfunded` when the balance check should pass but the reserve check should fail.
+
+**Solution**:
+1. Changed available balance check to NOT include sponsorship (matching C++ `getAvailableBalance`):
+```rust
+// BEFORE (incorrect):
+let min_balance = if sponsor_is_source {
+    state.minimum_balance_for_account_with_deltas(
+        &account, context.protocol_version, 0, sponsorship_multiplier, 0,
+    )?
+} else {
+    state.minimum_balance_for_account(&account, context.protocol_version, 0)?
+};
+
+// AFTER (correct - matches C++ getAvailableBalance):
+let min_balance =
+    state.minimum_balance_for_account(&account, context.protocol_version, 0)?;
+```
+
+2. Moved sponsor reserve check (LowReserve) to AFTER balance deduction, matching C++ order.
+
+**Files Changed**:
+- `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs` - Reordered checks, fixed available balance calculation
+
+**Regression Tests**:
+- `test_create_claimable_balance_low_reserve_after_underfunded_check` - Verifies LOW_RESERVE when available passes but sponsor reserve fails
+- `test_create_claimable_balance_underfunded` - Verifies UNDERFUNDED when available balance is too low
+
+**Verification**: Ledgers 647350-647355 pass with 0 header mismatches.
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:

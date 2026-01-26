@@ -96,40 +96,26 @@ pub fn execute_create_claimable_balance(
     let sponsor = state
         .active_sponsor_for(source)
         .unwrap_or_else(|| source.clone());
-    let sponsor_is_source = sponsor == *source;
+    let _sponsor_is_source = sponsor == *source;
     let sponsorship_multiplier = op.claimants.len() as i64;
 
-    let sponsor_account = state
-        .get_account(&sponsor)
-        .ok_or(TxError::SourceAccountNotFound)?;
-    let sponsor_min_balance = state.minimum_balance_for_account_with_deltas(
-        sponsor_account,
-        context.protocol_version,
-        0,
-        sponsorship_multiplier,
-        0,
-    )?;
-    if sponsor_account.balance < sponsor_min_balance {
-        return Ok(make_create_result(
-            CreateClaimableBalanceResultCode::LowReserve,
-            None,
-        ));
-    }
+    // C++ stellar-core order:
+    // 1. Check available balance (UNDERFUNDED) - before deducting
+    // 2. Deduct balance
+    // 3. Call createEntryWithPossibleSponsorship (LOW_RESERVE)
+    //
+    // We must check UNDERFUNDED before LOW_RESERVE to match C++ behavior.
 
-    // Check source has sufficient balance
+    // Check source has sufficient balance FIRST (matches C++ getAvailableBalance check)
+    // NOTE: C++ getAvailableBalance() uses getMinBalance() which does NOT include
+    // the sponsorship for the new claimable balance. The sponsorship reserve check
+    // happens separately in createEntryWithPossibleSponsorship AFTER deducting balance.
     match &op.asset {
         Asset::Native => {
-            let min_balance = if sponsor_is_source {
-                state.minimum_balance_for_account_with_deltas(
-                    &account,
-                    context.protocol_version,
-                    0,
-                    sponsorship_multiplier,
-                    0,
-                )?
-            } else {
-                state.minimum_balance_for_account(&account, context.protocol_version, 0)?
-            };
+            // For native assets, available = balance - minBalance(current state)
+            // Do NOT include sponsorship_multiplier here - matches C++ behavior
+            let min_balance =
+                state.minimum_balance_for_account(&account, context.protocol_version, 0)?;
             let available = account.balance - min_balance;
             if available < op.amount {
                 return Ok(make_create_result(
@@ -171,7 +157,7 @@ pub fn execute_create_claimable_balance(
     // Generate the claimable balance ID
     let balance_id = generate_claimable_balance_id(tx_source, tx_seq, op_index)?;
 
-    // Deduct balance from source
+    // Deduct balance from source (matches C++ addBalance call)
     match &op.asset {
         Asset::Native => {
             if let Some(account) = state.get_account_mut(source) {
@@ -185,6 +171,25 @@ pub fn execute_create_claimable_balance(
                 }
             }
         }
+    }
+
+    // NOW check sponsor's reserve (matches C++ createEntryWithPossibleSponsorship)
+    // This happens AFTER balance deduction in C++
+    let sponsor_account = state
+        .get_account(&sponsor)
+        .ok_or(TxError::SourceAccountNotFound)?;
+    let sponsor_min_balance = state.minimum_balance_for_account_with_deltas(
+        sponsor_account,
+        context.protocol_version,
+        0,
+        sponsorship_multiplier,
+        0,
+    )?;
+    if sponsor_account.balance < sponsor_min_balance {
+        return Ok(make_create_result(
+            CreateClaimableBalanceResultCode::LowReserve,
+            None,
+        ));
     }
 
     let mut claimable_flags = 0u32;
@@ -1268,5 +1273,136 @@ mod tests {
             op_source_in_delta,
             "Operation source account should be recorded in delta when different from tx source"
         );
+    }
+
+    /// Test that CreateClaimableBalance checks available balance before sponsor reserve.
+    ///
+    /// This is a regression test for ledger 647352 (testnet). In C++ stellar-core:
+    /// 1. First checks getAvailableBalance (available = balance - minBalance(current))
+    ///    - Note: minBalance does NOT include the new sponsorship
+    /// 2. Deducts balance via addBalance
+    /// 3. Calls createEntryWithPossibleSponsorship which checks sponsor reserve
+    ///
+    /// The key insight is that getAvailableBalance uses CURRENT minBalance, not
+    /// minBalance AFTER the new sponsorship. So:
+    /// - If available >= amount, the balance is deducted
+    /// - THEN sponsorship reserve is checked separately
+    ///
+    /// This test verifies the scenario where:
+    /// - available (balance - current_minBalance) >= amount  -> passes underfunded check
+    /// - But sponsor doesn't have enough reserve -> returns LOW_RESERVE
+    #[test]
+    fn test_create_claimable_balance_low_reserve_after_underfunded_check() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let claimant_id = create_test_account_id(1);
+
+        // base_reserve = 5_000_000
+        // min_balance for account with 0 sub_entries = 2 * base_reserve = 10_000_000
+        //
+        // Create source account with balance = 20_000_000
+        // - current min_balance = 10_000_000
+        // - available = 20_000_000 - 10_000_000 = 10_000_000
+        // - amount = 5_000_000 (less than available) -> UNDERFUNDED check passes
+        //
+        // After deducting 5_000_000, balance = 15_000_000
+        // For sponsorship check with 1 claimant:
+        // - sponsor_min_balance = 10_000_000 + 1*5_000_000 = 15_000_000
+        // - sponsor_balance = 15_000_000 (after deduction)
+        // - 15_000_000 >= 15_000_000 -> sponsor check PASSES too
+        //
+        // To trigger LOW_RESERVE, we need balance just barely above available check
+        // but after deduction, below sponsor requirement.
+        //
+        // balance = 15_500_000
+        // - available = 15_500_000 - 10_000_000 = 5_500_000
+        // - amount = 5_000_000 -> UNDERFUNDED check passes
+        // After deducting: balance = 10_500_000
+        // - sponsor_min_balance = 10_000_000 + 5_000_000 = 15_000_000
+        // - 10_500_000 < 15_000_000 -> LOW_RESERVE
+        state.create_account(create_test_account(source_id.clone(), 15_500_000));
+        state.create_account(create_test_account(claimant_id.clone(), 10_000_000));
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        let op = CreateClaimableBalanceOp {
+            asset: Asset::Native,
+            amount: 5_000_000,
+            claimants: vec![claimant].try_into().unwrap(),
+        };
+
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
+
+        // Should return LOW_RESERVE because:
+        // 1. UNDERFUNDED check passes (available 5.5M >= amount 5M)
+        // 2. Balance is deducted (15.5M - 5M = 10.5M)
+        // 3. Sponsor reserve check fails (10.5M < 15M required)
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, CreateClaimableBalanceResult::LowReserve),
+                    "Expected LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test that CreateClaimableBalance returns UNDERFUNDED when available balance is too low.
+    ///
+    /// Complementary test to verify UNDERFUNDED is returned when the available balance
+    /// (balance - current_minBalance) is less than the amount.
+    #[test]
+    fn test_create_claimable_balance_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let claimant_id = create_test_account_id(1);
+
+        // base_reserve = 5_000_000
+        // min_balance = 10_000_000 (2 * base_reserve for 0 sub_entries)
+        //
+        // balance = 12_000_000
+        // available = 12_000_000 - 10_000_000 = 2_000_000
+        // amount = 5_000_000 > 2_000_000 -> UNDERFUNDED
+        state.create_account(create_test_account(source_id.clone(), 12_000_000));
+        state.create_account(create_test_account(claimant_id.clone(), 10_000_000));
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        let op = CreateClaimableBalanceOp {
+            asset: Asset::Native,
+            amount: 5_000_000,
+            claimants: vec![claimant].try_into().unwrap(),
+        };
+
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .expect("create claimable balance");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, CreateClaimableBalanceResult::Underfunded),
+                    "Expected Underfunded, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 }
