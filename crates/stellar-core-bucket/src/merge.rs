@@ -309,23 +309,25 @@ pub fn merge_in_memory(
         "merge_in_memory: starting"
     );
 
-    // Build output metadata
-    let old_meta = extract_metadata(old_entries);
-    let new_meta = extract_metadata(new_entries);
+    // Build output metadata using max_protocol_version directly.
+    // This matches C++ mergeInMemory behavior where meta.ledgerVersion = maxProtocolVersion
+    // without calling calculateMergeProtocolVersion.
+    let output_meta = if max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY {
+        let mut meta = BucketMetadata {
+            ledger_version: max_protocol_version,
+            ext: BucketMetadataExt::V0,
+        };
+        if max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+            meta.ext = BucketMetadataExt::V1(stellar_xdr::curr::BucketListType::Live);
+        }
+        Some(BucketEntry::Metadata(meta))
+    } else {
+        None
+    };
 
-    // DEBUG: print metadata extraction
-    tracing::debug!(
-        old_meta = ?old_meta,
-        new_meta = ?new_meta,
-        "merge_in_memory: extracted metadata"
-    );
-
-    let (_, output_meta) =
-        build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
-
-    // DEBUG: print output metadata
     tracing::debug!(
         output_meta = ?output_meta,
+        max_protocol_version = max_protocol_version,
         "merge_in_memory: built output metadata"
     );
 
@@ -836,26 +838,24 @@ fn build_output_metadata(
     new_meta: Option<&BucketMetadata>,
     max_protocol_version: u32,
 ) -> Result<(u32, Option<BucketEntry>)> {
-    let mut input_version = 0u32;
+    // Calculate the merge protocol version as max of input bucket versions.
+    // This matches C++ stellar-core's calculateMergeProtocolVersion() in BucketBase.cpp.
+    let mut protocol_version = 0u32;
     if let Some(meta) = old_meta {
-        input_version = input_version.max(meta.ledger_version);
+        protocol_version = protocol_version.max(meta.ledger_version);
     }
     if let Some(meta) = new_meta {
-        input_version = input_version.max(meta.ledger_version);
+        protocol_version = protocol_version.max(meta.ledger_version);
     }
 
-    if max_protocol_version > 0 && input_version > max_protocol_version {
+    // Validate that the calculated version doesn't exceed max_protocol_version.
+    // max_protocol_version is a constraint, not the output version.
+    if max_protocol_version > 0 && protocol_version > max_protocol_version {
         return Err(BucketError::Merge(format!(
             "bucket protocol version {} exceeds max_protocol_version {}",
-            input_version, max_protocol_version
+            protocol_version, max_protocol_version
         )));
     }
-
-    let protocol_version = if max_protocol_version > 0 {
-        max_protocol_version
-    } else {
-        input_version
-    };
 
     let use_meta = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
     if !use_meta {
@@ -1347,5 +1347,260 @@ mod tests {
         // Should be able to get in-memory entries
         let in_mem = bucket.get_in_memory_entries().unwrap();
         assert_eq!(in_mem.len(), 2);
+    }
+
+    // ============ Protocol Version Handling Regression Tests ============
+    //
+    // These tests verify the fix for bucket list hash divergence caused by
+    // incorrect protocol version handling in merges.
+    //
+    // C++ stellar-core has TWO different merge behaviors:
+    // 1. In-memory merge (level 0): Uses maxProtocolVersion directly
+    // 2. Disk-based merge (levels 1+): Uses max(old_bucket_version, new_bucket_version)
+    //
+    // Our Rust code was incorrectly using max_protocol_version as output for ALL merges.
+
+    #[test]
+    fn test_build_output_metadata_uses_max_of_inputs() {
+        // Regression test: build_output_metadata must use max(old, new) as output version,
+        // NOT max_protocol_version. max_protocol_version is only a constraint.
+
+        // Create metadata with different versions
+        let old_meta = BucketMetadata {
+            ledger_version: 20,
+            ext: BucketMetadataExt::V0,
+        };
+        let new_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+
+        // max_protocol_version is 25 (current ledger), but output should be max(20, 22) = 22
+        let (version, output_meta) =
+            build_output_metadata(Some(&old_meta), Some(&new_meta), 25).unwrap();
+
+        assert_eq!(
+            version, 22,
+            "Output version should be max(old=20, new=22) = 22, NOT max_protocol_version=25"
+        );
+        assert!(output_meta.is_some());
+        if let Some(BucketEntry::Metadata(meta)) = output_meta {
+            assert_eq!(meta.ledger_version, 22);
+        }
+    }
+
+    #[test]
+    fn test_build_output_metadata_validates_constraint() {
+        // Regression test: max_protocol_version should be validated as a constraint
+        let old_meta = BucketMetadata {
+            ledger_version: 20,
+            ext: BucketMetadataExt::V0,
+        };
+        let new_meta = BucketMetadata {
+            ledger_version: 26, // Exceeds max_protocol_version
+            ext: BucketMetadataExt::V0,
+        };
+
+        // Should fail because 26 > 25 (the constraint)
+        let result = build_output_metadata(Some(&old_meta), Some(&new_meta), 25);
+        assert!(
+            result.is_err(),
+            "Should fail when bucket version exceeds max_protocol_version constraint"
+        );
+    }
+
+    #[test]
+    fn test_build_output_metadata_with_only_old_meta() {
+        // When only old bucket has metadata, output version = old version
+        let old_meta = BucketMetadata {
+            ledger_version: 18,
+            ext: BucketMetadataExt::V0,
+        };
+
+        let (version, _) = build_output_metadata(Some(&old_meta), None, 25).unwrap();
+        assert_eq!(version, 18, "Output version should be old bucket's version");
+    }
+
+    #[test]
+    fn test_build_output_metadata_with_only_new_meta() {
+        // When only new bucket has metadata, output version = new version
+        let new_meta = BucketMetadata {
+            ledger_version: 21,
+            ext: BucketMetadataExt::V0,
+        };
+
+        let (version, _) = build_output_metadata(None, Some(&new_meta), 25).unwrap();
+        assert_eq!(version, 21, "Output version should be new bucket's version");
+    }
+
+    #[test]
+    fn test_build_output_metadata_no_metadata_inputs() {
+        // When neither bucket has metadata (pre-protocol 11), output has no metadata
+        let (version, output_meta) = build_output_metadata(None, None, 25).unwrap();
+        assert_eq!(version, 0, "Version should be 0 when no metadata present");
+        assert!(
+            output_meta.is_none(),
+            "No metadata should be output for pre-protocol-11 buckets"
+        );
+    }
+
+    #[test]
+    fn test_merge_in_memory_uses_max_protocol_version_directly() {
+        // Regression test: merge_in_memory (level 0) uses max_protocol_version directly,
+        // matching C++ LiveBucket::mergeInMemory behavior.
+
+        // Create buckets with protocol version 20 metadata
+        let old_meta = BucketMetadata {
+            ledger_version: 20,
+            ext: BucketMetadataExt::V0,
+        };
+        let new_meta = BucketMetadata {
+            ledger_version: 20,
+            ext: BucketMetadataExt::V0,
+        };
+
+        let old_entries = vec![
+            BucketEntry::Metadata(old_meta),
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+        ];
+        let new_entries = vec![
+            BucketEntry::Metadata(new_meta),
+            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+        ];
+
+        let old_bucket = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
+        let new_bucket = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
+
+        // Merge with max_protocol_version = 25 (current ledger's protocol)
+        let merged = merge_in_memory(&old_bucket, &new_bucket, 25).unwrap();
+
+        // The output metadata should use 25 (max_protocol_version), NOT 20 (max of inputs)
+        let merged_entries: Vec<_> = merged.iter().collect();
+        let meta_entry = merged_entries
+            .iter()
+            .find(|e| e.is_metadata())
+            .expect("Merged bucket should have metadata");
+
+        if let BucketEntry::Metadata(meta) = meta_entry {
+            assert_eq!(
+                meta.ledger_version, 25,
+                "In-memory merge should use max_protocol_version=25 directly, NOT max(old,new)=20"
+            );
+        } else {
+            panic!("Expected metadata entry");
+        }
+    }
+
+    #[test]
+    fn test_disk_merge_uses_max_of_inputs() {
+        // Regression test: disk-based merge (merge_buckets) uses max(old, new) for version,
+        // matching C++ BucketBase::merge/calculateMergeProtocolVersion behavior.
+
+        // Create buckets with different protocol versions
+        let old_meta = BucketMetadata {
+            ledger_version: 18,
+            ext: BucketMetadataExt::V0,
+        };
+        let new_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+
+        let old_entries = vec![
+            BucketEntry::Metadata(old_meta),
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+        ];
+        let new_entries = vec![
+            BucketEntry::Metadata(new_meta),
+            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+        ];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries).unwrap();
+
+        // Merge with max_protocol_version = 25 (current ledger's protocol)
+        let merged = merge_buckets(&old_bucket, &new_bucket, true, 25).unwrap();
+
+        // The output metadata should use max(18, 22) = 22, NOT 25
+        let merged_entries: Vec<_> = merged.iter().collect();
+        let meta_entry = merged_entries
+            .iter()
+            .find(|e| e.is_metadata())
+            .expect("Merged bucket should have metadata");
+
+        if let BucketEntry::Metadata(meta) = meta_entry {
+            assert_eq!(
+                meta.ledger_version, 22,
+                "Disk merge should use max(old=18, new=22)=22, NOT max_protocol_version=25"
+            );
+        } else {
+            panic!("Expected metadata entry");
+        }
+    }
+
+    #[test]
+    fn test_protocol_version_difference_in_memory_vs_disk() {
+        // Regression test: Verify the key difference between in-memory and disk merges.
+        // This is the exact scenario that caused bucket list hash divergence.
+
+        let old_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+        let new_meta = BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        };
+
+        let old_entries = vec![
+            BucketEntry::Metadata(old_meta.clone()),
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+        ];
+        let new_entries = vec![
+            BucketEntry::Metadata(new_meta.clone()),
+            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+        ];
+
+        // Create two sets of buckets
+        let old_bucket_disk = Bucket::from_entries(old_entries.clone()).unwrap();
+        let new_bucket_disk = Bucket::from_entries(new_entries.clone()).unwrap();
+
+        let old_bucket_mem = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
+        let new_bucket_mem = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
+
+        // max_protocol_version = 25 (ledger's current protocol)
+        let max_pv = 25u32;
+
+        // Disk merge: uses max(old, new) = max(22, 22) = 22
+        let merged_disk = merge_buckets(&old_bucket_disk, &new_bucket_disk, true, max_pv).unwrap();
+        let disk_meta = merged_disk
+            .iter()
+            .find(|e| e.is_metadata())
+            .expect("disk merged should have meta");
+
+        // In-memory merge: uses max_protocol_version = 25 directly
+        let merged_mem = merge_in_memory(&old_bucket_mem, &new_bucket_mem, max_pv).unwrap();
+        let mem_meta = merged_mem
+            .iter()
+            .find(|e| e.is_metadata())
+            .expect("mem merged should have meta");
+
+        if let (BucketEntry::Metadata(disk_m), BucketEntry::Metadata(mem_m)) = (disk_meta, mem_meta)
+        {
+            assert_eq!(
+                disk_m.ledger_version, 22,
+                "Disk merge version should be max(inputs) = 22"
+            );
+            assert_eq!(
+                mem_m.ledger_version, 25,
+                "In-memory merge version should be max_protocol_version = 25"
+            );
+            assert_ne!(
+                disk_m.ledger_version, mem_m.ledger_version,
+                "Disk and in-memory merges should produce different versions when max_pv > max(inputs)"
+            );
+        } else {
+            panic!("Expected metadata entries");
+        }
     }
 }

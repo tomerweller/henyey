@@ -634,12 +634,13 @@ if let Some(ref inflation_dest) = op.inflation_dest {
 
 ### F13: Bucket List Hash Divergence at Large Merge Points
 
-**Status**: Under Investigation  
-**Impact**: Bucket list hash diverges at major merge points after extended replay  
-**Added**: 2026-01-25
+**Status**: FIXED  
+**Impact**: Was causing bucket list hash divergence at major merge points after extended replay  
+**Added**: 2026-01-25  
+**Fixed**: 2026-01-26
 
 **Description**:
-When running verify-execution over extended ranges (e.g., 300000-400000), all transaction executions match but the bucket list hash diverges at major merge points (where multiple levels spill simultaneously).
+When running verify-execution over extended ranges (e.g., 300000-400000), all transaction executions matched but the bucket list hash diverged at major merge points (where multiple levels spill simultaneously).
 
 **Observed at**: Ledger 365312 (testnet) - levels 0-7 all spill
 
@@ -648,13 +649,39 @@ When running verify-execution over extended ranges (e.g., 300000-400000), all tr
 - All individual ledger header hashes match until the merge point
 - At 365312 (level 0-7 merge), bucket list hash diverges
 - Starting from a closer checkpoint (365248) passes verification
-- Metadata shows `last_modified_ledger_seq` differences for some account entries
 
-**Root Cause (Hypothesized)**:
-Account entry `last_modified_ledger_seq` values diverge in some edge cases (possibly fee refund application or accessed-but-unchanged account recording). The differences are small enough not to affect individual ledger hashes but accumulate in bucket list entries over many ledgers. When a large merge combines entries from many levels, the divergent `last_modified_ledger_seq` values cause a hash mismatch.
+**Root Cause**:
+Incorrect protocol version handling in bucket merges. C++ stellar-core has TWO different merge behaviors:
 
-**Workaround**:
-Start verification from checkpoints closer to the target range. The divergence appears to require accumulation over thousands of ledgers.
+1. **In-memory merge (level 0)**: Uses `maxProtocolVersion` (current ledger's protocol version) directly for output metadata
+2. **Disk-based merge (levels 1+)**: Uses `max(old_bucket_version, new_bucket_version)` via `calculateMergeProtocolVersion()`
+
+Our Rust code was incorrectly using `max_protocol_version` as the output version for ALL merges, when it should only be used for in-memory (level 0) merges. This caused metadata protocol version mismatches that accumulated over many merges, eventually causing bucket hash divergence.
+
+**Solution**:
+1. `build_output_metadata()` now uses `max(old, new)` as output version, with `max_protocol_version` only as a constraint
+2. `merge_in_memory()` creates metadata directly with `max_protocol_version`, matching C++ `LiveBucket::mergeInMemory()`
+3. `merge_hot_archive_buckets()` uses `max(curr, snap)` as output version
+
+**Files Changed**:
+- `crates/stellar-core-bucket/src/merge.rs` - Fixed `build_output_metadata()` and `merge_in_memory()`
+- `crates/stellar-core-bucket/src/hot_archive.rs` - Fixed `merge_hot_archive_buckets()`
+- `crates/stellar-core-bucket/src/bucket_list.rs` - Updated `restart_merges_from_has()`
+
+**Regression Tests** (11 new tests):
+- `test_build_output_metadata_uses_max_of_inputs`
+- `test_build_output_metadata_validates_constraint`
+- `test_build_output_metadata_with_only_old_meta`
+- `test_build_output_metadata_with_only_new_meta`
+- `test_build_output_metadata_no_metadata_inputs`
+- `test_merge_in_memory_uses_max_protocol_version_directly`
+- `test_disk_merge_uses_max_of_inputs`
+- `test_protocol_version_difference_in_memory_vs_disk`
+- `test_hot_archive_merge_uses_max_of_inputs`
+- `test_hot_archive_merge_validates_constraint`
+- `test_hot_archive_merge_same_version_uses_that_version`
+
+**Verification**: Ledgers 365183-365314 now pass with 0 header mismatches.
 
 ---
 

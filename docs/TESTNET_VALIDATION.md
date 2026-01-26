@@ -501,23 +501,33 @@ When a `CreateClaimableBalance` operation has an operation source different from
 
 **Regression test:** `test_create_claimable_balance_records_source_account_access` in `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
 
-### Known Issues
+### Issues Fixed (2026-01-26)
 
-#### Bucket List Hash Divergence at Large Merge Points (Ledger 365312+)
+#### Bucket List Hash Divergence at Large Merge Points (Ledger 365312)
 
-**Status**: Under Investigation
+**Status**: FIXED
 
-Starting from checkpoint 364479, the bucket list hash diverges at ledger 365312, which is a major merge point (levels 0-7 spill). All transaction executions match (0 TX mismatches), but accumulated `last_modified_ledger_seq` differences in account entries cause the bucket list hash to diverge.
+Starting from checkpoint 364479, the bucket list hash was diverging at ledger 365312 (levels 0-7 all spill simultaneously). All transaction executions matched (0 TX mismatches), but the bucket list hash differed at the merge point.
 
-**Observed symptoms**:
-- All 65,000+ transactions execute correctly (execution results match)
-- Header hash matches until ledger 365312
-- At ledger 365312 (checkpoint boundary with level 0-7 merge), bucket list hash diverges
-- Starting from a closer checkpoint (365248) passes verification
+**Root Cause**: Incorrect protocol version handling in bucket merges. C++ stellar-core has two different behaviors:
+1. **In-memory merge (level 0)**: Uses `maxProtocolVersion` directly
+2. **Disk-based merge (levels 1+)**: Uses `max(old_bucket_version, new_bucket_version)`
 
-**Likely cause**: Account entry `last_modified_ledger_seq` propagation differs from CDP expectations in some edge cases. The differences accumulate over many ledgers and only become visible when large bucket merges combine the state.
+Our code was using `max_protocol_version` for ALL merges, causing metadata version mismatches.
 
-**Workaround**: Verification passes when starting from checkpoints closer to the target range. The issue appears to be related to state accumulation over extended ranges.
+**Fix**: 
+- `build_output_metadata()` now uses `max(old, new)` with `max_protocol_version` as constraint only
+- `merge_in_memory()` uses `max_protocol_version` directly, matching C++ `LiveBucket::mergeInMemory()`
+- `merge_hot_archive_buckets()` uses `max(curr, snap)` as output version
+
+**Files Changed**:
+- `crates/stellar-core-bucket/src/merge.rs`
+- `crates/stellar-core-bucket/src/hot_archive.rs`
+- `crates/stellar-core-bucket/src/bucket_list.rs`
+
+**Regression Tests**: 11 new tests added covering protocol version handling.
+
+**Verification**: Ledgers 365183-365314 (131 ledgers, 567 transactions) pass with 0 header mismatches.
 
 #### (RESOLVED) Ledger 134448: Live BL Restore vs Hot Archive Restore Distinction
 

@@ -1767,6 +1767,16 @@ async fn cmd_replay_bucket_list(
                 .output
                 .as_ref()
                 .and_then(|h| Hash256::from_hex(h).ok()),
+            input_curr: level
+                .next
+                .curr
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+            input_snap: level
+                .next
+                .snap
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
         })
         .collect();
 
@@ -1794,6 +1804,16 @@ async fn cmd_replay_bucket_list(
                     output: level
                         .next
                         .output
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_curr: level
+                        .next
+                        .curr
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_snap: level
+                        .next
+                        .snap
                         .as_ref()
                         .and_then(|h| Hash256::from_hex(h).ok()),
                 })
@@ -1876,11 +1896,25 @@ async fn cmd_replay_bucket_list(
         println!("Pre-restart hot archive hash: {}", hot_hash.to_hex());
     }
 
-    // Restart merges for both bucket lists.
-    // At checkpoint boundaries (state=0), this recreates pending merges based on timing.
-    bucket_list.restart_merges(init_checkpoint, init_protocol_version)?;
+    // Restart merges for both bucket lists using HAS input hashes when available (state 2).
+    // This ensures merges use the exact input buckets that were in progress at checkpoint time.
+    bucket_list.restart_merges_from_has(
+        init_checkpoint,
+        init_protocol_version,
+        &live_next_states,
+        |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
+    )?;
     if let Some(ref mut hot_archive) = hot_archive_bucket_list {
-        hot_archive.restart_merges(init_checkpoint, init_protocol_version)?;
+        if let Some(ref ha_next_states) = hot_archive_next_states {
+            hot_archive.restart_merges_from_has(
+                init_checkpoint,
+                init_protocol_version,
+                ha_next_states,
+                |hash| bucket_manager.load_hot_archive_bucket(hash),
+            )?;
+        } else {
+            hot_archive.restart_merges(init_checkpoint, init_protocol_version)?;
+        }
     }
 
     let initial_live_hash = bucket_list.hash();
@@ -2652,6 +2686,16 @@ async fn cmd_verify_execution(
                 .output
                 .as_ref()
                 .and_then(|h| Hash256::from_hex(h).ok()),
+            input_curr: level
+                .next
+                .curr
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+            input_snap: level
+                .next
+                .snap
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
         })
         .collect();
 
@@ -2678,6 +2722,16 @@ async fn cmd_verify_execution(
                     output: level
                         .next
                         .output
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_curr: level
+                        .next
+                        .curr
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_snap: level
+                        .next
+                        .snap
                         .as_ref()
                         .and_then(|h| Hash256::from_hex(h).ok()),
                 })
@@ -2753,14 +2807,26 @@ async fn cmd_verify_execution(
     // Restart any pending merges that should have been in progress at the checkpoint.
     // This is critical for correct bucket list hash computation after catchup.
     // In C++ stellar-core, this is done by BucketListBase::restartMerges().
-    bucket_list
-        .write()
-        .unwrap()
-        .restart_merges(init_checkpoint, init_protocol_version)?;
+    // Use restart_merges_from_has to handle state 2 (merge in progress with stored input hashes).
+    bucket_list.write().unwrap().restart_merges_from_has(
+        init_checkpoint,
+        init_protocol_version,
+        &live_next_states,
+        |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
+    )?;
     if let Some(ref hot) = hot_archive_bucket_list {
-        hot.write()
-            .unwrap()
-            .restart_merges(init_checkpoint, init_protocol_version)?;
+        if let Some(ref ha_next_states) = hot_archive_next_states {
+            hot.write().unwrap().restart_merges_from_has(
+                init_checkpoint,
+                init_protocol_version,
+                ha_next_states,
+                |hash| bucket_manager.load_hot_archive_bucket(hash),
+            )?;
+        } else {
+            hot.write()
+                .unwrap()
+                .restart_merges(init_checkpoint, init_protocol_version)?;
+        }
     }
 
     if !quiet {

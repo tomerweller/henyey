@@ -72,20 +72,30 @@ pub const BUCKET_LIST_LEVELS: usize = 11;
 /// FutureBucket state constants (matches C++ stellar-core's FBStatus enum in HAS JSON).
 /// HAS_NEXT_STATE_CLEAR: No pending merge
 /// HAS_NEXT_STATE_OUTPUT: Merge complete, output hash is known
+/// HAS_NEXT_STATE_INPUTS: Merge in progress, input hashes are stored
 pub const HAS_NEXT_STATE_CLEAR: u32 = 0;
 pub const HAS_NEXT_STATE_OUTPUT: u32 = 1;
+pub const HAS_NEXT_STATE_INPUTS: u32 = 2;
 
 /// State of a pending bucket merge from History Archive State (HAS).
 ///
-/// When restoring from a HAS, each level may have a pending merge. If state is
-/// HAS_NEXT_STATE_OUTPUT (1), the output hash contains the hash of the completed merge
-/// result that should be set as the level's `next` bucket.
+/// When restoring from a HAS, each level may have a pending merge:
+/// - State 0 (CLEAR): No pending merge
+/// - State 1 (OUTPUT): Merge complete, output hash is set
+/// - State 2 (INPUTS): Merge in progress, input curr/snap hashes are set
+///
+/// For state 1, use the output hash directly as the level's `next` bucket.
+/// For state 2, restart the merge using the stored input hashes.
 #[derive(Clone, Debug, Default)]
 pub struct HasNextState {
-    /// Merge state (0 = clear, 1 = hash output known, etc.)
+    /// Merge state (0 = clear, 1 = output, 2 = inputs)
     pub state: u32,
     /// Output bucket hash if merge is complete (state == 1)
     pub output: Option<Hash256>,
+    /// Input curr bucket hash for pending merge (state == 2)
+    pub input_curr: Option<Hash256>,
+    /// Input snap bucket hash for pending merge (state == 2)
+    pub input_snap: Option<Hash256>,
 }
 
 /// A single level in the BucketList, containing `curr` and `snap` buckets.
@@ -709,7 +719,26 @@ impl BucketList {
                 );
 
                 // Commit any pending merge at level i (promotes next→curr)
+                let pre_commit_curr_hash = self.levels[i].curr.hash();
+                let pre_commit_snap_hash = self.levels[i].snap.hash();
+                let pre_commit_next_hash = self.levels[i]
+                    .next
+                    .as_ref()
+                    .map(|b| b.hash().to_hex())
+                    .unwrap_or_else(|| "None".to_string());
+
                 self.levels[i].commit();
+
+                let post_commit_curr_hash = self.levels[i].curr.hash();
+                tracing::debug!(
+                    ledger = ledger_seq,
+                    level = i,
+                    pre_commit_curr = %pre_commit_curr_hash.to_hex(),
+                    pre_commit_snap = %pre_commit_snap_hash.to_hex(),
+                    pre_commit_next = %pre_commit_next_hash,
+                    post_commit_curr = %post_commit_curr_hash.to_hex(),
+                    "Level commit step"
+                );
 
                 // Prepare level i: merge curr with the spilling_snap from level i-1
                 let keep_dead = Self::keep_tombstone_entries(i);
@@ -728,12 +757,28 @@ impl BucketList {
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
                     protocol_version,
-                    spilling_snap,
+                    spilling_snap.clone(),
                     keep_dead,
                     &shadow_buckets,
                     normalize_init,
                     use_empty_curr,
                 )?;
+
+                let post_prepare_next_hash = self.levels[i]
+                    .next
+                    .as_ref()
+                    .map(|b| b.hash().to_hex())
+                    .unwrap_or_else(|| "None".to_string());
+                tracing::debug!(
+                    ledger = ledger_seq,
+                    level = i,
+                    use_empty_curr = use_empty_curr,
+                    spilling_snap_hash = %spilling_snap.hash().to_hex(),
+                    post_prepare_next = %post_prepare_next_hash,
+                    post_prepare_curr = %self.levels[i].curr.hash().to_hex(),
+                    post_prepare_snap = %self.levels[i].snap.hash().to_hex(),
+                    "Level prepare step"
+                );
             }
         }
 
@@ -1012,6 +1057,8 @@ impl BucketList {
                         None
                     }
                 } else {
+                    // For state 2 (HAS_NEXT_STATE_INPUTS), we don't set next here.
+                    // The merge will be restarted in restart_merges_from_has.
                     None
                 }
             } else {
@@ -1029,6 +1076,98 @@ impl BucketList {
             levels,
             ledger_seq: 0,
         })
+    }
+
+    /// Restart any pending merges after restoring from a History Archive State (HAS),
+    /// using the stored input hashes from the HAS.
+    ///
+    /// This handles state 2 (HAS_NEXT_STATE_INPUTS) by restarting merges with the
+    /// exact input curr and snap hashes stored in the HAS.
+    ///
+    /// This matches C++ stellar-core's logic in restartMerges() for handling
+    /// FutureBuckets with hasHashes() && !isLive().
+    pub fn restart_merges_from_has<F>(
+        &mut self,
+        ledger: u32,
+        protocol_version: u32,
+        next_states: &[HasNextState],
+        mut load_bucket: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Hash256) -> Result<Bucket>,
+    {
+        tracing::debug!(
+            ledger = ledger,
+            "restart_merges_from_has: restarting merges using HAS input hashes"
+        );
+
+        for i in 1..BUCKET_LIST_LEVELS {
+            // Skip if there's already a pending merge (from state 1 output)
+            if self.levels[i].next.is_some() {
+                tracing::trace!(
+                    level = i,
+                    "restart_merges_from_has: level already has pending merge"
+                );
+                continue;
+            }
+
+            // Check if HAS has stored input hashes for this level (state 2)
+            if let Some(state) = next_states.get(i) {
+                if state.state == HAS_NEXT_STATE_INPUTS {
+                    if let (Some(ref curr_hash), Some(ref snap_hash)) =
+                        (&state.input_curr, &state.input_snap)
+                    {
+                        // Load the input buckets from the stored hashes
+                        let input_curr = if curr_hash.is_zero() {
+                            Bucket::empty()
+                        } else {
+                            load_bucket(curr_hash)?
+                        };
+
+                        let input_snap = if snap_hash.is_zero() {
+                            Bucket::empty()
+                        } else {
+                            load_bucket(snap_hash)?
+                        };
+
+                        tracing::info!(
+                            level = i,
+                            ledger = ledger,
+                            input_curr_hash = %curr_hash.to_hex(),
+                            input_snap_hash = %snap_hash.to_hex(),
+                            "restart_merges_from_has: restarting merge with HAS input hashes"
+                        );
+
+                        // Perform the merge with the exact input hashes from HAS
+                        // Use the caller's protocol_version (from ledger header) as the
+                        // max protocol version, matching C++ behavior in restartMerges
+                        // where makeLive() is called with maxProtocolVersion.
+                        let keep_dead = Self::keep_tombstone_entries(i);
+
+                        let merged = merge_buckets_with_options_and_shadows(
+                            &input_curr,
+                            &input_snap,
+                            keep_dead,
+                            protocol_version, // Use caller's protocol version, not bucket's
+                            false,            // normalize_init = false
+                            &[],              // no shadows for post-protocol-12
+                        )?;
+
+                        tracing::info!(
+                            level = i,
+                            merged_hash = %merged.hash().to_hex(),
+                            "restart_merges_from_has: merge completed"
+                        );
+
+                        self.levels[i].next = Some(merged);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // For levels that don't have HAS input hashes, fall back to regular restart_merges
+        self.restart_merges(ledger, protocol_version)
     }
 
     /// Restart any pending merges after restoring from a History Archive State (HAS).

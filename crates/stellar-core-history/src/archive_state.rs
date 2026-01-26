@@ -52,14 +52,31 @@ pub struct HASBucketLevel {
 }
 
 /// State of the next bucket merge operation.
+///
+/// States (matching C++ FutureBucket::State):
+/// - 0 (FB_CLEAR): No pending merge
+/// - 1 (FB_HASH_OUTPUT): Merge complete, output hash is known
+/// - 2 (FB_HASH_INPUTS): Merge in progress, input hashes are stored
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HASBucketNext {
-    /// Merge state (0 = idle, non-zero = in progress).
+    /// Merge state (0 = clear, 1 = output, 2 = inputs).
     pub state: u32,
 
-    /// Output bucket hash if merge is complete.
+    /// Output bucket hash if merge is complete (state == 1).
     #[serde(default)]
     pub output: Option<String>,
+
+    /// Input curr bucket hash for pending merge (state == 2).
+    #[serde(default)]
+    pub curr: Option<String>,
+
+    /// Input snap bucket hash for pending merge (state == 2).
+    #[serde(default)]
+    pub snap: Option<String>,
+
+    /// Shadow bucket hashes for pending merge (state == 2, pre-protocol 12).
+    #[serde(default)]
+    pub shadow: Option<Vec<String>>,
 }
 
 impl HistoryArchiveState {
@@ -137,11 +154,29 @@ impl HistoryArchiveState {
                 }
             }
 
-            // Add next output if present and non-zero
+            // Add next output if present and non-zero (state == 1)
             if let Some(ref output) = level.next.output {
                 if !output.is_empty() && output != &zero_hash {
                     if let Ok(h) = Hash256::from_hex(output) {
                         hashes.push(h);
+                    }
+                }
+            }
+
+            // Add next input hashes if present and non-zero (state == 2)
+            if level.next.state == 2 {
+                if let Some(ref curr) = level.next.curr {
+                    if !curr.is_empty() && curr != &zero_hash {
+                        if let Ok(h) = Hash256::from_hex(curr) {
+                            hashes.push(h);
+                        }
+                    }
+                }
+                if let Some(ref snap) = level.next.snap {
+                    if !snap.is_empty() && snap != &zero_hash {
+                        if let Ok(h) = Hash256::from_hex(snap) {
+                            hashes.push(h);
+                        }
                     }
                 }
             }
@@ -158,6 +193,31 @@ impl HistoryArchiveState {
                 if !level.snap.is_empty() && level.snap != zero_hash {
                     if let Ok(h) = Hash256::from_hex(&level.snap) {
                         hashes.push(h);
+                    }
+                }
+                // Add next output if present and non-zero (state == 1)
+                if let Some(ref output) = level.next.output {
+                    if !output.is_empty() && output != &zero_hash {
+                        if let Ok(h) = Hash256::from_hex(output) {
+                            hashes.push(h);
+                        }
+                    }
+                }
+                // Add next input hashes if present and non-zero (state == 2)
+                if level.next.state == 2 {
+                    if let Some(ref curr) = level.next.curr {
+                        if !curr.is_empty() && curr != &zero_hash {
+                            if let Ok(h) = Hash256::from_hex(curr) {
+                                hashes.push(h);
+                            }
+                        }
+                    }
+                    if let Some(ref snap) = level.next.snap {
+                        if !snap.is_empty() && snap != &zero_hash {
+                            if let Ok(h) = Hash256::from_hex(snap) {
+                                hashes.push(h);
+                            }
+                        }
                     }
                 }
             }

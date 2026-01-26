@@ -34,7 +34,7 @@ use stellar_xdr::curr::{
 
 use stellar_core_common::Hash256;
 
-use crate::bucket_list::{HasNextState, HAS_NEXT_STATE_OUTPUT};
+use crate::bucket_list::{HasNextState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
 use crate::entry::ledger_entry_to_key;
 use crate::{BucketError, Result};
 
@@ -864,6 +864,96 @@ impl HotArchiveBucketList {
         })
     }
 
+    /// Restart any pending merges after restoring from a History Archive State (HAS),
+    /// using the stored input hashes from the HAS.
+    ///
+    /// This handles state 2 (HAS_NEXT_STATE_INPUTS) by restarting merges with the
+    /// exact input curr and snap hashes stored in the HAS.
+    ///
+    /// This matches C++ stellar-core's logic in restartMerges() for handling
+    /// FutureBuckets with hasHashes() && !isLive().
+    pub fn restart_merges_from_has<F>(
+        &mut self,
+        ledger: u32,
+        protocol_version: u32,
+        next_states: &[HasNextState],
+        mut load_bucket: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Hash256) -> Result<HotArchiveBucket>,
+    {
+        tracing::debug!(
+            ledger = ledger,
+            "hot_archive restart_merges_from_has: restarting merges using HAS input hashes"
+        );
+
+        for i in 1..HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            // Skip if there's already a pending merge (from state 1 output)
+            if self.levels[i].next.is_some() {
+                tracing::trace!(
+                    level = i,
+                    "hot_archive restart_merges_from_has: level already has pending merge"
+                );
+                continue;
+            }
+
+            // Check if HAS has stored input hashes for this level (state 2)
+            if let Some(state) = next_states.get(i) {
+                if state.state == HAS_NEXT_STATE_INPUTS {
+                    if let (Some(ref curr_hash), Some(ref snap_hash)) =
+                        (&state.input_curr, &state.input_snap)
+                    {
+                        // Load the input buckets from the stored hashes
+                        let input_curr = if curr_hash.is_zero() {
+                            HotArchiveBucket::empty()
+                        } else {
+                            load_bucket(curr_hash)?
+                        };
+
+                        let input_snap = if snap_hash.is_zero() {
+                            HotArchiveBucket::empty()
+                        } else {
+                            load_bucket(snap_hash)?
+                        };
+
+                        tracing::info!(
+                            level = i,
+                            ledger = ledger,
+                            input_curr_hash = %curr_hash.to_hex(),
+                            input_snap_hash = %snap_hash.to_hex(),
+                            "hot_archive restart_merges_from_has: restarting merge with HAS input hashes"
+                        );
+
+                        // Perform the merge with the exact input hashes from HAS
+                        // Use the caller's protocol_version (from ledger header) as the
+                        // max protocol version, matching C++ behavior in restartMerges
+                        // where makeLive() is called with maxProtocolVersion.
+                        let keep_tombstones = Self::keep_tombstone_entries(i);
+
+                        let merged = merge_hot_archive_buckets(
+                            &input_curr,
+                            &input_snap,
+                            protocol_version, // Use caller's protocol version, not bucket's
+                            keep_tombstones,
+                        )?;
+
+                        tracing::info!(
+                            level = i,
+                            merged_hash = %merged.hash().to_hex(),
+                            "hot_archive restart_merges_from_has: merge completed"
+                        );
+
+                        self.levels[i].next = Some(merged);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // For levels that don't have HAS input hashes, fall back to regular restart_merges
+        self.restart_merges(ledger, protocol_version)
+    }
+
     /// Restart any pending merges after restoring from a History Archive State (HAS).
     ///
     /// When a hot archive bucket list is restored from HAS, there may be merges that should
@@ -1385,13 +1475,18 @@ pub fn merge_hot_archive_buckets(
     // This is critical for hash consistency.
     let mut result_entries = Vec::with_capacity(merged_entries.len() + 1);
 
-    // Calculate output protocol version, matching C++ behavior.
-    // The passed protocol_version (maxProtocolVersion) is used for the output bucket.
-    let output_version = if protocol_version > 0 {
-        protocol_version
-    } else {
-        curr.get_protocol_version().max(snap.get_protocol_version())
-    };
+    // Calculate output protocol version using max(curr, snap), matching C++ behavior
+    // in calculateMergeProtocolVersion(). The passed protocol_version is only used as
+    // a constraint (maxProtocolVersion), not as the output version.
+    let output_version = curr.get_protocol_version().max(snap.get_protocol_version());
+
+    // Validate that calculated version doesn't exceed the max
+    if protocol_version > 0 && output_version > protocol_version {
+        return Err(BucketError::Merge(format!(
+            "hot archive bucket protocol version {} exceeds max {}",
+            output_version, protocol_version
+        )));
+    }
 
     // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
     // for Protocol 23+.
@@ -1672,5 +1767,103 @@ mod tests {
 
         // Live entry should be dropped
         assert!(merged.get(&key).unwrap().is_none());
+    }
+
+    // ============ Protocol Version Handling Regression Tests ============
+
+    #[test]
+    fn test_hot_archive_merge_uses_max_of_inputs() {
+        // Regression test: hot archive merge uses max(curr, snap) for output version,
+        // NOT the passed protocol_version which is only a constraint.
+        let entry1 = make_contract_data_entry([1u8; 32], b"key1", 100);
+        let entry2 = make_contract_data_entry([2u8; 32], b"key2", 200);
+
+        // curr has protocol version 23
+        let curr = HotArchiveBucket::from_entries(vec![
+            HotArchiveBucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 23,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
+            }),
+            HotArchiveBucketEntry::Archived(entry1),
+        ])
+        .unwrap();
+
+        // snap has protocol version 24
+        let snap = HotArchiveBucket::from_entries(vec![
+            HotArchiveBucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 24,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
+            }),
+            HotArchiveBucketEntry::Archived(entry2),
+        ])
+        .unwrap();
+
+        // protocol_version = 25 (constraint from ledger header)
+        let merged = merge_hot_archive_buckets(&curr, &snap, 25, true).unwrap();
+
+        // Output should use max(23, 24) = 24, NOT 25
+        assert_eq!(
+            merged.get_protocol_version(),
+            24,
+            "Hot archive merge should use max(curr=23, snap=24)=24, NOT max_protocol_version=25"
+        );
+    }
+
+    #[test]
+    fn test_hot_archive_merge_validates_constraint() {
+        // Regression test: protocol_version should be validated as a constraint
+        let entry = make_contract_data_entry([1u8; 32], b"key1", 100);
+
+        // Bucket with protocol version 26 (exceeds constraint)
+        let bucket = HotArchiveBucket::from_entries(vec![
+            HotArchiveBucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 26,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
+            }),
+            HotArchiveBucketEntry::Archived(entry),
+        ])
+        .unwrap();
+
+        // Should fail because bucket version 26 > constraint 25
+        let result = merge_hot_archive_buckets(&bucket, &HotArchiveBucket::empty(), 25, true);
+        assert!(
+            result.is_err(),
+            "Should fail when bucket version exceeds protocol_version constraint"
+        );
+    }
+
+    #[test]
+    fn test_hot_archive_merge_same_version_uses_that_version() {
+        // When both buckets have the same version, output should use that version
+        let entry1 = make_contract_data_entry([1u8; 32], b"key1", 100);
+        let entry2 = make_contract_data_entry([2u8; 32], b"key2", 200);
+
+        let curr = HotArchiveBucket::from_entries(vec![
+            HotArchiveBucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 24,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
+            }),
+            HotArchiveBucketEntry::Archived(entry1),
+        ])
+        .unwrap();
+
+        let snap = HotArchiveBucket::from_entries(vec![
+            HotArchiveBucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 24,
+                ext: BucketMetadataExt::V1(BucketListType::HotArchive),
+            }),
+            HotArchiveBucketEntry::Archived(entry2),
+        ])
+        .unwrap();
+
+        // max_protocol_version = 25, but both inputs are 24
+        let merged = merge_hot_archive_buckets(&curr, &snap, 25, true).unwrap();
+
+        // Output should be 24 (max of inputs), not 25
+        assert_eq!(
+            merged.get_protocol_version(),
+            24,
+            "Output should be max(24, 24)=24, not constraint=25"
+        );
     }
 }

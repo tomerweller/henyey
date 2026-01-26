@@ -750,6 +750,9 @@ impl HistoryArchiveManager {
             next: HASBucketNext {
                 state: 0, // FB_CLEAR
                 output: None,
+                curr: None,
+                snap: None,
+                shadow: None,
             },
         };
 
