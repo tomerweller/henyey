@@ -1275,20 +1275,26 @@ impl OverlayManager {
     }
 
     /// Get snapshots for all connected peers.
-    /// Uses the peer info cache for info, falls back to try_lock for stats.
+    /// Uses the peer info cache for info, tries to get stats if lock is available.
+    /// Returns all peers even if stats lock is unavailable (uses default stats).
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
         self.peer_info_cache
             .iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 let peer_id = entry.key();
                 let info = entry.value().clone();
-                // Try to get stats from the locked peer
-                self.peers.get(peer_id).and_then(|peer_entry| {
-                    peer_entry.value().try_lock().ok().map(|p| PeerSnapshot {
-                        info,
-                        stats: p.stats().snapshot(),
-                    })
-                })
+                // Try to get stats from the locked peer, default if lock unavailable
+                let stats = if let Some(peer_entry) = self.peers.get(peer_id) {
+                    peer_entry
+                        .value()
+                        .try_lock()
+                        .ok()
+                        .map(|p| p.stats().snapshot())
+                        .unwrap_or_default()
+                } else {
+                    PeerStatsSnapshot::default()
+                };
+                PeerSnapshot { info, stats }
             })
             .collect()
     }

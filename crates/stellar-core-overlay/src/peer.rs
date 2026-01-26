@@ -136,7 +136,7 @@ impl PeerStats {
 ///
 /// All values are captured atomically but may not be perfectly consistent
 /// with each other (one counter might be slightly more up-to-date than another).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PeerStatsSnapshot {
     pub messages_sent: u64,
     pub messages_received: u64,
