@@ -738,7 +738,32 @@ impl ScpDriver {
 
     /// Clear the transaction set cache.
     pub fn clear_tx_set_cache(&self) {
+        let count = self.tx_set_cache.len();
         self.tx_set_cache.clear();
+        if count > 0 {
+            tracing::info!(count, "Cleared scp_driver tx_set_cache");
+        }
+    }
+
+    /// Clear all caches in scp_driver.
+    /// Called after catchup to release stale cached data.
+    pub fn clear_all_caches(&self) {
+        let tx_set_count = self.tx_set_cache.len();
+        let pending_count = self.pending_tx_sets.len();
+        let externalized_count = self.externalized.read().len();
+
+        self.tx_set_cache.clear();
+        self.pending_tx_sets.clear();
+        self.externalized.write().clear();
+
+        if tx_set_count > 0 || pending_count > 0 || externalized_count > 0 {
+            tracing::info!(
+                tx_set_count,
+                pending_count,
+                externalized_count,
+                "Cleared scp_driver caches"
+            );
+        }
     }
 
     /// Purge SCP state for slots below the given slot.

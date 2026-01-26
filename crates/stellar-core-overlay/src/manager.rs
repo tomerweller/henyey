@@ -185,7 +185,11 @@ pub struct OverlayManager {
 impl OverlayManager {
     /// Create a new overlay manager with the given configuration.
     pub fn new(config: OverlayConfig, local_node: LocalNode) -> Result<Self> {
-        let (message_tx, _) = broadcast::channel(65536);
+        // Reduced from 65536 to 1024 to limit memory usage.
+        // The broadcast channel holds messages until all receivers consume them.
+        // With 65536 messages and potentially large tx_sets (~50KB each), this could
+        // use several GB of memory. Receivers that lag will get Lagged errors.
+        let (message_tx, _) = broadcast::channel(1024);
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {

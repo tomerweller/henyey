@@ -62,5 +62,9 @@ fs2.workspace = true
 # Synchronization primitives
 parking_lot.workspace = true
 
+# Memory management (for malloc_trim on Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true

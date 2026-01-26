@@ -1457,6 +1457,30 @@ impl Herder {
         self.scp_driver.cleanup_pending_tx_sets(120);
     }
 
+    /// Clear the transaction set cache to release memory.
+    /// Called after catchup to release stale cached tx sets.
+    pub fn clear_tx_set_cache(&self) {
+        self.scp_driver.clear_tx_set_cache();
+    }
+
+    /// Clear all scp_driver caches to release memory.
+    /// Called after catchup to release stale cached data.
+    pub fn clear_scp_driver_caches(&self) {
+        self.scp_driver.clear_all_caches();
+    }
+
+    /// Clear all fetching caches to release memory.
+    /// Called after catchup to release stale cached data.
+    pub fn clear_fetching_caches(&self) {
+        self.fetching_envelopes.clear_all();
+    }
+
+    /// Clear pending envelopes to release memory.
+    /// Called after catchup to release stale pending data.
+    pub fn clear_pending_envelopes(&self) {
+        self.pending_envelopes.clear();
+    }
+
     /// Get pending transaction set hashes that need to be fetched from peers.
     pub fn get_pending_tx_set_hashes(&self) -> Vec<Hash256> {
         self.scp_driver.get_pending_tx_set_hashes()

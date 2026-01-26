@@ -213,6 +213,14 @@ impl Tracker {
         self.last_seen_slot_index = 0;
     }
 
+    /// Clear all state.
+    /// Called after catchup to release memory.
+    pub fn clear(&mut self) {
+        self.waiting_envelopes.clear();
+        self.last_ask_time = None;
+        self.last_seen_slot_index = 0;
+    }
+
     /// Handle a DONT_HAVE response from a peer.
     pub fn doesnt_have(&mut self, peer: &PeerId) -> bool {
         if self.last_asked_peer.as_ref() == Some(peer) {
@@ -602,6 +610,17 @@ impl ItemFetcher {
             num_trackers: trackers.len(),
             total_waiting_envelopes: total_waiting,
             oldest_fetch_duration: oldest_duration,
+        }
+    }
+
+    /// Clear all trackers and pending state.
+    /// Called after catchup to release memory.
+    pub fn clear(&self) {
+        let mut trackers = self.trackers.lock().unwrap();
+        let count = trackers.len();
+        trackers.clear();
+        if count > 0 {
+            debug!(item_type = ?self.item_type, count, "Cleared item fetcher trackers");
         }
     }
 }

@@ -1975,6 +1975,20 @@ impl App {
         progress.set_phase(crate::logging::CatchupPhase::Complete);
         progress.summary();
 
+        // Clear buffered ledgers after catchup - they are now stale.
+        // The new ledger state is authoritative from the history archive.
+        {
+            let mut buffer = self.syncing_ledgers.write().await;
+            let old_count = buffer.len();
+            buffer.clear();
+            if old_count > 0 {
+                tracing::info!(
+                    old_buffered_count = old_count,
+                    "Cleared stale buffered ledgers after catchup"
+                );
+            }
+        }
+
         // Clear bucket manager cache to release memory after catchup.
         // The bucket files are still on disk if needed, but we don't need to
         // keep them in RAM. With frequent catchups, this cache can grow unbounded.
@@ -1985,6 +1999,34 @@ impl App {
             cache_size_before,
             "Cleared bucket manager cache after catchup"
         );
+
+        // Clear ALL herder/scp_driver caches to release memory after catchup.
+        // This includes tx_set_cache, pending_tx_sets, and externalized slots.
+        // The old data is no longer relevant after reinitializing from history.
+        self.herder.clear_scp_driver_caches();
+
+        // Clear fetching_envelopes caches (tx_set_cache, quorum_set_cache, slots).
+        // These accumulate when the validator is stuck and can use significant memory.
+        self.herder.clear_fetching_caches();
+
+        // Clear pending envelopes - they are stale after catchup.
+        self.herder.clear_pending_envelopes();
+
+        // On Linux, ask glibc to return freed memory to the OS.
+        // This helps prevent RSS from appearing to grow unboundedly after catchups,
+        // even though Rust has freed the memory internally.
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: malloc_trim is a standard glibc function that's safe to call.
+            // It returns memory to the OS and is commonly used after large deallocations.
+            unsafe {
+                let trimmed = libc::malloc_trim(0);
+                tracing::info!(
+                    trimmed,
+                    "Called malloc_trim after catchup to return memory to OS"
+                );
+            }
+        }
 
         // Reset the tx set exhausted flag after catchup - fresh start
         self.tx_set_all_peers_exhausted
@@ -3477,6 +3519,11 @@ impl App {
         buffer: &mut BTreeMap<u32, stellar_core_herder::LedgerCloseInfo>,
         current_ledger: u32,
     ) {
+        // Hard limit on buffer size to prevent unbounded memory growth.
+        // With ~50 slots per checkpoint and large tx sets, keeping more than
+        // 100 slots can use significant memory (100+ MB).
+        const MAX_BUFFER_SIZE: usize = 100;
+
         let min_keep = current_ledger.saturating_add(1);
         buffer.retain(|seq, _| *seq >= min_keep);
         if buffer.is_empty() {
@@ -3495,6 +3542,23 @@ impl App {
         };
 
         buffer.retain(|seq, _| *seq >= trim_before);
+
+        // If buffer is still too large, keep only the most recent MAX_BUFFER_SIZE slots.
+        // This prevents unbounded memory growth when the validator is stuck.
+        if buffer.len() > MAX_BUFFER_SIZE {
+            let keys_to_remove: Vec<u32> = buffer
+                .keys()
+                .take(buffer.len() - MAX_BUFFER_SIZE)
+                .copied()
+                .collect();
+            for key in keys_to_remove {
+                buffer.remove(&key);
+            }
+            tracing::debug!(
+                buffer_size = buffer.len(),
+                "Trimmed syncing_ledgers buffer to max size"
+            );
+        }
     }
 
     async fn update_buffered_tx_set(

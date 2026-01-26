@@ -335,8 +335,13 @@ impl PendingEnvelopes {
 
     /// Clear all pending envelopes.
     pub fn clear(&self) {
+        let slots_count = self.slots.len();
+        let seen_count = self.seen_hashes.len();
         self.slots.clear();
         self.seen_hashes.clear();
+        if slots_count > 0 || seen_count > 0 {
+            tracing::info!(slots_count, seen_count, "Cleared pending_envelopes");
+        }
     }
 }
 
