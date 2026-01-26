@@ -3706,6 +3706,16 @@ async fn cmd_verify_execution(
                 // For DEAD: exclude entries that were created+deleted
                 our_dead.retain(|k| !created_and_deleted.contains(k));
 
+                // Filter out entries restored from hot archive that were then deleted.
+                // These entries came from hot archive (not live bucket list), so deleting them
+                // should NOT add them to the live bucket list's DEAD entries. The hot archive
+                // restoration is handled separately via our_hot_archive_restored_keys.
+                if !our_hot_archive_restored_keys.is_empty() {
+                    let restored_set: std::collections::HashSet<_> =
+                        our_hot_archive_restored_keys.iter().collect();
+                    our_dead.retain(|k| !restored_set.contains(k));
+                }
+
                 // NOTE: We use the ORIGINAL deleted_keys (built at line 3535) for LIVE filtering,
                 // not a filtered version. An entry that was updated+deleted should NOT appear
                 // in LIVE (only in DEAD). The our_dead.retain() above only affects DEAD output.

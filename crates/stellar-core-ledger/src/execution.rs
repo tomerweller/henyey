@@ -2807,25 +2807,15 @@ impl TransactionExecutor {
                                 })
                                 .collect();
                             // Collect data/code keys only for HotArchiveBucketList::add_batch
-                            // For RestoreFootprint: the data/code entries come from hot_archive_restores
-                            // and are prefetched into state (not in created_keys). We should include all
-                            // of them since they're the entries actually being restored.
-                            // For InvokeHostFunction: filter by created_keys to only include entries
-                            // that were actually created (not already in live BL from earlier TX).
-                            if op_type == OperationType::RestoreFootprint {
-                                // For RestoreFootprint, include all hot archive entries
-                                // (they're already filtered by live BL above)
-                                collected_hot_archive_keys
-                                    .extend(hot_archive_for_bucket_list.iter().cloned());
-                            } else {
-                                // For InvokeHostFunction, filter by created_keys
-                                collected_hot_archive_keys.extend(
-                                    hot_archive_for_bucket_list
-                                        .iter()
-                                        .filter(|k| created_keys.contains(k))
-                                        .cloned(),
-                                );
-                            }
+                            // All hot archive keys (already filtered by live BL above) should be
+                            // passed to the bucket list. This is true for both RestoreFootprint
+                            // and InvokeHostFunction - the hot archive needs to remove ALL entries
+                            // that were restored, regardless of whether the contract then modifies
+                            // them (which would put them in `updated` rather than `created`).
+                            // The `created_keys` filtering above is only for transaction meta
+                            // emission (RESTORED vs UPDATED), not for bucket list operations.
+                            collected_hot_archive_keys
+                                .extend(hot_archive_for_bucket_list.iter().cloned());
                             // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
                             restored.hot_archive.extend(hot_archive_for_meta);
                             restored.hot_archive.extend(ttl_keys);

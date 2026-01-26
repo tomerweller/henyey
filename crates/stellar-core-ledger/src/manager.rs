@@ -1821,6 +1821,26 @@ impl<'a> LedgerCloseContext<'a> {
             let mut live_entries = self.delta.live_entries();
             let mut dead_entries = self.delta.dead_entries();
 
+            // Filter out entries restored from hot archive that were then deleted.
+            // These entries came from hot archive (not live bucket list), so deleting them
+            // should NOT add them to the live bucket list's DEAD entries. The hot archive
+            // restoration is handled separately via hot_archive_restored_keys.
+            if !self.hot_archive_restored_keys.is_empty() {
+                let restored_set: std::collections::HashSet<_> =
+                    self.hot_archive_restored_keys.iter().collect();
+                let before_count = dead_entries.len();
+                dead_entries.retain(|key| !restored_set.contains(key));
+                if dead_entries.len() != before_count {
+                    tracing::debug!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        before_count = before_count,
+                        after_count = dead_entries.len(),
+                        filtered_count = before_count - dead_entries.len(),
+                        "Filtered hot archive restored entries from dead_entries"
+                    );
+                }
+            }
+
             // Log bucket list entries for debugging hash mismatch
             tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,

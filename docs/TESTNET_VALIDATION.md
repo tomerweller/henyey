@@ -63,6 +63,9 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 64-617812+ | 617,749+ | ~600,000+ | 100% | ~98% | **Hot archive fix allows further expansion** |
 | 300000-365311 | 65,312 | ~200,000+ | 100% | ~98% | Module cache + SetOptions inflation fixes |
 | 419000-420000 | 1,001 | 3,762 | 100% | ~99% | LiquidityPoolDeposit issuer trustline fix verified |
+| 580000-646000 | 66,001 | ~250,000+ | 100% | ~98% | Hot archive restore+delete fix verified |
+| 603000-604000 | 1,001 | 3,884 | 100% | ~97% | Hot archive restore+delete fix verified (ledger 603325) |
+| 610000-611000 | 1,001 | 3,968 | 100% | ~97% | Hot archive restore+delete fix verified (ledger 610541) |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
@@ -504,6 +507,37 @@ When a `CreateClaimableBalance` operation has an operation source different from
 
 ### Issues Fixed (2026-01-26)
 
+#### Hot Archive Restored Entries Then Deleted Should Not Go to Live Bucket List DEAD (Ledgers 603325, 610541)
+
+**Status**: FIXED
+
+When entries are restored from hot archive during `InvokeHostFunction` execution and then deleted by the contract in the same transaction, they were incorrectly being added to the live bucket list's DEAD entries. This caused bucket list hash mismatches.
+
+**Root Cause (Two Parts)**:
+
+1. **Bucket list key filtering**: In `execution.rs`, for `InvokeHostFunction` we were filtering `collected_hot_archive_keys` by `created_keys`. Entries that were auto-restored and then modified (not created) by the contract were excluded. All entries in `archived_soroban_entries` should be passed to `HotArchiveBucketList::add_batch`.
+
+2. **Dead entries not filtered**: In `manager.rs` and the offline verification code, entries restored from hot archive that were subsequently deleted should NOT become DEAD entries in the live bucket list. They came from hot archive (not live bucket list), so deleting them just removes them from hot archive.
+
+**Observed symptoms**:
+- Header mismatch at ledgers 603325 and 610541
+- `DEAD only in OURS` showing ContractData entries that CDP doesn't have
+- `hot_archive_restored_keys: cdp_restored_count=3, our_restored_count=1`
+
+**Fix**:
+1. In `execution.rs`: Pass ALL hot archive keys (after live BL filtering) to `collected_hot_archive_keys`, not just those in `created_keys`
+2. In `manager.rs`: Filter `dead_entries` to exclude keys in `hot_archive_restored_keys`
+3. In `main.rs` (offline verify): Filter `our_dead` to exclude keys in `our_hot_archive_restored_keys`
+
+**Files Changed**:
+- `crates/stellar-core-ledger/src/execution.rs` - Removed `created_keys` filtering for bucket list
+- `crates/stellar-core-ledger/src/manager.rs` - Added dead_entries filtering by hot_archive_restored_keys
+- `crates/rs-stellar-core/src/main.rs` - Added our_dead filtering by our_hot_archive_restored_keys
+
+**Regression Test**: Testnet verification at ledgers 603325 and 610541 serves as the regression test. The fix involves complex integration between transaction execution and bucket list updates that's difficult to unit test in isolation.
+
+**Verification**: Ledgers 603000-604000 and 610000-611000 pass with 0 header mismatches.
+
 #### LiquidityPoolDeposit/Withdraw Fails for Asset Issuers (Ledger 419086)
 
 **Status**: FIXED
@@ -663,6 +697,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-26**: Fixed hot archive restored entries then deleted should not go to live bucket list DEAD (ledgers 603325, 610541) - extends verification to 646000+
 - **2026-01-26**: Fixed LiquidityPoolDeposit/Withdraw failing for asset issuers (ledger 419086) - extends verification to 420000+
 - **2026-01-26**: Fixed bucket list hash divergence at large merge points (ledger 365312) - extends verification to 365314+
 - **2026-01-25**: Fixed SetOptions missing inflation destination validation (ledger 329805) - extends verification to 329810+

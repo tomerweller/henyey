@@ -685,6 +685,67 @@ Our Rust code was incorrectly using `max_protocol_version` as the output version
 
 ---
 
+### F15: Hot Archive Restored Entries Then Deleted Should Not Go to Live Bucket List DEAD
+
+**Status**: FIXED  
+**Impact**: Was causing bucket list hash mismatches at ledgers with hot archive restore+delete  
+**Added**: 2026-01-26  
+**Fixed**: 2026-01-26
+
+**Description**:
+When entries are restored from hot archive during `InvokeHostFunction` execution and then deleted by the contract in the same transaction, they were incorrectly being added to the live bucket list's DEAD entries. This caused bucket list hash mismatches because:
+1. The entries came from hot archive, not live bucket list
+2. Deleting a restored-from-hot-archive entry should just remove it from hot archive, not add it to live DEAD
+
+**Observed at**: Ledgers 603325 and 610541 (testnet)
+
+**Symptoms**:
+- Header mismatch with `DEAD only in OURS: ContractData(...HasRole...burner...)`
+- `hot_archive_restored_keys: cdp_restored_count=3, our_restored_count=1`
+- All 3 entries from `archived_soroban_entries` should be passed to hot archive bucket list
+
+**Root Cause (Two Parts)**:
+
+1. **Bucket list key filtering**: In `execution.rs`, for `InvokeHostFunction` we filtered `collected_hot_archive_keys` by `created_keys`. Entries that were auto-restored and then **modified** (going to `updated`, not `created`) by the contract were excluded. All entries in `archived_soroban_entries` should be passed to `HotArchiveBucketList::add_batch`.
+
+2. **Dead entries not filtered**: In `manager.rs` and `main.rs`, entries restored from hot archive that were subsequently deleted were going into `dead_entries` for the live bucket list. They should NOT - they came from hot archive, not live bucket list.
+
+**Solution**:
+
+1. In `execution.rs`: Pass ALL hot archive keys (after live BL filtering) to `collected_hot_archive_keys`:
+```rust
+// Before (buggy):
+collected_hot_archive_keys.extend(
+    hot_archive_for_bucket_list
+        .iter()
+        .filter(|k| created_keys.contains(k))  // WRONG: filters out modified entries
+        .cloned(),
+);
+
+// After (fixed):
+collected_hot_archive_keys.extend(hot_archive_for_bucket_list.iter().cloned());
+```
+
+2. In `manager.rs`: Filter `dead_entries` to exclude keys in `hot_archive_restored_keys`:
+```rust
+if !self.hot_archive_restored_keys.is_empty() {
+    let restored_set: std::collections::HashSet<_> =
+        self.hot_archive_restored_keys.iter().collect();
+    dead_entries.retain(|key| !restored_set.contains(key));
+}
+```
+
+3. In `main.rs` (offline verify): Same filtering for `our_dead` by `our_hot_archive_restored_keys`
+
+**Files Changed**:
+- `crates/stellar-core-ledger/src/execution.rs` - Removed `created_keys` filtering
+- `crates/stellar-core-ledger/src/manager.rs` - Added dead_entries filtering
+- `crates/rs-stellar-core/src/main.rs` - Added our_dead filtering
+
+**Verification**: Ledgers 603000-604000 (1001 ledgers) and 610000-611000 (1001 ledgers) now pass with 0 header mismatches.
+
+---
+
 ### F14: LiquidityPoolDeposit/Withdraw Fails for Asset Issuers
 
 **Status**: FIXED  
