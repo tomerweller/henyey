@@ -3539,8 +3539,15 @@ async fn cmd_verify_execution(
                     }
                 } else {
                     // Not in test range (catch-up mode) - still need to apply refunds
-                    // to ensure bucket list has correct balances.
+                    // and collect hot archive restored keys to ensure bucket list has
+                    // correct state when we reach the test range.
                     if let Ok(result) = exec_result {
+                        // Collect hot archive restored keys during catch-up.
+                        // These must be removed from the hot archive bucket list even
+                        // for ledgers outside the test range, otherwise the hot archive
+                        // hash will diverge when starting from a later ledger.
+                        our_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
+                        
                         if result.fee_refund > 0 {
                             let frame = stellar_core_tx::TransactionFrame::with_network(
                                 tx_info.envelope.clone(),

@@ -926,6 +926,57 @@ let mut hot_archive =
 
 ---
 
+### F18: Hot Archive Restored Keys Not Collected During Catch-Up Mode
+
+**Status**: FIXED  
+**Impact**: Was causing hot archive hash divergence when starting verification from a ledger after checkpoint  
+**Added**: 2026-01-26  
+**Fixed**: 2026-01-26
+
+**Description**:
+When running `verify-execution` with a `--from` ledger that is after the checkpoint ledger, the code processes "catch-up" ledgers (between checkpoint and start_ledger) to build up state. During this catch-up phase, hot archive restored keys were NOT being collected from transaction execution results, even though they still need to be passed to `HotArchiveBucketList::add_batch()` to remove restored entries from the hot archive.
+
+**Observed at**: Ledger 635740 (testnet) - starting directly at 635740 produced different hot archive hash than starting from 635729
+
+**Symptoms**:
+- Starting from ledger 635729 to 635745: ALL ledgers pass (17 ledgers, 0 header mismatches)
+- Starting from ledger 635740 to 635741: Ledger 635740 FAILS with header mismatch
+- Different initial hot archive hash when starting from different ledgers within the same checkpoint range
+
+**Root Cause**:
+In `main.rs`, the `our_hot_archive_restored_keys` HashSet was only being populated inside the `if in_test_range` block (line 3357). For ledgers in catch-up mode (`!in_test_range`), the hot archive restored keys were not being collected from `result.hot_archive_restored_keys`, even though they were still passed to `hot_archive.add_batch()` to update the hot archive bucket list.
+
+This meant that entries restored during catch-up ledgers remained in the hot archive, causing the hash to diverge when compared against expected values.
+
+**Solution**:
+Added collection of hot archive restored keys in the catch-up mode branch:
+
+```rust
+} else {
+    // Not in test range (catch-up mode) - still need to collect hot archive
+    // restored keys and apply refunds to ensure bucket list has correct state.
+    if let Ok(result) = exec_result {
+        // Collect hot archive restored keys during catch-up.
+        our_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
+        
+        if result.fee_refund > 0 {
+            // ... refund handling ...
+        }
+    }
+}
+```
+
+**Files Changed**:
+- `crates/rs-stellar-core/src/main.rs` - Added `our_hot_archive_restored_keys.extend()` call in catch-up mode branch
+
+**Regression Test**: This is a CLI-level integration issue affecting the offline `verify-execution` command's catch-up mode. The fix is verified by running:
+- `./target/release/rs-stellar-core offline verify-execution --testnet --from 635740 --to 635741` - should pass with 0 header mismatches
+- Starting from any ledger within a checkpoint range should produce identical results
+
+**Verification**: Ledgers 635740-635741 now pass with 0 header mismatches when starting directly, matching the results when replaying from an earlier ledger (635729).
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:

@@ -67,7 +67,8 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 603000-604000 | 1,001 | 3,884 | 100% | ~97% | Hot archive restore+delete fix verified (ledger 603325) |
 | 610000-611000 | 1,001 | 3,968 | 100% | ~97% | Hot archive restore+delete fix verified (ledger 610541) |
 | 620000-635729 | 15,730 | ~60,000+ | 100% | ~98% | Duplicate hot archive key fix verified |
-| 635729-635740 | 12 | 215 | 100% | ~99% | Hot archive actual_restored_indices fix verified (ledger 635730) |
+| 635729-635745 | 17 | 250+ | 100% | ~99% | Hot archive actual_restored_indices fix verified (ledger 635730) |
+| 635740-635741 | 2 | 9 | 100% | ~99% | Hot archive catch-up mode fix verified (F18) |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
@@ -724,6 +725,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-26**: Fixed hot archive restored keys not collected during catch-up mode (F18) - enables verification from any ledger within checkpoint range
 - **2026-01-26**: Fixed duplicate hot archive restored keys causing multiple LIVE entries (ledger 635730 partial fix) - extends verification to 635729
 - **2026-01-26**: Fixed hot archive restored entries then deleted should not go to live bucket list DEAD (ledgers 603325, 610541) - extends verification to 646000+
 - **2026-01-26**: Fixed LiquidityPoolDeposit/Withdraw failing for asset issuers (ledger 419086) - extends verification to 420000+
