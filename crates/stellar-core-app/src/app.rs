@@ -3476,10 +3476,30 @@ impl App {
                 let mut buffer = self.syncing_ledgers.write().await;
                 for slot in (last_processed + 1)..=latest_externalized {
                     if let Some(info) = self.herder.check_ledger_close(slot) {
-                        if info.tx_set.is_none() {
-                            missing_tx_set = true;
+                        let has_tx_set = info.tx_set.is_some();
+                        // Update existing entry's tx_set if it was missing but now available,
+                        // or insert new entry if slot wasn't buffered yet.
+                        match buffer.entry(info.slot as u32) {
+                            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                let existing = entry.get_mut();
+                                if existing.tx_set.is_none() && info.tx_set.is_some() {
+                                    existing.tx_set = info.tx_set;
+                                    tracing::info!(
+                                        slot,
+                                        "Updated buffered ledger with tx_set from check_ledger_close"
+                                    );
+                                }
+                                if existing.tx_set.is_none() {
+                                    missing_tx_set = true;
+                                }
+                            }
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                if !has_tx_set {
+                                    missing_tx_set = true;
+                                }
+                                entry.insert(info);
+                            }
                         }
-                        buffer.entry(info.slot as u32).or_insert(info);
                         buffered_count += 1;
                         if slot == advance_to + 1 {
                             advance_to = slot;
