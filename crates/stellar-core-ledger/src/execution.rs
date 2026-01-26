@@ -65,11 +65,11 @@ use stellar_xdr::curr::{
     ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation,
     OperationBody, OperationMetaV2, OperationResult, OperationResultTr,
     PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress,
-    SignerKey, SorobanTransactionData, SorobanTransactionDataExt, SorobanTransactionMetaExt,
-    SorobanTransactionMetaExtV1, SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent,
-    TransactionEventStage, TransactionMeta, TransactionMetaV4, TransactionResult,
-    TransactionResultExt, TransactionResultMetaV1, TransactionResultPair, TransactionResultResult,
-    TrustLineAsset, TrustLineFlags, VecM, WriteXdr,
+    SignerKey, SorobanTransactionData, SorobanTransactionMetaExt, SorobanTransactionMetaExtV1,
+    SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
+    TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultExt,
+    TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset,
+    TrustLineFlags, VecM, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -1404,10 +1404,15 @@ impl TransactionExecutor {
     /// This handles all entry types including contract data, contract code, and TTL entries.
     /// Returns true if the entry was found and loaded.
     pub fn load_entry(&mut self, snapshot: &SnapshotHandle, key: &LedgerKey) -> Result<bool> {
+        // First check if entry already exists in state (e.g., created by a previous TX in this ledger).
+        // This is important for entries like TTLs that are created during restoration but haven't
+        // been written to the bucket list yet.
+        if self.state.get_entry(key).is_some() {
+            return Ok(true);
+        }
+        // Try to load from snapshot (bucket list + hot archive)
         if let Some(entry) = snapshot.get_entry(key)? {
-            if self.state.get_entry(key).is_none() {
-                self.state.load_entry(entry);
-            }
+            self.state.load_entry(entry);
             return Ok(true);
         }
         Ok(false)
@@ -1456,10 +1461,26 @@ impl TransactionExecutor {
                     .map_err(|e| LedgerError::Serialization(e.to_string()))?;
                 let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
 
-                let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
-                // Try to load TTL entry - it may not exist for newly created entries
-                // or in older bucket lists before TTL tracking was added
-                self.load_entry(snapshot, &ttl_key)?;
+                let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                    key_hash: key_hash.clone(),
+                });
+                // Try to load TTL entry - it may not exist for:
+                // 1. Newly created entries that haven't been checkpointed
+                // 2. Entries being restored from hot archive (TTL doesn't exist in bucket list)
+                // The load_entry function now checks state first, so entries restored by
+                // a previous TX in this ledger will be found.
+                let loaded = self.load_entry(snapshot, &ttl_key)?;
+                // Debug: log when TTL is not found for entries that might be archived
+                // (This is expected for hot archive entries in their first restoration TX)
+                if !loaded {
+                    if let LedgerKey::ContractCode(cc) = key {
+                        tracing::debug!(
+                            code_hash = ?cc.hash,
+                            key_hash = ?key_hash,
+                            "load_ttl_for_key: TTL not found (expected for hot archive entries)"
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -2722,14 +2743,22 @@ impl TransactionExecutor {
                             }
 
                             // Get hot archive keys from two sources:
-                            // 1. For InvokeHostFunction: extracted from archived_soroban_entries
+                            // 1. For InvokeHostFunction: from actual_restored_indices (filtered by host)
                             // 2. For RestoreFootprint: from soroban_meta.hot_archive_restores
                             // NOTE: We must exclude live BL restore keys from the hot archive set.
                             // Live BL restores are entries that exist in the live bucket list with
                             // expired TTL but haven't been evicted yet - these are NOT hot archive
                             // restores and should not be added to HotArchiveBucketList::add_batch.
-                            let mut hot_archive =
-                                extract_hot_archive_restored_keys(soroban_data, op_type);
+                            let actual_restored_indices = op_exec
+                                .soroban_meta
+                                .as_ref()
+                                .map(|m| m.actual_restored_indices.as_slice())
+                                .unwrap_or(&[]);
+                            let mut hot_archive = extract_hot_archive_restored_keys(
+                                soroban_data,
+                                op_type,
+                                actual_restored_indices,
+                            );
                             // For RestoreFootprint, get hot archive keys and entries from the meta
                             if let Some(meta) = &op_exec.soroban_meta {
                                 for ha_restore in &meta.hot_archive_restores {
@@ -3599,8 +3628,10 @@ struct RestoredEntries {
 
 /// Extract keys of entries being restored from the hot archive.
 ///
-/// For InvokeHostFunction: `archived_soroban_entries` contains indices into the
-/// read_write footprint that point to entries being auto-restored from hot archive.
+/// For InvokeHostFunction: Uses `actual_restored_indices` from the execution result,
+/// which filters out entries that were already restored by a previous transaction
+/// in the same ledger. This is crucial for correctness - entries listed in
+/// `archived_soroban_entries` in the envelope may have been restored by a prior TX.
 ///
 /// For RestoreFootprint: entries are from hot archive if they don't exist in live BL,
 /// otherwise they're from live BL (detected separately).
@@ -3610,6 +3641,7 @@ struct RestoredEntries {
 fn extract_hot_archive_restored_keys(
     soroban_data: Option<&SorobanTransactionData>,
     op_type: OperationType,
+    actual_restored_indices: &[u32],
 ) -> HashSet<LedgerKey> {
     let mut keys = HashSet::new();
 
@@ -3626,14 +3658,11 @@ fn extract_hot_archive_restored_keys(
         return keys;
     }
 
-    let archived_indices: Vec<u32> = match &data.ext {
-        SorobanTransactionDataExt::V1(ext) => {
-            ext.archived_soroban_entries.iter().copied().collect()
-        }
-        SorobanTransactionDataExt::V0 => Vec::new(),
-    };
-
-    if archived_indices.is_empty() {
+    // Use actual_restored_indices instead of raw archived_soroban_entries.
+    // The actual_restored_indices is filtered during host invocation to only
+    // include entries that are ACTUALLY being restored in THIS transaction,
+    // excluding entries already restored by a previous transaction in this ledger.
+    if actual_restored_indices.is_empty() {
         return keys;
     }
 
@@ -3642,8 +3671,8 @@ fn extract_hot_archive_restored_keys(
     // C++ stellar-core's HotArchiveBucketList::add_batch only receives the main entry keys,
     // not TTL keys. TTL entries are handled separately in the live bucket list.
     let read_write = &data.resources.footprint.read_write;
-    for index in archived_indices {
-        if let Some(key) = read_write.get(index as usize) {
+    for index in actual_restored_indices {
+        if let Some(key) = read_write.get(*index as usize) {
             keys.insert(key.clone());
         }
     }
@@ -5678,6 +5707,131 @@ mod tests {
             tracker.refund_amount(),
             max_refundable_fee,
             "refund should be full max_refundable_fee after reset"
+        );
+    }
+
+    /// Regression test for F17: extract_hot_archive_restored_keys uses actual_restored_indices
+    ///
+    /// When multiple transactions in the same ledger reference the same archived entry,
+    /// only the FIRST transaction should treat it as a hot archive restore. Subsequent
+    /// transactions should see it as already live (restored by the prior TX).
+    ///
+    /// The key insight is that `archived_soroban_entries` in the transaction envelope
+    /// is set at submission time, not execution time. By execution time, a prior TX
+    /// may have already restored the entry.
+    ///
+    /// This test verifies that extract_hot_archive_restored_keys only returns keys
+    /// for indices in `actual_restored_indices`, not all `archived_soroban_entries`.
+    #[test]
+    fn test_extract_hot_archive_restored_keys_uses_actual_indices() {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractId, LedgerFootprint, LedgerKey, LedgerKeyContractData,
+            ScAddress, ScVal, SorobanResources, SorobanResourcesExtV0, SorobanTransactionData,
+            SorobanTransactionDataExt,
+        };
+
+        // Create a footprint with 3 keys in read_write
+        let key0 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0u8; 32]))),
+            key: ScVal::U32(0),
+            durability: ContractDataDurability::Persistent,
+        });
+        let key1 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([1u8; 32]))),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Persistent,
+        });
+        let key2 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([2u8; 32]))),
+            key: ScVal::U32(2),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![key0.clone(), key1.clone(), key2.clone()]
+                .try_into()
+                .unwrap(),
+        };
+
+        // Envelope says all 3 indices (0, 1, 2) need restoration
+        // (this was set at submission time)
+        // Note: V1 extension with archived_soroban_entries requires Protocol 25
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0, 1, 2].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        // Case 1: All 3 are actually archived (actual_restored_indices = [0, 1, 2])
+        let actual_all = vec![0u32, 1, 2];
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::InvokeHostFunction,
+            &actual_all,
+        );
+        assert_eq!(
+            result.len(),
+            3,
+            "Should return all 3 keys when all are actually archived"
+        );
+        assert!(result.contains(&key0));
+        assert!(result.contains(&key1));
+        assert!(result.contains(&key2));
+
+        // Case 2: Only index 0 is actually archived (1 and 2 were restored by prior TX)
+        // This is the bug scenario - actual_restored_indices is filtered by the host
+        let actual_one = vec![0u32];
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::InvokeHostFunction,
+            &actual_one,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only return 1 key when only index 0 is actually archived"
+        );
+        assert!(result.contains(&key0), "Should contain key0");
+        assert!(
+            !result.contains(&key1),
+            "Should NOT contain key1 (already restored)"
+        );
+        assert!(
+            !result.contains(&key2),
+            "Should NOT contain key2 (already restored)"
+        );
+
+        // Case 3: None are actually archived (all were restored by prior TXs)
+        let actual_none: Vec<u32> = vec![];
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::InvokeHostFunction,
+            &actual_none,
+        );
+        assert_eq!(
+            result.len(),
+            0,
+            "Should return empty set when none are actually archived"
+        );
+
+        // Case 4: RestoreFootprint should always return empty (handled separately)
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::RestoreFootprint,
+            &actual_all,
+        );
+        assert_eq!(
+            result.len(),
+            0,
+            "RestoreFootprint should return empty (keys come from meta.hot_archive_restores)"
         );
     }
 }

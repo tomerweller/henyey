@@ -96,6 +96,11 @@ pub struct SorobanOperationMeta {
     /// These need RESTORED ledger entry changes emitted in transaction meta.
     /// Contains both the key and the entry value.
     pub hot_archive_restores: Vec<HotArchiveRestore>,
+    /// Indices of entries ACTUALLY restored from hot archive in THIS transaction.
+    /// This is a subset of the transaction envelope's archived_soroban_entries,
+    /// excluding entries that were already restored by a previous transaction
+    /// in the same ledger. Used to determine whether to emit INIT vs LIVE changes.
+    pub actual_restored_indices: Vec<u32>,
 }
 
 /// Entry restored from the hot archive.
@@ -495,6 +500,7 @@ pub fn execute_operation_with_soroban(
                     rent_fee,
                     live_bucket_list_restores: Vec::new(),
                     hot_archive_restores: Vec::new(),
+                    actual_restored_indices: Vec::new(),
                 });
             }
             Ok(exec)
@@ -655,6 +661,7 @@ pub fn execute_operation_with_soroban(
                     rent_fee,
                     live_bucket_list_restores: Vec::new(),
                     hot_archive_restores,
+                    actual_restored_indices: Vec::new(),
                 });
             }
             Ok(exec)

@@ -67,8 +67,34 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 603000-604000 | 1,001 | 3,884 | 100% | ~97% | Hot archive restore+delete fix verified (ledger 603325) |
 | 610000-611000 | 1,001 | 3,968 | 100% | ~97% | Hot archive restore+delete fix verified (ledger 610541) |
 | 620000-635729 | 15,730 | ~60,000+ | 100% | ~98% | Duplicate hot archive key fix verified |
+| 635729-635740 | 12 | 215 | 100% | ~99% | Hot archive actual_restored_indices fix verified (ledger 635730) |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
+
+### Issues Fixed (2026-01-26)
+
+#### 1. Hot Archive Restoration Using Envelope Instead of Actual Restored Indices (Ledger 635730)
+
+The `extract_hot_archive_restored_keys` function in `execution.rs` was incorrectly using raw `archived_soroban_entries` from the transaction envelope to determine hot archive restorations. Entries listed in `archived_soroban_entries` may have already been restored by a previous transaction in the same ledger.
+
+**Root Cause**: The envelope's `archived_soroban_entries` is set at transaction submission time. If a prior TX in the same ledger already restored an entry, subsequent TXs should NOT treat it as a hot archive restore. The soroban-env-host already computes `actual_restored_indices` which filters out already-restored entries, but this wasn't being used.
+
+**Observed symptoms**:
+- `cdp_restored_count=0` but `our_restored_count=2`
+- Entries had valid `live_until >= current_ledger` (already live)
+- Bucket list hash mismatch
+
+**Fix**: 
+1. Added `actual_restored_indices` field to `SorobanOperationMeta` struct
+2. Updated `build_soroban_operation_meta` to propagate the field
+3. Modified `extract_hot_archive_restored_keys` in `execution.rs` to use `actual_restored_indices` instead of envelope data
+
+**Files changed:**
+- `crates/stellar-core-tx/src/operations/execute/mod.rs` - Added field to struct
+- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Propagated field
+- `crates/stellar-core-ledger/src/execution.rs` - Updated function signature and call site
+
+**Verification**: Ledgers 635729-635740 pass with 0 header mismatches. Combined with F16 (duplicate key fix), ledger 635730 is fully resolved.
 
 ### Issues Fixed (2026-01-25)
 

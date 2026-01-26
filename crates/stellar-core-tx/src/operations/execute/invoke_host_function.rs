@@ -399,6 +399,7 @@ fn execute_upload_wasm(
                 rent_fee: 0,
                 live_bucket_list_restores: Vec::new(),
                 hot_archive_restores: Vec::new(),
+                actual_restored_indices: Vec::new(),
             },
         ));
     }
@@ -463,6 +464,7 @@ fn execute_upload_wasm(
             rent_fee,
             live_bucket_list_restores: Vec::new(),
             hot_archive_restores: Vec::new(),
+            actual_restored_indices: Vec::new(),
         },
     ))
 }
@@ -777,6 +779,7 @@ fn build_soroban_operation_meta(
         rent_fee: result.rent_fee,
         live_bucket_list_restores: result.live_bucket_list_restores.clone(),
         hot_archive_restores: Vec::new(), // For InvokeHostFunction, hot archive keys are detected via archived_soroban_entries
+        actual_restored_indices: result.actual_restored_indices.clone(),
     }
 }
 

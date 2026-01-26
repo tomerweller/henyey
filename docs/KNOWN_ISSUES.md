@@ -853,7 +853,76 @@ for entry in moved_to_live {
 
 **Verification**: Ledgers 603325 and 610541 (previously fixed) still pass. This fix prevents duplicate entries in future similar scenarios.
 
-**Note**: Ledger 635730 still has a separate issue (CDP vs ours restored_keys discrepancy) that requires further investigation. This fix resolved the duplicate entries but the remaining mismatch is about whether entries should be classified as hot archive restores.
+**Note**: This fix was combined with F17 to fully resolve ledger 635730.
+
+---
+
+### F17: Hot Archive Restoration Using Envelope Instead of Actual Restored Indices
+
+**Status**: FIXED  
+**Impact**: Was causing incorrect hot archive restored_count and bucket list hash mismatch  
+**Added**: 2026-01-26  
+**Fixed**: 2026-01-26
+
+**Description**:
+The `extract_hot_archive_restored_keys` function in `execution.rs` was using raw `archived_soroban_entries` from the transaction envelope to determine which entries should be removed from the hot archive. However, entries listed in `archived_soroban_entries` may have already been restored by a **previous transaction in the same ledger**. The envelope's indices are set at transaction submission time, not execution time.
+
+**Observed at**: Ledger 635730 (testnet) - ContractCode and ContractData listed as hot archive restores but already live
+
+**Symptoms**:
+- `cdp_restored_count=0` but `our_restored_count=2`
+- Entries had valid `live_until >= current_ledger` (already restored by ledger 635729)
+- Bucket list hash mismatch due to incorrect hot archive deletion
+
+**Root Cause**:
+The `extract_hot_archive_restored_keys` function in `execution.rs` extracted hot archive keys from `archived_soroban_entries` in the transaction envelope. But the soroban-env-host already filters these indices during execution to build `actual_restored_indices`, which excludes entries that were already restored by a prior transaction.
+
+The fix for F7 added `actual_restored_indices` to `SorobanExecutionResult` in `host.rs`, and F7 updated `extract_hot_archive_restored_keys` in `invoke_host_function.rs`. However, there was a SECOND copy of `extract_hot_archive_restored_keys` in `execution.rs` that was NOT updated to use this field.
+
+**Solution**:
+
+1. Added `actual_restored_indices` field to `SorobanOperationMeta` struct to propagate the filtered indices:
+```rust
+pub struct SorobanOperationMeta {
+    // ... existing fields ...
+    pub actual_restored_indices: Vec<u32>,
+}
+```
+
+2. Updated `build_soroban_operation_meta` in `invoke_host_function.rs` to pass the field:
+```rust
+SorobanOperationMeta {
+    // ... existing fields ...
+    actual_restored_indices: result.actual_restored_indices.clone(),
+}
+```
+
+3. Modified `extract_hot_archive_restored_keys` in `execution.rs` to take `actual_restored_indices` as a parameter instead of extracting from envelope:
+```rust
+fn extract_hot_archive_restored_keys(
+    soroban_data: Option<&SorobanTransactionData>,
+    op_type: OperationType,
+    actual_restored_indices: &[u32],  // NEW parameter
+) -> HashSet<LedgerKey>
+```
+
+4. Updated the call site to pass `actual_restored_indices` from `op_exec.soroban_meta`:
+```rust
+let actual_restored_indices = op_exec
+    .soroban_meta
+    .as_ref()
+    .map(|m| m.actual_restored_indices.as_slice())
+    .unwrap_or(&[]);
+let mut hot_archive =
+    extract_hot_archive_restored_keys(soroban_data, op_type, actual_restored_indices);
+```
+
+**Files Changed**:
+- `crates/stellar-core-tx/src/operations/execute/mod.rs` - Added field to `SorobanOperationMeta`
+- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Propagated field in all struct constructions
+- `crates/stellar-core-ledger/src/execution.rs` - Updated function signature and call site
+
+**Verification**: Ledgers 635729-635740 (12 ledgers) pass with 0 header mismatches. Combined with F16, ledger 635730 is now fully resolved.
 
 ---
 
