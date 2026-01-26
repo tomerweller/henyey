@@ -301,7 +301,7 @@ pub fn validate_signatures(
 ) -> std::result::Result<(), ValidationError> {
     // Compute transaction hash - this can fail if the envelope is malformed
     let _tx_hash = frame.hash(&context.network_id).map_err(|e| {
-        tracing::warn!("validate_signatures: hash computation failed: {:?}", e);
+        tracing::debug!("validate_signatures: hash computation failed: {:?}", e);
         ValidationError::InvalidSignature
     })?;
 

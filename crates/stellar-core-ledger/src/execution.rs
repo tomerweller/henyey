@@ -640,7 +640,7 @@ impl RefundableFeeTracker {
         // This matches C++ stellar-core's consumeRefundableSorobanResources which checks
         // if (mMaximumRefundableFee < mConsumedRentFee) before computing events fee.
         if self.consumed_rent_fee > self.max_refundable_fee {
-            tracing::warn!(
+            tracing::debug!(
                 consumed_rent_fee = self.consumed_rent_fee,
                 max_refundable_fee = self.max_refundable_fee,
                 rent_fee = rent_fee,
@@ -662,7 +662,7 @@ impl RefundableFeeTracker {
 
         // Second check: total consumed (rent + events) must not exceed max refundable fee.
         if self.consumed_refundable_fee > self.max_refundable_fee {
-            tracing::warn!(
+            tracing::debug!(
                 consumed_refundable_fee = self.consumed_refundable_fee,
                 max_refundable_fee = self.max_refundable_fee,
                 consumed_rent_fee = self.consumed_rent_fee,
@@ -2180,7 +2180,7 @@ impl TransactionExecutor {
             &fee_source_account,
             outer_threshold,
         ) {
-            tracing::warn!("Signature check failed: fee_source outer check");
+            tracing::debug!("Signature check failed: fee_source outer check");
             return Ok(TransactionExecutionResult {
                 success: false,
                 fee_charged: 0,
@@ -2204,7 +2204,7 @@ impl TransactionExecutor {
                 &source_account,
                 inner_threshold,
             ) {
-                tracing::warn!("Signature check failed: fee_bump inner check");
+                tracing::debug!("Signature check failed: fee_bump inner check");
                 return Ok(TransactionExecutionResult {
                     success: false,
                     fee_charged: 0,
@@ -2232,7 +2232,7 @@ impl TransactionExecutor {
                 required_weight,
             )
         {
-            tracing::warn!(
+            tracing::debug!(
                 required_weight = required_weight,
                 is_fee_bump = frame.is_fee_bump(),
                 master_weight = source_account.thresholds.0[0],
@@ -2907,7 +2907,7 @@ impl TransactionExecutor {
                     Err(e) => {
                         self.state.end_op_snapshot();
                         all_success = false;
-                        warn!(
+                        debug!(
                             error = %e,
                             op_index = op_index,
                             op_type = ?OperationType::from_body(&op.body),
@@ -2932,7 +2932,7 @@ impl TransactionExecutor {
                 .hash(&self.network_id)
                 .map(|hash| hash.to_hex())
                 .unwrap_or_else(|_| "unknown".to_string());
-            warn!(
+            debug!(
                 tx_hash = %tx_hash,
                 fee_source = %account_id_to_strkey(&fee_source_id),
                 inner_source = %account_id_to_strkey(&inner_source_id),
