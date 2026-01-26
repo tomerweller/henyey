@@ -2953,10 +2953,13 @@ impl App {
             GeneralizedTransactionSet, Limits, ScpStatementPledges, TransactionPhase,
             TxSetComponent, WriteXdr,
         };
+        use std::collections::HashSet;
 
         let mut cached_tx_sets = 0u32;
         let mut requested_tx_sets = 0u32;
         let mut recorded_externalized = 0u32;
+        // Track tx_sets we've already broadcast requests for to avoid spamming all peers
+        let mut requested_hashes: HashSet<Hash256> = HashSet::new();
 
         loop {
             match message_rx.recv().await {
@@ -3050,35 +3053,42 @@ impl App {
                                 {
                                     let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
 
-                                    // Check if we already have this tx_set
-                                    if !self.herder.has_tx_set(&tx_set_hash) {
+                                    // Check if we already have this tx_set or already broadcast a request
+                                    if !self.herder.has_tx_set(&tx_set_hash)
+                                        && !requested_hashes.contains(&tx_set_hash)
+                                    {
                                         // Register as pending and send GetTxSet request
                                         self.herder
                                             .scp_driver()
                                             .request_tx_set(tx_set_hash, slot);
 
-                                        // Send GetTxSet request to the peer
-                                        let peer = msg.from_peer.clone();
+                                        // Track that we've requested this hash to avoid duplicate broadcasts
+                                        requested_hashes.insert(tx_set_hash);
+
+                                        // Broadcast GetTxSet request to ALL peers, not just the sender.
+                                        // This is critical for bridging the gap after catchup: by the time
+                                        // catchup completes, older tx_sets may be evicted from the sender's
+                                        // cache. By requesting from all peers, we maximize our chances of
+                                        // getting the tx_set before any single peer evicts it.
                                         let overlay = self.overlay.lock().await;
                                         if let Some(ref overlay) = *overlay {
-                                            let request = StellarMessage::GetTxSet(
-                                                stellar_xdr::curr::Uint256(tx_set_hash.0),
-                                            );
-                                            if let Err(e) = overlay.send_to(&peer, request).await {
-                                                tracing::debug!(
-                                                    slot,
-                                                    peer = %peer,
-                                                    error = %e,
-                                                    "Failed to request tx set during catchup"
-                                                );
-                                            } else {
-                                                requested_tx_sets += 1;
-                                                tracing::info!(
-                                                    slot,
-                                                    hash = %tx_set_hash,
-                                                    peer = %peer,
-                                                    "Requested tx_set during catchup from EXTERNALIZE"
-                                                );
+                                            match overlay.request_tx_set(&tx_set_hash.0).await {
+                                                Ok(peer_count) => {
+                                                    requested_tx_sets += 1;
+                                                    tracing::info!(
+                                                        slot,
+                                                        hash = %tx_set_hash,
+                                                        peer_count,
+                                                        "Broadcast tx_set request to all peers during catchup"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        slot,
+                                                        error = %e,
+                                                        "Failed to broadcast tx_set request during catchup"
+                                                    );
+                                                }
                                             }
                                         }
                                     }
