@@ -685,6 +685,56 @@ Our Rust code was incorrectly using `max_protocol_version` as the output version
 
 ---
 
+### F14: LiquidityPoolDeposit/Withdraw Fails for Asset Issuers
+
+**Status**: FIXED  
+**Impact**: Was causing LiquidityPoolDeposit to return NoTrust when issuer deposits their own asset  
+**Added**: 2026-01-26  
+**Fixed**: 2026-01-26
+
+**Description**:
+When an asset issuer attempts to deposit into or withdraw from a liquidity pool containing their own asset, the operation was incorrectly returning `NoTrust` because the code required a trustline for the asset. In Stellar, issuers don't need trustlines for their own assets - they can create/destroy assets from nothing with unlimited capacity.
+
+**Observed at**: Ledger 419086 (testnet) - TX 3 LiquidityPoolDeposit
+
+**Symptoms**:
+- Our result: `LiquidityPoolDeposit(NoTrust)` - TX failed
+- CDP result: `LiquidityPoolDeposit(Success)` - TX succeeded
+- Account balance diff: 5,000,000,000 stroops (5000 XLM)
+- Missing from our delta: LiquidityPool entry + PoolShare trustline
+
+**Root Cause**:
+The `execute_liquidity_pool_deposit()` and related functions checked for trustlines without considering the issuer special case. In C++ stellar-core, the `TrustLineWrapper` class handles this via separate `IssuerImpl` and `NonIssuerImpl` implementations:
+
+1. For non-issuers: Load and verify trustline exists and is authorized
+2. For issuers: Use `IssuerImpl` which:
+   - Returns `true` for `operator bool()` (always valid)
+   - Returns `true` for `addBalance()` (no-op, assets created/destroyed from nothing)
+   - Returns `i64::MAX` for available balance (unlimited capacity)
+
+Our Rust code was unconditionally requiring trustlines.
+
+**Solution**:
+Added `is_issuer()` helper function and updated multiple code paths:
+
+1. **Trustline checks**: Skip for issuers (`trustline_a`/`trustline_b` set to `None`)
+2. **Available balance**: Return `i64::MAX` for issuers (unlimited capacity)
+3. **Deduct balance**: No-op for issuers (they "create" assets from nothing)
+4. **can_credit_asset()**: Return `Ok` for issuers (can always receive their own assets)
+5. **credit_asset()**: No-op for issuers (received assets are "destroyed")
+6. **Unrelated bug fix**: `make_deposit_result` → `make_withdraw_result` in withdraw's "pool not found" error
+
+**Files Changed**:
+- `crates/stellar-core-tx/src/operations/execute/liquidity_pool.rs` - Added `is_issuer()` helper and updated all affected functions
+
+**Regression Tests**:
+- `test_liquidity_pool_deposit_issuer_no_trustline` - Issuer can deposit their own asset without trustline
+- `test_liquidity_pool_withdraw_issuer_no_trustline` - Issuer can withdraw and receive their own asset
+
+**Verification**: Ledgers 419000-420000 (1001 ledgers, 3762 transactions) pass with 0 header mismatches.
+
+---
+
 ## How to Add Issues
 
 When adding a new issue:

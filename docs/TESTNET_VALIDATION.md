@@ -2,7 +2,7 @@
 
 This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
 
-**Last Updated:** 2026-01-25
+**Last Updated:** 2026-01-26
 
 ## Quick Reference: Running Verification
 
@@ -62,6 +62,7 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 300000-312750 | 12,751 | ~40,000+ | 100% | ~99% | Duplicate entry fix verified |
 | 64-617812+ | 617,749+ | ~600,000+ | 100% | ~98% | **Hot archive fix allows further expansion** |
 | 300000-365311 | 65,312 | ~200,000+ | 100% | ~98% | Module cache + SetOptions inflation fixes |
+| 419000-420000 | 1,001 | 3,762 | 100% | ~99% | LiquidityPoolDeposit issuer trustline fix verified |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
@@ -503,6 +504,33 @@ When a `CreateClaimableBalance` operation has an operation source different from
 
 ### Issues Fixed (2026-01-26)
 
+#### LiquidityPoolDeposit/Withdraw Fails for Asset Issuers (Ledger 419086)
+
+**Status**: FIXED
+
+When an asset issuer deposits into or withdraws from a liquidity pool containing their own asset, the operation was incorrectly returning `NoTrust` because the code required a trustline.
+
+**Root Cause**: In Stellar, issuers don't need trustlines for their own assets - they can create/destroy assets from nothing with unlimited capacity. C++ stellar-core's `TrustLineWrapper` handles this via separate `IssuerImpl` and `NonIssuerImpl` implementations. Our Rust code was unconditionally requiring trustlines.
+
+**Observed symptoms**:
+- Our result: `LiquidityPoolDeposit(NoTrust)` - TX failed
+- CDP result: `LiquidityPoolDeposit(Success)` - TX succeeded
+- Account balance diff: 5,000,000,000 stroops (5000 XLM)
+
+**Fix**: Added `is_issuer()` helper function and updated:
+- Trustline checks: Skip for issuers
+- Available balance: Return `i64::MAX` for issuers (unlimited capacity)
+- Deduct/credit balance: No-op for issuers
+
+**Files Changed**:
+- `crates/stellar-core-tx/src/operations/execute/liquidity_pool.rs`
+
+**Regression Tests**:
+- `test_liquidity_pool_deposit_issuer_no_trustline`
+- `test_liquidity_pool_withdraw_issuer_no_trustline`
+
+**Verification**: Ledgers 419000-420000 (1001 ledgers, 3762 transactions) pass with 0 header mismatches.
+
 #### Bucket List Hash Divergence at Large Merge Points (Ledger 365312)
 
 **Status**: FIXED
@@ -635,6 +663,8 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-26**: Fixed LiquidityPoolDeposit/Withdraw failing for asset issuers (ledger 419086) - extends verification to 420000+
+- **2026-01-26**: Fixed bucket list hash divergence at large merge points (ledger 365312) - extends verification to 365314+
 - **2026-01-25**: Fixed SetOptions missing inflation destination validation (ledger 329805) - extends verification to 329810+
 - **2026-01-25**: Fixed persistent module cache not updated for newly deployed contracts (ledger 328879) - extends verification to 328900+
 - **2026-01-24**: Fixed duplicate entry error when restoring hot archive entries (ledger 306338) - enables verification of 300000-312750+

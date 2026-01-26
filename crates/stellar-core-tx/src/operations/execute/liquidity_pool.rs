@@ -81,8 +81,9 @@ pub fn execute_liquidity_pool_deposit(
             }
         };
 
-    // Check source has trustlines for both assets (unless native)
-    let trustline_a = if matches!(&asset_a, Asset::Native) {
+    // Check source has trustlines for both assets (unless native or issuer).
+    // Issuers don't need trustlines for their own assets - they can always hold them.
+    let trustline_a = if matches!(&asset_a, Asset::Native) || is_issuer(source, &asset_a) {
         None
     } else {
         match state.get_trustline(source, &asset_a) {
@@ -93,7 +94,7 @@ pub fn execute_liquidity_pool_deposit(
         }
     };
 
-    let trustline_b = if matches!(&asset_b, Asset::Native) {
+    let trustline_b = if matches!(&asset_b, Asset::Native) || is_issuer(source, &asset_b) {
         None
     } else {
         match state.get_trustline(source, &asset_b) {
@@ -126,10 +127,12 @@ pub fn execute_liquidity_pool_deposit(
 
     let available_a = match &asset_a {
         Asset::Native => available_native_balance(source, state, context)?,
+        _ if is_issuer(source, &asset_a) => i64::MAX, // Issuers have unlimited capacity
         _ => trustline_a.map(|tl| tl.balance).unwrap_or(0),
     };
     let available_b = match &asset_b {
         Asset::Native => available_native_balance(source, state, context)?,
+        _ if is_issuer(source, &asset_b) => i64::MAX, // Issuers have unlimited capacity
         _ => trustline_b.map(|tl| tl.balance).unwrap_or(0),
     };
     let available_pool_share_limit = pool_share_trustline
@@ -219,6 +222,7 @@ pub fn execute_liquidity_pool_deposit(
     }
 
     // Deduct assets from source
+    // Note: issuers can deposit their own assets without a trustline (they create from nothing)
     if matches!(&asset_a, Asset::Native) {
         if let Some(account) = state.get_account_mut(source) {
             if account.balance < deposit_a {
@@ -228,6 +232,8 @@ pub fn execute_liquidity_pool_deposit(
             }
             account.balance -= deposit_a;
         }
+    } else if is_issuer(source, &asset_a) {
+        // Issuer "creates" assets out of nothing, no balance to deduct
     } else if let Some(tl) = state.get_trustline_mut(source, &asset_a) {
         if tl.balance < deposit_a {
             return Ok(make_deposit_result(
@@ -246,6 +252,8 @@ pub fn execute_liquidity_pool_deposit(
             }
             account.balance -= deposit_b;
         }
+    } else if is_issuer(source, &asset_b) {
+        // Issuer "creates" assets out of nothing, no balance to deduct
     } else if let Some(tl) = state.get_trustline_mut(source, &asset_b) {
         if tl.balance < deposit_b {
             return Ok(make_deposit_result(
@@ -552,6 +560,12 @@ fn can_credit_asset(
         return WithdrawAssetCheck::Ok;
     }
 
+    // Issuers don't need trustlines for their own assets - they can always hold them
+    // with effectively unlimited capacity
+    if is_issuer(source, asset) {
+        return WithdrawAssetCheck::Ok;
+    }
+
     let Some(tl) = state.get_trustline(source, asset) else {
         return WithdrawAssetCheck::NoTrust;
     };
@@ -569,6 +583,11 @@ fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asse
         if let Some(account) = state.get_account_mut(source) {
             account.balance += amount;
         }
+        return;
+    }
+
+    // Issuers don't track balance for their own assets - credits are essentially "destroyed"
+    if is_issuer(source, asset) {
         return;
     }
 
@@ -603,6 +622,16 @@ fn big_divide(a: i64, b: i64, c: i64, round: Round) -> Result<i64> {
         return Ok(0);
     }
     Ok(result as i64)
+}
+
+/// Check if an account is the issuer of an asset.
+/// The issuer doesn't need a trustline to hold their own asset.
+fn is_issuer(account: &AccountId, asset: &Asset) -> bool {
+    match asset {
+        Asset::Native => false,
+        Asset::CreditAlphanum4(a) => &a.issuer == account,
+        Asset::CreditAlphanum12(a) => &a.issuer == account,
+    }
 }
 
 fn big_square_root(a: i64, b: i64) -> i64 {
@@ -1003,6 +1032,164 @@ mod tests {
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
                 assert!(matches!(r, LiquidityPoolWithdrawResult::LineFull));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test that asset issuers can deposit into liquidity pools without trustlines.
+    /// This is a regression test for the bug at ledger 419086.
+    #[test]
+    fn test_liquidity_pool_deposit_issuer_no_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        // The issuer is the source account depositing
+        let issuer_id = create_test_account_id(0);
+        let other_issuer = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer.clone(), 100_000_000, 0));
+
+        // Asset B is issued by the depositor
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: other_issuer.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"RDCI"),
+            issuer: issuer_id.clone(), // Issuer is the depositor
+        });
+        let pool_id = PoolId(Hash([10u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            0,
+            0,
+            0,
+        ));
+
+        // Create trustline for asset_a (which issuer_id is NOT the issuer of)
+        let trustline_a = TrustLineEntry {
+            account_id: issuer_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000_000,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // No trustline for asset_b since issuer_id IS the issuer
+
+        let pool_share_tl = TrustLineEntry {
+            account_id: issuer_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&issuer_id).unwrap().num_sub_entries += 2;
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 500_000,
+            max_amount_b: 500_000,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 2, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &issuer_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                // Should succeed - issuers can deposit their own assets without trustlines
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test that asset issuers can withdraw from liquidity pools and receive their own assets.
+    #[test]
+    fn test_liquidity_pool_withdraw_issuer_no_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        // The issuer is the source account withdrawing
+        let issuer_id = create_test_account_id(0);
+        let other_issuer = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer.clone(), 100_000_000, 0));
+
+        // Asset B is issued by the withdrawer
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: other_issuer.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"RDCI"),
+            issuer: issuer_id.clone(), // Issuer is the withdrawer
+        });
+        let pool_id = PoolId(Hash([11u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        ));
+
+        // Create trustline for asset_a (which issuer_id is NOT the issuer of)
+        let trustline_a = TrustLineEntry {
+            account_id: issuer_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // No trustline for asset_b since issuer_id IS the issuer
+
+        let pool_share_tl = TrustLineEntry {
+            account_id: issuer_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100_000,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&issuer_id).unwrap().num_sub_entries += 2;
+
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id,
+            amount: 50_000,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &issuer_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                // Should succeed - issuers can receive their own assets without trustlines
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
             }
             other => panic!("unexpected result: {:?}", other),
         }
