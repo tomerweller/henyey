@@ -1278,24 +1278,20 @@ fn make_result(code: InvokeHostFunctionResultCode, success_hash: Hash) -> Operat
 /// C++ stellar-core checks if the failure was due to exceeding specified resource limits:
 /// - If actual CPU instructions > specified instructions -> RESOURCE_LIMIT_EXCEEDED
 /// - If actual memory > network's txMemoryLimit -> RESOURCE_LIMIT_EXCEEDED
-/// - If the host error is Budget/ExceededLimit -> RESOURCE_LIMIT_EXCEEDED
 /// - Otherwise -> TRAPPED (for any other failure like auth errors, panics, storage errors, etc.)
 ///
 /// The key insight is that C++ checks raw resource consumption regardless of error type.
 /// Even if the host returns an Auth error, if CPU exceeded the specified limit, the
 /// result is RESOURCE_LIMIT_EXCEEDED.
 ///
-/// Additionally, if the host itself reports a Budget/ExceededLimit error, we return
-/// RESOURCE_LIMIT_EXCEEDED regardless of our measured consumption. This handles cases
-/// where historical cost model differences cause our measured consumption to be lower
-/// than what was measured when the transaction was originally executed.
+/// Note: C++ does NOT check the host error type - it purely checks measured consumption
+/// against limits. A host error of Budget/ExceededLimit does NOT automatically become
+/// ResourceLimitExceeded; only actual limit violations trigger that result code.
 fn map_host_error_to_result_code(
     exec_error: &crate::soroban::SorobanExecutionError,
     specified_instructions: u32,
     tx_memory_limit: u64,
 ) -> InvokeHostFunctionResultCode {
-    use soroban_env_host_p25::xdr::{ScErrorCode, ScErrorType};
-
     // C++ stellar-core logic (InvokeHostFunctionOpFrame.cpp lines 579-602):
     // First check if CPU instructions exceeded the specified limit
     if exec_error.cpu_insns_consumed > specified_instructions as u64 {
@@ -1307,20 +1303,10 @@ fn map_host_error_to_result_code(
         return InvokeHostFunctionResultCode::ResourceLimitExceeded;
     }
 
-    // If the host error is Budget/ExceededLimit, return ResourceLimitExceeded.
-    // This handles cases where the soroban host internally detected a budget
-    // exceeded condition, even if our measured consumption differs due to
-    // historical cost model variance.
-    if exec_error.host_error.error.is_type(ScErrorType::Budget)
-        && exec_error
-            .host_error
-            .error
-            .is_code(ScErrorCode::ExceededLimit)
-    {
-        return InvokeHostFunctionResultCode::ResourceLimitExceeded;
-    }
-
     // All other failures are TRAPPED
+    // Note: C++ does NOT special-case Budget/ExceededLimit errors from the host.
+    // Even if the host internally ran out of budget, if our measured consumption
+    // is within limits, the result is Trapped (not ResourceLimitExceeded).
     InvokeHostFunctionResultCode::Trapped
 }
 
@@ -1731,6 +1717,28 @@ mod tests {
             cpu_insns_consumed: 100, // CPU within limit
             mem_bytes_consumed: 100, // Mem within limit
         };
+        assert_eq!(
+            map_host_error_to_result_code(&exec_error, 500, 1000),
+            InvokeHostFunctionResultCode::Trapped
+        );
+    }
+
+    #[test]
+    fn test_map_host_error_to_result_code_budget_error_within_limits() {
+        use crate::soroban::SorobanExecutionError;
+        // Budget/ExceededLimit error from host BUT measured consumption within limits -> TRAPPED
+        // This matches C++ stellar-core behavior: only measured consumption matters, not error type.
+        // The host may internally track budget differently, but C++ checks actual consumed values.
+        let host_error = soroban_env_host_p25::HostError::from((
+            soroban_env_host_p25::xdr::ScErrorType::Budget,
+            soroban_env_host_p25::xdr::ScErrorCode::ExceededLimit,
+        ));
+        let exec_error = SorobanExecutionError {
+            host_error,
+            cpu_insns_consumed: 100, // CPU within limit (100 < 500)
+            mem_bytes_consumed: 100, // Mem within limit (100 < 1000)
+        };
+        // Even though host reported Budget/ExceededLimit, consumption is within limits -> TRAPPED
         assert_eq!(
             map_host_error_to_result_code(&exec_error, 500, 1000),
             InvokeHostFunctionResultCode::Trapped

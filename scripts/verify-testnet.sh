@@ -77,8 +77,11 @@ run_segment() {
 
         # Extract results from output
         local verified=$(grep "Ledgers verified:" "$seg_log" | awk '{print $3}' || echo "0")
-        local matched=$(grep "Phase 2 execution matched:" "$seg_log" | awk '{print $5}' || echo "0")
-        local mismatched=$(grep "Phase 2 execution mismatched:" "$seg_log" | awk '{print $5}' || echo "0")
+        local matched=$(grep "Execution matched:" "$seg_log" | awk '{print $3}' || echo "0")
+        local mismatched=$(grep "Execution mismatched:" "$seg_log" | awk '{print $3}' || echo "0")
+        # Handle empty values (grep didn't match)
+        [ -z "$matched" ] && matched=0
+        [ -z "$mismatched" ] && mismatched=0
         local ledger_tx_mismatches=$(grep "Ledgers with tx mismatches:" "$seg_log" | awk '{print $5}' || echo "0")
         local ledger_header_mismatches=$(grep "Ledgers with header mismatches:" "$seg_log" | awk '{print $5}' || echo "0")
         local ledger_both_mismatches=$(grep "Ledgers with tx+header mismatches:" "$seg_log" | awk '{print $5}' || echo "0")
@@ -91,12 +94,13 @@ run_segment() {
             tx_only=$((ledger_tx_mismatches - ledger_both_mismatches))
         fi
 
-        if [ "$mismatched" = "0" ]; then
+        # Success = no header mismatches (the definitive test)
+        if [ "$ledger_header_mismatches" = "0" ] && [ "$mismatched" = "0" ]; then
             echo "SUCCESS segment=$seg_num start=$seg_start end=$seg_end verified=$verified matched=$matched mismatched=$mismatched ledger_tx_mismatches=$ledger_tx_mismatches ledger_header_mismatches=$ledger_header_mismatches ledger_both_mismatches=$ledger_both_mismatches bucketlist_only=$bucketlist_only tx_only=$tx_only duration=${duration}s" > "$seg_result"
             echo -e "${GREEN}Segment $seg_num PASSED${NC} ($verified ledgers, ${duration}s)"
         else
             echo "MISMATCH segment=$seg_num start=$seg_start end=$seg_end verified=$verified matched=$matched mismatched=$mismatched ledger_tx_mismatches=$ledger_tx_mismatches ledger_header_mismatches=$ledger_header_mismatches ledger_both_mismatches=$ledger_both_mismatches bucketlist_only=$bucketlist_only tx_only=$tx_only duration=${duration}s" > "$seg_result"
-            echo -e "${YELLOW}Segment $seg_num completed with $mismatched mismatches${NC}"
+            echo -e "${YELLOW}Segment $seg_num completed with header_mismatches=$ledger_header_mismatches exec_mismatches=$mismatched${NC}"
         fi
     else
         local exit_code=$?

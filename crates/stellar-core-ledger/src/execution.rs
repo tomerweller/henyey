@@ -3360,6 +3360,15 @@ impl TransactionExecutor {
                 }
             }
             OperationBody::SetOptions(op_data) => {
+                // If SetOptions sets an inflation_dest that differs from the source,
+                // we need to load that account to validate it exists.
+                // This matches C++ stellar-core's loadAccountWithoutRecord() call.
+                if let Some(ref inflation_dest) = op_data.inflation_dest {
+                    if inflation_dest != &op_source {
+                        self.load_account(snapshot, inflation_dest)?;
+                    }
+                }
+
                 // If SetOptions modifies signers and the source account has sponsored signers,
                 // we need to load those sponsor accounts so we can update their num_sponsoring.
                 if op_data.signer.is_some() {

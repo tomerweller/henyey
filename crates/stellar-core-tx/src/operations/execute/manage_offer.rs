@@ -89,6 +89,11 @@ fn execute_manage_offer(
         ));
     }
 
+    // C++ stellar-core checks trustlines BEFORE checking offer existence.
+    // This is done in checkOfferValid() which is called before loadOffer().
+    // We need to match this order to produce identical error codes.
+
+    // Check issuer existence for protocols < 13
     if context.protocol_version < 13 {
         if let Some(issuer) = issuer_for_asset(selling) {
             if state.get_account(issuer).is_none() {
@@ -109,25 +114,8 @@ fn execute_manage_offer(
         }
     }
 
-    let old_offer = if offer_id != 0 {
-        state.get_offer(source, offer_id).cloned()
-    } else {
-        None
-    };
-    if offer_id != 0 && old_offer.is_none() {
-        return Ok(make_sell_offer_result(
-            ManageSellOfferResultCode::NotFound,
-            None,
-        ));
-    }
-    let sponsor = if old_offer.is_none() {
-        state.active_sponsor_for(source)
-    } else {
-        None
-    };
-    let reserve_subentry = old_offer.is_none() && sponsor.is_none();
-
     // For selling non-native assets, check trustline exists and has balance
+    // This must happen BEFORE we check if the offer exists (NotFound).
     if !matches!(selling, Asset::Native) {
         if issuer_for_asset(selling) == Some(source) {
             // Issuer can always sell its own asset.
@@ -157,23 +145,10 @@ fn execute_manage_offer(
                 ));
             }
         }
-    } else {
-        // For native asset, check account exists
-        let account = state.get_account(source).unwrap();
-        let min_balance = state.minimum_balance_for_account(
-            account,
-            context.protocol_version,
-            if reserve_subentry { 1 } else { 0 },
-        )?;
-        if account.balance < min_balance {
-            return Ok(make_sell_offer_result(
-                ManageSellOfferResultCode::Underfunded,
-                None,
-            ));
-        }
     }
 
     // For buying non-native assets, check trustline exists
+    // This must happen BEFORE we check if the offer exists (NotFound).
     if !matches!(buying, Asset::Native) {
         if issuer_for_asset(buying) == Some(source) {
             // Issuer can always receive its own asset.
@@ -194,6 +169,41 @@ fn execute_manage_offer(
                     None,
                 ));
             }
+        }
+    }
+
+    // NOW check if the offer exists (after trustline checks)
+    let old_offer = if offer_id != 0 {
+        state.get_offer(source, offer_id).cloned()
+    } else {
+        None
+    };
+    if offer_id != 0 && old_offer.is_none() {
+        return Ok(make_sell_offer_result(
+            ManageSellOfferResultCode::NotFound,
+            None,
+        ));
+    }
+    let sponsor = if old_offer.is_none() {
+        state.active_sponsor_for(source)
+    } else {
+        None
+    };
+    let reserve_subentry = old_offer.is_none() && sponsor.is_none();
+
+    // For native selling asset, check account has sufficient balance
+    if matches!(selling, Asset::Native) {
+        let account = state.get_account(source).unwrap();
+        let min_balance = state.minimum_balance_for_account(
+            account,
+            context.protocol_version,
+            if reserve_subentry { 1 } else { 0 },
+        )?;
+        if account.balance < min_balance {
+            return Ok(make_sell_offer_result(
+                ManageSellOfferResultCode::Underfunded,
+                None,
+            ));
         }
     }
 
