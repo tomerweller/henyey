@@ -61,7 +61,7 @@ use stellar_xdr::curr::{
     InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
     InnerTransactionResultResult, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
     LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
-    LedgerKeyLiquidityPool, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
+    LedgerKeyLiquidityPool, LedgerKeyTrustLine, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
     ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation,
     OperationBody, OperationMetaV2, OperationResult, OperationResultTr,
     PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress,
@@ -3264,6 +3264,17 @@ impl TransactionExecutor {
                 };
                 if let Some(ref tl_asset) = tl_asset {
                     self.load_trustline(snapshot, &op_source, tl_asset)?;
+                    // If deleting a trustline (limit=0), load the sponsor account if it has one.
+                    // The sponsor's num_sponsoring needs to be decremented.
+                    if op_data.limit == 0 {
+                        let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                            account_id: op_source.clone(),
+                            asset: tl_asset.clone(),
+                        });
+                        if let Some(sponsor) = self.state.entry_sponsor(&tl_key).cloned() {
+                            self.load_account(snapshot, &sponsor)?;
+                        }
+                    }
                 }
                 // Load issuer account for non-pool-share assets WITHOUT recording.
                 // C++ stellar-core uses loadAccountWithoutRecord() for ChangeTrust issuer check
