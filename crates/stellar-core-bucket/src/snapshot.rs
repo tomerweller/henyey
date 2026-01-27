@@ -995,8 +995,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_bucket_snapshot_manager_creation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_snapshot_manager_creation() {
         let bucket_list = BucketList::new();
         let hot_archive = HotArchiveBucketList::new();
         let header = make_test_header(1);
@@ -1010,8 +1010,8 @@ mod tests {
         assert_eq!(manager.historical_snapshot_count(), 0);
     }
 
-    #[test]
-    fn test_snapshot_update_maintains_history() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_snapshot_update_maintains_history() {
         let bucket_list = BucketList::new();
         let hot_archive = HotArchiveBucketList::new();
 
@@ -1060,8 +1060,8 @@ mod tests {
         assert_eq!(newest, 5);
     }
 
-    #[test]
-    fn test_searchable_snapshot_load() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_searchable_snapshot_load() {
         let mut bucket_list = BucketList::new();
         let header = make_test_header(1);
 
@@ -1107,8 +1107,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_concurrent_access() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_access() {
         use std::sync::Arc;
         use std::thread;
 
@@ -1141,8 +1141,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_scan_for_entries_of_type() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_for_entries_of_type() {
         let mut bucket_list = BucketList::new();
         let header = make_test_header(1);
 
@@ -1198,8 +1198,8 @@ mod tests {
         assert_eq!(count, 3);
     }
 
-    #[test]
-    fn test_load_inflation_winners() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_inflation_winners() {
         let mut bucket_list = BucketList::new();
         let header = make_test_header(10);
 
@@ -1271,8 +1271,8 @@ mod tests {
         assert_eq!(winners[0].votes, 6_000_000_000);
     }
 
-    #[test]
-    fn test_inflation_winners_min_balance_filter() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_inflation_winners_min_balance_filter() {
         let mut bucket_list = BucketList::new();
         let header = make_test_header(5);
 

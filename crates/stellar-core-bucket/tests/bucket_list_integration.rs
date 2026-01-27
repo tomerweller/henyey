@@ -134,8 +134,8 @@ fn make_account_key(seed: u8) -> LedgerKey {
 /// This test verifies that when entries are archived and tombstones (Live markers)
 /// are added for restoration, the tombstones expire at the bottom level while
 /// the archived entries remain.
-#[test]
-fn test_hot_archive_tombstones_expire_at_bottom_level() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_hot_archive_tombstones_expire_at_bottom_level() {
     // Use a smaller depth for faster testing (matching C++ testutil::BucketListDepthModifier)
     // We'll manually control the number of levels we test
     let mut bl = HotArchiveBucketList::new();
@@ -194,8 +194,8 @@ fn test_hot_archive_tombstones_expire_at_bottom_level() {
 /// Test matching upstream: "hot archive accepts multiple archives and restores for same key"
 ///
 /// Simulates: archive V0 → restore → re-archive V1 → verify V1 wins at bottom
-#[test]
-fn test_hot_archive_multiple_archives_and_restores() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_hot_archive_multiple_archives_and_restores() {
     let mut bl = HotArchiveBucketList::new();
 
     // Create initial archived entry V0
@@ -235,8 +235,8 @@ fn test_hot_archive_multiple_archives_and_restores() {
 }
 
 /// Test that archive and restore in the same batch works correctly
-#[test]
-fn test_hot_archive_concurrent_archive_and_restore() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_hot_archive_concurrent_archive_and_restore() {
     let mut bl = HotArchiveBucketList::new();
 
     // Archive entry 1
@@ -270,8 +270,8 @@ fn test_hot_archive_concurrent_archive_and_restore() {
 /// Test matching upstream: "bucket list" basic operations
 ///
 /// Adds batches to bucket list and verifies level sizes stay within bounds.
-#[test]
-fn test_bucket_list_basic_operations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bucket_list_basic_operations() {
     let mut bl = BucketList::new();
 
     // Add batches and verify bucket sizes stay reasonable
@@ -337,8 +337,8 @@ fn test_bucket_list_basic_operations() {
 /// Test matching upstream: "BucketList snap reaches steady state"
 ///
 /// Verifies that after sufficient ledgers, snap bucket sizes stabilize.
-#[test]
-fn test_bucket_list_snap_steady_state() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bucket_list_snap_steady_state() {
     let mut bl = BucketList::new();
 
     // Add many batches to reach steady state
@@ -373,8 +373,8 @@ fn test_bucket_list_snap_steady_state() {
 /// Test matching upstream: "BucketList deepest curr accumulates"
 ///
 /// Verifies that the deepest level's curr bucket accumulates entries.
-#[test]
-fn test_bucket_list_deepest_curr_accumulates() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bucket_list_deepest_curr_accumulates() {
     let mut bl = BucketList::new();
 
     // Add batches to push entries to deeper levels
@@ -414,8 +414,8 @@ fn test_bucket_list_deepest_curr_accumulates() {
 /// Test matching upstream: "single entry bubbling up"
 ///
 /// Verifies that a single entry bubbles up through all levels correctly.
-#[test]
-fn test_single_entry_bubbling_up() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_single_entry_bubbling_up() {
     let mut bl = BucketList::new();
 
     // Add a single entry
@@ -465,8 +465,8 @@ fn test_single_entry_bubbling_up() {
 /// Test matching upstream: "bucket tombstones mutually-annihilate init entries"
 ///
 /// Verifies CAP-0020 semantics: INIT + DEAD = annihilation
-#[test]
-fn test_init_dead_annihilation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_init_dead_annihilation() {
     let mut bl = BucketList::new();
 
     // Add an entry (creates INIT at level 0)
@@ -536,8 +536,8 @@ fn test_init_dead_annihilation() {
 /// Test matching upstream: "live bucket tombstones expire at bottom level"
 ///
 /// Verifies that DEAD entries (tombstones) are dropped at the bottom level.
-#[test]
-fn test_tombstones_expire_at_bottom_level() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tombstones_expire_at_bottom_level() {
     let mut bl = BucketList::new();
 
     // Add an entry
@@ -608,8 +608,8 @@ fn test_tombstones_expire_at_bottom_level() {
 /// Test matching upstream: "Searchable BucketListDB snapshots"
 ///
 /// Verifies that bucket list snapshots can be searched correctly.
-#[test]
-fn test_searchable_bucket_list_snapshots() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_searchable_bucket_list_snapshots() {
     let mut bl = BucketList::new();
 
     // Add an entry that we'll update multiple times
@@ -664,8 +664,8 @@ fn test_searchable_bucket_list_snapshots() {
 
 /// Test that eviction iterator positioning is preserved across add_batch calls
 /// when no spill occurs.
-#[test]
-fn test_eviction_iterator_preserved_when_no_spill() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eviction_iterator_preserved_when_no_spill() {
     // EvictionIterator and update_starting_eviction_iterator are imported at top
 
     let mut iter = EvictionIterator {
@@ -685,8 +685,8 @@ fn test_eviction_iterator_preserved_when_no_spill() {
 }
 
 /// Test that eviction iterator resets when a spill occurs at its level.
-#[test]
-fn test_eviction_iterator_resets_on_spill() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eviction_iterator_resets_on_spill() {
     // EvictionIterator and update_starting_eviction_iterator are imported at top
 
     let mut iter = EvictionIterator {
@@ -717,8 +717,8 @@ fn test_eviction_iterator_resets_on_spill() {
 ///
 /// Creates Soroban entries with TTL, advances ledgers until they expire,
 /// then verifies they are properly evicted (temporary deleted, persistent archived).
-#[test]
-fn test_eviction_scan_basic() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eviction_scan_basic() {
     let mut bl = BucketList::new();
 
     // Create some Soroban entries (ContractCode is persistent)
@@ -815,8 +815,8 @@ fn test_eviction_scan_basic() {
 /// Test matching upstream: "eviction scan" -> "shadowed entries not evicted"
 ///
 /// Creates entries, updates their TTL before expiration, verifies they're not evicted.
-#[test]
-fn test_eviction_scan_shadowed_entries_not_evicted() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eviction_scan_shadowed_entries_not_evicted() {
     let mut bl = BucketList::new();
 
     let current_ledger = 1u32;
@@ -882,8 +882,8 @@ fn test_eviction_scan_shadowed_entries_not_evicted() {
 }
 
 /// Test incremental eviction scan with settings
-#[test]
-fn test_eviction_scan_incremental() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eviction_scan_incremental() {
     use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
 
     let mut bl = BucketList::new();
@@ -962,8 +962,8 @@ fn test_eviction_scan_incremental() {
 ///
 /// Creates a BucketManager, adds buckets, closes it, reopens it, and verifies
 /// the state is preserved.
-#[test]
-fn test_bucket_manager_persistence() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bucket_manager_persistence() {
     use stellar_core_bucket::{BucketEntry, BucketManager};
     use tempfile::tempdir;
 
@@ -1043,8 +1043,8 @@ fn test_bucket_manager_persistence() {
 }
 
 /// Test BucketManager can load buckets by hash
-#[test]
-fn test_bucket_manager_load_by_hash() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bucket_manager_load_by_hash() {
     use stellar_core_bucket::{BucketEntry, BucketManager};
     use tempfile::tempdir;
 
@@ -1091,8 +1091,8 @@ fn test_bucket_manager_load_by_hash() {
 }
 
 /// Test BucketManager handles empty buckets correctly
-#[test]
-fn test_bucket_manager_empty_bucket() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bucket_manager_empty_bucket() {
     use stellar_core_bucket::{Bucket, BucketManager};
     use tempfile::tempdir;
 
@@ -1132,8 +1132,8 @@ fn test_bucket_manager_empty_bucket() {
 }
 
 /// Test bucket verification
-#[test]
-fn test_bucket_manager_verify_buckets() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bucket_manager_verify_buckets() {
     use stellar_core_bucket::{BucketEntry, BucketManager};
     use tempfile::tempdir;
 

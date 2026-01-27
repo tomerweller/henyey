@@ -314,8 +314,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_integration_bucket_list_with_manager() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_integration_bucket_list_with_manager() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = BucketManager::new(temp_dir.path().to_path_buf()).unwrap();
 
@@ -338,8 +338,8 @@ mod tests {
         assert_eq!(loaded.hash(), bucket.hash());
     }
 
-    #[test]
-    fn test_integration_full_workflow() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_integration_full_workflow() {
         // Create a bucket list and add entries over multiple ledgers
         let mut bucket_list = BucketList::new();
 
@@ -433,14 +433,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_bucket_list_constants() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_constants() {
         assert_eq!(BUCKET_LIST_LEVELS, 11);
         assert_eq!(BucketList::NUM_LEVELS, 11);
     }
 
-    #[test]
-    fn test_bucket_entry_types() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_entry_types() {
         let entry = make_account_entry([1u8; 32], 100);
         let key = make_account_key([1u8; 32]);
 

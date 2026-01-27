@@ -309,16 +309,16 @@ mod tests {
 
     const TEST_PROTOCOL: u32 = 25;
 
-    #[test]
-    fn test_empty_bucket_list() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_empty_bucket_list() {
         let bucket_list = BucketList::new();
         let iter = LiveEntriesIterator::new(&bucket_list);
         let entries: Vec<_> = iter.collect();
         assert!(entries.is_empty());
     }
 
-    #[test]
-    fn test_single_entry() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_single_entry() {
         let mut bucket_list = BucketList::new();
         let entry = make_account_entry([1u8; 32], 100);
 
@@ -345,8 +345,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_multiple_entries() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multiple_entries() {
         let mut bucket_list = BucketList::new();
 
         for i in 1..=10u32 {
@@ -373,8 +373,8 @@ mod tests {
         assert_eq!(entries.len(), 10);
     }
 
-    #[test]
-    fn test_deduplication() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_deduplication() {
         let mut bucket_list = BucketList::new();
 
         // Add entry in ledger 1
@@ -419,8 +419,8 @@ mod tests {
         assert!(iter.entries_skipped() >= 1); // At least the old entry was skipped
     }
 
-    #[test]
-    fn test_dead_entry_shadows() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dead_entry_shadows() {
         let mut bucket_list = BucketList::new();
 
         // Add entry in ledger 1
@@ -457,8 +457,8 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    #[test]
-    fn test_matches_live_entries() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_matches_live_entries() {
         // Verify that LiveEntriesIterator produces the same results as live_entries()
         let mut bucket_list = BucketList::new();
 
@@ -540,8 +540,8 @@ mod tests {
         assert_eq!(old_keys, new_keys, "Key sets differ");
     }
 
-    #[test]
-    fn test_stats() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stats() {
         let mut bucket_list = BucketList::new();
 
         // Add 5 unique entries

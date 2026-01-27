@@ -120,8 +120,8 @@ fn create_searchable_snapshot(bucket_list: &BucketList) -> SearchableBucketListS
 /// This test creates several liquidity pools with different asset combinations
 /// and verifies that querying for trustlines with a specific asset returns
 /// only the trustlines for pools containing that asset.
-#[test]
-fn test_load_pool_share_trustlines_by_account_and_asset() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_pool_share_trustlines_by_account_and_asset() {
     let mut bucket_list = BucketList::new();
 
     // Create accounts
@@ -201,8 +201,8 @@ fn test_load_pool_share_trustlines_by_account_and_asset() {
 }
 
 /// Test that querying an account with no matching trustlines returns empty.
-#[test]
-fn test_load_pool_share_trustlines_no_match() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_pool_share_trustlines_no_match() {
     let mut bucket_list = BucketList::new();
 
     let account_id = make_account_id([1u8; 32]);
@@ -240,8 +240,8 @@ fn test_load_pool_share_trustlines_no_match() {
 }
 
 /// Test that deleted pools are not included in results.
-#[test]
-fn test_load_pool_share_trustlines_deleted_pool() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_pool_share_trustlines_deleted_pool() {
     let mut bucket_list = BucketList::new();
 
     let account_id = make_account_id([1u8; 32]);
@@ -298,8 +298,8 @@ fn test_load_pool_share_trustlines_deleted_pool() {
 /// Test multi-version entries (updates).
 ///
 /// When an entry is updated, the newer version should be used.
-#[test]
-fn test_load_pool_share_trustlines_multi_version() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_pool_share_trustlines_multi_version() {
     let mut bucket_list = BucketList::new();
 
     let account_id = make_account_id([1u8; 32]);
@@ -356,8 +356,8 @@ fn test_load_pool_share_trustlines_multi_version() {
 }
 
 /// Test loading all trustlines for an account.
-#[test]
-fn test_load_trustlines_for_account() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_trustlines_for_account() {
     let mut bucket_list = BucketList::new();
 
     let account_id = make_account_id([1u8; 32]);
@@ -437,8 +437,8 @@ fn test_load_trustlines_for_account() {
 }
 
 /// Test that pool entries with asset_b matching are also found.
-#[test]
-fn test_load_pool_share_trustlines_asset_in_b_position() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_pool_share_trustlines_asset_in_b_position() {
     let mut bucket_list = BucketList::new();
 
     let account_id = make_account_id([1u8; 32]);

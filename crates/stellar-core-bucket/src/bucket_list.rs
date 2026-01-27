@@ -44,10 +44,12 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits, WriteXdr,
 };
+use tokio::sync::oneshot;
 
 use stellar_core_common::Hash256;
 
@@ -99,13 +101,197 @@ pub struct HasNextState {
     pub input_snap: Option<Hash256>,
 }
 
+/// Pending merge result for a bucket level.
+///
+/// This supports two modes matching C++ stellar-core:
+/// - `InMemory`: Synchronous merge result (used for level 0)
+/// - `Async`: Background merge in progress (used for levels 1+)
+///
+/// The async mode allows merges to run in background threads while the
+/// main thread continues processing, significantly reducing ledger close time.
+pub enum PendingMerge {
+    /// Synchronous merge result (level 0 only).
+    /// Level 0 uses in-memory merges that complete immediately.
+    InMemory(Bucket),
+    /// Asynchronous merge in progress (levels 1+).
+    /// The merge runs in a background thread and the result is retrieved when commit() is called.
+    Async(AsyncMergeHandle),
+}
+
+impl std::fmt::Debug for PendingMerge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PendingMerge::InMemory(b) => f
+                .debug_struct("InMemory")
+                .field("hash", &b.hash().to_hex())
+                .finish(),
+            PendingMerge::Async(h) => f.debug_struct("Async").field("level", &h.level).finish(),
+        }
+    }
+}
+
+impl PendingMerge {
+    /// Get the hash of the pending merge result.
+    ///
+    /// For InMemory, returns the bucket hash directly.
+    /// For Async, returns the cached result hash if resolved, otherwise returns a placeholder.
+    pub fn hash(&self) -> Hash256 {
+        match self {
+            PendingMerge::InMemory(bucket) => bucket.hash(),
+            PendingMerge::Async(handle) => {
+                // If we have a cached result, return its hash
+                if let Some(ref bucket) = handle.result {
+                    bucket.hash()
+                } else {
+                    // Return zero hash to indicate unresolved async merge
+                    Hash256::default()
+                }
+            }
+        }
+    }
+}
+
+/// Handle to an asynchronous bucket merge running in a background thread.
+///
+/// The merge is started immediately when this handle is created, and runs
+/// concurrently with other operations. Call `resolve()` to wait for completion.
+pub struct AsyncMergeHandle {
+    /// Oneshot channel to receive the merge result.
+    receiver: Option<oneshot::Receiver<Result<Bucket>>>,
+    /// The level this merge is for (for logging/debugging).
+    level: usize,
+    /// Cached result after resolution (allows multiple reads).
+    result: Option<Arc<Bucket>>,
+}
+
+impl AsyncMergeHandle {
+    /// Create a new async merge handle and start the merge in a background thread.
+    ///
+    /// Uses `tokio::task::spawn_blocking` to run the merge on tokio's blocking thread pool,
+    /// which is properly sized and managed. This avoids creating unbounded OS threads and
+    /// integrates well with the tokio runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside of a tokio runtime context. Tests should use `#[tokio::test(flavor = "multi_thread")]`.
+    fn start_merge(
+        curr: Arc<Bucket>,
+        snap: Arc<Bucket>,
+        keep_dead_entries: bool,
+        protocol_version: u32,
+        normalize_init: bool,
+        shadow_buckets: Vec<Bucket>,
+        level: usize,
+    ) -> Self {
+        let (sender, receiver) = oneshot::channel();
+
+        // Spawn the merge on tokio's blocking thread pool.
+        // This is better than std::thread::spawn because:
+        // 1. Uses a managed thread pool with appropriate sizing
+        // 2. Avoids unbounded thread creation
+        // 3. Integrates with tokio's shutdown handling
+        tokio::task::spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            tracing::debug!(level, "Background merge started");
+
+            let result = merge_buckets_with_options_and_shadows(
+                &curr,
+                &snap,
+                keep_dead_entries,
+                protocol_version,
+                normalize_init,
+                &shadow_buckets,
+            );
+
+            let elapsed = start.elapsed();
+            match &result {
+                Ok(bucket) => {
+                    tracing::debug!(
+                        level,
+                        duration_ms = elapsed.as_millis(),
+                        result_hash = %bucket.hash().to_hex(),
+                        result_entries = bucket.len(),
+                        "Background merge completed successfully"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        level,
+                        duration_ms = elapsed.as_millis(),
+                        error = %e,
+                        "Background merge failed"
+                    );
+                }
+            }
+
+            // Send the result; ignore errors if receiver was dropped
+            let _ = sender.send(result);
+        });
+
+        Self {
+            receiver: Some(receiver),
+            level,
+            result: None,
+        }
+    }
+
+    /// Check if the merge is complete without blocking.
+    pub fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// Resolve the merge, blocking until complete if necessary.
+    ///
+    /// After calling this, the result is cached and can be retrieved multiple times.
+    ///
+    /// Uses `tokio::task::block_in_place` when called from within a tokio runtime
+    /// to avoid the "cannot block from async context" panic, while still allowing
+    /// synchronous use in the ledger close path.
+    pub fn resolve(&mut self) -> Result<Arc<Bucket>> {
+        if let Some(ref result) = self.result {
+            return Ok(result.clone());
+        }
+
+        let receiver = self
+            .receiver
+            .take()
+            .ok_or_else(|| BucketError::Merge("merge handle already consumed".to_string()))?;
+
+        let start = std::time::Instant::now();
+
+        // Use block_in_place to allow blocking from within an async context.
+        // This moves the blocking operation to a blocking thread, avoiding the
+        // "cannot block the current thread" panic when called from tokio tests
+        // or async code paths.
+        let bucket = tokio::task::block_in_place(|| {
+            receiver
+                .blocking_recv()
+                .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))
+        })??;
+
+        let elapsed = start.elapsed();
+
+        if elapsed.as_millis() > 10 {
+            tracing::info!(
+                level = self.level,
+                wait_ms = elapsed.as_millis(),
+                "Waited for background merge to complete"
+            );
+        }
+
+        let bucket = Arc::new(bucket);
+        self.result = Some(bucket.clone());
+        Ok(bucket)
+    }
+}
+
 /// A single level in the BucketList, containing `curr` and `snap` buckets.
 ///
 /// Each level maintains two buckets:
 /// - `curr`: Receives merged data from the level below when it spills
 /// - `snap`: Previous `curr` that was "snapped" during a spill
 ///
-/// The level also has a `next` bucket used during merge operations to
+/// The level also has a `next` pending merge used during merge operations to
 /// stage the result before committing it to `curr`.
 ///
 /// # Spill Behavior
@@ -114,14 +300,24 @@ pub struct HasNextState {
 /// 1. The old `snap` is returned (flows to the next level)
 /// 2. `curr` becomes the new `snap`
 /// 3. `curr` is reset to empty (ready for new merges)
-#[derive(Clone, Debug)]
+///
+/// # Background Merging
+///
+/// For levels 1+, merges run asynchronously in background threads. When `prepare()`
+/// is called, the merge is started immediately but returns without waiting. The
+/// merge result is retrieved when `commit()` is called, blocking only if the merge
+/// hasn't completed yet.
+///
+/// This matches C++ stellar-core's FutureBucket design and allows merges for higher
+/// levels (which take longer) to run concurrently with other ledger close operations.
+#[derive(Debug)]
 pub struct BucketLevel {
     /// The current bucket being filled with merged entries.
     pub curr: Bucket,
     /// The snapshot bucket from the previous spill.
     pub snap: Bucket,
-    /// Staged merge result awaiting commit (replaces `curr` on commit).
-    next: Option<Bucket>,
+    /// Pending merge result awaiting commit (replaces `curr` on commit).
+    next: Option<PendingMerge>,
     /// The level number (0-10).
     level: usize,
 }
@@ -171,16 +367,55 @@ impl BucketLevel {
     }
 
     /// Promote the prepared bucket into curr, if any.
+    ///
+    /// For async merges, this will block until the merge completes.
+    /// This matches C++ stellar-core's BucketLevel::commit() behavior.
     fn commit(&mut self) {
-        if let Some(next) = self.next.take() {
-            self.curr = next;
+        if let Some(pending) = self.next.take() {
+            match pending {
+                PendingMerge::InMemory(bucket) => {
+                    self.curr = bucket;
+                }
+                PendingMerge::Async(mut handle) => {
+                    match handle.resolve() {
+                        Ok(bucket) => {
+                            // Arc<Bucket> -> Bucket via unwrap_or_clone
+                            self.curr =
+                                Arc::try_unwrap(bucket).unwrap_or_else(|arc| (*arc).clone());
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                level = self.level,
+                                error = %e,
+                                "Failed to resolve async merge, keeping current bucket"
+                            );
+                            // Keep the current bucket on error
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// Check if there is an in-progress merge.
+    pub fn has_in_progress_merge(&self) -> bool {
+        self.next.is_some()
     }
 
     /// Get a reference to the next bucket if any (pending merge result).
     /// Used for lookups to check pending merges.
+    ///
+    /// Note: For async merges that haven't completed yet, this returns None.
+    /// To get the result of an async merge, use commit() which will block if needed.
     pub fn next(&self) -> Option<&Bucket> {
-        self.next.as_ref()
+        match &self.next {
+            Some(PendingMerge::InMemory(bucket)) => Some(bucket),
+            Some(PendingMerge::Async(handle)) => {
+                // For async, only return if we have a cached result
+                handle.result.as_ref().map(|arc| arc.as_ref())
+            }
+            None => None,
+        }
     }
 
     /// Snap the current bucket to become the new snapshot.
@@ -256,24 +491,44 @@ impl BucketLevel {
             "prepare_with_normalization: about to merge"
         );
 
-        // Merge curr (or empty) with the incoming bucket
-        let merged = merge_buckets_with_options_and_shadows(
-            &curr_for_merge,
-            &incoming,
-            keep_dead_entries,
-            protocol_version,
-            normalize_init,
-            shadow_buckets,
-        )?;
+        // For levels 1+, use async merging to run merges in background threads.
+        // This matches C++ stellar-core's FutureBucket design where merges for
+        // higher levels (which have larger buckets) start immediately and run
+        // concurrently with other operations. The merge result is retrieved when
+        // commit() is called, blocking only if the merge hasn't finished yet.
+        //
+        // Level 0 uses synchronous in-memory merging (handled in prepare_first_level).
+        if self.level >= 1 {
+            let handle = AsyncMergeHandle::start_merge(
+                Arc::new(curr_for_merge),
+                Arc::new(incoming),
+                keep_dead_entries,
+                protocol_version,
+                normalize_init,
+                shadow_buckets.to_vec(),
+                self.level,
+            );
+            self.next = Some(PendingMerge::Async(handle));
+        } else {
+            // Level 0 should use prepare_first_level, but if called here, do sync merge
+            let merged = merge_buckets_with_options_and_shadows(
+                &curr_for_merge,
+                &incoming,
+                keep_dead_entries,
+                protocol_version,
+                normalize_init,
+                shadow_buckets,
+            )?;
 
-        tracing::debug!(
-            level = self.level,
-            merged_hash = %merged.hash(),
-            merged_entries = merged.len(),
-            "prepare_with_normalization: merge complete"
-        );
+            tracing::debug!(
+                level = self.level,
+                merged_hash = %merged.hash(),
+                merged_entries = merged.len(),
+                "prepare_with_normalization: merge complete"
+            );
 
-        self.next = Some(merged);
+            self.next = Some(PendingMerge::InMemory(merged));
+        }
         Ok(())
     }
 
@@ -340,7 +595,8 @@ impl BucketLevel {
             merged
         };
 
-        self.next = Some(merged);
+        // Level 0 uses synchronous in-memory merge
+        self.next = Some(PendingMerge::InMemory(merged));
         Ok(())
     }
 
@@ -357,6 +613,44 @@ impl BucketLevel {
 impl Default for BucketLevel {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+impl Clone for BucketLevel {
+    fn clone(&self) -> Self {
+        // For the `next` field, we can only clone InMemory variants.
+        // Async variants would need to be resolved first, but since Clone
+        // takes &self (not &mut self), we can't resolve them here.
+        // Instead, we only clone the cached result if available.
+        let cloned_next = match &self.next {
+            None => None,
+            Some(PendingMerge::InMemory(bucket)) => Some(PendingMerge::InMemory(bucket.clone())),
+            Some(PendingMerge::Async(handle)) => {
+                // If the async merge has completed and we have a cached result,
+                // clone it as InMemory. Otherwise, skip the pending merge.
+                // This is safe because:
+                // 1. Cloning is typically done for snapshotting state
+                // 2. Pending merges shouldn't be part of canonical state
+                if let Some(ref result) = handle.result {
+                    Some(PendingMerge::InMemory((**result).clone()))
+                } else {
+                    // Async merge not yet resolved - skip it
+                    // The caller should resolve merges before cloning if they need them
+                    tracing::warn!(
+                        level = self.level,
+                        "Cloning BucketLevel with unresolved async merge - merge will be lost"
+                    );
+                    None
+                }
+            }
+        };
+
+        Self {
+            curr: self.curr.clone(),
+            snap: self.snap.clone(),
+            next: cloned_next,
+            level: self.level,
+        }
     }
 }
 
@@ -1079,7 +1373,7 @@ impl BucketList {
             };
 
             // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
-            let next = if let Some(state) = next_states.get(i) {
+            let next: Option<PendingMerge> = if let Some(state) = next_states.get(i) {
                 if state.state == HAS_NEXT_STATE_OUTPUT {
                     if let Some(ref output_hash) = state.output {
                         if !output_hash.is_zero() {
@@ -1088,7 +1382,7 @@ impl BucketList {
                                 output_hash = %output_hash.to_hex(),
                                 "restore_from_has: loading completed merge output"
                             );
-                            Some(load_bucket(output_hash)?)
+                            Some(PendingMerge::InMemory(load_bucket(output_hash)?))
                         } else {
                             None
                         }
@@ -1198,7 +1492,7 @@ impl BucketList {
                             "restart_merges_from_has: merge completed"
                         );
 
-                        self.levels[i].next = Some(merged);
+                        self.levels[i].next = Some(PendingMerge::InMemory(merged));
                         continue;
                     }
                 }
@@ -1810,15 +2104,15 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_new_bucket_list() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_new_bucket_list() {
         let bl = BucketList::new();
         assert_eq!(bl.levels().len(), BUCKET_LIST_LEVELS);
         assert_eq!(bl.ledger_seq(), 0);
     }
 
-    #[test]
-    fn test_add_batch_simple() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_batch_simple() {
         let mut bl = BucketList::new();
 
         let entry = make_account_entry([1u8; 32], 100);
@@ -1842,8 +2136,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_add_batch_update() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_batch_update() {
         let mut bl = BucketList::new();
 
         // Add initial entry
@@ -1880,8 +2174,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_live_entries_respects_deletes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_live_entries_respects_deletes() {
         let mut bl = BucketList::new();
 
         let entry = make_account_entry([1u8; 32], 100);
@@ -1910,8 +2204,8 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    #[test]
-    fn test_add_batch_delete() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_batch_delete() {
         let mut bl = BucketList::new();
 
         // Add entry
@@ -1943,8 +2237,8 @@ mod tests {
         assert!(found.is_none());
     }
 
-    #[test]
-    fn test_level_sizes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_level_sizes() {
         assert_eq!(BucketList::level_size(0), 4);
         assert_eq!(BucketList::level_size(1), 16);
         assert_eq!(BucketList::level_size(2), 64);
@@ -1955,8 +2249,8 @@ mod tests {
         assert_eq!(BucketList::level_half(3), 128);
     }
 
-    #[test]
-    fn test_level_should_spill_boundaries() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_level_should_spill_boundaries() {
         // Level 0 spills at even ledgers (multiples of 2)
         assert!(BucketList::level_should_spill(0, 0));
         assert!(BucketList::level_should_spill(2, 0));
@@ -1982,8 +2276,8 @@ mod tests {
         assert!(!BucketList::level_should_spill(64, BUCKET_LIST_LEVELS - 1));
     }
 
-    #[test]
-    fn test_prepare_with_normalization_converts_init() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prepare_with_normalization_converts_init() {
         let mut level = BucketLevel::new(BUCKET_LIST_LEVELS - 1);
         let entry = make_account_entry([1u8; 32], 100);
         let meta = BucketMetadata {
@@ -2015,8 +2309,8 @@ mod tests {
         assert!(saw_live);
     }
 
-    #[test]
-    fn test_merge_drops_dead_when_keep_dead_false() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_merge_drops_dead_when_keep_dead_false() {
         let key = make_account_key([1u8; 32]);
         let bucket = Bucket::from_entries(vec![BucketListEntry::Dead(key)]).unwrap();
         let merged =
@@ -2032,8 +2326,8 @@ mod tests {
         assert!(!has_non_meta);
     }
 
-    #[test]
-    fn test_bucket_list_hash_changes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_hash_changes() {
         let mut bl = BucketList::new();
         let hash1 = bl.hash();
 
@@ -2052,8 +2346,8 @@ mod tests {
         assert_ne!(hash1, hash2);
     }
 
-    #[test]
-    fn test_contains() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_contains() {
         let mut bl = BucketList::new();
 
         let key = make_account_key([1u8; 32]);
@@ -2073,8 +2367,8 @@ mod tests {
         assert!(bl.contains(&key).unwrap());
     }
 
-    #[test]
-    fn test_multiple_levels() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multiple_levels() {
         let mut bl = BucketList::new();
 
         // Add many entries to trigger spills to higher levels
@@ -2103,8 +2397,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_should_merge_with_empty_curr() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_should_merge_with_empty_curr() {
         // Level 0 always returns false
         assert!(!BucketList::should_merge_with_empty_curr(1, 0));
         assert!(!BucketList::should_merge_with_empty_curr(2, 0));
@@ -2132,8 +2426,8 @@ mod tests {
         assert!(BucketList::should_merge_with_empty_curr(14, 1));
     }
 
-    #[test]
-    fn test_entries_preserved_across_should_merge_with_empty_curr() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_entries_preserved_across_should_merge_with_empty_curr() {
         // This test specifically verifies that entries are not lost when
         // shouldMergeWithEmptyCurr returns true.
         //
