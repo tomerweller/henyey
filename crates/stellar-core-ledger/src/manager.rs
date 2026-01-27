@@ -873,10 +873,11 @@ impl LedgerManager {
         let mut soroban_state = self.soroban_state.write();
         soroban_state.clear();
 
-        // Stream through entries and collect CONTRACT_DATA, CONTRACT_CODE, and TTL entries
+        // Stream through entries and collect CONTRACT_DATA, CONTRACT_CODE, TTL, and ConfigSetting entries
         let mut data_count = 0u64;
         let mut code_count = 0u64;
         let mut ttl_count = 0u64;
+        let mut config_count = 0u64;
 
         for entry_result in bucket_list.live_entries_iter() {
             let entry = entry_result.map_err(|e| {
@@ -918,6 +919,18 @@ impl LedgerManager {
                         ttl_count += 1;
                     }
                 }
+                LedgerEntryData::ConfigSetting(_) => {
+                    // ConfigSetting entries are cached for fast Soroban config loading
+                    if let Err(e) = soroban_state.process_entry_create(
+                        &entry,
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                    } else {
+                        config_count += 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -930,6 +943,7 @@ impl LedgerManager {
             data_count,
             code_count,
             ttl_count,
+            config_count,
             total_size,
             contract_data_size = stats.contract_data_size,
             contract_code_size = stats.contract_code_size,
@@ -1046,6 +1060,7 @@ impl LedgerManager {
         let mut data_count = 0u64;
         let mut code_count = 0u64;
         let mut ttl_count = 0u64;
+        let mut config_count = 0u64;
         let mut entry_count = 0u64;
 
         // Stream through all live entries without full materialization
@@ -1122,6 +1137,19 @@ impl LedgerManager {
                     }
                 }
 
+                // ConfigSetting -> soroban state (cached for fast Soroban config loading)
+                LedgerEntryData::ConfigSetting(_) => {
+                    if let Err(e) = soroban_state.process_entry_create(
+                        &entry,
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                    } else {
+                        config_count += 1;
+                    }
+                }
+
                 // Other entry types are ignored
                 _ => {}
             }
@@ -1159,6 +1187,7 @@ impl LedgerManager {
             data_count,
             code_count,
             ttl_count,
+            config_count,
             total_soroban_size =
                 soroban_stats.contract_data_size + soroban_stats.contract_code_size,
             "Initialized caches from bucket list"

@@ -52,12 +52,55 @@ use soroban_xdr_p25::ReadXdr;
 use stellar_core_common::Hash256;
 use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
 use stellar_xdr::curr::{
-    ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
-    LedgerKeyContractData, LedgerKeyTtl, Limits, TtlEntry, WriteXdr,
+    ConfigSettingId, ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey,
+    LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, Limits,
+    TtlEntry, WriteXdr,
 };
 use tracing::{debug, trace};
 
 use crate::{LedgerError, Result};
+
+/// Get the ConfigSettingId (as i32) from a ConfigSettingEntry.
+fn config_setting_entry_id(entry: &stellar_xdr::curr::ConfigSettingEntry) -> i32 {
+    use stellar_xdr::curr::ConfigSettingEntry;
+    match entry {
+        ConfigSettingEntry::ContractMaxSizeBytes(_) => ConfigSettingId::ContractMaxSizeBytes as i32,
+        ConfigSettingEntry::ContractComputeV0(_) => ConfigSettingId::ContractComputeV0 as i32,
+        ConfigSettingEntry::ContractLedgerCostV0(_) => ConfigSettingId::ContractLedgerCostV0 as i32,
+        ConfigSettingEntry::ContractHistoricalDataV0(_) => {
+            ConfigSettingId::ContractHistoricalDataV0 as i32
+        }
+        ConfigSettingEntry::ContractEventsV0(_) => ConfigSettingId::ContractEventsV0 as i32,
+        ConfigSettingEntry::ContractBandwidthV0(_) => ConfigSettingId::ContractBandwidthV0 as i32,
+        ConfigSettingEntry::ContractCostParamsCpuInstructions(_) => {
+            ConfigSettingId::ContractCostParamsCpuInstructions as i32
+        }
+        ConfigSettingEntry::ContractCostParamsMemoryBytes(_) => {
+            ConfigSettingId::ContractCostParamsMemoryBytes as i32
+        }
+        ConfigSettingEntry::ContractDataKeySizeBytes(_) => {
+            ConfigSettingId::ContractDataKeySizeBytes as i32
+        }
+        ConfigSettingEntry::ContractDataEntrySizeBytes(_) => {
+            ConfigSettingId::ContractDataEntrySizeBytes as i32
+        }
+        ConfigSettingEntry::StateArchival(_) => ConfigSettingId::StateArchival as i32,
+        ConfigSettingEntry::ContractExecutionLanes(_) => {
+            ConfigSettingId::ContractExecutionLanes as i32
+        }
+        ConfigSettingEntry::LiveSorobanStateSizeWindow(_) => {
+            ConfigSettingId::LiveSorobanStateSizeWindow as i32
+        }
+        ConfigSettingEntry::EvictionIterator(_) => ConfigSettingId::EvictionIterator as i32,
+        ConfigSettingEntry::ContractParallelComputeV0(_) => {
+            ConfigSettingId::ContractParallelComputeV0 as i32
+        }
+        ConfigSettingEntry::ContractLedgerCostExtV0(_) => {
+            ConfigSettingId::ContractLedgerCostExtV0 as i32
+        }
+        ConfigSettingEntry::ScpTiming(_) => ConfigSettingId::ScpTiming as i32,
+    }
+}
 
 /// Convert a LedgerEntry to soroban-env-host P25's XDR type.
 /// This is needed because soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io,
@@ -223,6 +266,12 @@ pub struct InMemorySorobanState {
     /// Contract code entries indexed by TTL key hash.
     contract_code_entries: HashMap<[u8; 32], ContractCodeMapEntry>,
 
+    /// ConfigSetting entries indexed by ConfigSettingId.
+    ///
+    /// These are cached for fast access during ledger close, avoiding
+    /// repeated bucket list lookups for Soroban config (cost params, limits, etc.).
+    config_settings: HashMap<i32, Arc<LedgerEntry>>,
+
     /// Pending TTLs waiting for their entries.
     ///
     /// During initialization, TTL entries may arrive before their corresponding
@@ -251,6 +300,7 @@ impl InMemorySorobanState {
         Self {
             contract_data_entries: HashMap::new(),
             contract_code_entries: HashMap::new(),
+            config_settings: HashMap::new(),
             pending_ttls: HashMap::new(),
             last_closed_ledger_seq: 0,
             contract_data_state_size: 0,
@@ -262,6 +312,7 @@ impl InMemorySorobanState {
     pub fn is_empty(&self) -> bool {
         self.contract_data_entries.is_empty()
             && self.contract_code_entries.is_empty()
+            && self.config_settings.is_empty()
             && self.pending_ttls.is_empty()
     }
 
@@ -307,7 +358,10 @@ impl InMemorySorobanState {
     pub fn is_in_memory_type(key: &LedgerKey) -> bool {
         matches!(
             key,
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)
+            LedgerKey::ContractData(_)
+                | LedgerKey::ContractCode(_)
+                | LedgerKey::Ttl(_)
+                | LedgerKey::ConfigSetting(_)
         )
     }
 
@@ -356,8 +410,15 @@ impl InMemorySorobanState {
                 self.get_contract_code(cc).map(|e| e.ledger_entry.clone())
             }
             LedgerKey::Ttl(ttl) => self.get_ttl_entry(ttl),
+            LedgerKey::ConfigSetting(cs) => self.get_config_setting(cs),
             _ => None,
         }
+    }
+
+    /// Get a ConfigSetting entry by key.
+    pub fn get_config_setting(&self, key: &LedgerKeyConfigSetting) -> Option<Arc<LedgerEntry>> {
+        let id = key.config_setting_id as i32;
+        self.config_settings.get(&id).cloned()
     }
 
     /// Get TTL data for a key.
@@ -841,6 +902,11 @@ impl InMemorySorobanState {
                 self.create_contract_code(entry.clone(), protocol_version, rent_config)
             }
             LedgerEntryData::Ttl(_) => self.process_ttl_entry_create(entry),
+            LedgerEntryData::ConfigSetting(cs) => {
+                let id = config_setting_entry_id(cs);
+                self.config_settings.insert(id, Arc::new(entry.clone()));
+                Ok(())
+            }
             _ => Ok(()), // Ignore non-Soroban entries
         }
     }
@@ -885,6 +951,11 @@ impl InMemorySorobanState {
                 }
             }
             LedgerEntryData::Ttl(_) => self.process_ttl_entry_update(entry),
+            LedgerEntryData::ConfigSetting(cs) => {
+                let id = config_setting_entry_id(cs);
+                self.config_settings.insert(id, Arc::new(entry.clone()));
+                Ok(())
+            }
             _ => Ok(()), // Ignore non-Soroban entries
         }
     }

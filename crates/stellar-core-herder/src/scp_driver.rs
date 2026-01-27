@@ -464,6 +464,39 @@ impl ScpDriver {
         })
     }
 
+    /// Get all externalized slot indices in a range (inclusive).
+    /// Returns a sorted list of slots that have been externalized.
+    pub fn get_externalized_slots_in_range(
+        &self,
+        from: SlotIndex,
+        to: SlotIndex,
+    ) -> Vec<SlotIndex> {
+        let externalized = self.externalized.read();
+        let mut slots: Vec<SlotIndex> = externalized
+            .keys()
+            .filter(|&&slot| slot >= from && slot <= to)
+            .copied()
+            .collect();
+        slots.sort();
+        slots
+    }
+
+    /// Find missing (gap) slots in a range that have not been externalized.
+    /// Returns slots that should have EXTERNALIZE but don't.
+    pub fn find_missing_slots_in_range(&self, from: SlotIndex, to: SlotIndex) -> Vec<SlotIndex> {
+        if from > to {
+            return vec![];
+        }
+        let externalized = self.externalized.read();
+        let mut missing = Vec::new();
+        for slot in from..=to {
+            if !externalized.contains_key(&slot) {
+                missing.push(slot);
+            }
+        }
+        missing
+    }
+
     /// Validate an SCP value.
     ///
     /// The value is the XDR-encoded StellarValue.
@@ -766,6 +799,40 @@ impl ScpDriver {
         }
     }
 
+    /// Trim stale caches while preserving data for slots after catchup.
+    /// Called after catchup to release memory while keeping tx_sets and
+    /// pending requests that will be needed for buffered ledgers.
+    pub fn trim_stale_caches(&self, keep_after_slot: SlotIndex) {
+        let initial_pending_count = self.pending_tx_sets.len();
+        let initial_externalized_count = self.externalized.read().len();
+
+        // Trim pending_tx_sets - keep requests for slots > keep_after_slot
+        self.pending_tx_sets
+            .retain(|_, pending| pending.slot > keep_after_slot);
+
+        // Trim externalized - keep slots > keep_after_slot
+        {
+            let mut externalized = self.externalized.write();
+            externalized.retain(|slot, _| *slot > keep_after_slot);
+        }
+
+        // Note: we don't trim tx_set_cache because it's keyed by hash, not slot.
+        // The tx_sets we need are also cached in fetching_envelopes which we DO trim.
+        // The tx_set_cache is small and will be naturally evicted by max size limits.
+
+        let kept_pending = self.pending_tx_sets.len();
+        let kept_externalized = self.externalized.read().len();
+
+        tracing::info!(
+            initial_pending_count,
+            initial_externalized_count,
+            kept_pending,
+            kept_externalized,
+            keep_after_slot,
+            "Trimmed stale scp_driver caches, preserving future slots"
+        );
+    }
+
     /// Purge SCP state for slots below the given slot.
     ///
     /// This removes externalized slots and cached tx sets for old slots,
@@ -986,6 +1053,121 @@ mod cache_tests {
         let pending_ids = driver.get_pending_quorum_set_node_ids(&unknown_hash);
         assert_eq!(pending_ids.len(), 1);
         assert_eq!(pending_ids[0], sender_node_id);
+    }
+
+    fn make_externalized_slot(slot: SlotIndex, close_time: u64) -> ExternalizedSlot {
+        ExternalizedSlot {
+            slot,
+            value: Value(vec![].try_into().unwrap()),
+            tx_set_hash: Some(Hash256::from_bytes([slot as u8; 32])),
+            close_time,
+            externalized_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_get_externalized_slots_in_range() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+
+        // Externalize some slots (manually insert into the map for testing)
+        {
+            let mut externalized = driver.externalized.write();
+            externalized.insert(100, make_externalized_slot(100, 1000));
+            externalized.insert(102, make_externalized_slot(102, 1010));
+            externalized.insert(105, make_externalized_slot(105, 1020));
+            externalized.insert(110, make_externalized_slot(110, 1030));
+        }
+
+        // Test exact range
+        let slots = driver.get_externalized_slots_in_range(100, 105);
+        assert_eq!(slots, vec![100, 102, 105]);
+
+        // Test partial range
+        let slots = driver.get_externalized_slots_in_range(101, 106);
+        assert_eq!(slots, vec![102, 105]);
+
+        // Test empty range (no slots in range)
+        let slots = driver.get_externalized_slots_in_range(106, 109);
+        assert!(slots.is_empty());
+
+        // Test single slot
+        let slots = driver.get_externalized_slots_in_range(102, 102);
+        assert_eq!(slots, vec![102]);
+    }
+
+    #[test]
+    fn test_find_missing_slots_in_range() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+
+        // Externalize some slots with gaps
+        {
+            let mut externalized = driver.externalized.write();
+            externalized.insert(100, make_externalized_slot(100, 1000));
+            externalized.insert(102, make_externalized_slot(102, 1010));
+            externalized.insert(105, make_externalized_slot(105, 1020));
+        }
+
+        // Find missing slots in range 100-105
+        let missing = driver.find_missing_slots_in_range(100, 105);
+        assert_eq!(missing, vec![101, 103, 104]);
+
+        // No missing slots when all present
+        let missing = driver.find_missing_slots_in_range(100, 100);
+        assert!(missing.is_empty());
+
+        // All slots missing
+        let missing = driver.find_missing_slots_in_range(106, 108);
+        assert_eq!(missing, vec![106, 107, 108]);
+
+        // Invalid range (from > to)
+        let missing = driver.find_missing_slots_in_range(110, 100);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_trim_stale_caches_preserves_future_slots() {
+        let driver = ScpDriver::new(make_config(10), Hash256::hash(b"network"));
+
+        // Add pending tx_sets for various slots
+        let tx_set_old = make_tx_set(1);
+        let tx_set_boundary = make_tx_set(2);
+        let tx_set_future1 = make_tx_set(3);
+        let tx_set_future2 = make_tx_set(4);
+
+        driver.request_tx_set(tx_set_old.hash, 98);
+        driver.request_tx_set(tx_set_boundary.hash, 100);
+        driver.request_tx_set(tx_set_future1.hash, 101);
+        driver.request_tx_set(tx_set_future2.hash, 105);
+
+        // Add externalized slots
+        {
+            let mut externalized = driver.externalized.write();
+            externalized.insert(95, make_externalized_slot(95, 1000));
+            externalized.insert(100, make_externalized_slot(100, 1010));
+            externalized.insert(101, make_externalized_slot(101, 1020));
+            externalized.insert(105, make_externalized_slot(105, 1030));
+        }
+
+        // Trim with keep_after_slot = 100
+        // Should keep slots > 100, i.e., 101 and 105
+        driver.trim_stale_caches(100);
+
+        // Verify pending_tx_sets
+        let pending = driver.get_pending_tx_sets();
+        assert_eq!(pending.len(), 2);
+        assert!(pending
+            .iter()
+            .any(|(h, s)| *h == tx_set_future1.hash && *s == 101));
+        assert!(pending
+            .iter()
+            .any(|(h, s)| *h == tx_set_future2.hash && *s == 105));
+        // Old and boundary slots should be removed
+        assert!(!pending.iter().any(|(h, _)| *h == tx_set_old.hash));
+        assert!(!pending.iter().any(|(h, _)| *h == tx_set_boundary.hash));
+
+        // Verify externalized slots
+        let ext_slots = driver.get_externalized_slots_in_range(0, 200);
+        assert_eq!(ext_slots, vec![101, 105]);
     }
 }
 

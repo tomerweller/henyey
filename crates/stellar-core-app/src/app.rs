@@ -1975,16 +1975,25 @@ impl App {
         progress.set_phase(crate::logging::CatchupPhase::Complete);
         progress.summary();
 
-        // Clear buffered ledgers after catchup - they are now stale.
-        // The new ledger state is authoritative from the history archive.
+        // Trim buffered ledgers that are now stale (at or before the new LCL).
+        // Keep ledgers AFTER the catchup target - they will be applied next.
+        // This matches C++ stellar-core's behavior in LedgerApplyManagerImpl::trimSyncingLedgers.
         {
             let mut buffer = self.syncing_ledgers.write().await;
             let old_count = buffer.len();
-            buffer.clear();
-            if old_count > 0 {
+            let new_lcl = output.result.ledger_seq;
+            // Keep ledgers > new_lcl (i.e., remove ledgers <= new_lcl)
+            buffer.retain(|seq, _| *seq > new_lcl);
+            let kept_count = buffer.len();
+            let removed_count = old_count - kept_count;
+            if removed_count > 0 || kept_count > 0 {
                 tracing::info!(
-                    old_buffered_count = old_count,
-                    "Cleared stale buffered ledgers after catchup"
+                    old_count,
+                    removed_count,
+                    kept_count,
+                    new_lcl,
+                    first_buffered = buffer.keys().next(),
+                    "Trimmed stale buffered ledgers after catchup, keeping future ledgers"
                 );
             }
         }
@@ -2000,16 +2009,19 @@ impl App {
             "Cleared bucket manager cache after catchup"
         );
 
-        // Clear ALL herder/scp_driver caches to release memory after catchup.
-        // This includes tx_set_cache, pending_tx_sets, and externalized slots.
-        // The old data is no longer relevant after reinitializing from history.
-        self.herder.clear_scp_driver_caches();
+        // Trim herder/scp_driver caches to release memory after catchup, but
+        // PRESERVE data for slots > new_lcl that will be needed for buffered ledgers.
+        // This is critical: during catchup, we receive EXTERNALIZE envelopes and
+        // cache their tx_sets. After catchup, we need those tx_sets to apply the
+        // buffered ledgers. If we clear them, peers may have already evicted those
+        // old tx_sets, causing "DontHave" responses and sync failures.
+        let new_lcl = output.result.ledger_seq;
+        self.herder.trim_scp_driver_caches(new_lcl as u64);
+        self.herder.trim_fetching_caches(new_lcl as u64);
 
-        // Clear fetching_envelopes caches (tx_set_cache, quorum_set_cache, slots).
-        // These accumulate when the validator is stuck and can use significant memory.
-        self.herder.clear_fetching_caches();
-
-        // Clear pending envelopes - they are stale after catchup.
+        // Clear pending envelopes for slots <= new_lcl - they are stale after catchup.
+        // Note: we keep pending envelopes for slots > new_lcl as they may still be
+        // waiting for tx_sets that we just preserved above.
         self.herder.clear_pending_envelopes();
 
         // On Linux, ask glibc to return freed memory to the OS.
@@ -3691,8 +3703,38 @@ impl App {
                 Self::trim_syncing_ledgers(&mut buffer, current_ledger);
                 match buffer.get(&next_seq) {
                     Some(info) if info.tx_set.is_some() => info.clone(),
-                    Some(_) => return,
-                    None => return,
+                    Some(info) => {
+                        // We have the slot externalized but no tx_set - it's pending
+                        tracing::debug!(
+                            next_seq,
+                            tx_set_hash = %info.tx_set_hash,
+                            "Waiting for tx_set for next slot"
+                        );
+                        return;
+                    }
+                    None => {
+                        // Slot not in buffer - check if it's externalized
+                        let is_externalized = self.herder.get_externalized(next_seq as u64).is_some();
+                        if is_externalized {
+                            // Externalized but not in buffer - shouldn't happen normally
+                            tracing::warn!(
+                                next_seq,
+                                current_ledger,
+                                "Next slot externalized but not in syncing_ledgers buffer"
+                            );
+                        } else {
+                            // Not externalized - we're missing the EXTERNALIZE message
+                            let latest = self.herder.latest_externalized_slot().unwrap_or(0);
+                            if latest > next_seq as u64 {
+                                tracing::debug!(
+                                    next_seq,
+                                    latest_externalized = latest,
+                                    "Missing EXTERNALIZE for next slot (gap detected)"
+                                );
+                            }
+                        }
+                        return;
+                    }
                 }
             };
 
@@ -4537,6 +4579,36 @@ impl App {
     async fn out_of_sync_recovery(&self, current_ledger: u32) {
         tracing::info!(current_ledger, "Performing out-of-sync recovery");
 
+        // Detect gaps in externalized slots to help diagnose sync issues
+        let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
+        let next_slot = current_ledger as u64 + 1;
+        if latest_externalized > next_slot {
+            let missing_slots = self.herder.find_missing_slots_in_range(next_slot, latest_externalized);
+            if !missing_slots.is_empty() {
+                let missing_count = missing_slots.len();
+                let first_missing = missing_slots.first().copied().unwrap_or(0);
+                let last_missing = missing_slots.last().copied().unwrap_or(0);
+                tracing::warn!(
+                    current_ledger,
+                    latest_externalized,
+                    missing_count,
+                    first_missing,
+                    last_missing,
+                    missing_slots = ?if missing_count <= 10 { missing_slots.clone() } else { vec![] },
+                    "Detected gap in externalized slots - missing EXTERNALIZE messages"
+                );
+            } else {
+                // No gaps in externalized, but we can't apply - likely missing tx_sets
+                let externalized_slots = self.herder.get_externalized_slots_in_range(next_slot, latest_externalized);
+                tracing::info!(
+                    current_ledger,
+                    latest_externalized,
+                    externalized_count = externalized_slots.len(),
+                    "All slots externalized but cannot apply - likely missing tx_sets"
+                );
+            }
+        }
+
         // Get recent SCP envelopes to broadcast
         let from_slot = current_ledger.saturating_sub(5) as u64;
         tracing::debug!(from_slot, "Getting SCP state for recovery");
@@ -4582,8 +4654,10 @@ impl App {
             );
         }
 
-        // Request SCP state from peers
-        let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
+        // Request SCP state from peers, starting from current_ledger to get gap slots
+        // Use current_ledger instead of get_min_ledger_seq_to_ask_peers() to ensure
+        // we request envelopes for slots close to where we're stuck.
+        let ledger_seq = current_ledger;
         match overlay.request_scp_state(ledger_seq).await {
             Ok(count) => {
                 tracing::info!(

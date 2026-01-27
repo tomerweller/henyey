@@ -390,6 +390,49 @@ impl FetchingEnvelopes {
         }
     }
 
+    /// Trim stale data while preserving tx_sets for slots after catchup.
+    /// Called after catchup to release memory from stale data while keeping
+    /// tx_sets that will be needed for the ledgers immediately after catchup.
+    ///
+    /// This is critical for avoiding sync gaps: during catchup, we receive
+    /// EXTERNALIZE envelopes and cache their tx_sets. After catchup completes,
+    /// we need those tx_sets to apply the buffered ledgers. If we clear them,
+    /// peers may have already evicted those old tx_sets, causing "DontHave"
+    /// responses and sync failures.
+    pub fn trim_stale(&self, keep_after_slot: SlotIndex) {
+        let initial_tx_set_count = self.tx_set_cache.len();
+        let initial_quorum_set_count = self.quorum_set_cache.len();
+        let initial_slots_count = self.slots.len();
+
+        // Clear slots for old ledgers only
+        self.slots.retain(|slot, _| *slot > keep_after_slot);
+
+        // Clear tx_sets for old ledgers only - KEEP tx_sets for slots > keep_after_slot
+        self.tx_set_cache
+            .retain(|_, (slot, _)| *slot > keep_after_slot);
+
+        // Clear quorum_set_cache entirely - quorum sets are small and not needed
+        // for applying buffered ledgers (they're only needed for SCP validation)
+        self.quorum_set_cache.clear();
+
+        // Clear fetchers - pending requests for old slots are stale
+        self.tx_set_fetcher.clear();
+        self.quorum_set_fetcher.clear();
+
+        let kept_tx_sets = self.tx_set_cache.len();
+        let kept_slots = self.slots.len();
+
+        tracing::info!(
+            initial_tx_set_count,
+            initial_quorum_set_count,
+            initial_slots_count,
+            kept_tx_sets,
+            kept_slots,
+            keep_after_slot,
+            "Trimmed stale fetching_envelopes caches, preserving future tx_sets"
+        );
+    }
+
     /// Get the number of cached TxSets.
     pub fn tx_set_cache_size(&self) -> usize {
         self.tx_set_cache.len()
@@ -764,5 +807,61 @@ mod tests {
         assert!(ready_slots.contains(&100));
         assert!(!ready_slots.contains(&101));
         assert!(ready_slots.contains(&102));
+    }
+
+    #[test]
+    fn test_trim_stale_preserves_future_tx_sets() {
+        let fetching = FetchingEnvelopes::with_defaults();
+
+        // Create distinct hashes for each tx_set
+        let hash_old = Hash256::from_bytes([98u8; 32]);
+        let hash_boundary = Hash256::from_bytes([99u8; 32]);
+        let hash_future = Hash256::from_bytes([100u8; 32]);
+
+        // Cache tx_sets for various slots (hash, slot, data)
+        fetching.cache_tx_set(hash_old, 98, vec![1, 2, 3]);
+        fetching.cache_tx_set(hash_boundary, 100, vec![4, 5, 6]);
+        fetching.cache_tx_set(hash_future, 101, vec![7, 8, 9]);
+
+        // Also add some quorum sets
+        let qs_hash = Hash256::from_bytes([1u8; 32]);
+        fetching.cache_quorum_set(
+            qs_hash,
+            ScpQuorumSet {
+                threshold: 1,
+                validators: vec![].try_into().unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            },
+        );
+
+        // Verify all are cached before trim
+        assert!(fetching.get_tx_set(&hash_old).is_some());
+        assert!(fetching.get_tx_set(&hash_boundary).is_some());
+        assert!(fetching.get_tx_set(&hash_future).is_some());
+        assert!(fetching.has_quorum_set(&qs_hash));
+
+        // Trim with keep_after_slot = 100
+        // Should keep tx_sets for slots > 100, i.e., slot 101
+        fetching.trim_stale(100);
+
+        // Verify tx_sets: only future slot (101) should remain
+        assert!(
+            fetching.get_tx_set(&hash_future).is_some(),
+            "tx_set for slot 101 should be preserved"
+        );
+        assert!(
+            fetching.get_tx_set(&hash_old).is_none(),
+            "tx_set for slot 98 should be removed"
+        );
+        assert!(
+            fetching.get_tx_set(&hash_boundary).is_none(),
+            "tx_set for slot 100 should be removed (boundary)"
+        );
+
+        // Verify quorum_set_cache is cleared
+        assert!(
+            !fetching.has_quorum_set(&qs_hash),
+            "quorum sets should be cleared"
+        );
     }
 }

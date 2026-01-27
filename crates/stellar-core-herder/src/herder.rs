@@ -1506,6 +1506,18 @@ impl Herder {
         self.scp_driver.find_externalized_slot_by_tx_set_hash(hash)
     }
 
+    /// Get all externalized slot indices in a range (inclusive).
+    /// Returns a sorted list of slots that have been externalized.
+    pub fn get_externalized_slots_in_range(&self, from: u64, to: u64) -> Vec<u64> {
+        self.scp_driver.get_externalized_slots_in_range(from, to)
+    }
+
+    /// Find missing (gap) slots in a range that have not been externalized.
+    /// Returns slots that should have EXTERNALIZE but don't.
+    pub fn find_missing_slots_in_range(&self, from: u64, to: u64) -> Vec<u64> {
+        self.scp_driver.find_missing_slots_in_range(from, to)
+    }
+
     /// Get SCP state envelopes for responding to peers.
     ///
     /// Returns SCP envelopes for slots starting from `from_slot`, along with
@@ -1591,10 +1603,24 @@ impl Herder {
         self.scp_driver.clear_all_caches();
     }
 
+    /// Trim stale scp_driver caches while preserving data for future slots.
+    /// Called after catchup to release memory while keeping pending tx_set
+    /// requests and externalized data for slots after catchup.
+    pub fn trim_scp_driver_caches(&self, keep_after_slot: SlotIndex) {
+        self.scp_driver.trim_stale_caches(keep_after_slot);
+    }
+
     /// Clear all fetching caches to release memory.
     /// Called after catchup to release stale cached data.
     pub fn clear_fetching_caches(&self) {
         self.fetching_envelopes.clear_all();
+    }
+
+    /// Trim stale fetching caches while preserving tx_sets for future slots.
+    /// Called after catchup to release memory while keeping tx_sets needed for
+    /// buffered ledgers that will be applied after catchup completes.
+    pub fn trim_fetching_caches(&self, keep_after_slot: SlotIndex) {
+        self.fetching_envelopes.trim_stale(keep_after_slot);
     }
 
     /// Clear pending envelopes to release memory.
