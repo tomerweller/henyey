@@ -2,7 +2,7 @@
 
 This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
 
-**Last Updated:** 2026-01-26
+**Last Updated:** 2026-01-27
 
 ## Quick Reference: Running Verification
 
@@ -40,10 +40,10 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-617812+ continuous replay passes (meta) |
+| **End-to-end verification** | Extended | 64-677220+ continuous replay passes (meta) |
 | **Transaction meta verification** | Passing | 100% meta match in tested ranges |
 | **Primary failure mode** | Fee refund mismatch | Investigating account balance differences |
-| **Continuous replay** | Ledgers 64-617812+ | Meta matches, expanding range |
+| **Continuous replay** | Ledgers 64-677220+ | Meta matches, expanding range |
 
 ### Verification Results
 
@@ -70,8 +70,43 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 635729-635745 | 17 | 250+ | 100% | ~99% | Hot archive actual_restored_indices fix verified (ledger 635730) |
 | 635740-635741 | 2 | 9 | 100% | ~99% | Hot archive catch-up mode fix verified (F18) |
 | 647350-647355 | 6 | 30+ | 100% | ~99% | CreateClaimableBalance check order fix verified (F19) |
+| 677219-677220 | 2 | 11 | 100% | ~99% | ChangeTrust sponsor account loading fix verified (F20) |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
+
+### Issues Fixed (2026-01-27)
+
+#### 1. ChangeTrust Sponsor Account Not Loaded for Delete Operations (Ledger 677219)
+
+When deleting a sponsored trustline (limit=0), the sponsor account's `num_sponsoring` counter needs to be decremented. This requires the sponsor account to be loaded into state before execution.
+
+**Root Cause**: In `load_operation_accounts()` for ChangeTrust operations, the sponsor account was not being loaded when deleting a trustline. When `remove_entry_sponsorship_and_update_counts()` tried to update the sponsor's `num_sponsoring` counter, it failed with "source account not found" (a misleading error - it was actually the sponsor account that was missing).
+
+**Observed symptoms**:
+- Our result: Transaction failed at operation 6 with "source account not found"
+- CDP result: Transaction succeeded
+
+**Fix**: 
+Added sponsor account loading in `load_operation_accounts()` for ChangeTrust when `limit=0`:
+```rust
+if op_data.limit == 0 {
+    let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: op_source.clone(),
+        asset: tl_asset.clone(),
+    });
+    if let Some(sponsor) = self.state.entry_sponsor(&tl_key).cloned() {
+        self.load_account(snapshot, &sponsor)?;
+    }
+}
+```
+
+**Files changed:**
+- `crates/stellar-core-ledger/src/execution.rs` - Added sponsor loading in `load_operation_accounts()`
+
+**Regression tests:**
+- `test_change_trust_delete_sponsored_trustline_updates_sponsor`
+
+**Verification**: Ledgers 677219-677220 pass with 0 header mismatches.
 
 ### Issues Fixed (2026-01-26)
 
@@ -749,6 +784,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
+- **2026-01-27**: Fixed ChangeTrust sponsor account not loaded for delete operations (F20) - ledger 677219 - extends verification to 677220+
 - **2026-01-26**: Fixed CreateClaimableBalance check order (F19) - Underfunded before LowReserve (ledger 647352) - extends verification to 647355+
 - **2026-01-26**: Fixed hot archive restored keys not collected during catch-up mode (F18) - enables verification from any ledger within checkpoint range
 - **2026-01-26**: Fixed duplicate hot archive restored keys causing multiple LIVE entries (ledger 635730 partial fix) - extends verification to 635729

@@ -1254,4 +1254,142 @@ mod tests {
             "Pool share trustline should be deleted"
         );
     }
+
+    /// Regression test for F20: ChangeTrust delete sponsored trustline
+    ///
+    /// When deleting a trustline that has a sponsor, the sponsor account's
+    /// num_sponsoring counter must be decremented. This test verifies that
+    /// the sponsorship is properly cleaned up.
+    ///
+    /// Bug discovered at testnet ledger 677219 - ChangeTrust operation failed
+    /// with "source account not found" because the sponsor account wasn't
+    /// loaded into state.
+    #[test]
+    fn test_change_trust_delete_sponsored_trustline_updates_sponsor() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        let sponsor_id = create_test_account_id(2);
+
+        // Create accounts with sufficient balance
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        // Create sponsor with num_sponsoring = 1 (sponsoring the trustline)
+        let mut sponsor_account = create_test_account(sponsor_id.clone(), 100_000_000);
+        sponsor_account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                num_sponsored: 0,
+                num_sponsoring: 1, // Sponsoring the trustline
+                signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                ext: AccountEntryExtensionV2Ext::V0,
+            }),
+        });
+        state.create_account(sponsor_account);
+
+        // Create a trustline with 0 balance (can be deleted)
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        };
+        let tl_asset = TrustLineAsset::CreditAlphanum4(asset.clone());
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset.clone(),
+            0, // 0 balance - can be deleted
+            1_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+
+        // Set up source account with num_sub_entries and num_sponsored
+        {
+            let source_account = state.get_account_mut(&source_id).unwrap();
+            source_account.num_sub_entries = 1;
+            source_account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored: 1, // This trustline is sponsored
+                    num_sponsoring: 0,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            });
+        }
+
+        // Set up entry sponsorship for the trustline
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: source_id.clone(),
+            asset: tl_asset.clone(),
+        });
+        state.set_entry_sponsor(ledger_key.clone(), sponsor_id.clone());
+
+        // Verify initial state
+        assert_eq!(state.entry_sponsor(&ledger_key), Some(&sponsor_id));
+        let sponsor_before = state.get_account(&sponsor_id).unwrap();
+        let sponsor_ext = match &sponsor_before.ext {
+            AccountEntryExt::V1(v1) => match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => v2,
+                _ => panic!("expected V2 ext"),
+            },
+            _ => panic!("expected V1 ext"),
+        };
+        assert_eq!(sponsor_ext.num_sponsoring, 1);
+
+        // Delete the trustline
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 0,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok(), "ChangeTrust delete should succeed");
+
+        // Verify trustline is deleted
+        let trustline_after = state.get_trustline_by_trustline_asset(&source_id, &tl_asset);
+        assert!(trustline_after.is_none(), "Trustline should be deleted");
+
+        // Verify sponsor's num_sponsoring was decremented
+        let sponsor_after = state.get_account(&sponsor_id).unwrap();
+        let sponsor_ext_after = match &sponsor_after.ext {
+            AccountEntryExt::V1(v1) => match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => v2,
+                _ => panic!("expected V2 ext"),
+            },
+            _ => panic!("expected V1 ext"),
+        };
+        assert_eq!(
+            sponsor_ext_after.num_sponsoring, 0,
+            "Sponsor's num_sponsoring should be decremented from 1 to 0"
+        );
+
+        // Verify source's num_sponsored was decremented
+        let source_after = state.get_account(&source_id).unwrap();
+        let source_ext_after = match &source_after.ext {
+            AccountEntryExt::V1(v1) => match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => v2,
+                _ => panic!("expected V2 ext"),
+            },
+            _ => panic!("expected V1 ext"),
+        };
+        assert_eq!(
+            source_ext_after.num_sponsored, 0,
+            "Source's num_sponsored should be decremented from 1 to 0"
+        );
+
+        // Verify sponsorship entry was removed
+        assert!(
+            state.entry_sponsor(&ledger_key).is_none(),
+            "Entry sponsorship should be removed"
+        );
+    }
 }

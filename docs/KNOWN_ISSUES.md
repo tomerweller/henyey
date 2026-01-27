@@ -138,6 +138,12 @@ Added `our_hot_archive_restored_keys.extend()` call in catch-up mode branch of v
 Fixed available balance check to not include sponsorship, and moved sponsor reserve check to after balance deduction, matching C++ stellar-core order.
 </details>
 
+<details>
+<summary>F20: ChangeTrust Sponsor Account Not Loaded for Delete Operations (FIXED 2026-01-27)</summary>
+
+When deleting a sponsored trustline (limit=0), the sponsor account wasn't being loaded into state, causing "source account not found" errors when trying to update the sponsor's `num_sponsoring` counter. Fixed by loading the trustline's sponsor account in `load_operation_accounts()` when deleting a trustline. Discovered at testnet ledger 677219.
+</details>
+
 ---
 
 ## How to Add Issues
