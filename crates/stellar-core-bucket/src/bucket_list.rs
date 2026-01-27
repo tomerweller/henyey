@@ -1042,7 +1042,20 @@ impl BucketList {
             if Self::level_should_spill(ledger_seq, i - 1) {
                 // Snap level i-1: moves curr→snap, returns the NEW snap (old curr)
                 // This is the bucket that flows to level i
-                let spilling_snap = self.levels[i - 1].snap();
+                let mut spilling_snap = self.levels[i - 1].snap();
+
+                // Clear in-memory entries when buckets move beyond level 0.
+                // Level 0 uses in-memory entries for fast merging, but once a bucket
+                // moves to level 1+, we should release this memory since the bucket
+                // is already persisted to disk and the in-memory entries are redundant.
+                // This prevents a memory leak where Arc<Vec<BucketEntry>> references
+                // would accumulate across bucket list generations.
+                if i - 1 == 0 {
+                    // Clear in-memory entries from the bucket flowing to level 1
+                    spilling_snap.clear_in_memory_entries();
+                    // Also clear from the snap position at level 0
+                    self.levels[0].snap.clear_in_memory_entries();
+                }
 
                 tracing::debug!(
                     level = i - 1,
@@ -2469,6 +2482,107 @@ mod tests {
                     ledger
                 );
             }
+        }
+    }
+
+    /// Regression test for memory leak fix: in-memory entries must be cleared
+    /// when buckets move from level 0 to level 1.
+    ///
+    /// Without this fix, Arc<Vec<BucketEntry>> references would accumulate
+    /// across bucket list generations, causing memory to grow at ~88 MB/hour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_in_memory_entries_cleared_on_level0_spill() {
+        let mut bl = BucketList::new();
+
+        // Helper to create consistent IDs
+        fn make_id(i: u32) -> [u8; 32] {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&i.to_be_bytes());
+            id
+        }
+
+        // Add an entry at ledger 1 - this goes to level 0's curr
+        let entry1 = make_account_entry(make_id(1), 100);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry1],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Level 0's curr should have in-memory entries after add_batch
+        assert!(
+            bl.levels[0].curr.has_in_memory_entries(),
+            "Level 0 curr should have in-memory entries after add_batch"
+        );
+
+        // Add at ledger 2 - this triggers level 0 to spill (snap)
+        // The old curr moves to snap, and a new curr is created
+        let entry2 = make_account_entry(make_id(2), 200);
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry2],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // After ledger 2, level 0 has spilled:
+        // - The bucket that was in curr is now in snap (and was passed to level 1)
+        // - Level 0's snap should NOT have in-memory entries (memory leak fix)
+        // - Level 0's curr should still have in-memory entries (for future merges)
+        assert!(
+            !bl.levels[0].snap.has_in_memory_entries(),
+            "Level 0 snap should NOT have in-memory entries after spill (memory leak fix)"
+        );
+        assert!(
+            bl.levels[0].curr.has_in_memory_entries(),
+            "Level 0 curr should still have in-memory entries for future merges"
+        );
+
+        // Continue adding entries to trigger more spills and verify the pattern holds
+        for ledger in 3..=8u32 {
+            let entry = make_account_entry(make_id(ledger), ledger as i64 * 100);
+            bl.add_batch(
+                ledger,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+            // At even ledgers, level 0 spills
+            if ledger % 2 == 0 {
+                assert!(
+                    !bl.levels[0].snap.has_in_memory_entries(),
+                    "Level 0 snap should NOT have in-memory entries after spill at ledger {}",
+                    ledger
+                );
+            }
+
+            // Level 0 curr should always have in-memory entries
+            assert!(
+                bl.levels[0].curr.has_in_memory_entries(),
+                "Level 0 curr should have in-memory entries at ledger {}",
+                ledger
+            );
+        }
+
+        // Verify that entries are still accessible (functionality preserved)
+        for i in 1..=8u32 {
+            let key = make_account_key(make_id(i));
+            assert!(
+                bl.get(&key).unwrap().is_some(),
+                "Entry {} should still be accessible",
+                i
+            );
         }
     }
 }
