@@ -45,6 +45,7 @@ use stellar_core_bucket::{
     BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
 };
 use stellar_core_common::{Hash256, NetworkId};
+use stellar_core_db::queries::offers as offers_db;
 use stellar_core_db::Database;
 use stellar_core_tx::soroban::PersistentModuleCache;
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
@@ -318,15 +319,12 @@ pub struct LedgerManager {
     /// repeated compilation of the same contract code.
     module_cache: RwLock<Option<PersistentModuleCache>>,
 
-    /// Pre-loaded offer entries from the bucket list.
+    /// Flag indicating whether the SQL offers table has been populated.
     ///
-    /// This cache is populated once during initialization from the bucket list
+    /// The offers table is populated once during initialization from the bucket list
     /// and updated as offers are created/modified/deleted during ledger closes.
     /// This avoids expensive full bucket list scans during orderbook operations.
-    offer_cache: Arc<RwLock<Vec<LedgerEntry>>>,
-
-    /// Flag indicating whether the offer cache has been populated.
-    offer_cache_initialized: Arc<RwLock<bool>>,
+    offers_initialized: Arc<RwLock<bool>>,
 
     /// In-memory Soroban state for Protocol 20+ contract data/code tracking.
     ///
@@ -369,8 +367,7 @@ impl LedgerManager {
             snapshots: SnapshotManager::new(config.max_snapshots),
             config,
             module_cache: RwLock::new(None),
-            offer_cache: Arc::new(RwLock::new(Vec::new())),
-            offer_cache_initialized: Arc::new(RwLock::new(false)),
+            offers_initialized: Arc::new(RwLock::new(false)),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
         }
     }
@@ -721,8 +718,13 @@ impl LedgerManager {
         // Explicitly drop old module cache to release memory
         let _ = self.module_cache.write().take();
 
-        self.offer_cache.write().clear();
-        *self.offer_cache_initialized.write() = false;
+        // Clear SQL offers table
+        if let Ok(conn) = self.db.connection() {
+            if let Err(e) = offers_db::drop_offers(&conn) {
+                tracing::warn!(error = %e, "Failed to drop offers table during reset");
+            }
+        }
+        *self.offers_initialized.write() = false;
         self.soroban_state.write().clear();
 
         // Reset state
@@ -788,39 +790,61 @@ impl LedgerManager {
         Ok(())
     }
 
-    /// Pre-load all offers from the bucket list into the offer cache.
+    /// Pre-load all offers from the bucket list into the SQL offers table.
     ///
     /// This is called once during initialization to avoid expensive bucket list
-    /// scans during orderbook operations. The offer cache is then maintained
+    /// scans during orderbook operations. The SQL table is then maintained
     /// incrementally as offers are created/updated/deleted.
     ///
     /// Note: This function is kept for potential future use in selective reinitialization.
     /// Normal initialization uses `initialize_all_caches()` for better memory efficiency.
     #[allow(dead_code)]
-    fn initialize_offer_cache(&self) -> Result<()> {
+    fn initialize_offers_sql(&self) -> Result<()> {
         let bucket_list = self.bucket_list.read();
 
-        // Collect offer entries using streaming iteration
-        let mut offers: Vec<LedgerEntry> = Vec::new();
+        // Initialize schema and clear existing offers
+        let mut conn = self.db.connection().map_err(LedgerError::from)?;
+        offers_db::drop_offers(&conn)
+            .map_err(|e| LedgerError::Internal(format!("Failed to drop offers table: {}", e)))?;
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| LedgerError::Internal(format!("Failed to start transaction: {}", e)))?;
+
+        // Collect offer entries using streaming iteration and batch insert
+        let mut offer_batch: Vec<LedgerEntry> = Vec::with_capacity(1000);
+        let mut offer_count = 0u64;
+        const BATCH_SIZE: usize = 1000;
+
         for entry_result in bucket_list.live_entries_iter() {
             let entry = entry_result.map_err(|e| {
-                LedgerError::Internal(format!(
-                    "Failed to iterate live entries for offer cache: {}",
-                    e
-                ))
+                LedgerError::Internal(format!("Failed to iterate live entries for offers: {}", e))
             })?;
             if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                offers.push(entry);
+                offer_batch.push(entry);
+                if offer_batch.len() >= BATCH_SIZE {
+                    offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
+                        LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
+                    })?;
+                    offer_count += offer_batch.len() as u64;
+                    offer_batch.clear();
+                }
             }
         }
 
-        let offer_count = offers.len();
+        // Flush remaining offers
+        if !offer_batch.is_empty() {
+            offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
+                LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
+            })?;
+            offer_count += offer_batch.len() as u64;
+        }
 
-        // Store in cache
-        *self.offer_cache.write() = offers;
-        *self.offer_cache_initialized.write() = true;
+        tx.commit()
+            .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
+        *self.offers_initialized.write() = true;
 
-        info!(offer_count, "Initialized offer cache from bucket list");
+        info!(offer_count, "Initialized SQL offers table from bucket list");
 
         Ok(())
     }
@@ -981,7 +1005,7 @@ impl LedgerManager {
     /// Initialize all caches from the bucket list in a single pass.
     ///
     /// This is an optimization over calling `initialize_module_cache()`,
-    /// `initialize_offer_cache()`, and `initialize_soroban_state()` separately,
+    /// `initialize_offers_sql()`, and `initialize_soroban_state()` separately,
     /// which would each call `live_entries()` and create full copies of all
     /// entries. On testnet with millions of entries, this saves several GB
     /// of temporary memory allocations.
@@ -1004,8 +1028,18 @@ impl LedgerManager {
         let mut soroban_state = self.soroban_state.write();
         soroban_state.clear();
 
-        // Prepare offer cache
-        let mut offers = Vec::new();
+        // Initialize SQL offers table
+        let mut conn = self.db.connection().map_err(LedgerError::from)?;
+        offers_db::drop_offers(&conn)
+            .map_err(|e| LedgerError::Internal(format!("Failed to drop offers table: {}", e)))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| LedgerError::Internal(format!("Failed to start transaction: {}", e)))?;
+
+        // Prepare offer batch for SQL bulk insert
+        let mut offer_batch: Vec<LedgerEntry> = Vec::with_capacity(1000);
+        let mut offer_count = 0u64;
+        const BATCH_SIZE: usize = 1000;
 
         // Counters for logging
         let mut contracts_added = 0u64;
@@ -1025,9 +1059,16 @@ impl LedgerManager {
             })?;
             entry_count += 1;
             match &entry.data {
-                // Offers -> offer cache
+                // Offers -> SQL table (batched insert)
                 LedgerEntryData::Offer(_) => {
-                    offers.push(entry);
+                    offer_batch.push(entry);
+                    if offer_batch.len() >= BATCH_SIZE {
+                        offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
+                            LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
+                        })?;
+                        offer_count += offer_batch.len() as u64;
+                        offer_batch.clear();
+                    }
                 }
 
                 // Contract code -> module cache + soroban state
@@ -1086,6 +1127,18 @@ impl LedgerManager {
             }
         }
 
+        // Flush remaining offers
+        if !offer_batch.is_empty() {
+            offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
+                LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
+            })?;
+            offer_count += offer_batch.len() as u64;
+        }
+
+        // Commit SQL transaction
+        tx.commit()
+            .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
+
         // Drop bucket list lock before acquiring write locks
         drop(bucket_list);
         drop(soroban_state);
@@ -1093,10 +1146,8 @@ impl LedgerManager {
         // Store module cache
         *self.module_cache.write() = module_cache;
 
-        // Store offer cache
-        let offer_count = offers.len();
-        *self.offer_cache.write() = offers;
-        *self.offer_cache_initialized.write() = true;
+        // Mark offers as initialized
+        *self.offers_initialized.write() = true;
 
         // Log initialization stats
         let soroban_stats = self.soroban_state.read().stats();
@@ -1116,14 +1167,9 @@ impl LedgerManager {
         Ok(())
     }
 
-    /// Get a reference to the offer cache for use by snapshots.
-    pub fn offer_cache(&self) -> &Arc<RwLock<Vec<LedgerEntry>>> {
-        &self.offer_cache
-    }
-
-    /// Check if the offer cache has been initialized.
-    pub fn is_offer_cache_initialized(&self) -> bool {
-        *self.offer_cache_initialized.read()
+    /// Check if the SQL offers table has been initialized.
+    pub fn is_offers_initialized(&self) -> bool {
+        *self.offers_initialized.read()
     }
 
     /// Apply a ledger from history (replay mode).
@@ -1336,21 +1382,23 @@ impl LedgerManager {
         let header_lookup_fn: crate::snapshot::LedgerHeaderLookupFn =
             Arc::new(move |seq: u32| db.get_ledger_header(seq).map_err(LedgerError::from));
 
-        // Create entries function that uses the pre-loaded offer cache when available.
+        // Create entries function that uses the SQL offers table when available.
         // This avoids expensive full bucket list scans during orderbook operations.
-        // The offer cache contains all offers pre-loaded at initialization and maintained
+        // The SQL table contains all offers pre-loaded at initialization and maintained
         // incrementally, so we can use it for offer-related queries.
-        let offer_cache = self.offer_cache.clone();
-        let offer_cache_initialized = self.offer_cache_initialized.clone();
+        let db_for_entries = self.db.clone();
+        let offers_initialized = self.offers_initialized.clone();
         let bucket_list_entries = self.bucket_list.clone();
         let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
-            // If offer cache is initialized, return only the cached offers.
+            // If SQL offers table is initialized, query it directly.
             // This is sufficient for orderbook operations which only need offers.
             // For other full-state operations, fall back to bucket list scan.
-            if *offer_cache_initialized.read() {
-                return Ok(offer_cache.read().clone());
+            if *offers_initialized.read() {
+                let conn = db_for_entries.connection().map_err(LedgerError::from)?;
+                return offers_db::load_all_offers(&conn)
+                    .map_err(|e| LedgerError::Internal(format!("Failed to load offers: {}", e)));
             }
-            // Fall back to bucket list scan if offer cache not initialized.
+            // Fall back to bucket list scan if offers not initialized.
             // Use streaming iterator to avoid excessive memory usage.
             let bucket_list = bucket_list_entries.read();
             let mut entries = Vec::new();
@@ -1448,9 +1496,11 @@ impl LedgerManager {
             }
         }
 
-        // Update offer cache with offer changes
-        if *self.offer_cache_initialized.read() {
-            let mut offer_cache = self.offer_cache.write();
+        // Update SQL offers table with offer changes
+        if *self.offers_initialized.read() {
+            let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
+            let mut offer_deletes: Vec<i64> = Vec::new();
+
             for change in delta.changes() {
                 let key = change.key()?;
                 // Only process offer entries
@@ -1459,45 +1509,41 @@ impl LedgerManager {
                 }
 
                 match change {
-                    EntryChange::Created(entry) => {
+                    EntryChange::Created(entry) | EntryChange::Updated { current: entry, .. } => {
                         if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                            offer_cache.push(entry.clone());
-                        }
-                    }
-                    EntryChange::Updated { current: entry, .. } => {
-                        // Find and replace the existing offer
-                        if let LedgerEntryData::Offer(offer) = &entry.data {
-                            let seller_id = &offer.seller_id;
-                            let offer_id = offer.offer_id;
-                            if let Some(pos) = offer_cache.iter().position(|e| {
-                                if let LedgerEntryData::Offer(o) = &e.data {
-                                    o.seller_id == *seller_id && o.offer_id == offer_id
-                                } else {
-                                    false
-                                }
-                            }) {
-                                offer_cache[pos] = entry.clone();
-                            } else {
-                                // Offer not found, add it
-                                offer_cache.push(entry.clone());
-                            }
+                            offer_upserts.push(entry.clone());
                         }
                     }
                     EntryChange::Deleted { .. } => {
-                        // Remove the offer from cache
+                        // Collect offer ID for deletion
                         if let LedgerKey::Offer(offer_key) = &key {
-                            let seller_id = &offer_key.seller_id;
-                            let offer_id = offer_key.offer_id;
-                            offer_cache.retain(|e| {
-                                if let LedgerEntryData::Offer(o) = &e.data {
-                                    !(o.seller_id == *seller_id && o.offer_id == offer_id)
-                                } else {
-                                    true
-                                }
-                            });
+                            offer_deletes.push(offer_key.offer_id);
                         }
                     }
                 }
+            }
+
+            // Apply changes to SQL in a transaction
+            if !offer_upserts.is_empty() || !offer_deletes.is_empty() {
+                let mut conn = self.db.connection().map_err(LedgerError::from)?;
+                let tx = conn.transaction().map_err(|e| {
+                    LedgerError::Internal(format!("Failed to start transaction: {}", e))
+                })?;
+
+                if !offer_upserts.is_empty() {
+                    offers_db::bulk_upsert_offers(&tx, &offer_upserts).map_err(|e| {
+                        LedgerError::Internal(format!("Failed to upsert offers: {}", e))
+                    })?;
+                }
+                if !offer_deletes.is_empty() {
+                    offers_db::bulk_delete_offers(&tx, &offer_deletes).map_err(|e| {
+                        LedgerError::Internal(format!("Failed to delete offers: {}", e))
+                    })?;
+                }
+
+                tx.commit().map_err(|e| {
+                    LedgerError::Internal(format!("Failed to commit offers transaction: {}", e))
+                })?;
             }
         }
 

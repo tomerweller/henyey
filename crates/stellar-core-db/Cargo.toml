@@ -27,6 +27,7 @@ tracing.workspace = true
 bytes.workspace = true
 hex.workspace = true
 base64.workspace = true
+stellar-strkey.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
