@@ -40,8 +40,12 @@
 //! within the merge window where the entry was created.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey};
+use sha2::{Digest, Sha256};
+use stellar_core_common::Hash256;
+use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey, Limits, WriteXdr};
 
 use crate::bucket::{Bucket, BucketIter};
 use crate::entry::{compare_keys, BucketEntry};
@@ -331,14 +335,85 @@ pub fn merge_in_memory(
         "merge_in_memory: built output metadata"
     );
 
-    // Pre-allocate output vector
-    let mut merged = Vec::with_capacity(
-        old_entries.len() + new_entries.len() + output_meta.as_ref().map(|_| 1).unwrap_or(0),
-    );
+    // Initialize incremental hash and entry collection
+    let mut hasher = Sha256::new();
+    let mut key_index = BTreeMap::new();
+
+    // Pre-allocate output vectors
+    // all_entries: includes metadata for storage/indexing
+    // level_zero_entries: excludes metadata for in-memory merges
+    let capacity =
+        old_entries.len() + new_entries.len() + output_meta.as_ref().map(|_| 1).unwrap_or(0);
+    let mut all_entries = Vec::with_capacity(capacity);
+    let mut level_zero_entries = Vec::with_capacity(old_entries.len() + new_entries.len());
+    let mut entry_idx = 0;
+
+    // Reusable buffer for XDR serialization (avoids repeated allocations)
+    let mut entry_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut key_buf: Vec<u8> = Vec::with_capacity(256);
+
+    // Helper to add entry to output with incremental hashing
+    // Uses reusable buffers to minimize allocations
+    let add_entry = |entry: BucketEntry,
+                     hasher: &mut Sha256,
+                     key_index: &mut BTreeMap<Vec<u8>, usize>,
+                     all_entries: &mut Vec<BucketEntry>,
+                     level_zero_entries: &mut Vec<BucketEntry>,
+                     entry_idx: &mut usize,
+                     entry_buf: &mut Vec<u8>,
+                     key_buf: &mut Vec<u8>|
+     -> Result<()> {
+        use stellar_xdr::curr::Limited;
+
+        // Serialize entry for hash using reusable buffer
+        entry_buf.clear();
+        let xdr_entry = entry.to_xdr_entry();
+        {
+            let mut limited = Limited::new(entry_buf as &mut Vec<u8>, Limits::none());
+            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+                BucketError::Serialization(format!("Failed to serialize entry: {}", e))
+            })?;
+        }
+
+        // Update hash with XDR Record Marking format
+        let size = entry_buf.len() as u32;
+        let record_mark = size | 0x80000000;
+        hasher.update(&record_mark.to_be_bytes());
+        hasher.update(entry_buf.as_slice());
+
+        // Build key index for non-metadata entries
+        if !entry.is_metadata() {
+            if let Some(key) = entry.key() {
+                // Serialize key using reusable buffer, then copy to owned vec for index
+                key_buf.clear();
+                {
+                    let mut limited = Limited::new(key_buf as &mut Vec<u8>, Limits::none());
+                    key.write_xdr(&mut limited).map_err(|e| {
+                        BucketError::Serialization(format!("Failed to serialize key: {}", e))
+                    })?;
+                }
+                key_index.insert(key_buf.clone(), *entry_idx);
+            }
+            level_zero_entries.push(entry.clone());
+        }
+
+        all_entries.push(entry);
+        *entry_idx += 1;
+        Ok(())
+    };
 
     // Add metadata first if present
     if let Some(ref meta) = output_meta {
-        merged.push(meta.clone());
+        add_entry(
+            meta.clone(),
+            &mut hasher,
+            &mut key_index,
+            &mut all_entries,
+            &mut level_zero_entries,
+            &mut entry_idx,
+            &mut entry_buf,
+            &mut key_buf,
+        )?;
     }
 
     // Set up indices, skipping metadata entries
@@ -357,7 +432,7 @@ pub fn merge_in_memory(
     // Level 0 does NOT normalize INIT entries (they stay INIT within the merge window)
     let normalize_init_entries = false;
 
-    // Merge entries using the same algorithm as merge_buckets_with_options
+    // Merge entries with incremental hashing
     while old_idx < old_entries.len() && new_idx < new_entries.len() {
         let old_entry = &old_entries[old_idx];
         let new_entry = &new_entries[new_idx];
@@ -371,16 +446,31 @@ pub fn merge_in_memory(
                 match compare_keys(ok, nk) {
                     std::cmp::Ordering::Less => {
                         if should_keep_entry(old_entry, keep_dead_entries) {
-                            merged.push(old_entry.clone());
+                            add_entry(
+                                old_entry.clone(),
+                                &mut hasher,
+                                &mut key_index,
+                                &mut all_entries,
+                                &mut level_zero_entries,
+                                &mut entry_idx,
+                                &mut entry_buf,
+                                &mut key_buf,
+                            )?;
                         }
                         old_idx += 1;
                     }
                     std::cmp::Ordering::Greater => {
                         if should_keep_entry(new_entry, keep_dead_entries) {
-                            merged.push(maybe_normalize_entry(
-                                new_entry.clone(),
-                                normalize_init_entries,
-                            ));
+                            add_entry(
+                                maybe_normalize_entry(new_entry.clone(), normalize_init_entries),
+                                &mut hasher,
+                                &mut key_index,
+                                &mut all_entries,
+                                &mut level_zero_entries,
+                                &mut entry_idx,
+                                &mut entry_buf,
+                                &mut key_buf,
+                            )?;
                         }
                         new_idx += 1;
                     }
@@ -391,7 +481,16 @@ pub fn merge_in_memory(
                             keep_dead_entries,
                             normalize_init_entries,
                         ) {
-                            merged.push(merged_entry);
+                            add_entry(
+                                merged_entry,
+                                &mut hasher,
+                                &mut key_index,
+                                &mut all_entries,
+                                &mut level_zero_entries,
+                                &mut entry_idx,
+                                &mut entry_buf,
+                                &mut key_buf,
+                            )?;
                         }
                         old_idx += 1;
                         new_idx += 1;
@@ -411,7 +510,16 @@ pub fn merge_in_memory(
     while old_idx < old_entries.len() {
         let entry = &old_entries[old_idx];
         if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
-            merged.push(entry.clone());
+            add_entry(
+                entry.clone(),
+                &mut hasher,
+                &mut key_index,
+                &mut all_entries,
+                &mut level_zero_entries,
+                &mut entry_idx,
+                &mut entry_buf,
+                &mut key_buf,
+            )?;
         }
         old_idx += 1;
     }
@@ -420,28 +528,47 @@ pub fn merge_in_memory(
     while new_idx < new_entries.len() {
         let entry = &new_entries[new_idx];
         if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
-            merged.push(maybe_normalize_entry(entry.clone(), normalize_init_entries));
+            add_entry(
+                maybe_normalize_entry(entry.clone(), normalize_init_entries),
+                &mut hasher,
+                &mut key_index,
+                &mut all_entries,
+                &mut level_zero_entries,
+                &mut entry_idx,
+                &mut entry_buf,
+                &mut key_buf,
+            )?;
         }
         new_idx += 1;
     }
 
     // Handle empty result
-    if merged.is_empty() {
+    if all_entries.is_empty() {
         if let Some(meta) = output_meta {
             return Bucket::from_sorted_entries_with_in_memory(vec![meta]);
         }
         return Ok(Bucket::empty());
     }
 
+    // Compute final hash
+    let hash_bytes: [u8; 32] = hasher.finalize().into();
+    let hash = Hash256::from_bytes(hash_bytes);
+
     // DEBUG: Print merge output
     tracing::debug!(
-        merged_count = merged.len(),
-        has_meta = merged.first().map(|e| e.is_metadata()).unwrap_or(false),
+        merged_count = all_entries.len(),
+        has_meta = all_entries.first().map(|e| e.is_metadata()).unwrap_or(false),
+        hash = %hash.to_hex(),
         "merge_in_memory: finished merge"
     );
 
-    // Create bucket with in-memory entries preserved
-    Bucket::from_sorted_entries_with_in_memory(merged)
+    // Create bucket directly with pre-computed hash
+    Ok(Bucket::from_parts(
+        hash,
+        Arc::new(all_entries),
+        Arc::new(key_index),
+        Some(Arc::new(level_zero_entries)),
+    ))
 }
 
 /// Merge two buckets with shadow elimination for pre-shadow-removal protocols.

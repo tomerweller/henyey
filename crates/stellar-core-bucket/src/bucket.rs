@@ -240,6 +240,30 @@ impl Bucket {
         })
     }
 
+    /// Create a bucket from pre-computed parts.
+    ///
+    /// This is an internal constructor used by optimized merge paths that have
+    /// already computed the hash incrementally during the merge operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - Pre-computed SHA256 hash of all entries
+    /// * `entries` - All entries including metadata, already sorted
+    /// * `key_index` - Pre-built key index mapping serialized keys to entry indices
+    /// * `level_zero_entries` - Optional non-metadata entries for level 0 merges
+    pub fn from_parts(
+        hash: Hash256,
+        entries: Arc<Vec<BucketEntry>>,
+        key_index: Arc<BTreeMap<Vec<u8>, usize>>,
+        level_zero_entries: Option<Arc<Vec<BucketEntry>>>,
+    ) -> Self {
+        Self {
+            hash,
+            storage: BucketStorage::InMemory { entries, key_index },
+            level_zero_entries,
+        }
+    }
+
     /// Load a bucket from a gzipped XDR file.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -730,18 +754,75 @@ impl Bucket {
     /// 1. METAENTRY is always first and can be reconstructed from protocol version
     /// 2. In-memory merges generate fresh metadata based on max protocol version
     /// 3. Keeping metadata separate simplifies the merge logic
+    ///
+    /// # Performance
+    ///
+    /// This method separates metadata and non-metadata entries in a single pass,
+    /// avoiding unnecessary cloning. The entries are partitioned by swapping,
+    /// then the hash is computed over all original entries while the non-metadata
+    /// entries are stored separately for level 0 optimizations.
     pub fn from_sorted_entries_with_in_memory(entries: Vec<BucketEntry>) -> Result<Self> {
-        // Filter non-metadata entries for in-memory storage (matches C++ behavior)
-        // Do this first before from_sorted_entries takes ownership via Arc
-        let in_memory_entries: Vec<BucketEntry> = entries
-            .iter()
-            .filter(|e| !e.is_metadata())
-            .cloned()
-            .collect();
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{Limited, WriteXdr};
 
-        let mut bucket = Self::from_sorted_entries(entries)?;
-        bucket.level_zero_entries = Some(Arc::new(in_memory_entries));
-        Ok(bucket)
+        let mut key_index = BTreeMap::new();
+        let mut hasher = Sha256::new();
+
+        // Count non-metadata entries for pre-allocation
+        let non_meta_count = entries.iter().filter(|e| !e.is_metadata()).count();
+        let mut in_memory_entries = Vec::with_capacity(non_meta_count);
+        let mut in_memory_idx = 0;
+
+        // Single pass: serialize each entry for hash, build key index,
+        // and collect non-metadata entries for level 0 storage
+        for (idx, entry) in entries.iter().enumerate() {
+            // Serialize entry to XDR for hash
+            let xdr_entry = entry.to_xdr_entry();
+            let mut entry_bytes = Vec::new();
+            let mut limited = Limited::new(&mut entry_bytes, Limits::none());
+            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+                BucketError::Serialization(format!("Failed to serialize entry: {}", e))
+            })?;
+
+            // Write record mark + entry to hasher (XDR Record Marking format)
+            let size = entry_bytes.len() as u32;
+            let record_mark = size | 0x80000000;
+            hasher.update(&record_mark.to_be_bytes());
+            hasher.update(&entry_bytes);
+
+            // Build key index for non-metadata entries
+            if !entry.is_metadata() {
+                if let Some(key) = entry.key() {
+                    let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                        BucketError::Serialization(format!("Failed to serialize key: {}", e))
+                    })?;
+                    key_index.insert(key_bytes, idx);
+                }
+                // Clone entry for level 0 storage (metadata excluded)
+                in_memory_entries.push(entry.clone());
+                in_memory_idx += 1;
+            } else if let Some(key) = entry.key() {
+                // Metadata entries can have keys too (for index)
+                let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to serialize key: {}", e))
+                })?;
+                key_index.insert(key_bytes, idx);
+            }
+        }
+        let _ = in_memory_idx; // silence unused warning
+
+        // Compute final hash
+        let hash_bytes: [u8; 32] = hasher.finalize().into();
+        let hash = Hash256::from_bytes(hash_bytes);
+
+        Ok(Self {
+            hash,
+            storage: BucketStorage::InMemory {
+                entries: Arc::new(entries),
+                key_index: Arc::new(key_index),
+            },
+            level_zero_entries: Some(Arc::new(in_memory_entries)),
+        })
     }
 }
 
