@@ -103,6 +103,7 @@ mod future_bucket;
 mod hot_archive;
 mod index;
 mod iterator;
+mod live_iterator;
 mod manager;
 mod merge;
 mod merge_map;
@@ -242,6 +243,12 @@ pub use metrics::{
 pub use iterator::{
     BucketInputIterator, BucketOutputIterator, FileMergeInput, MemoryMergeInput, MergeInput,
 };
+
+// ============================================================================
+// Live entries streaming iterator
+// ============================================================================
+
+pub use live_iterator::{LiveEntriesIterator, LiveEntriesStats};
 
 // ============================================================================
 // Protocol version constants

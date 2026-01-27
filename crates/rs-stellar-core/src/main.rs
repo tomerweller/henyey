@@ -1963,21 +1963,17 @@ async fn cmd_replay_bucket_list(
     }
     println!();
 
-    // Initialize in-memory Soroban state from the checkpoint.
+    // Initialize in-memory Soroban state from the checkpoint using streaming iteration.
     let mut soroban_state = InMemorySorobanState::new();
     if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-        let live_entries = bucket_list.live_entries()?;
         let soroban_config = load_soroban_config_from_bucket_list(&bucket_list);
-        soroban_state
-            .update_state(
-                init_checkpoint,
-                &live_entries,
-                &[],
-                &[],
-                init_protocol_version,
-                Some(&soroban_config),
-            )
-            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
+        for entry_result in bucket_list.live_entries_iter() {
+            let entry = entry_result?;
+            soroban_state
+                .process_entry_create(&entry, init_protocol_version, Some(&soroban_config))
+                .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
+        }
+        soroban_state.set_last_closed_ledger_seq(init_checkpoint);
     }
 
     let _replay_config = ReplayConfig {
@@ -2887,58 +2883,84 @@ async fn cmd_verify_execution(
         SorobanRentConfig::default()
     };
 
-    // Initialize in-memory Soroban state from the checkpoint.
+    // Initialize all caches in a single pass over live entries using streaming iteration.
+    // This avoids loading all ~60M mainnet entries into memory at once.
     let mut soroban_state = InMemorySorobanState::new();
-    let mut module_cache: Option<PersistentModuleCache> = None;
-    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-        let live_entries = bucket_list.read().unwrap().live_entries()?;
-        soroban_state
-            .update_state(
-                init_checkpoint,
-                &live_entries,
-                &[],
-                &[],
-                init_protocol_version,
-                Some(&init_rent_config),
-            )
-            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
+    let mut offers: Vec<stellar_xdr::curr::LedgerEntry> = Vec::new();
+    let mut contracts_added = 0u64;
 
-        // Initialize persistent module cache from contract code entries.
-        // This pre-compiles all WASM modules for reuse across transactions,
-        // matching C++ stellar-core's SharedModuleCacheCompiler behavior.
-        if let Some(cache) = PersistentModuleCache::new_for_protocol(init_protocol_version) {
-            let mut contracts_added = 0;
-            for entry in &live_entries {
-                if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
-                    if cache.add_contract(contract_code.code.as_slice(), init_protocol_version) {
-                        contracts_added += 1;
+    // Create module cache if Soroban is supported
+    let module_cache = if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+        PersistentModuleCache::new_for_protocol(init_protocol_version)
+    } else {
+        None
+    };
+
+    // Single pass over all live entries
+    {
+        let bucket_list_guard = bucket_list.read().unwrap();
+        for entry_result in bucket_list_guard.live_entries_iter() {
+            let entry = entry_result?;
+
+            match &entry.data {
+                // Offers -> offer cache
+                LedgerEntryData::Offer(_) => {
+                    offers.push(entry);
+                }
+
+                // Contract code -> module cache + soroban state
+                LedgerEntryData::ContractCode(contract_code) => {
+                    if let Some(ref cache) = module_cache {
+                        if cache.add_contract(contract_code.code.as_slice(), init_protocol_version) {
+                            contracts_added += 1;
+                        }
+                    }
+                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+                        soroban_state
+                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
+                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
                     }
                 }
+
+                // Contract data -> soroban state
+                LedgerEntryData::ContractData(_) => {
+                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+                        soroban_state
+                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
+                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
+                    }
+                }
+
+                // TTL -> soroban state
+                LedgerEntryData::Ttl(_) => {
+                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+                        soroban_state
+                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
+                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
+                    }
+                }
+
+                _ => {}
             }
-            if !quiet && contracts_added > 0 {
-                println!(
-                    "Module cache: pre-compiled {} contract modules",
-                    contracts_added
-                );
-            }
-            module_cache = Some(cache);
         }
     }
 
-    // Pre-load all offers from the bucket list for efficient orderbook operations.
-    // This avoids expensive full bucket list scans during path payment and manage offer operations.
-    // The cache is maintained incrementally as offers are created/modified/deleted.
-    let offer_cache: Arc<RwLock<Vec<stellar_xdr::curr::LedgerEntry>>> = {
-        let live_entries = bucket_list.read().unwrap().live_entries()?;
-        let offers: Vec<_> = live_entries
-            .into_iter()
-            .filter(|e| matches!(e.data, LedgerEntryData::Offer(_)))
-            .collect();
-        if !quiet {
-            println!("Offer cache: pre-loaded {} offers from bucket list", offers.len());
+    // Finalize state
+    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+        soroban_state.set_last_closed_ledger_seq(init_checkpoint);
+    }
+
+    if !quiet {
+        if contracts_added > 0 {
+            println!(
+                "Module cache: pre-compiled {} contract modules",
+                contracts_added
+            );
         }
-        Arc::new(RwLock::new(offers))
-    };
+        println!("Offer cache: pre-loaded {} offers from bucket list", offers.len());
+    }
+
+    let offer_cache: Arc<RwLock<Vec<stellar_xdr::curr::LedgerEntry>>> = Arc::new(RwLock::new(offers));
 
     // Track results
     let mut ledgers_verified = 0u32;

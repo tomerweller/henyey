@@ -763,15 +763,15 @@ impl LedgerManager {
 
         // Scan bucket list for CONTRACT_CODE entries and pre-compile them
         let bucket_list = self.bucket_list.read();
-        let live_entries = bucket_list.live_entries().map_err(|e| {
-            LedgerError::Internal(format!(
-                "Failed to get live entries for module cache: {}",
-                e
-            ))
-        })?;
 
         let mut contracts_added = 0;
-        for entry in &live_entries {
+        for entry_result in bucket_list.live_entries_iter() {
+            let entry = entry_result.map_err(|e| {
+                LedgerError::Internal(format!(
+                    "Failed to iterate live entries for module cache: {}",
+                    e
+                ))
+            })?;
             if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
                 if cache.add_contract(contract_code.code.as_slice(), protocol_version) {
                     contracts_added += 1;
@@ -799,15 +799,20 @@ impl LedgerManager {
     #[allow(dead_code)]
     fn initialize_offer_cache(&self) -> Result<()> {
         let bucket_list = self.bucket_list.read();
-        let live_entries = bucket_list.live_entries().map_err(|e| {
-            LedgerError::Internal(format!("Failed to get live entries for offer cache: {}", e))
-        })?;
 
-        // Filter for offer entries only
-        let offers: Vec<LedgerEntry> = live_entries
-            .into_iter()
-            .filter(|entry| matches!(entry.data, LedgerEntryData::Offer(_)))
-            .collect();
+        // Collect offer entries using streaming iteration
+        let mut offers: Vec<LedgerEntry> = Vec::new();
+        for entry_result in bucket_list.live_entries_iter() {
+            let entry = entry_result.map_err(|e| {
+                LedgerError::Internal(format!(
+                    "Failed to iterate live entries for offer cache: {}",
+                    e
+                ))
+            })?;
+            if matches!(entry.data, LedgerEntryData::Offer(_)) {
+                offers.push(entry);
+            }
+        }
 
         let offer_count = offers.len();
 
@@ -837,12 +842,6 @@ impl LedgerManager {
         }
 
         let bucket_list = self.bucket_list.read();
-        let live_entries = bucket_list.live_entries().map_err(|e| {
-            LedgerError::Internal(format!(
-                "Failed to get live entries for soroban state: {}",
-                e
-            ))
-        })?;
 
         // Load rent config for accurate code size calculation
         let rent_config = self.load_soroban_rent_config(&bucket_list);
@@ -850,12 +849,18 @@ impl LedgerManager {
         let mut soroban_state = self.soroban_state.write();
         soroban_state.clear();
 
-        // First pass: collect all CONTRACT_DATA and CONTRACT_CODE entries
+        // Stream through entries and collect CONTRACT_DATA, CONTRACT_CODE, and TTL entries
         let mut data_count = 0u64;
         let mut code_count = 0u64;
         let mut ttl_count = 0u64;
 
-        for entry in &live_entries {
+        for entry_result in bucket_list.live_entries_iter() {
+            let entry = entry_result.map_err(|e| {
+                LedgerError::Internal(format!(
+                    "Failed to iterate live entries for soroban state: {}",
+                    e
+                ))
+            })?;
             match &entry.data {
                 LedgerEntryData::ContractData(_) => {
                     if let Err(e) = soroban_state.create_contract_data(entry.clone()) {
@@ -1007,17 +1012,18 @@ impl LedgerManager {
         let mut data_count = 0u64;
         let mut code_count = 0u64;
         let mut ttl_count = 0u64;
+        let mut entry_count = 0u64;
 
-        // Single pass over all live entries
-        let live_entries = bucket_list.live_entries().map_err(|e| {
-            LedgerError::Internal(format!(
-                "Failed to get live entries for initialization: {}",
-                e
-            ))
-        })?;
-        let entry_count = live_entries.len();
-
-        for entry in live_entries {
+        // Stream through all live entries without full materialization
+        // This uses HashSet<LedgerKey> for deduplication instead of loading everything into memory
+        for entry_result in bucket_list.live_entries_iter() {
+            let entry = entry_result.map_err(|e| {
+                LedgerError::Internal(format!(
+                    "Failed to iterate live entries for initialization: {}",
+                    e
+                ))
+            })?;
+            entry_count += 1;
             match &entry.data {
                 // Offers -> offer cache
                 LedgerEntryData::Offer(_) => {
@@ -1096,7 +1102,7 @@ impl LedgerManager {
         let soroban_stats = self.soroban_state.read().stats();
         info!(
             ledger_seq,
-            entry_count,
+            entry_count = entry_count,
             contracts_added,
             offer_count,
             data_count,
@@ -1344,11 +1350,18 @@ impl LedgerManager {
             if *offer_cache_initialized.read() {
                 return Ok(offer_cache.read().clone());
             }
-            // Fall back to bucket list scan if offer cache not initialized
-            bucket_list_entries
-                .read()
-                .live_entries()
-                .map_err(LedgerError::Bucket)
+            // Fall back to bucket list scan if offer cache not initialized.
+            // Use streaming iterator to avoid excessive memory usage.
+            let bucket_list = bucket_list_entries.read();
+            let mut entries = Vec::new();
+            for entry_result in bucket_list.live_entries_iter() {
+                let entry = entry_result.map_err(LedgerError::Bucket)?;
+                // Only collect offers for the offer cache fallback
+                if matches!(entry.data, LedgerEntryData::Offer(_)) {
+                    entries.push(entry);
+                }
+            }
+            Ok(entries)
         });
 
         Ok(SnapshotHandle::with_lookups_and_entries(

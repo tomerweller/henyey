@@ -5549,27 +5549,31 @@ pub fn compute_soroban_state_size_from_bucket_list(
 
     let mut total_size: u64 = 0;
 
-    if let Ok(entries) = bucket_list.live_entries() {
-        for entry in &entries {
-            match &entry.data {
-                LedgerEntryData::ContractData(_) => {
-                    // Contract data uses XDR size
-                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
-                        total_size += xdr_bytes.len() as u64;
-                    }
+    // Stream through entries without full materialization
+    for entry_result in bucket_list.live_entries_iter() {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => continue, // Skip entries that fail to iterate
+        };
+
+        match &entry.data {
+            LedgerEntryData::ContractData(_) => {
+                // Contract data uses XDR size
+                if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
+                    total_size += xdr_bytes.len() as u64;
                 }
-                LedgerEntryData::ContractCode(_) => {
-                    // Contract code uses entry_size_for_rent which includes
-                    // the compiled module memory cost for Protocol 23+
-                    if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
-                        let xdr_size = xdr_bytes.len() as u32;
-                        let rent_size =
-                            entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size);
-                        total_size += rent_size as u64;
-                    }
-                }
-                _ => {}
             }
+            LedgerEntryData::ContractCode(_) => {
+                // Contract code uses entry_size_for_rent which includes
+                // the compiled module memory cost for Protocol 23+
+                if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
+                    let xdr_size = xdr_bytes.len() as u32;
+                    let rent_size =
+                        entry_size_for_rent_by_protocol(protocol_version, &entry, xdr_size);
+                    total_size += rent_size as u64;
+                }
+            }
+            _ => {}
         }
     }
 

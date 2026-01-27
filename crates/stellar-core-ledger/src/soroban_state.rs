@@ -270,6 +270,14 @@ impl InMemorySorobanState {
         self.last_closed_ledger_seq
     }
 
+    /// Set the last closed ledger sequence number.
+    ///
+    /// This is used during initialization when populating state from a bucket list
+    /// checkpoint without going through `update_state()`.
+    pub fn set_last_closed_ledger_seq(&mut self, ledger_seq: u32) {
+        self.last_closed_ledger_seq = ledger_seq;
+    }
+
     /// Get the total state size (data + code).
     pub fn total_size(&self) -> u64 {
         (self.contract_data_state_size + self.contract_code_state_size) as u64

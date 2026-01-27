@@ -59,6 +59,7 @@ use crate::entry::{
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
 };
+use crate::live_iterator::LiveEntriesIterator;
 use crate::merge::{merge_buckets_with_options_and_shadows, merge_in_memory};
 use crate::{
     BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
@@ -562,7 +563,45 @@ impl BucketList {
         Ok(results)
     }
 
+    /// Returns a streaming iterator over all live entries.
+    ///
+    /// This is a memory-efficient alternative to [`live_entries()`](Self::live_entries)
+    /// that avoids materializing all entries into a `Vec`. It uses `HashSet<LedgerKey>`
+    /// for deduplication, matching C++ stellar-core's approach.
+    ///
+    /// # Memory Efficiency
+    ///
+    /// For mainnet scale (~60M entries):
+    /// - `live_entries()`: ~52 GB (full entry Vec + serialized key HashSet)
+    /// - `live_entries_iter()`: ~8.6 GB (LedgerKey HashSet only)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let bucket_list = BucketList::new();
+    /// // ... populate bucket list ...
+    ///
+    /// for entry_result in bucket_list.live_entries_iter() {
+    ///     let entry = entry_result?;
+    ///     // Process entry immediately
+    /// }
+    /// ```
+    pub fn live_entries_iter(&self) -> LiveEntriesIterator<'_> {
+        LiveEntriesIterator::new(self)
+    }
+
     /// Return all live entries as of the current bucket list state.
+    ///
+    /// # Deprecation
+    ///
+    /// This method materializes all entries into memory, which is problematic
+    /// for mainnet scale (~60M entries = ~52 GB RAM). Prefer using
+    /// [`live_entries_iter()`](Self::live_entries_iter) for memory-efficient
+    /// streaming iteration.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use live_entries_iter() for memory-efficient streaming iteration"
+    )]
     pub fn live_entries(&self) -> Result<Vec<LedgerEntry>> {
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut entries = Vec::new();
