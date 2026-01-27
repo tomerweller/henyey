@@ -2209,6 +2209,16 @@ mod tests {
         let acceptable_slot = 100 + 50; // 150, well within MAX_EXTERNALIZE_SLOT_DISTANCE
         let envelope = make_signed_externalize_envelope(acceptable_slot, &herder);
 
+        // Cache a dummy tx_set with the hash used in make_signed_externalize_envelope ([0u8; 32])
+        // The EXTERNALIZE handler requires the tx_set to be available before accepting the envelope
+        let dummy_tx_set = TransactionSet {
+            hash: Hash256([0u8; 32]),
+            previous_ledger_hash: Hash256::ZERO,
+            transactions: vec![],
+            generalized_tx_set: None,
+        };
+        herder.cache_tx_set(dummy_tx_set);
+
         let result = herder.receive_scp_envelope(envelope);
 
         // Should be accepted and cause fast-forward
