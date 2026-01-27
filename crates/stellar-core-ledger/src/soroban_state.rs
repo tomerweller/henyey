@@ -1027,12 +1027,18 @@ impl InMemorySorobanState {
         self.contract_code_state_size = 0;
     }
 
+    /// Get the number of config setting entries.
+    pub fn config_settings_count(&self) -> usize {
+        self.config_settings.len()
+    }
+
     /// Get statistics about the current state.
     pub fn stats(&self) -> SorobanStateStats {
         SorobanStateStats {
             ledger_seq: self.last_closed_ledger_seq,
             contract_data_count: self.contract_data_entries.len(),
             contract_code_count: self.contract_code_entries.len(),
+            config_settings_count: self.config_settings.len(),
             contract_data_size: self.contract_data_state_size,
             contract_code_size: self.contract_code_state_size,
             pending_ttl_count: self.pending_ttls.len(),
@@ -1049,6 +1055,8 @@ pub struct SorobanStateStats {
     pub contract_data_count: usize,
     /// Number of contract code entries.
     pub contract_code_count: usize,
+    /// Number of config setting entries.
+    pub config_settings_count: usize,
     /// Total contract data size in bytes.
     pub contract_data_size: i64,
     /// Total contract code size in bytes.

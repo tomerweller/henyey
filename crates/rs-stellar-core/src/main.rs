@@ -2940,6 +2940,16 @@ async fn cmd_verify_execution(
                     }
                 }
 
+                // ConfigSetting -> soroban state (cached for fast Soroban config loading)
+                // This matches online execution which caches ConfigSettings for O(1) access
+                LedgerEntryData::ConfigSetting(_) => {
+                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+                        soroban_state
+                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
+                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -2958,7 +2968,18 @@ async fn cmd_verify_execution(
             );
         }
         println!("Offer cache: pre-loaded {} offers from bucket list", offers.len());
+        println!(
+            "Soroban state: {} contract data, {} contract code, {} config settings",
+            soroban_state.contract_data_count(),
+            soroban_state.contract_code_count(),
+            soroban_state.config_settings_count(),
+        );
     }
+
+    // Wrap soroban_state in Arc<RwLock<>> for sharing with snapshot lookup closures.
+    // This enables O(1) lookups for CONTRACT_DATA, CONTRACT_CODE, TTL, and ConfigSetting
+    // entries instead of O(log n) bucket list traversals.
+    let soroban_state: Arc<RwLock<InMemorySorobanState>> = Arc::new(RwLock::new(soroban_state));
 
     let offer_cache: Arc<RwLock<Vec<stellar_xdr::curr::LedgerEntry>>> = Arc::new(RwLock::new(offers));
 
@@ -3091,10 +3112,13 @@ async fn cmd_verify_execution(
                 continue;
             }
 
-            // Create snapshot handle with bucket list lookup (checks both live and hot archive)
+            // Create snapshot handle with optimized lookup that checks in-memory Soroban state
+            // first for O(1) access, then falls back to bucket list for other types.
+            // This matches online execution's lookup optimization.
             let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
             let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> =
                 hot_archive_bucket_list.clone();
+            let soroban_state_clone: Arc<RwLock<InMemorySorobanState>> = Arc::clone(&soroban_state);
             let lookup_fn: Arc<
                 dyn Fn(
                         &LedgerKey,
@@ -3103,7 +3127,14 @@ async fn cmd_verify_execution(
                     + Send
                     + Sync,
             > = Arc::new(move |key: &LedgerKey| {
-                // First try the live bucket list
+                // Check in-memory Soroban state first for Soroban entry types (O(1) lookup).
+                // This includes CONTRACT_DATA, CONTRACT_CODE, TTL, and ConfigSetting.
+                if InMemorySorobanState::is_in_memory_type(key) {
+                    if let Some(entry) = soroban_state_clone.read().unwrap().get(key) {
+                        return Ok(Some((*entry).clone()));
+                    }
+                }
+                // Fall back to bucket list for non-Soroban types or if not found in memory
                 if let Some(entry) = bucket_list_clone.read().unwrap().get(key).map_err(|e| {
                     LedgerError::Internal(format!("Live bucket lookup failed: {}", e))
                 })? {
@@ -3654,22 +3685,25 @@ async fn cmd_verify_execution(
                     // This can happen when restoring from hot archive:
                     // - ContractCode may still be live because another contract uses the same WASM
                     // - ContractData may already exist if a previous TX in this ledger restored it
-                    let already_in_soroban_state = match &entry.data {
-                        stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
-                            let code_key = stellar_xdr::curr::LedgerKeyContractCode {
-                                hash: cc.hash.clone(),
-                            };
-                            soroban_state.get_contract_code(&code_key).is_some()
+                    let already_in_soroban_state = {
+                        let soroban_state_guard = soroban_state.read().unwrap();
+                        match &entry.data {
+                            stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                                let code_key = stellar_xdr::curr::LedgerKeyContractCode {
+                                    hash: cc.hash.clone(),
+                                };
+                                soroban_state_guard.get_contract_code(&code_key).is_some()
+                            }
+                            stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                                let data_key = stellar_xdr::curr::LedgerKeyContractData {
+                                    contract: cd.contract.clone(),
+                                    key: cd.key.clone(),
+                                    durability: cd.durability,
+                                };
+                                soroban_state_guard.get_contract_data(&data_key).is_some()
+                            }
+                            _ => false,
                         }
-                        stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                            let data_key = stellar_xdr::curr::LedgerKeyContractData {
-                                contract: cd.contract.clone(),
-                                key: cd.key.clone(),
-                                durability: cd.durability,
-                            };
-                            soroban_state.get_contract_data(&data_key).is_some()
-                        }
-                        _ => false,
                     };
 
                     if already_in_soroban_state {
@@ -3706,22 +3740,25 @@ async fn cmd_verify_execution(
                         entry.last_modified_ledger_seq = seq;
 
                         // Check if ContractCode/ContractData already exists in soroban_state
-                        let already_exists = match &entry.data {
-                            stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
-                                let code_key = stellar_xdr::curr::LedgerKeyContractCode {
-                                    hash: cc.hash.clone(),
-                                };
-                                soroban_state.get_contract_code(&code_key).is_some()
+                        let already_exists = {
+                            let soroban_state_guard = soroban_state.read().unwrap();
+                            match &entry.data {
+                                stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                                    let code_key = stellar_xdr::curr::LedgerKeyContractCode {
+                                        hash: cc.hash.clone(),
+                                    };
+                                    soroban_state_guard.get_contract_code(&code_key).is_some()
+                                }
+                                stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                                    let data_key = stellar_xdr::curr::LedgerKeyContractData {
+                                        contract: cd.contract.clone(),
+                                        key: cd.key.clone(),
+                                        durability: cd.durability,
+                                    };
+                                    soroban_state_guard.get_contract_data(&data_key).is_some()
+                                }
+                                _ => false,
                             }
-                            stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                                let data_key = stellar_xdr::curr::LedgerKeyContractData {
-                                    contract: cd.contract.clone(),
-                                    key: cd.key.clone(),
-                                    durability: cd.durability,
-                                };
-                                soroban_state.get_contract_data(&data_key).is_some()
-                            }
-                            _ => false,
                         };
 
                         if already_exists {
@@ -4111,7 +4148,7 @@ async fn cmd_verify_execution(
                         seq,
                         cdp_header.ledger_version,
                         &bl,
-                        soroban_state.total_size(),
+                        soroban_state.read().unwrap().total_size(),
                         archival_override.clone(),
                     ) {
                         our_live.push(window_entry);
@@ -4125,7 +4162,7 @@ async fn cmd_verify_execution(
                         seq,
                         cdp_header.ledger_version,
                         &bl,
-                        soroban_state.total_size(),
+                        soroban_state.read().unwrap().total_size(),
                         &mut aggregator,
                         archival_override.clone(),
                     );
@@ -4136,6 +4173,8 @@ async fn cmd_verify_execution(
 
                 if cdp_header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
                     soroban_state
+                        .write()
+                        .unwrap()
                         .update_state(
                             seq,
                             &all_init,
