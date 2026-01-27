@@ -2,44 +2,15 @@
 
 This document tracks known issues, limitations, and technical debt in rs-stellar-core.
 
-## Open Issues
+## Limitations
 
-### P2: Invariant Checks Disabled Due to Bucket List Scans
+### Testnet Only
 
-**Status**: Open (workaround in place)  
-**Impact**: Reduced validation, potential for undetected state inconsistencies  
-**Added**: 2026-01-23
+**Status**: By Design
 
-**Description**:
-Ledger invariant checking is disabled (`validate_invariants: false`) because it requires full bucket list scans via `live_entries()` on every ledger close.
-
-**Current Workaround**:
-Invariants are disabled in `stellar-core-app/src/app.rs` to avoid memory growth from repeated bucket list scans.
-
-**Ideal Solution**:
-Refactor invariant checks to:
-1. Only validate entries that changed (from the delta)
-2. Use incremental state tracking instead of full scans
-3. Or run invariant checks only periodically (e.g., every N ledgers)
-
-**Files Involved**:
-- `crates/stellar-core-app/src/app.rs` - Invariant config
-- `crates/stellar-core-ledger/src/manager.rs` - Lines 1512-1519, 2174-2206
-- `crates/stellar-core-invariant/` - Invariant implementations
-
----
-
-### F1: Testnet Only
-
-**Status**: By Design  
-**Impact**: Cannot run on mainnet  
-**Added**: 2026-01-23
-
-**Description**:
 This implementation is designed for testnet synchronization only. It should not be used on mainnet due to:
-- Incomplete validation
-- Disabled invariant checks
 - Potential parity gaps with C++ stellar-core
+- Not yet production-hardened
 
 ---
 
@@ -161,62 +132,11 @@ Propagated `actual_restored_indices` through `SorobanOperationMeta` to `extract_
 Added `our_hot_archive_restored_keys.extend()` call in catch-up mode branch of verify-execution.
 </details>
 
----
+<details>
+<summary>F19: CreateClaimableBalance Check Order - Underfunded Before LowReserve (FIXED 2026-01-26)</summary>
 
-### F19: CreateClaimableBalance Check Order (Underfunded Before LowReserve)
-
-**Status**: FIXED  
-**Impact**: Was returning Underfunded when CDP expected LowReserve  
-**Added**: 2026-01-26  
-**Fixed**: 2026-01-26
-
-**Description**:
-The `CreateClaimableBalance` operation was incorrectly checking sponsor reserve (LowReserve) before available balance (Underfunded). In C++ stellar-core, the available balance check happens FIRST using the CURRENT minimum balance (without the new sponsorship), and the sponsor reserve check happens AFTER the balance is deducted.
-
-**Observed at**: Ledger 647352 (testnet)
-
-**Symptoms**:
-- Our result: `CreateClaimableBalance(Underfunded)`
-- CDP result: `CreateClaimableBalance(LowReserve)`
-- The sponsor had enough balance for the claimable balance amount but not enough reserve for the new sponsorship
-
-**Root Cause**:
-In C++ stellar-core's `CreateClaimableBalanceOpFrame::doApply()`:
-1. First calls `getAvailableBalance(sourceAccount)` which computes `balance - minBalance(CURRENT_state)`
-   - **Key**: `minBalance` does NOT include the new sponsorship being created
-2. If `available < amount`, returns `UNDERFUNDED`
-3. Deducts the balance via `addBalance`
-4. Calls `createEntryWithPossibleSponsorship` which checks sponsor reserve → `LOW_RESERVE`
-
-Our code was incorrectly including `sponsorship_multiplier` in the available balance check when `sponsor == source`, causing us to return `Underfunded` when the balance check should pass but the reserve check should fail.
-
-**Solution**:
-1. Changed available balance check to NOT include sponsorship (matching C++ `getAvailableBalance`):
-```rust
-// BEFORE (incorrect):
-let min_balance = if sponsor_is_source {
-    state.minimum_balance_for_account_with_deltas(
-        &account, context.protocol_version, 0, sponsorship_multiplier, 0,
-    )?
-} else {
-    state.minimum_balance_for_account(&account, context.protocol_version, 0)?
-};
-
-// AFTER (correct - matches C++ getAvailableBalance):
-let min_balance =
-    state.minimum_balance_for_account(&account, context.protocol_version, 0)?;
-```
-
-2. Moved sponsor reserve check (LowReserve) to AFTER balance deduction, matching C++ order.
-
-**Files Changed**:
-- `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs` - Reordered checks, fixed available balance calculation
-
-**Regression Tests**:
-- `test_create_claimable_balance_low_reserve_after_underfunded_check` - Verifies LOW_RESERVE when available passes but sponsor reserve fails
-- `test_create_claimable_balance_underfunded` - Verifies UNDERFUNDED when available balance is too low
-
-**Verification**: Ledgers 647350-647355 pass with 0 header mismatches.
+Fixed available balance check to not include sponsorship, and moved sponsor reserve check to after balance deduction, matching C++ stellar-core order.
+</details>
 
 ---
 
