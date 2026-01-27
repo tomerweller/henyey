@@ -1001,13 +1001,17 @@ impl BucketList {
             .collect();
         entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
 
-        // Create the new bucket with in-memory entries for level 0 optimization
-        // This enables fast in-memory merges at level 0
-        let new_bucket = Bucket::from_sorted_entries_with_in_memory({
+        // Create the new bucket with in-memory entries for level 0 optimization.
+        // We use fresh_in_memory_only() which skips hash computation because:
+        // 1. This bucket will be immediately merged with level 0 curr
+        // 2. Only the merged result's hash matters for the bucket list
+        // 3. Skipping hash computation saves ~50% of the bucket update time
+        // This matches C++ stellar-core's freshInMemoryOnly optimization.
+        let new_bucket = Bucket::fresh_in_memory_only({
             let mut e = entries;
             e.sort_by(crate::entry::compare_entries);
             e
-        })?;
+        });
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;

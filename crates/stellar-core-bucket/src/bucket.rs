@@ -264,6 +264,42 @@ impl Bucket {
         }
     }
 
+    /// Create a "shell" bucket for immediate in-memory merging.
+    ///
+    /// This is an optimization matching C++ stellar-core's `freshInMemoryOnly`.
+    /// It creates a bucket with entries for merging but WITHOUT computing the hash.
+    /// The hash is set to zero since:
+    /// 1. This bucket will be immediately merged with another bucket
+    /// 2. Only the merged result's hash matters for the bucket list
+    /// 3. Skipping hash computation saves significant CPU time
+    ///
+    /// # Warning
+    ///
+    /// This bucket MUST only be used as input to an in-memory merge. It should
+    /// NOT be stored in the bucket list or used for any operation that requires
+    /// a valid hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - Sorted entries (metadata first, then data entries by key)
+    pub fn fresh_in_memory_only(entries: Vec<BucketEntry>) -> Self {
+        // Filter non-metadata entries for level 0 storage
+        let level_zero_entries: Vec<BucketEntry> = entries
+            .iter()
+            .filter(|e| !e.is_metadata())
+            .cloned()
+            .collect();
+
+        Self {
+            hash: Hash256::ZERO, // Hash not computed - this is intentional!
+            storage: BucketStorage::InMemory {
+                entries: Arc::new(entries),
+                key_index: Arc::new(BTreeMap::new()), // No index needed for merge input
+            },
+            level_zero_entries: Some(Arc::new(level_zero_entries)),
+        }
+    }
+
     /// Load a bucket from a gzipped XDR file.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -710,33 +746,6 @@ impl Bucket {
     /// Call this when a bucket moves beyond level 0.
     pub fn clear_in_memory_entries(&mut self) {
         self.level_zero_entries = None;
-    }
-
-    /// Create a bucket with only in-memory entries (no hash, no index).
-    ///
-    /// This creates a "shell" bucket for immediate in-memory merging.
-    /// It does NOT compute the hash or create an index, making creation fast.
-    /// The bucket cannot be persisted until properly finalized.
-    ///
-    /// This is the Rust equivalent of C++ `LiveBucket::freshInMemoryOnly`.
-    ///
-    /// # Arguments
-    ///
-    /// * `entries` - Pre-sorted bucket entries (must be sorted by key!)
-    ///
-    /// # Returns
-    ///
-    /// A bucket suitable for in-memory merging. The hash is set to ZERO
-    /// until the bucket is finalized through merging.
-    pub fn fresh_in_memory_only(entries: Vec<BucketEntry>) -> Self {
-        Self {
-            hash: Hash256::ZERO, // Not computed yet
-            storage: BucketStorage::InMemory {
-                entries: Arc::new(Vec::new()), // Empty - use level_zero_entries instead
-                key_index: Arc::new(BTreeMap::new()),
-            },
-            level_zero_entries: Some(Arc::new(entries)),
-        }
     }
 
     /// Create a bucket from sorted entries with in-memory optimization enabled.
