@@ -40,10 +40,10 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 
 | Metric | Status | Notes |
 |--------|--------|-------|
-| **End-to-end verification** | Extended | 64-677220+ continuous replay passes (meta) |
-| **Transaction meta verification** | Passing | 100% meta match in tested ranges |
-| **Primary failure mode** | Fee refund mismatch | Investigating account balance differences |
-| **Continuous replay** | Ledgers 64-677220+ | Meta matches, expanding range |
+| **End-to-end verification** | Complete | 64-697279 continuous replay passes (current CDP edge) |
+| **Transaction meta verification** | Passing | ~99% meta match in tested ranges |
+| **Primary failure mode** | None | All execution matches |
+| **Continuous replay** | Ledgers 64-697279 | Complete to current CDP metadata edge |
 
 ### Verification Results
 
@@ -60,7 +60,7 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 617808-617812 | 5 | 22 | Pending | 100% | Hot archive restore fix verified (meta OK) |
 | 250000-253000 | 3,001 | 8,091 | 100% | ~99% | Extra RESTORED fix verified |
 | 300000-312750 | 12,751 | ~40,000+ | 100% | ~99% | Duplicate entry fix verified |
-| 64-617812+ | 617,749+ | ~600,000+ | 100% | ~98% | **Hot archive fix allows further expansion** |
+| **64-697279** | **697,216** | **~700,000+** | **100%** | **~99%** | **Full testnet verification complete** |
 | 300000-365311 | 65,312 | ~200,000+ | 100% | ~98% | Module cache + SetOptions inflation fixes |
 | 419000-420000 | 1,001 | 3,762 | 100% | ~99% | LiquidityPoolDeposit issuer trustline fix verified |
 | 580000-646000 | 66,001 | ~250,000+ | 100% | ~98% | Hot archive restore+delete fix verified |
@@ -71,6 +71,7 @@ Previously, `verify-execution` used CDP metadata to update the bucket list after
 | 635740-635741 | 2 | 9 | 100% | ~99% | Hot archive catch-up mode fix verified (F18) |
 | 647350-647355 | 6 | 30+ | 100% | ~99% | CreateClaimableBalance check order fix verified (F19) |
 | 677219-677220 | 2 | 11 | 100% | ~99% | ChangeTrust sponsor account loading fix verified (F20) |
+| 677221-697279 | 20,059 | ~85,000+ | 100% | ~99% | **Full verification to CDP edge** |
 
 **Note**: Minor transaction meta mismatches (~1%) are for non-critical fields that don't affect bucket list hash computation.
 
@@ -784,7 +785,7 @@ When contracts are deployed via Soroban transactions, the contract code was writ
 
 ## History
 
-- **2026-01-27**: Fixed ChangeTrust sponsor account not loaded for delete operations (F20) - ledger 677219 - extends verification to 677220+
+- **2026-01-27**: Fixed ChangeTrust sponsor account not loaded for delete operations (F20) - ledger 677219 - **completes full testnet verification to 697279 (CDP edge)**
 - **2026-01-26**: Fixed CreateClaimableBalance check order (F19) - Underfunded before LowReserve (ledger 647352) - extends verification to 647355+
 - **2026-01-26**: Fixed hot archive restored keys not collected during catch-up mode (F18) - enables verification from any ledger within checkpoint range
 - **2026-01-26**: Fixed duplicate hot archive restored keys causing multiple LIVE entries (ledger 635730 partial fix) - extends verification to 635729
