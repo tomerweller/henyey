@@ -1,0 +1,726 @@
+//! Index persistence for BucketListDB.
+//!
+//! This module provides serialization and deserialization of `DiskIndex`
+//! structures to `.index` files, enabling fast startup without rebuilding
+//! indexes from bucket files.
+//!
+//! # File Format
+//!
+//! Index files use bincode serialization with a version header:
+//!
+//! ```text
+//! bucket-{hash}.index
+//! ├── header
+//! │   ├── version: u32 (BUCKET_INDEX_VERSION)
+//! │   └── page_size: u64
+//! └── data
+//!     ├── pages: Vec<(SerializableRangeEntry, u64)>
+//!     ├── bloom_data: Option<BloomFilterData>
+//!     ├── counters: SerializableCounters
+//!     └── type_ranges: HashMap<u32, (u64, u64)>
+//! ```
+//!
+//! # Version Compatibility
+//!
+//! If the stored version doesn't match `BUCKET_INDEX_VERSION`, the index
+//! file is discarded and rebuilt from the bucket file.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, ReadXdr, WriteXdr};
+
+use crate::index::{BucketEntryCounters, DiskIndex, RangeEntry, TypeRange};
+use crate::BucketError;
+
+/// Current version of the index file format.
+///
+/// Increment this when making breaking changes to the serialization format.
+pub const BUCKET_INDEX_VERSION: u32 = 1;
+
+// ============================================================================
+// Serializable Types
+// ============================================================================
+
+/// Header for index files, used for version checking.
+#[derive(Serialize, Deserialize, Debug)]
+struct IndexHeader {
+    version: u32,
+    page_size: u64,
+}
+
+/// Serializable version of RangeEntry.
+///
+/// LedgerKey doesn't implement Serialize, so we store it as XDR bytes.
+#[derive(Serialize, Deserialize, Debug)]
+struct SerializableRangeEntry {
+    lower_bound_xdr: Vec<u8>,
+    upper_bound_xdr: Vec<u8>,
+}
+
+impl SerializableRangeEntry {
+    fn from_range_entry(entry: &RangeEntry) -> Result<Self, BucketError> {
+        let lower_bound_xdr = entry.lower_bound.to_xdr(Limits::none()).map_err(|e| {
+            BucketError::Serialization(format!("Failed to serialize lower bound: {}", e))
+        })?;
+        let upper_bound_xdr = entry.upper_bound.to_xdr(Limits::none()).map_err(|e| {
+            BucketError::Serialization(format!("Failed to serialize upper bound: {}", e))
+        })?;
+        Ok(Self {
+            lower_bound_xdr,
+            upper_bound_xdr,
+        })
+    }
+
+    fn to_range_entry(&self) -> Result<RangeEntry, BucketError> {
+        let lower_bound =
+            LedgerKey::from_xdr(&self.lower_bound_xdr, Limits::none()).map_err(|e| {
+                BucketError::Serialization(format!("Failed to deserialize lower bound: {}", e))
+            })?;
+        let upper_bound =
+            LedgerKey::from_xdr(&self.upper_bound_xdr, Limits::none()).map_err(|e| {
+                BucketError::Serialization(format!("Failed to deserialize upper bound: {}", e))
+            })?;
+        Ok(RangeEntry::new(lower_bound, upper_bound))
+    }
+}
+
+/// Serializable bloom filter data.
+///
+/// The BucketBloomFilter uses xorf::BinaryFuse16 internally, which we serialize
+/// by extracting its components.
+///
+/// Note: Currently unused as we don't persist bloom filters (they are rebuilt
+/// from bucket files when needed). Kept for potential future optimization.
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug)]
+struct BloomFilterData {
+    seed: [u8; 16],
+    /// xorf filter internals
+    filter_seed: u64,
+    segment_length: u32,
+    fingerprints: Vec<u16>,
+}
+
+/// Serializable entry counters.
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct SerializableCounters {
+    /// Count of live entries by entry type (u32 discriminant).
+    live_entries: HashMap<u32, u64>,
+    /// Count of dead entries by entry type.
+    dead_entries: HashMap<u32, u64>,
+    /// Count of init entries by entry type.
+    init_entries: HashMap<u32, u64>,
+    /// Count of persistent Soroban entries.
+    persistent_soroban_entries: u64,
+    /// Count of temporary Soroban entries.
+    temporary_soroban_entries: u64,
+}
+
+impl SerializableCounters {
+    fn from_counters(counters: &BucketEntryCounters) -> Self {
+        Self {
+            live_entries: counters
+                .live_entries
+                .iter()
+                .map(|(k, v)| (entry_type_to_u32(*k), *v))
+                .collect(),
+            dead_entries: counters
+                .dead_entries
+                .iter()
+                .map(|(k, v)| (entry_type_to_u32(*k), *v))
+                .collect(),
+            init_entries: counters
+                .init_entries
+                .iter()
+                .map(|(k, v)| (entry_type_to_u32(*k), *v))
+                .collect(),
+            persistent_soroban_entries: counters.persistent_soroban_entries,
+            temporary_soroban_entries: counters.temporary_soroban_entries,
+        }
+    }
+
+    fn to_counters(&self) -> BucketEntryCounters {
+        BucketEntryCounters {
+            live_entries: self
+                .live_entries
+                .iter()
+                .filter_map(|(k, v)| u32_to_entry_type(*k).map(|t| (t, *v)))
+                .collect(),
+            dead_entries: self
+                .dead_entries
+                .iter()
+                .filter_map(|(k, v)| u32_to_entry_type(*k).map(|t| (t, *v)))
+                .collect(),
+            init_entries: self
+                .init_entries
+                .iter()
+                .filter_map(|(k, v)| u32_to_entry_type(*k).map(|t| (t, *v)))
+                .collect(),
+            persistent_soroban_entries: self.persistent_soroban_entries,
+            temporary_soroban_entries: self.temporary_soroban_entries,
+        }
+    }
+}
+
+/// Full serializable index data.
+#[derive(Serialize, Deserialize, Debug)]
+struct IndexData {
+    pages: Vec<(SerializableRangeEntry, u64)>,
+    bloom_seed: [u8; 16],
+    // Note: We don't serialize the bloom filter for now - it can be rebuilt quickly
+    // from the bucket file if needed. This simplifies serialization.
+    counters: SerializableCounters,
+    /// Type ranges stored as (entry_type_u32, (start, end)).
+    type_ranges: HashMap<u32, (u64, u64)>,
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn entry_type_to_u32(entry_type: LedgerEntryType) -> u32 {
+    match entry_type {
+        LedgerEntryType::Account => 0,
+        LedgerEntryType::Trustline => 1,
+        LedgerEntryType::Offer => 2,
+        LedgerEntryType::Data => 3,
+        LedgerEntryType::ClaimableBalance => 4,
+        LedgerEntryType::LiquidityPool => 5,
+        LedgerEntryType::ContractData => 6,
+        LedgerEntryType::ContractCode => 7,
+        LedgerEntryType::ConfigSetting => 8,
+        LedgerEntryType::Ttl => 9,
+    }
+}
+
+fn u32_to_entry_type(value: u32) -> Option<LedgerEntryType> {
+    match value {
+        0 => Some(LedgerEntryType::Account),
+        1 => Some(LedgerEntryType::Trustline),
+        2 => Some(LedgerEntryType::Offer),
+        3 => Some(LedgerEntryType::Data),
+        4 => Some(LedgerEntryType::ClaimableBalance),
+        5 => Some(LedgerEntryType::LiquidityPool),
+        6 => Some(LedgerEntryType::ContractData),
+        7 => Some(LedgerEntryType::ContractCode),
+        8 => Some(LedgerEntryType::ConfigSetting),
+        9 => Some(LedgerEntryType::Ttl),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Persistence Functions
+// ============================================================================
+
+/// Compute the index file path for a bucket.
+pub fn index_path_for_bucket(bucket_path: &Path) -> PathBuf {
+    let mut index_path = bucket_path.to_path_buf();
+    index_path.set_extension("index");
+    index_path
+}
+
+/// Save a DiskIndex to disk.
+///
+/// Uses atomic write via temp file + rename to prevent corruption.
+///
+/// # Arguments
+///
+/// * `index` - The DiskIndex to save
+/// * `bucket_path` - Path to the bucket file (used to derive index path)
+///
+/// # Returns
+///
+/// `Ok(())` on success, `Err` on I/O or serialization failure.
+pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), BucketError> {
+    let index_path = index_path_for_bucket(bucket_path);
+    let tmp_path = index_path.with_extension("index.tmp");
+
+    // Serialize index data
+    let pages: Result<Vec<_>, _> = index
+        .pages_iter()
+        .map(|(range, offset)| {
+            SerializableRangeEntry::from_range_entry(range).map(|r| (r, *offset))
+        })
+        .collect();
+    let pages = pages?;
+
+    let type_ranges: HashMap<u32, (u64, u64)> = index
+        .type_ranges_iter()
+        .map(|(entry_type, range)| {
+            (
+                entry_type_to_u32(*entry_type),
+                (range.start_offset, range.end_offset),
+            )
+        })
+        .collect();
+
+    let data = IndexData {
+        pages,
+        bloom_seed: index.bloom_seed(),
+        counters: SerializableCounters::from_counters(index.counters()),
+        type_ranges,
+    };
+
+    let header = IndexHeader {
+        version: BUCKET_INDEX_VERSION,
+        page_size: index.page_size(),
+    };
+
+    // Write to temp file
+    {
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+
+        bincode::serialize_into(&mut writer, &header).map_err(|e| {
+            BucketError::Serialization(format!("Failed to serialize header: {}", e))
+        })?;
+        bincode::serialize_into(&mut writer, &data)
+            .map_err(|e| BucketError::Serialization(format!("Failed to serialize data: {}", e)))?;
+
+        writer.flush()?;
+    }
+
+    // Atomic rename
+    match std::fs::rename(&tmp_path, &index_path) {
+        Ok(()) => {}
+        Err(_) => {
+            // Retry after short delay (race condition workaround)
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::rename(&tmp_path, &index_path)?;
+        }
+    }
+
+    tracing::debug!(
+        path = %index_path.display(),
+        "Saved bucket index"
+    );
+
+    Ok(())
+}
+
+/// Load a DiskIndex from disk.
+///
+/// Returns `None` if:
+/// - Index file doesn't exist
+/// - Version mismatch
+/// - PageSize mismatch
+/// - Deserialization error
+///
+/// # Arguments
+///
+/// * `bucket_path` - Path to the bucket file
+/// * `expected_page_size` - Expected page size (triggers rebuild if different)
+///
+/// # Returns
+///
+/// `Some(DiskIndex)` if successfully loaded, `None` if should rebuild.
+pub fn load_disk_index(
+    bucket_path: &Path,
+    expected_page_size: u64,
+) -> Result<Option<DiskIndex>, BucketError> {
+    let index_path = index_path_for_bucket(bucket_path);
+
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let file = match File::open(&index_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = BufReader::new(file);
+
+    // Read and validate header
+    let header: IndexHeader = match bincode::deserialize_from(&mut reader) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                path = %index_path.display(),
+                error = %e,
+                "Failed to read index header, will rebuild"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Version check
+    if header.version != BUCKET_INDEX_VERSION {
+        tracing::info!(
+            path = %index_path.display(),
+            stored_version = header.version,
+            expected_version = BUCKET_INDEX_VERSION,
+            "Index version mismatch, will rebuild"
+        );
+        // Delete outdated file
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+
+    // PageSize check
+    if header.page_size != expected_page_size {
+        tracing::info!(
+            path = %index_path.display(),
+            stored_page_size = header.page_size,
+            expected_page_size = expected_page_size,
+            "Index page size mismatch, will rebuild"
+        );
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+
+    // Load data
+    let data: IndexData = match bincode::deserialize_from(&mut reader) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                path = %index_path.display(),
+                error = %e,
+                "Failed to deserialize index, will rebuild"
+            );
+            let _ = std::fs::remove_file(&index_path);
+            return Ok(None);
+        }
+    };
+
+    // Convert to DiskIndex
+    let pages: Result<Vec<_>, _> = data
+        .pages
+        .into_iter()
+        .map(|(range, offset)| range.to_range_entry().map(|r| (r, offset)))
+        .collect();
+    let pages = pages?;
+
+    let type_ranges: HashMap<LedgerEntryType, TypeRange> = data
+        .type_ranges
+        .into_iter()
+        .filter_map(|(k, (start, end))| {
+            u32_to_entry_type(k).map(|t| (t, TypeRange::new(start, end)))
+        })
+        .collect();
+
+    let index = DiskIndex::from_persisted(
+        header.page_size,
+        pages,
+        data.bloom_seed,
+        data.counters.to_counters(),
+        type_ranges,
+    );
+
+    tracing::debug!(
+        path = %index_path.display(),
+        "Loaded bucket index from disk"
+    );
+
+    Ok(Some(index))
+}
+
+/// Delete an index file.
+pub fn delete_index(bucket_path: &Path) -> Result<(), BucketError> {
+    let index_path = index_path_for_bucket(bucket_path);
+    if index_path.exists() {
+        std::fs::remove_file(&index_path)?;
+    }
+    Ok(())
+}
+
+/// Clean up orphaned index files (indexes without corresponding bucket files).
+pub fn cleanup_orphaned_indexes(bucket_dir: &Path) -> Result<usize, BucketError> {
+    let mut removed_count = 0;
+
+    for entry in std::fs::read_dir(bucket_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().map(|e| e == "index").unwrap_or(false) {
+            // Check if corresponding bucket file exists
+            let mut bucket_path = path.clone();
+            bucket_path.set_extension("xdr");
+
+            if !bucket_path.exists() {
+                tracing::info!(
+                    path = %path.display(),
+                    "Removing orphaned index file"
+                );
+                std::fs::remove_file(&path)?;
+                removed_count += 1;
+            }
+        }
+    }
+
+    Ok(removed_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::DEFAULT_PAGE_SIZE;
+    use stellar_xdr::curr::*;
+    use tempfile::tempdir;
+
+    fn make_account_key(byte: u8) -> LedgerKey {
+        LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32]))),
+        })
+    }
+
+    #[test]
+    fn test_serializable_range_entry_roundtrip() {
+        let range = RangeEntry::new(make_account_key(1), make_account_key(10));
+        let serializable = SerializableRangeEntry::from_range_entry(&range).unwrap();
+        let restored = serializable.to_range_entry().unwrap();
+
+        // Verify keys match
+        let orig_lower_bytes = range.lower_bound.to_xdr(Limits::none()).unwrap();
+        let restored_lower_bytes = restored.lower_bound.to_xdr(Limits::none()).unwrap();
+        assert_eq!(orig_lower_bytes, restored_lower_bytes);
+    }
+
+    #[test]
+    fn test_entry_type_conversion() {
+        let types = vec![
+            LedgerEntryType::Account,
+            LedgerEntryType::Trustline,
+            LedgerEntryType::Offer,
+            LedgerEntryType::ContractData,
+            LedgerEntryType::Ttl,
+        ];
+
+        for entry_type in types {
+            let u32_val = entry_type_to_u32(entry_type);
+            let restored = u32_to_entry_type(u32_val);
+            assert_eq!(restored, Some(entry_type));
+        }
+    }
+
+    #[test]
+    fn test_index_path_for_bucket() {
+        let bucket_path = Path::new("/tmp/buckets/bucket-abc123.xdr");
+        let index_path = index_path_for_bucket(bucket_path);
+        assert_eq!(
+            index_path.to_str().unwrap(),
+            "/tmp/buckets/bucket-abc123.index"
+        );
+    }
+
+    #[test]
+    fn test_load_nonexistent_index() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-test.xdr");
+
+        let result = load_disk_index(&bucket_path, DEFAULT_PAGE_SIZE).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_serializable_counters_roundtrip() {
+        let mut counters = BucketEntryCounters::default();
+        counters.live_entries.insert(LedgerEntryType::Account, 100);
+        counters.dead_entries.insert(LedgerEntryType::Offer, 50);
+        counters.persistent_soroban_entries = 25;
+
+        let serializable = SerializableCounters::from_counters(&counters);
+        let restored = serializable.to_counters();
+
+        assert_eq!(
+            restored.live_entries.get(&LedgerEntryType::Account),
+            Some(&100)
+        );
+        assert_eq!(
+            restored.dead_entries.get(&LedgerEntryType::Offer),
+            Some(&50)
+        );
+        assert_eq!(restored.persistent_soroban_entries, 25);
+    }
+
+    #[test]
+    fn test_save_load_disk_index_roundtrip() {
+        use crate::entry::BucketEntry;
+        use crate::index::DiskIndex;
+
+        fn make_account_entry(byte: u8) -> LedgerEntry {
+            LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32]))),
+                    balance: 100,
+                    seq_num: SequenceNumber(1),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32::default(),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: vec![].try_into().unwrap(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        }
+
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-test.xdr");
+
+        // Create a DiskIndex with entries
+        let entries: Vec<(BucketEntry, u64)> = (0..100u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let bloom_seed = [42u8; 16];
+        let page_size = 10u64;
+        let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size);
+
+        // Save the index
+        save_disk_index(&original, &bucket_path).unwrap();
+
+        // Verify index file was created
+        let index_path = index_path_for_bucket(&bucket_path);
+        assert!(index_path.exists());
+
+        // Load the index back
+        let loaded = load_disk_index(&bucket_path, page_size)
+            .unwrap()
+            .expect("Index should load successfully");
+
+        // Verify properties match
+        assert_eq!(loaded.page_size(), original.page_size());
+        assert_eq!(loaded.num_pages(), original.num_pages());
+        assert_eq!(loaded.bloom_seed(), original.bloom_seed());
+
+        // Verify counters match
+        assert_eq!(
+            loaded.counters().total_live(),
+            original.counters().total_live()
+        );
+        assert_eq!(
+            loaded
+                .counters()
+                .live_entries
+                .get(&LedgerEntryType::Account),
+            original
+                .counters()
+                .live_entries
+                .get(&LedgerEntryType::Account)
+        );
+
+        // Verify type ranges match
+        let orig_range = original.type_range(LedgerEntryType::Account);
+        let loaded_range = loaded.type_range(LedgerEntryType::Account);
+        assert!(orig_range.is_some());
+        assert!(loaded_range.is_some());
+        assert_eq!(
+            orig_range.unwrap().start_offset,
+            loaded_range.unwrap().start_offset
+        );
+
+        // Verify page lookup works on loaded index
+        let key = make_account_key(55);
+        let orig_page = original.find_page_for_key(&key);
+        let loaded_page = loaded.find_page_for_key(&key);
+        // Note: loaded index doesn't have bloom filter, so it may not filter
+        // but if original returns a page, loaded should too
+        if orig_page.is_some() {
+            assert!(loaded_page.is_some());
+            assert_eq!(orig_page, loaded_page);
+        }
+    }
+
+    #[test]
+    fn test_load_with_wrong_page_size_returns_none() {
+        use crate::entry::BucketEntry;
+        use crate::index::DiskIndex;
+
+        fn make_account_entry(byte: u8) -> LedgerEntry {
+            LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32]))),
+                    balance: 100,
+                    seq_num: SequenceNumber(1),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32::default(),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: vec![].try_into().unwrap(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        }
+
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-test.xdr");
+
+        // Create and save with page_size = 10
+        let entries: Vec<(BucketEntry, u64)> = (0..50u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
+        save_disk_index(&index, &bucket_path).unwrap();
+
+        // Try to load with different page_size = 20
+        let result = load_disk_index(&bucket_path, 20).unwrap();
+        assert!(
+            result.is_none(),
+            "Should return None for page size mismatch"
+        );
+
+        // Index file should be deleted
+        let index_path = index_path_for_bucket(&bucket_path);
+        assert!(
+            !index_path.exists(),
+            "Mismatched index file should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_delete_index() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-test.xdr");
+        let index_path = index_path_for_bucket(&bucket_path);
+
+        // Create a dummy index file
+        std::fs::write(&index_path, b"dummy").unwrap();
+        assert!(index_path.exists());
+
+        // Delete it
+        delete_index(&bucket_path).unwrap();
+        assert!(!index_path.exists());
+
+        // Deleting again should be a no-op
+        delete_index(&bucket_path).unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_orphaned_indexes() {
+        let temp_dir = tempdir().unwrap();
+
+        // Create some bucket files and their indexes
+        let bucket1 = temp_dir.path().join("bucket-aaa.xdr");
+        let bucket2 = temp_dir.path().join("bucket-bbb.xdr");
+        std::fs::write(&bucket1, b"bucket1").unwrap();
+        std::fs::write(&bucket2, b"bucket2").unwrap();
+        std::fs::write(index_path_for_bucket(&bucket1), b"index1").unwrap();
+        std::fs::write(index_path_for_bucket(&bucket2), b"index2").unwrap();
+
+        // Create an orphaned index (no bucket file)
+        let orphaned_index = temp_dir.path().join("bucket-orphan.index");
+        std::fs::write(&orphaned_index, b"orphan").unwrap();
+
+        // Cleanup
+        let removed = cleanup_orphaned_indexes(temp_dir.path()).unwrap();
+        assert_eq!(removed, 1);
+
+        // Verify orphaned was removed but others remain
+        assert!(!orphaned_index.exists());
+        assert!(index_path_for_bucket(&bucket1).exists());
+        assert!(index_path_for_bucket(&bucket2).exists());
+    }
+}

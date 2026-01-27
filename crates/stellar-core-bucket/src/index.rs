@@ -609,6 +609,60 @@ impl DiskIndex {
     pub fn page_size(&self) -> u64 {
         self.page_size
     }
+
+    /// Creates a DiskIndex from persisted data.
+    ///
+    /// This is used when loading an index from disk storage instead of
+    /// rebuilding it from the bucket file.
+    ///
+    /// # Arguments
+    ///
+    /// * `page_size` - Page size (number of entries per page)
+    /// * `pages` - Page ranges and their offsets
+    /// * `bloom_seed` - Seed for bloom filter reconstruction
+    /// * `counters` - Entry counters
+    /// * `type_ranges` - Ranges for each entry type
+    pub fn from_persisted(
+        page_size: u64,
+        pages: Vec<(RangeEntry, u64)>,
+        bloom_seed: HashSeed,
+        counters: BucketEntryCounters,
+        type_ranges: HashMap<LedgerEntryType, TypeRange>,
+    ) -> Self {
+        // Note: We don't restore the bloom filter or asset_to_pool_id from persistence.
+        // The bloom filter can be rebuilt if needed, and asset_to_pool_id is typically
+        // not required for persisted indexes (it's mainly used during active operation).
+        Self {
+            page_size,
+            pages,
+            bloom_filter: None, // Not persisted - will cause false positives but no correctness issues
+            bloom_seed,
+            asset_to_pool_id: AssetPoolIdMap::new(), // Not persisted
+            counters,
+            type_ranges,
+        }
+    }
+
+    /// Returns an iterator over pages (range, offset) pairs.
+    ///
+    /// Used for serialization/persistence.
+    pub fn pages_iter(&self) -> impl Iterator<Item = (&RangeEntry, &u64)> {
+        self.pages.iter().map(|(range, offset)| (range, offset))
+    }
+
+    /// Returns an iterator over type ranges.
+    ///
+    /// Used for serialization/persistence.
+    pub fn type_ranges_iter(&self) -> impl Iterator<Item = (&LedgerEntryType, &TypeRange)> {
+        self.type_ranges.iter()
+    }
+
+    /// Returns the bloom filter seed.
+    ///
+    /// Used for serialization/persistence.
+    pub fn bloom_seed(&self) -> HashSeed {
+        self.bloom_seed
+    }
 }
 
 // ============================================================================

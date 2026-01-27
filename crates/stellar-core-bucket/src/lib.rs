@@ -102,6 +102,7 @@ mod eviction;
 mod future_bucket;
 mod hot_archive;
 mod index;
+mod index_persistence;
 mod iterator;
 mod live_iterator;
 mod manager;
@@ -204,6 +205,15 @@ pub use snapshot::{
 pub use index::{
     AssetPoolIdMap, BucketEntryCounters, DiskIndex, InMemoryIndex, LiveBucketIndex, RangeEntry,
     TypeRange, DEFAULT_PAGE_SIZE, IN_MEMORY_INDEX_THRESHOLD,
+};
+
+// ============================================================================
+// Index persistence
+// ============================================================================
+
+pub use index_persistence::{
+    cleanup_orphaned_indexes, delete_index, index_path_for_bucket, load_disk_index, save_disk_index,
+    BUCKET_INDEX_VERSION,
 };
 
 // ============================================================================
