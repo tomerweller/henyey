@@ -188,10 +188,36 @@ impl Bucket {
     ///
     /// This is intended for entries extracted from disk-backed buckets that were
     /// already sorted by stellar-core, or from bucket iteration which preserves order.
+    ///
+    /// # Performance
+    ///
+    /// This method computes the bucket hash incrementally while building the key index,
+    /// using a single serialization pass for each entry. This is more efficient than
+    /// serializing all entries twice (once for the index, once for the hash).
     pub fn from_sorted_entries(entries: Vec<BucketEntry>) -> Result<Self> {
-        // Build key index
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{Limited, WriteXdr};
+
         let mut key_index = BTreeMap::new();
+        let mut hasher = Sha256::new();
+
+        // Single pass: serialize each entry once, use for both index and hash
         for (idx, entry) in entries.iter().enumerate() {
+            // Serialize entry to XDR
+            let xdr_entry = entry.to_xdr_entry();
+            let mut entry_bytes = Vec::new();
+            let mut limited = Limited::new(&mut entry_bytes, Limits::none());
+            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+                BucketError::Serialization(format!("Failed to serialize entry: {}", e))
+            })?;
+
+            // Write record mark + entry to hasher (XDR Record Marking format)
+            let size = entry_bytes.len() as u32;
+            let record_mark = size | 0x80000000; // Set high bit
+            hasher.update(&record_mark.to_be_bytes());
+            hasher.update(&entry_bytes);
+
+            // Build key index (only need to serialize key if entry has one)
             if let Some(key) = entry.key() {
                 let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                     BucketError::Serialization(format!("Failed to serialize key: {}", e))
@@ -200,8 +226,9 @@ impl Bucket {
             }
         }
 
-        // Compute hash
-        let hash = Self::compute_hash_for_entries(&entries)?;
+        // Compute final hash
+        let hash_bytes: [u8; 32] = hasher.finalize().into();
+        let hash = Hash256::from_bytes(hash_bytes);
 
         Ok(Self {
             hash,
@@ -704,10 +731,15 @@ impl Bucket {
     /// 2. In-memory merges generate fresh metadata based on max protocol version
     /// 3. Keeping metadata separate simplifies the merge logic
     pub fn from_sorted_entries_with_in_memory(entries: Vec<BucketEntry>) -> Result<Self> {
-        let mut bucket = Self::from_sorted_entries(entries.clone())?;
-        // Store entries WITHOUT METAENTRY for in-memory merges (matches C++ behavior)
-        let in_memory_entries: Vec<BucketEntry> =
-            entries.into_iter().filter(|e| !e.is_metadata()).collect();
+        // Filter non-metadata entries for in-memory storage (matches C++ behavior)
+        // Do this first before from_sorted_entries takes ownership via Arc
+        let in_memory_entries: Vec<BucketEntry> = entries
+            .iter()
+            .filter(|e| !e.is_metadata())
+            .cloned()
+            .collect();
+
+        let mut bucket = Self::from_sorted_entries(entries)?;
         bucket.level_zero_entries = Some(Arc::new(in_memory_entries));
         Ok(bucket)
     }

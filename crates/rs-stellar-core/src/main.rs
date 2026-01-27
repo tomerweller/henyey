@@ -2994,6 +2994,20 @@ async fn cmd_verify_execution(
     let mut ledgers_with_header_mismatches = 0u32;
     let mut ledgers_with_both_mismatches = 0u32;
 
+    // Timing statistics for performance analysis
+    struct LedgerTimings {
+        cdp_fetch_us: u64,
+        snapshot_setup_us: u64,
+        tx_execution_us: u64,
+        bucket_update_us: u64,
+        soroban_state_us: u64,
+        header_verify_us: u64,
+        total_us: u64,
+        tx_count: u32,
+    }
+    let mut all_timings: Vec<LedgerTimings> = Vec::new();
+    let verification_start = std::time::Instant::now();
+
     // Process ledgers from init_checkpoint+1 to end_ledger
     let process_from = init_checkpoint + 1;
     let process_from_cp = checkpoint::checkpoint_containing(process_from);
@@ -3047,7 +3061,21 @@ async fn cmd_verify_execution(
             // Determine if this ledger is in the user's requested test range
             let in_test_range = seq >= start_ledger && seq <= end_ledger;
 
+            // Start ledger timing
+            let ledger_start = std::time::Instant::now();
+            let mut timing = LedgerTimings {
+                cdp_fetch_us: 0,
+                snapshot_setup_us: 0,
+                tx_execution_us: 0,
+                bucket_update_us: 0,
+                soroban_state_us: 0,
+                header_verify_us: 0,
+                total_us: 0,
+                tx_count: 0,
+            };
+
             // Fetch CDP metadata
+            let cdp_fetch_start = std::time::Instant::now();
             let lcm = match cdp.get_ledger_close_meta(seq).await {
                 Ok(lcm) => lcm,
                 Err(e) => {
@@ -3057,6 +3085,7 @@ async fn cmd_verify_execution(
                     continue;
                 }
             };
+            timing.cdp_fetch_us = cdp_fetch_start.elapsed().as_micros() as u64;
 
             // Extract transactions and expected results from CDP
             let cdp_header = extract_ledger_header(&lcm);
@@ -3066,6 +3095,8 @@ async fn cmd_verify_execution(
                 &lcm,
                 network_id.as_bytes(),
             );
+            timing.tx_count = tx_processing.len() as u32;
+
             // Validate that CDP data matches the history archive data
             // If ledger hashes don't match, we're likely comparing data from different network epochs
             // (e.g., testnet was reset between when CDP was captured and current archive state)
@@ -3115,6 +3146,7 @@ async fn cmd_verify_execution(
             // Create snapshot handle with optimized lookup that checks in-memory Soroban state
             // first for O(1) access, then falls back to bucket list for other types.
             // This matches online execution's lookup optimization.
+            let snapshot_setup_start = std::time::Instant::now();
             let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
             let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> =
                 hot_archive_bucket_list.clone();
@@ -3244,8 +3276,10 @@ async fn cmd_verify_execution(
             // Update prev_id_pool for the next ledger
             prev_id_pool = Some(current_id_pool);
             let executor = executor.as_mut().unwrap();
+            timing.snapshot_setup_us = snapshot_setup_start.elapsed().as_micros() as u64;
 
             // Execute each transaction and compare (using aligned envelope/result/meta)
+            let tx_exec_start = std::time::Instant::now();
             let mut ledger_matched = true;
             let mut ledger_tx_mismatch = false;
             let mut ledger_header_mismatch = false;
@@ -3613,9 +3647,12 @@ async fn cmd_verify_execution(
                     }
                 }
             }
+            timing.tx_execution_us = tx_exec_start.elapsed().as_micros() as u64;
+
             // Apply changes to bucket list for next ledger
             // We always use our executor's state for true end-to-end verification
             // CDP metadata is only used for comparison to detect divergence
+            let bucket_update_start = std::time::Instant::now();
             {
                 use stellar_core_bucket::ledger_entry_to_key;
                 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
@@ -4171,6 +4208,7 @@ async fn cmd_verify_execution(
                 // Use our execution results for state updates
                 let (all_init, all_live, all_dead) = (our_init.clone(), our_live.clone(), our_dead.clone());
 
+                let soroban_state_start = std::time::Instant::now();
                 if cdp_header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
                     soroban_state
                         .write()
@@ -4211,6 +4249,7 @@ async fn cmd_verify_execution(
                         }
                     }
                 }
+                timing.soroban_state_us = soroban_state_start.elapsed().as_micros() as u64;
 
                 // Diagnostic logging: compare our execution vs CDP metadata
                 let (cdp_init, cdp_live, cdp_dead) = aggregator.to_vectors();
@@ -4549,8 +4588,10 @@ async fn cmd_verify_execution(
                     }
                 }
             }
+            timing.bucket_update_us = bucket_update_start.elapsed().as_micros() as u64;
 
             // Header verification: Compare our computed header fields against CDP
+            let header_verify_start = std::time::Instant::now();
             if in_test_range {
                 // 1. Compute bucket list hash
                 let bl = bucket_list.read().unwrap();
@@ -4721,6 +4762,7 @@ async fn cmd_verify_execution(
                         anyhow::bail!("Header mismatch at ledger {}", seq);
                     }
                 }
+                timing.header_verify_us = header_verify_start.elapsed().as_micros() as u64;
             }
 
             // ALWAYS update tracked values for next ledger (even outside test range)
@@ -4768,11 +4810,16 @@ async fn cmd_verify_execution(
                     ledgers_with_both_mismatches += 1;
                 }
                 ledgers_verified += 1;
+
+                // Collect timing for this ledger
+                timing.total_us = ledger_start.elapsed().as_micros() as u64;
+                all_timings.push(timing);
             }
         }
 
         current_cp = next_cp;
     }
+    let total_verification_time = verification_start.elapsed();
 
     println!();
     println!("Transaction Execution Verification Complete");
@@ -4831,6 +4878,154 @@ async fn cmd_verify_execution(
             header_mismatches
         );
         println!("This indicates divergence in bucket list state, fee pool calculation, or header computation.");
+    }
+
+    // Print timing statistics
+    if !all_timings.is_empty() {
+        println!();
+        println!("Performance Statistics");
+        println!("======================");
+        println!("  Total verification time: {:.2}s", total_verification_time.as_secs_f64());
+        println!("  Ledgers processed: {}", all_timings.len());
+        println!(
+            "  Throughput: {:.1} ledgers/sec, {:.1} txs/sec",
+            all_timings.len() as f64 / total_verification_time.as_secs_f64(),
+            all_timings.iter().map(|t| t.tx_count as u64).sum::<u64>() as f64
+                / total_verification_time.as_secs_f64()
+        );
+
+        // Compute timing statistics
+        let sum_cdp = all_timings.iter().map(|t| t.cdp_fetch_us).sum::<u64>();
+        let sum_snapshot = all_timings.iter().map(|t| t.snapshot_setup_us).sum::<u64>();
+        let sum_tx_exec = all_timings.iter().map(|t| t.tx_execution_us).sum::<u64>();
+        let sum_bucket = all_timings.iter().map(|t| t.bucket_update_us).sum::<u64>();
+        let sum_soroban = all_timings.iter().map(|t| t.soroban_state_us).sum::<u64>();
+        let sum_header = all_timings.iter().map(|t| t.header_verify_us).sum::<u64>();
+        let sum_total = all_timings.iter().map(|t| t.total_us).sum::<u64>();
+
+        let avg_cdp = sum_cdp as f64 / all_timings.len() as f64;
+        let avg_snapshot = sum_snapshot as f64 / all_timings.len() as f64;
+        let avg_tx_exec = sum_tx_exec as f64 / all_timings.len() as f64;
+        let avg_bucket = sum_bucket as f64 / all_timings.len() as f64;
+        let avg_soroban = sum_soroban as f64 / all_timings.len() as f64;
+        let avg_header = sum_header as f64 / all_timings.len() as f64;
+        let avg_total = sum_total as f64 / all_timings.len() as f64;
+
+        // Compute max timings
+        let max_cdp = all_timings.iter().map(|t| t.cdp_fetch_us).max().unwrap_or(0);
+        let max_snapshot = all_timings.iter().map(|t| t.snapshot_setup_us).max().unwrap_or(0);
+        let max_tx_exec = all_timings.iter().map(|t| t.tx_execution_us).max().unwrap_or(0);
+        let max_bucket = all_timings.iter().map(|t| t.bucket_update_us).max().unwrap_or(0);
+        let max_soroban = all_timings.iter().map(|t| t.soroban_state_us).max().unwrap_or(0);
+        let max_header = all_timings.iter().map(|t| t.header_verify_us).max().unwrap_or(0);
+        let max_total = all_timings.iter().map(|t| t.total_us).max().unwrap_or(0);
+
+        println!();
+        println!("  Per-ledger timing breakdown (avg / max in ms):");
+        println!("    CDP fetch:       {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+            avg_cdp / 1000.0, max_cdp as f64 / 1000.0, 
+            sum_cdp as f64 / sum_total as f64 * 100.0);
+        println!("    Snapshot setup:  {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+            avg_snapshot / 1000.0, max_snapshot as f64 / 1000.0,
+            sum_snapshot as f64 / sum_total as f64 * 100.0);
+        println!("    TX execution:    {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+            avg_tx_exec / 1000.0, max_tx_exec as f64 / 1000.0,
+            sum_tx_exec as f64 / sum_total as f64 * 100.0);
+        println!("    Bucket update:   {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+            avg_bucket / 1000.0, max_bucket as f64 / 1000.0,
+            sum_bucket as f64 / sum_total as f64 * 100.0);
+        println!("    Soroban state:   {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+            avg_soroban / 1000.0, max_soroban as f64 / 1000.0,
+            sum_soroban as f64 / sum_total as f64 * 100.0);
+        println!("    Header verify:   {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+            avg_header / 1000.0, max_header as f64 / 1000.0,
+            sum_header as f64 / sum_total as f64 * 100.0);
+        println!("    Total:           {:>7.2} / {:>7.2}", 
+            avg_total / 1000.0, max_total as f64 / 1000.0);
+
+        // Show slowest ledgers
+        let mut sorted_by_total: Vec<_> = all_timings.iter().enumerate().collect();
+        sorted_by_total.sort_by(|a, b| b.1.total_us.cmp(&a.1.total_us));
+        
+        println!();
+        println!("  Slowest 5 ledgers:");
+        for (idx, timing) in sorted_by_total.iter().take(5) {
+            // idx is position in all_timings, need to map back to ledger seq
+            let ledger_offset = *idx as u32;
+            println!(
+                "    #{}: {}ms total (cdp={}ms, tx={}ms, bucket={}ms, {} txs)",
+                ledger_offset,
+                timing.total_us / 1000,
+                timing.cdp_fetch_us / 1000,
+                timing.tx_execution_us / 1000,
+                timing.bucket_update_us / 1000,
+                timing.tx_count
+            );
+        }
+
+        // Analyze correlation between tx count and timing
+        println!();
+        println!("  Transaction count vs timing analysis:");
+        
+        // Group ledgers by tx count ranges
+        let mut by_tx_count: std::collections::BTreeMap<u32, Vec<&LedgerTimings>> = std::collections::BTreeMap::new();
+        for timing in &all_timings {
+            let bucket = match timing.tx_count {
+                0 => 0,
+                1..=5 => 1,
+                6..=10 => 6,
+                11..=20 => 11,
+                21..=50 => 21,
+                _ => 51,
+            };
+            by_tx_count.entry(bucket).or_default().push(timing);
+        }
+        
+        println!("    {:>10} {:>8} {:>12} {:>12} {:>12}", 
+            "TX range", "Count", "Avg total", "Avg TX exec", "Avg bucket");
+        for (bucket, timings) in &by_tx_count {
+            let label = match *bucket {
+                0 => "0 txs".to_string(),
+                1 => "1-5 txs".to_string(),
+                6 => "6-10 txs".to_string(),
+                11 => "11-20 txs".to_string(),
+                21 => "21-50 txs".to_string(),
+                _ => "51+ txs".to_string(),
+            };
+            let count = timings.len();
+            let avg_total = timings.iter().map(|t| t.total_us).sum::<u64>() as f64 / count as f64 / 1000.0;
+            let avg_tx = timings.iter().map(|t| t.tx_execution_us).sum::<u64>() as f64 / count as f64 / 1000.0;
+            let avg_bucket = timings.iter().map(|t| t.bucket_update_us).sum::<u64>() as f64 / count as f64 / 1000.0;
+            println!("    {:>10} {:>8} {:>10.2}ms {:>10.2}ms {:>10.2}ms", 
+                label, count, avg_total, avg_tx, avg_bucket);
+        }
+
+        // Compute Pearson correlation coefficient between tx_count and tx_execution_us
+        let n = all_timings.len() as f64;
+        let sum_x: f64 = all_timings.iter().map(|t| t.tx_count as f64).sum();
+        let sum_y: f64 = all_timings.iter().map(|t| t.tx_execution_us as f64).sum();
+        let sum_xy: f64 = all_timings.iter().map(|t| t.tx_count as f64 * t.tx_execution_us as f64).sum();
+        let sum_x2: f64 = all_timings.iter().map(|t| (t.tx_count as f64).powi(2)).sum();
+        let sum_y2: f64 = all_timings.iter().map(|t| (t.tx_execution_us as f64).powi(2)).sum();
+        
+        let numerator = n * sum_xy - sum_x * sum_y;
+        let denominator = ((n * sum_x2 - sum_x.powi(2)) * (n * sum_y2 - sum_y.powi(2))).sqrt();
+        let correlation_tx = if denominator > 0.0 { numerator / denominator } else { 0.0 };
+
+        // Correlation between tx_count and total_us
+        let sum_y_total: f64 = all_timings.iter().map(|t| t.total_us as f64).sum();
+        let sum_xy_total: f64 = all_timings.iter().map(|t| t.tx_count as f64 * t.total_us as f64).sum();
+        let sum_y2_total: f64 = all_timings.iter().map(|t| (t.total_us as f64).powi(2)).sum();
+        
+        let numerator_total = n * sum_xy_total - sum_x * sum_y_total;
+        let denominator_total = ((n * sum_x2 - sum_x.powi(2)) * (n * sum_y2_total - sum_y_total.powi(2))).sqrt();
+        let correlation_total = if denominator_total > 0.0 { numerator_total / denominator_total } else { 0.0 };
+
+        println!();
+        println!("  Correlation coefficients:");
+        println!("    TX count vs TX execution time: {:.3}", correlation_tx);
+        println!("    TX count vs Total time:        {:.3}", correlation_total);
+        println!("    (1.0 = perfect correlation, 0.0 = no correlation)");
     }
 
     Ok(())
