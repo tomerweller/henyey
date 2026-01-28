@@ -122,6 +122,48 @@ impl BucketEntry {
             .map_err(|e| BucketError::Serialization(format!("Failed to serialize XDR: {}", e)))
     }
 
+    /// Write XDR bytes directly to a buffer without intermediate allocation.
+    ///
+    /// This is more efficient than `to_xdr()` for repeated serialization
+    /// as it writes directly to the provided buffer. Note that the inner
+    /// data is still cloned during serialization.
+    pub fn write_xdr_to<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+        use stellar_xdr::curr::{Limited, WriteXdr};
+
+        // Write discriminant (BucketEntryType as i32)
+        // Values from XDR: Metaentry=-1, Liveentry=0, Deadentry=1, Initentry=2
+        let discriminant: i32 = match self {
+            BucketEntry::Live(_) => 0,      // LIVEENTRY
+            BucketEntry::Dead(_) => 1,      // DEADENTRY
+            BucketEntry::Init(_) => 2,      // INITENTRY
+            BucketEntry::Metadata(_) => -1, // METAENTRY
+        };
+        let mut limited = Limited::new(writer, Limits::none());
+        discriminant.write_xdr(&mut limited).map_err(|e| {
+            BucketError::Serialization(format!("Failed to write discriminant: {}", e))
+        })?;
+
+        // Write payload
+        match self {
+            BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                entry.write_xdr(&mut limited).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to write entry: {}", e))
+                })?;
+            }
+            BucketEntry::Dead(key) => {
+                key.write_xdr(&mut limited).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to write key: {}", e))
+                })?;
+            }
+            BucketEntry::Metadata(meta) => {
+                meta.write_xdr(&mut limited).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to write metadata: {}", e))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get the LedgerKey for this entry.
     ///
     /// Returns None for metadata entries since they don't have a key.
@@ -714,5 +756,31 @@ mod tests {
             compare_keys(&trustline_key, &account_key),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn test_write_xdr_to_matches_to_xdr() {
+        // Test that write_xdr_to produces identical output to to_xdr for all entry types
+        let live = BucketEntry::Live(make_account_entry([1u8; 32]));
+        let dead = BucketEntry::Dead(LedgerKey::Account(LedgerKeyAccount {
+            account_id: make_account_id([2u8; 32]),
+        }));
+        let init = BucketEntry::Init(make_account_entry([3u8; 32]));
+        let meta = BucketEntry::Metadata(BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        });
+
+        for entry in [live, dead, init, meta] {
+            let expected = entry.to_xdr().unwrap();
+            let mut actual = Vec::new();
+            entry.write_xdr_to(&mut actual).unwrap();
+            assert_eq!(
+                expected,
+                actual,
+                "write_xdr_to mismatch for {:?}",
+                entry.entry_type()
+            );
+        }
     }
 }
