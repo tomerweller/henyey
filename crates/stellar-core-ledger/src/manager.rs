@@ -1511,9 +1511,7 @@ impl LedgerManager {
                 }
             }
             // Fall back to bucket list snapshot for non-Soroban types or if not found in memory
-            bucket_list_snapshot
-                .get_result(key)
-                .map_err(LedgerError::Bucket)
+            Ok(bucket_list_snapshot.get(key))
         });
 
         // Create a lookup function that queries the ledger header table
