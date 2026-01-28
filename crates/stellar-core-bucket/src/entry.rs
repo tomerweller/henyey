@@ -122,6 +122,46 @@ impl BucketEntry {
             .map_err(|e| BucketError::Serialization(format!("Failed to serialize XDR: {}", e)))
     }
 
+    /// Write XDR bytes directly to a buffer without allocating.
+    ///
+    /// This is more efficient than `to_xdr()` as it writes directly to the
+    /// provided buffer and avoids cloning the entry.
+    pub fn write_xdr_to<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+        use stellar_xdr::curr::{Limited, WriteXdr};
+
+        // Write discriminant (BucketEntryType as i32)
+        let discriminant: i32 = match self {
+            BucketEntry::Live(_) => 0,      // LIVEENTRY
+            BucketEntry::Init(_) => 1,      // INITENTRY
+            BucketEntry::Dead(_) => 2,      // DEADENTRY
+            BucketEntry::Metadata(_) => -1, // METAENTRY
+        };
+        let mut limited = Limited::new(writer, Limits::none());
+        discriminant.write_xdr(&mut limited).map_err(|e| {
+            BucketError::Serialization(format!("Failed to write discriminant: {}", e))
+        })?;
+
+        // Write payload (without cloning by using reference)
+        match self {
+            BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                entry.write_xdr(&mut limited).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to write entry: {}", e))
+                })?;
+            }
+            BucketEntry::Dead(key) => {
+                key.write_xdr(&mut limited).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to write key: {}", e))
+                })?;
+            }
+            BucketEntry::Metadata(meta) => {
+                meta.write_xdr(&mut limited).map_err(|e| {
+                    BucketError::Serialization(format!("Failed to write metadata: {}", e))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get the LedgerKey for this entry.
     ///
     /// Returns None for metadata entries since they don't have a key.
