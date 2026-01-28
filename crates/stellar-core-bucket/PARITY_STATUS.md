@@ -293,6 +293,33 @@ The Rust implementation correctly handles:
 - `RandomEvictionCache` provides LRU caching for frequently-accessed account entries
 - In-memory level 0 optimization reduces disk I/O for frequent merges
 
+#### Known Performance Gaps
+
+**Merge Deduplication Not Integrated**
+
+The `BucketMergeMap` and `LiveMergeFutures` data structures are implemented and tested (matching C++ behavior), but they are **not integrated** into the `BucketList` merge workflow.
+
+In C++ stellar-core:
+- `BucketManager::getMergeFuture()` checks `mLiveBucketFutures` for in-progress merges
+- If not found, checks `mFinishedMerges` (`BucketMergeMap`) for cached completed merges
+- `BucketManager::putMergeFuture()` registers new merges
+- `adoptFileAsBucket()` calls `recordMerge()` to cache input→output mappings
+
+This allows C++ to skip re-running merges when the same inputs are requested again (e.g., during catchup retries or restart merges).
+
+In our Rust implementation:
+- We guard against duplicate concurrent merges via `if self.next.is_some() { continue; }`
+- But we don't cache completed merge results for reuse
+- Each `restart_merges()` call re-runs merges even if the same inputs were merged before
+
+**Impact**: Potential performance regression during catchup/restart scenarios where the same merge is requested multiple times. During normal operation, this has minimal impact since each ledger produces unique bucket contents.
+
+**To integrate** (if needed):
+1. Add `BucketMergeMap` and `LiveMergeFutures` to `BucketManager`
+2. Before `AsyncMergeHandle::start_merge()`, check for existing/completed merge
+3. After merge completes, call `record_merge()`
+4. Wire up GC to call `forget_all_merges_producing()` when buckets are dropped
+
 #### File Format Compatibility
 
 - Bucket file format is fully compatible (gzip-compressed XDR with RFC 5531 record marking)
