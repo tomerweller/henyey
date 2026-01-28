@@ -365,9 +365,14 @@ pub fn merge_in_memory(
         use stellar_xdr::curr::Limited;
 
         // Serialize entry for hash using reusable buffer
-        // Uses write_xdr_to which avoids intermediate allocation
         entry_buf.clear();
-        entry.write_xdr_to(entry_buf)?;
+        let xdr_entry = entry.to_xdr_entry();
+        {
+            let mut limited = Limited::new(entry_buf as &mut Vec<u8>, Limits::none());
+            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+                BucketError::Serialization(format!("Failed to serialize entry: {}", e))
+            })?;
+        }
 
         // Update hash with XDR Record Marking format
         let size = entry_buf.len() as u32;
