@@ -339,13 +339,13 @@ pub fn merge_in_memory(
     let mut hasher = Sha256::new();
     let mut key_index = BTreeMap::new();
 
-    // Pre-allocate output vector
+    // Pre-allocate output vectors
     // all_entries: includes metadata for storage/indexing
-    // Note: We derive level_zero_entries at the end by filtering metadata from all_entries
-    // This avoids cloning entries just for the level_zero_entries vector
+    // level_zero_entries: excludes metadata for in-memory merges
     let capacity =
         old_entries.len() + new_entries.len() + output_meta.as_ref().map(|_| 1).unwrap_or(0);
     let mut all_entries = Vec::with_capacity(capacity);
+    let mut level_zero_entries = Vec::with_capacity(old_entries.len() + new_entries.len());
     let mut entry_idx = 0;
 
     // Reusable buffer for XDR serialization (avoids repeated allocations)
@@ -358,6 +358,7 @@ pub fn merge_in_memory(
                      hasher: &mut Sha256,
                      key_index: &mut BTreeMap<Vec<u8>, usize>,
                      all_entries: &mut Vec<BucketEntry>,
+                     level_zero_entries: &mut Vec<BucketEntry>,
                      entry_idx: &mut usize,
                      entry_buf: &mut Vec<u8>,
                      key_buf: &mut Vec<u8>|
@@ -365,9 +366,14 @@ pub fn merge_in_memory(
         use stellar_xdr::curr::Limited;
 
         // Serialize entry for hash using reusable buffer
-        // Uses write_xdr_to which avoids cloning the entry
         entry_buf.clear();
-        entry.write_xdr_to(entry_buf)?;
+        let xdr_entry = entry.to_xdr_entry();
+        {
+            let mut limited = Limited::new(entry_buf as &mut Vec<u8>, Limits::none());
+            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+                BucketError::Serialization(format!("Failed to serialize entry: {}", e))
+            })?;
+        }
 
         // Update hash with XDR Record Marking format
         let size = entry_buf.len() as u32;
@@ -388,6 +394,7 @@ pub fn merge_in_memory(
                 }
                 key_index.insert(key_buf.clone(), *entry_idx);
             }
+            level_zero_entries.push(entry.clone());
         }
 
         all_entries.push(entry);
@@ -402,6 +409,7 @@ pub fn merge_in_memory(
             &mut hasher,
             &mut key_index,
             &mut all_entries,
+            &mut level_zero_entries,
             &mut entry_idx,
             &mut entry_buf,
             &mut key_buf,
@@ -443,6 +451,7 @@ pub fn merge_in_memory(
                                 &mut hasher,
                                 &mut key_index,
                                 &mut all_entries,
+                                &mut level_zero_entries,
                                 &mut entry_idx,
                                 &mut entry_buf,
                                 &mut key_buf,
@@ -457,6 +466,7 @@ pub fn merge_in_memory(
                                 &mut hasher,
                                 &mut key_index,
                                 &mut all_entries,
+                                &mut level_zero_entries,
                                 &mut entry_idx,
                                 &mut entry_buf,
                                 &mut key_buf,
@@ -476,6 +486,7 @@ pub fn merge_in_memory(
                                 &mut hasher,
                                 &mut key_index,
                                 &mut all_entries,
+                                &mut level_zero_entries,
                                 &mut entry_idx,
                                 &mut entry_buf,
                                 &mut key_buf,
@@ -504,6 +515,7 @@ pub fn merge_in_memory(
                 &mut hasher,
                 &mut key_index,
                 &mut all_entries,
+                &mut level_zero_entries,
                 &mut entry_idx,
                 &mut entry_buf,
                 &mut key_buf,
@@ -521,6 +533,7 @@ pub fn merge_in_memory(
                 &mut hasher,
                 &mut key_index,
                 &mut all_entries,
+                &mut level_zero_entries,
                 &mut entry_idx,
                 &mut entry_buf,
                 &mut key_buf,
@@ -549,16 +562,12 @@ pub fn merge_in_memory(
         "merge_in_memory: finished merge"
     );
 
-    // Count metadata entries (typically 0 or 1, always at the start)
-    let metadata_count = if output_meta.is_some() { 1 } else { 0 };
-
     // Create bucket directly with pre-computed hash
-    // Use shared level zero state - no cloning needed!
     Ok(Bucket::from_parts(
         hash,
         Arc::new(all_entries),
         Arc::new(key_index),
-        metadata_count,
+        Some(Arc::new(level_zero_entries)),
     ))
 }
 

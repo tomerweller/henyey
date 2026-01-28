@@ -106,29 +106,15 @@ pub struct Bucket {
     storage: BucketStorage,
     /// In-memory entries for level 0 optimization.
     ///
-    /// This stores entries in memory for fast access during subsequent merges.
-    /// The storage uses an enum to support two modes:
-    /// - `Separate`: A separate vector of entries (legacy, used for compatibility)
-    /// - `Shared`: A shared Arc pointing to the same entries as storage, with an offset
-    ///   to skip metadata entries. This avoids cloning entries.
-    level_zero_state: LevelZeroState,
-}
-
-/// Level 0 in-memory state storage.
-///
-/// This enum supports two modes to balance compatibility and performance:
-/// - `None`: No in-memory entries (used for disk-backed buckets or non-level-0)
-/// - `Separate`: A separate vector of entries (used when entries differ from storage)
-/// - `Shared`: Shares storage entries with an offset to skip metadata (zero-copy)
-#[derive(Clone)]
-enum LevelZeroState {
-    /// No in-memory entries available.
-    None,
-    /// Separate in-memory entries (legacy mode, requires cloning).
-    Separate(Arc<Vec<BucketEntry>>),
-    /// Shared with storage entries, starting at the given offset.
-    /// The offset skips metadata entries (typically 0 or 1).
-    Shared { offset: usize },
+    /// When set, these entries are kept in memory for fast access during
+    /// subsequent merges. This avoids disk I/O for level 0 merges which
+    /// happen frequently and block the main thread.
+    ///
+    /// This is separate from `BucketStorage::InMemory` because:
+    /// - The bucket is still written to disk for durability
+    /// - This is an optional optimization for level 0 only
+    /// - The entries are the same as in the storage, just kept in RAM
+    level_zero_entries: Option<Arc<Vec<BucketEntry>>>,
 }
 
 impl Bucket {
@@ -156,8 +142,8 @@ impl Bucket {
                 entries: Arc::new(Vec::new()),
                 key_index: Arc::new(BTreeMap::new()),
             },
-            // Empty bucket with shared state at offset 0 - matches C++ behavior
-            level_zero_state: LevelZeroState::Shared { offset: 0 },
+            // Empty vector, not None - matches C++ behavior where mEntries is an empty vector
+            level_zero_entries: Some(Arc::new(Vec::new())),
         }
     }
 
@@ -250,7 +236,7 @@ impl Bucket {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
             },
-            level_zero_state: LevelZeroState::None,
+            level_zero_entries: None,
         })
     }
 
@@ -264,19 +250,17 @@ impl Bucket {
     /// * `hash` - Pre-computed SHA256 hash of all entries
     /// * `entries` - All entries including metadata, already sorted
     /// * `key_index` - Pre-built key index mapping serialized keys to entry indices
-    /// * `metadata_count` - Number of metadata entries at the start (0 or 1)
+    /// * `level_zero_entries` - Optional non-metadata entries for level 0 merges
     pub fn from_parts(
         hash: Hash256,
         entries: Arc<Vec<BucketEntry>>,
         key_index: Arc<BTreeMap<Vec<u8>, usize>>,
-        metadata_count: usize,
+        level_zero_entries: Option<Arc<Vec<BucketEntry>>>,
     ) -> Self {
         Self {
             hash,
             storage: BucketStorage::InMemory { entries, key_index },
-            level_zero_state: LevelZeroState::Shared {
-                offset: metadata_count,
-            },
+            level_zero_entries,
         }
     }
 
@@ -299,8 +283,12 @@ impl Bucket {
     ///
     /// * `entries` - Sorted entries (metadata first, then data entries by key)
     pub fn fresh_in_memory_only(entries: Vec<BucketEntry>) -> Self {
-        // Count metadata entries at the start
-        let metadata_count = entries.iter().take_while(|e| e.is_metadata()).count();
+        // Filter non-metadata entries for level 0 storage
+        let level_zero_entries: Vec<BucketEntry> = entries
+            .iter()
+            .filter(|e| !e.is_metadata())
+            .cloned()
+            .collect();
 
         Self {
             hash: Hash256::ZERO, // Hash not computed - this is intentional!
@@ -308,9 +296,7 @@ impl Bucket {
                 entries: Arc::new(entries),
                 key_index: Arc::new(BTreeMap::new()), // No index needed for merge input
             },
-            level_zero_state: LevelZeroState::Shared {
-                offset: metadata_count,
-            },
+            level_zero_entries: Some(Arc::new(level_zero_entries)),
         }
     }
 
@@ -384,7 +370,7 @@ impl Bucket {
             storage: BucketStorage::DiskBacked {
                 disk_bucket: Arc::new(disk_bucket),
             },
-            level_zero_state: LevelZeroState::None,
+            level_zero_entries: None,
         })
     }
 
@@ -418,7 +404,7 @@ impl Bucket {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
             },
-            level_zero_state: LevelZeroState::None,
+            level_zero_entries: None,
         })
     }
 
@@ -736,25 +722,14 @@ impl Bucket {
     /// When true, the bucket can participate in fast in-memory merges
     /// without disk I/O.
     pub fn has_in_memory_entries(&self) -> bool {
-        !matches!(self.level_zero_state, LevelZeroState::None)
+        self.level_zero_entries.is_some()
     }
 
     /// Get the in-memory entries for level 0 optimization.
     ///
     /// Returns None if entries are not cached in memory.
-    /// Returns entries without metadata (per C++ stellar-core convention).
     pub fn get_in_memory_entries(&self) -> Option<&[BucketEntry]> {
-        match &self.level_zero_state {
-            LevelZeroState::None => None,
-            LevelZeroState::Separate(entries) => Some(entries.as_slice()),
-            LevelZeroState::Shared { offset } => {
-                // Get entries from storage and skip metadata
-                match &self.storage {
-                    BucketStorage::InMemory { entries, .. } => Some(&entries[*offset..]),
-                    BucketStorage::DiskBacked { .. } => None,
-                }
-            }
-        }
+        self.level_zero_entries.as_ref().map(|v| v.as_slice())
     }
 
     /// Set the in-memory entries for level 0 optimization.
@@ -762,7 +737,7 @@ impl Bucket {
     /// This stores entries in memory for fast access during subsequent merges.
     /// Call this after creating a bucket to enable in-memory level 0 merges.
     pub fn set_in_memory_entries(&mut self, entries: Vec<BucketEntry>) {
-        self.level_zero_state = LevelZeroState::Separate(Arc::new(entries));
+        self.level_zero_entries = Some(Arc::new(entries));
     }
 
     /// Clear the in-memory entries.
@@ -770,7 +745,7 @@ impl Bucket {
     /// This releases the memory used for level 0 optimization.
     /// Call this when a bucket moves beyond level 0.
     pub fn clear_in_memory_entries(&mut self) {
-        self.level_zero_state = LevelZeroState::None;
+        self.level_zero_entries = None;
     }
 
     /// Create a bucket from sorted entries with in-memory optimization enabled.
@@ -791,9 +766,10 @@ impl Bucket {
     ///
     /// # Performance
     ///
-    /// This method uses shared storage with an offset to avoid cloning entries.
-    /// The offset points past metadata entries, so `get_in_memory_entries` returns
-    /// a slice of the storage entries without metadata.
+    /// This method separates metadata and non-metadata entries in a single pass,
+    /// avoiding unnecessary cloning. The entries are partitioned by swapping,
+    /// then the hash is computed over all original entries while the non-metadata
+    /// entries are stored separately for level 0 optimizations.
     pub fn from_sorted_entries_with_in_memory(entries: Vec<BucketEntry>) -> Result<Self> {
         use sha2::{Digest, Sha256};
         use stellar_xdr::curr::{Limited, WriteXdr};
@@ -801,10 +777,13 @@ impl Bucket {
         let mut key_index = BTreeMap::new();
         let mut hasher = Sha256::new();
 
-        // Count metadata entries at the start (typically 0 or 1)
-        let metadata_count = entries.iter().take_while(|e| e.is_metadata()).count();
+        // Count non-metadata entries for pre-allocation
+        let non_meta_count = entries.iter().filter(|e| !e.is_metadata()).count();
+        let mut in_memory_entries = Vec::with_capacity(non_meta_count);
+        let mut in_memory_idx = 0;
 
-        // Single pass: serialize each entry for hash and build key index
+        // Single pass: serialize each entry for hash, build key index,
+        // and collect non-metadata entries for level 0 storage
         for (idx, entry) in entries.iter().enumerate() {
             // Serialize entry to XDR for hash
             let xdr_entry = entry.to_xdr_entry();
@@ -820,14 +799,26 @@ impl Bucket {
             hasher.update(&record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
 
-            // Build key index for all entries with keys
-            if let Some(key) = entry.key() {
+            // Build key index for non-metadata entries
+            if !entry.is_metadata() {
+                if let Some(key) = entry.key() {
+                    let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                        BucketError::Serialization(format!("Failed to serialize key: {}", e))
+                    })?;
+                    key_index.insert(key_bytes, idx);
+                }
+                // Clone entry for level 0 storage (metadata excluded)
+                in_memory_entries.push(entry.clone());
+                in_memory_idx += 1;
+            } else if let Some(key) = entry.key() {
+                // Metadata entries can have keys too (for index)
                 let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                     BucketError::Serialization(format!("Failed to serialize key: {}", e))
                 })?;
                 key_index.insert(key_bytes, idx);
             }
         }
+        let _ = in_memory_idx; // silence unused warning
 
         // Compute final hash
         let hash_bytes: [u8; 32] = hasher.finalize().into();
@@ -839,10 +830,7 @@ impl Bucket {
                 entries: Arc::new(entries),
                 key_index: Arc::new(key_index),
             },
-            // Use shared storage with offset to skip metadata - no cloning!
-            level_zero_state: LevelZeroState::Shared {
-                offset: metadata_count,
-            },
+            level_zero_entries: Some(Arc::new(in_memory_entries)),
         })
     }
 }
