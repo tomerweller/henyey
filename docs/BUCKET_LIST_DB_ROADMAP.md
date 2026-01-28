@@ -8,60 +8,78 @@ This document outlines the complete implementation plan for the Bucket List DB r
 the critical path to mainnet support. It expands on the analysis in `MAINNET_GAPS.md`
 and provides detailed implementation guidance for each phase.
 
+## Current State
+
+Significant foundational work is already in place:
+
+| Component | Location | Status |
+|-----------|----------|--------|
+| `LiveEntriesIterator` | `stellar-core-bucket/src/live_iterator.rs` | Complete — streaming iteration with `HashSet<LedgerKey>` dedup |
+| Offers SQL schema & queries | `stellar-core-db/src/queries/offers.rs` | Complete — schema, indexes, bulk ops, all query functions |
+| Offer population during catchup | `stellar-core-ledger/src/manager.rs` (`initialize_all_caches`, `initialize_offers_sql`) | Complete — batch inserts via streaming iterator |
+| Offer delta during ledger close | `stellar-core-ledger/src/manager.rs:1540-1576` | Complete — upserts/deletes from `EntryChange` |
+| `LiveBucketIndex` (InMemory + Disk) | `stellar-core-bucket/src/index.rs` | Complete — threshold at 10,000 entries, page size 1,024 |
+| `RandomEvictionCache` | `stellar-core-bucket/src/cache.rs` | Complete — 100 MB / 100k entry default, accounts only |
+| `BucketList::get()` point lookup | `stellar-core-bucket/src/bucket_list.rs:789` | Complete — searches levels 0-10 newest-first |
+| Index persistence (save/load) | `stellar-core-bucket/src/index_persistence.rs` | Partial — bincode format, version 1; bloom filter not yet persisted |
+
 ## Phase Summary
 
-| Phase | Focus | Duration | Status |
-|-------|-------|----------|--------|
-| 1 | Streaming Iterator | 1 week | RFC Approved (RFC-001) |
-| 2 | SQL-Backed Offers | 2 weeks | Planned |
-| 3 | BucketListDB Point Lookups | 2 weeks | Planned |
-| 4 | Index Persistence | 1 week | Planned |
-| **Total** | | **6 weeks** | |
+| Phase | Focus | Status |
+|-------|-------|--------|
+| 1 | Streaming Iterator | **Complete** |
+| 2 | SQL-Backed Offers | **Complete** |
+| 3 | BucketListDB Point Lookups | **Substantially Complete** — remaining: integration with LedgerManager for cache-miss fallback |
+| 4 | Index Persistence | **Partial** — save/load works but bloom filter persistence missing |
 
 ---
 
 ## Phase 1: Streaming Iterator (RFC-001)
 
-**Status:** RFC Approved - Ready for implementation
+**Status: Complete**
 
-See `docs/RFC-001-STREAMING-LIVE-ENTRIES.md` for full details.
+See `docs/RFC-001-STREAMING-LIVE-ENTRIES.md` for full design.
 
-### Summary
-- Replace `live_entries()` with `LiveEntriesIterator`
-- Use `HashSet<LedgerKey>` for deduplication (matches C++)
-- Memory: ~8.6 GB for 60M entries (vs 52 GB current)
+### What Was Delivered
 
-### Key Deliverables
-1. `LiveEntriesIterator` type in `stellar-core-bucket`
-2. Migration of `initialize_all_caches()` 
-3. Migration of `compute_soroban_state_size_from_bucket_list()`
-4. Deprecation of `live_entries()`
+- `LiveEntriesIterator` in `stellar-core-bucket/src/live_iterator.rs` (571 lines)
+- Uses `HashSet<LedgerKey>` for deduplication (matches C++ `unordered_set<LedgerKey>`)
+- Integrated into `initialize_all_caches()`, `initialize_offers_sql()`, and `initialize_soroban_state()`
+- Statistics tracking: `entries_yielded`, `entries_skipped`, `seen_keys_count`
+
+### Memory Profile
+
+| Scale | Old `live_entries()` | New `live_entries_iter()` |
+|-------|---------------------|--------------------------|
+| Testnet (~70k entries) | ~405 MB | ~5 MB (keys only) |
+| Mainnet (~60M entries) | ~52 GB | ~8.6 GB |
+
+**Note:** The 8.6 GB deduplication `HashSet` is **transient** — it is allocated during
+catchup/initialization and freed after the iteration completes. Steady-state operation
+does not retain this set.
 
 ---
 
 ## Phase 2: SQL-Backed Offers
 
-**Status:** Planned
+**Status: Complete**
 
-### Problem
-Current Rust implementation keeps all offers in memory (`Vec<LedgerEntry>`).
-C++ stores offers in SQLite with indexes for efficient order book queries.
+### What Was Delivered
 
-### C++ Architecture (What We're Matching)
+**Schema** (`stellar-core-db/src/queries/offers.rs`):
 
 ```sql
--- From LedgerTxnOfferSQL.cpp
 CREATE TABLE offers (
-    sellerid         VARCHAR(56) NOT NULL,
-    offerid          BIGINT NOT NULL PRIMARY KEY,
+    sellerid         TEXT NOT NULL,
+    offerid          INTEGER NOT NULL PRIMARY KEY,
     sellingasset     TEXT NOT NULL,
     buyingasset      TEXT NOT NULL,
-    amount           BIGINT NOT NULL,
-    pricen           INT NOT NULL,
-    priced           INT NOT NULL,
-    price            DOUBLE PRECISION NOT NULL,
-    flags            INT NOT NULL,
-    lastmodified     INT NOT NULL,
+    amount           INTEGER NOT NULL,
+    pricen           INTEGER NOT NULL,
+    priced           INTEGER NOT NULL,
+    price            REAL NOT NULL,
+    flags            INTEGER NOT NULL,
+    lastmodified     INTEGER NOT NULL,
     extension        TEXT NOT NULL,
     ledgerext        TEXT NOT NULL
 );
@@ -70,126 +88,145 @@ CREATE INDEX bestofferindex ON offers (sellingasset, buyingasset, price, offerid
 CREATE INDEX offerbyseller ON offers (sellerid);
 ```
 
-### Implementation Tasks
+**Query functions** — all implemented:
+- `load_offer()`, `load_offer_by_id()` — point lookups
+- `load_best_offers()`, `load_best_offers_worse_than()` — order book queries
+- `load_offers_by_account_and_asset()` — account-scoped queries
+- `load_all_offers()`, `bulk_load_offers()` — bulk reads
+- `bulk_upsert_offers()`, `bulk_delete_offers()` — bulk writes (1,000-entry batches)
+- `count_offers()`
 
-1. **Create offers table schema** (1 day)
-   - Add migration to create `offers` table
-   - Match C++ column types and indexes
-
-2. **Implement offer SQL operations** (3 days)
-   - `load_offer(sellerid, offerid) -> Option<LedgerEntry>`
-   - `load_best_offers(buying, selling, limit) -> Vec<LedgerEntry>`
-   - `load_best_offers_worse_than(buying, selling, price, offerid, limit)`
-   - `load_offers_by_account_and_asset(account, asset) -> Vec<LedgerEntry>`
-   - `bulk_upsert_offers(entries)`
-   - `bulk_delete_offers(keys)`
-
-3. **Populate offers during catchup** (2 days)
-   - During streaming iteration (Phase 1), insert offers into SQL
-   - Use batch inserts for performance
-
-4. **Update offers during ledger close** (2 days)
-   - Extract offer changes from `LedgerDelta`
-   - Apply upserts and deletes to SQL table
-
-5. **Replace in-memory offer cache** (2 days)
-   - Remove `offer_cache: Vec<LedgerEntry>` from `LedgerManager`
-   - Update order book matching to use SQL queries
-   - Update `create_snapshot_handle()` to query SQL
-
-### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `crates/stellar-core-ledger/src/database/` | New module for offer SQL operations |
-| `crates/stellar-core-ledger/src/manager.rs` | Remove `offer_cache`, use SQL |
-| `crates/stellar-core-ledger/src/execution.rs` | Update order book matching |
-| `crates/stellar-core-bucket/src/live_iterator.rs` | Add hook for offer collection |
+**Integration points:**
+- **Catchup**: `initialize_all_caches()` populates offers via streaming iterator
+- **Ledger close**: `manager.rs:1540-1576` extracts offer `EntryChange`s from the delta and applies upserts/deletes in a SQLite transaction
 
 ### Memory Impact
-- Current: ~500 MB for testnet offers (scales with offer count)
-- After: ~0 MB (offers in SQLite file, not RAM)
+
+- **Before**: All offers held in-memory as `Vec<LedgerEntry>`
+- **After**: Offers stored in SQLite; ~0 MB heap usage for offer data
+
+Mainnet has approximately **12-15 million offers**. At ~200 bytes per offer entry, this
+represents **2.4-3 GB of memory savings** compared to an in-memory approach — substantially
+more than the testnet ~500 MB figure.
+
+### Open Items
+
+- **Offer rollback on failed ledger close.** The current implementation applies offer SQL
+  changes after the ledger close succeeds. If a ledger close fails mid-execution, the offers
+  table remains consistent because changes are only committed at the end. However, this does
+  not yet support the C++ `LedgerTxn` parent/child rollback semantics where offer mutations
+  are speculatively applied and rolled back per-transaction. This gap is acceptable for now
+  because the bucket list is the source of truth, not the offers table — on any mismatch,
+  offers are rebuilt from the bucket list during the next catchup.
 
 ---
 
 ## Phase 3: BucketListDB Point Lookups
 
-**Status:** Planned
+**Status: Substantially Complete**
 
-### Problem
-Currently, entries are looked up via in-memory caches. For entries not in cache,
-we need efficient disk-backed lookups.
+### What Exists
 
-### C++ Architecture (What We're Matching)
+The core building blocks are implemented:
 
-C++ uses two index types based on bucket size:
+1. **LiveBucketIndex** (`index.rs`, 939 lines)
+   - `InMemoryIndex`: Full `LedgerKey -> offset` map for buckets with < 10,000 entries
+   - `DiskIndex`: Page-based range index (1,024 entries/page) with bloom filter
+   - `BucketEntryCounters` for per-type accounting
 
-1. **InMemoryIndex** (small buckets < 20 MB)
-   - Full `unordered_map<LedgerKey, file_offset>`
-   - Fast lookups, higher memory
+2. **RandomEvictionCache** (`cache.rs`, 599 lines)
+   - Default: 100 MB / 100,000 entries
+   - Only caches `Account` entries (hot path for TX validation)
+   - Minimum bucket list size for cache activation: 1,000,000 entries
 
-2. **DiskIndex / RangeIndex** (large buckets)
-   - Page-based index with bloom filter
-   - Lower memory, requires disk seeks
+3. **BucketList::get()** (`bucket_list.rs:789`)
+   - Searches levels 0-10 in order (newest first)
+   - Checks `curr` then `snap` at each level
+   - Returns first live match; dead entries return `None`
 
-### Implementation Tasks
-
-1. **Enhance DiskBucket index** (3 days)
-   - Current: 8-byte hash -> offset (compact but collision-prone)
-   - New: Support full `LedgerKey` -> offset for small buckets
-   - Add configurable threshold (`BUCKETLIST_DB_INDEX_CUTOFF`)
-
-2. **Implement per-bucket RandomEvictionCache** (3 days)
-   - Cache ACCOUNT entries only (hot path for TX validation)
-   - Proportional allocation based on bucket's share of accounts
-   - Configurable memory budget
-
-3. **Add BucketList.load(key) API** (2 days)
-   ```rust
-   impl BucketList {
-       /// Load a single entry by key, checking cache then disk.
-       pub fn load(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-           // 1. Check per-bucket caches (newest levels first)
-           // 2. Query bucket indexes
-           // 3. Read from disk if found
-           // 4. Optionally cache result
-       }
-   }
-   ```
-
-4. **Integrate with LedgerManager** (2 days)
-   - Use `BucketList.load()` for cache misses
-   - Remove dependency on full entry cache where possible
-
-### Configuration Options
+### Configuration
 
 ```toml
 [bucket_list_db]
-# Bucket size threshold for InMemory vs Disk index (MB)
-index_cutoff_mb = 20
+# Bucket entry count threshold for InMemory vs Disk index
+# Buckets with fewer than this many entries use full in-memory key->offset maps.
+# Buckets with more entries use page-based range indexes with bloom filters.
+index_entry_threshold = 10000
 
 # Total memory budget for entry caching (MB)
-memory_for_caching_mb = 512
+memory_for_caching_mb = 100
 
-# Page size for range index (2^N bytes)
-page_size_exponent = 14
+# Entries per page for range index
+page_size = 1024
 ```
 
+**Note on units:** The C++ upstream uses a byte-size cutoff (`BUCKETLIST_DB_INDEX_CUTOFF`
+defaults to 250 MB). The Rust implementation uses an entry-count threshold (10,000 entries).
+These are functionally equivalent but the Rust approach is simpler to reason about since
+entry sizes vary. If parity with the C++ byte-based cutoff is desired, this can be revisited.
+
+### Remaining Work
+
+1. **LedgerManager cache-miss fallback** — When `entry_cache` misses, fall back to
+   `BucketList::get()` for on-demand disk lookups instead of requiring all entries to be
+   pre-loaded. This is the final step to eliminate the full entry cache dependency.
+
+2. **Snapshot isolation for point lookups** — `BucketList::get()` must be safe to call
+   concurrently with bucket merges. The current implementation uses `RwLock` on the bucket
+   list; point lookups take a read lock. During merges, `PendingMerge` transitions happen
+   under a write lock. This is functionally correct but could become a contention point
+   under high lookup rates. Consider whether a snapshot-based approach (reading from an
+   immutable snapshot handle) would reduce lock contention.
+
 ### Memory Impact
-- Per-bucket caches: ~512 MB (configurable)
-- Indexes: ~500 MB
+
+| Component | Estimate |
+|-----------|----------|
+| Per-bucket caches | ~100 MB (configurable) |
+| InMemory indexes (small buckets) | ~50-200 MB depending on level distribution |
+| DiskIndex metadata (large buckets) | ~50-100 MB (page headers + bloom filters) |
+| **Total** | **~200-400 MB** |
 
 ---
 
 ## Phase 4: Index Persistence
 
-**Status:** Planned
+**Status: Partial**
 
-### Problem
-Currently, bucket indexes are rebuilt on every startup by scanning bucket files.
-For mainnet with large buckets, this is slow.
+### What Exists
 
-### C++ Architecture
+`index_persistence.rs` (726 lines) implements save/load using bincode serialization:
+
+```
+Header:
+  - Version: u32 (currently BUCKET_INDEX_VERSION = 1)
+
+Body:
+  - pages: Vec<(SerializableRangeEntry, u64)>
+  - bloom_seed: [u8; 16]
+  - counters: SerializableCounters
+  - type_ranges: HashMap<u32, (u64, u64)>
+```
+
+### Remaining Work
+
+1. **Bloom filter persistence** — Currently not serialized (noted in code:
+   `index_persistence.rs:175-176`). The bloom filter is rebuilt on load, which
+   partially defeats the purpose of persistence for large buckets. Adding bloom
+   filter serialization would make startup significantly faster.
+
+2. **`asset_to_pool_id` map persistence** — Not currently serialized. Needed for
+   complete index restoration.
+
+3. **InMemoryIndex persistence** — The current persistence is range-index focused.
+   Small buckets using `InMemoryIndex` may need their own persistence path, or they
+   can be rebuilt quickly since they are small by definition.
+
+4. **Integration with BucketManager** — Automatically save indexes after catchup/merge
+   and load on startup with fallback to rebuild if missing/corrupt.
+
+### C++ Reference
+
 C++ saves indexes as `.index` files alongside bucket `.xdr` files:
 ```
 buckets/
@@ -197,44 +234,58 @@ buckets/
   <hash>.index       # Serialized index
 ```
 
-### Implementation Tasks
-
-1. **Define index file format** (1 day)
-   ```
-   Header:
-     - Magic: "RSBI" (4 bytes)
-     - Version: u32
-     - Index type: u8 (InMemory=0, Range=1)
-   
-   Body (InMemoryIndex):
-     - Entry count: u64
-     - Entries: [(LedgerKey XDR, file_offset: u64), ...]
-   
-   Body (RangeIndex):
-     - Bloom filter: BinaryFuse16 serialized
-     - Page count: u64
-     - Pages: [(start_key XDR, file_offset: u64), ...]
-   
-   Footer:
-     - Checksum: u32 (CRC32)
-   ```
-
-2. **Implement save/load** (2 days)
-   ```rust
-   impl BucketIndex {
-       pub fn save_to_file(&self, path: &Path) -> Result<()>;
-       pub fn load_from_file(path: &Path, expected_hash: &Hash256) -> Result<Option<Self>>;
-   }
-   ```
-
-3. **Integrate with BucketManager** (2 days)
-   - Save index after building during catchup/merge
-   - Load index on startup if available
-   - Fall back to rebuild if missing/corrupt
-
 ### Memory Impact
+
 - No direct memory impact
-- Faster startup (avoids full bucket scans)
+- Faster startup (avoids full bucket scans for index construction)
+
+### Startup Time Target
+
+- With persisted indexes (clean shutdown): target < 2 minutes
+- Without indexes (crash recovery / first boot): full bucket scan required,
+  proportional to total bucket data size
+
+---
+
+## Memory Budget Summary
+
+### During Catchup (Peak)
+
+| Component | Estimate |
+|-----------|----------|
+| Deduplication `HashSet<LedgerKey>` (transient) | ~8.6 GB |
+| Bucket indexes | ~200-400 MB |
+| Module cache (WASM compilation) | ~500 MB |
+| SQLite (offers + overhead) | ~200 MB |
+| Operating overhead (allocator, stack, etc.) | ~2 GB |
+| **Peak total** | **~12-13 GB** |
+
+### Steady-State Operation
+
+| Component | Estimate |
+|-----------|----------|
+| Bucket indexes (persistent) | ~200-400 MB |
+| Entry cache (`RandomEvictionCache`) | ~100 MB (configurable) |
+| Module cache | ~500 MB |
+| SQLite (offers + overhead) | ~200 MB |
+| Operating overhead | ~1.5 GB |
+| **Steady-state total** | **~2.5-3 GB** |
+
+The deduplication HashSet is freed after catchup completes, so steady-state memory is
+substantially lower than peak.
+
+---
+
+## Hot Archive Bucket List
+
+The `HotArchiveBucketList` (`hot_archive.rs`, 1,869 lines) stores recently evicted persistent
+Soroban entries. It currently uses **full in-memory materialization** (`Vec<HotArchiveBucketEntry>`
+plus `BTreeMap` index).
+
+On mainnet, the hot archive is expected to remain small relative to the live bucket list
+because entries are only retained for a limited period after eviction. However, if the hot
+archive grows significantly, it will need the same streaming/disk-backed treatment applied
+to the live bucket list. This should be monitored during extended mainnet observer runs.
 
 ---
 
@@ -246,33 +297,37 @@ buckets/
 
 ### Integration Tests
 - Full catchup with streaming iterator
-- Ledger close with SQL offers
-- Point lookups with cache misses
+- Ledger close with SQL offers (upserts + deletes verified)
+- Point lookups with cache misses (verify disk fallback returns correct entries)
 
 ### Performance Tests
-- Memory profiling during catchup (target: < 10 GB peak)
+- Memory profiling during catchup (target: < 13 GB peak)
+- Steady-state memory after 1,000+ ledger closes (target: < 4 GB)
 - Iteration speed benchmark
 - Point lookup latency (cache hit vs miss)
+- SQL offer query latency during order book matching
 
 ### Mainnet Simulation
 - Use mainnet bucket archives for realistic scale testing
-- Verify memory stays within 16 GB budget
+- Verify peak memory stays within 16 GB budget
+- Verify steady-state memory stays within 4 GB budget
 
 ---
 
 ## Dependencies
 
 ```
-Phase 1 (Streaming Iterator)
+Phase 1 (Streaming Iterator) ✅
     |
     v
-Phase 2 (SQL Offers) <-------+
-    |                        |
-    v                        |
-Phase 3 (Point Lookups) -----+ (can parallelize)
-    |
+Phase 2 (SQL Offers) ✅ <------+
+    |                           |
+    v                           |
+Phase 3 (Point Lookups) -------+ (can parallelize)
+    |     ~substantially complete
     v
 Phase 4 (Index Persistence)
+          ~partial
 ```
 
 Phases 2 and 3 can be worked on in parallel after Phase 1 completes.
@@ -281,21 +336,26 @@ Phases 2 and 3 can be worked on in parallel after Phase 1 completes.
 
 ## Risk Mitigation
 
-| Risk | Mitigation |
-|------|------------|
-| SQL performance for offers | Benchmark early; SQLite with proper indexes is fast |
-| Memory estimation off | Profile with real mainnet data early in Phase 1 |
-| Index format changes | Version field allows backward-compatible updates |
-| Regression in ledger close | Comprehensive comparison tests vs old impl |
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+| **SQL offer query latency** | Medium | High — DEX matching is latency-sensitive | SQLite with the `bestofferindex` composite index should handle order book queries efficiently. Benchmark with mainnet-scale offer counts (~12M) early. If latency is unacceptable, consider an in-memory order book index backed by SQL as source of truth. |
+| **Memory estimation off** | Medium | High — could exceed 16 GB target | Profile with real mainnet bucket archives. The transient dedup HashSet (~8.6 GB) is the largest single allocation; if it's too large, a bloom filter pre-screen could be added as a second tier to reduce the set size. |
+| **Index format changes** | Low | Medium — breaks existing persisted indexes | Version field in the index header allows backward-compatible updates. Fallback to rebuild ensures no data loss. |
+| **Regression in ledger close** | Low | Critical — consensus failure | Comprehensive comparison tests: run Rust and C++ side-by-side on the same ledger sequence and verify identical hashes for 1,000+ consecutive ledgers. |
+| **Lock contention on BucketList** | Medium | Medium — slower lookups under load | Point lookups take a read lock; merges take a write lock. If contention is observed, move to a snapshot-based read path that doesn't hold a lock during disk I/O. |
+| **Hot archive memory growth** | Low | Medium — unexpected memory pressure | Monitor hot archive size during extended mainnet observer runs. Flag for disk-backed treatment if it exceeds 1 GB. |
 
 ---
 
 ## Success Metrics
 
-1. **Memory**: Peak RSS < 16 GB during catchup and steady-state operation
-2. **Correctness**: All existing tests pass, ledger hashes match C++
-3. **Performance**: Ledger close time within 10% of current
-4. **Startup**: < 5 minutes from persisted state (with index persistence)
+1. **Memory (peak)**: RSS < 16 GB during catchup with mainnet bucket archives
+2. **Memory (steady-state)**: RSS < 4 GB during normal ledger close operation
+3. **Correctness**: Ledger hashes match C++ for 1,000+ consecutive ledgers on testnet
+4. **Performance**: Ledger close time within 10% of current
+5. **Startup (warm)**: < 2 minutes from persisted state after clean shutdown
+6. **Startup (cold)**: < 10 minutes with full index rebuild after crash recovery
+7. **Offer queries**: Order book best-offer query < 5 ms at mainnet scale
 
 ---
 
