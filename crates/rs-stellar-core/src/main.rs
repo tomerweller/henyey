@@ -61,7 +61,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use stellar_core_bucket::StateArchivalSettings;
-use stellar_core_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use stellar_core_history::ReplayConfig;
 use stellar_xdr::curr::WriteXdr;
 
@@ -2517,7 +2516,7 @@ async fn cmd_verify_execution(
     no_cache: bool,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use stellar_core_bucket::{
         is_persistent_entry, BucketList, BucketManager, HasNextState, HotArchiveBucketList,
     };
@@ -2528,12 +2527,9 @@ async fn cmd_verify_execution(
     };
     use stellar_core_history::{checkpoint, HistoryArchive};
     use stellar_core_ledger::execution::{load_soroban_config, TransactionExecutor};
-    use stellar_core_ledger::{
-        InMemorySorobanState, LedgerError, LedgerSnapshot, SnapshotHandle, SorobanRentConfig,
-    };
-    use stellar_core_tx::soroban::PersistentModuleCache;
+    use stellar_core_ledger::{LedgerManager, LedgerManagerConfig};
     use stellar_core_tx::ClassicEventConfig;
-    use stellar_xdr::curr::{BucketListType, LedgerEntry, LedgerEntryData, LedgerKey};
+    use stellar_xdr::curr::{LedgerEntry, LedgerKey};
 
     if !quiet {
         println!("Transaction Execution Verification");
@@ -2770,24 +2766,24 @@ async fn cmd_verify_execution(
     }
 
     // Restore live bucket list for state lookups (with FutureBucket states for pending merges)
-    let bucket_list = Arc::new(RwLock::new(BucketList::restore_from_has(
+    let mut bucket_list = BucketList::restore_from_has(
         &bucket_hashes,
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
-    )?));
+    )?;
 
     // Restore hot archive bucket list if present (protocol 23+)
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
     // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
-    let hot_archive_bucket_list: Option<Arc<RwLock<HotArchiveBucketList>>> =
+    let mut hot_archive_bucket_list: Option<HotArchiveBucketList> =
         if let (Some(ref hashes), Some(ref next_states)) =
             (&hot_archive_hashes, &hot_archive_next_states)
         {
-            Some(Arc::new(RwLock::new(
-                HotArchiveBucketList::restore_from_has(hashes, next_states, |hash| {
-                    bucket_manager.load_hot_archive_bucket(hash)
-                })?,
-            )))
+            Some(HotArchiveBucketList::restore_from_has(
+                hashes,
+                next_states,
+                |hash| bucket_manager.load_hot_archive_bucket(hash),
+            )?)
         } else {
             None
         };
@@ -2804,170 +2800,70 @@ async fn cmd_verify_execution(
     // This is critical for correct bucket list hash computation after catchup.
     // In C++ stellar-core, this is done by BucketListBase::restartMerges().
     // Use restart_merges_from_has to handle state 2 (merge in progress with stored input hashes).
-    bucket_list.write().unwrap().restart_merges_from_has(
+    bucket_list.restart_merges_from_has(
         init_checkpoint,
         init_protocol_version,
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
     )?;
-    if let Some(ref hot) = hot_archive_bucket_list {
+    if let Some(ref mut hot) = hot_archive_bucket_list {
         if let Some(ref ha_next_states) = hot_archive_next_states {
-            hot.write().unwrap().restart_merges_from_has(
+            hot.restart_merges_from_has(
                 init_checkpoint,
                 init_protocol_version,
                 ha_next_states,
                 |hash| bucket_manager.load_hot_archive_bucket(hash),
             )?;
         } else {
-            hot.write()
-                .unwrap()
-                .restart_merges(init_checkpoint, init_protocol_version)?;
+            hot.restart_merges(init_checkpoint, init_protocol_version)?;
         }
     }
 
     if !quiet {
         println!(
             "Initial live bucket list hash: {}",
-            bucket_list.read().unwrap().hash().to_hex()
+            bucket_list.hash().to_hex()
         );
         println!(
             "Live bucket list stats: {:?}",
-            bucket_list.read().unwrap().stats()
+            bucket_list.stats()
         );
         if let Some(ref hot) = hot_archive_bucket_list {
             println!(
                 "Initial hot archive hash: {}",
-                hot.read().unwrap().hash().to_hex()
+                hot.hash().to_hex()
             );
-            println!("Hot archive stats: {:?}", hot.read().unwrap().stats());
+            println!("Hot archive stats: {:?}", hot.stats());
         }
         println!();
     }
-    let init_rent_config = if let Some(init_header_entry) = init_header_entry {
-        let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
-        let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> =
-            hot_archive_bucket_list.clone();
-        let lookup_fn: Arc<
-            dyn Fn(&LedgerKey) -> stellar_core_ledger::Result<Option<LedgerEntry>> + Send + Sync,
-        > =
-            Arc::new(move |key: &LedgerKey| {
-                if let Some(entry) = bucket_list_clone.read().unwrap().get(key).map_err(|e| {
-                    LedgerError::Internal(format!("Live bucket lookup failed: {}", e))
-                })? {
-                    return Ok(Some(entry));
-                }
-                if let Some(ref hot_archive) = hot_archive_clone {
-                    if let Some(entry) = hot_archive.read().unwrap().get(key).map_err(|e| {
-                        LedgerError::Internal(format!("Hot archive bucket lookup failed: {}", e))
-                    })? {
-                        return Ok(Some(entry.clone()));
-                    }
-                }
-                Ok(None)
-            });
 
-        let snapshot = LedgerSnapshot::new(
-            init_header_entry.header.clone(),
-            Hash256::from(init_header_entry.hash.0),
-            std::collections::HashMap::new(),
-        );
-        let snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
-        let soroban_config = load_soroban_config(&snapshot_handle, init_protocol_version);
-        SorobanRentConfig {
-            cpu_cost_params: soroban_config.cpu_cost_params,
-            mem_cost_params: soroban_config.mem_cost_params,
-            tx_max_instructions: soroban_config.tx_max_instructions,
-            tx_max_memory_bytes: soroban_config.tx_max_memory_bytes,
-        }
-    } else {
-        SorobanRentConfig::default()
-    };
+    // Create LedgerManager with in-memory database
+    let db = stellar_core_db::Database::open_in_memory()?;
+    let ledger_manager = LedgerManager::with_config(
+        db,
+        config.network.passphrase.clone(),
+        LedgerManagerConfig {
+            validate_bucket_hash: true,
+            persist_to_db: false,
+            max_entry_cache_size: 100_000,
+            ..Default::default()
+        },
+    );
 
-    // Initialize all caches in a single pass over live entries using streaming iteration.
-    // This avoids loading all ~60M mainnet entries into memory at once.
-    let mut soroban_state = InMemorySorobanState::new();
-    let mut offers: Vec<stellar_xdr::curr::LedgerEntry> = Vec::new();
-    let mut contracts_added = 0u64;
-
-    // Create module cache if Soroban is supported
-    let module_cache = if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-        PersistentModuleCache::new_for_protocol(init_protocol_version)
-    } else {
-        None
-    };
-
-    // Single pass over all live entries
-    {
-        let bucket_list_guard = bucket_list.read().unwrap();
-        for entry_result in bucket_list_guard.live_entries_iter() {
-            let entry = entry_result?;
-
-            match &entry.data {
-                // Offers -> offer cache
-                LedgerEntryData::Offer(_) => {
-                    offers.push(entry);
-                }
-
-                // Contract code -> module cache + soroban state
-                LedgerEntryData::ContractCode(contract_code) => {
-                    if let Some(ref cache) = module_cache {
-                        if cache.add_contract(contract_code.code.as_slice(), init_protocol_version) {
-                            contracts_added += 1;
-                        }
-                    }
-                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-                        soroban_state
-                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
-                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
-                    }
-                }
-
-                // Contract data -> soroban state
-                LedgerEntryData::ContractData(_) => {
-                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-                        soroban_state
-                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
-                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
-                    }
-                }
-
-                // TTL -> soroban state
-                LedgerEntryData::Ttl(_) => {
-                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-                        soroban_state
-                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
-                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
-                    }
-                }
-
-                // ConfigSetting -> soroban state (cached for fast Soroban config loading)
-                // This matches online execution which caches ConfigSettings for O(1) access
-                LedgerEntryData::ConfigSetting(_) => {
-                    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-                        soroban_state
-                            .process_entry_create(&entry, init_protocol_version, Some(&init_rent_config))
-                            .map_err(|e| anyhow::anyhow!("soroban state init failed: {}", e))?;
-                    }
-                }
-
-                _ => {}
-            }
-        }
-    }
-
-    // Finalize state
-    if init_protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-        soroban_state.set_last_closed_ledger_seq(init_checkpoint);
-    }
+    // Initialize LedgerManager (handles soroban_state, SQL offers, module_cache, entry_cache)
+    let init_header_hash = init_header_entry.map(|h| Hash256::from(h.hash.0));
+    ledger_manager.initialize_from_buckets(
+        bucket_list,
+        hot_archive_bucket_list,
+        init_header_entry
+            .map(|h| h.header.clone())
+            .unwrap_or_default(),
+        init_header_hash,
+    )?;
 
     if !quiet {
-        if contracts_added > 0 {
-            println!(
-                "Module cache: pre-compiled {} contract modules",
-                contracts_added
-            );
-        }
-        println!("Offer cache: pre-loaded {} offers from bucket list", offers.len());
+        let soroban_state = ledger_manager.soroban_state().read();
         println!(
             "Soroban state: {} contract data, {} contract code, {} config settings",
             soroban_state.contract_data_count(),
@@ -2975,13 +2871,6 @@ async fn cmd_verify_execution(
             soroban_state.config_settings_count(),
         );
     }
-
-    // Wrap soroban_state in Arc<RwLock<>> for sharing with snapshot lookup closures.
-    // This enables O(1) lookups for CONTRACT_DATA, CONTRACT_CODE, TTL, and ConfigSetting
-    // entries instead of O(log n) bucket list traversals.
-    let soroban_state: Arc<RwLock<InMemorySorobanState>> = Arc::new(RwLock::new(soroban_state));
-
-    let offer_cache: Arc<RwLock<Vec<stellar_xdr::curr::LedgerEntry>>> = Arc::new(RwLock::new(offers));
 
     // Track results
     let mut ledgers_verified = 0u32;
@@ -3000,7 +2889,6 @@ async fn cmd_verify_execution(
         snapshot_setup_us: u64,
         tx_execution_us: u64,
         bucket_update_us: u64,
-        soroban_state_us: u64,
         header_verify_us: u64,
         total_us: u64,
         tx_count: u32,
@@ -3068,7 +2956,6 @@ async fn cmd_verify_execution(
                 snapshot_setup_us: 0,
                 tx_execution_us: 0,
                 bucket_update_us: 0,
-                soroban_state_us: 0,
                 header_verify_us: 0,
                 total_us: 0,
                 tx_count: 0,
@@ -3143,53 +3030,18 @@ async fn cmd_verify_execution(
                 continue;
             }
 
-            // Create snapshot handle with optimized lookup that checks in-memory Soroban state
-            // first for O(1) access, then falls back to bucket list for other types.
-            // This matches online execution's lookup optimization.
+            // Create snapshot handle via LedgerManager.
+            // This uses BucketListSnapshot (zero-lock), in-memory Soroban state (O(1)),
+            // SQL offers (indexed), and entry cache (LRU).
             let snapshot_setup_start = std::time::Instant::now();
-            let bucket_list_clone: Arc<RwLock<BucketList>> = Arc::clone(&bucket_list);
-            let hot_archive_clone: Option<Arc<RwLock<HotArchiveBucketList>>> =
-                hot_archive_bucket_list.clone();
-            let soroban_state_clone: Arc<RwLock<InMemorySorobanState>> = Arc::clone(&soroban_state);
-            let lookup_fn: Arc<
-                dyn Fn(
-                        &LedgerKey,
-                    )
-                        -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>>
-                    + Send
-                    + Sync,
-            > = Arc::new(move |key: &LedgerKey| {
-                // Check in-memory Soroban state first for Soroban entry types (O(1) lookup).
-                // This includes CONTRACT_DATA, CONTRACT_CODE, TTL, and ConfigSetting.
-                if InMemorySorobanState::is_in_memory_type(key) {
-                    if let Some(entry) = soroban_state_clone.read().unwrap().get(key) {
-                        return Ok(Some((*entry).clone()));
-                    }
-                }
-                // Fall back to bucket list for non-Soroban types or if not found in memory
-                if let Some(entry) = bucket_list_clone.read().unwrap().get(key).map_err(|e| {
-                    LedgerError::Internal(format!("Live bucket lookup failed: {}", e))
-                })? {
-                    return Ok(Some(entry));
-                }
-                // Then try the hot archive bucket list (for archived/evicted entries)
-                // HotArchiveBucketList::get returns Option<&LedgerEntry>, so we clone
-                if let Some(ref hot_archive) = hot_archive_clone {
-                    if let Some(entry) = hot_archive.read().unwrap().get(key).map_err(|e| {
-                        LedgerError::Internal(format!("Hot archive bucket lookup failed: {}", e))
-                    })? {
-                        return Ok(Some(entry.clone()));
-                    }
-                }
-                Ok(None)
-            });
 
-            let snapshot = LedgerSnapshot::new(
-                header.clone(),
-                Hash256::from(header_entry.hash.0),
-                std::collections::HashMap::new(),
-            );
-            let mut snapshot_handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+            // Update LedgerManager state for this ledger's header
+            ledger_manager.set_state(header.clone(), Hash256::from(header_entry.hash.0));
+
+            let mut snapshot_handle = ledger_manager.create_snapshot()
+                .map_err(|e| anyhow::anyhow!("Failed to create snapshot: {}", e))?;
+
+            // Override header lookup with local checkpoint headers (not in DB)
             let header_map: std::collections::HashMap<u32, stellar_xdr::curr::LedgerHeader> =
                 headers
                     .iter()
@@ -3203,27 +3055,8 @@ async fn cmd_verify_execution(
             > = std::sync::Arc::new(move |seq| Ok(header_map.get(&seq).cloned()));
             snapshot_handle.set_header_lookup(header_lookup);
 
-            // Add entries_fn to enable orderbook loading for path payments.
-            // Use the pre-loaded offer cache instead of scanning the bucket list each time.
-            // This significantly improves performance for ledgers with orderbook operations.
-            let offer_cache_for_entries = Arc::clone(&offer_cache);
-            let entries_fn: Arc<
-                dyn Fn() -> stellar_core_ledger::Result<Vec<stellar_xdr::curr::LedgerEntry>>
-                    + Send
-                    + Sync,
-            > = Arc::new(move || {
-                Ok(offer_cache_for_entries.read().unwrap().clone())
-            });
-            snapshot_handle.set_entries_lookup(entries_fn);
-
             // Load Soroban config from ledger state
             let soroban_config = load_soroban_config(&snapshot_handle, header.ledger_version);
-            let rent_config = SorobanRentConfig {
-                cpu_cost_params: soroban_config.cpu_cost_params.clone(),
-                mem_cost_params: soroban_config.mem_cost_params.clone(),
-                tx_max_instructions: soroban_config.tx_max_instructions,
-                tx_max_memory_bytes: soroban_config.tx_max_memory_bytes,
-            };
 
             // Create or advance the transaction executor
             // Keeping the executor across ledgers preserves state changes from earlier ledgers
@@ -3254,22 +3087,17 @@ async fn cmd_verify_execution(
                     soroban_config,
                     ClassicEventConfig::default(),
                 );
-                // Set the persistent module cache if available
-                if let Some(ref cache) = module_cache {
-                    new_executor.set_module_cache(cache.clone());
+                // Set the persistent module cache from LedgerManager
+                {
+                    let module_cache_guard = ledger_manager.module_cache().read();
+                    if let Some(ref cache) = *module_cache_guard {
+                        new_executor.set_module_cache(cache.clone());
+                    }
                 }
                 // Set the hot archive for Protocol 23+ entry restoration.
-                // Note: The executor expects Arc<parking_lot::RwLock<Option<...>>> but main.rs
-                // uses Arc<std::sync::RwLock<...>>. For offline verification, we create a
-                // compatible wrapper by cloning the hot archive into the expected type.
-                if let Some(ref hot_archive) = hot_archive_bucket_list {
-                    use stellar_core_bucket::HotArchiveBucketList;
-                    let hot_archive_for_exec: std::sync::Arc<::parking_lot::RwLock<Option<HotArchiveBucketList>>> = 
-                        std::sync::Arc::new(
-                            ::parking_lot::RwLock::new(Some(hot_archive.read().unwrap().clone()))
-                        );
-                    new_executor.set_hot_archive(hot_archive_for_exec);
-                }
+                // LedgerManager already uses Arc<parking_lot::RwLock<Option<...>>> which
+                // is what the executor expects.
+                new_executor.set_hot_archive(ledger_manager.hot_archive_bucket_list().clone());
                 executor = Some(new_executor);
             }
 
@@ -3723,7 +3551,7 @@ async fn cmd_verify_execution(
                     // - ContractCode may still be live because another contract uses the same WASM
                     // - ContractData may already exist if a previous TX in this ledger restored it
                     let already_in_soroban_state = {
-                        let soroban_state_guard = soroban_state.read().unwrap();
+                        let soroban_state_guard = ledger_manager.soroban_state().read();
                         match &entry.data {
                             stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
                                 let code_key = stellar_xdr::curr::LedgerKeyContractCode {
@@ -3778,7 +3606,7 @@ async fn cmd_verify_execution(
 
                         // Check if ContractCode/ContractData already exists in soroban_state
                         let already_exists = {
-                            let soroban_state_guard = soroban_state.read().unwrap();
+                            let soroban_state_guard = ledger_manager.soroban_state().read();
                             match &entry.data {
                                 stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
                                     let code_key = stellar_xdr::curr::LedgerKeyContractCode {
@@ -3863,7 +3691,7 @@ async fn cmd_verify_execution(
                 let mut our_live: Vec<LedgerEntry> = live_by_key.into_values().collect();
 
                 let mut aggregator = CoalescedLedgerChanges::new();
-                let bl = bucket_list.read().unwrap();
+                let bl = ledger_manager.bucket_list().read();
 
                 // Apply per-transaction changes in ledger order.
                 // For Protocol 23+, post_fee_meta must be applied AFTER all tx_meta
@@ -4039,7 +3867,7 @@ async fn cmd_verify_execution(
                     .filter(|tp| tx_succeeded(&tp.result))
                     .map(|tp| tp.meta.clone())
                     .collect();
-                let restored_keys = if hot_archive_bucket_list.is_some() {
+                let restored_keys = if ledger_manager.hot_archive_bucket_list().read().is_some() {
                     extract_restored_keys(&tx_metas_for_restore)
                 } else {
                     Vec::new()
@@ -4185,7 +4013,7 @@ async fn cmd_verify_execution(
                         seq,
                         cdp_header.ledger_version,
                         &bl,
-                        soroban_state.read().unwrap().total_size(),
+                        ledger_manager.soroban_state().read().total_size(),
                         archival_override.clone(),
                     ) {
                         our_live.push(window_entry);
@@ -4199,57 +4027,11 @@ async fn cmd_verify_execution(
                         seq,
                         cdp_header.ledger_version,
                         &bl,
-                        soroban_state.read().unwrap().total_size(),
+                        ledger_manager.soroban_state().read().total_size(),
                         &mut aggregator,
                         archival_override.clone(),
                     );
                 }
-
-                // Use our execution results for state updates
-                let (all_init, all_live, all_dead) = (our_init.clone(), our_live.clone(), our_dead.clone());
-
-                let soroban_state_start = std::time::Instant::now();
-                if cdp_header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-                    soroban_state
-                        .write()
-                        .unwrap()
-                        .update_state(
-                            seq,
-                            &all_init,
-                            &all_live,
-                            &all_dead,
-                            cdp_header.ledger_version,
-                            Some(&rent_config),
-                        )
-                        .map_err(|e| anyhow::anyhow!("soroban state update failed: {}", e))?;
-
-                    // Update persistent module cache with newly deployed contracts.
-                    // This matches C++ stellar-core's commit-phase behavior where
-                    // addAnyContractsToModuleCache() is called after all transactions
-                    // in a ledger are applied, ensuring newly deployed contracts are
-                    // available in the cache for the next ledger's execution.
-                    if let Some(ref cache) = module_cache {
-                        let mut contracts_added = 0;
-                        for entry in all_init.iter().chain(all_live.iter()) {
-                            if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
-                                if cache.add_contract(
-                                    contract_code.code.as_slice(),
-                                    cdp_header.ledger_version,
-                                ) {
-                                    contracts_added += 1;
-                                }
-                            }
-                        }
-                        if contracts_added > 0 {
-                            tracing::debug!(
-                                ledger_seq = seq,
-                                contracts_added,
-                                "Updated module cache with new contracts"
-                            );
-                        }
-                    }
-                }
-                timing.soroban_state_us = soroban_state_start.elapsed().as_micros() as u64;
 
                 // Diagnostic logging: compare our execution vs CDP metadata
                 let (cdp_init, cdp_live, cdp_dead) = aggregator.to_vectors();
@@ -4463,55 +4245,12 @@ async fn cmd_verify_execution(
                 // Use our execution results for bucket list update
                 let (all_init, all_live, all_dead) = (our_init, our_live, our_dead);
 
-                // Update the offer cache with offer changes from this ledger
-                {
-                    let mut cache = offer_cache.write().unwrap();
-                    
-                    // Add new offers (INIT entries)
-                    for entry in &all_init {
-                        if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                            cache.push(entry.clone());
-                        }
-                    }
-                    
-                    // Update modified offers (LIVE entries)
-                    for entry in &all_live {
-                        if let LedgerEntryData::Offer(offer) = &entry.data {
-                            // Find and replace existing offer
-                            if let Some(pos) = cache.iter().position(|e| {
-                                if let LedgerEntryData::Offer(o) = &e.data {
-                                    o.seller_id == offer.seller_id && o.offer_id == offer.offer_id
-                                } else {
-                                    false
-                                }
-                            }) {
-                                cache[pos] = entry.clone();
-                            } else {
-                                // Not found, add it (shouldn't happen but be defensive)
-                                cache.push(entry.clone());
-                            }
-                        }
-                    }
-                    
-                    // Remove deleted offers
-                    for key in &all_dead {
-                        if let stellar_xdr::curr::LedgerKey::Offer(offer_key) = key {
-                            cache.retain(|e| {
-                                if let LedgerEntryData::Offer(o) = &e.data {
-                                    !(o.seller_id == offer_key.seller_id && o.offer_id == offer_key.offer_id)
-                                } else {
-                                    true
-                                }
-                            });
-                        }
-                    }
-                }
-
                 // Before evicting entries from the live bucket list, look up full entry data
                 // for persistent entries that need to go to the hot archive. Use the
                 // post-transaction state when entries were updated in this ledger.
+                let has_hot_archive = ledger_manager.hot_archive_bucket_list().read().is_some();
                 let mut archived_entries = Vec::new();
-                if hot_archive_bucket_list.is_some() {
+                if has_hot_archive {
                     let mut changed_entries: std::collections::HashMap<
                         stellar_xdr::curr::LedgerKey,
                         stellar_xdr::curr::LedgerEntry,
@@ -4548,45 +4287,35 @@ async fn cmd_verify_execution(
                     }
                 }
 
-                drop(bl);
-
-                // Apply to bucket list
-                bucket_list.write().unwrap().add_batch(
-                    seq,
-                    cdp_header.ledger_version,
-                    BucketListType::Live,
-                    all_init.clone(),
-                    all_live.clone(),
-                    all_dead.clone(),
-                )?;
-
-                // Update hot archive bucket list
+                // Debug: log when CDP and our restored keys differ
                 if cdp_header.ledger_version >= 23 {
-                    if let Some(ref hot_archive) = hot_archive_bucket_list {
-                        // Debug: log when CDP and our restored keys differ
-                        if !restored_keys.is_empty() || !our_hot_archive_restored_keys.is_empty() {
-                            if restored_keys.len() != our_hot_archive_restored_keys.len() {
-                                tracing::info!(
-                                    ledger_seq = seq,
-                                    cdp_restored_count = restored_keys.len(),
-                                    our_restored_count = our_hot_archive_restored_keys.len(),
-                                    "Hot archive restored keys: CDP vs ours (difference = live BL restores)"
-                                );
-                            }
+                    if !restored_keys.is_empty() || !our_hot_archive_restored_keys.is_empty() {
+                        if restored_keys.len() != our_hot_archive_restored_keys.len() {
+                            tracing::info!(
+                                ledger_seq = seq,
+                                cdp_restored_count = restored_keys.len(),
+                                our_restored_count = our_hot_archive_restored_keys.len(),
+                                "Hot archive restored keys: CDP vs ours (difference = live BL restores)"
+                            );
                         }
-                        // Use OUR execution's hot archive restored keys, not CDP's.
-                        // CDP metadata includes both hot archive restores and live BL restores,
-                        // but only hot archive restores should be passed to add_batch.
-                        // Our execution correctly filters out live BL restores.
-                        // Convert HashSet to Vec for add_batch.
-                        hot_archive.write().unwrap().add_batch(
-                            seq,
-                            cdp_header.ledger_version,
-                            archived_entries,
-                            our_hot_archive_restored_keys.iter().cloned().collect(),
-                        )?;
                     }
                 }
+
+                drop(bl);
+
+                // Apply all state updates via LedgerManager:
+                // bucket list, hot archive, soroban state, module cache, SQL offers, entry cache
+                ledger_manager.apply_ledger_close(
+                    seq,
+                    cdp_header.ledger_version,
+                    &all_init,
+                    &all_live,
+                    &all_dead,
+                    archived_entries,
+                    our_hot_archive_restored_keys.iter().cloned().collect(),
+                    cdp_header.clone(),
+                    Hash256::from(header_entry.hash.0),
+                ).map_err(|e| anyhow::anyhow!("apply_ledger_close failed: {}", e))?;
             }
             timing.bucket_update_us = bucket_update_start.elapsed().as_micros() as u64;
 
@@ -4594,13 +4323,12 @@ async fn cmd_verify_execution(
             let header_verify_start = std::time::Instant::now();
             if in_test_range {
                 // 1. Compute bucket list hash
-                let bl = bucket_list.read().unwrap();
-                let our_live_hash = bl.hash();
-                drop(bl);
+                let our_live_hash = ledger_manager.bucket_list().read().hash();
 
-                let our_hot_hash = hot_archive_bucket_list
-                    .as_ref()
-                    .map(|hot| hot.read().unwrap().hash());
+                let our_hot_hash = {
+                    let hot_guard = ledger_manager.hot_archive_bucket_list().read();
+                    hot_guard.as_ref().map(|hot| hot.hash())
+                };
 
                 let our_bucket_list_hash = {
                     // For Protocol 23+, combine live and hot archive hashes
@@ -4714,7 +4442,7 @@ async fn cmd_verify_execution(
                             );
                         }
                         // Print level-by-level hashes for debugging
-                        let bl = bucket_list.read().unwrap();
+                        let bl = ledger_manager.bucket_list().read();
                         println!("    Level-by-level live bucket hashes:");
                         for i in 0..11 {
                             if let Some(level) = bl.level(i) {
@@ -4899,7 +4627,6 @@ async fn cmd_verify_execution(
         let sum_snapshot = all_timings.iter().map(|t| t.snapshot_setup_us).sum::<u64>();
         let sum_tx_exec = all_timings.iter().map(|t| t.tx_execution_us).sum::<u64>();
         let sum_bucket = all_timings.iter().map(|t| t.bucket_update_us).sum::<u64>();
-        let sum_soroban = all_timings.iter().map(|t| t.soroban_state_us).sum::<u64>();
         let sum_header = all_timings.iter().map(|t| t.header_verify_us).sum::<u64>();
         let sum_total = all_timings.iter().map(|t| t.total_us).sum::<u64>();
 
@@ -4907,7 +4634,6 @@ async fn cmd_verify_execution(
         let avg_snapshot = sum_snapshot as f64 / all_timings.len() as f64;
         let avg_tx_exec = sum_tx_exec as f64 / all_timings.len() as f64;
         let avg_bucket = sum_bucket as f64 / all_timings.len() as f64;
-        let avg_soroban = sum_soroban as f64 / all_timings.len() as f64;
         let avg_header = sum_header as f64 / all_timings.len() as f64;
         let avg_total = sum_total as f64 / all_timings.len() as f64;
 
@@ -4916,7 +4642,6 @@ async fn cmd_verify_execution(
         let max_snapshot = all_timings.iter().map(|t| t.snapshot_setup_us).max().unwrap_or(0);
         let max_tx_exec = all_timings.iter().map(|t| t.tx_execution_us).max().unwrap_or(0);
         let max_bucket = all_timings.iter().map(|t| t.bucket_update_us).max().unwrap_or(0);
-        let max_soroban = all_timings.iter().map(|t| t.soroban_state_us).max().unwrap_or(0);
         let max_header = all_timings.iter().map(|t| t.header_verify_us).max().unwrap_or(0);
         let max_total = all_timings.iter().map(|t| t.total_us).max().unwrap_or(0);
 
@@ -4931,13 +4656,10 @@ async fn cmd_verify_execution(
         println!("    TX execution:    {:>7.2} / {:>7.2}  ({:>5.1}%)", 
             avg_tx_exec / 1000.0, max_tx_exec as f64 / 1000.0,
             sum_tx_exec as f64 / sum_total as f64 * 100.0);
-        println!("    Bucket update:   {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+        println!("    State update:    {:>7.2} / {:>7.2}  ({:>5.1}%)",
             avg_bucket / 1000.0, max_bucket as f64 / 1000.0,
             sum_bucket as f64 / sum_total as f64 * 100.0);
-        println!("    Soroban state:   {:>7.2} / {:>7.2}  ({:>5.1}%)", 
-            avg_soroban / 1000.0, max_soroban as f64 / 1000.0,
-            sum_soroban as f64 / sum_total as f64 * 100.0);
-        println!("    Header verify:   {:>7.2} / {:>7.2}  ({:>5.1}%)", 
+        println!("    Header verify:   {:>7.2} / {:>7.2}  ({:>5.1}%)",
             avg_header / 1000.0, max_header as f64 / 1000.0,
             sum_header as f64 / sum_total as f64 * 100.0);
         println!("    Total:           {:>7.2} / {:>7.2}", 
@@ -4953,7 +4675,7 @@ async fn cmd_verify_execution(
             // idx is position in all_timings, need to map back to ledger seq
             let ledger_offset = *idx as u32;
             println!(
-                "    #{}: {}ms total (cdp={}ms, tx={}ms, bucket={}ms, {} txs)",
+                "    #{}: {}ms total (cdp={}ms, tx={}ms, state={}ms, {} txs)",
                 ledger_offset,
                 timing.total_us / 1000,
                 timing.cdp_fetch_us / 1000,
@@ -4982,7 +4704,7 @@ async fn cmd_verify_execution(
         }
         
         println!("    {:>10} {:>8} {:>12} {:>12} {:>12}", 
-            "TX range", "Count", "Avg total", "Avg TX exec", "Avg bucket");
+            "TX range", "Count", "Avg total", "Avg TX exec", "Avg state");
         for (bucket, timings) in &by_tx_count {
             let label = match *bucket {
                 0 => "0 txs".to_string(),

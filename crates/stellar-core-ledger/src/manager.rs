@@ -425,6 +425,37 @@ impl LedgerManager {
         &self.soroban_state
     }
 
+    /// Get a reference to the bucket list.
+    pub fn bucket_list(&self) -> &Arc<RwLock<BucketList>> {
+        &self.bucket_list
+    }
+
+    /// Get a reference to the hot archive bucket list.
+    pub fn hot_archive_bucket_list(&self) -> &Arc<RwLock<Option<HotArchiveBucketList>>> {
+        &self.hot_archive_bucket_list
+    }
+
+    /// Get a reference to the module cache.
+    pub fn module_cache(&self) -> &RwLock<Option<PersistentModuleCache>> {
+        &self.module_cache
+    }
+
+    /// Get a reference to the offers_initialized flag.
+    pub fn offers_initialized(&self) -> &Arc<RwLock<bool>> {
+        &self.offers_initialized
+    }
+
+    /// Update the ledger header and hash for offline replay scenarios.
+    ///
+    /// This updates the internal state so that `create_snapshot()` uses the
+    /// correct header. Used by verify-execution and other offline tools.
+    pub fn set_state(&self, header: LedgerHeader, header_hash: Hash256) {
+        let mut state = self.state.write();
+        state.header = header;
+        state.header_hash = header_hash;
+        state.initialized = true;
+    }
+
     /// Get the SCP timing configuration from the current ledger state.
     pub fn scp_timing(&self) -> Option<ConfigSettingScpTiming> {
         if !self.is_initialized() {
@@ -1459,11 +1490,19 @@ impl LedgerManager {
         let snapshot = LedgerSnapshot::new(state.header.clone(), state.header_hash, entries);
 
         // Create a lookup function that checks in-memory Soroban state first for O(1) access,
-        // then falls back to bucket list for non-Soroban types or cache misses.
+        // then falls back to a bucket list snapshot for non-Soroban types or cache misses.
         // This optimization provides O(1) lookups for CONTRACT_DATA, CONTRACT_CODE, and TTL
         // entries instead of O(log n) bucket list B-tree traversals.
+        //
+        // We capture a BucketListSnapshot instead of the live Arc<RwLock<BucketList>> so that
+        // point lookups during TX execution don't contend with the write lock held during
+        // commit() (add_batch + hash computation). The snapshot holds Arc<Bucket> references
+        // which are cheap clones and require no locking.
         let soroban_state_lookup = self.soroban_state.clone();
-        let bucket_list_lookup = self.bucket_list.clone();
+        let bucket_list_snapshot = {
+            let bl = self.bucket_list.read();
+            stellar_core_bucket::BucketListSnapshot::new(&bl, state.header.clone())
+        };
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
             // Check in-memory Soroban state first for Soroban entry types
             if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
@@ -1471,10 +1510,9 @@ impl LedgerManager {
                     return Ok(Some((*entry).clone()));
                 }
             }
-            // Fall back to bucket list for non-Soroban types or if not found in memory
-            bucket_list_lookup
-                .read()
-                .get(key)
+            // Fall back to bucket list snapshot for non-Soroban types or if not found in memory
+            bucket_list_snapshot
+                .get_result(key)
                 .map_err(LedgerError::Bucket)
         });
 
@@ -1656,6 +1694,183 @@ impl LedgerManager {
         }
 
         Ok(())
+    }
+
+    /// Apply a pre-computed ledger close to the manager's internal state.
+    ///
+    /// This is used by offline tools (verify-execution) that execute transactions
+    /// externally but want to use LedgerManager for state management. It performs
+    /// the same state updates as `LedgerCloseContext::commit()`:
+    ///
+    /// 1. Bucket list add_batch (live)
+    /// 2. Hot archive add_batch (if protocol 23+)
+    /// 3. Soroban state update (init/live/dead)
+    /// 4. Module cache update (new contract code)
+    /// 5. SQL offers update (insert/update/delete)
+    /// 6. Entry cache update
+    /// 7. Internal header update
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_ledger_close(
+        &self,
+        ledger_seq: u32,
+        protocol_version: u32,
+        init_entries: &[LedgerEntry],
+        live_entries: &[LedgerEntry],
+        dead_entries: &[LedgerKey],
+        archived_entries: Vec<LedgerEntry>,
+        restored_keys: Vec<LedgerKey>,
+        new_header: LedgerHeader,
+        new_header_hash: Hash256,
+    ) -> Result<()> {
+        use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
+
+        // 1. Bucket list add_batch
+        self.bucket_list.write().add_batch(
+            ledger_seq,
+            protocol_version,
+            BucketListType::Live,
+            init_entries.to_vec(),
+            live_entries.to_vec(),
+            dead_entries.to_vec(),
+        )?;
+
+        // 2. Hot archive add_batch (protocol 23+)
+        if protocol_version >= 23 {
+            if let Some(ref mut hot_archive) = *self.hot_archive_bucket_list.write() {
+                hot_archive.add_batch(
+                    ledger_seq,
+                    protocol_version,
+                    archived_entries,
+                    restored_keys,
+                )?;
+            }
+        }
+
+        // 3. Soroban state update
+        // Load rent config BEFORE acquiring soroban_state write lock to avoid deadlock.
+        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+            let rent_config = self.load_soroban_rent_config(&self.bucket_list.read());
+            self.soroban_state
+                .write()
+                .update_state(
+                    ledger_seq,
+                    init_entries,
+                    live_entries,
+                    dead_entries,
+                    protocol_version,
+                    rent_config.as_ref(),
+                )
+                .map_err(|e| {
+                    LedgerError::Internal(format!("soroban state update failed: {}", e))
+                })?;
+        }
+
+        // 4. Module cache update (new contract code)
+        {
+            let module_cache_guard = self.module_cache.read();
+            if let Some(ref cache) = *module_cache_guard {
+                for entry in init_entries.iter().chain(live_entries.iter()) {
+                    if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
+                        cache.add_contract(contract_code.code.as_slice(), protocol_version);
+                    }
+                }
+            }
+        }
+
+        // 5. SQL offers update
+        self.update_offers_from_entries(init_entries, live_entries, dead_entries)?;
+
+        // 6. Entry cache update
+        self.update_entry_cache_from_entries(init_entries, live_entries, dead_entries);
+
+        // 7. Update header
+        self.set_state(new_header, new_header_hash);
+
+        Ok(())
+    }
+
+    /// Update SQL offers table from init/live/dead entry vectors.
+    fn update_offers_from_entries(
+        &self,
+        init_entries: &[LedgerEntry],
+        live_entries: &[LedgerEntry],
+        dead_entries: &[LedgerKey],
+    ) -> Result<()> {
+        if !*self.offers_initialized.read() {
+            return Ok(());
+        }
+
+        let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
+        let mut offer_deletes: Vec<i64> = Vec::new();
+
+        for entry in init_entries.iter().chain(live_entries.iter()) {
+            if matches!(entry.data, LedgerEntryData::Offer(_)) {
+                offer_upserts.push(entry.clone());
+            }
+        }
+
+        for key in dead_entries {
+            if let LedgerKey::Offer(offer_key) = key {
+                offer_deletes.push(offer_key.offer_id);
+            }
+        }
+
+        if !offer_upserts.is_empty() || !offer_deletes.is_empty() {
+            let mut conn = self.db.connection().map_err(LedgerError::from)?;
+            let tx = conn.transaction().map_err(|e| {
+                LedgerError::Internal(format!("Failed to start transaction: {}", e))
+            })?;
+
+            if !offer_upserts.is_empty() {
+                offers_db::bulk_upsert_offers(&tx, &offer_upserts).map_err(|e| {
+                    LedgerError::Internal(format!("Failed to upsert offers: {}", e))
+                })?;
+            }
+            if !offer_deletes.is_empty() {
+                offers_db::bulk_delete_offers(&tx, &offer_deletes).map_err(|e| {
+                    LedgerError::Internal(format!("Failed to delete offers: {}", e))
+                })?;
+            }
+
+            tx.commit().map_err(|e| {
+                LedgerError::Internal(format!("Failed to commit offers transaction: {}", e))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Update entry cache from init/live/dead entry vectors.
+    fn update_entry_cache_from_entries(
+        &self,
+        init_entries: &[LedgerEntry],
+        live_entries: &[LedgerEntry],
+        dead_entries: &[LedgerKey],
+    ) {
+        let mut cache = self.entry_cache.write();
+
+        for entry in init_entries.iter().chain(live_entries.iter()) {
+            if let Some(key) = stellar_core_bucket::ledger_entry_to_key(entry) {
+                if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                    cache.insert(key_bytes, entry.clone());
+                }
+            }
+        }
+
+        for key in dead_entries {
+            if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                cache.swap_remove(&key_bytes);
+            }
+        }
+
+        // Evict oldest entries if cache exceeds limit
+        let max_size = self.config.max_entry_cache_size;
+        if max_size > 0 && cache.len() > max_size {
+            let to_remove = cache.len() - max_size;
+            for _ in 0..to_remove {
+                cache.shift_remove_index(0);
+            }
+        }
     }
 
     /// Get the database handle.
