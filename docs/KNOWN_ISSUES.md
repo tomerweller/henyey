@@ -2,6 +2,43 @@
 
 This document tracks known issues, limitations, and technical debt in rs-stellar-core.
 
+## Performance Issues
+
+### P1: Merge Deduplication Not Integrated
+
+**Status**: Known Gap  
+**Impact**: Medium - Potential performance regression during catchup/restart  
+**Added**: 2026-01-28
+
+The `BucketMergeMap` and `LiveMergeFutures` data structures are implemented and tested (matching C++ behavior), but they are **not integrated** into the `BucketList` merge workflow.
+
+**C++ Behavior:**
+- `BucketManager::getMergeFuture()` checks for in-progress merges, then cached completed merges
+- `recordMerge()` caches input→output mappings after merge completion
+- This allows skipping re-runs when the same inputs are requested (e.g., catchup retries)
+
+**Current Rust Behavior:**
+- Guards against duplicate concurrent merges via `if self.next.is_some() { continue; }`
+- Does NOT cache completed merge results for reuse
+- Each `restart_merges()` re-runs merges even if same inputs were merged before
+
+**Impact Assessment:**
+- Minimal during normal operation (each ledger produces unique bucket contents)
+- Potential regression during catchup/restart scenarios with repeated merge requests
+
+**Files:**
+- `crates/stellar-core-bucket/src/merge_map.rs` - Data structures (implemented)
+- `crates/stellar-core-bucket/src/bucket_list.rs` - Would need integration
+- `crates/stellar-core-bucket/PARITY_STATUS.md` - Detailed documentation
+
+**To Fix:**
+1. Add `BucketMergeMap` and `LiveMergeFutures` to `BucketManager`
+2. Before `AsyncMergeHandle::start_merge()`, check for existing/completed merge
+3. After merge completes, call `record_merge()`
+4. Wire up GC to call `forget_all_merges_producing()` when buckets are dropped
+
+---
+
 ## Limitations
 
 ### Testnet Only
