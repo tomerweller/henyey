@@ -675,13 +675,67 @@ impl ScpDriver {
 
     /// Record an externalized value.
     pub fn record_externalized(&self, slot: SlotIndex, value: Value) {
-        // Parse the StellarValue
-        let (tx_set_hash, close_time) =
+        // Parse the StellarValue and extract stellar_value_ext for logging
+        let (tx_set_hash, close_time, stellar_value_ext_desc) =
             if let Ok(sv) = StellarValue::from_xdr(&value, stellar_xdr::curr::Limits::none()) {
-                (Some(Hash256::from_bytes(sv.tx_set_hash.0)), sv.close_time.0)
+                let ext_desc = match &sv.ext {
+                    stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
+                    stellar_xdr::curr::StellarValueExt::Signed(sig) => {
+                        let node_id_bytes = match &sig.node_id.0 {
+                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+                        };
+                        format!(
+                            "Signed(node_id={}, sig_len={})",
+                            Hash256::from_bytes(node_id_bytes).to_hex(),
+                            sig.signature.len()
+                        )
+                    }
+                };
+                (
+                    Some(Hash256::from_bytes(sv.tx_set_hash.0)),
+                    sv.close_time.0,
+                    ext_desc,
+                )
             } else {
-                (None, 0)
+                (None, 0, "Unknown".to_string())
             };
+
+        // Check if we're overwriting an existing externalized value with different content
+        {
+            let existing = self.externalized.read();
+            if let Some(old) = existing.get(&slot) {
+                if old.value != value {
+                    // Parse old value's stellar_value_ext for comparison
+                    let old_ext_desc = if let Ok(old_sv) =
+                        StellarValue::from_xdr(&old.value, stellar_xdr::curr::Limits::none())
+                    {
+                        match &old_sv.ext {
+                            stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
+                            stellar_xdr::curr::StellarValueExt::Signed(sig) => {
+                                let node_id_bytes = match &sig.node_id.0 {
+                                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+                                        key.0
+                                    }
+                                };
+                                format!(
+                                    "Signed(node_id={}, sig_len={})",
+                                    Hash256::from_bytes(node_id_bytes).to_hex(),
+                                    sig.signature.len()
+                                )
+                            }
+                        }
+                    } else {
+                        "Unknown".to_string()
+                    };
+                    warn!(
+                        slot,
+                        old_stellar_value_ext = %old_ext_desc,
+                        new_stellar_value_ext = %stellar_value_ext_desc,
+                        "Overwriting externalized value with DIFFERENT value - this may cause hash mismatch!"
+                    );
+                }
+            }
+        }
 
         let externalized = ExternalizedSlot {
             slot,

@@ -782,6 +782,16 @@ impl BucketList {
         &self.levels
     }
 
+    /// Get the hash of each level along with curr and snap bucket hashes.
+    ///
+    /// Returns an iterator of (level_index, level_hash, curr_hash, snap_hash).
+    /// This is useful for debugging bucket list hash mismatches.
+    pub fn level_hashes(&self) -> impl Iterator<Item = (usize, Hash256, Hash256, Hash256)> + '_ {
+        self.levels.iter().enumerate().map(|(idx, level)| {
+            (idx, level.hash(), level.curr.hash(), level.snap.hash())
+        })
+    }
+
     /// Look up an entry by its key.
     ///
     /// Searches from the newest (level 0) to oldest levels.
@@ -2032,8 +2042,20 @@ impl BucketList {
                 evicted_keys.push(ttl_key);
                 data_entries_evicted += 1;
             } else if is_persistent_entry(live_entry) {
-                // Persistent entries go to hot archive AND are evicted from live
-                archived_entries.push(live_entry.clone());
+                // Persistent entries go to hot archive AND are evicted from live.
+                // IMPORTANT: We must archive the NEWEST version of the entry from the
+                // bucket list, not the potentially stale version we scanned. The entry
+                // we scanned might be from an older bucket level, and a newer version
+                // may exist in a lower (newer) level. Protocol V24+ requires archiving
+                // the newest version to ensure deterministic hot archive contents.
+                // See: BucketSnapshot.cpp scanForEviction() lines 247-261
+                let entry_to_archive = if let Some(newest_entry) = self.get(&key)? {
+                    newest_entry
+                } else {
+                    // Entry was deleted in a newer bucket; shouldn't happen but be safe
+                    live_entry.clone()
+                };
+                archived_entries.push(entry_to_archive);
                 evicted_keys.push(key);
                 evicted_keys.push(ttl_key);
                 data_entries_evicted += 1;

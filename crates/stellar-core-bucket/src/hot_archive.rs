@@ -481,6 +481,17 @@ impl HotArchiveBucketList {
         &self.levels
     }
 
+    /// Get the hash of each level along with curr and snap bucket hashes.
+    ///
+    /// Returns an iterator of (level_index, level_hash, curr_hash, snap_hash).
+    /// This is useful for debugging bucket list hash mismatches.
+    pub fn level_hashes(&self) -> impl Iterator<Item = (usize, Hash256, Hash256, Hash256)> + '_ {
+        self.levels
+            .iter()
+            .enumerate()
+            .map(|(idx, level)| (idx, level.hash(), level.curr.hash(), level.snap.hash()))
+    }
+
     /// Get a reference to a level.
     pub fn level(&self, idx: usize) -> Option<&HotArchiveBucketLevel> {
         self.levels.get(idx)

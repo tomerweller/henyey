@@ -1338,6 +1338,78 @@ impl LedgerManager {
                 skip_list_3 = %skip_list_3,
                 "Hash mismatch - our computed header hash differs from network's prev_ledger_hash"
             );
+
+            // Log detailed bucket list state for debugging hash mismatch
+            // This helps identify which specific level has diverged
+            {
+                let bucket_list = self.bucket_list.read();
+                let live_hash = bucket_list.hash();
+                tracing::error!(
+                    ledger_seq = state.header.ledger_seq,
+                    bucket_list_ledger_seq = bucket_list.ledger_seq(),
+                    live_bucket_list_hash = %live_hash.to_hex(),
+                    "HASH_MISMATCH_DEBUG: Live bucket list state"
+                );
+
+                // Log each level's curr and snap hashes
+                for (level, level_hash, curr_hash, snap_hash) in bucket_list.level_hashes() {
+                    tracing::error!(
+                        ledger_seq = state.header.ledger_seq,
+                        level = level,
+                        level_hash = %level_hash.to_hex(),
+                        curr_hash = %curr_hash.to_hex(),
+                        snap_hash = %snap_hash.to_hex(),
+                        "HASH_MISMATCH_DEBUG: Live bucket list level"
+                    );
+                }
+
+                // Log hot archive state if present
+                let hot_archive = self.hot_archive_bucket_list.read();
+                if let Some(ref ha) = *hot_archive {
+                    let hot_hash = ha.hash();
+                    tracing::error!(
+                        ledger_seq = state.header.ledger_seq,
+                        hot_archive_ledger_seq = ha.ledger_seq(),
+                        hot_archive_hash = %hot_hash.to_hex(),
+                        "HASH_MISMATCH_DEBUG: Hot archive bucket list state"
+                    );
+
+                    for (level, level_hash, curr_hash, snap_hash) in ha.level_hashes() {
+                        tracing::error!(
+                            ledger_seq = state.header.ledger_seq,
+                            level = level,
+                            level_hash = %level_hash.to_hex(),
+                            curr_hash = %curr_hash.to_hex(),
+                            snap_hash = %snap_hash.to_hex(),
+                            "HASH_MISMATCH_DEBUG: Hot archive bucket list level"
+                        );
+                    }
+
+                    // Log the combined hash computation
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(live_hash.as_bytes());
+                    hasher.update(hot_hash.as_bytes());
+                    let result = hasher.finalize();
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&result);
+                    let combined_hash = Hash256::from_bytes(bytes);
+                    tracing::error!(
+                        ledger_seq = state.header.ledger_seq,
+                        live_hash = %live_hash.to_hex(),
+                        hot_hash = %hot_hash.to_hex(),
+                        combined_hash = %combined_hash.to_hex(),
+                        header_bucket_list_hash = %Hash256::from(state.header.bucket_list_hash.0).to_hex(),
+                        "HASH_MISMATCH_DEBUG: Combined bucket list hash computation"
+                    );
+                } else {
+                    tracing::error!(
+                        ledger_seq = state.header.ledger_seq,
+                        "HASH_MISMATCH_DEBUG: No hot archive bucket list present!"
+                    );
+                }
+            }
+
             return Err(LedgerError::HashMismatch {
                 expected: state.header_hash.to_hex(),
                 actual: close_data.prev_ledger_hash.to_hex(),
@@ -1864,9 +1936,13 @@ impl<'a> LedgerCloseContext<'a> {
             results: self.tx_results.clone().try_into().unwrap_or_default(),
         };
         let tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
-        tracing::debug!(
+
+        // Log transaction results for debugging - helps identify tx execution differences
+        tracing::info!(
             ledger_seq = self.close_data.ledger_seq,
-            "Computed tx result hash"
+            tx_count = self.tx_results.len(),
+            tx_result_hash = %tx_result_hash.to_hex(),
+            "TX_RESULT: Transaction result hash computed"
         );
 
         let mut upgraded_header = self.prev_header.clone();
@@ -2003,36 +2079,44 @@ impl<'a> LedgerCloseContext<'a> {
                     // Use pre-loaded eviction settings (loaded before bucket list lock)
                     let eviction_settings = eviction_settings.unwrap_or_default();
 
-                    tracing::debug!(
+                    tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
-                        "Loading eviction iterator from bucket list"
+                        "EVICTION: Loading eviction iterator from bucket list"
                     );
                     let eviction_iterator = load_eviction_iterator_from_bucket_list(&bucket_list);
-                    tracing::debug!(
+                    tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
                         has_iterator = eviction_iterator.is_some(),
-                        "Loaded eviction iterator"
+                        iter_level = eviction_iterator.as_ref().map(|i| i.bucket_list_level),
+                        iter_is_curr = eviction_iterator.as_ref().map(|i| i.is_curr_bucket),
+                        iter_offset = eviction_iterator.as_ref().map(|i| i.bucket_file_offset),
+                        "EVICTION: Loaded eviction iterator from bucket list"
                     );
 
                     let iter = eviction_iterator.unwrap_or_else(|| {
-                        tracing::debug!(
+                        tracing::info!(
                             ledger_seq = self.close_data.ledger_seq,
-                            "Creating new EvictionIterator"
+                            starting_level = eviction_settings.starting_eviction_scan_level,
+                            "EVICTION: Creating new EvictionIterator (no entry found)"
                         );
                         EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
                     });
-                    tracing::debug!(
+                    tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
-                        "EvictionIterator ready"
+                        level = iter.bucket_list_level,
+                        is_curr = iter.is_curr_bucket,
+                        offset = iter.bucket_file_offset,
+                        "EVICTION: EvictionIterator ready"
                     );
 
-                    tracing::debug!(
+                    tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
                         start_level = iter.bucket_list_level,
                         start_is_curr = iter.is_curr_bucket,
                         start_offset = iter.bucket_file_offset,
                         scan_size = eviction_settings.eviction_scan_size,
-                        "Starting eviction scan"
+                        max_entries_to_archive = eviction_settings.max_entries_to_archive,
+                        "EVICTION: Starting eviction scan"
                     );
 
                     // Run eviction scan
@@ -2046,16 +2130,37 @@ impl<'a> LedgerCloseContext<'a> {
                         .map_err(LedgerError::Bucket)?;
                     let eviction_duration = eviction_start.elapsed();
 
-                    tracing::debug!(
+                    tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
                         bytes_scanned = eviction_result.bytes_scanned,
                         archived_count = eviction_result.archived_entries.len(),
                         evicted_count = eviction_result.evicted_keys.len(),
                         end_level = eviction_result.end_iterator.bucket_list_level,
                         end_is_curr = eviction_result.end_iterator.is_curr_bucket,
+                        end_offset = eviction_result.end_iterator.bucket_file_offset,
                         duration_ms = eviction_duration.as_millis(),
-                        "Incremental eviction scan completed"
+                        "EVICTION: Incremental eviction scan completed"
                     );
+
+                    // Log archived entries for debugging
+                    if !eviction_result.archived_entries.is_empty() {
+                        for (i, entry) in eviction_result.archived_entries.iter().enumerate() {
+                            let key_type = match &entry.data {
+                                LedgerEntryData::ContractData(cd) => {
+                                    format!("ContractData({:?})", cd.durability)
+                                }
+                                LedgerEntryData::ContractCode(_) => "ContractCode".to_string(),
+                                _ => format!("{:?}", std::mem::discriminant(&entry.data)),
+                            };
+                            tracing::info!(
+                                ledger_seq = self.close_data.ledger_seq,
+                                entry_index = i,
+                                key_type = %key_type,
+                                last_modified = entry.last_modified_ledger_seq,
+                                "EVICTION: Archived entry"
+                            );
+                        }
+                    }
 
                     // Add evicted keys to dead entries
                     dead_entries.extend(eviction_result.evicted_keys);
@@ -2288,6 +2393,65 @@ impl<'a> LedgerCloseContext<'a> {
                 );
             }
 
+            // Compute hashes of entries being added for debugging
+            // This allows us to compare with expected values when a mismatch occurs
+            let init_entries_hash = {
+                use sha2::{Digest, Sha256};
+                use stellar_xdr::curr::{Limits, WriteXdr};
+                let mut hasher = Sha256::new();
+                for entry in &init_entries {
+                    if let Ok(xdr) = entry.to_xdr(Limits::none()) {
+                        hasher.update(&xdr);
+                    }
+                }
+                let result = hasher.finalize();
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&result);
+                Hash256::from_bytes(bytes)
+            };
+            let live_entries_hash = {
+                use sha2::{Digest, Sha256};
+                use stellar_xdr::curr::{Limits, WriteXdr};
+                let mut hasher = Sha256::new();
+                for entry in &live_entries {
+                    if let Ok(xdr) = entry.to_xdr(Limits::none()) {
+                        hasher.update(&xdr);
+                    }
+                }
+                let result = hasher.finalize();
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&result);
+                Hash256::from_bytes(bytes)
+            };
+            let dead_entries_hash = {
+                use sha2::{Digest, Sha256};
+                use stellar_xdr::curr::{Limits, WriteXdr};
+                let mut hasher = Sha256::new();
+                for key in &dead_entries {
+                    if let Ok(xdr) = key.to_xdr(Limits::none()) {
+                        hasher.update(&xdr);
+                    }
+                }
+                let result = hasher.finalize();
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&result);
+                Hash256::from_bytes(bytes)
+            };
+
+            // Log the inputs to add_batch - this is critical for debugging mismatches
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                init_count = init_entries.len(),
+                live_count = live_entries.len(),
+                dead_count = dead_entries.len(),
+                init_entries_hash = %init_entries_hash.to_hex(),
+                live_entries_hash = %live_entries_hash.to_hex(),
+                dead_entries_hash = %dead_entries_hash.to_hex(),
+                pre_add_batch_hash = %bucket_list.hash().to_hex(),
+                bucket_list_ledger_seq = bucket_list.ledger_seq(),
+                "BUCKET_INPUT: Entries being added to live bucket list"
+            );
+
             bucket_list.add_batch(
                 self.close_data.ledger_seq,
                 protocol_version,
@@ -2299,10 +2463,10 @@ impl<'a> LedgerCloseContext<'a> {
 
             let live_hash = bucket_list.hash();
 
-            tracing::debug!(
+            tracing::info!(
                 ledger_seq = self.close_data.ledger_seq,
                 post_add_batch_hash = %live_hash.to_hex(),
-                "Bucket list state after add_batch"
+                "BUCKET_OUTPUT: Live bucket list hash after add_batch"
             );
 
             // For Protocol 23+, update hot archive and combine bucket list hashes
@@ -2326,6 +2490,48 @@ impl<'a> LedgerCloseContext<'a> {
                     // Must call add_batch even with empty entries to maintain spill consistency
                     // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
                     let pre_hot_hash = hot_archive.hash();
+
+                    // Compute hashes of hot archive inputs for debugging
+                    let archived_entries_hash = {
+                        use sha2::{Digest, Sha256};
+                        use stellar_xdr::curr::{Limits, WriteXdr};
+                        let mut hasher = Sha256::new();
+                        for entry in &archived_entries {
+                            if let Ok(xdr) = entry.to_xdr(Limits::none()) {
+                                hasher.update(&xdr);
+                            }
+                        }
+                        let result = hasher.finalize();
+                        let mut bytes = [0u8; 32];
+                        bytes.copy_from_slice(&result);
+                        Hash256::from_bytes(bytes)
+                    };
+                    let restored_keys_hash = {
+                        use sha2::{Digest, Sha256};
+                        use stellar_xdr::curr::{Limits, WriteXdr};
+                        let mut hasher = Sha256::new();
+                        for key in &self.hot_archive_restored_keys {
+                            if let Ok(xdr) = key.to_xdr(Limits::none()) {
+                                hasher.update(&xdr);
+                            }
+                        }
+                        let result = hasher.finalize();
+                        let mut bytes = [0u8; 32];
+                        bytes.copy_from_slice(&result);
+                        Hash256::from_bytes(bytes)
+                    };
+
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        archived_count = archived_entries.len(),
+                        restored_count = self.hot_archive_restored_keys.len(),
+                        archived_entries_hash = %archived_entries_hash.to_hex(),
+                        restored_keys_hash = %restored_keys_hash.to_hex(),
+                        pre_hot_hash = %pre_hot_hash.to_hex(),
+                        hot_archive_ledger_seq = hot_archive.ledger_seq(),
+                        "BUCKET_INPUT: Entries being added to hot archive bucket list"
+                    );
+
                     hot_archive.add_batch(
                         self.close_data.ledger_seq,
                         protocol_version,
@@ -2335,6 +2541,13 @@ impl<'a> LedgerCloseContext<'a> {
 
                     use sha2::{Digest, Sha256};
                     let hot_hash = hot_archive.hash();
+
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        post_hot_hash = %hot_hash.to_hex(),
+                        "BUCKET_OUTPUT: Hot archive bucket list hash after add_batch"
+                    );
+
                     let mut hasher = Sha256::new();
                     hasher.update(live_hash.as_bytes());
                     hasher.update(hot_hash.as_bytes());
@@ -2343,15 +2556,12 @@ impl<'a> LedgerCloseContext<'a> {
                     bytes.copy_from_slice(&result);
                     let combined_hash = Hash256::from_bytes(bytes);
 
-                    tracing::debug!(
+                    tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
                         live_hash = %live_hash.to_hex(),
-                        pre_hot_hash = %pre_hot_hash.to_hex(),
-                        post_hot_hash = %hot_hash.to_hex(),
+                        hot_hash = %hot_hash.to_hex(),
                         combined_hash = %combined_hash.to_hex(),
-                        archived_count = archived_entries.len(),
-                        restored_count = self.hot_archive_restored_keys.len(),
-                        "Bucket list hash computation"
+                        "BUCKET_OUTPUT: Combined bucket list hash"
                     );
                     combined_hash
                 } else {
@@ -2502,6 +2712,15 @@ impl<'a> LedgerCloseContext<'a> {
             upgrades_count = new_header.scp_value.upgrades.len(),
             stellar_value_ext = %stellar_value_ext_desc,
             prev_header_hash = %self.prev_header_hash.to_hex(),
+            skip_list_0 = %Hash256::from(new_header.skip_list[0].clone()).to_hex(),
+            skip_list_1 = %Hash256::from(new_header.skip_list[1].clone()).to_hex(),
+            skip_list_2 = %Hash256::from(new_header.skip_list[2].clone()).to_hex(),
+            skip_list_3 = %Hash256::from(new_header.skip_list[3].clone()).to_hex(),
+            id_pool = new_header.id_pool,
+            inflation_seq = new_header.inflation_seq,
+            base_fee = new_header.base_fee,
+            base_reserve = new_header.base_reserve,
+            max_tx_set_size = new_header.max_tx_set_size,
             "Ledger closed"
         );
 

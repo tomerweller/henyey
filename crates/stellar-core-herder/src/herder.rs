@@ -683,12 +683,36 @@ impl Herder {
         {
             // Extract value and tx_set_hash upfront before any potential move
             let value = ext.commit.value.clone();
-            let tx_set_hash = if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
-                Hash256::from_bytes(sv.tx_set_hash.0)
+            let (tx_set_hash, stellar_value_ext_desc) = if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
+                let ext_desc = match &sv.ext {
+                    stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
+                    stellar_xdr::curr::StellarValueExt::Signed(sig) => {
+                        let node_id_bytes = match &sig.node_id.0 {
+                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+                        };
+                        format!(
+                            "Signed(node_id={}, sig_len={})",
+                            Hash256::from_bytes(node_id_bytes).to_hex(),
+                            sig.signature.len()
+                        )
+                    }
+                };
+                (Hash256::from_bytes(sv.tx_set_hash.0), ext_desc)
             } else {
                 warn!(slot, "Failed to parse StellarValue from EXTERNALIZE");
                 return EnvelopeState::Invalid;
             };
+            
+            // Log the sender and stellar_value_ext for debugging
+            let sender_bytes = match &envelope.statement.node_id.0 {
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+            };
+            debug!(
+                slot,
+                sender = %Hash256::from_bytes(sender_bytes).to_hex(),
+                stellar_value_ext = %stellar_value_ext_desc,
+                "Received EXTERNALIZE message"
+            );
 
             // Only request tx sets for slots we haven't already closed via catchup
             if lcl.map_or(true, |l| slot > l) {
