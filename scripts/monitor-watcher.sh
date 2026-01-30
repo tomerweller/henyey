@@ -83,8 +83,9 @@ run_check() {
     log_message "Launching OpenCode for detailed check..."
     cd "$PROJECT_DIR"
     
-    # Run opencode with the prompt (non-interactive mode)
-    echo "$PROMPT" | opencode --dangerously-skip-permissions 2>&1 | tee -a "$LOG_DIR/opencode-$(date '+%Y%m%d-%H%M%S').log"
+    # Run opencode with the prompt (non-interactive mode using 'run' command)
+    # Note: opencode run auto-approves permissions, no flag needed
+    opencode run "$PROMPT" 2>&1 | tee -a "$LOG_DIR/opencode-$(date '+%Y%m%d-%H%M%S').log"
     
     log_message "OpenCode check completed"
 }
