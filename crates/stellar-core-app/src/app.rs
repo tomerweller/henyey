@@ -451,6 +451,10 @@ struct ConsensusStuckState {
     last_recovery_attempt: Instant,
     /// Number of recovery attempts made.
     recovery_attempts: u32,
+    /// Whether we've already triggered catchup for this stuck state.
+    /// Set to true when catchup is triggered, prevents repeated catchup attempts
+    /// when archive has no newer checkpoint available.
+    catchup_triggered: bool,
 }
 
 /// Actions to take when consensus is stuck.
@@ -3974,7 +3978,19 @@ impl App {
                                 CONSENSUS_STUCK_TIMEOUT_SECS
                             };
 
-                            if elapsed >= effective_timeout {
+                            // If we've already triggered catchup for this stuck state and it
+                            // was skipped (no newer checkpoint), don't trigger again until the
+                            // archive cooldown expires. The recently_caught_up check combined
+                            // with catchup_triggered prevents repeated catchup attempts.
+                            if state.catchup_triggered && recently_caught_up {
+                                tracing::debug!(
+                                    current_ledger,
+                                    first_buffered,
+                                    elapsed_secs = elapsed,
+                                    "Catchup already triggered, waiting for archive cooldown"
+                                );
+                                ConsensusStuckAction::Wait
+                            } else if elapsed >= effective_timeout {
                                 tracing::warn!(
                                     current_ledger,
                                     first_buffered,
@@ -3988,9 +4004,11 @@ impl App {
                                     recovery_failed,
                                     recently_caught_up,
                                     effective_timeout,
+                                    catchup_triggered = state.catchup_triggered,
                                     "Buffered catchup stuck timeout; triggering catchup"
                                 );
-                                *stuck_state = None;
+                                // Mark that we've triggered catchup for this stuck state
+                                state.catchup_triggered = true;
                                 // Reset the exhausted flag since we're triggering catchup
                                 self.tx_set_all_peers_exhausted
                                     .store(false, Ordering::SeqCst);
@@ -4037,6 +4055,7 @@ impl App {
                                 stuck_start: now,
                                 last_recovery_attempt: now,
                                 recovery_attempts: 0,
+                                catchup_triggered: false,
                             });
                             ConsensusStuckAction::AttemptRecovery
                         }
@@ -4185,6 +4204,9 @@ impl App {
                 let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
 
                 if catchup_did_work {
+                    // Reset stuck state - catchup made progress, so we're no longer stuck
+                    *self.consensus_stuck_state.write().await = None;
+                    
                     *self.current_ledger.write().await = result.ledger_seq;
                     *self.last_processed_slot.write().await = result.ledger_seq as u64;
                     self.clear_tx_advert_history(result.ledger_seq).await;
@@ -4214,6 +4236,7 @@ impl App {
                 } else {
                     // Catchup was skipped (already at or past target)
                     // Don't reset tx_set tracking - preserve pending requests
+                    // Don't reset stuck_state - we're still stuck, just waiting for next checkpoint
                     tracing::info!(
                         ledger_seq = result.ledger_seq,
                         "Buffered catchup skipped (already at target); preserving tx_set tracking"
@@ -7722,11 +7745,13 @@ mod tests {
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
             recovery_attempts: 0,
+            catchup_triggered: false,
         };
 
         assert_eq!(state.current_ledger, 1000);
         assert_eq!(state.first_buffered, 1001);
         assert_eq!(state.recovery_attempts, 0);
+        assert!(!state.catchup_triggered);
     }
 
     #[test]
