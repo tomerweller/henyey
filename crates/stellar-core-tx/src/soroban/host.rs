@@ -1379,8 +1379,11 @@ pub fn execute_host_function_with_cache(
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<&dyn super::HotArchiveLookup>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
+    eprintln!("[TIMING] execute_host_function_with_cache: entry, protocol={}, has_module_cache={}, ro_keys={}, rw_keys={}",
+        context.protocol_version, module_cache.is_some(), soroban_data.resources.footprint.read_only.len(), soroban_data.resources.footprint.read_write.len());
     if context.protocol_version >= 25 {
         let p25_cache = module_cache.and_then(|c| c.as_p25());
+        eprintln!("[TIMING] Dispatching to P25 path, has_p25_cache={}", p25_cache.is_some());
         return execute_host_function_p25(
             host_function,
             auth_entries,
@@ -1394,6 +1397,7 @@ pub fn execute_host_function_with_cache(
         );
     }
     let p24_cache = module_cache.and_then(|c| c.as_p24());
+    tracing::info!(has_p24_cache = p24_cache.is_some(), "Dispatching to P24 path");
     execute_host_function_p24(
         host_function,
         auth_entries,
@@ -1634,6 +1638,7 @@ fn execute_host_function_p24(
         Ok(())
     };
 
+    let footprint_start = std::time::Instant::now();
     for key in soroban_data.resources.footprint.read_only.iter() {
         let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(|| {
             make_setup_error(HostErrorP25::from(
@@ -1755,26 +1760,22 @@ fn execute_host_function_p24(
         }
     }
 
-    tracing::debug!(
+    let footprint_elapsed = footprint_start.elapsed();
+    tracing::info!(
         ledger_entries_count = encoded_ledger_entries.len(),
         ttl_entries_count = encoded_ttl_entries.len(),
-        envelope_restored_count = restored_rw_entry_indices.len(),
         actual_restored_count = actual_restored_indices.len(),
-        live_bl_restore_count = live_bl_restores.len(),
+        footprint_ms = footprint_elapsed.as_millis() as u64,
         "P24: Prepared entries for e2e_invoke"
     );
 
     // Use existing module cache if provided, otherwise build one from the footprint.
-    // When a persistent cache is provided, it should already contain all contracts
-    // from the bucket list, so we just use it directly. Otherwise we fall back to
-    // building a per-transaction cache from the footprint.
+    let cache_start = std::time::Instant::now();
     let module_cache = if let Some(cache) = existing_cache {
-        tracing::debug!("P24: Using existing persistent module cache");
+        tracing::info!("P24: Using existing persistent module cache");
         Some(cache.clone())
     } else {
-        // Build module cache with pre-compiled contracts from the footprint.
-        // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
-        // all WASM contracts outside of transaction budgets.
+        tracing::info!("P24: FALLBACK - building per-TX module cache from footprint");
         build_module_cache_for_footprint(
             state,
             &soroban_data.resources.footprint,
@@ -1782,8 +1783,15 @@ fn execute_host_function_p24(
             context.sequence,
         )
     };
+    let cache_elapsed = cache_start.elapsed();
+    tracing::info!(
+        cache_ms = cache_elapsed.as_millis() as u64,
+        has_cache = module_cache.is_some(),
+        "P24: Module cache ready"
+    );
 
     // Call e2e_invoke - iterator yields &Vec<u8> which implements AsRef<[u8]>
+    let invoke_start = std::time::Instant::now();
     let mut diagnostic_events: Vec<soroban_env_host24::xdr::DiagnosticEvent> = Vec::new();
     let result = match e2e_invoke::invoke_host_function(
         &budget,
@@ -1801,15 +1809,26 @@ fn execute_host_function_p24(
         None, // trace_hook
         module_cache,
     ) {
-        Ok(r) => r,
+        Ok(r) => {
+            let invoke_elapsed = invoke_start.elapsed();
+            tracing::info!(
+                invoke_ms = invoke_elapsed.as_millis() as u64,
+                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                "P24: e2e_invoke completed successfully"
+            );
+            r
+        }
         Err(e) => {
+            let invoke_elapsed = invoke_start.elapsed();
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
             let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
-            tracing::debug!(
+            tracing::info!(
+                invoke_ms = invoke_elapsed.as_millis() as u64,
                 cpu_consumed = cpu_insns_consumed,
                 mem_consumed = mem_bytes_consumed,
                 diagnostic_events = diagnostic_events.len(),
-                "Soroban e2e_invoke failed"
+                "P24: e2e_invoke FAILED"
             );
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p24_to_p25(e),
@@ -2177,6 +2196,7 @@ fn execute_host_function_p25(
         Ok(())
     };
 
+    let footprint_start = std::time::Instant::now();
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
             add_entry(key, entry.as_ref(), live_until)?;
@@ -2274,26 +2294,17 @@ fn execute_host_function_p25(
         }
     }
 
-    tracing::debug!(
-        ledger_entries_count = encoded_ledger_entries.len(),
-        ttl_entries_count = encoded_ttl_entries.len(),
-        envelope_restored_count = restored_rw_entry_indices.len(),
-        actual_restored_count = actual_restored_indices.len(),
-        live_bl_restore_count = live_bl_restores.len(),
-        "P25: Prepared entries for e2e_invoke"
-    );
+    let footprint_elapsed = footprint_start.elapsed();
+    eprintln!("[TIMING] P25: Prepared entries for e2e_invoke: ledger_entries={}, ttl_entries={}, restored={}, footprint_ms={}",
+        encoded_ledger_entries.len(), encoded_ttl_entries.len(), actual_restored_indices.len(), footprint_elapsed.as_millis());
 
     // Use existing module cache if provided, otherwise build one from the footprint.
-    // When a persistent cache is provided, it should already contain all contracts
-    // from the bucket list, so we just use it directly. Otherwise we fall back to
-    // building a per-transaction cache from the footprint.
+    let cache_start = std::time::Instant::now();
     let module_cache = if let Some(cache) = existing_cache {
-        tracing::debug!("P25: Using existing persistent module cache");
+        eprintln!("[TIMING] P25: Using existing persistent module cache");
         Some(cache.clone())
     } else {
-        // Build module cache with pre-compiled contracts from the footprint.
-        // This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
-        // all WASM contracts outside of transaction budgets.
+        eprintln!("[TIMING] P25: FALLBACK - building per-TX module cache from footprint");
         build_module_cache_for_footprint_p25(
             state,
             &soroban_data.resources.footprint,
@@ -2301,7 +2312,10 @@ fn execute_host_function_p25(
             context.sequence,
         )
     };
+    let cache_elapsed = cache_start.elapsed();
+    eprintln!("[TIMING] P25: Module cache ready: cache_ms={}, has_cache={}", cache_elapsed.as_millis(), module_cache.is_some());
 
+    let invoke_start = std::time::Instant::now();
     let mut diagnostic_events: Vec<soroban_env_host25::xdr::DiagnosticEvent> = Vec::new();
 
     let result = match e2e_invoke::invoke_host_function(
@@ -2320,18 +2334,18 @@ fn execute_host_function_p25(
         None,
         module_cache,
     ) {
-        Ok(r) => r,
+        Ok(r) => {
+            let invoke_elapsed = invoke_start.elapsed();
+            eprintln!("[TIMING] P25: e2e_invoke completed successfully: invoke_ms={}, cpu_consumed={}, mem_consumed={}",
+                invoke_elapsed.as_millis(), budget.get_cpu_insns_consumed().unwrap_or(0), budget.get_mem_bytes_consumed().unwrap_or(0));
+            r
+        }
         Err(e) => {
+            let invoke_elapsed = invoke_start.elapsed();
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
             let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
-            tracing::warn!(
-                cpu_consumed = cpu_insns_consumed,
-                mem_consumed = mem_bytes_consumed,
-                diagnostic_events = diagnostic_events.len(),
-                error = %e,
-                "P25: Soroban e2e_invoke failed"
-            );
-            // Log diagnostic events for debugging crypto errors
+            eprintln!("[TIMING] P25: e2e_invoke FAILED: invoke_ms={}, cpu_consumed={}, mem_consumed={}, error={}",
+                invoke_elapsed.as_millis(), cpu_insns_consumed, mem_bytes_consumed, e);
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host25::xdr::WriteXdr as _;
                 if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {

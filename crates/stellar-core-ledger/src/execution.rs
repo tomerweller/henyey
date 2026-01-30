@@ -106,7 +106,7 @@ impl stellar_core_tx::soroban::HotArchiveLookup for HotArchiveLookupImpl {
             }
         };
         match hot_archive.get(key) {
-            Ok(Some(entry)) => Some(entry.clone()),
+            Ok(Some(entry)) => Some(entry),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!(
@@ -1331,32 +1331,82 @@ impl TransactionExecutor {
         Ok(())
     }
 
-    fn load_orderbook_offers(&mut self, snapshot: &SnapshotHandle) -> Result<()> {
+    /// Load all orderbook offers from the snapshot into state.
+    ///
+    /// Called once per ledger during initialization, before any transactions execute.
+    /// Offers remain current across transactions because TX execution modifies them
+    /// directly in `self.state`, and `snapshot_delta()` preserves committed changes
+    /// between transactions.
+    pub fn load_orderbook_offers(&mut self, snapshot: &SnapshotHandle) -> Result<()> {
         let entries = snapshot.all_entries()?;
         for entry in entries {
-            let LedgerEntryData::Offer(offer) = &entry.data else {
-                continue;
-            };
-            // Only load offers that haven't been touched this ledger.
-            // This preserves modifications (including deletions) made by previous transactions.
-            // We check both:
-            // 1. The entry currently exists in state (modified but not deleted)
-            // 2. The entry was deleted in the delta (by a previous tx)
-            let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
-                seller_id: offer.seller_id.clone(),
-                offer_id: offer.offer_id,
-            });
-            if self.state.get_entry(&offer_key).is_some() {
+            if !matches!(entry.data, LedgerEntryData::Offer(_)) {
                 continue;
             }
-            // Also check if the offer was deleted in the delta (by a previous tx)
-            if self.state.delta().deleted_keys().contains(&offer_key) {
-                continue;
-            }
-            let offer = offer.clone();
             self.state.load_entry(entry);
-            self.load_offer_dependencies(snapshot, &offer)?;
         }
+        Ok(())
+    }
+
+    /// Pre-load account and trustline dependencies for offers matching specific asset pairs.
+    ///
+    /// Instead of loading dependencies for ALL 911K offers upfront (which causes ~2.7M
+    /// individual bucket list lookups taking 15+ minutes on mainnet), we only load
+    /// dependencies for offers that could be crossed by the current operation.
+    /// A typical path payment touches only a few thousand offers across 2-4 asset pairs.
+    fn load_offer_dependencies_for_assets(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        assets: &[stellar_xdr::curr::Asset],
+    ) -> Result<()> {
+        use std::collections::HashSet;
+
+        // Collect unique seller IDs for account loading
+        let mut seller_ids: HashSet<AccountId> = HashSet::new();
+        // Collect unique (seller, asset) pairs for trustline loading
+        // A seller may have offers in multiple asset pairs, so we must track
+        // trustlines per-seller-per-asset, not per-seller.
+        let mut trustline_keys: HashSet<(AccountId, String)> = HashSet::new();
+        let mut trustlines_to_load: Vec<(AccountId, stellar_xdr::curr::Asset)> = Vec::new();
+
+        // For each pair of assets (A, B), find offers selling A for B or B for A
+        for i in 0..assets.len() {
+            for j in 0..assets.len() {
+                if i == j {
+                    continue;
+                }
+                // Get offers where buying=assets[i], selling=assets[j]
+                for offer in self.state.offers_for_asset_pair(&assets[i], &assets[j]) {
+                    seller_ids.insert(offer.seller_id.clone());
+                    // Track non-native assets that need trustline loading
+                    if !matches!(&offer.selling, stellar_xdr::curr::Asset::Native) {
+                        let key = (offer.seller_id.clone(), format!("{:?}", &offer.selling));
+                        if trustline_keys.insert(key) {
+                            trustlines_to_load.push((offer.seller_id.clone(), offer.selling.clone()));
+                        }
+                    }
+                    if !matches!(&offer.buying, stellar_xdr::curr::Asset::Native) {
+                        let key = (offer.seller_id.clone(), format!("{:?}", &offer.buying));
+                        if trustline_keys.insert(key) {
+                            trustlines_to_load.push((offer.seller_id.clone(), offer.buying.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Load accounts
+        for seller_id in &seller_ids {
+            self.load_account(snapshot, seller_id)?;
+        }
+
+        // Load trustlines
+        for (seller_id, asset) in &trustlines_to_load {
+            if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                self.load_trustline(snapshot, seller_id, &tl_asset)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -2605,8 +2655,6 @@ impl TransactionExecutor {
         let mut soroban_return_value = None;
         let mut all_success = true;
         let mut failure = None;
-        let mut orderbook_loaded = false;
-
         // For multi-operation transactions, C++ stellar-core records STATE/UPDATED
         // for every accessed entry per operation, even if values are identical.
         // For single-operation transactions, it only records if values changed.
@@ -2632,9 +2680,14 @@ impl TransactionExecutor {
                 let op_delta_before = delta_snapshot(&self.state);
                 self.state.begin_op_snapshot();
 
-                if !orderbook_loaded && op_requires_orderbook(&op.body) {
-                    self.load_orderbook_offers(snapshot)?;
-                    orderbook_loaded = true;
+                // For orderbook operations, lazily load account/trustline dependencies
+                // only for offers matching this operation's specific asset pairs.
+                // Offers themselves are already loaded during ledger initialization.
+                if op_requires_orderbook(&op.body) {
+                    let assets = extract_operation_assets(&op.body);
+                    if !assets.is_empty() {
+                        self.load_offer_dependencies_for_assets(snapshot, &assets)?;
+                    }
                 }
 
                 // Load any accounts needed for this operation
@@ -2934,6 +2987,8 @@ impl TransactionExecutor {
                     Err(e) => {
                         self.state.end_op_snapshot();
                         all_success = false;
+                        eprintln!("[ERROR] execute_single_operation failed: op_index={}, op_type={:?}, error={:?}",
+                            op_index, OperationType::from_body(&op.body), e);
                         debug!(
                             error = %e,
                             op_index = op_index,
@@ -3551,6 +3606,55 @@ fn op_requires_orderbook(op: &OperationBody) -> bool {
             | OperationBody::PathPaymentStrictSend(_)
             | OperationBody::PathPaymentStrictReceive(_)
     )
+}
+
+/// Extract assets involved in an orderbook operation so we can lazily load
+/// only the offer dependencies for relevant asset pairs.
+fn extract_operation_assets(op: &OperationBody) -> Vec<stellar_xdr::curr::Asset> {
+    use std::collections::HashSet;
+    use stellar_xdr::curr::Asset;
+
+    let mut assets = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut add = |asset: &Asset| {
+        let key = format!("{:?}", asset);
+        if seen.insert(key) {
+            assets.push(asset.clone());
+        }
+    };
+
+    match op {
+        OperationBody::PathPaymentStrictReceive(pp) => {
+            add(&pp.send_asset);
+            add(&pp.dest_asset);
+            for a in pp.path.iter() {
+                add(a);
+            }
+        }
+        OperationBody::PathPaymentStrictSend(pp) => {
+            add(&pp.send_asset);
+            add(&pp.dest_asset);
+            for a in pp.path.iter() {
+                add(a);
+            }
+        }
+        OperationBody::ManageSellOffer(o) => {
+            add(&o.selling);
+            add(&o.buying);
+        }
+        OperationBody::ManageBuyOffer(o) => {
+            add(&o.selling);
+            add(&o.buying);
+        }
+        OperationBody::CreatePassiveSellOffer(o) => {
+            add(&o.selling);
+            add(&o.buying);
+        }
+        _ => {}
+    }
+
+    assets
 }
 
 #[derive(Clone, Copy)]
@@ -5348,6 +5452,9 @@ pub fn execute_transaction_set_with_fee_mode(
     if let Some(ha) = hot_archive {
         executor.set_hot_archive(ha);
     }
+
+    // Load all orderbook offers before executing any transactions
+    executor.load_orderbook_offers(snapshot)?;
 
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());

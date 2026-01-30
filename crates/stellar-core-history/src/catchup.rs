@@ -1012,10 +1012,11 @@ impl CatchupManager {
         }
 
         // Restore the live bucket list
-        let bucket_list =
+        let mut bucket_list =
             BucketList::restore_from_hashes(&live_hashes, load_bucket).map_err(|e| {
                 HistoryError::CatchupFailed(format!("Failed to restore live bucket list: {}", e))
             })?;
+        bucket_list.set_bucket_dir(bucket_dir.to_path_buf());
 
         // Log the restored bucket list hash
         info!("Live bucket list restored hash: {}", bucket_list.hash());

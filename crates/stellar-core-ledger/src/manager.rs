@@ -40,9 +40,10 @@ use crate::{
 };
 use indexmap::IndexMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use stellar_core_bucket::{
-    BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
+    BucketEntry, BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
 };
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::queries::offers as offers_db;
@@ -326,6 +327,11 @@ pub struct LedgerManager {
     /// This avoids expensive full bucket list scans during orderbook operations.
     offers_initialized: Arc<RwLock<bool>>,
 
+    /// In-memory cache of all live offers, keyed by offer_id.
+    /// Populated during initialize_all_caches() and updated on each ledger close.
+    /// Eliminates the need to query SQL for orderbook operations.
+    offer_store: Arc<RwLock<HashMap<i64, LedgerEntry>>>,
+
     /// In-memory Soroban state for Protocol 20+ contract data/code tracking.
     ///
     /// This tracks all CONTRACT_DATA, CONTRACT_CODE, and TTL entries in memory,
@@ -368,6 +374,7 @@ impl LedgerManager {
             config,
             module_cache: RwLock::new(None),
             offers_initialized: Arc::new(RwLock::new(false)),
+            offer_store: Arc::new(RwLock::new(HashMap::new())),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
         }
     }
@@ -1047,19 +1054,27 @@ impl LedgerManager {
         })
     }
 
-    /// Initialize all caches from the bucket list in a single pass.
+    /// Initialize all caches from the bucket list using per-type scanning.
     ///
-    /// This is an optimization over calling `initialize_module_cache()`,
-    /// `initialize_offers_sql()`, and `initialize_soroban_state()` separately,
-    /// which would each call `live_entries()` and create full copies of all
-    /// entries. On testnet with millions of entries, this saves several GB
-    /// of temporary memory allocations.
+    /// Instead of iterating all ~60M entries with a single dedup HashSet (~8.6 GB
+    /// on mainnet), this performs separate scans per entry type. Each scan maintains
+    /// its own dedup set scoped to that type's keys, with peak memory ~240 MB
+    /// (for ContractData with ~1.68M keys). The dedup set is freed between scans.
+    ///
+    /// Scan order:
+    /// 1. Offers -> SQL bulk insert (dedup: ~912K keys, ~130 MB)
+    /// 2. ContractCode -> module cache + soroban state (dedup: ~874 keys, tiny)
+    /// 3. ContractData -> soroban state (dedup: ~1.68M keys, ~240 MB)
+    /// 4. TTL -> soroban state (dedup: ~1.68M keys, ~240 MB)
+    /// 5. ConfigSetting -> soroban state (dedup: ~17 keys, tiny)
     fn initialize_all_caches(&self, protocol_version: u32, ledger_seq: u32) -> Result<()> {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
+        use stellar_xdr::curr::LedgerEntryType;
 
         let bucket_list = self.bucket_list.read();
+        let cache_init_start = std::time::Instant::now();
 
-        // Load rent config before iterating (uses point lookups, not full scan)
+        // Load rent config before scanning (uses point lookups, not full scan)
         let rent_config = self.load_soroban_rent_config(&bucket_list);
 
         // Create module cache if Soroban is supported
@@ -1073,7 +1088,8 @@ impl LedgerManager {
         let mut soroban_state = self.soroban_state.write();
         soroban_state.clear();
 
-        // Initialize SQL offers table
+        // --- Scan 1: Offers -> SQL table ---
+        info!("Cache init: scanning Offer entries...");
         let mut conn = self.db.connection().map_err(LedgerError::from)?;
         offers_db::drop_offers(&conn)
             .map_err(|e| LedgerError::Internal(format!("Failed to drop offers table: {}", e)))?;
@@ -1081,78 +1097,98 @@ impl LedgerManager {
             .transaction()
             .map_err(|e| LedgerError::Internal(format!("Failed to start transaction: {}", e)))?;
 
-        // Prepare offer batch for SQL bulk insert
         let mut offer_batch: Vec<LedgerEntry> = Vec::with_capacity(1000);
         let mut offer_count = 0u64;
+        let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
         const BATCH_SIZE: usize = 1000;
 
-        // Counters for logging
-        let mut contracts_added = 0u64;
-        let mut data_count = 0u64;
-        let mut code_count = 0u64;
-        let mut ttl_count = 0u64;
-        let mut config_count = 0u64;
-        let mut entry_count = 0u64;
+        bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
+            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                // Insert into persistent in-memory store
+                if let LedgerEntryData::Offer(ref offer) = entry.data {
+                    mem_offers.insert(offer.offer_id, entry.clone());
+                }
 
-        // Stream through all live entries without full materialization
-        // This uses HashSet<LedgerKey> for deduplication instead of loading everything into memory
-        for entry_result in bucket_list.live_entries_iter() {
-            let entry = entry_result.map_err(|e| {
-                LedgerError::Internal(format!(
-                    "Failed to iterate live entries for initialization: {}",
-                    e
-                ))
+                offer_batch.push(entry.clone());
+                if offer_batch.len() >= BATCH_SIZE {
+                    if let Err(e) = offers_db::bulk_upsert_offers(&tx, &offer_batch) {
+                        tracing::warn!(error = %e, "Failed to bulk upsert offers");
+                    }
+                    offer_count += offer_batch.len() as u64;
+                    offer_batch.clear();
+                }
+            }
+            true
+        });
+
+        if !offer_batch.is_empty() {
+            offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
+                LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
             })?;
-            entry_count += 1;
-            match &entry.data {
-                // Offers -> SQL table (batched insert)
-                LedgerEntryData::Offer(_) => {
-                    offer_batch.push(entry);
-                    if offer_batch.len() >= BATCH_SIZE {
-                        offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
-                            LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
-                        })?;
-                        offer_count += offer_batch.len() as u64;
-                        offer_batch.clear();
-                    }
-                }
+            offer_count += offer_batch.len() as u64;
+        }
 
-                // Contract code -> module cache + soroban state
-                LedgerEntryData::ContractCode(contract_code) => {
-                    // Add to module cache
-                    if let Some(ref cache) = module_cache {
-                        if cache.add_contract(contract_code.code.as_slice(), protocol_version) {
-                            contracts_added += 1;
+        tx.commit()
+            .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
+
+        // Store in persistent in-memory offer store
+        *self.offer_store.write() = mem_offers;
+
+        info!(offer_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: Offer scan complete");
+
+        // --- Scan 2: ContractCode -> module cache + soroban state ---
+        let mut contracts_added = 0u64;
+        let mut code_count = 0u64;
+        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+            info!("Cache init: scanning ContractCode entries...");
+            bucket_list.scan_for_entries_of_type(LedgerEntryType::ContractCode, |be| {
+                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                    if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
+                        if let Some(ref cache) = module_cache {
+                            if cache.add_contract(contract_code.code.as_slice(), protocol_version) {
+                                contracts_added += 1;
+                            }
                         }
                     }
-                    // Add to soroban state
-                    if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-                        if let Err(e) = soroban_state.create_contract_code(
-                            entry.clone(),
-                            protocol_version,
-                            rent_config.as_ref(),
-                        ) {
-                            tracing::warn!(error = %e, "Failed to add contract code to soroban state");
-                        } else {
-                            code_count += 1;
-                        }
+                    if let Err(e) = soroban_state.create_contract_code(
+                        entry.clone(),
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::warn!(error = %e, "Failed to add contract code to soroban state");
+                    } else {
+                        code_count += 1;
                     }
                 }
+                true
+            });
+            info!(code_count, contracts_added, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: ContractCode scan complete");
+        }
 
-                // Contract data -> soroban state
-                LedgerEntryData::ContractData(_) => {
-                    if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-                        if let Err(e) = soroban_state.create_contract_data(entry) {
-                            tracing::warn!(error = %e, "Failed to add contract data to soroban state");
-                        } else {
-                            data_count += 1;
-                        }
+        // --- Scan 3: ContractData -> soroban state ---
+        let mut data_count = 0u64;
+        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+            info!("Cache init: scanning ContractData entries...");
+            bucket_list.scan_for_entries_of_type(LedgerEntryType::ContractData, |be| {
+                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                    if let Err(e) = soroban_state.create_contract_data(entry.clone()) {
+                        tracing::warn!(error = %e, "Failed to add contract data to soroban state");
+                    } else {
+                        data_count += 1;
                     }
                 }
+                true
+            });
+            info!(data_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: ContractData scan complete");
+        }
 
-                // TTL -> soroban state
-                LedgerEntryData::Ttl(ttl) => {
-                    if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+        // --- Scan 4: TTL -> soroban state ---
+        let mut ttl_count = 0u64;
+        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+            info!("Cache init: scanning TTL entries...");
+            bucket_list.scan_for_entries_of_type(LedgerEntryType::Ttl, |be| {
+                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                    if let LedgerEntryData::Ttl(ttl) = &entry.data {
                         let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
                             key_hash: ttl.key_hash.clone(),
                         };
@@ -1167,11 +1203,19 @@ impl LedgerManager {
                         }
                     }
                 }
+                true
+            });
+            info!(ttl_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: TTL scan complete");
+        }
 
-                // ConfigSetting -> soroban state (cached for fast Soroban config loading)
-                LedgerEntryData::ConfigSetting(_) => {
+        // --- Scan 5: ConfigSetting -> soroban state ---
+        let mut config_count = 0u64;
+        {
+            info!("Cache init: scanning ConfigSetting entries...");
+            bucket_list.scan_for_entries_of_type(LedgerEntryType::ConfigSetting, |be| {
+                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
                     if let Err(e) = soroban_state.process_entry_create(
-                        &entry,
+                        entry,
                         protocol_version,
                         rent_config.as_ref(),
                     ) {
@@ -1180,23 +1224,10 @@ impl LedgerManager {
                         config_count += 1;
                     }
                 }
-
-                // Other entry types are ignored
-                _ => {}
-            }
+                true
+            });
+            info!(config_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: ConfigSetting scan complete");
         }
-
-        // Flush remaining offers
-        if !offer_batch.is_empty() {
-            offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
-                LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
-            })?;
-            offer_count += offer_batch.len() as u64;
-        }
-
-        // Commit SQL transaction
-        tx.commit()
-            .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
 
         // Drop bucket list lock before acquiring write locks
         drop(bucket_list);
@@ -1212,7 +1243,6 @@ impl LedgerManager {
         let soroban_stats = self.soroban_state.read().stats();
         info!(
             ledger_seq,
-            entry_count = entry_count,
             contracts_added,
             offer_count,
             data_count,
@@ -1221,7 +1251,8 @@ impl LedgerManager {
             config_count,
             total_soroban_size =
                 soroban_stats.contract_data_size + soroban_stats.contract_code_size,
-            "Initialized caches from bucket list"
+            elapsed_s = cache_init_start.elapsed().as_secs(),
+            "Initialized caches from bucket list (per-type scanning)"
         );
 
         Ok(())
@@ -1476,8 +1507,6 @@ impl LedgerManager {
     /// The snapshot includes a lookup function for entries not in the cache,
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
-        use std::collections::HashMap;
-
         let state = self.state.read();
         // Convert IndexMap to HashMap for the snapshot
         let entries: HashMap<Vec<u8>, LedgerEntry> = self
@@ -1519,21 +1548,17 @@ impl LedgerManager {
         let header_lookup_fn: crate::snapshot::LedgerHeaderLookupFn =
             Arc::new(move |seq: u32| db.get_ledger_header(seq).map_err(LedgerError::from));
 
-        // Create entries function that uses the SQL offers table when available.
-        // This avoids expensive full bucket list scans during orderbook operations.
-        // The SQL table contains all offers pre-loaded at initialization and maintained
-        // incrementally, so we can use it for offer-related queries.
-        let db_for_entries = self.db.clone();
+        // Create entries function that reads from the in-memory offer store.
+        // This avoids expensive SQL queries or bucket list scans during orderbook operations.
+        // The in-memory store is populated at initialization and maintained incrementally.
+        let offer_store = self.offer_store.clone();
         let offers_initialized = self.offers_initialized.clone();
         let bucket_list_entries = self.bucket_list.clone();
         let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
-            // If SQL offers table is initialized, query it directly.
-            // This is sufficient for orderbook operations which only need offers.
-            // For other full-state operations, fall back to bucket list scan.
+            // If offers are initialized, read from the in-memory store.
             if *offers_initialized.read() {
-                let conn = db_for_entries.connection().map_err(LedgerError::from)?;
-                return offers_db::load_all_offers(&conn)
-                    .map_err(|e| LedgerError::Internal(format!("Failed to load offers: {}", e)));
+                let store = offer_store.read();
+                return Ok(store.values().cloned().collect());
             }
             // Fall back to bucket list scan if offers not initialized.
             // Use streaming iterator to avoid excessive memory usage.
@@ -1633,7 +1658,7 @@ impl LedgerManager {
             }
         }
 
-        // Update SQL offers table with offer changes
+        // Update SQL offers table and in-memory offer store with offer changes
         if *self.offers_initialized.read() {
             let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
             let mut offer_deletes: Vec<i64> = Vec::new();
@@ -1681,6 +1706,17 @@ impl LedgerManager {
                 tx.commit().map_err(|e| {
                     LedgerError::Internal(format!("Failed to commit offers transaction: {}", e))
                 })?;
+
+                // Update in-memory offer store
+                let mut store = self.offer_store.write();
+                for entry in &offer_upserts {
+                    if let LedgerEntryData::Offer(ref offer) = entry.data {
+                        store.insert(offer.offer_id, entry.clone());
+                    }
+                }
+                for offer_id in &offer_deletes {
+                    store.remove(offer_id);
+                }
             }
         }
 
@@ -1787,7 +1823,7 @@ impl LedgerManager {
         Ok(())
     }
 
-    /// Update SQL offers table from init/live/dead entry vectors.
+    /// Update SQL offers table and in-memory offer store from init/live/dead entry vectors.
     fn update_offers_from_entries(
         &self,
         init_entries: &[LedgerEntry],
@@ -1833,6 +1869,17 @@ impl LedgerManager {
             tx.commit().map_err(|e| {
                 LedgerError::Internal(format!("Failed to commit offers transaction: {}", e))
             })?;
+
+            // Update in-memory offer store
+            let mut store = self.offer_store.write();
+            for entry in &offer_upserts {
+                if let LedgerEntryData::Offer(ref offer) = entry.data {
+                    store.insert(offer.offer_id, entry.clone());
+                }
+            }
+            for offer_id in &offer_deletes {
+                store.remove(offer_id);
+            }
         }
 
         Ok(())

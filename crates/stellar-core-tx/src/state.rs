@@ -2197,6 +2197,20 @@ impl LedgerStateManager {
         self.offer_index.has_offers(buying, selling)
     }
 
+    /// Get all offers for a specific buying/selling asset pair.
+    ///
+    /// Returns cloned OfferEntry values for each offer in the pair's order book.
+    pub fn offers_for_asset_pair(
+        &self,
+        buying: &Asset,
+        selling: &Asset,
+    ) -> Vec<OfferEntry> {
+        self.offer_index
+            .offers_for_pair(buying, selling)
+            .filter_map(|key| self.offers.get(&(key.seller, key.offer_id)).cloned())
+            .collect()
+    }
+
     /// Get the number of offers in the index.
     pub fn offer_index_size(&self) -> usize {
         self.offer_index.len()

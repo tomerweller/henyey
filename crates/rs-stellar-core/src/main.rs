@@ -1159,6 +1159,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             .load_bucket_list(checkpoint)?
             .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot {}", checkpoint))?;
         let mut bucket_list = BucketList::new();
+        bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
         for (idx, (curr_hash, snap_hash)) in levels.iter().enumerate() {
             let curr_bucket = bucket_manager.load_bucket(curr_hash)?;
             let snap_bucket = bucket_manager.load_bucket(snap_hash)?;
@@ -1862,6 +1863,7 @@ async fn cmd_replay_bucket_list(
     let mut bucket_list = BucketList::restore_from_hashes(&live_bucket_hashes, |hash| {
         bucket_manager.load_bucket(hash).map(|b| (*b).clone())
     })?;
+    bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
 
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
     // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
@@ -2771,6 +2773,7 @@ async fn cmd_verify_execution(
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
     )?;
+    bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
 
     // Restore hot archive bucket list if present (protocol 23+)
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
@@ -2872,6 +2875,8 @@ async fn cmd_verify_execution(
         );
     }
 
+    tracing::info!("Post-init: starting verification loop setup");
+
     // Track results
     let mut ledgers_verified = 0u32;
     let mut transactions_verified = 0u32;
@@ -2926,11 +2931,14 @@ async fn cmd_verify_execution(
     // Track header verification mismatches
     let mut header_mismatches: u32 = 0;
 
+    tracing::info!("Entering verification loop");
     let mut current_cp = process_from_cp;
     while current_cp <= end_checkpoint {
         let next_cp = checkpoint::next_checkpoint(current_cp);
 
+        tracing::info!(checkpoint = current_cp, "Fetching headers for checkpoint");
         let headers = archive.get_ledger_headers(current_cp).await?;
+        tracing::info!(checkpoint = current_cp, header_count = headers.len(), "Got headers");
 
         for header_entry in &headers {
             let header = &header_entry.header;
@@ -2948,6 +2956,8 @@ async fn cmd_verify_execution(
 
             // Determine if this ledger is in the user's requested test range
             let in_test_range = seq >= start_ledger && seq <= end_ledger;
+
+            tracing::info!(ledger_seq = seq, "Starting ledger processing");
 
             // Start ledger timing
             let ledger_start = std::time::Instant::now();
@@ -2973,6 +2983,7 @@ async fn cmd_verify_execution(
                 }
             };
             timing.cdp_fetch_us = cdp_fetch_start.elapsed().as_micros() as u64;
+            tracing::info!(ledger_seq = seq, cdp_fetch_ms = timing.cdp_fetch_us / 1000, "CDP fetch done");
 
             // Extract transactions and expected results from CDP
             let cdp_header = extract_ledger_header(&lcm);
@@ -3104,7 +3115,15 @@ async fn cmd_verify_execution(
             // Update prev_id_pool for the next ledger
             prev_id_pool = Some(current_id_pool);
             let executor = executor.as_mut().unwrap();
+
+            // Load all orderbook offers into the executor's state before any transactions.
+            // Offers stay current across transactions because TX execution modifies them
+            // directly in state, and snapshot_delta() preserves committed changes.
+            executor.load_orderbook_offers(&snapshot_handle)
+                .map_err(|e| anyhow::anyhow!("Failed to load orderbook offers: {}", e))?;
+
             timing.snapshot_setup_us = snapshot_setup_start.elapsed().as_micros() as u64;
+            tracing::info!(ledger_seq = seq, snapshot_setup_ms = timing.snapshot_setup_us / 1000, "Snapshot setup done");
 
             // Execute each transaction and compare (using aligned envelope/result/meta)
             let tx_exec_start = std::time::Instant::now();
@@ -3126,6 +3145,7 @@ async fn cmd_verify_execution(
                 stellar_xdr::curr::Hash,
                 stellar_xdr::curr::LedgerEntry,
             > = std::collections::HashMap::new();
+            let ttl_preload_start = std::time::Instant::now();
             for tx_info in tx_processing.iter() {
                 let frame = stellar_core_tx::TransactionFrame::with_network(
                     tx_info.envelope.clone(),
@@ -3172,6 +3192,13 @@ async fn cmd_verify_execution(
                 }
             }
 
+            tracing::info!(
+                ledger_seq = seq,
+                ttl_preload_ms = ttl_preload_start.elapsed().as_millis() as u64,
+                ttl_count = ledger_start_ttls.len(),
+                "TTL preload done"
+            );
+
             // Single-phase transaction processing matching online execution.
             // This ensures offline verification uses the same code path as production,
             // including proper fee handling and rollback behavior for failed transactions.
@@ -3183,6 +3210,7 @@ async fn cmd_verify_execution(
             // (which only happens when deduct_fee=true).
 
             // Execute all transactions with single-phase fee+execution
+            tracing::info!(ledger_seq = seq, tx_count = tx_processing.len(), "Starting TX loop");
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Snapshot the delta before starting each transaction.
                 // This preserves committed changes from previous transactions so they're
@@ -3206,6 +3234,10 @@ async fn cmd_verify_execution(
                 // Execute with deduct_fee=true for proper fee handling and rollback behavior.
                 // This matches online execution and ensures failed transactions still have
                 // their fee source account modification preserved in the delta.
+                if tx_idx < 3 {
+                    tracing::info!(ledger_seq = seq, tx_idx, "Executing TX");
+                }
+                let tx_start = std::time::Instant::now();
                 let exec_result = executor.execute_transaction_with_fee_mode(
                     &snapshot_handle,
                     &tx_info.envelope,
@@ -3213,6 +3245,10 @@ async fn cmd_verify_execution(
                     prng_seed,
                     true, // deduct_fee = true - single-phase execution matching online
                 );
+                let tx_elapsed_ms = tx_start.elapsed().as_millis() as u64;
+                if tx_elapsed_ms > 100 || tx_idx < 3 {
+                    tracing::info!(ledger_seq = seq, tx_idx, tx_elapsed_ms, "TX executed");
+                }
 
                 // Check if CDP transaction succeeded
                 // For fee bump transactions, success is TxFeeBumpInnerSuccess with inner TxSuccess
@@ -3476,6 +3512,7 @@ async fn cmd_verify_execution(
                 }
             }
             timing.tx_execution_us = tx_exec_start.elapsed().as_micros() as u64;
+            tracing::info!(ledger_seq = seq, tx_execution_ms = timing.tx_execution_us / 1000, tx_count = timing.tx_count, "TX execution done");
 
             // Apply changes to bucket list for next ledger
             // We always use our executor's state for true end-to-end verification
@@ -3961,11 +3998,13 @@ async fn cmd_verify_execution(
                         }
                     };
 
+                    let eviction_start = std::time::Instant::now();
                     let scan_result = bl
                         .scan_for_eviction_incremental(iter, seq, &settings)
                         .unwrap();
+                    tracing::info!(ledger_seq = seq, eviction_ms = eviction_start.elapsed().as_millis() as u64, "Eviction scan done");
                     let updated_iter = scan_result.end_iterator;
-                    
+
                     // Add evicted keys from our scan to our_dead
                     // This is critical: C++ evicts entries based on TTL expiration during
                     // the eviction scan. We must do the same using OUR scan results,
@@ -4305,6 +4344,7 @@ async fn cmd_verify_execution(
 
                 // Apply all state updates via LedgerManager:
                 // bucket list, hot archive, soroban state, module cache, SQL offers, entry cache
+                tracing::info!(ledger_seq = seq, "Starting apply_ledger_close");
                 ledger_manager.apply_ledger_close(
                     seq,
                     cdp_header.ledger_version,
@@ -4318,6 +4358,7 @@ async fn cmd_verify_execution(
                 ).map_err(|e| anyhow::anyhow!("apply_ledger_close failed: {}", e))?;
             }
             timing.bucket_update_us = bucket_update_start.elapsed().as_micros() as u64;
+            tracing::info!(ledger_seq = seq, bucket_update_ms = timing.bucket_update_us / 1000, "Bucket update done");
 
             // Header verification: Compare our computed header fields against CDP
             let header_verify_start = std::time::Instant::now();
@@ -4541,6 +4582,20 @@ async fn cmd_verify_execution(
 
                 // Collect timing for this ledger
                 timing.total_us = ledger_start.elapsed().as_micros() as u64;
+
+                // Log per-ledger timing breakdown for performance analysis
+                tracing::info!(
+                    ledger_seq = seq,
+                    tx_count = timing.tx_count,
+                    total_ms = timing.total_us / 1000,
+                    cdp_fetch_ms = timing.cdp_fetch_us / 1000,
+                    snapshot_setup_ms = timing.snapshot_setup_us / 1000,
+                    tx_execution_ms = timing.tx_execution_us / 1000,
+                    bucket_update_ms = timing.bucket_update_us / 1000,
+                    header_verify_ms = timing.header_verify_us / 1000,
+                    "Ledger timing"
+                );
+
                 all_timings.push(timing);
             }
         }
@@ -4847,6 +4902,7 @@ async fn cmd_debug_bucket_entry(
     let mut bucket_list = BucketList::restore_from_hashes(&bucket_hashes, |hash| {
         bucket_manager.load_bucket(hash).map(|b| (*b).clone())
     })?;
+    bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
 
     // Restart pending merges (for correct state)
     bucket_list.restart_merges(checkpoint_seq, 25)?;
@@ -6037,7 +6093,14 @@ fn apply_change_with_prestate(
     match change {
         LedgerEntryChange::Created(entry) => {
             if let Some(key) = ledger_entry_to_key(entry) {
-                let existed = bucket_list.get(&key).ok().flatten().is_some();
+                // If aggregator already tracks this key, it already exists — treat as update.
+                // This avoids expensive bucket list lookups for keys seen earlier in the ledger
+                // (e.g., fee source accounts that appear in multiple transactions).
+                let existed = if aggregator.changes.contains_key(&key) {
+                    true
+                } else {
+                    bucket_list.get(&key).ok().flatten().is_some()
+                };
                 if existed {
                     aggregator.apply_change(&LedgerEntryChange::Updated(entry.clone()));
                 } else {
@@ -6050,7 +6113,11 @@ fn apply_change_with_prestate(
             // or be auto-restored from the live bucket list. Classify based
             // on pre-state to match LedgerTxn init/live behavior.
             if let Some(key) = ledger_entry_to_key(entry) {
-                let existed = bucket_list.get(&key).ok().flatten().is_some();
+                let existed = if aggregator.changes.contains_key(&key) {
+                    true
+                } else {
+                    bucket_list.get(&key).ok().flatten().is_some()
+                };
                 if existed {
                     aggregator.apply_change(&LedgerEntryChange::Updated(entry.clone()));
                 } else {

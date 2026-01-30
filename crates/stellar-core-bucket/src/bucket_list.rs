@@ -62,7 +62,8 @@ use crate::eviction::{
     update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
 };
 use crate::live_iterator::LiveEntriesIterator;
-use crate::merge::{merge_buckets_with_options_and_shadows, merge_in_memory};
+use crate::manager::temp_merge_path;
+use crate::merge::{merge_buckets_to_file, merge_buckets_with_options_and_shadows, merge_in_memory};
 use crate::{
     BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
@@ -182,6 +183,7 @@ impl AsyncMergeHandle {
         normalize_init: bool,
         shadow_buckets: Vec<Bucket>,
         level: usize,
+        bucket_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let (sender, receiver) = oneshot::channel();
 
@@ -192,16 +194,44 @@ impl AsyncMergeHandle {
         // 3. Integrates with tokio's shutdown handling
         tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
-            tracing::debug!(level, "Background merge started");
+            tracing::debug!(level, disk_backed = bucket_dir.is_some(), "Background merge started");
 
-            let result = merge_buckets_with_options_and_shadows(
-                &curr,
-                &snap,
-                keep_dead_entries,
-                protocol_version,
-                normalize_init,
-                &shadow_buckets,
-            );
+            let result = if let Some(ref dir) = bucket_dir {
+                // Disk-backed merge: write output to temp file, create DiskBacked bucket.
+                // This keeps memory O(index_size) instead of O(data_size).
+                let temp_path = temp_merge_path(dir);
+                match merge_buckets_to_file(
+                    &curr,
+                    &snap,
+                    &temp_path,
+                    keep_dead_entries,
+                    protocol_version,
+                    normalize_init,
+                ) {
+                    Ok((_hash, entry_count)) => {
+                        if entry_count == 0 {
+                            let _ = std::fs::remove_file(&temp_path);
+                            Ok(Bucket::empty())
+                        } else {
+                            Bucket::from_xdr_file_disk_backed(&temp_path)
+                        }
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&temp_path);
+                        Err(e)
+                    }
+                }
+            } else {
+                // In-memory merge (used in tests or when no bucket_dir is set)
+                merge_buckets_with_options_and_shadows(
+                    &curr,
+                    &snap,
+                    keep_dead_entries,
+                    protocol_version,
+                    normalize_init,
+                    &shadow_buckets,
+                )
+            };
 
             let elapsed = start.elapsed();
             match &result {
@@ -211,6 +241,7 @@ impl AsyncMergeHandle {
                         duration_ms = elapsed.as_millis(),
                         result_hash = %bucket.hash().to_hex(),
                         result_entries = bucket.len(),
+                        disk_backed = bucket_dir.is_some(),
                         "Background merge completed successfully"
                     );
                 }
@@ -455,6 +486,7 @@ impl BucketLevel {
         shadow_buckets: &[Bucket],
         normalize_init: bool,
         use_empty_curr: bool,
+        bucket_dir: Option<&std::path::Path>,
     ) -> Result<()> {
         if self.next.is_some() {
             return Err(BucketError::Merge(
@@ -506,6 +538,7 @@ impl BucketLevel {
                 normalize_init,
                 shadow_buckets.to_vec(),
                 self.level,
+                bucket_dir.map(|p| p.to_path_buf()),
             );
             self.next = Some(PendingMerge::Async(handle));
         } else {
@@ -688,6 +721,44 @@ pub struct BucketList {
     levels: Vec<BucketLevel>,
     /// The current ledger sequence number (last ledger added).
     ledger_seq: u32,
+    /// Optional directory for writing merge output files.
+    /// When set, merges at level 1+ write to disk instead of collecting in memory,
+    /// reducing peak memory from O(data_size) to O(index_size).
+    bucket_dir: Option<std::path::PathBuf>,
+}
+
+/// Get the LedgerEntryType from LedgerEntryData.
+fn entry_type_of_data(data: &stellar_xdr::curr::LedgerEntryData) -> stellar_xdr::curr::LedgerEntryType {
+    use stellar_xdr::curr::{LedgerEntryData, LedgerEntryType};
+    match data {
+        LedgerEntryData::Account(_) => LedgerEntryType::Account,
+        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
+        LedgerEntryData::Data(_) => LedgerEntryType::Data,
+        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
+    }
+}
+
+/// Get the LedgerEntryType from a LedgerKey.
+fn entry_type_of_key(key: &stellar_xdr::curr::LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
+    use stellar_xdr::curr::{LedgerEntryType, LedgerKey};
+    match key {
+        LedgerKey::Account(_) => LedgerEntryType::Account,
+        LedgerKey::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerKey::Offer(_) => LedgerEntryType::Offer,
+        LedgerKey::Data(_) => LedgerEntryType::Data,
+        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerKey::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerKey::Ttl(_) => LedgerEntryType::Ttl,
+    }
 }
 
 /// Deduplicate ledger entries by key, keeping only the last occurrence.
@@ -732,7 +803,18 @@ impl BucketList {
         Self {
             levels,
             ledger_seq: 0,
+            bucket_dir: None,
         }
+    }
+
+    /// Set the bucket directory for disk-backed merge output.
+    ///
+    /// When set, merges at level 1+ write output to this directory as temporary
+    /// XDR files and create DiskBacked buckets, keeping memory O(index_size)
+    /// instead of O(data_size). This is critical for mainnet where merge outputs
+    /// at higher levels can be tens of GB.
+    pub fn set_bucket_dir(&mut self, dir: std::path::PathBuf) {
+        self.bucket_dir = Some(dir);
     }
 
     /// Get the hash of the entire BucketList.
@@ -891,6 +973,62 @@ impl BucketList {
     /// ```
     pub fn live_entries_iter(&self) -> LiveEntriesIterator<'_> {
         LiveEntriesIterator::new(self)
+    }
+
+    /// Scan for entries of a specific type with per-type deduplication.
+    ///
+    /// This iterates through all buckets (level 0 to level 10, curr then snap)
+    /// and invokes the callback for each live/init entry matching the specified type.
+    /// Dead entries shadow older live entries with the same key.
+    ///
+    /// The dedup set is scoped to this single scan, so memory usage is proportional
+    /// to the number of unique keys of the requested type (not all types combined).
+    /// For mainnet, this means ~240 MB peak (for ContractData with ~1.68M keys)
+    /// instead of ~8.6 GB (for all 60M keys across all types).
+    ///
+    /// # Returns
+    ///
+    /// `true` if iteration completed, `false` if stopped early by callback.
+    pub fn scan_for_entries_of_type<F>(
+        &self,
+        entry_type: stellar_xdr::curr::LedgerEntryType,
+        mut callback: F,
+    ) -> bool
+    where
+        F: FnMut(&BucketEntry) -> bool,
+    {
+        use stellar_xdr::curr::LedgerKey;
+
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+
+        for level in &self.levels {
+            for bucket in [&*level.curr, &*level.snap] {
+                for entry in bucket.iter() {
+                    if let Some(key) = entry.key() {
+                        if seen_keys.contains(&key) {
+                            continue;
+                        }
+
+                        let matches_type = match &entry {
+                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                                entry_type_of_data(&e.data) == entry_type
+                            }
+                            BucketEntry::Dead(k) => entry_type_of_key(k) == entry_type,
+                            BucketEntry::Metadata(_) => false,
+                        };
+
+                        if matches_type {
+                            seen_keys.insert(key);
+
+                            if !entry.is_dead() && !callback(&entry) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Return all live entries as of the current bucket list state.
@@ -1121,6 +1259,7 @@ impl BucketList {
                     &shadow_buckets,
                     normalize_init,
                     use_empty_curr,
+                    self.bucket_dir.as_deref(),
                 )?;
 
                 let post_prepare_next_hash = self.levels[i]
@@ -1353,6 +1492,7 @@ impl BucketList {
         Ok(Self {
             levels,
             ledger_seq: 0,
+            bucket_dir: None,
         })
     }
 
@@ -1434,6 +1574,7 @@ impl BucketList {
         Ok(Self {
             levels,
             ledger_seq: 0,
+            bucket_dir: None,
         })
     }
 
@@ -1503,14 +1644,35 @@ impl BucketList {
                         // where makeLive() is called with maxProtocolVersion.
                         let keep_dead = Self::keep_tombstone_entries(i);
 
-                        let merged = merge_buckets_with_options_and_shadows(
-                            &input_curr,
-                            &input_snap,
-                            keep_dead,
-                            protocol_version, // Use caller's protocol version, not bucket's
-                            false,            // normalize_init = false
-                            &[],              // no shadows for post-protocol-12
-                        )?;
+                        let merged = if let Some(ref dir) = self.bucket_dir {
+                            // Disk-backed merge: write output to temp file to avoid
+                            // loading all entries into memory. Critical for mainnet
+                            // where higher-level bucket merges can be tens of GB.
+                            let temp_path = temp_merge_path(dir);
+                            let (_hash, entry_count) = merge_buckets_to_file(
+                                &input_curr,
+                                &input_snap,
+                                &temp_path,
+                                keep_dead,
+                                protocol_version,
+                                false, // normalize_init = false
+                            )?;
+                            if entry_count == 0 {
+                                let _ = std::fs::remove_file(&temp_path);
+                                Bucket::empty()
+                            } else {
+                                Bucket::from_xdr_file_disk_backed(&temp_path)?
+                            }
+                        } else {
+                            merge_buckets_with_options_and_shadows(
+                                &input_curr,
+                                &input_snap,
+                                keep_dead,
+                                protocol_version,
+                                false, // normalize_init = false
+                                &[],   // no shadows for post-protocol-12
+                            )?
+                        };
 
                         tracing::info!(
                             level = i,
@@ -1607,6 +1769,7 @@ impl BucketList {
                 &[],
                 normalize_init,
                 use_empty_curr,
+                self.bucket_dir.as_deref(),
             )?;
 
             tracing::info!(
@@ -2315,7 +2478,7 @@ mod tests {
         .unwrap();
 
         level
-            .prepare_with_normalization(5, TEST_PROTOCOL, Arc::new(incoming), false, &[], true, false)
+            .prepare_with_normalization(5, TEST_PROTOCOL, Arc::new(incoming), false, &[], true, false, None)
             .unwrap();
         level.commit();
 

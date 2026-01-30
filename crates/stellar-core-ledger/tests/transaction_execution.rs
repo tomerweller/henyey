@@ -2837,6 +2837,9 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
         SorobanConfig::default(),
         classic_events,
     );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load orderbook");
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -2988,6 +2991,9 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
         SorobanConfig::default(),
         classic_events,
     );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load orderbook");
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");

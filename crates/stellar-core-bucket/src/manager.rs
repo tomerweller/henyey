@@ -49,8 +49,23 @@ use stellar_core_common::Hash256;
 
 use crate::bucket::Bucket;
 use crate::entry::BucketEntry;
-use crate::merge::merge_buckets;
+use crate::merge::merge_buckets_to_file;
 use crate::{BucketError, Result};
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global counter for generating unique temp file names.
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a unique temporary file path in the given directory.
+pub(crate) fn temp_merge_path(bucket_dir: &Path) -> PathBuf {
+    let id = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    bucket_dir.join(format!(
+        "merge-tmp-{}-{}.xdr",
+        std::process::id(),
+        id
+    ))
+}
 
 /// Manager for bucket files on disk.
 ///
@@ -368,33 +383,56 @@ impl BucketManager {
     }
 
     /// Merge two buckets and create a new bucket.
+    ///
+    /// Uses disk-backed streaming merge to avoid loading all entries into memory.
+    /// The merge output is written directly to disk and the resulting bucket is
+    /// DiskBacked, keeping memory usage O(index_size) instead of O(data_size).
     pub fn merge(
         &self,
         old: &Bucket,
         new: &Bucket,
         max_protocol_version: u32,
     ) -> Result<Arc<Bucket>> {
-        let merged = merge_buckets(old, new, true, max_protocol_version)?;
+        if old.is_empty() && new.is_empty() {
+            return Ok(Arc::new(Bucket::empty()));
+        }
 
-        if merged.is_empty() {
+        // Write merge output to a temp file
+        let temp_path = temp_merge_path(&self.bucket_dir);
+        let (hash, entry_count) = merge_buckets_to_file(
+            old,
+            new,
+            &temp_path,
+            true, // keep_dead_entries
+            max_protocol_version,
+            true, // normalize_init_entries
+        )?;
+
+        if hash.is_zero() || entry_count == 0 {
+            let _ = std::fs::remove_file(&temp_path);
             return Ok(Arc::new(Bucket::empty()));
         }
 
         // Check if already cached
-        let hash = merged.hash();
         {
             let cache = self.cache.read().unwrap();
             if let Some(cached) = cache.get(&hash) {
+                let _ = std::fs::remove_file(&temp_path);
                 return Ok(Arc::clone(cached));
             }
         }
 
-        // Save to disk as uncompressed XDR
-        let path = self.bucket_path(&hash);
-        merged.save_to_xdr_file(&path)?;
+        // Move to final canonical path
+        let final_path = self.bucket_path(&hash);
+        if !final_path.exists() {
+            std::fs::rename(&temp_path, &final_path)?;
+        } else {
+            let _ = std::fs::remove_file(&temp_path);
+        }
 
-        // Add to cache
-        let bucket = Arc::new(merged);
+        // Load as DiskBacked (builds index, O(index_size) memory)
+        let bucket = Bucket::from_xdr_file_disk_backed(&final_path)?;
+        let bucket = Arc::new(bucket);
         self.add_to_cache(hash, Arc::clone(&bucket));
 
         Ok(bucket)
