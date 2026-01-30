@@ -99,7 +99,12 @@ impl stellar_core_tx::soroban::HotArchiveLookup for HotArchiveLookupImpl {
     fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
         // Use the hot archive bucket list's get method
         let guard = self.hot_archive.read();
-        let hot_archive = guard.as_ref()?;
+        let hot_archive = match guard.as_ref() {
+            Some(ha) => ha,
+            None => {
+                return None;
+            }
+        };
         match hot_archive.get(key) {
             Ok(Some(entry)) => Some(entry.clone()),
             Ok(None) => None,
@@ -2685,6 +2690,21 @@ impl TransactionExecutor {
                     Ok(op_exec) => {
                         self.state.flush_modified_entries();
                         let mut op_result = op_exec.result;
+
+                        // Debug: Log operation result for Soroban operations
+                        if op_type.is_soroban() {
+                            let is_success_before_refund_check = is_operation_success(&op_result);
+                            tracing::info!(
+                                ledger_seq = self.ledger_seq,
+                                op_index,
+                                op_type = ?op_type,
+                                op_result = ?op_result,
+                                is_success = is_success_before_refund_check,
+                                has_soroban_meta = op_exec.soroban_meta.is_some(),
+                                "Soroban operation executed"
+                            );
+                        }
+
                         if let Some(meta) = &op_exec.soroban_meta {
                             if let Some(tracker) = refundable_fee_tracker.as_mut() {
                                 if !tracker.consume(
@@ -2703,6 +2723,13 @@ impl TransactionExecutor {
                         // Check if operation succeeded
                         if !is_operation_success(&op_result) {
                             all_success = false;
+                            tracing::debug!(
+                                ledger_seq = self.ledger_seq,
+                                op_index,
+                                op_type = ?op_type,
+                                op_result = ?op_result,
+                                "Operation failed"
+                            );
                             if matches!(op_result, OperationResult::OpNotSupported) {
                                 failure = Some(ExecutionFailure::NotSupported);
                             }
@@ -2966,6 +2993,13 @@ impl TransactionExecutor {
             // This mirrors C++ stellar-core's behavior where setError() calls resetConsumedFee(),
             // ensuring the full max_refundable_fee is refunded on any transaction failure.
             if let Some(tracker) = refundable_fee_tracker.as_mut() {
+                tracing::debug!(
+                    ledger_seq = self.ledger_seq,
+                    is_soroban = frame.is_soroban(),
+                    max_refundable_fee = tracker.max_refundable_fee,
+                    consumed_before_reset = tracker.consumed_refundable_fee,
+                    "Resetting fee tracker due to tx failure"
+                );
                 tracker.reset();
             }
         } else {

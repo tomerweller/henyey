@@ -4,13 +4,22 @@
 //! which restores archived Soroban contract data entries.
 
 use stellar_xdr::curr::{
-    AccountId, Hash, LedgerKey, OperationResult, OperationResultTr, RestoreFootprintOp,
-    RestoreFootprintResult, RestoreFootprintResultCode, SorobanTransactionData, TtlEntry,
+    AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerKey, OperationResult, OperationResultTr,
+    RestoreFootprintOp, RestoreFootprintResult, RestoreFootprintResultCode, SorobanTransactionData,
+    TtlEntry,
 };
 
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
+
+/// Entry to restore from the hot archive.
+pub struct HotArchiveRestoreEntry {
+    /// The key of the entry to restore.
+    pub key: LedgerKey,
+    /// The entry value from the hot archive.
+    pub entry: LedgerEntry,
+}
 
 /// Execute a RestoreFootprint operation.
 ///
@@ -25,6 +34,7 @@ use crate::Result;
 /// * `context` - The ledger context
 /// * `soroban_data` - The Soroban transaction data containing the footprint
 /// * `min_persistent_entry_ttl` - Minimum persistent entry TTL from Soroban config
+/// * `hot_archive_restores` - Entries to restore from the hot archive
 ///
 /// # Returns
 ///
@@ -36,6 +46,7 @@ pub fn execute_restore_footprint(
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
     min_persistent_entry_ttl: u32,
+    hot_archive_restores: &[HotArchiveRestoreEntry],
 ) -> Result<OperationResult> {
     // Get the footprint from Soroban transaction data
     let footprint = match soroban_data {
@@ -63,9 +74,48 @@ pub fn execute_restore_footprint(
         .saturating_add(min_persistent_entry_ttl)
         .saturating_sub(1);
 
-    // Restore all entries in the read-write footprint
-    // (RestoreFootprint only restores entries that are in read-write)
+    // First, restore hot archive entries to state.
+    // These entries don't exist in the live bucket list, so we need to add them.
+    for restore in hot_archive_restores {
+        tracing::debug!(
+            ?restore.key,
+            new_ttl,
+            "RestoreFootprint: restoring entry from hot archive to state"
+        );
+        // Add the entry to state based on type
+        match &restore.entry.data {
+            LedgerEntryData::ContractCode(code) => {
+                state.create_contract_code(code.clone());
+            }
+            LedgerEntryData::ContractData(data) => {
+                state.create_contract_data(data.clone());
+            }
+            _ => {
+                // Hot archive should only contain ContractCode and ContractData
+                tracing::warn!(
+                    ?restore.key,
+                    "RestoreFootprint: unexpected entry type in hot archive"
+                );
+            }
+        }
+
+        // Create the TTL entry for the restored entry
+        let key_hash = compute_ledger_key_hash(&restore.key);
+        let ttl_entry = TtlEntry {
+            key_hash,
+            live_until_ledger_seq: new_ttl,
+        };
+        state.create_ttl(ttl_entry);
+    }
+
+    // Restore all entries in the read-write footprint that exist in live state
+    // (these have expired TTLs but the entry still exists)
     for key in footprint.read_write.iter() {
+        // Skip entries that were restored from hot archive - they're already handled
+        if hot_archive_restores.iter().any(|r| &r.key == key) {
+            continue;
+        }
+
         if restore_entry(key, new_ttl, state, current_ledger).is_err() {
             return Ok(make_result(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
@@ -198,6 +248,7 @@ mod tests {
             &context,
             None,
             TEST_MIN_PERSISTENT_TTL,
+            &[], // No hot archive restores
         );
         assert!(result.is_ok());
 
@@ -240,6 +291,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
+            &[], // No hot archive restores
         );
         assert!(result.is_ok());
 
@@ -286,6 +338,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
+            &[], // No hot archive restores
         );
         assert!(result.is_ok());
 
@@ -334,6 +387,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
+            &[], // No hot archive restores
         );
         assert!(result.is_ok());
 

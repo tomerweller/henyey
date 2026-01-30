@@ -520,27 +520,14 @@ pub fn execute_operation_with_soroban(
             let mut snapshots = Vec::new();
             let mut hot_archive_restores = Vec::new();
             if let Some(data) = soroban_data {
-                tracing::debug!(
-                    read_write_count = data.resources.footprint.read_write.len(),
-                    current_ledger = context.sequence,
-                    "RestoreFootprint: checking entries"
-                );
                 for key in data.resources.footprint.read_write.iter() {
                     // Only compute rent for entries that need restoration
                     let key_hash = ledger_key_hash(key);
                     let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
-                    tracing::debug!(
-                        ?key,
-                        ?current_ttl,
-                        current_ledger = context.sequence,
-                        "RestoreFootprint: checking entry TTL"
-                    );
-
                     // Case 1: TTL exists and entry is live -> skip
                     if let Some(ttl) = current_ttl {
                         if ttl >= context.sequence {
-                            tracing::debug!(?key, ttl, "RestoreFootprint: skipping live entry");
                             continue;
                         }
                         // Case 3: TTL exists but expired -> restore from live bucket list
@@ -552,12 +539,6 @@ pub fn execute_operation_with_soroban(
                                 context.protocol_version,
                                 &entry,
                                 entry_xdr.len() as u32,
-                            );
-                            tracing::debug!(
-                                ?key,
-                                entry_size,
-                                old_live_until = ttl,
-                                "RestoreFootprint: adding expired entry to rent snapshots"
                             );
                             let (is_persistent, is_code_entry) = match key {
                                 stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
@@ -585,10 +566,6 @@ pub fn execute_operation_with_soroban(
                         // This is different from expired entries where we use the actual old size.
                         if let Some(ha) = hot_archive {
                             if let Some(entry) = ha.get(key) {
-                                tracing::debug!(
-                                    ?key,
-                                    "RestoreFootprint: adding hot archive entry to rent snapshots (old_size=0)"
-                                );
                                 let (is_persistent, is_code_entry) = match key {
                                     stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
                                     stellar_xdr::curr::LedgerKey::ContractData(cd) => (
@@ -610,26 +587,20 @@ pub fn execute_operation_with_soroban(
                                     key: key.clone(),
                                     entry: entry.clone(),
                                 });
-                            } else {
-                                tracing::debug!(
-                                    ?key,
-                                    "RestoreFootprint: entry not in hot archive, skipping"
-                                );
                             }
-                        } else {
-                            tracing::debug!(
-                                ?key,
-                                "RestoreFootprint: no hot archive available, skipping"
-                            );
                         }
                     }
                 }
-                tracing::debug!(
-                    snapshots_count = snapshots.len(),
-                    hot_archive_count = hot_archive_restores.len(),
-                    "RestoreFootprint: final snapshots count"
-                );
             }
+            // Convert HotArchiveRestore to HotArchiveRestoreEntry for execute_restore_footprint
+            let ha_restore_entries: Vec<restore_footprint::HotArchiveRestoreEntry> =
+                hot_archive_restores
+                    .iter()
+                    .map(|r| restore_footprint::HotArchiveRestoreEntry {
+                        key: r.key.clone(),
+                        entry: r.entry.clone(),
+                    })
+                    .collect();
             let result = restore_footprint::execute_restore_footprint(
                 op_data,
                 &op_source,
@@ -637,6 +608,7 @@ pub fn execute_operation_with_soroban(
                 context,
                 soroban_data,
                 config.min_persistent_entry_ttl,
+                &ha_restore_entries,
             )?;
             let mut exec = OperationExecutionResult::new(result);
             if matches!(
