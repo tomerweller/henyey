@@ -41,6 +41,8 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -123,48 +125,39 @@ pub fn merge_buckets_with_options(
         return Ok(Bucket::empty());
     }
 
-    // Get entries from both buckets (already sorted)
-    // Note: use iter() instead of entries() to support disk-backed buckets
-    let old_entries: Vec<BucketEntry> = old_bucket.iter().collect();
-    let new_entries: Vec<BucketEntry> = new_bucket.iter().collect();
+    // Use streaming merge: iterate one entry at a time from each bucket.
+    // For in-memory buckets this iterates over the slice; for disk-backed
+    // buckets this streams from disk via BufReader (O(1) memory per input).
+    let mut old_iter = old_bucket.iter();
+    let mut new_iter = new_bucket.iter();
+
+    // Extract metadata from the first entries of each bucket.
+    let mut old_meta: Option<BucketMetadata> = None;
+    let mut new_meta: Option<BucketMetadata> = None;
+    let mut old_current = advance_skip_metadata(&mut old_iter, &mut old_meta);
+    let mut new_current = advance_skip_metadata(&mut new_iter, &mut new_meta);
 
     tracing::trace!(
         old_hash = %old_bucket.hash(),
         new_hash = %new_bucket.hash(),
-        old_entries = old_entries.len(),
-        new_entries = new_entries.len(),
-        "merge_buckets starting"
+        old_has_meta = old_meta.is_some(),
+        new_has_meta = new_meta.is_some(),
+        "merge_buckets starting (streaming)"
     );
 
-    let old_meta = extract_metadata(&old_entries);
-    let new_meta = extract_metadata(&new_entries);
     let (_, output_meta) =
         build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
 
-    let mut merged = Vec::with_capacity(
-        old_entries.len() + new_entries.len() + output_meta.as_ref().map(|_| 1).unwrap_or(0),
-    );
+    let mut merged = Vec::new();
 
     if let Some(ref meta) = output_meta {
         merged.push(meta.clone());
     }
 
-    let mut old_idx = 0;
-    let mut new_idx = 0;
-
-    // Skip metadata entries from old and new buckets; we'll insert output metadata ourselves.
-    while old_idx < old_entries.len() && old_entries[old_idx].is_metadata() {
-        old_idx += 1;
-    }
-
-    while new_idx < new_entries.len() && new_entries[new_idx].is_metadata() {
-        new_idx += 1;
-    }
-
-    // Merge the remaining entries
-    while old_idx < old_entries.len() && new_idx < new_entries.len() {
-        let old_entry = &old_entries[old_idx];
-        let new_entry = &new_entries[new_idx];
+    // Two-pointer merge using streaming iterators
+    while old_current.is_some() && new_current.is_some() {
+        let old_entry = old_current.as_ref().unwrap();
+        let new_entry = new_current.as_ref().unwrap();
 
         let old_key = old_entry.key();
         let new_key = new_entry.key();
@@ -174,12 +167,10 @@ pub fn merge_buckets_with_options(
                 match compare_keys(ok, nk) {
                     Ordering::Less => {
                         // Old entry comes first, no shadow.
-                        // DON'T normalize old entries - they should stay as-is.
-                        // Init entries in old bucket are from before this merge boundary.
                         if should_keep_entry(old_entry, keep_dead_entries) {
                             merged.push(old_entry.clone());
                         }
-                        old_idx += 1;
+                        old_current = next_non_meta(&mut old_iter);
                     }
                     Ordering::Greater => {
                         // New entry comes first
@@ -189,11 +180,10 @@ pub fn merge_buckets_with_options(
                                 normalize_init_entries,
                             ));
                         }
-                        new_idx += 1;
+                        new_current = next_non_meta(&mut new_iter);
                     }
                     Ordering::Equal => {
                         // Keys match - new entry shadows old entry
-                        // Apply merge semantics (per CAP-0020)
                         if let Some(merged_entry) = merge_entries(
                             old_entry,
                             new_entry,
@@ -202,36 +192,38 @@ pub fn merge_buckets_with_options(
                         ) {
                             merged.push(merged_entry);
                         }
-                        old_idx += 1;
-                        new_idx += 1;
+                        old_current = next_non_meta(&mut old_iter);
+                        new_current = next_non_meta(&mut new_iter);
                     }
                 }
             }
-            (None, Some(_)) => old_idx += 1,
-            (Some(_), None) => new_idx += 1,
+            (None, Some(_)) => {
+                old_current = next_non_meta(&mut old_iter);
+            }
+            (Some(_), None) => {
+                new_current = next_non_meta(&mut new_iter);
+            }
             (None, None) => {
-                old_idx += 1;
-                new_idx += 1;
+                old_current = next_non_meta(&mut old_iter);
+                new_current = next_non_meta(&mut new_iter);
             }
         }
     }
 
-    // Add remaining old entries
-    while old_idx < old_entries.len() {
-        let entry = &old_entries[old_idx];
-        if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
-            merged.push(entry.clone());
+    // Drain remaining old entries
+    while let Some(entry) = old_current {
+        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
+            merged.push(entry);
         }
-        old_idx += 1;
+        old_current = old_iter.next();
     }
 
-    // Add remaining new entries
-    while new_idx < new_entries.len() {
-        let entry = &new_entries[new_idx];
-        if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
-            merged.push(maybe_normalize_entry(entry.clone(), normalize_init_entries));
+    // Drain remaining new entries
+    while let Some(entry) = new_current {
+        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
+            merged.push(maybe_normalize_entry(entry, normalize_init_entries));
         }
-        new_idx += 1;
+        new_current = new_iter.next();
     }
 
     if merged.is_empty() {
@@ -246,7 +238,6 @@ pub fn merge_buckets_with_options(
     }
 
     // Use from_sorted_entries since the merge algorithm maintains sorted order.
-    // This avoids the overhead of re-sorting already-sorted data.
     let result = Bucket::from_sorted_entries(merged)?;
 
     tracing::trace!(
@@ -255,6 +246,181 @@ pub fn merge_buckets_with_options(
         "merge_buckets complete"
     );
     Ok(result)
+}
+
+/// Merge two buckets and write the output directly to an uncompressed XDR file.
+///
+/// This is the fully streaming merge: both inputs and the output are streamed,
+/// so memory usage is O(1) per input bucket regardless of size. The output
+/// is written as uncompressed XDR with record marks (RFC 5531) suitable for
+/// creating a `DiskBacked` bucket.
+///
+/// # Arguments
+/// * `old_bucket` - The older bucket (entries may be shadowed)
+/// * `new_bucket` - The newer bucket (entries take precedence)
+/// * `output_path` - Path to write the merged bucket file
+/// * `keep_dead_entries` - Whether to keep dead entries in the output
+/// * `max_protocol_version` - Maximum protocol version allowed
+/// * `normalize_init_entries` - Whether to convert INIT entries to LIVE
+///
+/// # Returns
+/// The hash of the output bucket and the number of entries written.
+pub fn merge_buckets_to_file(
+    old_bucket: &Bucket,
+    new_bucket: &Bucket,
+    output_path: &Path,
+    keep_dead_entries: bool,
+    max_protocol_version: u32,
+    normalize_init_entries: bool,
+) -> Result<(Hash256, usize)> {
+    use std::io::{BufWriter, Write};
+
+    if new_bucket.is_empty() && old_bucket.is_empty() {
+        // Write empty file
+        File::create(output_path)?;
+        return Ok((Hash256::ZERO, 0));
+    }
+
+    let mut old_iter = old_bucket.iter();
+    let mut new_iter = new_bucket.iter();
+
+    let mut old_meta: Option<BucketMetadata> = None;
+    let mut new_meta: Option<BucketMetadata> = None;
+    let mut old_current = advance_skip_metadata(&mut old_iter, &mut old_meta);
+    let mut new_current = advance_skip_metadata(&mut new_iter, &mut new_meta);
+
+    let (_, output_meta) =
+        build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
+
+    let file = File::create(output_path)?;
+    let mut writer = BufWriter::new(file);
+    let mut hasher = Sha256::new();
+    let mut entry_count = 0usize;
+
+    // Helper: serialize and write one entry
+    let mut write_entry = |entry: &BucketEntry,
+                           writer: &mut BufWriter<File>,
+                           hasher: &mut Sha256,
+                           count: &mut usize|
+     -> Result<()> {
+        let xdr_entry = entry.to_xdr_entry();
+        let data = xdr_entry.to_xdr(Limits::none()).map_err(|e| {
+            BucketError::Serialization(format!("Failed to serialize entry: {}", e))
+        })?;
+
+        // Write XDR record mark + data
+        let record_mark = (data.len() as u32) | 0x80000000;
+        writer.write_all(&record_mark.to_be_bytes())?;
+        writer.write_all(&data)?;
+
+        // Update hash (same format as record mark + data)
+        hasher.update(&record_mark.to_be_bytes());
+        hasher.update(&data);
+
+        *count += 1;
+        Ok(())
+    };
+
+    // Write metadata first
+    if let Some(ref meta) = output_meta {
+        write_entry(meta, &mut writer, &mut hasher, &mut entry_count)?;
+    }
+
+    // Two-pointer merge
+    while old_current.is_some() && new_current.is_some() {
+        let old_entry = old_current.as_ref().unwrap();
+        let new_entry = new_current.as_ref().unwrap();
+
+        let old_key = old_entry.key();
+        let new_key = new_entry.key();
+
+        match (old_key, new_key) {
+            (Some(ref ok), Some(ref nk)) => match compare_keys(ok, nk) {
+                Ordering::Less => {
+                    if should_keep_entry(old_entry, keep_dead_entries) {
+                        write_entry(old_entry, &mut writer, &mut hasher, &mut entry_count)?;
+                    }
+                    old_current = next_non_meta(&mut old_iter);
+                }
+                Ordering::Greater => {
+                    if should_keep_entry(new_entry, keep_dead_entries) {
+                        let entry =
+                            maybe_normalize_entry(new_entry.clone(), normalize_init_entries);
+                        write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
+                    }
+                    new_current = next_non_meta(&mut new_iter);
+                }
+                Ordering::Equal => {
+                    if let Some(merged_entry) = merge_entries(
+                        old_entry,
+                        new_entry,
+                        keep_dead_entries,
+                        normalize_init_entries,
+                    ) {
+                        write_entry(&merged_entry, &mut writer, &mut hasher, &mut entry_count)?;
+                    }
+                    old_current = next_non_meta(&mut old_iter);
+                    new_current = next_non_meta(&mut new_iter);
+                }
+            },
+            (None, Some(_)) => {
+                old_current = next_non_meta(&mut old_iter);
+            }
+            (Some(_), None) => {
+                new_current = next_non_meta(&mut new_iter);
+            }
+            (None, None) => {
+                old_current = next_non_meta(&mut old_iter);
+                new_current = next_non_meta(&mut new_iter);
+            }
+        }
+    }
+
+    // Drain remaining old entries
+    while let Some(entry) = old_current {
+        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
+            write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
+        }
+        old_current = old_iter.next();
+    }
+
+    // Drain remaining new entries
+    while let Some(entry) = new_current {
+        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
+            let entry = maybe_normalize_entry(entry, normalize_init_entries);
+            write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
+        }
+        new_current = new_iter.next();
+    }
+
+    // Flush and sync
+    writer.flush()?;
+    writer.into_inner().map_err(|e| {
+        BucketError::Io(std::io::Error::other(format!(
+            "Failed to flush writer: {}",
+            e
+        )))
+    })?.sync_all()?;
+
+    let hash_bytes: [u8; 32] = hasher.finalize().into();
+    let hash = Hash256::from_bytes(hash_bytes);
+
+    Ok((hash, entry_count))
+}
+
+/// Advance a `BucketIter`, skipping metadata entries and extracting metadata.
+fn advance_skip_metadata(
+    iter: &mut BucketIter<'_>,
+    meta_out: &mut Option<BucketMetadata>,
+) -> Option<BucketEntry> {
+    for entry in iter.by_ref() {
+        if let BucketEntry::Metadata(m) = &entry {
+            *meta_out = Some(m.clone());
+            continue;
+        }
+        return Some(entry);
+    }
+    None
 }
 
 /// Merge two buckets using in-memory entries (level 0 optimization).

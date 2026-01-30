@@ -383,6 +383,27 @@ impl Bucket {
         })
     }
 
+    /// Create a DiskBacked bucket from an existing uncompressed XDR file.
+    ///
+    /// This builds the index by streaming through the file one entry at a time,
+    /// using O(index_size) memory instead of O(file_size). The hash is computed
+    /// incrementally during the streaming pass.
+    ///
+    /// This is the preferred method for loading large bucket files (multi-GB)
+    /// that would exceed available memory if loaded entirely.
+    pub fn from_xdr_file_disk_backed(path: impl AsRef<Path>) -> Result<Self> {
+        let disk_bucket = DiskBucket::from_file_streaming(path)?;
+        let hash = disk_bucket.hash();
+
+        Ok(Self {
+            hash,
+            storage: BucketStorage::DiskBacked {
+                disk_bucket: Arc::new(disk_bucket),
+            },
+            level_zero_state: LevelZeroState::None,
+        })
+    }
+
     /// Internal method to create a bucket with optional key index building.
     fn from_xdr_bytes_internal(bytes: &[u8], build_index: bool) -> Result<Self> {
         let entries = Self::parse_entries(bytes)?;
@@ -555,7 +576,96 @@ impl Bucket {
         Ok(bytes)
     }
 
+    /// Save this bucket to an uncompressed XDR file.
+    ///
+    /// This writes the bucket entries in uncompressed XDR format with record marks
+    /// (RFC 5531). This is the canonical on-disk format that supports random-access
+    /// seeks for disk-backed indexing and streaming iteration.
+    ///
+    /// The bucket hash is computed over this exact format, so the file contents
+    /// will hash to `self.hash()`.
+    pub fn save_to_xdr_file(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+
+        match &self.storage {
+            BucketStorage::InMemory { entries, .. } => {
+                // Serialize entries to uncompressed XDR with record marks
+                let uncompressed = Self::serialize_entries(entries)?;
+
+                // Write directly (no compression)
+                let mut file = std::fs::File::create(&path)?;
+                file.write_all(&uncompressed)?;
+                file.sync_all()?;
+            }
+            BucketStorage::DiskBacked { disk_bucket } => {
+                // For disk-backed buckets, the file is already uncompressed XDR
+                let source = disk_bucket.file_path();
+                if source != path {
+                    std::fs::copy(source, &path)?;
+                }
+            }
+        }
+
+        Ok(path)
+    }
+
+    /// Streaming migration: decompress a `.bucket.gz` file directly to a
+    /// `.bucket.xdr` file without loading all entries into memory.
+    ///
+    /// Reads the gzipped XDR stream one record at a time and writes each
+    /// record (with its record mark) directly to the output file. Peak memory
+    /// usage is one XDR record (typically < 1 KB, at most a few MB).
+    pub fn migrate_gz_to_xdr(
+        gz_path: impl AsRef<Path>,
+        xdr_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let gz_file = std::fs::File::open(gz_path.as_ref())?;
+        let mut decoder = BufReader::new(GzDecoder::new(BufReader::new(gz_file)));
+        let mut output = std::io::BufWriter::new(std::fs::File::create(xdr_path.as_ref())?);
+
+        // Stream through the decompressed data, copying record marks + data
+        loop {
+            // Read 4-byte record mark
+            let mut mark_buf = [0u8; 4];
+            match decoder.read_exact(&mut mark_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+
+            let record_mark = u32::from_be_bytes(mark_buf);
+            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+
+            // Read record data
+            let mut record_data = vec![0u8; record_len];
+            decoder.read_exact(&mut record_data)?;
+
+            // Write record mark + data to output
+            output.write_all(&mark_buf)?;
+            output.write_all(&record_data)?;
+        }
+
+        output.flush()?;
+        output.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        Ok(())
+    }
+
+    /// Load a bucket from an uncompressed XDR file.
+    ///
+    /// This reads the bucket file directly without any decompression. The file
+    /// must contain XDR entries with record marks (RFC 5531).
+    pub fn load_from_xdr_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)?;
+        Self::from_xdr_bytes(&bytes)
+    }
+
     /// Save this bucket to a gzipped file.
+    ///
+    /// This is the legacy format used for backward compatibility and archive publishing.
+    /// For normal on-disk storage, use [`save_to_xdr_file`] instead.
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
         let path = path.as_ref().to_path_buf();
 
@@ -624,6 +734,38 @@ impl Bucket {
                 match disk_bucket.iter() {
                     Ok(iter) => BucketIter::DiskBacked(iter),
                     Err(_) => BucketIter::Empty,
+                }
+            }
+        }
+    }
+
+    /// Iterate over entries starting from a byte offset, yielding record sizes.
+    ///
+    /// This is optimized for the eviction scan. For disk-backed buckets, it seeks
+    /// directly to `start_offset` in the file instead of reading and skipping all
+    /// prior entries. It also returns each entry's on-disk record size (4-byte
+    /// record mark + XDR data) so callers can track byte offsets without
+    /// re-serializing every entry to XDR.
+    ///
+    /// Each item is `(BucketEntry, record_size)` where `record_size` is the total
+    /// bytes this entry occupies on disk.
+    pub fn iter_from_offset_with_sizes(
+        &self,
+        start_offset: u64,
+    ) -> BucketOffsetIter<'_> {
+        match &self.storage {
+            BucketStorage::InMemory { entries, .. } => {
+                BucketOffsetIter::InMemory(InMemoryOffsetIter {
+                    entries,
+                    index: 0,
+                    current_offset: 0,
+                    start_offset,
+                })
+            }
+            BucketStorage::DiskBacked { disk_bucket } => {
+                match disk_bucket.iter_from_offset_with_sizes(start_offset) {
+                    Ok(iter) => BucketOffsetIter::DiskBacked(iter),
+                    Err(_) => BucketOffsetIter::Empty,
                 }
             }
         }
@@ -871,6 +1013,63 @@ impl<'a> Iterator for BucketIter<'a> {
             BucketIter::InMemory(iter) => iter.next().cloned(),
             BucketIter::DiskBacked(iter) => iter.next().and_then(|r| r.ok()),
             BucketIter::Empty => None,
+        }
+    }
+}
+
+/// Iterator over bucket entries that yields record sizes alongside entries.
+///
+/// For disk-backed buckets, this seeks directly to a starting byte offset and
+/// reads record sizes from the file format (no re-serialization needed).
+/// For in-memory buckets, it computes record sizes via XDR serialization
+/// (acceptable since in-memory buckets are small).
+pub enum BucketOffsetIter<'a> {
+    /// In-memory variant that computes sizes on the fly.
+    InMemory(InMemoryOffsetIter<'a>),
+    /// Disk-backed variant that reads sizes from record marks.
+    DiskBacked(crate::disk_bucket::DiskBucketOffsetIter),
+    /// Empty iterator (used for error recovery).
+    Empty,
+}
+
+/// In-memory offset iterator state.
+pub struct InMemoryOffsetIter<'a> {
+    entries: &'a [BucketEntry],
+    index: usize,
+    current_offset: u64,
+    start_offset: u64,
+}
+
+impl<'a> Iterator for BucketOffsetIter<'a> {
+    /// (entry, total_record_size)
+    type Item = (BucketEntry, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            BucketOffsetIter::InMemory(iter) => {
+                while iter.index < iter.entries.len() {
+                    let entry = &iter.entries[iter.index];
+                    iter.index += 1;
+
+                    // Compute the on-disk record size: 4-byte mark + XDR bytes
+                    let entry_size = match entry.to_xdr() {
+                        Ok(bytes) => bytes.len() as u64 + 4,
+                        Err(_) => continue,
+                    };
+
+                    let entry_end = iter.current_offset + entry_size;
+                    if entry_end <= iter.start_offset {
+                        iter.current_offset = entry_end;
+                        continue;
+                    }
+
+                    iter.current_offset = entry_end;
+                    return Some((entry.clone(), entry_size));
+                }
+                None
+            }
+            BucketOffsetIter::DiskBacked(iter) => iter.next().and_then(|r| r.ok()),
+            BucketOffsetIter::Empty => None,
         }
     }
 }

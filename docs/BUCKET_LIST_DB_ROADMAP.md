@@ -21,7 +21,7 @@ Significant foundational work is already in place:
 | `LiveBucketIndex` (InMemory + Disk) | `stellar-core-bucket/src/index.rs` | Complete — threshold at 10,000 entries, page size 1,024 |
 | `RandomEvictionCache` | `stellar-core-bucket/src/cache.rs` | Complete — 100 MB / 100k entry default, accounts only |
 | `BucketList::get()` point lookup | `stellar-core-bucket/src/bucket_list.rs:789` | Complete — searches levels 0-10 newest-first |
-| Index persistence (save/load) | `stellar-core-bucket/src/index_persistence.rs` | Partial — bincode format, version 1; bloom filter not yet persisted |
+| Index persistence (save/load) | `stellar-core-bucket/src/index_persistence.rs` | Complete — bincode format, version 2; bloom filter + asset_pool_map persisted |
 
 ## Phase Summary
 
@@ -29,8 +29,14 @@ Significant foundational work is already in place:
 |-------|-------|--------|
 | 1 | Streaming Iterator | **Complete** |
 | 2 | SQL-Backed Offers | **Complete** |
-| 3 | BucketListDB Point Lookups | **Substantially Complete** — remaining: integration with LedgerManager for cache-miss fallback |
-| 4 | Index Persistence | **Partial** — save/load works but bloom filter persistence missing |
+| 3 | BucketListDB Point Lookups | **Complete** |
+| 4 | Index Persistence | **Complete** |
+| 5 | Uncompressed XDR On-Disk Format | Not started |
+| 6 | Streaming Iteration & Merge | Not started |
+| 7 | DiskBacked Buckets by Default | Not started |
+| 8 | Connect Index System to DiskBucket | Not started |
+| 9 | Arc\<Bucket\> Shared Ownership | Not started |
+| 10 | HotArchive DiskBacked Support | Not started |
 
 ---
 
@@ -109,25 +115,21 @@ Mainnet has approximately **12-15 million offers**. At ~200 bytes per offer entr
 represents **2.4-3 GB of memory savings** compared to an in-memory approach — substantially
 more than the testnet ~500 MB figure.
 
-### Open Items
+### Offer Rollback (Resolved)
 
-- **Offer rollback on failed ledger close.** The current implementation applies offer SQL
-  changes after the ledger close succeeds. If a ledger close fails mid-execution, the offers
-  table remains consistent because changes are only committed at the end. However, this does
-  not yet support the C++ `LedgerTxn` parent/child rollback semantics where offer mutations
-  are speculatively applied and rolled back per-transaction. This gap is acceptable for now
-  because the bucket list is the source of truth, not the offers table — on any mismatch,
-  offers are rebuilt from the bucket list during the next catchup.
+Per-transaction rollback semantics are achieved through `snapshot_delta()` + `rollback()`
+in `state.rs`. Offers created in Tx_i are visible to Tx_{i+1} via shared in-memory state
+(`executor.state`). The SQL offers table is batch-updated once at ledger close, matching
+C++ behavior. The mechanism differs from C++ (delta snapshots vs nested `LedgerTxn`
+hierarchy) but the observable semantics are identical.
 
 ---
 
 ## Phase 3: BucketListDB Point Lookups
 
-**Status: Substantially Complete**
+**Status: Complete**
 
-### What Exists
-
-The core building blocks are implemented:
+### What Was Delivered
 
 1. **LiveBucketIndex** (`index.rs`, 939 lines)
    - `InMemoryIndex`: Full `LedgerKey -> offset` map for buckets with < 10,000 entries
@@ -143,6 +145,21 @@ The core building blocks are implemented:
    - Searches levels 0-10 in order (newest first)
    - Checks `curr` then `snap` at each level
    - Returns first live match; dead entries return `None`
+
+4. **LedgerManager cache-miss fallback** (`manager.rs`)
+   - `create_snapshot()` provides a `lookup_fn` closure that falls back to bucket list
+     point lookups when the entry cache misses
+   - `load_entry()` populates the entry cache on demand from bucket list lookups
+
+5. **Snapshot isolation** (`manager.rs`, `snapshot.rs`)
+   - `create_snapshot()` captures a `BucketListSnapshot` at snapshot time instead of
+     holding a reference to the live `Arc<RwLock<BucketList>>`
+   - Point lookups during TX execution use the immutable snapshot — no lock acquisition
+   - Eliminates contention with the write lock held during `commit()` (add_batch + hash)
+   - `BucketListSnapshot::get_result()` and `BucketSnapshot::get_result()` propagate
+     errors instead of silently swallowing them
+   - Integration test (`test_snapshot_isolation_from_bucket_list_mutations`) verifies
+     snapshot is not affected by subsequent bucket list mutations
 
 ### Configuration
 
@@ -165,19 +182,6 @@ defaults to 250 MB). The Rust implementation uses an entry-count threshold (10,0
 These are functionally equivalent but the Rust approach is simpler to reason about since
 entry sizes vary. If parity with the C++ byte-based cutoff is desired, this can be revisited.
 
-### Remaining Work
-
-1. **LedgerManager cache-miss fallback** — When `entry_cache` misses, fall back to
-   `BucketList::get()` for on-demand disk lookups instead of requiring all entries to be
-   pre-loaded. This is the final step to eliminate the full entry cache dependency.
-
-2. **Snapshot isolation for point lookups** — `BucketList::get()` must be safe to call
-   concurrently with bucket merges. The current implementation uses `RwLock` on the bucket
-   list; point lookups take a read lock. During merges, `PendingMerge` transitions happen
-   under a write lock. This is functionally correct but could become a contention point
-   under high lookup rates. Consider whether a snapshot-based approach (reading from an
-   immutable snapshot handle) would reduce lock contention.
-
 ### Memory Impact
 
 | Component | Estimate |
@@ -191,39 +195,37 @@ entry sizes vary. If parity with the C++ byte-based cutoff is desired, this can 
 
 ## Phase 4: Index Persistence
 
-**Status: Partial**
+**Status: Complete**
 
-### What Exists
+### What Was Delivered
 
-`index_persistence.rs` (726 lines) implements save/load using bincode serialization:
+`index_persistence.rs` implements save/load using bincode serialization:
 
 ```
 Header:
-  - Version: u32 (currently BUCKET_INDEX_VERSION = 1)
+  - Version: u32 (BUCKET_INDEX_VERSION = 2)
+  - page_size: u64
 
 Body:
   - pages: Vec<(SerializableRangeEntry, u64)>
-  - bloom_seed: [u8; 16]
+  - bloom_data: Option<BloomFilterData>   (bloom filter + seed, added in v2)
   - counters: SerializableCounters
   - type_ranges: HashMap<u32, (u64, u64)>
+  - asset_pool_map: Vec<(xdr bytes, xdr bytes)>  (added in v2)
 ```
 
-### Remaining Work
+1. **Bloom filter persistence** — Serialized as `BloomFilterData` containing the
+   `BinaryFuse16` fingerprints and seed. Eliminates rebuild on load.
 
-1. **Bloom filter persistence** — Currently not serialized (noted in code:
-   `index_persistence.rs:175-176`). The bloom filter is rebuilt on load, which
-   partially defeats the purpose of persistence for large buckets. Adding bloom
-   filter serialization would make startup significantly faster.
+2. **`asset_to_pool_id` map persistence** — Serialized as XDR byte pairs. Restored
+   on load for complete index state.
 
-2. **`asset_to_pool_id` map persistence** — Not currently serialized. Needed for
-   complete index restoration.
+3. **InMemoryIndex** — Small buckets rebuild quickly from the bucket file; no
+   separate persistence path needed.
 
-3. **InMemoryIndex persistence** — The current persistence is range-index focused.
-   Small buckets using `InMemoryIndex` may need their own persistence path, or they
-   can be rebuilt quickly since they are small by definition.
-
-4. **Integration with BucketManager** — Automatically save indexes after catchup/merge
-   and load on startup with fallback to rebuild if missing/corrupt.
+4. **BucketManager integration** — `persist_index()` flag controls automatic saving
+   after catchup/merge. Loading falls back to rebuild if the index file is missing,
+   corrupt, or has a version mismatch.
 
 ### C++ Reference
 
@@ -244,6 +246,298 @@ buckets/
 - With persisted indexes (clean shutdown): target < 2 minutes
 - Without indexes (crash recovery / first boot): full bucket scan required,
   proportional to total bucket data size
+
+---
+
+## Phase 5: Uncompressed XDR On-Disk Format
+
+**Status: Not started**
+
+**Why:** Foundation for all subsequent phases. The current `.bucket.gz` (gzip compressed)
+format is not seekable — random-access reads are impossible without full decompression.
+C++ stellar-core stores buckets as uncompressed `.xdr` files with RFC 5531 record marks,
+enabling page-based seeks for the DiskIndex.
+
+**Gap:** `BucketManager` stores files as `<hash>.bucket.gz`. `DiskBucket` stores
+uncompressed `.xdr` separately. These are two disconnected paths.
+
+### What Needs to Change
+
+**Files:** `stellar-core-bucket/src/bucket.rs`, `src/manager.rs`
+
+1. **Canonical format**: `BucketManager::bucket_path()` returns `<hash>.bucket.xdr`
+   (uncompressed, with XDR record marks) instead of `<hash>.bucket.gz`
+
+2. **Save**: `Bucket::save_to_xdr_file(path)` writes uncompressed XDR with record marks
+   (the hash-compatible format already used by the hash computation)
+
+3. **Load**: `BucketManager::load_bucket()` reads from `.bucket.xdr` (no decompression)
+
+4. **Migration**: If `.bucket.gz` exists but `.bucket.xdr` doesn't, decompress on first access
+
+5. **Download path**: Download `.gz` from archives → decompress → save `.xdr` to disk
+
+**Compatibility:** The bucket hash is computed over uncompressed XDR with record marks.
+This is already the internal format. Changing on-disk storage doesn't affect hash computation.
+
+---
+
+## Phase 6: Streaming Iteration & Merge
+
+**Status: Not started**
+
+**Why:** Two critical memory bottlenecks exist:
+
+1. `DiskBucket::iter()` calls `reader.read_to_end(&mut bytes)`, loading the **entire file**
+   (up to 6.4 GB for the largest mainnet bucket) into a `Vec<u8>`.
+
+2. `merge_buckets_with_options()` calls `.iter().collect()` on both inputs, loading **all
+   entries from both buckets** into `Vec<BucketEntry>`. For two large mainnet buckets, this
+   is 10-20 GB.
+
+C++ stellar-core uses `BucketInputIterator` / `BucketOutputIterator` that stream one entry
+at a time from/to disk.
+
+### What Needs to Change
+
+**Files:** `stellar-core-bucket/src/disk_bucket.rs`, `src/merge.rs`, `src/iterator.rs`
+
+#### 6a: Streaming DiskBucket Iteration
+
+Replace `DiskBucketIter`:
+- **Current**: `bytes: Vec<u8>` (entire file in memory), parses entries from byte buffer
+- **New**: `reader: BufReader<File>` (8 KB buffer), reads one XDR record at a time
+
+Since Phase 5 makes files uncompressed, sequential reads are straightforward:
+read 4-byte record mark → extract length → read record bytes → parse `BucketEntry`.
+
+**Memory:** O(1) per iterator (one entry + 8 KB buffer) instead of O(file_size)
+
+#### 6b: Streaming Merge
+
+Add `merge_buckets_streaming()`:
+- Uses `BucketInputIterator` (already exists in `iterator.rs`) for both inputs
+- Uses `BucketOutputIterator` (already exists) for output
+- Standard two-pointer merge-sort, one entry at a time from each input
+- Shadow checking via bloom filter lookups (no need to load shadow bucket entries)
+- Output: new `.bucket.xdr` file → create DiskBacked `Bucket`
+
+Update `merge_buckets_with_options()` dispatch:
+- Both inputs have in-memory entries → existing in-memory merge (level 0)
+- Otherwise → `merge_buckets_streaming()` (levels 1-10)
+
+Update `AsyncMergeHandle::start_merge()` to pass output directory for streaming merges.
+
+**Memory:** O(1) per merge (one entry from each input + output buffer) instead of O(entries)
+
+### C++ Reference
+
+```cpp
+// BucketBase::merge() in .upstream-v25/src/bucket/BucketBase.cpp
+// Creates BucketInputIterator for each input, BucketOutputIterator for output.
+// Iterates one entry at a time. Memory: O(1) per input regardless of bucket size.
+FileMergeInput<BucketT> fileMergeInput(oldBucket, newBucket);
+mergeInternal(bm, maxProtocolVersion, keepDeadEntries, out, shadows, fileMergeInput);
+```
+
+---
+
+## Phase 7: DiskBacked Buckets by Default
+
+**Status: Not started**
+
+**Why:** `BucketManager::load_bucket()` calls `Bucket::load_from_file()` which decompresses
+`.gz` and loads **all entries** into `Vec<BucketEntry>`. This is the direct cause of the
+OOM on mainnet (60+ GB peak RSS, killed by OOM killer on a 62 GB machine).
+
+### What Needs to Change
+
+**Files:** `stellar-core-bucket/src/manager.rs`, `src/bucket.rs`, `src/disk_bucket.rs`
+
+1. **`BucketManager::load_bucket()` new flow:**
+   - Check cache → return `Arc<Bucket>` if found
+   - Check for `.bucket.xdr` on disk:
+     - If file size < `INMEMORY_THRESHOLD` (e.g., 10 MB): load as InMemory
+     - Otherwise: create DiskBacked Bucket from `.xdr` file
+   - If only `.bucket.gz` exists: decompress to `.xdr`, then proceed as above
+
+2. **`Bucket::from_xdr_file(path)` constructor:**
+   - Builds `DiskBucket` from an existing uncompressed `.xdr` file
+   - Streams through file to build index (one entry at a time, O(1) memory)
+   - Computes hash during the streaming pass
+   - Does NOT load entries into memory
+
+3. **`DiskBucket::from_file()` streaming index build:**
+   - Current: `reader.read_to_end(&mut bytes)` → `build_index(&bytes)` (entire file in memory)
+   - New: read entries one at a time, record file offsets as we go
+   - Builds `BTreeMap<u64, IndexEntry>` incrementally
+
+4. **Eliminate clone in restore path:**
+   - Current: `bucket_manager.load_bucket(hash).map(|b| (*b).clone())`
+   - For DiskBacked, this clone is cheap (just Arc increments on internal DiskBucket)
+   - Verify no deep copies occur
+
+### Expected Memory Impact
+
+| Scale | Before (InMemory) | After (DiskBacked) |
+|-------|-------------------|-------------------|
+| Testnet | ~1 GB | ~100 MB |
+| Mainnet | **60+ GB (OOM)** | **~1 GB** (flat index only) |
+
+The ~1 GB flat index is reduced to ~150 MB in Phase 8 (page-based index).
+
+### Mainnet OOM Autopsy
+
+Test run on 62 GB machine:
+```
+Peak RSS: 60.4 GB (63,335,868 KB)
+Wall time: 6m 16s before OOM kill (signal 9)
+Killed during: Bucket list restoration (downloading + loading last 2-3 of 42 buckets)
+Largest bucket: 6.4 GB on disk (uncompressed XDR)
+Total cached bucket data: 21 GB on disk across 137 files
+```
+
+The process never reached ledger execution — it was killed during initialization. The 42
+mainnet buckets, when parsed into Rust structs with heap allocations (`Vec`, `String`, XDR
+enum variants), expand from ~21 GB on disk to 60+ GB in memory.
+
+---
+
+## Phase 8: Connect Index System to DiskBucket
+
+**Status: Not started**
+
+**Why:** The `DiskBucket` flat index (`BTreeMap<u64, IndexEntry>`) stores one entry per
+key (16 bytes each). For 60M mainnet keys, that's ~960 MB of index. The existing `index.rs`
+`DiskIndex` uses pages (~1024 entries/page) reducing the index to ~60K entries (~10 MB)
+plus a bloom filter (~138 MB). The `index.rs` code is complete but not connected to `DiskBucket`.
+
+### What Needs to Change
+
+**Files:** `stellar-core-bucket/src/disk_bucket.rs`, `src/index.rs`, `src/index_persistence.rs`
+
+1. **Refactor DiskBucket to use `index.rs` indexes:**
+   - Small buckets (< `INDEX_CUTOFF` entries): `InMemoryIndex` from `index.rs`
+     - `BTreeMap<Vec<u8>, u64>` mapping key bytes → file offset
+     - Bloom filter for fast negative lookups
+   - Large buckets (≥ `INDEX_CUTOFF`): `DiskIndex` from `index.rs`
+     - Page-based: `Vec<(RangeEntry, u64)>` with configurable page size (default 1024)
+     - `BinaryFuseFilter` for fast negative lookups
+     - Binary search to find candidate page → seek to page offset → scan within page
+
+2. **Connect `RandomEvictionCache`** (`cache.rs`) **to DiskBucket:**
+   - Per-bucket bounded cache of recently-accessed ACCOUNT entries
+   - Size proportional to bucket's share of total ACCOUNT entry bytes
+   - Total cache memory configurable (default 256 MB)
+   - Matches C++ `RandomEvictionCache` behavior
+
+3. **Lookup path for large DiskBacked bucket:**
+   1. Check `RandomEvictionCache` → if hit, return immediately
+   2. Check bloom filter → if definitely not present, return None
+   3. Binary search `pages` vector → find candidate page with matching range
+   4. Seek to page offset in `.xdr` file, scan entries within page
+   5. If found and ACCOUNT type, add to `RandomEvictionCache`
+
+4. **Index persistence integration:**
+   - `BucketManager` saves DiskIndex as `<hash>.bucket.index` on creation
+   - On load: check for `.index` file → deserialize; otherwise rebuild from `.xdr`
+   - Uses existing `index_persistence.rs` serialization
+
+### Memory After Phase 8
+
+| Component | Memory |
+|-----------|--------|
+| DiskIndex pages (~60K entries across all buckets) | ~10 MB |
+| Bloom filters (~2.3 bytes/key, ~60M keys) | ~138 MB |
+| RandomEvictionCache (bounded) | ~256 MB (configurable) |
+| **Total** | **~400 MB** |
+
+### C++ Reference
+
+```cpp
+// DiskIndex<BucketT>::scan() in .upstream-v25/src/bucket/DiskIndex.cpp
+// Uses lower_bound on RangeIndex to find page, then checks bloom filter,
+// then returns file offset for page-level scan.
+auto iter = lower_bound(begin, end, key, lowerBoundCmp);
+if (mFilter && !mFilter->contain(keyHash)) return {ScanResult::NOT_FOUND};
+```
+
+---
+
+## Phase 9: Arc\<Bucket\> Shared Ownership
+
+**Status: Not started**
+
+**Why:** `BucketList` currently owns `Bucket` directly. C++ uses `shared_ptr<Bucket>` so
+the same bucket object is shared by `BucketList`, `BucketManager`, snapshots, and merges.
+This eliminates copies and ensures deduplication.
+
+### What Needs to Change
+
+**Files:** `stellar-core-bucket/src/bucket_list.rs`, `src/snapshot.rs`
+
+1. `BucketLevel` fields become `curr: Arc<Bucket>`, `snap: Arc<Bucket>`
+2. `BucketSnapshot::new()` takes `Arc<Bucket>` directly (already supports this)
+3. Creating `BucketListSnapshot` becomes zero-cost: just `Arc::clone` on each bucket
+4. `BucketManager` cache shares `Arc<Bucket>` with `BucketList` — same object everywhere
+5. Merge inputs take `Arc<Bucket>` — keeps bucket alive during background merge
+6. `BucketManager::forgetUnreferencedBuckets()` — GC buckets where `Arc::strong_count() == 1`
+
+---
+
+## Phase 10: HotArchive DiskBacked Support
+
+**Status: Not started**
+
+**Why:** `HotArchiveBucket` is always InMemory (`BTreeMap<LedgerKey, HotArchiveBucketEntry>`).
+On mainnet with persistent eviction (protocol 23+), the hot archive grows over time. C++
+uses `HotArchiveBucketIndex` with `DiskIndex` (always disk-based, no cache).
+
+### What Needs to Change
+
+**Files:** `stellar-core-bucket/src/hot_archive.rs`
+
+1. Add `DiskBacked` storage variant to `HotArchiveBucket`
+2. Use `DiskIndex` (no `RandomEvictionCache`, matching C++)
+3. `BucketManager::load_hot_archive_bucket()` creates DiskBacked for large files
+4. Streaming merge and iteration for hot archive buckets (reuse Phase 6 patterns)
+
+---
+
+## Phase Dependencies (Complete Picture)
+
+```
+Phase 1 (Streaming Iterator)        ✅
+    |
+    v
+Phase 2 (SQL Offers)                ✅ <------+
+    |                                         |
+    v                                         |
+Phase 3 (Point Lookups)              ✅ ------+ (parallel)
+    |
+    v
+Phase 4 (Index Persistence)          ✅
+    |
+    v
+Phase 5 (Uncompressed XDR Format)    ← Next
+    |
+    v
+Phase 6 (Streaming Iteration/Merge)  ← Needs seekable files
+    |
+    v
+Phase 7 (DiskBacked by Default)      ← Needs streaming merge for subsequent ops
+    |
+    v
+Phase 8 (Connect Index to DiskBucket) ← Needs DiskBacked buckets
+    |
+    +------> Phase 9 (Arc<Bucket>)    ← Can parallelize with Phase 8
+    |
+    v
+Phase 10 (HotArchive DiskBacked)     ← Reuses Phase 5-7 patterns
+```
+
+**Minimum viable for mainnet (fixes OOM):** Phases 5-7
+**Full C++ parity:** All 10 phases
 
 ---
 
@@ -314,7 +608,7 @@ to the live bucket list. This should be monitored during extended mainnet observ
 
 ---
 
-## Dependencies
+## Dependencies (Phases 1-4)
 
 ```
 Phase 1 (Streaming Iterator) ✅
@@ -323,14 +617,13 @@ Phase 1 (Streaming Iterator) ✅
 Phase 2 (SQL Offers) ✅ <------+
     |                           |
     v                           |
-Phase 3 (Point Lookups) -------+ (can parallelize)
-    |     ~substantially complete
+Phase 3 (Point Lookups) ✅ ----+ (can parallelize)
+    |
     v
-Phase 4 (Index Persistence)
-          ~partial
+Phase 4 (Index Persistence) ✅
 ```
 
-Phases 2 and 3 can be worked on in parallel after Phase 1 completes.
+See [Phase Dependencies (Complete Picture)](#phase-dependencies-complete-picture) for the full dependency graph including Phases 5-10.
 
 ---
 
@@ -342,7 +635,7 @@ Phases 2 and 3 can be worked on in parallel after Phase 1 completes.
 | **Memory estimation off** | Medium | High — could exceed 16 GB target | Profile with real mainnet bucket archives. The transient dedup HashSet (~8.6 GB) is the largest single allocation; if it's too large, a bloom filter pre-screen could be added as a second tier to reduce the set size. |
 | **Index format changes** | Low | Medium — breaks existing persisted indexes | Version field in the index header allows backward-compatible updates. Fallback to rebuild ensures no data loss. |
 | **Regression in ledger close** | Low | Critical — consensus failure | Comprehensive comparison tests: run Rust and C++ side-by-side on the same ledger sequence and verify identical hashes for 1,000+ consecutive ledgers. |
-| **Lock contention on BucketList** | Medium | Medium — slower lookups under load | Point lookups take a read lock; merges take a write lock. If contention is observed, move to a snapshot-based read path that doesn't hold a lock during disk I/O. |
+| **Lock contention on BucketList** | Low (mitigated) | Medium — slower lookups under load | Addressed: `create_snapshot()` now captures a `BucketListSnapshot` so point lookups during TX execution use an immutable snapshot with no lock acquisition. |
 | **Hot archive memory growth** | Low | Medium — unexpected memory pressure | Monitor hot archive size during extended mainnet observer runs. Flag for disk-backed treatment if it exceeds 1 GB. |
 
 ---

@@ -204,6 +204,25 @@ impl BucketBloomFilter {
     pub fn is_empty(&self) -> bool {
         self.filter.len() == 0
     }
+
+    /// Returns a reference to the inner `BinaryFuse16` filter.
+    ///
+    /// Used for serialization/persistence.
+    pub fn inner_filter(&self) -> &BinaryFuse16 {
+        &self.filter
+    }
+
+    /// Constructs a `BucketBloomFilter` from its component parts.
+    ///
+    /// Used when restoring a persisted filter from disk.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - The deserialized `BinaryFuse16` filter
+    /// * `seed` - The hash seed used during original construction
+    pub fn from_parts(filter: BinaryFuse16, seed: HashSeed) -> Self {
+        Self { filter, seed }
+    }
 }
 
 impl std::fmt::Debug for BucketBloomFilter {

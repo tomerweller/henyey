@@ -313,9 +313,9 @@ impl AsyncMergeHandle {
 #[derive(Debug)]
 pub struct BucketLevel {
     /// The current bucket being filled with merged entries.
-    pub curr: Bucket,
+    pub curr: Arc<Bucket>,
     /// The snapshot bucket from the previous spill.
-    pub snap: Bucket,
+    pub snap: Arc<Bucket>,
     /// Pending merge result awaiting commit (replaces `curr` on commit).
     next: Option<PendingMerge>,
     /// The level number (0-10).
@@ -326,8 +326,8 @@ impl BucketLevel {
     /// Create a new empty level.
     pub fn new(level: usize) -> Self {
         Self {
-            curr: Bucket::empty(),
-            snap: Bucket::empty(),
+            curr: Arc::new(Bucket::empty()),
+            snap: Arc::new(Bucket::empty()),
             next: None,
             level,
         }
@@ -353,12 +353,12 @@ impl BucketLevel {
 
     /// Set the curr bucket.
     pub fn set_curr(&mut self, bucket: Bucket) {
-        self.curr = bucket;
+        self.curr = Arc::new(bucket);
     }
 
     /// Set the snap bucket.
     pub fn set_snap(&mut self, bucket: Bucket) {
-        self.snap = bucket;
+        self.snap = Arc::new(bucket);
     }
 
     /// Get the level number.
@@ -374,14 +374,12 @@ impl BucketLevel {
         if let Some(pending) = self.next.take() {
             match pending {
                 PendingMerge::InMemory(bucket) => {
-                    self.curr = bucket;
+                    self.curr = Arc::new(bucket);
                 }
                 PendingMerge::Async(mut handle) => {
                     match handle.resolve() {
                         Ok(bucket) => {
-                            // Arc<Bucket> -> Bucket via unwrap_or_clone
-                            self.curr =
-                                Arc::try_unwrap(bucket).unwrap_or_else(|arc| (*arc).clone());
+                            self.curr = bucket;
                         }
                         Err(e) => {
                             tracing::error!(
@@ -427,11 +425,12 @@ impl BucketLevel {
     ///
     /// Note: Unlike commit(), snap() does NOT commit pending merges. In C++,
     /// mNextCurr is a FutureBucket that stays pending until explicitly committed.
-    fn snap(&mut self) -> Bucket {
-        // Move curr to snap (curr becomes empty via replace)
-        self.snap = std::mem::take(&mut self.curr);
+    fn snap(&mut self) -> Arc<Bucket> {
+        // Move curr to snap, replacing curr with empty bucket
+        let old_curr = std::mem::replace(&mut self.curr, Arc::new(Bucket::empty()));
+        self.snap = old_curr;
         // Return the new snap (old curr) for merging into next level
-        self.snap.clone()
+        Arc::clone(&self.snap)
     }
 
     /// Prepare the next bucket for this level with explicit INIT normalization control.
@@ -451,7 +450,7 @@ impl BucketLevel {
         &mut self,
         _ledger_seq: u32,
         protocol_version: u32,
-        incoming: Bucket,
+        incoming: Arc<Bucket>,
         keep_dead_entries: bool,
         shadow_buckets: &[Bucket],
         normalize_init: bool,
@@ -464,12 +463,12 @@ impl BucketLevel {
         }
 
         // Choose curr or empty based on shouldMergeWithEmptyCurr
-        let curr_for_merge = if use_empty_curr {
+        let curr_for_merge: Arc<Bucket> = if use_empty_curr {
             tracing::debug!(
                 level = self.level,
                 "prepare_with_normalization: using EMPTY curr (shouldMergeWithEmptyCurr=true)"
             );
-            Bucket::empty()
+            Arc::new(Bucket::empty())
         } else {
             tracing::debug!(
                 level = self.level,
@@ -477,7 +476,7 @@ impl BucketLevel {
                 curr_entries = self.curr.len(),
                 "prepare_with_normalization: using actual curr"
             );
-            self.curr.clone()
+            Arc::clone(&self.curr)
         };
 
         tracing::debug!(
@@ -500,8 +499,8 @@ impl BucketLevel {
         // Level 0 uses synchronous in-memory merging (handled in prepare_first_level).
         if self.level >= 1 {
             let handle = AsyncMergeHandle::start_merge(
-                Arc::new(curr_for_merge),
-                Arc::new(incoming),
+                curr_for_merge,
+                incoming,
                 keep_dead_entries,
                 protocol_version,
                 normalize_init,
@@ -605,8 +604,8 @@ impl BucketLevel {
     /// This should be called when entries from this level move to higher levels
     /// and no longer need to participate in fast in-memory merges.
     pub fn clear_in_memory_entries(&mut self) {
-        self.curr.clear_in_memory_entries();
-        self.snap.clear_in_memory_entries();
+        Arc::make_mut(&mut self.curr).clear_in_memory_entries();
+        Arc::make_mut(&mut self.snap).clear_in_memory_entries();
     }
 }
 
@@ -913,7 +912,7 @@ impl BucketList {
         for level in &self.levels {
             // Collect buckets to iterate: curr (newest), snap (oldest)
             // The order matters because first occurrence shadows later ones.
-            let buckets: [&Bucket; 2] = [&level.curr, &level.snap];
+            let buckets: [&Bucket; 2] = [&*level.curr, &*level.snap];
 
             for bucket in buckets {
                 for entry in bucket.iter() {
@@ -1066,9 +1065,9 @@ impl BucketList {
                 // would accumulate across bucket list generations.
                 if i - 1 == 0 {
                     // Clear in-memory entries from the bucket flowing to level 1
-                    spilling_snap.clear_in_memory_entries();
+                    Arc::make_mut(&mut spilling_snap).clear_in_memory_entries();
                     // Also clear from the snap position at level 0
-                    self.levels[0].snap.clear_in_memory_entries();
+                    Arc::make_mut(&mut self.levels[0].snap).clear_in_memory_entries();
                 }
 
                 tracing::debug!(
@@ -1107,8 +1106,8 @@ impl BucketList {
                 let shadow_buckets = if protocol_version < FIRST_PROTOCOL_SHADOWS_REMOVED {
                     let mut shadows = Vec::new();
                     for level in self.levels.iter().take(i - 1) {
-                        shadows.push(level.curr.clone());
-                        shadows.push(level.snap.clone());
+                        shadows.push((*level.curr).clone());
+                        shadows.push((*level.snap).clone());
                     }
                     shadows
                 } else {
@@ -1117,7 +1116,7 @@ impl BucketList {
                 self.levels[i].prepare_with_normalization(
                     ledger_seq,
                     protocol_version,
-                    spilling_snap.clone(),
+                    Arc::clone(&spilling_snap),
                     keep_dead,
                     &shadow_buckets,
                     normalize_init,
@@ -1346,8 +1345,8 @@ impl BucketList {
             };
 
             let mut level = BucketLevel::new(i);
-            level.curr = curr;
-            level.snap = snap;
+            level.curr = Arc::new(curr);
+            level.snap = Arc::new(snap);
             levels.push(level);
         }
 
@@ -1426,8 +1425,8 @@ impl BucketList {
             };
 
             let mut level = BucketLevel::new(i);
-            level.curr = curr;
-            level.snap = snap;
+            level.curr = Arc::new(curr);
+            level.snap = Arc::new(snap);
             level.next = next;
             levels.push(level);
         }
@@ -1885,6 +1884,11 @@ impl BucketList {
     /// Scan a region of a bucket for evictable entries.
     ///
     /// Returns (entries_scanned, bytes_used, data_entries_evicted, finished_bucket).
+    ///
+    /// Uses byte-offset-aware iteration: for disk-backed buckets, seeks directly
+    /// to the start offset (instead of reading and skipping millions of entries)
+    /// and reads record sizes from the file format (instead of re-serializing
+    /// every entry to XDR just for byte size computation).
     #[allow(clippy::too_many_arguments)]
     fn scan_bucket_region(
         &self,
@@ -1910,42 +1914,32 @@ impl BucketList {
 
         // bucket_file_offset is a byte offset in the bucket file.
         let start_offset = iter.bucket_file_offset;
-        let mut current_offset = 0u64;
 
-        // Iterate directly instead of collecting all entries into memory
-        // This is critical for performance with disk-backed buckets
-        for entry in bucket.iter() {
-            let entry = &entry;
-            let entry_size = entry.to_xdr()?.len() as u64 + 4; // 4-byte record mark
-
-            let entry_end = current_offset + entry_size;
-            if entry_end <= start_offset {
-                current_offset = entry_end;
-                continue;
-            }
-
+        // Use offset-aware iteration: for disk-backed buckets this seeks directly
+        // to start_offset and reads record sizes from record marks (no XDR
+        // re-serialization). For in-memory buckets it computes sizes on the fly
+        // (acceptable since in-memory buckets are small).
+        for (entry, entry_size) in bucket.iter_from_offset_with_sizes(start_offset) {
             bytes_used += entry_size;
             entries_scanned += 1;
 
             // Process the entry for eviction
-            let live_entry = match entry {
+            let live_entry = match &entry {
                 BucketEntry::Live(e) | BucketEntry::Init(e) => e,
                 BucketEntry::Dead(key) => {
                     // Mark dead keys as seen
                     if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
                         seen_keys.insert(key_bytes);
                     }
-                    current_offset = entry_end;
                     if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = current_offset;
+                        iter.bucket_file_offset = start_offset + bytes_used;
                         return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                     }
                     continue;
                 }
                 BucketEntry::Metadata(_) => {
-                    current_offset = entry_end;
                     if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = current_offset;
+                        iter.bucket_file_offset = start_offset + bytes_used;
                         return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                     }
                     continue;
@@ -1954,9 +1948,8 @@ impl BucketList {
 
             // Only check Soroban entries
             if !is_soroban_entry(live_entry) {
-                current_offset = entry_end;
                 if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = current_offset;
+                    iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
@@ -1964,9 +1957,8 @@ impl BucketList {
 
             // Get the key for this entry
             let Some(key) = ledger_entry_to_key(live_entry) else {
-                current_offset = entry_end;
                 if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = current_offset;
+                    iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
@@ -1976,9 +1968,8 @@ impl BucketList {
             let key_bytes = match key.to_xdr(Limits::none()) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    current_offset = entry_end;
                     if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = current_offset;
+                        iter.bucket_file_offset = start_offset + bytes_used;
                         return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                     }
                     continue;
@@ -1986,9 +1977,8 @@ impl BucketList {
             };
 
             if !seen_keys.insert(key_bytes) {
-                current_offset = entry_end;
                 if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = current_offset;
+                    iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 // Already processed from a newer level
@@ -1997,9 +1987,8 @@ impl BucketList {
 
             // Get the TTL key
             let Some(ttl_key) = get_ttl_key(&key) else {
-                current_offset = entry_end;
                 if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = current_offset;
+                    iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
@@ -2007,9 +1996,8 @@ impl BucketList {
 
             // Look up the TTL entry
             let Some(ttl_entry) = self.get(&ttl_key)? else {
-                current_offset = entry_end;
                 if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = current_offset;
+                    iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
@@ -2017,18 +2005,16 @@ impl BucketList {
 
             // Check if expired
             let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
-                current_offset = entry_end;
                 if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = current_offset;
+                    iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
             };
 
             if !is_expired {
-                current_offset = entry_end;
                 if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = current_offset;
+                    iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
                 }
                 continue;
@@ -2061,16 +2047,15 @@ impl BucketList {
                 data_entries_evicted += 1;
             }
 
-            current_offset = entry_end;
             // Check both limits: bytes scanned and entries evicted
             if bytes_used >= max_bytes || data_entries_evicted >= max_entries {
-                iter.bucket_file_offset = current_offset;
+                iter.bucket_file_offset = start_offset + bytes_used;
                 return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
             }
         }
 
         // Finished the bucket
-        iter.bucket_file_offset = current_offset;
+        iter.bucket_file_offset = start_offset + bytes_used;
         Ok((entries_scanned, bytes_used, data_entries_evicted, true))
     }
 }
@@ -2330,7 +2315,7 @@ mod tests {
         .unwrap();
 
         level
-            .prepare_with_normalization(5, TEST_PROTOCOL, incoming, false, &[], true, false)
+            .prepare_with_normalization(5, TEST_PROTOCOL, Arc::new(incoming), false, &[], true, false)
             .unwrap();
         level.commit();
 

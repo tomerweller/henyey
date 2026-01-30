@@ -106,6 +106,14 @@ impl BucketSnapshot {
         self.bucket.get(key).ok().flatten()
     }
 
+    /// Gets an entry by key from this bucket, propagating errors.
+    ///
+    /// Unlike [`get`](Self::get) which swallows errors, this method returns
+    /// a `Result` so callers can handle I/O or deserialization failures.
+    pub fn get_result(&self, key: &LedgerKey) -> crate::Result<Option<BucketEntry>> {
+        self.bucket.get(key)
+    }
+
     /// Returns a reference to the underlying bucket.
     pub fn raw_bucket(&self) -> &Bucket {
         &self.bucket
@@ -197,11 +205,14 @@ pub struct BucketLevelSnapshot {
 
 impl BucketLevelSnapshot {
     /// Creates a new level snapshot from a bucket level.
+    ///
+    /// Uses `Arc::clone` for curr and snap (zero-cost reference count increment)
+    /// instead of deep-cloning the bucket data.
     pub fn from_level(level: &BucketLevel) -> Self {
         Self {
-            curr: BucketSnapshot::from_ref(&level.curr),
+            curr: BucketSnapshot::new(Arc::clone(&level.curr)),
             next: level.next().map(BucketSnapshot::from_ref),
-            snap: BucketSnapshot::from_ref(&level.snap),
+            snap: BucketSnapshot::new(Arc::clone(&level.snap)),
         }
     }
 }
@@ -279,6 +290,25 @@ impl BucketListSnapshot {
             }
         }
         None
+    }
+
+    /// Looks up an entry by key in this snapshot, propagating errors.
+    ///
+    /// Like [`get`](Self::get) but returns a `Result` instead of swallowing
+    /// I/O or deserialization errors from disk-backed buckets.
+    pub fn get_result(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        for level in &self.levels {
+            for bucket in [&level.curr, &level.snap] {
+                if let Some(entry) = bucket.get_result(key)? {
+                    match entry {
+                        BucketEntry::Live(e) | BucketEntry::Init(e) => return Ok(Some(e)),
+                        BucketEntry::Dead(_) => return Ok(None),
+                        BucketEntry::Metadata(_) => continue,
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Loads multiple entries by their keys.
@@ -1341,5 +1371,96 @@ mod tests {
         // dest2 should be first (higher votes)
         assert_eq!(winners[0].account_id, dest2);
         assert_eq!(winners[1].account_id, dest1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_snapshot_isolation_from_bucket_list_mutations() {
+        let mut bucket_list = BucketList::new();
+
+        // Add entry A
+        let account_a = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
+        let entry_a = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_a.clone(),
+                balance: 1000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![entry_a.clone()],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+        let key_a = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_a,
+        });
+
+        // Take snapshot — should see entry A
+        let snapshot = BucketListSnapshot::new(&bucket_list, make_test_header(1));
+        assert!(snapshot.get(&key_a).is_some());
+
+        // Also verify get_result returns the same entry
+        let result = snapshot.get_result(&key_a).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().last_modified_ledger_seq, 1);
+
+        // Mutate bucket list: add entry B, delete entry A
+        let account_b = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xBB; 32])));
+        let entry_b = LedgerEntry {
+            last_modified_ledger_seq: 2,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_b.clone(),
+                balance: 2000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let key_b = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_b,
+        });
+        bucket_list
+            .add_batch(
+                2,
+                25,
+                BucketListType::Live,
+                vec![entry_b],
+                vec![],
+                vec![key_a.clone()],
+            )
+            .unwrap();
+
+        // Verify bucket list itself reflects the mutations
+        assert!(bucket_list.get(&key_a).unwrap().is_none(), "A should be deleted from live bucket list");
+        assert!(bucket_list.get(&key_b).unwrap().is_some(), "B should exist in live bucket list");
+
+        // Verify snapshot is isolated — still sees old state
+        assert!(snapshot.get(&key_a).is_some(), "snapshot should still see entry A");
+        assert!(snapshot.get(&key_b).is_none(), "snapshot should not see entry B");
+
+        // Same via get_result
+        assert!(snapshot.get_result(&key_a).unwrap().is_some(), "get_result should still return entry A");
+        assert!(snapshot.get_result(&key_b).unwrap().is_none(), "get_result should not return entry B");
     }
 }

@@ -32,15 +32,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, PoolId, ReadXdr, WriteXdr};
+use xorf::BinaryFuse16;
 
-use crate::index::{BucketEntryCounters, DiskIndex, RangeEntry, TypeRange};
+use crate::bloom_filter::BucketBloomFilter;
+use crate::index::{AssetPoolIdMap, BucketEntryCounters, DiskIndex, RangeEntry, TypeRange};
 use crate::BucketError;
 
 /// Current version of the index file format.
 ///
 /// Increment this when making breaking changes to the serialization format.
-pub const BUCKET_INDEX_VERSION: u32 = 1;
+/// Version 2: Added bloom filter and asset-to-pool-id map persistence.
+pub const BUCKET_INDEX_VERSION: u32 = 2;
 
 // ============================================================================
 // Serializable Types
@@ -89,21 +92,48 @@ impl SerializableRangeEntry {
     }
 }
 
-/// Serializable bloom filter data.
+/// Serializable wrapper for the asset-to-pool-id mapping.
 ///
-/// The BucketBloomFilter uses xorf::BinaryFuse16 internally, which we serialize
-/// by extracting its components.
-///
-/// Note: Currently unused as we don't persist bloom filters (they are rebuilt
-/// from bucket files when needed). Kept for potential future optimization.
-#[allow(dead_code)]
-#[derive(Serialize, Deserialize, Debug)]
-struct BloomFilterData {
-    seed: [u8; 16],
-    /// xorf filter internals
-    filter_seed: u64,
-    segment_length: u32,
-    fingerprints: Vec<u16>,
+/// Converts `HashMap<[u8;32], HashSet<PoolId>>` to/from
+/// `HashMap<[u8;32], Vec<[u8;32]>>` for serde compatibility.
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct SerializableAssetPoolIdMap {
+    /// Maps asset hash to list of pool ID bytes.
+    entries: HashMap<[u8; 32], Vec<[u8; 32]>>,
+}
+
+impl SerializableAssetPoolIdMap {
+    fn from_asset_pool_map(map: &AssetPoolIdMap) -> Self {
+        let entries = map
+            .raw_map()
+            .iter()
+            .map(|(asset_hash, pool_ids)| {
+                let pool_bytes: Vec<[u8; 32]> = pool_ids.iter().map(|pid| pid.0 .0).collect();
+                (*asset_hash, pool_bytes)
+            })
+            .collect();
+        Self { entries }
+    }
+
+    fn to_asset_pool_map(&self) -> AssetPoolIdMap {
+        use stellar_xdr::curr::Hash;
+        let asset_to_pools = self
+            .entries
+            .iter()
+            .map(|(asset_hash, pool_bytes)| {
+                let pool_ids: std::collections::HashSet<PoolId> = pool_bytes
+                    .iter()
+                    .map(|bytes| PoolId(Hash(*bytes)))
+                    .collect();
+                (*asset_hash, pool_ids)
+            })
+            .collect();
+        AssetPoolIdMap::from_raw(asset_to_pools)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Serializable entry counters.
@@ -172,11 +202,13 @@ impl SerializableCounters {
 struct IndexData {
     pages: Vec<(SerializableRangeEntry, u64)>,
     bloom_seed: [u8; 16],
-    // Note: We don't serialize the bloom filter for now - it can be rebuilt quickly
-    // from the bucket file if needed. This simplifies serialization.
+    /// Bloom filter (BinaryFuse16 is directly serializable via xorf's serde feature).
+    bloom_filter: Option<BinaryFuse16>,
     counters: SerializableCounters,
     /// Type ranges stored as (entry_type_u32, (start, end)).
     type_ranges: HashMap<u32, (u64, u64)>,
+    /// Asset-to-pool-id mapping.
+    asset_pool_map: Option<SerializableAssetPoolIdMap>,
 }
 
 // ============================================================================
@@ -260,11 +292,28 @@ pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), Buck
         })
         .collect();
 
+    // Serialize bloom filter if present
+    let bloom_filter = index
+        .bloom_filter()
+        .map(|bf| bf.inner_filter().clone());
+
+    // Serialize asset pool map if non-empty
+    let asset_pool_map = {
+        let map = SerializableAssetPoolIdMap::from_asset_pool_map(index.asset_to_pool_id());
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
+    };
+
     let data = IndexData {
         pages,
         bloom_seed: index.bloom_seed(),
+        bloom_filter,
         counters: SerializableCounters::from_counters(index.counters()),
         type_ranges,
+        asset_pool_map,
     };
 
     let header = IndexHeader {
@@ -405,12 +454,22 @@ pub fn load_disk_index(
         })
         .collect();
 
+    // Restore bloom filter
+    let bloom_filter = data
+        .bloom_filter
+        .map(|bf| BucketBloomFilter::from_parts(bf, data.bloom_seed));
+
+    // Restore asset pool map
+    let asset_pool_map = data.asset_pool_map.map(|m| m.to_asset_pool_map());
+
     let index = DiskIndex::from_persisted(
         header.page_size,
         pages,
         data.bloom_seed,
         data.counters.to_counters(),
         type_ranges,
+        bloom_filter,
+        asset_pool_map,
     );
 
     tracing::debug!(
@@ -618,16 +677,32 @@ mod tests {
             loaded_range.unwrap().start_offset
         );
 
+        // Verify bloom filter survives persistence
+        assert!(
+            original.bloom_filter().is_some(),
+            "Original should have a bloom filter"
+        );
+        assert!(
+            loaded.bloom_filter().is_some(),
+            "Loaded index should have bloom filter restored"
+        );
+
+        // Verify bloom filter no false negatives: all original keys found
+        for i in 0..100u8 {
+            let key = make_account_key(i);
+            assert!(
+                loaded.may_contain(&key),
+                "bloom filter false negative for key {}",
+                i
+            );
+        }
+
         // Verify page lookup works on loaded index
         let key = make_account_key(55);
         let orig_page = original.find_page_for_key(&key);
         let loaded_page = loaded.find_page_for_key(&key);
-        // Note: loaded index doesn't have bloom filter, so it may not filter
-        // but if original returns a page, loaded should too
-        if orig_page.is_some() {
-            assert!(loaded_page.is_some());
-            assert_eq!(orig_page, loaded_page);
-        }
+        assert!(orig_page.is_some());
+        assert_eq!(orig_page, loaded_page);
     }
 
     #[test]
@@ -722,5 +797,203 @@ mod tests {
         assert!(!orphaned_index.exists());
         assert!(index_path_for_bucket(&bucket1).exists());
         assert!(index_path_for_bucket(&bucket2).exists());
+    }
+
+    // Helper to create a DiskIndex with entries
+    fn make_disk_index(num_entries: u8, bloom_seed: [u8; 16], page_size: u64) -> DiskIndex {
+        use crate::entry::BucketEntry;
+
+        fn make_account_entry_for(byte: u8) -> LedgerEntry {
+            LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32]))),
+                    balance: 100,
+                    seq_num: SequenceNumber(1),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32::default(),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: vec![].try_into().unwrap(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        }
+
+        let entries: Vec<(BucketEntry, u64)> = (0..num_entries)
+            .map(|i| {
+                (
+                    BucketEntry::Live(make_account_entry_for(i)),
+                    i as u64 * 100,
+                )
+            })
+            .collect();
+
+        DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size)
+    }
+
+    #[test]
+    fn test_save_load_with_bloom_filter() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-bloom.xdr");
+
+        let bloom_seed = [7u8; 16];
+        let page_size = 10u64;
+        let original = make_disk_index(100, bloom_seed, page_size);
+
+        // Verify original has bloom filter
+        assert!(original.bloom_filter().is_some());
+
+        // Save
+        save_disk_index(&original, &bucket_path).unwrap();
+
+        // Load
+        let loaded = load_disk_index(&bucket_path, page_size)
+            .unwrap()
+            .expect("Should load successfully");
+
+        // Verify bloom filter is restored
+        assert!(loaded.bloom_filter().is_some());
+
+        // Verify no false negatives: every key in the original must pass
+        for i in 0..100u8 {
+            let key = make_account_key(i);
+            assert!(
+                loaded.may_contain(&key),
+                "bloom filter false negative for key {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_save_load_with_asset_pool_map() {
+        use crate::index::AssetPoolIdMap;
+        use stellar_xdr::curr::{
+            AlphaNum4, Asset, AssetCode4, Hash, LiquidityPoolConstantProductParameters,
+            LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
+        };
+
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-pool.xdr");
+
+        // Build a DiskIndex that includes liquidity pool entries
+        // We'll use from_entries with pool entries to populate the map
+        let pool_id = PoolId(Hash([1u8; 32]));
+        let asset_a = Asset::Native;
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32]))),
+        });
+
+        // Create entries with a liquidity pool
+        let pool_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::LiquidityPool(stellar_xdr::curr::LiquidityPoolEntry {
+                liquidity_pool_id: pool_id.clone(),
+                body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                    LiquidityPoolEntryConstantProduct {
+                        params: LiquidityPoolConstantProductParameters {
+                            asset_a: asset_a.clone(),
+                            asset_b: asset_b.clone(),
+                            fee: 30,
+                        },
+                        reserve_a: 1000,
+                        reserve_b: 2000,
+                        total_pool_shares: 1000,
+                        pool_shares_trust_line_count: 1,
+                    },
+                ),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Build a small account entry first, then the pool entry
+        let account_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                balance: 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        use crate::entry::BucketEntry;
+
+        let entries = vec![
+            (BucketEntry::Live(account_entry), 0u64),
+            (BucketEntry::Live(pool_entry), 100u64),
+        ];
+
+        let bloom_seed = [0u8; 16];
+        let page_size = 10u64;
+        let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size);
+
+        // Verify original has pool data
+        let pools_native = original.asset_to_pool_id().get_pools_for_asset(&asset_a);
+        assert_eq!(pools_native.len(), 1);
+        assert_eq!(pools_native[0], pool_id);
+
+        // Save
+        save_disk_index(&original, &bucket_path).unwrap();
+
+        // Load
+        let loaded = load_disk_index(&bucket_path, page_size)
+            .unwrap()
+            .expect("Should load successfully");
+
+        // Verify pool map is restored
+        let loaded_pools_native = loaded.asset_to_pool_id().get_pools_for_asset(&asset_a);
+        assert_eq!(loaded_pools_native.len(), 1);
+        assert_eq!(loaded_pools_native[0], pool_id);
+
+        let loaded_pools_usd = loaded.asset_to_pool_id().get_pools_for_asset(&asset_b);
+        assert_eq!(loaded_pools_usd.len(), 1);
+        assert_eq!(loaded_pools_usd[0], pool_id);
+    }
+
+    #[test]
+    fn test_version_2_rejects_version_1() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-v1.xdr");
+        let index_path = index_path_for_bucket(&bucket_path);
+
+        // Manually write an index file with version 1
+        let header = IndexHeader {
+            version: 1,
+            page_size: 10,
+        };
+
+        {
+            let file = File::create(&index_path).unwrap();
+            let mut writer = BufWriter::new(file);
+            bincode::serialize_into(&mut writer, &header).unwrap();
+            writer.flush().unwrap();
+        }
+
+        assert!(index_path.exists());
+
+        // Try to load — should return None due to version mismatch
+        let result = load_disk_index(&bucket_path, 10).unwrap();
+        assert!(
+            result.is_none(),
+            "Version 1 index should be rejected by version 2 loader"
+        );
+
+        // Old file should be cleaned up
+        assert!(
+            !index_path.exists(),
+            "Outdated index file should be deleted"
+        );
     }
 }

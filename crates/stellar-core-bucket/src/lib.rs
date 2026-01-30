@@ -169,7 +169,8 @@ pub use manager::{BucketManager, BucketManagerStats};
 // ============================================================================
 
 pub use merge::{
-    merge_buckets, merge_buckets_with_options, merge_in_memory, merge_multiple, MergeIterator,
+    merge_buckets, merge_buckets_to_file, merge_buckets_with_options, merge_in_memory,
+    merge_multiple, MergeIterator,
 };
 
 // ============================================================================

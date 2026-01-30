@@ -18,13 +18,14 @@
 //!
 //! ```text
 //! <bucket_dir>/
-//!   <hash1>.bucket.gz
-//!   <hash2>.bucket.gz
+//!   <hash1>.bucket.xdr
+//!   <hash2>.bucket.xdr
 //!   ...
 //! ```
 //!
-//! Files are gzip-compressed XDR. The hash is computed from the uncompressed
-//! content (including XDR record marks).
+//! Files are uncompressed XDR with record marks (RFC 5531). The hash is
+//! computed from these contents. This format supports random-access seeks
+//! for efficient disk-backed indexing and streaming iteration.
 //!
 //! # Caching
 //!
@@ -89,11 +90,21 @@ pub struct BucketManager {
     cache: RwLock<HashMap<Hash256, Arc<Bucket>>>,
     /// Maximum number of buckets to keep in cache.
     max_cache_size: usize,
+    /// Whether to persist/load disk indexes alongside bucket files.
+    persist_index: bool,
 }
 
 impl BucketManager {
     /// Default maximum cache size.
     pub const DEFAULT_MAX_CACHE_SIZE: usize = 100;
+
+    /// File size threshold (in bytes) above which buckets are loaded as DiskBacked
+    /// instead of InMemory. Files larger than this threshold are accessed via
+    /// random disk I/O with an in-memory index, avoiding loading the full file.
+    ///
+    /// Default: 10 MB. Files under this size are small enough to load entirely
+    /// into memory without significant memory pressure.
+    pub const DISK_BACKED_THRESHOLD: u64 = 10 * 1024 * 1024;
 
     /// Create a new BucketManager with the given directory.
     pub fn new(bucket_dir: PathBuf) -> Result<Self> {
@@ -104,6 +115,7 @@ impl BucketManager {
             bucket_dir,
             cache: RwLock::new(HashMap::new()),
             max_cache_size: Self::DEFAULT_MAX_CACHE_SIZE,
+            persist_index: false,
         })
     }
 
@@ -115,7 +127,28 @@ impl BucketManager {
             bucket_dir,
             cache: RwLock::new(HashMap::new()),
             max_cache_size,
+            persist_index: false,
         })
+    }
+
+    /// Create a new BucketManager with index persistence enabled.
+    ///
+    /// When `persist_index` is true, disk indexes are saved alongside bucket files
+    /// and loaded on startup, avoiding expensive index rebuilds.
+    pub fn with_persist_index(bucket_dir: PathBuf, persist_index: bool) -> Result<Self> {
+        std::fs::create_dir_all(&bucket_dir)?;
+
+        Ok(Self {
+            bucket_dir,
+            cache: RwLock::new(HashMap::new()),
+            max_cache_size: Self::DEFAULT_MAX_CACHE_SIZE,
+            persist_index,
+        })
+    }
+
+    /// Returns whether index persistence is enabled.
+    pub fn persist_index(&self) -> bool {
+        self.persist_index
     }
 
     /// Get the bucket directory path.
@@ -124,7 +157,17 @@ impl BucketManager {
     }
 
     /// Get the file path for a bucket with the given hash.
+    ///
+    /// Returns the path using the canonical `.bucket.xdr` extension
+    /// (uncompressed XDR with record marks).
     pub fn bucket_path(&self, hash: &Hash256) -> PathBuf {
+        self.bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()))
+    }
+
+    /// Get the legacy gzip file path for a bucket with the given hash.
+    ///
+    /// Used for migration from the old `.bucket.gz` format.
+    fn legacy_bucket_path(&self, hash: &Hash256) -> PathBuf {
         self.bucket_dir.join(format!("{}.bucket.gz", hash.to_hex()))
     }
 
@@ -133,7 +176,7 @@ impl BucketManager {
     /// This will:
     /// 1. Sort entries by key
     /// 2. Create the bucket
-    /// 3. Save to disk
+    /// 3. Save to disk as uncompressed XDR
     /// 4. Add to cache
     pub fn create_bucket(&self, entries: Vec<BucketEntry>) -> Result<Arc<Bucket>> {
         if entries.is_empty() {
@@ -152,9 +195,9 @@ impl BucketManager {
             }
         }
 
-        // Save to disk
+        // Save to disk as uncompressed XDR
         let path = self.bucket_path(&hash);
-        bucket.save_to_file(&path)?;
+        bucket.save_to_xdr_file(&path)?;
 
         // Add to cache
         let bucket = Arc::new(bucket);
@@ -180,6 +223,12 @@ impl BucketManager {
     /// Load a bucket by its hash.
     ///
     /// First checks the cache, then loads from disk if not cached.
+    /// Supports both the canonical `.bucket.xdr` format and the legacy
+    /// `.bucket.gz` format (with automatic migration).
+    ///
+    /// Files larger than [`DISK_BACKED_THRESHOLD`] are loaded as DiskBacked
+    /// buckets (only the index is in memory); smaller files are loaded entirely
+    /// into memory for faster access.
     pub fn load_bucket(&self, hash: &Hash256) -> Result<Arc<Bucket>> {
         // Check if it's the empty bucket
         if hash.is_zero() {
@@ -194,13 +243,38 @@ impl BucketManager {
             }
         }
 
-        // Load from disk
-        let path = self.bucket_path(hash);
-        if !path.exists() {
-            return Err(BucketError::NotFound(hash.to_hex()));
+        // Try canonical .bucket.xdr path first
+        let xdr_path = self.bucket_path(hash);
+        if !xdr_path.exists() {
+            // Fall back to legacy .bucket.gz format with migration
+            let gz_path = self.legacy_bucket_path(hash);
+            if !gz_path.exists() {
+                return Err(BucketError::NotFound(hash.to_hex()));
+            }
+
+            // Streaming migration: decompress gz → xdr without loading all entries
+            Bucket::migrate_gz_to_xdr(&gz_path, &xdr_path)?;
+            std::fs::remove_file(&gz_path)?;
+            tracing::info!(
+                hash = %hash,
+                "Migrated bucket from .bucket.gz to .bucket.xdr"
+            );
         }
 
-        let bucket = Bucket::load_from_file(&path)?;
+        // Load from .bucket.xdr based on file size
+        let file_size = std::fs::metadata(&xdr_path)?.len();
+        let bucket = if file_size > Self::DISK_BACKED_THRESHOLD {
+            // Large file: use DiskBacked with streaming index build (O(index_size) memory)
+            tracing::debug!(
+                hash = %hash,
+                file_size,
+                "Loading bucket as DiskBacked (file exceeds threshold)"
+            );
+            Bucket::from_xdr_file_disk_backed(&xdr_path)?
+        } else {
+            // Small file: load entirely into memory for fast access
+            Bucket::load_from_xdr_file(&xdr_path)?
+        };
 
         // Verify hash matches
         if bucket.hash() != *hash {
@@ -221,6 +295,10 @@ impl BucketManager {
     ///
     /// Hot archive buckets contain `HotArchiveBucketEntry` instead of `BucketEntry`.
     /// This method loads and parses the bucket file with the correct entry type.
+    /// Supports both canonical `.bucket.xdr` and legacy `.bucket.gz` formats.
+    ///
+    /// For files larger than `DISK_BACKED_THRESHOLD`, creates a DiskBacked bucket
+    /// that only holds an index in memory (matching C++ behavior for hot archive).
     ///
     /// Note: Hot archive buckets are not cached (they use a different entry type).
     pub fn load_hot_archive_bucket(
@@ -232,13 +310,31 @@ impl BucketManager {
             return Ok(crate::hot_archive::HotArchiveBucket::empty());
         }
 
-        // Load from disk
-        let path = self.bucket_path(hash);
-        if !path.exists() {
-            return Err(BucketError::NotFound(hash.to_hex()));
+        // Try canonical .bucket.xdr path first
+        let xdr_path = self.bucket_path(hash);
+        if !xdr_path.exists() {
+            // Fall back to legacy .bucket.gz format and migrate
+            let gz_path = self.legacy_bucket_path(hash);
+            if !gz_path.exists() {
+                return Err(BucketError::NotFound(hash.to_hex()));
+            }
+
+            // Streaming migration: decompress gz → xdr without loading all entries
+            Bucket::migrate_gz_to_xdr(&gz_path, &xdr_path)?;
+            std::fs::remove_file(&gz_path)?;
+            tracing::info!(
+                hash = %hash,
+                "Migrated hot archive bucket from .bucket.gz to .bucket.xdr"
+            );
         }
 
-        let bucket = crate::hot_archive::HotArchiveBucket::load_from_file(&path)?;
+        // Load based on file size: DiskBacked for large files, InMemory for small
+        let file_size = std::fs::metadata(&xdr_path)?.len();
+        let bucket = if file_size > Self::DISK_BACKED_THRESHOLD {
+            crate::hot_archive::HotArchiveBucket::from_xdr_file_disk_backed(&xdr_path)?
+        } else {
+            crate::hot_archive::HotArchiveBucket::load_from_xdr_file(&xdr_path)?
+        };
 
         // Verify hash matches
         if bucket.hash() != *hash {
@@ -252,6 +348,8 @@ impl BucketManager {
     }
 
     /// Check if a bucket exists (in cache or on disk).
+    ///
+    /// Checks both the canonical `.bucket.xdr` and legacy `.bucket.gz` paths.
     pub fn bucket_exists(&self, hash: &Hash256) -> bool {
         if hash.is_zero() {
             return true; // Empty bucket always "exists"
@@ -265,8 +363,8 @@ impl BucketManager {
             }
         }
 
-        // Check disk
-        self.bucket_path(hash).exists()
+        // Check disk (canonical path first, then legacy)
+        self.bucket_path(hash).exists() || self.legacy_bucket_path(hash).exists()
     }
 
     /// Merge two buckets and create a new bucket.
@@ -291,9 +389,9 @@ impl BucketManager {
             }
         }
 
-        // Save to disk
+        // Save to disk as uncompressed XDR
         let path = self.bucket_path(&hash);
-        merged.save_to_file(&path)?;
+        merged.save_to_xdr_file(&path)?;
 
         // Add to cache
         let bucket = Arc::new(merged);
@@ -312,6 +410,48 @@ impl BucketManager {
         // For now, just call the sync version
         // In the future, this could use tokio::task::spawn_blocking
         self.merge(old, new, max_protocol_version)
+    }
+
+    /// Save a disk index for a bucket.
+    ///
+    /// Only effective when `persist_index` is true. The index is saved as a
+    /// `.index` file alongside the bucket file.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The bucket hash (used to derive file paths)
+    /// * `index` - The DiskIndex to persist
+    pub fn save_index_for_bucket(
+        &self,
+        hash: &Hash256,
+        index: &crate::index::DiskIndex,
+    ) -> Result<()> {
+        if !self.persist_index {
+            return Ok(());
+        }
+        let bucket_path = self.bucket_path(hash);
+        crate::index_persistence::save_disk_index(index, &bucket_path)
+    }
+
+    /// Try to load a persisted disk index for a bucket.
+    ///
+    /// Returns `None` if persistence is disabled, the file doesn't exist,
+    /// or the stored version/page-size doesn't match.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The bucket hash
+    /// * `expected_page_size` - Expected page size for validation
+    pub fn try_load_index_for_bucket(
+        &self,
+        hash: &Hash256,
+        expected_page_size: u64,
+    ) -> Result<Option<crate::index::DiskIndex>> {
+        if !self.persist_index {
+            return Ok(None);
+        }
+        let bucket_path = self.bucket_path(hash);
+        crate::index_persistence::load_disk_index(&bucket_path, expected_page_size)
     }
 
     /// Add a bucket to the cache.
@@ -342,6 +482,8 @@ impl BucketManager {
     }
 
     /// List all bucket files in the directory.
+    ///
+    /// Finds both canonical `.bucket.xdr` and legacy `.bucket.gz` files.
     pub fn list_buckets(&self) -> Result<Vec<Hash256>> {
         let mut hashes = Vec::new();
 
@@ -350,10 +492,19 @@ impl BucketManager {
             let path = entry.path();
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".bucket.gz") {
-                    let hash_str = name.trim_end_matches(".bucket.gz");
+                let hash_str = if name.ends_with(".bucket.xdr") {
+                    Some(name.trim_end_matches(".bucket.xdr"))
+                } else if name.ends_with(".bucket.gz") {
+                    Some(name.trim_end_matches(".bucket.gz"))
+                } else {
+                    None
+                };
+
+                if let Some(hash_str) = hash_str {
                     if let Ok(hash) = Hash256::from_hex(hash_str) {
-                        hashes.push(hash);
+                        if !hashes.contains(&hash) {
+                            hashes.push(hash);
+                        }
                     }
                 }
             }
@@ -364,7 +515,9 @@ impl BucketManager {
 
     /// Delete a bucket file.
     ///
-    /// This also removes the bucket from the cache.
+    /// This also removes the bucket from the cache and deletes the
+    /// associated `.index` file when `persist_index` is true.
+    /// Removes both `.bucket.xdr` and legacy `.bucket.gz` files if present.
     pub fn delete_bucket(&self, hash: &Hash256) -> Result<()> {
         // Remove from cache
         {
@@ -372,10 +525,23 @@ impl BucketManager {
             cache.remove(hash);
         }
 
-        // Delete file
-        let path = self.bucket_path(hash);
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        // Delete canonical .bucket.xdr file
+        let xdr_path = self.bucket_path(hash);
+        if xdr_path.exists() {
+            // Delete associated index file
+            if self.persist_index {
+                let _ = crate::index_persistence::delete_index(&xdr_path);
+            }
+            std::fs::remove_file(&xdr_path)?;
+        }
+
+        // Delete legacy .bucket.gz file if it exists
+        let gz_path = self.legacy_bucket_path(hash);
+        if gz_path.exists() {
+            if self.persist_index {
+                let _ = crate::index_persistence::delete_index(&gz_path);
+            }
+            std::fs::remove_file(&gz_path)?;
         }
 
         Ok(())
@@ -383,7 +549,8 @@ impl BucketManager {
 
     /// Delete all bucket files not in the given set of hashes.
     ///
-    /// This is useful for garbage collection.
+    /// This is useful for garbage collection. When `persist_index` is enabled,
+    /// also cleans up orphaned `.index` files.
     pub fn retain_buckets(&self, keep: &[Hash256]) -> Result<usize> {
         let keep_set: std::collections::HashSet<_> = keep.iter().collect();
         let all_buckets = self.list_buckets()?;
@@ -394,6 +561,11 @@ impl BucketManager {
                 self.delete_bucket(&hash)?;
                 deleted += 1;
             }
+        }
+
+        // Clean up any orphaned index files
+        if self.persist_index {
+            let _ = crate::index_persistence::cleanup_orphaned_indexes(&self.bucket_dir);
         }
 
         Ok(deleted)
@@ -412,9 +584,13 @@ impl BucketManager {
     }
 
     /// Import a bucket from raw XDR bytes.
+    ///
+    /// Saves the raw bytes to disk first, then loads via the threshold-aware
+    /// path (DiskBacked for files > 10 MB, InMemory for smaller files).
+    /// This avoids loading all entries into memory for large buckets.
     pub fn import_bucket(&self, xdr_bytes: &[u8]) -> Result<Arc<Bucket>> {
-        let bucket = Bucket::from_xdr_bytes(xdr_bytes)?;
-        let hash = bucket.hash();
+        // Compute hash directly from raw bytes (no entry parsing needed)
+        let hash = Hash256::hash(xdr_bytes);
 
         // Check cache
         {
@@ -424,15 +600,20 @@ impl BucketManager {
             }
         }
 
-        // Save to disk
+        // Save raw XDR bytes to disk if not already there
         let path = self.bucket_path(&hash);
-        bucket.save_to_file(&path)?;
+        if !path.exists() {
+            use std::io::Write;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(xdr_bytes)?;
+            file.sync_all()?;
+        }
 
-        // Add to cache
-        let bucket = Arc::new(bucket);
-        self.add_to_cache(hash, Arc::clone(&bucket));
-
-        Ok(bucket)
+        // Load via threshold-aware path (DiskBacked for large, InMemory for small)
+        self.load_bucket(&hash)
     }
 
     /// Export a bucket to raw XDR bytes.
@@ -742,12 +923,19 @@ impl BucketManager {
                 continue;
             }
 
-            let path = self.bucket_path(expected_hash);
-            if !path.exists() {
-                continue; // Skip missing files (use verify_buckets_exist for that check)
-            }
+            // Try canonical path first, then legacy
+            let xdr_path = self.bucket_path(expected_hash);
+            let gz_path = self.legacy_bucket_path(expected_hash);
 
-            match Bucket::load_from_file(&path) {
+            let load_result = if xdr_path.exists() {
+                Bucket::load_from_xdr_file(&xdr_path)
+            } else if gz_path.exists() {
+                Bucket::load_from_file(&gz_path)
+            } else {
+                continue; // Skip missing files (use verify_buckets_exist for that check)
+            };
+
+            match load_result {
                 Ok(bucket) => {
                     let actual_hash = bucket.hash();
                     if actual_hash != *expected_hash {
@@ -1214,5 +1402,69 @@ mod tests {
             .ensure_buckets_exist(&[bucket.hash()], |_hash| panic!("Should not be called"))
             .unwrap();
         assert_eq!(fetched, 0);
+    }
+
+    #[test]
+    fn test_bucket_manager_persist_index() {
+        use crate::index::{DiskIndex, DEFAULT_PAGE_SIZE};
+        use crate::index_persistence::index_path_for_bucket;
+
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            BucketManager::with_persist_index(temp_dir.path().to_path_buf(), true).unwrap();
+        assert!(manager.persist_index());
+
+        // Create a bucket
+        let entries: Vec<BucketEntry> = (0..100u8)
+            .map(|i| BucketEntry::Live(make_account_entry([i; 32], i as i64 * 100)))
+            .collect();
+        let bucket = manager.create_bucket(entries.clone()).unwrap();
+        let hash = bucket.hash();
+        let bucket_path = manager.bucket_path(&hash);
+
+        // Build and save a disk index
+        let indexed_entries: Vec<(crate::entry::BucketEntry, u64)> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| (e, i as u64 * 100))
+            .collect();
+        let bloom_seed = [0u8; 16];
+        let index =
+            DiskIndex::from_entries(indexed_entries.into_iter(), bloom_seed, DEFAULT_PAGE_SIZE);
+        manager.save_index_for_bucket(&hash, &index).unwrap();
+
+        // Verify index file exists
+        let index_path = index_path_for_bucket(&bucket_path);
+        assert!(index_path.exists(), "Index file should be created");
+
+        // Load the index back
+        let loaded = manager
+            .try_load_index_for_bucket(&hash, DEFAULT_PAGE_SIZE)
+            .unwrap();
+        assert!(loaded.is_some(), "Should load persisted index");
+
+        let loaded_idx = loaded.unwrap();
+        assert_eq!(loaded_idx.page_size(), DEFAULT_PAGE_SIZE);
+
+        // Delete the bucket — index should also be removed
+        manager.delete_bucket(&hash).unwrap();
+        assert!(!bucket_path.exists(), "Bucket file should be deleted");
+        assert!(!index_path.exists(), "Index file should also be deleted");
+    }
+
+    #[test]
+    fn test_bucket_manager_no_persist_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = BucketManager::new(temp_dir.path().to_path_buf()).unwrap();
+        assert!(!manager.persist_index());
+
+        // save/load should be no-ops when persist_index is false
+        let hash = Hash256::hash(b"dummy");
+        let entries: Vec<(crate::entry::BucketEntry, u64)> = vec![];
+        let index = crate::index::DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
+
+        manager.save_index_for_bucket(&hash, &index).unwrap();
+        let loaded = manager.try_load_index_for_bucket(&hash, 10).unwrap();
+        assert!(loaded.is_none());
     }
 }

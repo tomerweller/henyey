@@ -27,6 +27,8 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{BufReader, Read as _, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry, LedgerEntry,
     LedgerKey, Limits, ReadXdr, WriteXdr,
@@ -44,15 +46,34 @@ pub const FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE: u32 = 23;
 /// Number of levels in the HotArchiveBucketList (same as live bucket list).
 pub const HOT_ARCHIVE_BUCKET_LIST_LEVELS: usize = 11;
 
+/// Storage backend for a hot archive bucket.
+#[derive(Clone, Debug)]
+enum HotArchiveStorage {
+    /// All entries in memory.
+    InMemory {
+        /// Entries indexed by key (for lookups).
+        entries: BTreeMap<Vec<u8>, HotArchiveBucketEntry>,
+        /// Entries in original/sorted order (for hash computation).
+        /// This preserves C++ stellar-core's entry order which uses semantic comparison,
+        /// not XDR byte comparison.
+        ordered_entries: Vec<HotArchiveBucketEntry>,
+    },
+    /// Entries stored on disk in uncompressed XDR format.
+    DiskBacked {
+        /// Path to the uncompressed `.bucket.xdr` file.
+        path: PathBuf,
+        /// Index mapping key XDR bytes → file offset of the record mark.
+        index: BTreeMap<Vec<u8>, u64>,
+        /// Number of entries in the bucket (including metadata).
+        entry_count: usize,
+    },
+}
+
 /// A hot archive bucket containing archived persistent Soroban entries.
 #[derive(Clone, Debug)]
 pub struct HotArchiveBucket {
-    /// Entries in the bucket, indexed by key (for lookups).
-    entries: BTreeMap<Vec<u8>, HotArchiveBucketEntry>,
-    /// Entries in original/sorted order (for hash computation).
-    /// This preserves C++ stellar-core's entry order which uses semantic comparison,
-    /// not XDR byte comparison.
-    ordered_entries: Vec<HotArchiveBucketEntry>,
+    /// Storage backend.
+    storage: HotArchiveStorage,
     /// Hash of the bucket contents.
     hash: Hash256,
 }
@@ -61,8 +82,10 @@ impl HotArchiveBucket {
     /// Create an empty hot archive bucket.
     pub fn empty() -> Self {
         Self {
-            entries: BTreeMap::new(),
-            ordered_entries: Vec::new(),
+            storage: HotArchiveStorage::InMemory {
+                entries: BTreeMap::new(),
+                ordered_entries: Vec::new(),
+            },
             hash: Hash256::from_bytes([0u8; 32]),
         }
     }
@@ -81,8 +104,10 @@ impl HotArchiveBucket {
         }
 
         let mut bucket = Self {
-            entries: entry_map,
-            ordered_entries: entries,
+            storage: HotArchiveStorage::InMemory {
+                entries: entry_map,
+                ordered_entries: entries,
+            },
             hash: Hash256::from_bytes([0u8; 32]),
         };
 
@@ -140,12 +165,18 @@ impl HotArchiveBucket {
 
     /// Check if the bucket is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        match &self.storage {
+            HotArchiveStorage::InMemory { entries, .. } => entries.is_empty(),
+            HotArchiveStorage::DiskBacked { entry_count, .. } => *entry_count == 0,
+        }
     }
 
     /// Get the number of entries in the bucket.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        match &self.storage {
+            HotArchiveStorage::InMemory { entries, .. } => entries.len(),
+            HotArchiveStorage::DiskBacked { entry_count, .. } => *entry_count,
+        }
     }
 
     /// Get the protocol version (bucket version) from the metadata entry.
@@ -153,24 +184,73 @@ impl HotArchiveBucket {
     /// This matches C++ stellar-core's `getBucketVersion()` method.
     /// Returns the ledger_version from the bucket's metadata entry, or 0 if no metadata.
     pub fn get_protocol_version(&self) -> u32 {
-        // Metadata entry is stored with empty key
-        if let Some(HotArchiveBucketEntry::Metaentry(meta)) = self.entries.get(&Vec::new()) {
-            return meta.ledger_version;
+        match &self.storage {
+            HotArchiveStorage::InMemory { entries, .. } => {
+                // Metadata entry is stored with empty key
+                if let Some(HotArchiveBucketEntry::Metaentry(meta)) = entries.get(&Vec::new()) {
+                    return meta.ledger_version;
+                }
+                0
+            }
+            HotArchiveStorage::DiskBacked { index, path, .. } => {
+                // Try to read metadata entry (stored at offset for empty key)
+                if let Some(&offset) = index.get(&Vec::new()) {
+                    if let Ok(entry) = Self::read_entry_at_offset(path, offset) {
+                        if let HotArchiveBucketEntry::Metaentry(meta) = entry {
+                            return meta.ledger_version;
+                        }
+                    }
+                }
+                0
+            }
         }
-        0
     }
 
     /// Look up an entry by key.
-    pub fn get(&self, key: &LedgerKey) -> Result<Option<&HotArchiveBucketEntry>> {
+    pub fn get(&self, key: &LedgerKey) -> Result<Option<HotArchiveBucketEntry>> {
         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
             BucketError::Serialization(format!("failed to serialize ledger key: {}", e))
         })?;
-        Ok(self.entries.get(&key_bytes))
+        match &self.storage {
+            HotArchiveStorage::InMemory { entries, .. } => Ok(entries.get(&key_bytes).cloned()),
+            HotArchiveStorage::DiskBacked { index, path, .. } => {
+                if let Some(&offset) = index.get(&key_bytes) {
+                    let entry = Self::read_entry_at_offset(path, offset)?;
+                    Ok(Some(entry))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
-    /// Iterate over all entries.
-    pub fn iter(&self) -> impl Iterator<Item = &HotArchiveBucketEntry> {
-        self.entries.values()
+    /// Iterate over all entries in sorted order.
+    ///
+    /// For InMemory buckets, iterates over the BTreeMap values.
+    /// For DiskBacked buckets, streams entries from the file sequentially.
+    pub fn iter(&self) -> HotArchiveIter<'_> {
+        match &self.storage {
+            HotArchiveStorage::InMemory { entries, .. } => HotArchiveIter::InMemory {
+                inner: entries.values(),
+            },
+            HotArchiveStorage::DiskBacked { path, .. } => {
+                // Open the file for streaming iteration
+                match std::fs::File::open(path) {
+                    Ok(file) => {
+                        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                        HotArchiveIter::DiskBacked {
+                            reader: BufReader::new(file),
+                            file_len,
+                            position: 0,
+                        }
+                    }
+                    Err(_) => {
+                        // If file can't be opened, return an empty iterator
+                        HotArchiveIter::Empty
+                    }
+                }
+            }
+        }
     }
 
     /// Compute the hash of the bucket contents.
@@ -183,32 +263,62 @@ impl HotArchiveBucket {
     /// entry order from the file or from fresh() sorting. This is critical because
     /// C++ uses semantic comparison (LedgerEntryIdCmp) which differs from XDR byte order.
     fn compute_hash(&self) -> Result<Hash256> {
-        if self.ordered_entries.is_empty() {
-            return Ok(Hash256::from_bytes([0u8; 32]));
+        match &self.storage {
+            HotArchiveStorage::InMemory {
+                ordered_entries, ..
+            } => {
+                if ordered_entries.is_empty() {
+                    return Ok(Hash256::from_bytes([0u8; 32]));
+                }
+
+                let mut hasher = Sha256::new();
+                for entry in ordered_entries {
+                    let bytes = entry.to_xdr(Limits::none()).map_err(|e| {
+                        BucketError::Serialization(format!("failed to serialize entry: {}", e))
+                    })?;
+
+                    // Write XDR record mark: 4-byte size (big-endian) with high bit set
+                    let sz = bytes.len() as u32;
+                    let record_mark: [u8; 4] = [
+                        ((sz >> 24) & 0xFF) as u8 | 0x80,
+                        ((sz >> 16) & 0xFF) as u8,
+                        ((sz >> 8) & 0xFF) as u8,
+                        (sz & 0xFF) as u8,
+                    ];
+                    hasher.update(record_mark);
+                    hasher.update(&bytes);
+                }
+
+                let result = hasher.finalize();
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(&result);
+                Ok(Hash256::from_bytes(hash_bytes))
+            }
+            HotArchiveStorage::DiskBacked { .. } => {
+                // For disk-backed, hash was computed during construction
+                Ok(self.hash)
+            }
         }
+    }
 
-        let mut hasher = Sha256::new();
-        for entry in &self.ordered_entries {
-            let bytes = entry.to_xdr(Limits::none()).map_err(|e| {
-                BucketError::Serialization(format!("failed to serialize entry: {}", e))
-            })?;
+    /// Read a single entry from the XDR file at a given offset.
+    fn read_entry_at_offset(path: &Path, offset: u64) -> Result<HotArchiveBucketEntry> {
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
 
-            // Write XDR record mark: 4-byte size (big-endian) with high bit set
-            let sz = bytes.len() as u32;
-            let record_mark: [u8; 4] = [
-                ((sz >> 24) & 0xFF) as u8 | 0x80, // High bit set as continuation bit
-                ((sz >> 16) & 0xFF) as u8,
-                ((sz >> 8) & 0xFF) as u8,
-                (sz & 0xFF) as u8,
-            ];
-            hasher.update(record_mark);
-            hasher.update(&bytes);
-        }
+        // Read record mark
+        let mut mark_bytes = [0u8; 4];
+        file.read_exact(&mut mark_bytes)?;
+        let record_mark = u32::from_be_bytes(mark_bytes);
+        let record_len = (record_mark & 0x7FFFFFFF) as usize;
 
-        let result = hasher.finalize();
-        let mut hash_bytes = [0u8; 32];
-        hash_bytes.copy_from_slice(&result);
-        Ok(Hash256::from_bytes(hash_bytes))
+        // Read entry data
+        let mut data = vec![0u8; record_len];
+        file.read_exact(&mut data)?;
+
+        HotArchiveBucketEntry::from_xdr(&data, Limits::none()).map_err(|e| {
+            BucketError::Serialization(format!("failed to parse hot archive entry: {}", e))
+        })
     }
 
     /// Load a hot archive bucket from a gzipped XDR file.
@@ -294,7 +404,7 @@ impl HotArchiveBucket {
             }
         } else {
             // Parse as raw XDR stream (legacy format)
-            use stellar_xdr::curr::{Limited, ReadXdr};
+            use stellar_xdr::curr::Limited;
             let cursor = std::io::Cursor::new(bytes);
             let mut limited = Limited::new(cursor, Limits::none());
 
@@ -317,10 +427,181 @@ impl HotArchiveBucket {
         let hash = Hash256::hash(bytes);
 
         Ok(Self {
-            entries,
-            ordered_entries,
+            storage: HotArchiveStorage::InMemory {
+                entries,
+                ordered_entries,
+            },
             hash,
         })
+    }
+
+    /// Load a hot archive bucket from an uncompressed XDR file.
+    ///
+    /// This reads the bucket file directly without any decompression.
+    pub fn load_from_xdr_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)?;
+        Self::from_xdr_bytes(&bytes)
+    }
+
+    /// Serialize this bucket's entries to uncompressed XDR bytes with record marks.
+    pub fn to_xdr_bytes(&self) -> Result<Vec<u8>> {
+        match &self.storage {
+            HotArchiveStorage::InMemory {
+                ordered_entries, ..
+            } => {
+                let mut bytes = Vec::new();
+                for entry in ordered_entries {
+                    let entry_bytes = entry.to_xdr(Limits::none()).map_err(|e| {
+                        BucketError::Serialization(format!("failed to serialize entry: {}", e))
+                    })?;
+                    let sz = entry_bytes.len() as u32;
+                    let record_mark = sz | 0x80000000;
+                    bytes.extend_from_slice(&record_mark.to_be_bytes());
+                    bytes.extend_from_slice(&entry_bytes);
+                }
+                Ok(bytes)
+            }
+            HotArchiveStorage::DiskBacked { path, .. } => {
+                // Read the entire file
+                std::fs::read(path).map_err(|e| e.into())
+            }
+        }
+    }
+
+    /// Create a disk-backed hot archive bucket from an existing uncompressed XDR file.
+    ///
+    /// Streams through the file to build an index without loading all entries into memory.
+    /// Hash is computed during the streaming pass.
+    pub fn from_xdr_file_disk_backed(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = std::fs::File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+
+        let mut index = BTreeMap::new();
+        let mut hasher = Sha256::new();
+        let mut entry_count = 0;
+        let mut position: u64 = 0;
+
+        while position + 4 <= file_len {
+            let record_offset = position;
+
+            // Read record mark
+            let mut mark_bytes = [0u8; 4];
+            reader.read_exact(&mut mark_bytes)?;
+            let record_mark = u32::from_be_bytes(mark_bytes);
+            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+
+            if position + 4 + record_len as u64 > file_len {
+                return Err(BucketError::Serialization(format!(
+                    "Record length {} exceeds remaining data at offset {}",
+                    record_len, position
+                )));
+            }
+
+            // Read entry data
+            let mut data = vec![0u8; record_len];
+            reader.read_exact(&mut data)?;
+
+            // Hash: include record mark + data
+            hasher.update(mark_bytes);
+            hasher.update(&data);
+
+            // Parse entry to extract key for index
+            let entry = HotArchiveBucketEntry::from_xdr(&data, Limits::none()).map_err(|e| {
+                BucketError::Serialization(format!(
+                    "failed to parse hot archive entry at offset {}: {}",
+                    position, e
+                ))
+            })?;
+
+            let key = hot_archive_entry_to_key(&entry)?;
+            index.insert(key, record_offset);
+            entry_count += 1;
+
+            position += 4 + record_len as u64;
+        }
+
+        let result = hasher.finalize();
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(&result);
+        let hash = if entry_count == 0 {
+            Hash256::from_bytes([0u8; 32])
+        } else {
+            Hash256::from_bytes(hash_bytes)
+        };
+
+        Ok(Self {
+            storage: HotArchiveStorage::DiskBacked {
+                path,
+                index,
+                entry_count,
+            },
+            hash,
+        })
+    }
+}
+
+/// Iterator over hot archive bucket entries.
+///
+/// Supports both in-memory (reference) and disk-backed (streaming) iteration.
+/// Returns owned entries in both cases for a uniform interface.
+pub enum HotArchiveIter<'a> {
+    /// In-memory iteration over BTreeMap values.
+    InMemory {
+        inner: std::collections::btree_map::Values<'a, Vec<u8>, HotArchiveBucketEntry>,
+    },
+    /// Disk-backed streaming iteration.
+    DiskBacked {
+        reader: BufReader<std::fs::File>,
+        file_len: u64,
+        position: u64,
+    },
+    /// Empty iterator (used when file can't be opened).
+    Empty,
+}
+
+impl<'a> Iterator for HotArchiveIter<'a> {
+    type Item = HotArchiveBucketEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            HotArchiveIter::InMemory { inner } => inner.next().cloned(),
+            HotArchiveIter::DiskBacked {
+                reader,
+                file_len,
+                position,
+            } => {
+                if *position + 4 > *file_len {
+                    return None;
+                }
+
+                // Read record mark
+                let mut mark_bytes = [0u8; 4];
+                if reader.read_exact(&mut mark_bytes).is_err() {
+                    return None;
+                }
+                let record_mark = u32::from_be_bytes(mark_bytes);
+                let record_len = (record_mark & 0x7FFFFFFF) as usize;
+
+                if *position + 4 + record_len as u64 > *file_len {
+                    return None;
+                }
+
+                // Read entry data
+                let mut data = vec![0u8; record_len];
+                if reader.read_exact(&mut data).is_err() {
+                    return None;
+                }
+
+                *position += 4 + record_len as u64;
+
+                // Parse entry
+                HotArchiveBucketEntry::from_xdr(&data, Limits::none()).ok()
+            }
+            HotArchiveIter::Empty => None,
+        }
     }
 }
 
@@ -618,7 +899,7 @@ impl HotArchiveBucketList {
     }
 
     /// Look up an archived entry by key.
-    pub fn get(&self, key: &LedgerKey) -> Result<Option<&LedgerEntry>> {
+    pub fn get(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
                 if let Some(entry) = bucket.get(key)? {
@@ -1456,8 +1737,8 @@ pub fn merge_hot_archive_buckets(
             continue;
         }
 
-        let key = hot_archive_entry_to_key(entry)?;
-        merged_entries.insert(key, entry.clone());
+        let key = hot_archive_entry_to_key(&entry)?;
+        merged_entries.insert(key, entry);
     }
 
     // Process snap entries (newer entries)
@@ -1468,10 +1749,10 @@ pub fn merge_hot_archive_buckets(
             continue;
         }
 
-        let key = hot_archive_entry_to_key(entry)?;
+        let key = hot_archive_entry_to_key(&entry)?;
         // Always insert snap entry - it will either add a new entry
         // or replace an existing curr entry (newer always wins)
-        merged_entries.insert(key, entry.clone());
+        merged_entries.insert(key, entry);
     }
 
     // Drop tombstones at bottom level
@@ -1643,7 +1924,7 @@ mod tests {
         assert!(found.is_some());
         match found.unwrap() {
             HotArchiveBucketEntry::Archived(e) => {
-                assert_eq!(e, &entry);
+                assert_eq!(e, entry);
             }
             _ => panic!("expected Archived entry"),
         }

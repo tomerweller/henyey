@@ -203,6 +203,20 @@ impl AssetPoolIdMap {
         self.asset_to_pools.len()
     }
 
+    /// Returns a reference to the raw mapping.
+    ///
+    /// Used for serialization/persistence.
+    pub fn raw_map(&self) -> &HashMap<[u8; 32], HashSet<PoolId>> {
+        &self.asset_to_pools
+    }
+
+    /// Constructs an `AssetPoolIdMap` from a raw mapping.
+    ///
+    /// Used when restoring from persisted data.
+    pub fn from_raw(asset_to_pools: HashMap<[u8; 32], HashSet<PoolId>>) -> Self {
+        Self { asset_to_pools }
+    }
+
     /// Computes a hash for an asset for use as a map key.
     fn hash_asset(asset: &Asset) -> [u8; 32] {
         let asset_bytes = asset.to_xdr(Limits::none()).unwrap_or_default();
@@ -622,22 +636,23 @@ impl DiskIndex {
     /// * `bloom_seed` - Seed for bloom filter reconstruction
     /// * `counters` - Entry counters
     /// * `type_ranges` - Ranges for each entry type
+    /// * `bloom_filter` - Optional persisted bloom filter
+    /// * `asset_to_pool_id` - Optional persisted asset-to-pool-id mapping
     pub fn from_persisted(
         page_size: u64,
         pages: Vec<(RangeEntry, u64)>,
         bloom_seed: HashSeed,
         counters: BucketEntryCounters,
         type_ranges: HashMap<LedgerEntryType, TypeRange>,
+        bloom_filter: Option<BucketBloomFilter>,
+        asset_to_pool_id: Option<AssetPoolIdMap>,
     ) -> Self {
-        // Note: We don't restore the bloom filter or asset_to_pool_id from persistence.
-        // The bloom filter can be rebuilt if needed, and asset_to_pool_id is typically
-        // not required for persisted indexes (it's mainly used during active operation).
         Self {
             page_size,
             pages,
-            bloom_filter: None, // Not persisted - will cause false positives but no correctness issues
+            bloom_filter: bloom_filter.map(Arc::new),
             bloom_seed,
-            asset_to_pool_id: AssetPoolIdMap::new(), // Not persisted
+            asset_to_pool_id: asset_to_pool_id.unwrap_or_default(),
             counters,
             type_ranges,
         }
@@ -662,6 +677,13 @@ impl DiskIndex {
     /// Used for serialization/persistence.
     pub fn bloom_seed(&self) -> HashSeed {
         self.bloom_seed
+    }
+
+    /// Returns a reference to the bloom filter, if present.
+    ///
+    /// Used for serialization/persistence.
+    pub fn bloom_filter(&self) -> Option<&BucketBloomFilter> {
+        self.bloom_filter.as_deref()
     }
 }
 

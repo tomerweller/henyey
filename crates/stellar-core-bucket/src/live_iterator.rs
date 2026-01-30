@@ -148,8 +148,8 @@ impl<'a> LiveEntriesIterator<'a> {
 
         let level = &self.levels[self.current_level];
         match self.current_phase {
-            0 => Some(&level.curr),
-            1 => Some(&level.snap),
+            0 => Some(&*level.curr),
+            1 => Some(&*level.snap),
             _ => None,
         }
     }
