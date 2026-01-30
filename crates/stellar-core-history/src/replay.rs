@@ -344,12 +344,11 @@ pub fn replay_ledger_with_execution(
         }
         // If not found and we have a hot archive, search there for archived entries and TTLs
         if let Some(ref hot_archive) = hot_archive_ref {
-            // HotArchiveBucketList::get returns Option<&LedgerEntry>, so clone if found
+            // HotArchiveBucketList::get returns Result<Option<LedgerEntry>>
             return hot_archive
                 .read()
                 .map_err(|_| LedgerError::Snapshot("hot archive lock poisoned".to_string()))?
                 .get(key)
-                .map(|opt| opt.cloned())
                 .map_err(LedgerError::Bucket);
         }
         Ok(None)
