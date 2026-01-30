@@ -125,10 +125,14 @@ impl CdpDataLake {
     fn url_for_ledger(&self, ledger_seq: u32) -> String {
         let partition = self.partition_for_ledger(ledger_seq);
         let filename = self.batch_filename(ledger_seq);
-        format!(
-            "{}/{}/{}/{}",
-            self.base_url, self.date_partition, partition, filename
-        )
+        if self.date_partition.is_empty() {
+            format!("{}/{}/{}", self.base_url, partition, filename)
+        } else {
+            format!(
+                "{}/{}/{}/{}",
+                self.base_url, self.date_partition, partition, filename
+            )
+        }
     }
 
     /// Fetch LedgerCloseMeta for a single ledger.
@@ -321,11 +325,11 @@ impl CachedCdpDataLake {
         cache_dir: impl AsRef<std::path::Path>,
         network: &str,
     ) -> std::io::Result<Self> {
-        let cache_path = cache_dir
-            .as_ref()
-            .join("cdp")
-            .join(network)
-            .join(date_partition);
+        let cache_path = if date_partition.is_empty() {
+            cache_dir.as_ref().join("cdp").join(network)
+        } else {
+            cache_dir.as_ref().join("cdp").join(network).join(date_partition)
+        };
         std::fs::create_dir_all(&cache_path)?;
 
         Ok(Self {
