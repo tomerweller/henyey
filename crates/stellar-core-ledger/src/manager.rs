@@ -1134,11 +1134,13 @@ impl LedgerManager {
         // Store in persistent in-memory offer store
         *self.offer_store.write() = mem_offers;
 
-        info!(offer_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: Offer scan complete");
+        let offer_elapsed = cache_init_start.elapsed();
+        info!(offer_count, elapsed_ms = offer_elapsed.as_millis() as u64, "Cache init: Offer scan complete");
 
         // --- Scan 2: ContractCode -> module cache + soroban state ---
         let mut contracts_added = 0u64;
         let mut code_count = 0u64;
+        let mut last_scan_elapsed = offer_elapsed;
         if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
             info!("Cache init: scanning ContractCode entries...");
             bucket_list.scan_for_entries_of_type(LedgerEntryType::ContractCode, |be| {
@@ -1162,7 +1164,12 @@ impl LedgerManager {
                 }
                 true
             });
-            info!(code_count, contracts_added, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: ContractCode scan complete");
+            let now = cache_init_start.elapsed();
+            info!(code_count, contracts_added,
+                scan_ms = (now - last_scan_elapsed).as_millis() as u64,
+                elapsed_ms = now.as_millis() as u64,
+                "Cache init: ContractCode scan complete");
+            last_scan_elapsed = now;
         }
 
         // --- Scan 3: ContractData -> soroban state ---
@@ -1179,7 +1186,12 @@ impl LedgerManager {
                 }
                 true
             });
-            info!(data_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: ContractData scan complete");
+            let now = cache_init_start.elapsed();
+            info!(data_count,
+                scan_ms = (now - last_scan_elapsed).as_millis() as u64,
+                elapsed_ms = now.as_millis() as u64,
+                "Cache init: ContractData scan complete");
+            last_scan_elapsed = now;
         }
 
         // --- Scan 4: TTL -> soroban state ---
@@ -1205,7 +1217,13 @@ impl LedgerManager {
                 }
                 true
             });
-            info!(ttl_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: TTL scan complete");
+            let now = cache_init_start.elapsed();
+            info!(ttl_count,
+                scan_ms = (now - last_scan_elapsed).as_millis() as u64,
+                elapsed_ms = now.as_millis() as u64,
+                "Cache init: TTL scan complete");
+            #[allow(unused_assignments)]
+            { last_scan_elapsed = now; }
         }
 
         // --- Scan 5: ConfigSetting -> soroban state ---
@@ -1226,7 +1244,7 @@ impl LedgerManager {
                 }
                 true
             });
-            info!(config_count, elapsed_s = cache_init_start.elapsed().as_secs(), "Cache init: ConfigSetting scan complete");
+            info!(config_count, elapsed_ms = cache_init_start.elapsed().as_millis() as u64, "Cache init: ConfigSetting scan complete");
         }
 
         // Drop bucket list lock before acquiring write locks
@@ -1251,8 +1269,392 @@ impl LedgerManager {
             config_count,
             total_soroban_size =
                 soroban_stats.contract_data_size + soroban_stats.contract_code_size,
-            elapsed_s = cache_init_start.elapsed().as_secs(),
+            elapsed_ms = cache_init_start.elapsed().as_millis() as u64,
             "Initialized caches from bucket list (per-type scanning)"
+        );
+
+        Ok(())
+    }
+
+    /// Initialize all caches from the bucket list using parallel scanning.
+    ///
+    /// Two tasks run concurrently via `tokio::task::spawn_blocking`:
+    /// - **Task A (Offers)**: Single scan for Offer entries → SQL bulk insert + HashMap
+    /// - **Task B (Soroban)**: Combined scan for ContractCode + ContractData + TTL +
+    ///   ConfigSetting → module cache + soroban state
+    ///
+    /// Both tasks acquire concurrent read locks on the bucket list (parking_lot allows
+    /// multiple readers). DiskBacked buckets use independent file readers, so concurrent
+    /// scans don't conflict.
+    ///
+    /// Compared to `initialize_all_caches()` which performs 5 sequential scans (75 GB
+    /// total disk reads on mainnet), this performs 2 concurrent scans (30 GB total,
+    /// wall time = max of the two).
+    async fn initialize_all_caches_parallel(
+        &self,
+        protocol_version: u32,
+        ledger_seq: u32,
+    ) -> Result<()> {
+        use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
+        use stellar_xdr::curr::LedgerEntryType;
+
+        let cache_init_start = std::time::Instant::now();
+
+        // Load rent config before spawning (uses point lookups, not full scan)
+        let rent_config = {
+            let bucket_list = self.bucket_list.read();
+            self.load_soroban_rent_config(&bucket_list)
+        };
+
+        // Create module cache if Soroban is supported
+        let module_cache = if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+            PersistentModuleCache::new_for_protocol(protocol_version)
+        } else {
+            None
+        };
+
+        // Clone Arc fields for the two tasks
+        let bucket_list_a = self.bucket_list.clone();
+        let bucket_list_b = self.bucket_list.clone();
+        let soroban_state = self.soroban_state.clone();
+        let db = self.db.clone();
+
+        // Clear soroban state before spawning tasks
+        soroban_state.write().clear();
+
+        // Task A — Offers: scan for Offer entries → SQL + in-memory HashMap
+        let offer_task = tokio::task::spawn_blocking(move || -> Result<(HashMap<i64, LedgerEntry>, u64)> {
+            let task_start = std::time::Instant::now();
+            info!("Cache init (parallel): scanning Offer entries...");
+
+            let bucket_list = bucket_list_a.read();
+            let mut conn = db.connection().map_err(LedgerError::from)?;
+            offers_db::drop_offers(&conn)
+                .map_err(|e| LedgerError::Internal(format!("Failed to drop offers table: {}", e)))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| LedgerError::Internal(format!("Failed to start transaction: {}", e)))?;
+
+            let mut offer_batch: Vec<LedgerEntry> = Vec::with_capacity(1000);
+            let mut offer_count = 0u64;
+            let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
+            const BATCH_SIZE: usize = 1000;
+
+            bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
+                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                    if let LedgerEntryData::Offer(ref offer) = entry.data {
+                        mem_offers.insert(offer.offer_id, entry.clone());
+                    }
+
+                    offer_batch.push(entry.clone());
+                    if offer_batch.len() >= BATCH_SIZE {
+                        if let Err(e) = offers_db::bulk_upsert_offers(&tx, &offer_batch) {
+                            tracing::warn!(error = %e, "Failed to bulk upsert offers");
+                        }
+                        offer_count += offer_batch.len() as u64;
+                        offer_batch.clear();
+                    }
+                }
+                true
+            });
+
+            if !offer_batch.is_empty() {
+                offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
+                    LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
+                })?;
+                offer_count += offer_batch.len() as u64;
+            }
+
+            tx.commit()
+                .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
+
+            info!(
+                offer_count,
+                elapsed_ms = task_start.elapsed().as_millis() as u64,
+                "Cache init (parallel): Offer scan complete"
+            );
+
+            Ok((mem_offers, offer_count))
+        });
+
+        // Task B — Soroban: combined scan for ContractCode + ContractData + TTL + ConfigSetting
+        let soroban_task = tokio::task::spawn_blocking(move || -> Result<(Option<PersistentModuleCache>, u64, u64, u64, u64)> {
+            let task_start = std::time::Instant::now();
+
+            if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
+                // No soroban scanning needed, but still scan ConfigSetting
+                let bucket_list = bucket_list_b.read();
+                let mut soroban_state = soroban_state.write();
+                let mut config_count = 0u64;
+
+                info!("Cache init (parallel): scanning ConfigSetting entries...");
+                bucket_list.scan_for_entries_of_type(LedgerEntryType::ConfigSetting, |be| {
+                    if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                        if let Err(e) = soroban_state.process_entry_create(
+                            entry,
+                            protocol_version,
+                            rent_config.as_ref(),
+                        ) {
+                            tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                        } else {
+                            config_count += 1;
+                        }
+                    }
+                    true
+                });
+
+                info!(
+                    config_count,
+                    elapsed_ms = task_start.elapsed().as_millis() as u64,
+                    "Cache init (parallel): ConfigSetting scan complete (pre-soroban)"
+                );
+
+                return Ok((module_cache, 0, 0, 0, config_count));
+            }
+
+            info!("Cache init (parallel): scanning Soroban entries (ContractCode + ContractData + TTL + ConfigSetting)...");
+
+            let bucket_list = bucket_list_b.read();
+            let mut soroban_state = soroban_state.write();
+            let mut contracts_added = 0u64;
+            let mut code_count = 0u64;
+            let mut data_count = 0u64;
+            let mut ttl_count = 0u64;
+            let mut config_count = 0u64;
+
+            bucket_list.scan_for_entries_of_types(
+                &[
+                    LedgerEntryType::ContractCode,
+                    LedgerEntryType::ContractData,
+                    LedgerEntryType::Ttl,
+                    LedgerEntryType::ConfigSetting,
+                ],
+                |be| {
+                    if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                        match &entry.data {
+                            LedgerEntryData::ContractCode(contract_code) => {
+                                if let Some(ref cache) = module_cache {
+                                    if cache.add_contract(
+                                        contract_code.code.as_slice(),
+                                        protocol_version,
+                                    ) {
+                                        contracts_added += 1;
+                                    }
+                                }
+                                if let Err(e) = soroban_state.create_contract_code(
+                                    entry.clone(),
+                                    protocol_version,
+                                    rent_config.as_ref(),
+                                ) {
+                                    tracing::warn!(error = %e, "Failed to add contract code to soroban state");
+                                } else {
+                                    code_count += 1;
+                                }
+                            }
+                            LedgerEntryData::ContractData(_) => {
+                                if let Err(e) = soroban_state.create_contract_data(entry.clone()) {
+                                    tracing::warn!(error = %e, "Failed to add contract data to soroban state");
+                                } else {
+                                    data_count += 1;
+                                }
+                            }
+                            LedgerEntryData::Ttl(ttl) => {
+                                let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                                    key_hash: ttl.key_hash.clone(),
+                                };
+                                let ttl_data = crate::soroban_state::TtlData::new(
+                                    ttl.live_until_ledger_seq,
+                                    entry.last_modified_ledger_seq,
+                                );
+                                if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
+                                    tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
+                                } else {
+                                    ttl_count += 1;
+                                }
+                            }
+                            LedgerEntryData::ConfigSetting(_) => {
+                                if let Err(e) = soroban_state.process_entry_create(
+                                    entry,
+                                    protocol_version,
+                                    rent_config.as_ref(),
+                                ) {
+                                    tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                                } else {
+                                    config_count += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    true
+                },
+            );
+
+            let elapsed = task_start.elapsed();
+            info!(
+                code_count,
+                contracts_added,
+                data_count,
+                ttl_count,
+                config_count,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "Cache init (parallel): Soroban combined scan complete"
+            );
+
+            Ok((module_cache, code_count, data_count, ttl_count, config_count))
+        });
+
+        // Await both tasks
+        let (offer_result, soroban_result) = tokio::try_join!(offer_task, soroban_task)
+            .map_err(|e| LedgerError::Internal(format!("Cache init task failed: {}", e)))?;
+
+        let (mem_offers, offer_count) = offer_result?;
+        let (module_cache, code_count, data_count, ttl_count, config_count) = soroban_result?;
+
+        // Store results
+        *self.offer_store.write() = mem_offers;
+        *self.module_cache.write() = module_cache;
+        *self.offers_initialized.write() = true;
+
+        // Log initialization stats
+        let soroban_stats = self.soroban_state.read().stats();
+        info!(
+            ledger_seq,
+            offer_count,
+            code_count,
+            data_count,
+            ttl_count,
+            config_count,
+            total_soroban_size =
+                soroban_stats.contract_data_size + soroban_stats.contract_code_size,
+            elapsed_ms = cache_init_start.elapsed().as_millis() as u64,
+            "Initialized caches from bucket list (parallel scanning)"
+        );
+
+        Ok(())
+    }
+
+    /// Initialize from bucket list state with parallel cache initialization.
+    ///
+    /// This is the async version of [`initialize_from_buckets`] that uses
+    /// [`initialize_all_caches_parallel`] for concurrent offer and soroban scanning.
+    /// The synchronous preamble (hash verification, state update) is identical.
+    pub async fn initialize_from_buckets_parallel(
+        &self,
+        bucket_list: BucketList,
+        hot_archive_bucket_list: Option<HotArchiveBucketList>,
+        header: LedgerHeader,
+        header_hash: Option<Hash256>,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        // Synchronous preamble: hash verification and state update.
+        // Scoped in a block so the state lock is dropped before any await points.
+        let (ledger_seq, header_hash_hex, protocol_version) = {
+            let mut state = self.state.write();
+            if state.initialized {
+                return Err(LedgerError::AlreadyInitialized);
+            }
+
+            // Compute combined bucket list hash for verification
+            let live_hash = bucket_list.hash();
+            let computed_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
+                let hot_hash = hot_archive.hash();
+                let mut hasher = Sha256::new();
+                hasher.update(live_hash.as_bytes());
+                hasher.update(hot_hash.as_bytes());
+                let result = hasher.finalize();
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&result);
+                Hash256::from_bytes(bytes)
+            } else {
+                live_hash
+            };
+
+            let expected_hash = Hash256::from(header.bucket_list_hash.0);
+
+            tracing::debug!(
+                header_ledger_seq = header.ledger_seq,
+                expected = %expected_hash.to_hex(),
+                computed = %computed_hash.to_hex(),
+                live_hash = %live_hash.to_hex(),
+                hot_archive = hot_archive_bucket_list.is_some(),
+                "Verifying bucket list hash"
+            );
+            for level_idx in 0..bucket_list.levels().len() {
+                if let Some(level) = bucket_list.level(level_idx) {
+                    tracing::debug!(
+                        level = level_idx,
+                        curr_hash = %level.curr.hash().to_hex(),
+                        snap_hash = %level.snap.hash().to_hex(),
+                        level_hash = %level.hash().to_hex(),
+                        "Live level hash"
+                    );
+                }
+            }
+            if let Some(ref hot_archive) = hot_archive_bucket_list {
+                tracing::debug!(
+                    hot_archive_hash = %hot_archive.hash().to_hex(),
+                    "Hot archive bucket list hash"
+                );
+            }
+
+            if self.config.validate_bucket_hash && computed_hash != expected_hash {
+                return Err(LedgerError::HashMismatch {
+                    expected: expected_hash.to_hex(),
+                    actual: computed_hash.to_hex(),
+                });
+            }
+
+            let header_hash = match header_hash {
+                Some(hash) => {
+                    tracing::debug!(
+                        ledger_seq = header.ledger_seq,
+                        provided_hash = %hash.to_hex(),
+                        "Using pre-computed header hash from history archive"
+                    );
+                    hash
+                }
+                None => {
+                    tracing::debug!(
+                        ledger_seq = header.ledger_seq,
+                        "Computing header hash (no pre-computed hash provided)"
+                    );
+                    compute_header_hash(&header)?
+                }
+            };
+
+            // Update state
+            *self.bucket_list.write() = bucket_list;
+            *self.hot_archive_bucket_list.write() = hot_archive_bucket_list;
+
+            self.bucket_list.write().set_ledger_seq(header.ledger_seq);
+            if let Some(ref mut habl) = *self.hot_archive_bucket_list.write() {
+                habl.set_ledger_seq(header.ledger_seq);
+            }
+
+            state.header = header.clone();
+            state.header_hash = header_hash;
+            state.initialized = true;
+
+            let ledger_seq = state.header.ledger_seq;
+            let header_hash_hex = state.header_hash.to_hex();
+            let protocol_version = header.ledger_version;
+
+            // Clear entry cache
+            self.entry_cache.write().clear();
+
+            (ledger_seq, header_hash_hex, protocol_version)
+        }; // state lock dropped here, before any await points
+
+        // Initialize all caches in parallel (async)
+        self.initialize_all_caches_parallel(protocol_version, ledger_seq)
+            .await?;
+
+        info!(
+            ledger_seq,
+            header_hash = %header_hash_hex,
+            "Ledger initialized from buckets (parallel)"
         );
 
         Ok(())

@@ -1513,62 +1513,106 @@ fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
 /// Returns (cached_count, downloaded_count)
 async fn download_buckets_parallel(
     archive: &stellar_core_history::HistoryArchive,
-    bucket_manager: &stellar_core_bucket::BucketManager,
+    bucket_manager: std::sync::Arc<stellar_core_bucket::BucketManager>,
     hashes: Vec<&stellar_core_common::Hash256>,
 ) -> anyhow::Result<(usize, usize)> {
     use futures::stream::{self, StreamExt};
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+    const MAX_CONCURRENT_LOADS: usize = 8;
 
     let total_count = hashes.len();
 
-    // Filter out already-cached buckets
+    // Collect unique non-zero hashes for later parallel loading
+    let unique_hashes: HashSet<stellar_core_common::Hash256> = hashes
+        .iter()
+        .filter(|h| !h.is_zero())
+        .map(|h| **h)
+        .collect();
+
+    // Filter out already-present buckets using fast existence check (no loading)
     let to_download: Vec<_> = hashes
         .into_iter()
-        .filter(|hash| bucket_manager.load_bucket(hash).is_err())
+        .filter(|hash| !bucket_manager.bucket_exists(hash))
         .collect();
 
     let cached_count = total_count - to_download.len();
 
-    if to_download.is_empty() {
-        return Ok((cached_count, 0));
+    if !to_download.is_empty() {
+        let download_count = to_download.len();
+        let downloaded = AtomicU32::new(0);
+
+        println!(
+            "  {} cached, {} to download...",
+            cached_count, download_count
+        );
+
+        let results: Vec<anyhow::Result<()>> = stream::iter(to_download.into_iter())
+            .map(|hash| {
+                let downloaded = &downloaded;
+                let bm = &bucket_manager;
+                async move {
+                    let bucket_data = archive.get_bucket(hash).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to download bucket {}: {}", hash.to_hex(), e)
+                    })?;
+                    bm.import_bucket(&bucket_data).map_err(|e| {
+                        anyhow::anyhow!("Failed to import bucket {}: {}", hash.to_hex(), e)
+                    })?;
+
+                    let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % 5 == 0 || count == download_count as u32 {
+                        println!("  Downloaded {}/{} buckets", count, download_count);
+                    }
+                    Ok(())
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+            .collect()
+            .await;
+
+        // Check for any failures
+        for result in results {
+            result?;
+        }
     }
 
-    let download_count = to_download.len();
-    let downloaded = AtomicU32::new(0);
+    // Parallel loading: load all unique buckets into cache using spawn_blocking
+    // This builds the in-memory index for each bucket (SHA256 hash + offset index).
+    // Thread safety: load_bucket takes read lock to check cache, then brief write lock to insert.
+    let load_start = std::time::Instant::now();
+    let unique_hashes_vec: Vec<stellar_core_common::Hash256> =
+        unique_hashes.into_iter().collect();
+    let load_count = unique_hashes_vec.len();
 
-    println!(
-        "  {} cached, {} to download...",
-        cached_count, download_count
-    );
-
-    let results: Vec<anyhow::Result<()>> = stream::iter(to_download.into_iter())
+    let load_results: Vec<anyhow::Result<()>> = stream::iter(unique_hashes_vec.into_iter())
         .map(|hash| {
-            let downloaded = &downloaded;
+            let bm = bucket_manager.clone();
             async move {
-                let bucket_data = archive.get_bucket(hash).await.map_err(|e| {
-                    anyhow::anyhow!("Failed to download bucket {}: {}", hash.to_hex(), e)
-                })?;
-                bucket_manager.import_bucket(&bucket_data).map_err(|e| {
-                    anyhow::anyhow!("Failed to import bucket {}: {}", hash.to_hex(), e)
-                })?;
-
-                let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
-                if count % 5 == 0 || count == download_count as u32 {
-                    println!("  Downloaded {}/{} buckets", count, download_count);
-                }
-                Ok(())
+                tokio::task::spawn_blocking(move || {
+                    bm.load_bucket(&hash).map_err(|e| {
+                        anyhow::anyhow!("Failed to load bucket {}: {}", hash.to_hex(), e)
+                    })?;
+                    Ok(())
+                })
+                .await?
             }
         })
-        .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+        .buffer_unordered(MAX_CONCURRENT_LOADS)
         .collect()
         .await;
 
-    // Check for any failures
-    for result in results {
+    for result in load_results {
         result?;
     }
+
+    let download_count = total_count - cached_count;
+    println!(
+        "  Loaded {} buckets into cache in {:.2}s",
+        load_count,
+        load_start.elapsed().as_secs_f64()
+    );
 
     Ok((cached_count, download_count))
 }
@@ -1605,6 +1649,7 @@ async fn cmd_replay_bucket_list(
     cdp_url: &str,
     cdp_date: &str,
 ) -> anyhow::Result<()> {
+    use std::sync::Arc;
     use stellar_core_bucket::{
         is_persistent_entry, BucketList, BucketManager, HasNextState, HotArchiveBucketList,
     };
@@ -1736,7 +1781,7 @@ async fn cmd_replay_bucket_list(
 
     // Setup bucket manager and restore initial state from checkpoint BEFORE our test range
     let bucket_dir = tempfile::tempdir()?;
-    let bucket_manager = BucketManager::new(bucket_dir.path().to_path_buf())?;
+    let bucket_manager = Arc::new(BucketManager::new(bucket_dir.path().to_path_buf())?);
 
     println!(
         "Downloading initial state at checkpoint {}...",
@@ -1848,7 +1893,7 @@ async fn cmd_replay_bucket_list(
 
     print!("Buckets ({} required):", all_hashes.len());
     let (cached, downloaded) =
-        download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+        download_buckets_parallel(&archive, bucket_manager.clone(), all_hashes).await?;
     if downloaded == 0 {
         println!(" {} cached", cached);
     }
@@ -2533,6 +2578,8 @@ async fn cmd_verify_execution(
     use stellar_core_tx::ClassicEventConfig;
     use stellar_xdr::curr::{LedgerEntry, LedgerKey};
 
+    let init_start = std::time::Instant::now();
+
     if !quiet {
         println!("Transaction Execution Verification");
         println!("===================================");
@@ -2633,6 +2680,8 @@ async fn cmd_verify_execution(
         println!("CDP metadata: {} ledgers cached", cached);
         println!();
     }
+    let t_cdp = init_start.elapsed();
+    println!("[INIT] CDP prefetch: {:.2}s", t_cdp.as_secs_f64());
 
     // Setup bucket manager with persistent or temp directory
     // We need to keep the temp directory alive for the duration of the function
@@ -2657,6 +2706,7 @@ async fn cmd_verify_execution(
         );
     }
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
+    println!("[INIT] HAS fetch: {:.2}s (cumulative)", init_start.elapsed().as_secs_f64());
 
     // Extract bucket hashes and FutureBucket states for live bucket list
     let bucket_hashes: Vec<(Hash256, Hash256)> = init_has
@@ -2761,23 +2811,30 @@ async fn cmd_verify_execution(
     if !quiet {
         print!("Buckets ({} required):", all_hashes.len());
     }
+    let t_bucket_dl_start = std::time::Instant::now();
     let (cached, downloaded) =
-        download_buckets_parallel(&archive, bucket_manager.as_ref(), all_hashes).await?;
+        download_buckets_parallel(&archive, bucket_manager.clone(), all_hashes).await?;
     if !quiet && downloaded == 0 {
         println!(" {} cached", cached);
     }
+    println!("[INIT] Bucket download: {:.2}s ({} cached, {} downloaded)",
+        t_bucket_dl_start.elapsed().as_secs_f64(), cached, downloaded);
+    println!("[INIT] After bucket download: {:.2}s (cumulative)", init_start.elapsed().as_secs_f64());
 
     // Restore live bucket list for state lookups (with FutureBucket states for pending merges)
+    let t_restore_start = std::time::Instant::now();
     let mut bucket_list = BucketList::restore_from_has(
         &bucket_hashes,
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
     )?;
     bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
+    println!("[INIT] Live bucket list restore: {:.2}s", t_restore_start.elapsed().as_secs_f64());
 
     // Restore hot archive bucket list if present (protocol 23+)
     // Hot archive buckets contain HotArchiveBucketEntry, not BucketEntry, so we use
     // the proper HotArchiveBucketList type and load_hot_archive_bucket method.
+    let t_hot_start = std::time::Instant::now();
     let mut hot_archive_bucket_list: Option<HotArchiveBucketList> =
         if let (Some(ref hashes), Some(ref next_states)) =
             (&hot_archive_hashes, &hot_archive_next_states)
@@ -2790,6 +2847,7 @@ async fn cmd_verify_execution(
         } else {
             None
         };
+    println!("[INIT] Hot archive bucket list restore: {:.2}s", t_hot_start.elapsed().as_secs_f64());
 
     let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
     let init_header_entry = init_headers
@@ -2803,12 +2861,15 @@ async fn cmd_verify_execution(
     // This is critical for correct bucket list hash computation after catchup.
     // In C++ stellar-core, this is done by BucketListBase::restartMerges().
     // Use restart_merges_from_has to handle state 2 (merge in progress with stored input hashes).
+    let t_merge_start = std::time::Instant::now();
     bucket_list.restart_merges_from_has(
         init_checkpoint,
         init_protocol_version,
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
     )?;
+    println!("[INIT] Live merge restart: {:.2}s", t_merge_start.elapsed().as_secs_f64());
+    let t_hot_merge_start = std::time::Instant::now();
     if let Some(ref mut hot) = hot_archive_bucket_list {
         if let Some(ref ha_next_states) = hot_archive_next_states {
             hot.restart_merges_from_has(
@@ -2821,6 +2882,8 @@ async fn cmd_verify_execution(
             hot.restart_merges(init_checkpoint, init_protocol_version)?;
         }
     }
+    println!("[INIT] Hot archive merge restart: {:.2}s", t_hot_merge_start.elapsed().as_secs_f64());
+    println!("[INIT] After bucket restore + merges: {:.2}s (cumulative)", init_start.elapsed().as_secs_f64());
 
     if !quiet {
         println!(
@@ -2856,14 +2919,19 @@ async fn cmd_verify_execution(
 
     // Initialize LedgerManager (handles soroban_state, SQL offers, module_cache, entry_cache)
     let init_header_hash = init_header_entry.map(|h| Hash256::from(h.hash.0));
-    ledger_manager.initialize_from_buckets(
-        bucket_list,
-        hot_archive_bucket_list,
-        init_header_entry
-            .map(|h| h.header.clone())
-            .unwrap_or_default(),
-        init_header_hash,
-    )?;
+    let t_init_caches_start = std::time::Instant::now();
+    ledger_manager
+        .initialize_from_buckets_parallel(
+            bucket_list,
+            hot_archive_bucket_list,
+            init_header_entry
+                .map(|h| h.header.clone())
+                .unwrap_or_default(),
+            init_header_hash,
+        )
+        .await?;
+    println!("[INIT] initialize_from_buckets_parallel (hash verify + all caches): {:.2}s", t_init_caches_start.elapsed().as_secs_f64());
+    println!("[INIT] TOTAL initialization: {:.2}s", init_start.elapsed().as_secs_f64());
 
     if !quiet {
         let soroban_state = ledger_manager.soroban_state().read();
@@ -4893,7 +4961,7 @@ async fn cmd_debug_bucket_entry(
 
     print!("Buckets ({} required):", all_hashes.len());
     let (cached, downloaded) =
-        download_buckets_parallel(&archive, &bucket_manager, all_hashes).await?;
+        download_buckets_parallel(&archive, bucket_manager.clone(), all_hashes).await?;
     if downloaded == 0 {
         println!(" {} cached", cached);
     }

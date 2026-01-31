@@ -1031,6 +1031,70 @@ impl BucketList {
         true
     }
 
+    /// Scan the bucket list for live entries matching ANY of the given types.
+    ///
+    /// This is similar to [`scan_for_entries_of_type`] but accepts multiple types and
+    /// performs a single pass over the bucket list, avoiding redundant I/O when multiple
+    /// types need to be loaded together (e.g., ContractCode + ContractData + TTL +
+    /// ConfigSetting for Soroban state initialization).
+    ///
+    /// A single `HashSet<LedgerKey>` is used for deduplication across all requested types.
+    /// This is safe because `LedgerKey` is a discriminated union — keys of different types
+    /// never collide.
+    ///
+    /// # Memory
+    ///
+    /// The dedup set holds keys for ALL requested types combined. For Soroban init
+    /// (ContractCode + ContractData + TTL + ConfigSetting), this is ~3.66M keys (~480 MB)
+    /// on mainnet.
+    ///
+    /// # Returns
+    ///
+    /// `true` if iteration completed, `false` if stopped early by callback.
+    pub fn scan_for_entries_of_types<F>(
+        &self,
+        entry_types: &[stellar_xdr::curr::LedgerEntryType],
+        mut callback: F,
+    ) -> bool
+    where
+        F: FnMut(&BucketEntry) -> bool,
+    {
+        use stellar_xdr::curr::LedgerKey;
+
+        let type_set: HashSet<stellar_xdr::curr::LedgerEntryType> =
+            entry_types.iter().copied().collect();
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+
+        for level in &self.levels {
+            for bucket in [&*level.curr, &*level.snap] {
+                for entry in bucket.iter() {
+                    if let Some(key) = entry.key() {
+                        if seen_keys.contains(&key) {
+                            continue;
+                        }
+
+                        let entry_type = match &entry {
+                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                                entry_type_of_data(&e.data)
+                            }
+                            BucketEntry::Dead(k) => entry_type_of_key(k),
+                            BucketEntry::Metadata(_) => continue,
+                        };
+
+                        if type_set.contains(&entry_type) {
+                            seen_keys.insert(key);
+
+                            if !entry.is_dead() && !callback(&entry) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Return all live entries as of the current bucket list state.
     ///
     /// # Deprecation

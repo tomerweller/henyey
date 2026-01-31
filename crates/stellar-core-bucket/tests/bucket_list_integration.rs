@@ -4,7 +4,8 @@
 //! particularly for eviction, hot archive operations, and bucket list mechanics.
 
 use stellar_core_bucket::{
-    update_starting_eviction_iterator, BucketList, EvictionIterator, HotArchiveBucketList,
+    update_starting_eviction_iterator, BucketEntry, BucketList, EvictionIterator,
+    HotArchiveBucketList,
 };
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::*;
@@ -1165,4 +1166,332 @@ async fn test_bucket_manager_verify_buckets() {
         manager.bucket_exists(&hash),
         "Bucket should exist after verification"
     );
+}
+
+// =============================================================================
+// scan_for_entries_of_types Tests
+// =============================================================================
+
+fn make_offer_entry(seed: u8, offer_id: i64) -> LedgerEntry {
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+
+    LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Offer(OfferEntry {
+            seller_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes))),
+            offer_id,
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    }
+}
+
+#[allow(dead_code)]
+fn make_config_setting_entry(_id: ConfigSettingId) -> LedgerEntry {
+    LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractMaxSizeBytes(16384)),
+        ext: LedgerEntryExt::V0,
+    }
+}
+
+/// Test that scan_for_entries_of_types returns entries matching multiple types
+/// in a single pass and correctly deduplicates across all types.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_for_entries_of_types_basic() {
+    let mut bl = BucketList::new();
+
+    // Add mixed entry types in a single batch
+    let entries = vec![
+        make_account_entry(1, 1000),
+        make_offer_entry(2, 100),
+        make_contract_code_entry(3, 1),
+        make_contract_data_entry(4, ContractDataDurability::Persistent, 1),
+    ];
+
+    bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, entries, vec![], vec![])
+        .unwrap();
+
+    // Scan for Offer + ContractCode — should find exactly 2 entries
+    let mut found_types = Vec::new();
+    bl.scan_for_entries_of_types(
+        &[LedgerEntryType::Offer, LedgerEntryType::ContractCode],
+        |be| {
+            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                match &entry.data {
+                    LedgerEntryData::Offer(_) => found_types.push("Offer"),
+                    LedgerEntryData::ContractCode(_) => found_types.push("ContractCode"),
+                    other => panic!("Unexpected entry type: {:?}", std::mem::discriminant(other)),
+                }
+            }
+            true
+        },
+    );
+
+    assert_eq!(found_types.len(), 2, "Should find exactly 2 entries");
+    assert!(found_types.contains(&"Offer"), "Should find Offer");
+    assert!(found_types.contains(&"ContractCode"), "Should find ContractCode");
+}
+
+/// Test that scan_for_entries_of_types deduplicates entries that appear in
+/// multiple levels (newer level shadows older level).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_for_entries_of_types_deduplication() {
+    let mut bl = BucketList::new();
+
+    // Ledger 1: add an offer and an account
+    bl.add_batch(
+        1,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![make_offer_entry(1, 100), make_account_entry(10, 500)],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    // Ledger 2: update the same offer (same key, new balance) + add contract code
+    bl.add_batch(
+        2,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![make_contract_code_entry(5, 2)],
+        vec![make_offer_entry(1, 100)], // update with same offer_id
+        vec![],
+    )
+    .unwrap();
+
+    // Scan for Offer + ContractCode — the offer should appear exactly once (deduped)
+    let mut offer_count = 0u32;
+    let mut code_count = 0u32;
+    bl.scan_for_entries_of_types(
+        &[LedgerEntryType::Offer, LedgerEntryType::ContractCode],
+        |be| {
+            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                match &entry.data {
+                    LedgerEntryData::Offer(_) => offer_count += 1,
+                    LedgerEntryData::ContractCode(_) => code_count += 1,
+                    _ => {}
+                }
+            }
+            true
+        },
+    );
+
+    assert_eq!(offer_count, 1, "Offer should be deduped to 1");
+    assert_eq!(code_count, 1, "ContractCode should appear once");
+}
+
+/// Test that scan_for_entries_of_types excludes dead entries and
+/// types not in the requested set.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_for_entries_of_types_excludes_dead_and_unmatched() {
+    let mut bl = BucketList::new();
+
+    // Ledger 1: add entries of multiple types
+    bl.add_batch(
+        1,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![
+            make_offer_entry(1, 100),
+            make_account_entry(2, 1000),
+            make_contract_code_entry(3, 1),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    // Ledger 2: delete the offer
+    let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+        seller_id: {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 1;
+            AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
+        },
+        offer_id: 100,
+    });
+    bl.add_batch(
+        2,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![],
+        vec![],
+        vec![offer_key],
+    )
+    .unwrap();
+
+    // Scan for Offer + Account — dead offer should NOT appear, account should
+    let mut found = Vec::new();
+    bl.scan_for_entries_of_types(
+        &[LedgerEntryType::Offer, LedgerEntryType::Account],
+        |be| {
+            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                match &entry.data {
+                    LedgerEntryData::Offer(_) => found.push("Offer"),
+                    LedgerEntryData::Account(_) => found.push("Account"),
+                    _ => {}
+                }
+            }
+            true
+        },
+    );
+
+    assert_eq!(found, vec!["Account"], "Only Account should remain (offer is dead)");
+}
+
+/// Test that scan_for_entries_of_types with a single type produces the same
+/// results as scan_for_entries_of_type.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_for_entries_of_types_matches_single_type_variant() {
+    let mut bl = BucketList::new();
+
+    // Add a mix of entries across multiple ledgers
+    for i in 1u8..=10 {
+        bl.add_batch(
+            i as u32,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![
+                make_account_entry(i * 10, 1000),
+                make_offer_entry(i * 10 + 1, i as i64 * 100),
+                make_contract_code_entry(i * 10 + 2, i as u32),
+            ],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    }
+
+    // Collect results from single-type scan
+    let mut single_type_offers = Vec::new();
+    bl.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
+        if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+            if let LedgerEntryData::Offer(ref offer) = entry.data {
+                single_type_offers.push(offer.offer_id);
+            }
+        }
+        true
+    });
+
+    // Collect results from multi-type scan (with only Offer)
+    let mut multi_type_offers = Vec::new();
+    bl.scan_for_entries_of_types(&[LedgerEntryType::Offer], |be| {
+        if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+            if let LedgerEntryData::Offer(ref offer) = entry.data {
+                multi_type_offers.push(offer.offer_id);
+            }
+        }
+        true
+    });
+
+    single_type_offers.sort();
+    multi_type_offers.sort();
+
+    assert_eq!(
+        single_type_offers, multi_type_offers,
+        "Multi-type scan with single type should match single-type scan"
+    );
+}
+
+/// Test that scan_for_entries_of_types supports early termination via callback.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_for_entries_of_types_early_termination() {
+    let mut bl = BucketList::new();
+
+    bl.add_batch(
+        1,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![
+            make_offer_entry(1, 100),
+            make_offer_entry(2, 200),
+            make_offer_entry(3, 300),
+            make_contract_code_entry(4, 1),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    // Stop after finding the first entry
+    let mut count = 0u32;
+    let completed = bl.scan_for_entries_of_types(
+        &[LedgerEntryType::Offer, LedgerEntryType::ContractCode],
+        |_be| {
+            count += 1;
+            false // stop immediately
+        },
+    );
+
+    assert!(!completed, "Should return false when stopped early");
+    assert_eq!(count, 1, "Should have processed exactly 1 entry before stopping");
+}
+
+/// Test scan_for_entries_of_types with all four Soroban types combined,
+/// matching the pattern used in initialize_all_caches_parallel.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_for_entries_of_types_soroban_combined() {
+    let mut bl = BucketList::new();
+
+    let code_entry = make_contract_code_entry(1, 1);
+    let data_entry = make_contract_data_entry(2, ContractDataDurability::Persistent, 1);
+    let code_key = make_contract_code_key(1);
+    let ttl_entry = make_ttl_entry(&code_key, 1000, 1);
+
+    bl.add_batch(
+        1,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![
+            code_entry,
+            data_entry,
+            ttl_entry,
+            make_account_entry(10, 5000), // should be excluded
+            make_offer_entry(11, 500),    // should be excluded
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    let mut code_count = 0u32;
+    let mut data_count = 0u32;
+    let mut ttl_count = 0u32;
+    let mut config_count = 0u32;
+    let mut other_count = 0u32;
+
+    bl.scan_for_entries_of_types(
+        &[
+            LedgerEntryType::ContractCode,
+            LedgerEntryType::ContractData,
+            LedgerEntryType::Ttl,
+            LedgerEntryType::ConfigSetting,
+        ],
+        |be| {
+            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                match &entry.data {
+                    LedgerEntryData::ContractCode(_) => code_count += 1,
+                    LedgerEntryData::ContractData(_) => data_count += 1,
+                    LedgerEntryData::Ttl(_) => ttl_count += 1,
+                    LedgerEntryData::ConfigSetting(_) => config_count += 1,
+                    _ => other_count += 1,
+                }
+            }
+            true
+        },
+    );
+
+    assert_eq!(code_count, 1, "Should find 1 ContractCode");
+    assert_eq!(data_count, 1, "Should find 1 ContractData");
+    assert_eq!(ttl_count, 1, "Should find 1 TTL");
+    assert_eq!(config_count, 0, "Should find 0 ConfigSettings (none added)");
+    assert_eq!(other_count, 0, "Should not find Account or Offer entries");
 }
