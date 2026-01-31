@@ -208,7 +208,6 @@ impl SorobanBudget {
 
 /// Budget tracking error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)]
 pub enum BudgetError {
     /// CPU instruction limit exceeded.
     CpuLimitExceeded,
