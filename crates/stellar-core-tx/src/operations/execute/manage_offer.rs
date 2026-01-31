@@ -267,6 +267,16 @@ fn execute_manage_offer(
     }
 
     if let Some(old) = &old_offer {
+        // Ensure trustlines for the old offer's assets are loaded before updating liabilities.
+        // The old offer might have different assets than the new offer being created/updated.
+        if !matches!(&old.selling, Asset::Native) && issuer_for_asset(&old.selling) != Some(source)
+        {
+            state.ensure_trustline_loaded(source, &old.selling)?;
+        }
+        if !matches!(&old.buying, Asset::Native) && issuer_for_asset(&old.buying) != Some(source) {
+            state.ensure_trustline_loaded(source, &old.buying)?;
+        }
+
         let (old_selling, old_buying) = offer_liabilities_sell(old.amount, &old.price)?;
         apply_liabilities_delta(
             source,
@@ -617,6 +627,16 @@ fn delete_offer(
             ));
         }
     };
+
+    // Ensure trustlines for the offer's assets are loaded before updating liabilities.
+    // The offer might reference assets that weren't loaded in the current transaction.
+    if !matches!(&offer.selling, Asset::Native) && issuer_for_asset(&offer.selling) != Some(source)
+    {
+        state.ensure_trustline_loaded(source, &offer.selling)?;
+    }
+    if !matches!(&offer.buying, Asset::Native) && issuer_for_asset(&offer.buying) != Some(source) {
+        state.ensure_trustline_loaded(source, &offer.buying)?;
+    }
 
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
     apply_liabilities_delta(
@@ -986,10 +1006,22 @@ fn cross_offer_v10(
     // This avoids preloading dependencies for all offers upfront.
     state.ensure_account_loaded(&seller)?;
     if !matches!(&wheat, Asset::Native) {
-        state.ensure_trustline_loaded(&seller, &wheat)?;
+        let loaded = state.ensure_trustline_loaded(&seller, &wheat)?;
+        tracing::debug!(
+            "manage_offer cross_offer_v10: ensure_trustline_loaded wheat seller={:02x?}... asset={:?} loaded={}",
+            &crate::account_id_to_key(&seller)[..4],
+            &wheat,
+            loaded
+        );
     }
     if !matches!(&sheep, Asset::Native) {
-        state.ensure_trustline_loaded(&seller, &sheep)?;
+        let loaded = state.ensure_trustline_loaded(&seller, &sheep)?;
+        tracing::debug!(
+            "manage_offer cross_offer_v10: ensure_trustline_loaded sheep seller={:02x?}... asset={:?} loaded={}",
+            &crate::account_id_to_key(&seller)[..4],
+            &sheep,
+            loaded
+        );
     }
 
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
