@@ -2159,8 +2159,10 @@ impl LedgerManager {
         new_header_hash: Hash256,
     ) -> Result<()> {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
+        let close_start = std::time::Instant::now();
 
         // 1. Bucket list add_batch
+        let t0 = std::time::Instant::now();
         self.bucket_list.write().add_batch(
             ledger_seq,
             protocol_version,
@@ -2169,8 +2171,10 @@ impl LedgerManager {
             live_entries.to_vec(),
             dead_entries.to_vec(),
         )?;
+        let bl_add_batch_us = t0.elapsed().as_micros() as u64;
 
         // 2. Hot archive add_batch (protocol 23+)
+        let t0 = std::time::Instant::now();
         if protocol_version >= 23 {
             if let Some(ref mut hot_archive) = *self.hot_archive_bucket_list.write() {
                 hot_archive.add_batch(
@@ -2181,9 +2185,11 @@ impl LedgerManager {
                 )?;
             }
         }
+        let ha_add_batch_us = t0.elapsed().as_micros() as u64;
 
         // 3. Soroban state update
         // Load rent config BEFORE acquiring soroban_state write lock to avoid deadlock.
+        let t0 = std::time::Instant::now();
         if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
             let rent_config = self.load_soroban_rent_config(&self.bucket_list.read());
             self.soroban_state
@@ -2200,8 +2206,10 @@ impl LedgerManager {
                     LedgerError::Internal(format!("soroban state update failed: {}", e))
                 })?;
         }
+        let soroban_update_us = t0.elapsed().as_micros() as u64;
 
         // 4. Module cache update (new contract code)
+        let t0 = std::time::Instant::now();
         {
             let module_cache_guard = self.module_cache.read();
             if let Some(ref cache) = *module_cache_guard {
@@ -2212,15 +2220,36 @@ impl LedgerManager {
                 }
             }
         }
+        let module_cache_us = t0.elapsed().as_micros() as u64;
 
         // 5. SQL offers update
+        let t0 = std::time::Instant::now();
         self.update_offers_from_entries(init_entries, live_entries, dead_entries)?;
+        let offers_update_us = t0.elapsed().as_micros() as u64;
 
         // 6. Entry cache update
+        let t0 = std::time::Instant::now();
         self.update_entry_cache_from_entries(init_entries, live_entries, dead_entries);
+        let entry_cache_us = t0.elapsed().as_micros() as u64;
 
         // 7. Update header
         self.set_state(new_header, new_header_hash);
+
+        let total_us = close_start.elapsed().as_micros() as u64;
+        tracing::info!(
+            ledger_seq,
+            total_us,
+            bl_add_batch_us,
+            ha_add_batch_us,
+            soroban_update_us,
+            module_cache_us,
+            offers_update_us,
+            entry_cache_us,
+            init_count = init_entries.len(),
+            live_count = live_entries.len(),
+            dead_count = dead_entries.len(),
+            "apply_ledger_close timing"
+        );
 
         Ok(())
     }

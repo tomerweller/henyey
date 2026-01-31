@@ -915,6 +915,37 @@ impl TransactionExecutor {
         self.loaded_accounts.clear();
     }
 
+    /// Advance to a new ledger, clearing cached entries but preserving offers.
+    ///
+    /// Offers are expensive to reload (~911K entries on mainnet, ~2.7s per ledger).
+    /// The executor's offer cache is maintained correctly across ledgers because:
+    /// 1. TX execution modifies offers directly in state (create/update/delete)
+    /// 2. At the end of a ledger, state.offers reflects the correct post-ledger state
+    /// 3. The in-memory offer store (LedgerManager) is also updated incrementally
+    ///
+    /// Non-offer entries are still cleared to reload from the bucket list, which
+    /// may have been updated with authoritative CDP metadata.
+    pub fn advance_to_ledger_preserving_offers(
+        &mut self,
+        ledger_seq: u32,
+        close_time: u64,
+        base_reserve: u32,
+        protocol_version: u32,
+        _id_pool: u64,
+        soroban_config: SorobanConfig,
+    ) {
+        self.ledger_seq = ledger_seq;
+        self.close_time = close_time;
+        self.base_reserve = base_reserve;
+        self.protocol_version = protocol_version;
+        self.soroban_config = soroban_config;
+        self.state.set_ledger_seq(ledger_seq);
+        // Clear cached entries except offers and offer index
+        self.state.clear_cached_entries_preserving_offers();
+        // Clear loaded_accounts cache (non-offer)
+        self.loaded_accounts.clear();
+    }
+
     /// Load an account from the snapshot into the state manager.
     pub fn load_account(
         &mut self,
@@ -1773,6 +1804,7 @@ impl TransactionExecutor {
         deduct_fee: bool,
         fee_source_pre_state: Option<LedgerEntry>,
     ) -> Result<TransactionExecutionResult> {
+        let tx_timing_start = std::time::Instant::now();
         let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = stellar_core_tx::muxed_to_account_id(&frame.inner_source_account());
@@ -2276,6 +2308,8 @@ impl TransactionExecutor {
             }
         }
 
+        let validation_us = tx_timing_start.elapsed().as_micros() as u64;
+
         // For fee bump transactions, the required fee includes an extra base fee for the wrapper
         let num_ops = std::cmp::max(1, frame.operation_count() as i64);
         let required_fee = if frame.is_fee_bump() {
@@ -2527,6 +2561,7 @@ impl TransactionExecutor {
 
         // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
+        let fee_seq_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us;
 
         // Create ledger context for operation execution
         let ledger_context = if let Some(prng_seed) = soroban_prng_seed {
@@ -2564,6 +2599,8 @@ impl TransactionExecutor {
         if let Some(data) = soroban_data {
             self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
         }
+
+        let footprint_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us - fee_seq_us;
 
         self.state.clear_sponsorship_stack();
 
@@ -2943,6 +2980,8 @@ impl TransactionExecutor {
             }
         }
 
+        let ops_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us - fee_seq_us - footprint_us;
+
         if all_success && self.protocol_version >= 14 && self.state.has_pending_sponsorship() {
             all_success = false;
             failure = Some(ExecutionFailure::BadSponsorship);
@@ -3050,6 +3089,24 @@ impl TransactionExecutor {
             diagnostic_events,
             soroban_fee_info,
         );
+
+        let total_us = tx_timing_start.elapsed().as_micros() as u64;
+        let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
+        if total_us > 5000 || frame.is_soroban() {
+            tracing::info!(
+                ledger_seq = self.ledger_seq,
+                total_us,
+                validation_us,
+                fee_seq_us,
+                footprint_us,
+                ops_us,
+                meta_us,
+                is_soroban = frame.is_soroban(),
+                num_ops = frame.operations().len(),
+                success = all_success,
+                "TX phase timing"
+            );
+        }
 
         Ok(TransactionExecutionResult {
             success: all_success,

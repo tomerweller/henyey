@@ -943,10 +943,27 @@ impl LedgerStateManager {
     /// ledger in verification mode to ensure entries are reloaded from the
     /// authoritative bucket list state.
     pub fn clear_cached_entries(&mut self) {
+        self.clear_cached_entries_inner(false);
+    }
+
+    /// Clear cached entries but preserve offers and the offer index.
+    ///
+    /// Offers are expensive to reload (~911K entries on mainnet, ~2.7s). Since
+    /// the in-memory offer store is maintained incrementally, the executor's
+    /// offer cache at the end of a ledger already reflects the correct post-ledger
+    /// state. This method clears everything else so non-offer entries are reloaded
+    /// from the authoritative bucket list.
+    pub fn clear_cached_entries_preserving_offers(&mut self) {
+        self.clear_cached_entries_inner(true);
+    }
+
+    fn clear_cached_entries_inner(&mut self, preserve_offers: bool) {
         self.accounts.clear();
         self.trustlines.clear();
-        self.offers.clear();
-        self.offer_index.clear();
+        if !preserve_offers {
+            self.offers.clear();
+            self.offer_index.clear();
+        }
         self.data_entries.clear();
         self.contract_data.clear();
         self.contract_code.clear();
@@ -954,9 +971,19 @@ impl LedgerStateManager {
         self.ttl_bucket_list_snapshot.clear();
         self.claimable_balances.clear();
         self.liquidity_pools.clear();
-        self.entry_sponsorships.clear();
-        self.entry_sponsorship_ext.clear();
-        self.entry_last_modified.clear();
+        if preserve_offers {
+            // Retain sponsorship/last_modified entries for Offer keys only
+            self.entry_sponsorships
+                .retain(|k, _| matches!(k, LedgerKey::Offer(_)));
+            self.entry_sponsorship_ext
+                .retain(|k| matches!(k, LedgerKey::Offer(_)));
+            self.entry_last_modified
+                .retain(|k, _| matches!(k, LedgerKey::Offer(_)));
+        } else {
+            self.entry_sponsorships.clear();
+            self.entry_sponsorship_ext.clear();
+            self.entry_last_modified.clear();
+        }
         self.entry_loader = None;
 
         // Clear all transaction-level state
@@ -992,7 +1019,9 @@ impl LedgerStateManager {
 
         self.created_accounts.clear();
         self.created_trustlines.clear();
-        self.created_offers.clear();
+        if !preserve_offers {
+            self.created_offers.clear();
+        }
         self.created_data.clear();
         self.created_contract_data.clear();
         self.created_contract_code.clear();

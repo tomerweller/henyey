@@ -3115,10 +3115,14 @@ async fn cmd_verify_execution(
             let snapshot_setup_start = std::time::Instant::now();
 
             // Update LedgerManager state for this ledger's header
+            let t0 = std::time::Instant::now();
             ledger_manager.set_state(header.clone(), Hash256::from(header_entry.hash.0));
+            let set_state_us = t0.elapsed().as_micros() as u64;
 
+            let t0 = std::time::Instant::now();
             let mut snapshot_handle = ledger_manager.create_snapshot()
                 .map_err(|e| anyhow::anyhow!("Failed to create snapshot: {}", e))?;
+            let create_snapshot_us = t0.elapsed().as_micros() as u64;
 
             // Override header lookup with local checkpoint headers (not in DB)
             let header_map: std::collections::HashMap<u32, stellar_xdr::curr::LedgerHeader> =
@@ -3135,7 +3139,9 @@ async fn cmd_verify_execution(
             snapshot_handle.set_header_lookup(header_lookup);
 
             // Load Soroban config from ledger state
+            let t0 = std::time::Instant::now();
             let soroban_config = load_soroban_config(&snapshot_handle, header.ledger_version);
+            let load_config_us = t0.elapsed().as_micros() as u64;
 
             // Create or advance the transaction executor
             // Keeping the executor across ledgers preserves state changes from earlier ledgers
@@ -3143,11 +3149,13 @@ async fn cmd_verify_execution(
             //
             // For id_pool: We need the value from BEFORE this ledger's transactions execute.
             // This is the previous ledger's CLOSING id_pool, not the current ledger's.
+            let t0 = std::time::Instant::now();
             let starting_id_pool = prev_id_pool.unwrap_or(0);
+            let is_first_ledger = executor.is_none();
             if let Some(ref mut exec) = executor {
-                // Use fresh state to clear cached entries that may be stale after
-                // applying CDP metadata to the bucket list in the previous ledger.
-                exec.advance_to_ledger_with_fresh_state(
+                // Preserve offers across ledgers to avoid reloading ~911K entries per ledger.
+                // Offers in the executor state are maintained incrementally by TX execution.
+                exec.advance_to_ledger_preserving_offers(
                     seq,
                     cdp_header.scp_value.close_time.0,
                     cdp_header.base_reserve,
@@ -3179,19 +3187,33 @@ async fn cmd_verify_execution(
                 new_executor.set_hot_archive(ledger_manager.hot_archive_bucket_list().clone());
                 executor = Some(new_executor);
             }
+            let executor_setup_us = t0.elapsed().as_micros() as u64;
 
             // Update prev_id_pool for the next ledger
             prev_id_pool = Some(current_id_pool);
             let executor = executor.as_mut().unwrap();
 
-            // Load all orderbook offers into the executor's state before any transactions.
-            // Offers stay current across transactions because TX execution modifies them
-            // directly in state, and snapshot_delta() preserves committed changes.
-            executor.load_orderbook_offers(&snapshot_handle)
-                .map_err(|e| anyhow::anyhow!("Failed to load orderbook offers: {}", e))?;
+            // Load all orderbook offers into the executor's state.
+            // Only needed for the first ledger - subsequent ledgers preserve offers
+            // across the advance_to_ledger_preserving_offers call.
+            let t0 = std::time::Instant::now();
+            if is_first_ledger {
+                executor.load_orderbook_offers(&snapshot_handle)
+                    .map_err(|e| anyhow::anyhow!("Failed to load orderbook offers: {}", e))?;
+            }
+            let load_offers_us = t0.elapsed().as_micros() as u64;
 
             timing.snapshot_setup_us = snapshot_setup_start.elapsed().as_micros() as u64;
-            tracing::info!(ledger_seq = seq, snapshot_setup_ms = timing.snapshot_setup_us / 1000, "Snapshot setup done");
+            tracing::info!(
+                ledger_seq = seq,
+                snapshot_setup_ms = timing.snapshot_setup_us / 1000,
+                set_state_us,
+                create_snapshot_us,
+                load_config_us,
+                executor_setup_us,
+                load_offers_us,
+                "Snapshot setup done"
+            );
 
             // Execute each transaction and compare (using aligned envelope/result/meta)
             let tx_exec_start = std::time::Instant::now();
@@ -3586,6 +3608,10 @@ async fn cmd_verify_execution(
             // We always use our executor's state for true end-to-end verification
             // CDP metadata is only used for comparison to detect divergence
             let bucket_update_start = std::time::Instant::now();
+            let mut delta_prep_us: u64 = 0;
+            let mut eviction_us: u64 = 0;
+            let mut aggregation_us: u64 = 0;
+            let mut apply_close_us: u64 = 0;
             {
                 use stellar_core_bucket::ledger_entry_to_key;
                 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
@@ -3794,6 +3820,8 @@ async fn cmd_verify_execution(
                 }
                 
                 let mut our_live: Vec<LedgerEntry> = live_by_key.into_values().collect();
+
+                delta_prep_us = bucket_update_start.elapsed().as_micros() as u64;
 
                 let mut aggregator = CoalescedLedgerChanges::new();
                 let bl = ledger_manager.bucket_list().read();
@@ -4070,7 +4098,8 @@ async fn cmd_verify_execution(
                     let scan_result = bl
                         .scan_for_eviction_incremental(iter, seq, &settings)
                         .unwrap();
-                    tracing::info!(ledger_seq = seq, eviction_ms = eviction_start.elapsed().as_millis() as u64, "Eviction scan done");
+                    eviction_us = eviction_start.elapsed().as_micros() as u64;
+                    tracing::info!(ledger_seq = seq, eviction_us, "Eviction scan done");
                     let updated_iter = scan_result.end_iterator;
 
                     // Add evicted keys from our scan to our_dead
@@ -4139,6 +4168,8 @@ async fn cmd_verify_execution(
                         archival_override.clone(),
                     );
                 }
+
+                aggregation_us = bucket_update_start.elapsed().as_micros() as u64 - delta_prep_us - eviction_us;
 
                 // Diagnostic logging: compare our execution vs CDP metadata
                 let (cdp_init, cdp_live, cdp_dead) = aggregator.to_vectors();
@@ -4412,7 +4443,7 @@ async fn cmd_verify_execution(
 
                 // Apply all state updates via LedgerManager:
                 // bucket list, hot archive, soroban state, module cache, SQL offers, entry cache
-                tracing::info!(ledger_seq = seq, "Starting apply_ledger_close");
+                let apply_start = std::time::Instant::now();
                 ledger_manager.apply_ledger_close(
                     seq,
                     cdp_header.ledger_version,
@@ -4424,9 +4455,20 @@ async fn cmd_verify_execution(
                     cdp_header.clone(),
                     Hash256::from(header_entry.hash.0),
                 ).map_err(|e| anyhow::anyhow!("apply_ledger_close failed: {}", e))?;
+                apply_close_us = apply_start.elapsed().as_micros() as u64;
             }
             timing.bucket_update_us = bucket_update_start.elapsed().as_micros() as u64;
-            tracing::info!(ledger_seq = seq, bucket_update_ms = timing.bucket_update_us / 1000, "Bucket update done");
+            let comparison_us = timing.bucket_update_us - delta_prep_us - eviction_us - aggregation_us - apply_close_us;
+            tracing::info!(
+                ledger_seq = seq,
+                bucket_update_ms = timing.bucket_update_us / 1000,
+                delta_prep_us,
+                eviction_us,
+                aggregation_us,
+                comparison_us,
+                apply_close_us,
+                "Bucket update done"
+            );
 
             // Header verification: Compare our computed header fields against CDP
             let header_verify_start = std::time::Instant::now();
