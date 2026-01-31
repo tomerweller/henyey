@@ -210,6 +210,9 @@ pub type LedgerHeaderLookupFn = Arc<dyn Fn(u32) -> Result<Option<LedgerHeader>> 
 /// Callback type for full entry enumeration (e.g., bucket list scan).
 pub type EntriesLookupFn = Arc<dyn Fn() -> Result<Vec<LedgerEntry>> + Send + Sync>;
 
+/// Batch entry lookup function for loading multiple entries in a single bucket list pass.
+pub type BatchEntryLookupFn = Arc<dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>> + Send + Sync>;
+
 /// Thread-safe handle to a ledger snapshot with optional lazy loading.
 ///
 /// `SnapshotHandle` wraps a [`LedgerSnapshot`] in an `Arc` for efficient
@@ -242,6 +245,8 @@ pub struct SnapshotHandle {
     header_lookup_fn: Option<LedgerHeaderLookupFn>,
     /// Optional enumeration of all live entries.
     entries_fn: Option<EntriesLookupFn>,
+    /// Optional batch lookup for multiple entries in a single pass.
+    batch_lookup_fn: Option<BatchEntryLookupFn>,
 }
 
 impl SnapshotHandle {
@@ -252,6 +257,7 @@ impl SnapshotHandle {
             lookup_fn: None,
             header_lookup_fn: None,
             entries_fn: None,
+            batch_lookup_fn: None,
         }
     }
 
@@ -262,6 +268,7 @@ impl SnapshotHandle {
             lookup_fn: Some(lookup_fn),
             header_lookup_fn: None,
             entries_fn: None,
+            batch_lookup_fn: None,
         }
     }
 
@@ -276,6 +283,7 @@ impl SnapshotHandle {
             lookup_fn: Some(lookup_fn),
             header_lookup_fn: Some(header_lookup_fn),
             entries_fn: None,
+            batch_lookup_fn: None,
         }
     }
 
@@ -291,6 +299,7 @@ impl SnapshotHandle {
             lookup_fn: Some(lookup_fn),
             header_lookup_fn: Some(header_lookup_fn),
             entries_fn: Some(entries_fn),
+            batch_lookup_fn: None,
         }
     }
 
@@ -307,6 +316,45 @@ impl SnapshotHandle {
     /// Set the full-entry lookup function.
     pub fn set_entries_lookup(&mut self, entries_fn: EntriesLookupFn) {
         self.entries_fn = Some(entries_fn);
+    }
+
+    /// Set the batch entry lookup function.
+    pub fn set_batch_lookup(&mut self, batch_fn: BatchEntryLookupFn) {
+        self.batch_lookup_fn = Some(batch_fn);
+    }
+
+    /// Load multiple entries by their keys.
+    ///
+    /// Checks the snapshot cache first, then uses the batch lookup function
+    /// (if available) for remaining keys. Falls back to individual lookups.
+    pub fn load_entries(&self, keys: &[LedgerKey]) -> Result<Vec<LedgerEntry>> {
+        // Check cache first, collect remaining keys
+        let mut result = Vec::new();
+        let mut remaining = Vec::new();
+        for key in keys {
+            if let Some(entry) = self.inner.get_entry(key)? {
+                result.push(entry.clone());
+            } else {
+                remaining.push(key.clone());
+            }
+        }
+
+        if remaining.is_empty() {
+            return Ok(result);
+        }
+
+        // Use batch lookup if available
+        if let Some(ref batch_fn) = self.batch_lookup_fn {
+            result.extend(batch_fn(&remaining)?);
+        } else if let Some(ref lookup_fn) = self.lookup_fn {
+            for key in &remaining {
+                if let Some(entry) = lookup_fn(key)? {
+                    result.push(entry);
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get the underlying snapshot.

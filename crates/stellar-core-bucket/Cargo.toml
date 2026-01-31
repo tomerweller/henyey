@@ -38,6 +38,9 @@ sha2.workspace = true
 xorf.workspace = true
 siphasher = "0.3"
 
+# Memory-mapped file I/O for disk bucket reads
+memmap2 = "0.9"
+
 # Concurrency
 parking_lot.workspace = true
 

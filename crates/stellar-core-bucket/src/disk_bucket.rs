@@ -39,7 +39,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use memmap2::Mmap;
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr};
@@ -123,9 +125,9 @@ enum DiskBucketIndex {
 ///
 /// # File Access Pattern
 ///
-/// Lookups reuse a cached file handle (protected by Mutex) to avoid
-/// re-opening the file for every get() call. This is critical for
-/// performance on mainnet where thousands of lookups per ledger are needed.
+/// Lookups use memory-mapped I/O for lock-free, zero-syscall reads.
+/// This is critical for performance on mainnet where thousands of
+/// lookups per ledger are needed.
 #[derive(Clone)]
 pub struct DiskBucket {
     /// The SHA-256 hash of this bucket's contents (for verification).
@@ -136,9 +138,10 @@ pub struct DiskBucket {
     disk_index: DiskBucketIndex,
     /// Total number of entries in this bucket.
     entry_count: usize,
-    /// Cached file handle for efficient repeated reads.
-    /// Protected by Mutex for interior mutability; shared across Arc clones.
-    cached_file: Arc<Mutex<Option<File>>>,
+    /// Memory-mapped file for lock-free reads.
+    /// Using mmap eliminates seek+read syscalls and the Mutex,
+    /// and lets the OS page cache manage data optimally.
+    mmap: Arc<Mmap>,
 }
 
 /// Iterator that reads `(BucketEntry, offset)` pairs one at a time from an
@@ -208,6 +211,21 @@ impl Iterator for StreamingXdrEntryIterator {
 }
 
 impl DiskBucket {
+    /// Create a memory-mapped file for lock-free reads.
+    /// Uses MADV_RANDOM to optimize for point lookups (no readahead waste).
+    fn create_mmap(path: &Path) -> Result<Arc<Mmap>> {
+        let file = File::open(path)?;
+        // SAFETY: The file is opened read-only, and the mmap is used for read-only access.
+        // The bucket file is not modified while the mmap is active.
+        let mmap = unsafe { Mmap::map(&file)? };
+        #[cfg(unix)]
+        {
+            mmap.advise(memmap2::Advice::Random)
+                .unwrap_or_else(|e| tracing::warn!("madvise(RANDOM) failed: {}", e));
+        }
+        Ok(Arc::new(mmap))
+    }
+
     /// Create a disk bucket from an XDR file.
     ///
     /// This parses the file to build the index but doesn't keep entries in memory.
@@ -259,7 +277,7 @@ impl DiskBucket {
                 bloom_seed,
             },
             entry_count,
-            cached_file: Arc::new(Mutex::new(None)),
+            mmap: Self::create_mmap(path)?,
         })
     }
 
@@ -338,7 +356,7 @@ impl DiskBucket {
             file_path: path.to_path_buf(),
             disk_index: DiskBucketIndex::Advanced(live_index),
             entry_count,
-            cached_file: Arc::new(Mutex::new(None)),
+            mmap: Self::create_mmap(path)?,
         })
     }
 
@@ -390,7 +408,7 @@ impl DiskBucket {
                 bloom_seed,
             },
             entry_count,
-            cached_file: Arc::new(Mutex::new(None)),
+            mmap: Self::create_mmap(save_path.as_ref())?,
         })
     }
 
@@ -637,54 +655,128 @@ impl DiskBucket {
         }
     }
 
-    /// Execute a closure with the cached file handle, opening it if needed.
-    /// The file handle is kept open between calls for efficient repeated reads.
-    fn with_file<T>(&self, f: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
-        let mut guard = self.cached_file.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(File::open(&self.file_path)?);
+    /// Look up an entry using pre-serialized key bytes to avoid redundant serialization.
+    ///
+    /// The `key` is needed for final verification (hash collisions), while `key_bytes`
+    /// is used for bloom filter checks, hash computation, and index lookups.
+    pub fn get_by_key_bytes(
+        &self,
+        key: &LedgerKey,
+        key_bytes: &[u8],
+    ) -> Result<Option<BucketEntry>> {
+        match &self.disk_index {
+            DiskBucketIndex::Legacy {
+                index,
+                bloom_filter,
+                bloom_seed,
+            } => {
+                if let Some(ref filter) = bloom_filter {
+                    let hash = crate::bloom_filter::BucketBloomFilter::hash_bytes(
+                        key_bytes, bloom_seed,
+                    );
+                    if !filter.may_contain_hash(hash) {
+                        return Ok(None);
+                    }
+                }
+
+                let key_hash = {
+                    let hash = Sha256::digest(key_bytes);
+                    u64::from_be_bytes(hash[0..8].try_into().unwrap())
+                };
+
+                let index_entry = match index.get(&key_hash) {
+                    Some(e) => e,
+                    None => return Ok(None),
+                };
+
+                let entry = self.read_entry_at(index_entry.offset)?;
+
+                if let Some(entry_key) = entry.key() {
+                    if &entry_key == key {
+                        return Ok(Some(entry));
+                    }
+                }
+
+                Ok(None)
+            }
+            DiskBucketIndex::Advanced(live_index) => {
+                if !live_index.may_contain_bytes(key_bytes) {
+                    return Ok(None);
+                }
+
+                match live_index {
+                    LiveBucketIndex::InMemory(idx) => {
+                        if let Some(offset) = idx.get_offset_by_key_bytes(key_bytes) {
+                            let entry = self.read_entry_at(offset)?;
+                            if let Some(entry_key) = entry.key() {
+                                if &entry_key == key {
+                                    return Ok(Some(entry));
+                                }
+                            }
+                        }
+                        Ok(None)
+                    }
+                    LiveBucketIndex::Disk(disk_idx) => {
+                        // Disk-based index uses key comparison for page search,
+                        // fall back to regular method
+                        if let Some(page_offset) = disk_idx.find_page_for_key(key) {
+                            self.scan_page_for_key(page_offset, key, disk_idx.page_size())
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                }
+            }
         }
-        f(guard.as_mut().unwrap())
     }
 
-    /// Read a single entry from the bucket file at the given offset.
+    /// Read a single entry from the mmap at the given offset.
+    /// No syscalls, no locks — direct memory access through the mmap.
     fn read_entry_at(&self, offset: u64) -> Result<BucketEntry> {
-        self.with_file(|file| {
-            file.seek(SeekFrom::Start(offset))?;
+        let offset = offset as usize;
+        let data = &*self.mmap;
 
-            // Read record mark
-            let mut mark_buf = [0u8; 4];
-            file.read_exact(&mut mark_buf)?;
+        if offset + 4 > data.len() {
+            return Err(BucketError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("offset {} + 4 exceeds file size {}", offset, data.len()),
+            )));
+        }
 
-            let (record_len, _data_offset) = if mark_buf[0] & 0x80 != 0 {
-                // Has record mark
-                let mark = u32::from_be_bytes(mark_buf);
-                ((mark & 0x7FFFFFFF) as usize, 4u64)
-            } else {
-                // No record mark - this shouldn't happen with XDR format, but handle gracefully
-                // Seek back and try reading as raw XDR
-                file.seek(SeekFrom::Start(offset))?;
-                use stellar_xdr::curr::Limited;
-                let mut limited = Limited::new(file, Limits::none());
-                let xdr_entry = stellar_xdr::curr::BucketEntry::read_xdr(&mut limited)
+        // Read record mark
+        let mark_buf: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
+
+        let (record_len, record_start) = if mark_buf[0] & 0x80 != 0 {
+            let mark = u32::from_be_bytes(mark_buf);
+            ((mark & 0x7FFFFFFF) as usize, offset + 4)
+        } else {
+            // No record mark — try reading as raw XDR from offset
+            let xdr_entry =
+                stellar_xdr::curr::BucketEntry::from_xdr(&data[offset..], Limits::none())
                     .map_err(|e| {
                         BucketError::Serialization(format!("Failed to parse entry: {}", e))
                     })?;
-                return BucketEntry::from_xdr_entry(xdr_entry);
-            };
+            return BucketEntry::from_xdr_entry(xdr_entry);
+        };
 
-            // Read the entry data
-            let mut data = vec![0u8; record_len];
-            file.read_exact(&mut data)?;
+        if record_start + record_len > data.len() {
+            return Err(BucketError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "record at offset {} (len {}) exceeds file size {}",
+                    offset,
+                    record_len,
+                    data.len()
+                ),
+            )));
+        }
 
-            // Parse the entry
-            let xdr_entry = stellar_xdr::curr::BucketEntry::from_xdr(&data, Limits::none())
-                .map_err(|e| {
-                    BucketError::Serialization(format!("Failed to parse entry: {}", e))
-                })?;
+        // Parse from mmap slice — zero-copy until XDR deserialization
+        let record_data = &data[record_start..record_start + record_len];
+        let xdr_entry = stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none())
+            .map_err(|e| BucketError::Serialization(format!("Failed to parse entry: {}", e)))?;
 
-            BucketEntry::from_xdr_entry(xdr_entry)
-        })
+        BucketEntry::from_xdr_entry(xdr_entry)
     }
 
     /// Scan a page starting at `page_offset` for a key, reading up to `page_size` entries.
@@ -694,58 +786,45 @@ impl DiskBucket {
         key: &LedgerKey,
         page_size: u64,
     ) -> Result<Option<BucketEntry>> {
-        self.with_file(|file| {
-            file.seek(SeekFrom::Start(page_offset))?;
+        let data = &*self.mmap;
+        let mut position = page_offset as usize;
+        let mut entries_scanned = 0u64;
 
-            let file_len = file.metadata()?.len();
-            let mut position = page_offset;
-            let mut entries_scanned = 0u64;
+        while (position + 4) <= data.len() && entries_scanned < page_size {
+            // Read 4-byte record mark
+            let mark_buf: [u8; 4] = data[position..position + 4].try_into().unwrap();
+            position += 4;
 
-            while position + 4 <= file_len && entries_scanned < page_size {
-                // Read 4-byte record mark
-                let mut mark_buf = [0u8; 4];
-                if file.read_exact(&mut mark_buf).is_err() {
-                    break;
-                }
-                position += 4;
+            let record_mark = u32::from_be_bytes(mark_buf);
+            let record_len = (record_mark & 0x7FFFFFFF) as usize;
 
-                let record_mark = u32::from_be_bytes(mark_buf);
-                let record_len = (record_mark & 0x7FFFFFFF) as usize;
-
-                if position + record_len as u64 > file_len {
-                    break;
-                }
-
-                // Read the entry data
-                let mut data = vec![0u8; record_len];
-                file.read_exact(&mut data)?;
-                position += record_len as u64;
-
-                // Parse the entry
-                if let Ok(xdr_entry) =
-                    stellar_xdr::curr::BucketEntry::from_xdr(&data, Limits::none())
-                {
-                    let entry = BucketEntry::from_xdr_entry(xdr_entry)?;
-
-                    // Check if this is the entry we're looking for
-                    if let Some(entry_key) = entry.key() {
-                        if &entry_key == key {
-                            return Ok(Some(entry));
-                        }
-                        // If we've passed the key (entries are sorted), stop scanning
-                        if crate::entry::compare_keys(&entry_key, key)
-                            == std::cmp::Ordering::Greater
-                        {
-                            return Ok(None);
-                        }
-                    }
-                }
-
-                entries_scanned += 1;
+            if position + record_len > data.len() {
+                break;
             }
 
-            Ok(None)
-        })
+            // Parse from mmap slice
+            let record_data = &data[position..position + record_len];
+            position += record_len;
+
+            if let Ok(xdr_entry) =
+                stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none())
+            {
+                let entry = BucketEntry::from_xdr_entry(xdr_entry)?;
+
+                if let Some(entry_key) = entry.key() {
+                    if &entry_key == key {
+                        return Ok(Some(entry));
+                    }
+                    if crate::entry::compare_keys(&entry_key, key) == std::cmp::Ordering::Greater {
+                        return Ok(None);
+                    }
+                }
+            }
+
+            entries_scanned += 1;
+        }
+
+        Ok(None)
     }
 
     /// Look up a ledger entry by key.

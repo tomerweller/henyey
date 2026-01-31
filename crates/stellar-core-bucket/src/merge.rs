@@ -40,7 +40,7 @@
 //! within the merge window where the entry was created.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -503,7 +503,7 @@ pub fn merge_in_memory(
 
     // Initialize incremental hash and entry collection
     let mut hasher = Sha256::new();
-    let mut key_index = BTreeMap::new();
+    let mut key_index = HashMap::new();
 
     // Pre-allocate output vector
     // all_entries: includes metadata for storage/indexing
@@ -522,7 +522,7 @@ pub fn merge_in_memory(
     // Uses reusable buffers to minimize allocations
     let add_entry = |entry: BucketEntry,
                      hasher: &mut Sha256,
-                     key_index: &mut BTreeMap<Vec<u8>, usize>,
+                     key_index: &mut HashMap<Vec<u8>, usize>,
                      all_entries: &mut Vec<BucketEntry>,
                      entry_idx: &mut usize,
                      entry_buf: &mut Vec<u8>,

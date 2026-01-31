@@ -114,6 +114,15 @@ impl BucketSnapshot {
         self.bucket.get(key)
     }
 
+    /// Gets an entry using pre-serialized key bytes, propagating errors.
+    pub fn get_result_by_key_bytes(
+        &self,
+        key: &LedgerKey,
+        key_bytes: &[u8],
+    ) -> crate::Result<Option<BucketEntry>> {
+        self.bucket.get_by_key_bytes(key, key_bytes)
+    }
+
     /// Returns a reference to the underlying bucket.
     pub fn raw_bucket(&self) -> &Bucket {
         &self.bucket
@@ -277,10 +286,12 @@ impl BucketListSnapshot {
     /// Searches from level 0 (most recent) to level 10 (oldest), returning
     /// the first live entry found or `None` if the key is dead or not present.
     pub fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+        let key_bytes = key.to_xdr(Limits::none()).ok()?;
         for level in &self.levels {
-            // Check buckets in order (newer to older): curr then snap
             for bucket in [&level.curr, &level.snap] {
-                if let Some(entry) = bucket.get(key) {
+                if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes).ok().flatten()
+                {
                     match entry {
                         BucketEntry::Live(e) | BucketEntry::Init(e) => return Some(e),
                         BucketEntry::Dead(_) => return None,
@@ -296,10 +307,17 @@ impl BucketListSnapshot {
     ///
     /// Like [`get`](Self::get) but returns a `Result` instead of swallowing
     /// I/O or deserialization errors from disk-backed buckets.
+    ///
+    /// Serializes the key once and reuses the bytes across all bucket lookups
+    /// to avoid redundant XDR serialization.
     pub fn get_result(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+        let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+            crate::BucketError::Serialization(format!("Failed to serialize key: {}", e))
+        })?;
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
-                if let Some(entry) = bucket.get_result(key)? {
+                if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes)? {
                     match entry {
                         BucketEntry::Live(e) | BucketEntry::Init(e) => return Ok(Some(e)),
                         BucketEntry::Dead(_) => return Ok(None),
@@ -309,6 +327,61 @@ impl BucketListSnapshot {
             }
         }
         Ok(None)
+    }
+
+    /// Batch-loads multiple entries by their keys in a single pass through the bucket list.
+    ///
+    /// Pre-serializes all keys once and searches through levels from newest to oldest.
+    /// Keys are removed from the search set as they are found (or confirmed dead),
+    /// allowing early termination when all keys are resolved.
+    ///
+    /// This is significantly faster than individual lookups when loading related entries
+    /// (e.g., an account and its trustlines) because it avoids re-traversing upper levels.
+    pub fn load_keys_result(&self, keys: &[LedgerKey]) -> crate::Result<Vec<LedgerEntry>> {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+
+        // Pre-serialize all keys once
+        let mut remaining: Vec<(&LedgerKey, Vec<u8>)> = keys
+            .iter()
+            .map(|k| {
+                let bytes = k.to_xdr(Limits::none()).map_err(|e| {
+                    crate::BucketError::Serialization(format!(
+                        "Failed to serialize key: {}",
+                        e
+                    ))
+                })?;
+                Ok((k, bytes))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        let mut result = Vec::with_capacity(keys.len());
+
+        for level in &self.levels {
+            if remaining.is_empty() {
+                break;
+            }
+            for bucket in [&level.curr, &level.snap] {
+                if remaining.is_empty() {
+                    break;
+                }
+                remaining.retain(|(key, key_bytes)| {
+                    match bucket.get_result_by_key_bytes(key, key_bytes) {
+                        Ok(Some(entry)) => match entry {
+                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                                result.push(e);
+                                false
+                            }
+                            BucketEntry::Dead(_) => false,
+                            BucketEntry::Metadata(_) => true,
+                        },
+                        Ok(None) => true,
+                        Err(_) => true,
+                    }
+                });
+            }
+        }
+
+        Ok(result)
     }
 
     /// Loads multiple entries by their keys.

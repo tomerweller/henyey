@@ -2655,6 +2655,17 @@ impl TransactionExecutor {
                 .map_err(|e| stellar_core_tx::TxError::Internal(e.to_string()))
         }));
 
+        // Set up batch entry loader for loading multiple entries in a single
+        // bucket list pass. This is used by path payment operations to batch-load
+        // seller account + trustlines together (~3x faster than separate lookups).
+        let snapshot_for_batch = snapshot.clone();
+        self.state
+            .set_batch_entry_loader(std::sync::Arc::new(move |keys| {
+                snapshot_for_batch
+                    .load_entries(keys)
+                    .map_err(|e| stellar_core_tx::TxError::Internal(e.to_string()))
+            }));
+
         // Execute operations
         let mut operation_results = Vec::new();
         let num_ops = frame.operations().len();

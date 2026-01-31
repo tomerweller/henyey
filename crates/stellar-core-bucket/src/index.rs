@@ -17,7 +17,7 @@
 //! - **Asset-to-PoolID mapping**: Maps assets to liquidity pool IDs for pool queries
 //! - **Entry counters**: Track counts by entry type and durability
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -272,7 +272,7 @@ impl TypeRange {
 #[derive(Debug, Clone)]
 pub struct InMemoryIndex {
     /// Maps keys to their byte offsets in the bucket file.
-    key_to_offset: BTreeMap<Vec<u8>, u64>,
+    key_to_offset: HashMap<Vec<u8>, u64>,
     /// Optional bloom filter for fast negative lookups.
     bloom_filter: Option<Arc<BucketBloomFilter>>,
     /// Bloom filter seed.
@@ -296,7 +296,7 @@ impl InMemoryIndex {
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
-        let mut key_to_offset = BTreeMap::new();
+        let mut key_to_offset = HashMap::new();
         let mut bloom_key_hashes = Vec::new();
         let mut asset_to_pool_id = AssetPoolIdMap::new();
         let mut counters = BucketEntryCounters::new();
@@ -395,6 +395,26 @@ impl InMemoryIndex {
         } else {
             true // No bloom filter, assume it might exist
         }
+    }
+
+    /// Checks if pre-serialized key bytes may exist (bloom filter check).
+    pub fn may_contain_bytes(&self, key_bytes: &[u8]) -> bool {
+        if let Some(ref filter) = self.bloom_filter {
+            let hash = crate::bloom_filter::BucketBloomFilter::hash_bytes(
+                key_bytes,
+                &self.bloom_seed,
+            );
+            filter.may_contain_hash(hash)
+        } else {
+            true
+        }
+    }
+
+    /// Looks up the offset for a key using pre-serialized key bytes.
+    ///
+    /// Skips bloom filter check (caller should check separately if needed).
+    pub fn get_offset_by_key_bytes(&self, key_bytes: &[u8]) -> Option<u64> {
+        self.key_to_offset.get(key_bytes).copied()
     }
 
     /// Returns the entry counters.
@@ -599,6 +619,19 @@ impl DiskIndex {
         }
     }
 
+    /// Checks if pre-serialized key bytes may exist (bloom filter check).
+    pub fn may_contain_bytes(&self, key_bytes: &[u8]) -> bool {
+        if let Some(ref filter) = self.bloom_filter {
+            let hash = crate::bloom_filter::BucketBloomFilter::hash_bytes(
+                key_bytes,
+                &self.bloom_seed,
+            );
+            filter.may_contain_hash(hash)
+        } else {
+            true
+        }
+    }
+
     /// Returns the entry counters.
     pub fn counters(&self) -> &BucketEntryCounters {
         &self.counters
@@ -733,6 +766,14 @@ impl LiveBucketIndex {
         match self {
             LiveBucketIndex::InMemory(idx) => idx.may_contain(key),
             LiveBucketIndex::Disk(idx) => idx.may_contain(key),
+        }
+    }
+
+    /// Checks if pre-serialized key bytes may exist (bloom filter check).
+    pub fn may_contain_bytes(&self, key_bytes: &[u8]) -> bool {
+        match self {
+            LiveBucketIndex::InMemory(idx) => idx.may_contain_bytes(key_bytes),
+            LiveBucketIndex::Disk(idx) => idx.may_contain_bytes(key_bytes),
         }
     }
 

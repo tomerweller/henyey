@@ -578,7 +578,9 @@ fn convert_with_offers_and_pools(
     let mut book_offer_trail = Vec::new();
     // Use savepoint instead of cloning entire state (avoids O(n) clone of 911K+ offers).
     // Run the orderbook path speculatively on the real state, and rollback if pool wins.
+    let t_sp = std::time::Instant::now();
     let savepoint = state.create_savepoint();
+    let savepoint_us = t_sp.elapsed().as_micros() as u64;
     let book_res = convert_with_offers(
         source,
         send_asset,
@@ -606,6 +608,9 @@ fn convert_with_offers_and_pools(
 
     if use_book {
         // Book wins — keep speculative changes (drop savepoint)
+        if savepoint_us > 100 {
+            tracing::info!(savepoint_us, rollback = false, "savepoint profiling (book wins)");
+        }
         *amount_send = book_amount_send;
         *amount_recv = book_amount_recv;
         offer_trail.clear();
@@ -614,7 +619,12 @@ fn convert_with_offers_and_pools(
     }
 
     // Pool wins — undo speculative book changes
+    let t_rb = std::time::Instant::now();
     state.rollback_to_savepoint(savepoint);
+    let rollback_us = t_rb.elapsed().as_micros() as u64;
+    if savepoint_us > 100 || rollback_us > 100 {
+        tracing::info!(savepoint_us, rollback_us, "savepoint profiling (pool wins)");
+    }
 
     offer_trail.clear();
     if apply_pool_exchange(
@@ -680,8 +690,16 @@ fn convert_with_offers(
         return Ok(ConvertResult::CrossedTooMany);
     }
 
+    // Micro-profiling accumulators
+    let loop_start = std::time::Instant::now();
+    let mut best_offer_us = 0u64;
+    let mut cross_offer_us = 0u64;
+    let mut offers_crossed = 0u32;
+
     while need_more {
+        let t0 = std::time::Instant::now();
         let offer = state.best_offer(send_asset, recv_asset);
+        best_offer_us += t0.elapsed().as_micros() as u64;
         let Some(offer) = offer else {
             break;
         };
@@ -695,6 +713,7 @@ fn convert_with_offers(
             return Ok(ConvertResult::CrossedTooMany);
         }
 
+        let t1 = std::time::Instant::now();
         let (recv, send, wheat_stays) = cross_offer_v10(
             &offer,
             max_recv,
@@ -704,6 +723,8 @@ fn convert_with_offers(
             state,
             context,
         )?;
+        cross_offer_us += t1.elapsed().as_micros() as u64;
+        offers_crossed += 1;
 
         *amount_send += send;
         *amount_recv += recv;
@@ -711,11 +732,42 @@ fn convert_with_offers(
         max_recv -= recv;
         need_more = !wheat_stays && max_send > 0 && max_recv > 0;
         if !need_more {
+            let total_us = loop_start.elapsed().as_micros() as u64;
+            if total_us > 1000 {
+                tracing::info!(
+                    offers_crossed,
+                    total_us,
+                    best_offer_us,
+                    cross_offer_us,
+                    "convert_with_offers profiling"
+                );
+            }
             return Ok(ConvertResult::Ok);
         }
         if wheat_stays {
+            let total_us = loop_start.elapsed().as_micros() as u64;
+            if total_us > 1000 {
+                tracing::info!(
+                    offers_crossed,
+                    total_us,
+                    best_offer_us,
+                    cross_offer_us,
+                    "convert_with_offers profiling"
+                );
+            }
             return Ok(ConvertResult::Partial);
         }
+    }
+
+    let total_us = loop_start.elapsed().as_micros() as u64;
+    if total_us > 1000 {
+        tracing::info!(
+            offers_crossed,
+            total_us,
+            best_offer_us,
+            cross_offer_us,
+            "convert_with_offers profiling"
+        );
     }
 
     Ok(if need_more {
@@ -738,15 +790,10 @@ fn cross_offer_v10(
     let wheat = offer.selling.clone();
     let seller = offer.seller_id.clone();
 
-    // Lazily load seller's account and trustlines before crossing.
-    // This avoids preloading dependencies for all offers upfront.
-    state.ensure_account_loaded(&seller)?;
-    if !matches!(&wheat, Asset::Native) {
-        state.ensure_trustline_loaded(&seller, &wheat)?;
-    }
-    if !matches!(&sheep, Asset::Native) {
-        state.ensure_trustline_loaded(&seller, &sheep)?;
-    }
+    // Batch-load seller's account and trustlines in a single bucket list pass.
+    // This is ~2-3x faster than separate ensure_*_loaded calls because it avoids
+    // re-traversing upper bucket list levels for each entry.
+    state.ensure_offer_entries_loaded(&seller, &wheat, &sheep)?;
 
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
     apply_liabilities_delta(

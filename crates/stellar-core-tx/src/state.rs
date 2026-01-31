@@ -20,6 +20,7 @@ use crate::{Result, TxError};
 
 /// Callback type for lazily loading ledger entries from the bucket list.
 type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>>;
+type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>>;
 
 /// Soroban state extracted from LedgerStateManager for cheap cloning.
 ///
@@ -538,6 +539,10 @@ pub struct LedgerStateManager {
     /// Used during offer crossing to load seller accounts and trustlines
     /// on demand instead of preloading all offer dependencies upfront.
     entry_loader: Option<Arc<EntryLoaderFn>>,
+    /// Optional batch callback for loading multiple entries in a single pass
+    /// through the bucket list. Used by `ensure_offer_entries_loaded` to batch
+    /// account + trustline lookups for offer sellers.
+    batch_entry_loader: Option<Arc<BatchEntryLoaderFn>>,
 }
 
 #[derive(Debug, Clone)]
@@ -611,6 +616,7 @@ impl LedgerStateManager {
             delta_snapshot: None,
             offer_index: OfferIndex::new(),
             entry_loader: None,
+            batch_entry_loader: None,
         }
     }
 
@@ -846,6 +852,78 @@ impl LedgerStateManager {
         loader: Arc<EntryLoaderFn>,
     ) {
         self.entry_loader = Some(loader);
+    }
+
+    /// Set a batch entry loader for loading multiple entries in one bucket list pass.
+    pub fn set_batch_entry_loader(
+        &mut self,
+        loader: Arc<BatchEntryLoaderFn>,
+    ) {
+        self.batch_entry_loader = Some(loader);
+    }
+
+    /// Batch-load all entries needed to cross an offer (seller account + trustlines).
+    ///
+    /// This is significantly faster than separate `ensure_account_loaded` +
+    /// `ensure_trustline_loaded` calls because it performs a single pass through
+    /// the bucket list for all needed entries instead of 2-3 separate passes.
+    pub fn ensure_offer_entries_loaded(
+        &mut self,
+        seller: &AccountId,
+        selling: &Asset,
+        buying: &Asset,
+    ) -> Result<()> {
+        let seller_bytes = account_id_to_bytes(seller);
+        let mut needed_keys = Vec::new();
+
+        if !self.accounts.contains_key(&seller_bytes) {
+            needed_keys.push(LedgerKey::Account(LedgerKeyAccount {
+                account_id: seller.clone(),
+            }));
+        }
+        if !matches!(selling, Asset::Native) {
+            let asset_key = AssetKey::from_asset(selling);
+            if !self.trustlines.contains_key(&(seller_bytes, asset_key)) {
+                let tl_asset = asset_to_trustline_asset(selling);
+                needed_keys.push(LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: seller.clone(),
+                    asset: tl_asset,
+                }));
+            }
+        }
+        if !matches!(buying, Asset::Native) {
+            let asset_key = AssetKey::from_asset(buying);
+            if !self.trustlines.contains_key(&(seller_bytes, asset_key)) {
+                let tl_asset = asset_to_trustline_asset(buying);
+                needed_keys.push(LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: seller.clone(),
+                    asset: tl_asset,
+                }));
+            }
+        }
+
+        if needed_keys.is_empty() {
+            return Ok(());
+        }
+
+        // Use batch loader for single-pass bucket list traversal
+        if let Some(loader) = self.batch_entry_loader.take() {
+            let entries = loader(&needed_keys);
+            self.batch_entry_loader = Some(loader);
+            for entry in entries? {
+                self.load_entry(entry);
+            }
+        } else if let Some(loader) = self.entry_loader.take() {
+            // Fallback to individual lookups
+            for key in &needed_keys {
+                if let Some(entry) = loader(key)? {
+                    self.load_entry(entry);
+                }
+            }
+            self.entry_loader = Some(loader);
+        }
+
+        Ok(())
     }
 
     /// Ensure an account is loaded in state, fetching lazily if needed.

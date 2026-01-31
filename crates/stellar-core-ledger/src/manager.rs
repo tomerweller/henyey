@@ -1930,10 +1930,11 @@ impl LedgerManager {
         // commit() (add_batch + hash computation). The snapshot holds Arc<Bucket> references
         // which are cheap clones and require no locking.
         let soroban_state_lookup = self.soroban_state.clone();
-        let bucket_list_snapshot = {
+        let bucket_list_snapshot = Arc::new({
             let bl = self.bucket_list.read();
             stellar_core_bucket::BucketListSnapshot::new(&bl, state.header.clone())
-        };
+        });
+        let bls_for_lookup = bucket_list_snapshot.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
             // Check in-memory Soroban state first for Soroban entry types
             if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
@@ -1942,8 +1943,19 @@ impl LedgerManager {
                 }
             }
             // Fall back to bucket list snapshot for non-Soroban types or if not found in memory
-            Ok(bucket_list_snapshot.get(key))
+            Ok(bls_for_lookup.get(key))
         });
+
+        // Batch lookup function for loading multiple entries in a single pass.
+        // This is used by path payment operations to batch-load seller accounts
+        // and trustlines together instead of 2-3 separate bucket list traversals.
+        let bls_for_batch = bucket_list_snapshot.clone();
+        let batch_lookup_fn: crate::snapshot::BatchEntryLookupFn =
+            Arc::new(move |keys: &[LedgerKey]| {
+                bls_for_batch
+                    .load_keys_result(keys)
+                    .map_err(|e| LedgerError::Bucket(e))
+            });
 
         // Create a lookup function that queries the ledger header table
         let db = self.db.clone();
@@ -1976,12 +1988,14 @@ impl LedgerManager {
             Ok(entries)
         });
 
-        Ok(SnapshotHandle::with_lookups_and_entries(
+        let mut handle = SnapshotHandle::with_lookups_and_entries(
             snapshot,
             lookup_fn,
             header_lookup_fn,
             entries_fn,
-        ))
+        );
+        handle.set_batch_lookup(batch_lookup_fn);
+        Ok(handle)
     }
 
     /// Get a historical snapshot by sequence number.

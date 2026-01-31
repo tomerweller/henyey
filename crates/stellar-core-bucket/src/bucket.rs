@@ -29,7 +29,7 @@
 //! to share across threads. The disk-backed mode uses file handles that are opened
 //! fresh for each operation to avoid contention.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,7 +56,7 @@ enum BucketStorage {
         /// The sorted list of bucket entries.
         entries: Arc<Vec<BucketEntry>>,
         /// Map from serialized key bytes to entry index for fast lookups.
-        key_index: Arc<BTreeMap<Vec<u8>, usize>>,
+        key_index: Arc<HashMap<Vec<u8>, usize>>,
     },
     /// Entries stored on disk with a compact index for on-demand loading.
     DiskBacked {
@@ -151,7 +151,7 @@ impl Bucket {
             hash: Hash256::ZERO,
             storage: BucketStorage::InMemory {
                 entries: Arc::new(Vec::new()),
-                key_index: Arc::new(BTreeMap::new()),
+                key_index: Arc::new(HashMap::new()),
             },
             // Empty bucket with shared state at offset 0 - matches C++ where mEntries is empty vector
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count: 0 },
@@ -209,7 +209,7 @@ impl Bucket {
         use sha2::{Digest, Sha256};
         use stellar_xdr::curr::{Limited, WriteXdr};
 
-        let mut key_index = BTreeMap::new();
+        let mut key_index = HashMap::new();
         let mut hasher = Sha256::new();
 
         // Single pass: serialize each entry once, use for both index and hash
@@ -265,7 +265,7 @@ impl Bucket {
     pub fn from_parts(
         hash: Hash256,
         entries: Arc<Vec<BucketEntry>>,
-        key_index: Arc<BTreeMap<Vec<u8>, usize>>,
+        key_index: Arc<HashMap<Vec<u8>, usize>>,
         metadata_count: usize,
     ) -> Self {
         Self {
@@ -302,7 +302,7 @@ impl Bucket {
             hash: Hash256::ZERO, // Hash not computed - this is intentional!
             storage: BucketStorage::InMemory {
                 entries: Arc::new(entries),
-                key_index: Arc::new(BTreeMap::new()), // No index needed for merge input
+                key_index: Arc::new(HashMap::new()), // No index needed for merge input
             },
             // Use shared state - no cloning needed
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count },
@@ -410,7 +410,7 @@ impl Bucket {
 
         // Build key index only if requested (skip during catchup for memory efficiency)
         let key_index = if build_index {
-            let mut index = BTreeMap::new();
+            let mut index = HashMap::new();
             for (idx, entry) in entries.iter().enumerate() {
                 if let Some(key) = entry.key() {
                     let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
@@ -421,7 +421,7 @@ impl Bucket {
             }
             index
         } else {
-            BTreeMap::new()
+            HashMap::new()
         };
 
         // Compute hash from raw bytes (including record marks)
@@ -809,6 +809,29 @@ impl Bucket {
         }
     }
 
+    /// Look up a bucket entry by its original key and pre-serialized XDR bytes.
+    ///
+    /// This avoids redundant key serialization when the caller has already
+    /// serialized the key (e.g., when searching multiple buckets in sequence).
+    pub fn get_by_key_bytes(
+        &self,
+        key: &LedgerKey,
+        key_bytes: &[u8],
+    ) -> Result<Option<BucketEntry>> {
+        match &self.storage {
+            BucketStorage::InMemory { entries, key_index } => {
+                if let Some(&idx) = key_index.get(key_bytes) {
+                    Ok(entries.get(idx).cloned())
+                } else {
+                    Ok(None)
+                }
+            }
+            BucketStorage::DiskBacked { disk_bucket } => {
+                disk_bucket.get_by_key_bytes(key, key_bytes)
+            }
+        }
+    }
+
     /// Look up a ledger entry by key, returning None if dead or not found.
     pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         match self.get(key)? {
@@ -936,7 +959,7 @@ impl Bucket {
         use sha2::{Digest, Sha256};
         use stellar_xdr::curr::{Limited, WriteXdr};
 
-        let mut key_index = BTreeMap::new();
+        let mut key_index = HashMap::new();
         let mut hasher = Sha256::new();
 
         // Count metadata entries (typically 0 or 1, always at the start)
