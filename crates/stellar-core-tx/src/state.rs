@@ -5918,4 +5918,288 @@ mod tests {
         let best = manager.best_offer(&offer1.buying, &offer1.selling).unwrap();
         assert_eq!(best.offer_id, 100);
     }
+
+    // ==================== Account-Asset Secondary Index Tests ====================
+
+    fn usd_asset() -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: create_test_account_id(99),
+        })
+    }
+
+    fn eur_asset() -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'E', b'U', b'R', 0]),
+            issuer: create_test_account_id(98),
+        })
+    }
+
+    fn create_test_offer_with_assets(
+        seller_seed: u8,
+        offer_id: i64,
+        selling: Asset,
+        buying: Asset,
+    ) -> OfferEntry {
+        OfferEntry {
+            seller_id: create_test_account_id(seller_seed),
+            offer_id,
+            selling,
+            buying,
+            amount: 1000000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        }
+    }
+
+    /// Helper to query the account_asset_offers index for a (seller, asset) pair.
+    fn aa_index_get(
+        manager: &LedgerStateManager,
+        seller_seed: u8,
+        asset: &Asset,
+    ) -> HashSet<i64> {
+        let seller = [seller_seed; 32];
+        let asset_key = AssetKey::from_asset(asset);
+        manager
+            .account_asset_offers
+            .get(&(seller, asset_key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_account_asset_index_create_offer() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // 2 offers for seller_1 (Native→USD)
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, usd_asset());
+        // 1 offer for seller_2 (Native→USD)
+        let offer3 = create_test_offer_with_assets(2, 300, Asset::Native, usd_asset());
+
+        manager.create_offer(offer1);
+        manager.create_offer(offer2);
+        manager.create_offer(offer3);
+
+        // seller_1's Native key should have both offer IDs
+        let s1_native = aa_index_get(&manager, 1, &Asset::Native);
+        assert_eq!(s1_native, HashSet::from([100, 200]));
+
+        // seller_1's USD key should have both offer IDs
+        let s1_usd = aa_index_get(&manager, 1, &usd_asset());
+        assert_eq!(s1_usd, HashSet::from([100, 200]));
+
+        // seller_2's keys should have just one
+        let s2_native = aa_index_get(&manager, 2, &Asset::Native);
+        assert_eq!(s2_native, HashSet::from([300]));
+
+        let s2_usd = aa_index_get(&manager, 2, &usd_asset());
+        assert_eq!(s2_usd, HashSet::from([300]));
+
+        // Total unique keys in the index: 4
+        assert_eq!(manager.account_asset_offers.len(), 4);
+    }
+
+    #[test]
+    fn test_account_asset_index_multi_asset() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, eur_asset());
+
+        manager.create_offer(offer1);
+        manager.create_offer(offer2);
+
+        // Both offers sell Native, so (seller_1, Native) should have both
+        let s1_native = aa_index_get(&manager, 1, &Asset::Native);
+        assert_eq!(s1_native, HashSet::from([100, 200]));
+
+        // Each buying asset only has its own offer
+        let s1_usd = aa_index_get(&manager, 1, &usd_asset());
+        assert_eq!(s1_usd, HashSet::from([100]));
+
+        let s1_eur = aa_index_get(&manager, 1, &eur_asset());
+        assert_eq!(s1_eur, HashSet::from([200]));
+    }
+
+    #[test]
+    fn test_account_asset_index_delete_offer() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, usd_asset());
+        let seller1 = create_test_account_id(1);
+
+        manager.create_offer(offer1);
+        manager.create_offer(offer2);
+
+        // Delete offer1
+        manager.delete_offer(&seller1, 100);
+
+        // offer1 should be removed from both keys
+        let s1_native = aa_index_get(&manager, 1, &Asset::Native);
+        assert_eq!(s1_native, HashSet::from([200]));
+
+        let s1_usd = aa_index_get(&manager, 1, &usd_asset());
+        assert_eq!(s1_usd, HashSet::from([200]));
+    }
+
+    #[test]
+    fn test_account_asset_index_update_offer() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        manager.create_offer(offer);
+
+        // Verify initial state
+        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+        assert_eq!(aa_index_get(&manager, 1, &eur_asset()), HashSet::new());
+
+        // Update offer to change buying asset from USD to EUR
+        let updated = create_test_offer_with_assets(1, 100, Asset::Native, eur_asset());
+        manager.update_offer(updated);
+
+        // offer_id should be removed from USD and added to EUR
+        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::new());
+        assert_eq!(aa_index_get(&manager, 1, &eur_asset()), HashSet::from([100]));
+
+        // Native should still have the offer
+        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
+    }
+
+    #[test]
+    fn test_remove_offers_by_account_and_asset() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // offer1: Native→USD, offer2: Native→EUR, offer3: EUR→USD
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, eur_asset());
+        let offer3 = create_test_offer_with_assets(1, 300, eur_asset(), usd_asset());
+        let seller1 = create_test_account_id(1);
+
+        manager.create_offer(offer1);
+        manager.create_offer(offer2);
+        manager.create_offer(offer3);
+
+        // Remove all offers that touch USD for seller_1
+        let removed = manager.remove_offers_by_account_and_asset(&seller1, &usd_asset());
+
+        // Should return offer1 (Native→USD) and offer3 (EUR→USD)
+        let removed_ids: HashSet<i64> = removed.iter().map(|o| o.offer_id).collect();
+        assert_eq!(removed_ids, HashSet::from([100, 300]));
+
+        // offer2 (Native→EUR) should remain
+        let s1_native = aa_index_get(&manager, 1, &Asset::Native);
+        assert_eq!(s1_native, HashSet::from([200]));
+
+        let s1_eur = aa_index_get(&manager, 1, &eur_asset());
+        assert_eq!(s1_eur, HashSet::from([200]));
+
+        // USD index should be empty
+        let s1_usd = aa_index_get(&manager, 1, &usd_asset());
+        assert!(s1_usd.is_empty());
+    }
+
+    #[test]
+    fn test_remove_offers_by_account_and_asset_isolation() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        let offer2 = create_test_offer_with_assets(2, 200, Asset::Native, usd_asset());
+        let seller1 = create_test_account_id(1);
+
+        manager.create_offer(offer1);
+        manager.create_offer(offer2);
+
+        // Remove only seller_1's offers touching USD
+        let removed = manager.remove_offers_by_account_and_asset(&seller1, &usd_asset());
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].offer_id, 100);
+
+        // seller_2's offer should be untouched
+        let s2_native = aa_index_get(&manager, 2, &Asset::Native);
+        assert_eq!(s2_native, HashSet::from([200]));
+
+        let s2_usd = aa_index_get(&manager, 2, &usd_asset());
+        assert_eq!(s2_usd, HashSet::from([200]));
+
+        // seller_1's index should be empty
+        let s1_native = aa_index_get(&manager, 1, &Asset::Native);
+        assert!(s1_native.is_empty());
+    }
+
+    #[test]
+    fn test_account_asset_index_rollback() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        manager.create_offer(offer);
+
+        // Index should be populated
+        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
+        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+
+        // Rollback should remove the offer (it was created in this tx)
+        manager.rollback();
+
+        assert!(aa_index_get(&manager, 1, &Asset::Native).is_empty());
+        assert!(aa_index_get(&manager, 1, &usd_asset()).is_empty());
+    }
+
+    #[test]
+    fn test_account_asset_index_rollback_restore() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create and commit offer1
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        manager.create_offer(offer1);
+        manager.commit();
+
+        // Create offer2 in a new transaction, then rollback
+        let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, usd_asset());
+        manager.create_offer(offer2);
+
+        // Both should be in the index before rollback
+        assert_eq!(
+            aa_index_get(&manager, 1, &Asset::Native),
+            HashSet::from([100, 200])
+        );
+
+        manager.rollback();
+
+        // After rollback, only offer1 should remain
+        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
+        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+    }
+
+    #[test]
+    fn test_account_asset_index_savepoint() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create and commit offer1
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        manager.create_offer(offer1);
+        manager.commit();
+
+        // Create savepoint
+        let sp = manager.create_savepoint();
+
+        // Create offer2 after savepoint
+        let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, usd_asset());
+        manager.create_offer(offer2);
+
+        // Both should be in the index
+        assert_eq!(
+            aa_index_get(&manager, 1, &Asset::Native),
+            HashSet::from([100, 200])
+        );
+
+        // Rollback to savepoint
+        manager.rollback_to_savepoint(sp);
+
+        // Only offer1 should remain
+        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
+        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+    }
 }
