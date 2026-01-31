@@ -982,6 +982,16 @@ fn cross_offer_v10(
     let wheat = offer.selling.clone();
     let seller = offer.seller_id.clone();
 
+    // Lazily load seller's account and trustlines before crossing.
+    // This avoids preloading dependencies for all offers upfront.
+    state.ensure_account_loaded(&seller)?;
+    if !matches!(&wheat, Asset::Native) {
+        state.ensure_trustline_loaded(&seller, &wheat)?;
+    }
+    if !matches!(&sheep, Asset::Native) {
+        state.ensure_trustline_loaded(&seller, &sheep)?;
+    }
+
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
     apply_liabilities_delta(
         &seller,

@@ -144,6 +144,15 @@ pub enum ChangeRef {
 ///     bucket_list.add(entry)?;
 /// }
 /// ```
+/// Captured vector lengths for savepoint support.
+#[derive(Clone)]
+pub struct DeltaLengths {
+    pub created: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub change_order: usize,
+}
+
 #[derive(Clone)]
 pub struct LedgerDelta {
     /// Ledger sequence this delta applies to.
@@ -321,6 +330,27 @@ impl LedgerDelta {
                 }
             }
         }
+    }
+
+    /// Capture the current vector lengths for savepoint support.
+    pub fn snapshot_lengths(&self) -> DeltaLengths {
+        DeltaLengths {
+            created: self.created.len(),
+            updated: self.updated.len(),
+            deleted: self.deleted.len(),
+            change_order: self.change_order.len(),
+        }
+    }
+
+    /// Truncate all vectors back to the given lengths.
+    /// Used by savepoint rollback to undo speculative delta entries.
+    pub fn truncate_to(&mut self, lengths: &DeltaLengths) {
+        self.created.truncate(lengths.created);
+        self.updated.truncate(lengths.updated);
+        self.update_states.truncate(lengths.updated);
+        self.deleted.truncate(lengths.deleted);
+        self.delete_states.truncate(lengths.deleted);
+        self.change_order.truncate(lengths.change_order);
     }
 
     /// Merge another delta into this one.

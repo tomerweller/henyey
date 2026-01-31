@@ -1,6 +1,7 @@
 //! Ledger state management for transaction execution.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
@@ -14,8 +15,76 @@ use stellar_xdr::curr::{
     SponsorshipDescriptor, TimePoint, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
 };
 
-use crate::apply::LedgerDelta;
+use crate::apply::{DeltaLengths, LedgerDelta};
 use crate::{Result, TxError};
+
+/// Callback type for lazily loading ledger entries from the bucket list.
+type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>>;
+
+/// Soroban state extracted from LedgerStateManager for cheap cloning.
+///
+/// Path payment operations need to clone the entire state for speculative
+/// orderbook exchange comparison against liquidity pools. By temporarily
+/// extracting the large Soroban collections (which are never accessed during
+/// orderbook exchange), the clone becomes much cheaper.
+pub struct SorobanState {
+    pub contract_data: HashMap<ContractDataKey, ContractDataEntry>,
+    pub contract_code: HashMap<[u8; 32], ContractCodeEntry>,
+    pub ttl_entries: HashMap<[u8; 32], TtlEntry>,
+    pub ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
+}
+
+/// Savepoint for rolling back speculative state modifications within a transaction.
+///
+/// Used by `convert_with_offers_and_pools` to speculatively run the orderbook path
+/// on the real state and undo changes if the liquidity pool path wins. This avoids
+/// cloning the entire state (911K+ offers) for speculation.
+///
+/// The savepoint captures:
+/// - Snapshot maps (to restore snapshot tracking state)
+/// - Current entry values for snapshot'd entries (pre-speculation values)
+/// - Delta vector lengths (for truncation)
+/// - Modified tracking vec lengths
+/// - Entry metadata snapshot state
+pub struct Savepoint {
+    // Snapshot maps clones (small: only entries modified earlier in TX)
+    offer_snapshots: HashMap<([u8; 32], i64), Option<OfferEntry>>,
+    account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
+    trustline_snapshots: HashMap<([u8; 32], AssetKey), Option<TrustLineEntry>>,
+
+    // Pre-speculation values of entries in snapshot maps.
+    // For entries modified earlier in TX and potentially re-modified during speculation.
+    offer_pre_values: Vec<(([u8; 32], i64), Option<OfferEntry>)>,
+    account_pre_values: Vec<([u8; 32], Option<AccountEntry>)>,
+    trustline_pre_values: Vec<(([u8; 32], AssetKey), Option<TrustLineEntry>)>,
+
+    // Created entry sets (path payments don't create entries during crossing,
+    // but save for correctness)
+    created_offers: HashSet<([u8; 32], i64)>,
+
+    // Delta vector lengths for truncation
+    delta_lengths: DeltaLengths,
+
+    // Modified tracking vec lengths
+    modified_accounts_len: usize,
+    modified_trustlines_len: usize,
+
+    // Entry metadata snapshots
+    entry_last_modified_snapshots: HashMap<LedgerKey, Option<u32>>,
+    entry_last_modified_pre_values: Vec<(LedgerKey, Option<u32>)>,
+    entry_sponsorship_snapshots: HashMap<LedgerKey, Option<AccountId>>,
+    entry_sponsorship_ext_snapshots: HashMap<LedgerKey, bool>,
+    entry_sponsorship_pre_values: Vec<(LedgerKey, Option<AccountId>)>,
+    entry_sponsorship_ext_pre_values: Vec<(LedgerKey, bool)>,
+
+    // Op entry snapshot keys (to remove entries added during speculation)
+    op_entry_snapshot_keys: HashSet<LedgerKey>,
+
+    // Liquidity pool snapshots (shouldn't change during orderbook speculation,
+    // but save for completeness)
+    liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
+
+}
 
 /// Trait for reading ledger entries from storage.
 pub trait LedgerReader {
@@ -232,9 +301,13 @@ impl OfferIndex {
     /// Remove an offer from the index.
     pub fn remove_offer(&mut self, seller: &AccountId, offer_id: i64) {
         let key = OfferKey::new(account_id_to_bytes(seller), offer_id);
+        self.remove_by_key(&key);
+    }
 
+    /// Remove an offer from the index by its key.
+    pub fn remove_by_key(&mut self, key: &OfferKey) {
         // Look up location in reverse index
-        if let Some((asset_pair, descriptor)) = self.offer_locations.remove(&key) {
+        if let Some((asset_pair, descriptor)) = self.offer_locations.remove(key) {
             // Remove from order book
             if let Some(order_book) = self.order_books.get_mut(&asset_pair) {
                 order_book.remove(&descriptor);
@@ -461,6 +534,10 @@ pub struct LedgerStateManager {
     /// Index of offers by asset pair for efficient best-offer lookups.
     /// This mirrors C++ stellar-core's MultiOrderBook structure.
     offer_index: OfferIndex,
+    /// Optional callback to lazily load ledger entries from the bucket list.
+    /// Used during offer crossing to load seller accounts and trustlines
+    /// on demand instead of preloading all offer dependencies upfront.
+    entry_loader: Option<Arc<EntryLoaderFn>>,
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +610,7 @@ impl LedgerStateManager {
             id_pool_snapshot: None,
             delta_snapshot: None,
             offer_index: OfferIndex::new(),
+            entry_loader: None,
         }
     }
 
@@ -758,6 +836,97 @@ impl LedgerStateManager {
         self.ledger_seq = ledger_seq;
     }
 
+    /// Set the entry loader callback for lazy loading from the bucket list.
+    ///
+    /// When set, `ensure_account_loaded` and `ensure_trustline_loaded` can
+    /// fetch entries on demand during offer crossing instead of requiring
+    /// all dependencies to be preloaded upfront.
+    pub fn set_entry_loader(
+        &mut self,
+        loader: Arc<EntryLoaderFn>,
+    ) {
+        self.entry_loader = Some(loader);
+    }
+
+    /// Ensure an account is loaded in state, fetching lazily if needed.
+    ///
+    /// Returns `Ok(true)` if the account is available (already loaded or
+    /// successfully fetched), `Ok(false)` if it doesn't exist.
+    pub fn ensure_account_loaded(&mut self, account_id: &AccountId) -> Result<bool> {
+        let key_bytes = account_id_to_bytes(account_id);
+        if self.accounts.contains_key(&key_bytes) {
+            return Ok(true);
+        }
+        if let Some(loader) = self.entry_loader.take() {
+            let ledger_key =
+                LedgerKey::Account(LedgerKeyAccount {
+                    account_id: account_id.clone(),
+                });
+            let result = loader(&ledger_key);
+            self.entry_loader = Some(loader); // restore before handling result
+            if let Some(entry) = result? {
+                self.load_entry(entry);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Ensure a trustline is loaded in state, fetching lazily if needed.
+    ///
+    /// Returns `Ok(true)` if the trustline is available (already loaded or
+    /// successfully fetched), `Ok(false)` if it doesn't exist.
+    pub fn ensure_trustline_loaded(
+        &mut self,
+        account_id: &AccountId,
+        asset: &Asset,
+    ) -> Result<bool> {
+        let account_key = account_id_to_bytes(account_id);
+        let asset_key = AssetKey::from_asset(asset);
+        if self.trustlines.contains_key(&(account_key, asset_key)) {
+            return Ok(true);
+        }
+        if let Some(loader) = self.entry_loader.take() {
+            let tl_asset = asset_to_trustline_asset(asset);
+            let ledger_key =
+                LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: account_id.clone(),
+                    asset: tl_asset,
+                });
+            let result = loader(&ledger_key);
+            self.entry_loader = Some(loader); // restore before handling result
+            if let Some(entry) = result? {
+                self.load_entry(entry);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+
+    /// Temporarily remove large Soroban collections to make clone() cheap.
+    ///
+    /// Used by path payment operations that need to clone state for speculative
+    /// orderbook exchange. The Soroban collections (contract data, code, TTL entries)
+    /// are never accessed during orderbook exchange, so removing them before cloning
+    /// and restoring after avoids copying millions of entries.
+    pub fn take_soroban_state(&mut self) -> SorobanState {
+        SorobanState {
+            contract_data: std::mem::take(&mut self.contract_data),
+            contract_code: std::mem::take(&mut self.contract_code),
+            ttl_entries: std::mem::take(&mut self.ttl_entries),
+            ttl_bucket_list_snapshot: std::mem::take(&mut self.ttl_bucket_list_snapshot),
+        }
+    }
+
+    /// Restore previously extracted Soroban collections.
+    pub fn restore_soroban_state(&mut self, soroban: SorobanState) {
+        self.contract_data = soroban.contract_data;
+        self.contract_code = soroban.contract_code;
+        self.ttl_entries = soroban.ttl_entries;
+        self.ttl_bucket_list_snapshot = soroban.ttl_bucket_list_snapshot;
+    }
+
     /// Snapshot the delta before starting a transaction.
     ///
     /// This preserves committed changes from previous transactions so they're not lost
@@ -788,6 +957,7 @@ impl LedgerStateManager {
         self.entry_sponsorships.clear();
         self.entry_sponsorship_ext.clear();
         self.entry_last_modified.clear();
+        self.entry_loader = None;
 
         // Clear all transaction-level state
         self.op_entry_snapshots.clear();
@@ -3656,6 +3826,289 @@ impl LedgerStateManager {
         }
     }
 
+    // ==================== Savepoint Support ====================
+
+    /// Create a savepoint capturing current state for potential rollback.
+    ///
+    /// Used by path payment speculation to avoid cloning the entire state.
+    /// The savepoint records the current values of all modified entries so
+    /// they can be restored if the speculative path is abandoned.
+    pub fn create_savepoint(&self) -> Savepoint {
+        Savepoint {
+            // Clone snapshot maps (small: only entries modified in current TX)
+            offer_snapshots: self.offer_snapshots.clone(),
+            account_snapshots: self.account_snapshots.clone(),
+            trustline_snapshots: self.trustline_snapshots.clone(),
+
+            // Save current values of entries in snapshot maps (pre-speculation values)
+            offer_pre_values: self
+                .offer_snapshots
+                .keys()
+                .map(|k| (*k, self.offers.get(k).cloned()))
+                .collect(),
+            account_pre_values: self
+                .account_snapshots
+                .keys()
+                .map(|k| (*k, self.accounts.get(k).cloned()))
+                .collect(),
+            trustline_pre_values: self
+                .trustline_snapshots
+                .keys()
+                .map(|k| (k.clone(), self.trustlines.get(k).cloned()))
+                .collect(),
+
+            created_offers: self.created_offers.clone(),
+            delta_lengths: self.delta.snapshot_lengths(),
+            modified_accounts_len: self.modified_accounts.len(),
+            modified_trustlines_len: self.modified_trustlines.len(),
+
+            // Entry metadata
+            entry_last_modified_snapshots: self.entry_last_modified_snapshots.clone(),
+            entry_last_modified_pre_values: self
+                .entry_last_modified_snapshots
+                .keys()
+                .map(|k| (k.clone(), self.entry_last_modified.get(k).cloned()))
+                .collect(),
+            entry_sponsorship_snapshots: self.entry_sponsorship_snapshots.clone(),
+            entry_sponsorship_ext_snapshots: self.entry_sponsorship_ext_snapshots.clone(),
+            entry_sponsorship_pre_values: self
+                .entry_sponsorship_snapshots
+                .keys()
+                .map(|k| (k.clone(), self.entry_sponsorships.get(k).cloned()))
+                .collect(),
+            entry_sponsorship_ext_pre_values: self
+                .entry_sponsorship_ext_snapshots
+                .keys()
+                .map(|k| (k.clone(), self.entry_sponsorship_ext.contains(k)))
+                .collect(),
+
+            op_entry_snapshot_keys: self.op_entry_snapshots.keys().cloned().collect(),
+            liquidity_pool_snapshots: self.liquidity_pool_snapshots.clone(),
+        }
+    }
+
+    /// Rollback state to a previously created savepoint.
+    ///
+    /// Undoes all modifications made since the savepoint was created,
+    /// restoring entries to their pre-speculation values. This is O(k)
+    /// where k = entries modified during speculation (typically < 50),
+    /// compared to O(n) for cloning 911K+ offers.
+    pub fn rollback_to_savepoint(&mut self, sp: Savepoint) {
+        // Phase 1: Restore entries newly snapshot'd during speculation.
+        // These entries have snapshots added after the savepoint, so their
+        // snapshot values ARE their pre-speculation (= pre-TX) values.
+
+        // Offers: collect new snapshot keys first to avoid borrow conflict
+        let new_offer_keys: Vec<_> = self
+            .offer_snapshots
+            .keys()
+            .filter(|k| !sp.offer_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        for key in new_offer_keys {
+            if let Some(snapshot) = self.offer_snapshots.get(&key) {
+                let offer_key = OfferKey::new(key.0, key.1);
+                match snapshot {
+                    Some(entry) => {
+                        self.offer_index.update_offer(entry);
+                        self.offers.insert(key, entry.clone());
+                    }
+                    None => {
+                        // Entry didn't exist before TX — remove it
+                        self.offer_index.remove_by_key(&offer_key);
+                        self.offers.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Accounts: collect new snapshot keys
+        let new_account_keys: Vec<_> = self
+            .account_snapshots
+            .keys()
+            .filter(|k| !sp.account_snapshots.contains_key(*k))
+            .cloned()
+            .collect();
+        for key in new_account_keys {
+            if let Some(snapshot) = self.account_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.accounts.insert(key, entry.clone());
+                    }
+                    None => {
+                        self.accounts.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Trustlines: collect new snapshot keys
+        let new_trustline_keys: Vec<_> = self
+            .trustline_snapshots
+            .keys()
+            .filter(|k| !sp.trustline_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        for key in new_trustline_keys {
+            if let Some(snapshot) = self.trustline_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.trustlines.insert(key.clone(), entry.clone());
+                    }
+                    None => {
+                        self.trustlines.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Restore pre-speculation values for entries already in snapshot maps.
+        // These were modified before the savepoint AND potentially re-modified during speculation.
+        for (key, value) in sp.offer_pre_values {
+            let offer_key = OfferKey::new(key.0, key.1);
+            match value {
+                Some(entry) => {
+                    self.offer_index.update_offer(&entry);
+                    self.offers.insert(key, entry);
+                }
+                None => {
+                    self.offer_index.remove_by_key(&offer_key);
+                    self.offers.remove(&key);
+                }
+            }
+        }
+
+        for (key, value) in sp.account_pre_values {
+            match value {
+                Some(entry) => {
+                    self.accounts.insert(key, entry);
+                }
+                None => {
+                    self.accounts.remove(&key);
+                }
+            }
+        }
+
+        for (key, value) in sp.trustline_pre_values {
+            match value {
+                Some(entry) => {
+                    self.trustlines.insert(key, entry);
+                }
+                None => {
+                    self.trustlines.remove(&key);
+                }
+            }
+        }
+
+        // Phase 3: Restore snapshot maps and created sets
+        self.offer_snapshots = sp.offer_snapshots;
+        self.account_snapshots = sp.account_snapshots;
+        self.trustline_snapshots = sp.trustline_snapshots;
+        self.created_offers = sp.created_offers;
+        self.liquidity_pool_snapshots = sp.liquidity_pool_snapshots;
+
+        // Phase 4: Truncate delta (undo offer update/delete records from speculation)
+        self.delta.truncate_to(&sp.delta_lengths);
+
+        // Phase 5: Truncate modified tracking vecs
+        self.modified_accounts.truncate(sp.modified_accounts_len);
+        self.modified_trustlines.truncate(sp.modified_trustlines_len);
+
+        // Phase 6: Restore entry metadata
+
+        // entry_last_modified: restore new entries from snapshots
+        let new_lm_keys: Vec<_> = self
+            .entry_last_modified_snapshots
+            .keys()
+            .filter(|k| !sp.entry_last_modified_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        for key in new_lm_keys {
+            if let Some(snapshot) = self.entry_last_modified_snapshots.get(&key) {
+                match snapshot {
+                    Some(seq) => {
+                        self.entry_last_modified.insert(key, *seq);
+                    }
+                    None => {
+                        self.entry_last_modified.remove(&key);
+                    }
+                }
+            }
+        }
+        // Restore pre-speculation values for existing entries
+        for (key, value) in sp.entry_last_modified_pre_values {
+            match value {
+                Some(seq) => {
+                    self.entry_last_modified.insert(key, seq);
+                }
+                None => {
+                    self.entry_last_modified.remove(&key);
+                }
+            }
+        }
+        self.entry_last_modified_snapshots = sp.entry_last_modified_snapshots;
+
+        // entry_sponsorships: restore new entries from snapshots
+        let new_sp_keys: Vec<_> = self
+            .entry_sponsorship_snapshots
+            .keys()
+            .filter(|k| !sp.entry_sponsorship_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        for key in new_sp_keys {
+            if let Some(snapshot) = self.entry_sponsorship_snapshots.get(&key) {
+                match snapshot {
+                    Some(sponsor) => {
+                        self.entry_sponsorships.insert(key, sponsor.clone());
+                    }
+                    None => {
+                        self.entry_sponsorships.remove(&key);
+                    }
+                }
+            }
+        }
+        for (key, value) in sp.entry_sponsorship_pre_values {
+            match value {
+                Some(sponsor) => {
+                    self.entry_sponsorships.insert(key, sponsor);
+                }
+                None => {
+                    self.entry_sponsorships.remove(&key);
+                }
+            }
+        }
+        self.entry_sponsorship_snapshots = sp.entry_sponsorship_snapshots;
+
+        // entry_sponsorship_ext: restore
+        let new_ext_keys: Vec<_> = self
+            .entry_sponsorship_ext_snapshots
+            .keys()
+            .filter(|k| !sp.entry_sponsorship_ext_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        for key in new_ext_keys {
+            if let Some(&was_present) = self.entry_sponsorship_ext_snapshots.get(&key) {
+                if was_present {
+                    self.entry_sponsorship_ext.insert(key);
+                } else {
+                    self.entry_sponsorship_ext.remove(&key);
+                }
+            }
+        }
+        for (key, was_present) in sp.entry_sponsorship_ext_pre_values {
+            if was_present {
+                self.entry_sponsorship_ext.insert(key);
+            } else {
+                self.entry_sponsorship_ext.remove(&key);
+            }
+        }
+        self.entry_sponsorship_ext_snapshots = sp.entry_sponsorship_ext_snapshots;
+
+        // Phase 7: Restore op entry snapshots
+        self.op_entry_snapshots
+            .retain(|k, _| sp.op_entry_snapshot_keys.contains(k));
+    }
+
     // ==================== Rollback Support ====================
 
     /// Rollback all changes since the state manager was created.
@@ -3691,23 +4144,22 @@ impl LedgerStateManager {
         }
         self.created_trustlines.clear();
 
-        // Restore offer snapshots
+        // Restore offer snapshots and incrementally update the index.
+        // Instead of rebuilding the full index from scratch (O(n log n) for all offers),
+        // we only undo index changes for offers touched by this transaction.
         for (key, snapshot) in self.offer_snapshots.drain() {
+            let offer_key = OfferKey::new(key.0, key.1);
             if self.created_offers.contains(&key) {
+                // Offer was created in this transaction — remove from index and map.
+                self.offer_index.remove_by_key(&offer_key);
                 self.offers.remove(&key);
             } else if let Some(entry) = snapshot {
+                // Offer existed before — restore it and update index.
+                self.offer_index.update_offer(&entry);
                 self.offers.insert(key, entry);
             }
         }
         self.created_offers.clear();
-
-        // Rebuild the offer index from the restored offers.
-        // This is necessary because offers may have been created, modified, or deleted
-        // during the transaction that is being rolled back.
-        self.offer_index.clear();
-        for offer in self.offers.values() {
-            self.offer_index.add_offer(offer);
-        }
 
         // Restore data entry snapshots
         for (key, snapshot) in self.data_snapshots.drain() {

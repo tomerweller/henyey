@@ -1348,68 +1348,6 @@ impl TransactionExecutor {
         Ok(())
     }
 
-    /// Pre-load account and trustline dependencies for offers matching specific asset pairs.
-    ///
-    /// Instead of loading dependencies for ALL 911K offers upfront (which causes ~2.7M
-    /// individual bucket list lookups taking 15+ minutes on mainnet), we only load
-    /// dependencies for offers that could be crossed by the current operation.
-    /// A typical path payment touches only a few thousand offers across 2-4 asset pairs.
-    fn load_offer_dependencies_for_assets(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        assets: &[stellar_xdr::curr::Asset],
-    ) -> Result<()> {
-        use std::collections::HashSet;
-
-        // Collect unique seller IDs for account loading
-        let mut seller_ids: HashSet<AccountId> = HashSet::new();
-        // Collect unique (seller, asset) pairs for trustline loading
-        // A seller may have offers in multiple asset pairs, so we must track
-        // trustlines per-seller-per-asset, not per-seller.
-        let mut trustline_keys: HashSet<(AccountId, String)> = HashSet::new();
-        let mut trustlines_to_load: Vec<(AccountId, stellar_xdr::curr::Asset)> = Vec::new();
-
-        // For each pair of assets (A, B), find offers selling A for B or B for A
-        for i in 0..assets.len() {
-            for j in 0..assets.len() {
-                if i == j {
-                    continue;
-                }
-                // Get offers where buying=assets[i], selling=assets[j]
-                for offer in self.state.offers_for_asset_pair(&assets[i], &assets[j]) {
-                    seller_ids.insert(offer.seller_id.clone());
-                    // Track non-native assets that need trustline loading
-                    if !matches!(&offer.selling, stellar_xdr::curr::Asset::Native) {
-                        let key = (offer.seller_id.clone(), format!("{:?}", &offer.selling));
-                        if trustline_keys.insert(key) {
-                            trustlines_to_load.push((offer.seller_id.clone(), offer.selling.clone()));
-                        }
-                    }
-                    if !matches!(&offer.buying, stellar_xdr::curr::Asset::Native) {
-                        let key = (offer.seller_id.clone(), format!("{:?}", &offer.buying));
-                        if trustline_keys.insert(key) {
-                            trustlines_to_load.push((offer.seller_id.clone(), offer.buying.clone()));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Load accounts
-        for seller_id in &seller_ids {
-            self.load_account(snapshot, seller_id)?;
-        }
-
-        // Load trustlines
-        for (seller_id, asset) in &trustlines_to_load {
-            if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                self.load_trustline(snapshot, seller_id, &tl_asset)?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Load all offers by an account for a specific asset.
     ///
     /// This is used when revoking trustline authorization - all offers for the
@@ -2646,6 +2584,17 @@ impl TransactionExecutor {
             }
         }
 
+        // Set up lazy entry loader for offer dependency loading.
+        // Instead of preloading all offer dependencies upfront (which requires
+        // O(n) bucket list lookups for all offers in each asset pair), the
+        // entry_loader enables on-demand loading during offer crossing.
+        let snapshot_for_loader = snapshot.clone();
+        self.state.set_entry_loader(std::sync::Arc::new(move |key| {
+            snapshot_for_loader
+                .get_entry(key)
+                .map_err(|e| stellar_core_tx::TxError::Internal(e.to_string()))
+        }));
+
         // Execute operations
         let mut operation_results = Vec::new();
         let num_ops = frame.operations().len();
@@ -2679,16 +2628,6 @@ impl TransactionExecutor {
                     .unwrap_or_else(|| frame.inner_source_account());
                 let op_delta_before = delta_snapshot(&self.state);
                 self.state.begin_op_snapshot();
-
-                // For orderbook operations, lazily load account/trustline dependencies
-                // only for offers matching this operation's specific asset pairs.
-                // Offers themselves are already loaded during ledger initialization.
-                if op_requires_orderbook(&op.body) {
-                    let assets = extract_operation_assets(&op.body);
-                    if !assets.is_empty() {
-                        self.load_offer_dependencies_for_assets(snapshot, &assets)?;
-                    }
-                }
 
                 // Load any accounts needed for this operation
                 self.load_operation_accounts(snapshot, op, &inner_source_id)?;
@@ -3111,17 +3050,6 @@ impl TransactionExecutor {
             diagnostic_events,
             soroban_fee_info,
         );
-
-        // Debug: verify meta structure immediately after building
-        if let TransactionMeta::V4(v4) = &tx_meta {
-            let ops_sum: usize = v4.operations.iter().map(|op| op.changes.len()).sum();
-            tracing::debug!(
-                "execute_transaction: meta built - tx_changes_before={}, ops_changes_sum={}, tx_changes_after={}",
-                v4.tx_changes_before.len(),
-                ops_sum,
-                v4.tx_changes_after.len()
-            );
-        }
 
         Ok(TransactionExecutionResult {
             success: all_success,
@@ -3595,66 +3523,6 @@ fn asset_to_trustline_asset(
             stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone()),
         ),
     }
-}
-
-fn op_requires_orderbook(op: &OperationBody) -> bool {
-    matches!(
-        op,
-        OperationBody::ManageSellOffer(_)
-            | OperationBody::ManageBuyOffer(_)
-            | OperationBody::CreatePassiveSellOffer(_)
-            | OperationBody::PathPaymentStrictSend(_)
-            | OperationBody::PathPaymentStrictReceive(_)
-    )
-}
-
-/// Extract assets involved in an orderbook operation so we can lazily load
-/// only the offer dependencies for relevant asset pairs.
-fn extract_operation_assets(op: &OperationBody) -> Vec<stellar_xdr::curr::Asset> {
-    use std::collections::HashSet;
-    use stellar_xdr::curr::Asset;
-
-    let mut assets = Vec::new();
-    let mut seen = HashSet::new();
-
-    let mut add = |asset: &Asset| {
-        let key = format!("{:?}", asset);
-        if seen.insert(key) {
-            assets.push(asset.clone());
-        }
-    };
-
-    match op {
-        OperationBody::PathPaymentStrictReceive(pp) => {
-            add(&pp.send_asset);
-            add(&pp.dest_asset);
-            for a in pp.path.iter() {
-                add(a);
-            }
-        }
-        OperationBody::PathPaymentStrictSend(pp) => {
-            add(&pp.send_asset);
-            add(&pp.dest_asset);
-            for a in pp.path.iter() {
-                add(a);
-            }
-        }
-        OperationBody::ManageSellOffer(o) => {
-            add(&o.selling);
-            add(&o.buying);
-        }
-        OperationBody::ManageBuyOffer(o) => {
-            add(&o.selling);
-            add(&o.buying);
-        }
-        OperationBody::CreatePassiveSellOffer(o) => {
-            add(&o.selling);
-            add(&o.buying);
-        }
-        _ => {}
-    }
-
-    assets
 }
 
 #[derive(Clone, Copy)]

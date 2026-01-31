@@ -558,7 +558,9 @@ fn convert_with_offers_and_pools(
     let mut book_amount_send = 0;
     let mut book_amount_recv = 0;
     let mut book_offer_trail = Vec::new();
-    let mut temp_state = state.clone();
+    // Use savepoint instead of cloning entire state (avoids O(n) clone of 911K+ offers).
+    // Run the orderbook path speculatively on the real state, and rollback if pool wins.
+    let savepoint = state.create_savepoint();
     let book_res = convert_with_offers(
         source,
         send_asset,
@@ -569,7 +571,7 @@ fn convert_with_offers_and_pools(
         &mut book_amount_recv,
         round,
         &mut book_offer_trail,
-        &mut temp_state,
+        state,
         context,
     )?;
 
@@ -584,13 +586,16 @@ fn convert_with_offers_and_pools(
     };
 
     if use_book {
-        *state = temp_state;
+        // Book wins — keep speculative changes (drop savepoint)
         *amount_send = book_amount_send;
         *amount_recv = book_amount_recv;
         offer_trail.clear();
         offer_trail.extend(book_offer_trail);
         return Ok(book_res);
     }
+
+    // Pool wins — undo speculative book changes
+    state.rollback_to_savepoint(savepoint);
 
     offer_trail.clear();
     if apply_pool_exchange(
@@ -704,6 +709,16 @@ fn cross_offer_v10(
     let sheep = offer.buying.clone();
     let wheat = offer.selling.clone();
     let seller = offer.seller_id.clone();
+
+    // Lazily load seller's account and trustlines before crossing.
+    // This avoids preloading dependencies for all offers upfront.
+    state.ensure_account_loaded(&seller)?;
+    if !matches!(&wheat, Asset::Native) {
+        state.ensure_trustline_loaded(&seller, &wheat)?;
+    }
+    if !matches!(&sheep, Asset::Native) {
+        state.ensure_trustline_loaded(&seller, &sheep)?;
+    }
 
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
     apply_liabilities_delta(
