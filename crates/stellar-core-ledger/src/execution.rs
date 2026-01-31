@@ -738,6 +738,8 @@ pub struct TransactionExecutionResult {
     /// Keys of entries restored from the hot archive (Protocol 23+).
     /// These should be passed to HotArchiveBucketList::add_batch as restored_keys.
     pub hot_archive_restored_keys: Vec<LedgerKey>,
+    /// Per-operation-type timing: maps op type to (total_us, count).
+    pub op_type_timings: HashMap<OperationType, (u64, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1826,6 +1828,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -1842,6 +1845,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -1857,6 +1861,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -1875,6 +1880,7 @@ impl TransactionExecutor {
                     fee_changes: None,
                     post_fee_changes: None,
                     hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
                 });
             }
         };
@@ -1893,6 +1899,7 @@ impl TransactionExecutor {
                     fee_changes: None,
                     post_fee_changes: None,
                     hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
                 });
             }
         };
@@ -1916,6 +1923,7 @@ impl TransactionExecutor {
                     fee_changes: None,
                     post_fee_changes: None,
                     hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
                 });
             }
 
@@ -1948,6 +1956,7 @@ impl TransactionExecutor {
                         fee_changes: None,
                         post_fee_changes: None,
                         hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
                     });
                 }
             } else {
@@ -1964,6 +1973,7 @@ impl TransactionExecutor {
                         fee_changes: None,
                         post_fee_changes: None,
                         hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
                     });
                 }
             }
@@ -1981,6 +1991,7 @@ impl TransactionExecutor {
                     fee_changes: None,
                     post_fee_changes: None,
                     hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
                 });
             }
         }
@@ -2010,6 +2021,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -2036,6 +2048,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -2053,6 +2066,7 @@ impl TransactionExecutor {
                         fee_changes: None,
                         post_fee_changes: None,
                         hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
                     });
                 }
             }
@@ -2074,6 +2088,7 @@ impl TransactionExecutor {
                         fee_changes: None,
                         post_fee_changes: None,
                         hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
                     });
                 }
             }
@@ -2097,6 +2112,7 @@ impl TransactionExecutor {
                         fee_changes: None,
                         post_fee_changes: None,
                         hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
                     });
                 }
             }
@@ -2123,6 +2139,7 @@ impl TransactionExecutor {
                     fee_changes: None,
                     post_fee_changes: None,
                     hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
                 });
             }
         }
@@ -2176,6 +2193,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -2192,6 +2210,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -2217,6 +2236,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -2241,6 +2261,7 @@ impl TransactionExecutor {
                     fee_changes: None,
                     post_fee_changes: None,
                     hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
                 });
             }
         }
@@ -2276,6 +2297,7 @@ impl TransactionExecutor {
                 fee_changes: None,
                 post_fee_changes: None,
                 hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
             });
         }
 
@@ -2303,6 +2325,7 @@ impl TransactionExecutor {
                         fee_changes: None,
                         post_fee_changes: None,
                         hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
                     });
                 }
             }
@@ -2652,6 +2675,7 @@ impl TransactionExecutor {
         // the same entry (e.g., same ContractCode), it should only be sent to
         // HotArchiveBucketList::add_batch once as a single Live marker.
         let mut collected_hot_archive_keys: HashSet<LedgerKey> = HashSet::new();
+        let mut op_type_timings: HashMap<OperationType, (u64, u32)> = HashMap::new();
 
         if let Some(preflight_failure) = preflight_failure {
             all_success = false;
@@ -2665,6 +2689,7 @@ impl TransactionExecutor {
                     .unwrap_or_else(|| frame.inner_source_account());
                 let op_delta_before = delta_snapshot(&self.state);
                 self.state.begin_op_snapshot();
+                let op_timing_start = std::time::Instant::now();
 
                 // Load any accounts needed for this operation
                 self.load_operation_accounts(snapshot, op, &inner_source_id)?;
@@ -2977,6 +3002,10 @@ impl TransactionExecutor {
                         failure = Some(ExecutionFailure::NotSupported);
                     }
                 }
+                let op_elapsed_us = op_timing_start.elapsed().as_micros() as u64;
+                let entry = op_type_timings.entry(op_type).or_insert((0u64, 0u32));
+                entry.0 += op_elapsed_us;
+                entry.1 += 1;
             }
         }
 
@@ -3093,6 +3122,14 @@ impl TransactionExecutor {
         let total_us = tx_timing_start.elapsed().as_micros() as u64;
         let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
         if total_us > 5000 || frame.is_soroban() {
+            // Build a compact string of per-op-type timings sorted by time desc
+            let mut op_timing_vec: Vec<_> = op_type_timings.iter().collect();
+            op_timing_vec.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+            let op_timing_str: String = op_timing_vec
+                .iter()
+                .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
+                .collect::<Vec<_>>()
+                .join(",");
             tracing::info!(
                 ledger_seq = self.ledger_seq,
                 total_us,
@@ -3104,6 +3141,7 @@ impl TransactionExecutor {
                 is_soroban = frame.is_soroban(),
                 num_ops = frame.operations().len(),
                 success = all_success,
+                op_timings = %op_timing_str,
                 "TX phase timing"
             );
         }
@@ -3128,6 +3166,7 @@ impl TransactionExecutor {
             post_fee_changes: Some(post_fee_changes),
             // Convert HashSet back to Vec for the return type
             hot_archive_restored_keys: collected_hot_archive_keys.into_iter().collect(),
+            op_type_timings,
         })
     }
 

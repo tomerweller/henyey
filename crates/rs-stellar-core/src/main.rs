@@ -2969,6 +2969,10 @@ async fn cmd_verify_execution(
     let mut all_timings: Vec<LedgerTimings> = Vec::new();
     let verification_start = std::time::Instant::now();
 
+    // Grand-total per-operation-type timing: op_type -> (total_us, count, failed_count, failed_us)
+    use stellar_core_tx::operations::OperationType;
+    let mut grand_op_timings: std::collections::HashMap<OperationType, (u64, u32, u32, u64)> = std::collections::HashMap::new();
+
     // Process ledgers from init_checkpoint+1 to end_ledger
     let process_from = init_checkpoint + 1;
     let process_from_cp = checkpoint::checkpoint_containing(process_from);
@@ -3301,6 +3305,8 @@ async fn cmd_verify_execution(
 
             // Execute all transactions with single-phase fee+execution
             tracing::info!(ledger_seq = seq, tx_count = tx_processing.len(), "Starting TX loop");
+            // Per-ledger op type timing: op_type -> (total_us, op_count)
+            let mut ledger_op_timings: std::collections::HashMap<OperationType, (u64, u32)> = std::collections::HashMap::new();
             for (tx_idx, tx_info) in tx_processing.iter().enumerate() {
                 // Snapshot the delta before starting each transaction.
                 // This preserves committed changes from previous transactions so they're
@@ -3338,6 +3344,15 @@ async fn cmd_verify_execution(
                 let tx_elapsed_ms = tx_start.elapsed().as_millis() as u64;
                 if tx_elapsed_ms > 100 || tx_idx < 3 {
                     tracing::info!(ledger_seq = seq, tx_idx, tx_elapsed_ms, "TX executed");
+                }
+
+                // Merge per-op-type timings from this TX into ledger aggregation
+                if let Ok(ref result) = exec_result {
+                    for (op_type, (us, count)) in &result.op_type_timings {
+                        let entry = ledger_op_timings.entry(*op_type).or_insert((0u64, 0u32));
+                        entry.0 += us;
+                        entry.1 += count;
+                    }
                 }
 
                 // Check if CDP transaction succeeded
@@ -3602,7 +3617,31 @@ async fn cmd_verify_execution(
                 }
             }
             timing.tx_execution_us = tx_exec_start.elapsed().as_micros() as u64;
-            tracing::info!(ledger_seq = seq, tx_execution_ms = timing.tx_execution_us / 1000, tx_count = timing.tx_count, "TX execution done");
+
+            // Log per-ledger op type timing and merge into grand totals
+            if !ledger_op_timings.is_empty() {
+                let mut op_timing_vec: Vec<_> = ledger_op_timings.iter().collect();
+                op_timing_vec.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+                let op_timing_str: String = op_timing_vec
+                    .iter()
+                    .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::info!(
+                    ledger_seq = seq,
+                    tx_execution_ms = timing.tx_execution_us / 1000,
+                    tx_count = timing.tx_count,
+                    op_timings = %op_timing_str,
+                    "TX execution done"
+                );
+                for (op_type, (us, count)) in &ledger_op_timings {
+                    let entry = grand_op_timings.entry(*op_type).or_insert((0u64, 0u32, 0u32, 0u64));
+                    entry.0 += us;
+                    entry.1 += count;
+                }
+            } else {
+                tracing::info!(ledger_seq = seq, tx_execution_ms = timing.tx_execution_us / 1000, tx_count = timing.tx_count, "TX execution done");
+            }
 
             // Apply changes to bucket list for next ledger
             // We always use our executor's state for true end-to-end verification
@@ -4913,6 +4952,28 @@ async fn cmd_verify_execution(
         println!("    TX count vs TX execution time: {:.3}", correlation_tx);
         println!("    TX count vs Total time:        {:.3}", correlation_total);
         println!("    (1.0 = perfect correlation, 0.0 = no correlation)");
+    }
+
+    // Print per-operation-type timing breakdown
+    if !grand_op_timings.is_empty() {
+        let total_op_us: u64 = grand_op_timings.values().map(|v| v.0).sum();
+        let total_op_count: u32 = grand_op_timings.values().map(|v| v.1).sum();
+        let mut sorted_ops: Vec<_> = grand_op_timings.iter().collect();
+        sorted_ops.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+
+        println!();
+        println!("Operation Type Performance Breakdown");
+        println!("=====================================");
+        println!("  Total operation time: {:.2}ms across {} operations", total_op_us as f64 / 1000.0, total_op_count);
+        println!();
+        println!("  {:>30} {:>8} {:>12} {:>10} {:>8}", "Operation Type", "Count", "Total (ms)", "Avg (us)", "% Time");
+        println!("  {:>30} {:>8} {:>12} {:>10} {:>8}", "------------------------------", "--------", "------------", "----------", "--------");
+        for (op_type, (us, count, _, _)) in &sorted_ops {
+            let avg_us = if *count > 0 { *us as f64 / *count as f64 } else { 0.0 };
+            let pct = if total_op_us > 0 { *us as f64 / total_op_us as f64 * 100.0 } else { 0.0 };
+            println!("  {:>30} {:>8} {:>10.2} {:>10.1} {:>7.1}%",
+                format!("{:?}", op_type), count, *us as f64 / 1000.0, avg_us, pct);
+        }
     }
 
     Ok(())

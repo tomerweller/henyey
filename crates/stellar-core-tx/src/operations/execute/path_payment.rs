@@ -103,6 +103,7 @@ pub fn execute_path_payment_strict_receive(
         let mut amount_send = 0;
         let mut amount_recv = 0;
         let mut offer_trail = Vec::new();
+        let max_offers_to_cross = MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64;
         let convert_res = convert_with_offers_and_pools(
             source,
             &send_asset,
@@ -115,6 +116,7 @@ pub fn execute_path_payment_strict_receive(
             &mut offer_trail,
             state,
             context,
+            max_offers_to_cross,
         )?;
 
         if convert_res == ConvertResult::FilterStopCrossSelf {
@@ -233,6 +235,7 @@ pub fn execute_path_payment_strict_send(
         let mut amount_send = 0;
         let mut amount_recv = 0;
         let mut offer_trail = Vec::new();
+        let max_offers_to_cross = MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64;
         let convert_res = convert_with_offers_and_pools(
             source,
             &send_asset,
@@ -245,6 +248,7 @@ pub fn execute_path_payment_strict_send(
             &mut offer_trail,
             state,
             context,
+            max_offers_to_cross,
         )?;
 
         if convert_res == ConvertResult::FilterStopCrossSelf {
@@ -499,11 +503,16 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
     }
 }
 
+/// Maximum number of offers that can be crossed per path payment operation.
+/// Matches C++ stellar-core's MAX_OFFERS_TO_CROSS (protocol 11+).
+const MAX_OFFERS_TO_CROSS: i64 = 1000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConvertResult {
     Ok,
     Partial,
     FilterStopCrossSelf,
+    CrossedTooMany,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -519,6 +528,7 @@ fn convert_with_offers_and_pools(
     offer_trail: &mut Vec<ClaimAtom>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
+    max_offers_to_cross: i64,
 ) -> Result<ConvertResult> {
     if round == RoundingType::Normal {
         return convert_with_offers(
@@ -533,6 +543,7 @@ fn convert_with_offers_and_pools(
             offer_trail,
             state,
             context,
+            max_offers_to_cross,
         );
     }
 
@@ -552,7 +563,14 @@ fn convert_with_offers_and_pools(
             offer_trail,
             state,
             context,
+            max_offers_to_cross,
         );
+    }
+
+    // C++ fast-fails if maxOffersToCross == 0 and pool exchange would add to trail
+    // (protocol 18+, but we only support 23+)
+    if max_offers_to_cross == 0 {
+        return Ok(ConvertResult::CrossedTooMany);
     }
 
     let mut book_amount_send = 0;
@@ -573,6 +591,7 @@ fn convert_with_offers_and_pools(
         &mut book_offer_trail,
         state,
         context,
+        max_offers_to_cross,
     )?;
 
     let pool_exchange = pool_exchange.unwrap();
@@ -629,6 +648,7 @@ fn convert_with_offers_and_pools(
         offer_trail,
         state,
         context,
+        max_offers_to_cross,
     )
 }
 
@@ -645,6 +665,7 @@ fn convert_with_offers(
     offer_trail: &mut Vec<ClaimAtom>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
+    max_offers_to_cross: i64,
 ) -> Result<ConvertResult> {
     offer_trail.clear();
     *amount_send = 0;
@@ -653,6 +674,12 @@ fn convert_with_offers(
     let mut max_send = max_send;
     let mut max_recv = max_recv;
     let mut need_more = max_send > 0 && max_recv > 0;
+
+    // Fast-fail if already at the limit (protocol 18+, but we only support 23+)
+    if need_more && max_offers_to_cross == 0 {
+        return Ok(ConvertResult::CrossedTooMany);
+    }
+
     while need_more {
         let offer = state.best_offer(send_asset, recv_asset);
         let Some(offer) = offer else {
@@ -661,6 +688,11 @@ fn convert_with_offers(
 
         if offer.seller_id == *source {
             return Ok(ConvertResult::FilterStopCrossSelf);
+        }
+
+        // Enforce max offers to cross limit (matches C++ stellar-core)
+        if offer_trail.len() as i64 >= max_offers_to_cross {
+            return Ok(ConvertResult::CrossedTooMany);
         }
 
         let (recv, send, wheat_stays) = cross_offer_v10(
@@ -672,10 +704,6 @@ fn convert_with_offers(
             state,
             context,
         )?;
-
-        if recv == 0 && send == 0 {
-            return Ok(ConvertResult::Partial);
-        }
 
         *amount_send += send;
         *amount_recv += recv;
