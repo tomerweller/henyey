@@ -1002,27 +1002,8 @@ fn cross_offer_v10(
     let wheat = offer.selling.clone();
     let seller = offer.seller_id.clone();
 
-    // Lazily load seller's account and trustlines before crossing.
-    // This avoids preloading dependencies for all offers upfront.
-    state.ensure_account_loaded(&seller)?;
-    if !matches!(&wheat, Asset::Native) {
-        let loaded = state.ensure_trustline_loaded(&seller, &wheat)?;
-        tracing::debug!(
-            "manage_offer cross_offer_v10: ensure_trustline_loaded wheat seller={:02x?}... asset={:?} loaded={}",
-            &crate::account_id_to_key(&seller)[..4],
-            &wheat,
-            loaded
-        );
-    }
-    if !matches!(&sheep, Asset::Native) {
-        let loaded = state.ensure_trustline_loaded(&seller, &sheep)?;
-        tracing::debug!(
-            "manage_offer cross_offer_v10: ensure_trustline_loaded sheep seller={:02x?}... asset={:?} loaded={}",
-            &crate::account_id_to_key(&seller)[..4],
-            &sheep,
-            loaded
-        );
-    }
+    // Batch-load seller's account and trustlines in a single bucket list pass.
+    state.ensure_offer_entries_loaded(&seller, &wheat, &sheep)?;
 
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
     apply_liabilities_delta(

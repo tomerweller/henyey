@@ -948,6 +948,68 @@ impl TransactionExecutor {
         self.loaded_accounts.clear();
     }
 
+    /// Batch-load multiple entries from the bucket list in a single pass.
+    ///
+    /// Filters out entries already in state or already attempted, then loads
+    /// remaining keys via `snapshot.load_entries()` which uses a single bucket
+    /// list traversal for all keys. This is significantly faster than individual
+    /// `load_account`/`load_trustline` calls for operations needing multiple entries.
+    fn batch_load_keys(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        keys: &[LedgerKey],
+    ) -> Result<()> {
+        let mut needed = Vec::new();
+
+        for key in keys {
+            let already_loaded = match key {
+                LedgerKey::Account(k) => {
+                    let key_bytes = account_id_to_key(&k.account_id);
+                    self.state.get_account(&k.account_id).is_some()
+                        || self.loaded_accounts.contains_key(&key_bytes)
+                }
+                LedgerKey::Trustline(k) => self
+                    .state
+                    .get_trustline_by_trustline_asset(&k.account_id, &k.asset)
+                    .is_some(),
+                LedgerKey::ClaimableBalance(k) => {
+                    self.state.get_claimable_balance(&k.balance_id).is_some()
+                }
+                LedgerKey::LiquidityPool(k) => self
+                    .state
+                    .get_liquidity_pool(&k.liquidity_pool_id)
+                    .is_some(),
+                LedgerKey::Offer(k) => {
+                    self.state.get_offer(&k.seller_id, k.offer_id).is_some()
+                }
+                _ => false,
+            };
+
+            if !already_loaded {
+                needed.push(key.clone());
+            }
+        }
+
+        if needed.is_empty() {
+            return Ok(());
+        }
+
+        // Mark all account keys as attempted (whether found or not)
+        for key in &needed {
+            if let LedgerKey::Account(k) = key {
+                let key_bytes = account_id_to_key(&k.account_id);
+                self.loaded_accounts.insert(key_bytes, true);
+            }
+        }
+
+        let entries = snapshot.load_entries(&needed)?;
+        for entry in entries {
+            self.state.load_entry(entry);
+        }
+
+        Ok(())
+    }
+
     /// Load an account from the snapshot into the state manager.
     pub fn load_account(
         &mut self,
@@ -1262,34 +1324,23 @@ impl TransactionExecutor {
         pool_id: &PoolId,
     ) -> Result<()> {
         if let Some(pool) = self.load_liquidity_pool(snapshot, pool_id)? {
+            // Batch-load pool share trustline + asset trustlines + issuer accounts
             let pool_share_asset = TrustLineAsset::PoolShare(pool_id.clone());
-            self.load_trustline(snapshot, op_source, &pool_share_asset)?;
-
-            let load_asset_dependencies = |executor: &mut TransactionExecutor,
-                                           asset: &Asset,
-                                           source: &AccountId|
-             -> Result<()> {
-                if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                    executor.load_trustline(snapshot, source, &tl_asset)?;
-                }
-                match asset {
-                    Asset::CreditAlphanum4(a) => {
-                        executor.load_account(snapshot, &a.issuer)?;
-                    }
-                    Asset::CreditAlphanum12(a) => {
-                        executor.load_account(snapshot, &a.issuer)?;
-                    }
-                    Asset::Native => {}
-                }
-                Ok(())
-            };
+            let mut keys = vec![make_trustline_key(op_source, &pool_share_asset)];
 
             match &pool.body {
                 LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
-                    load_asset_dependencies(self, &cp.params.asset_a, op_source)?;
-                    load_asset_dependencies(self, &cp.params.asset_b, op_source)?;
+                    for asset in [&cp.params.asset_a, &cp.params.asset_b] {
+                        if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                            keys.push(make_trustline_key(op_source, &tl_asset));
+                        }
+                        if let Some(issuer) = asset_issuer_id(asset) {
+                            keys.push(make_account_key(&issuer));
+                        }
+                    }
                 }
             }
+            self.batch_load_keys(snapshot, &keys)?;
         }
         Ok(())
     }
@@ -1459,18 +1510,38 @@ impl TransactionExecutor {
         snapshot: &SnapshotHandle,
         footprint: &stellar_xdr::curr::LedgerFootprint,
     ) -> Result<()> {
-        // Load read-only entries
-        for key in footprint.read_only.iter() {
-            self.load_entry(snapshot, key)?;
-            // Also load TTL for contract entries
-            self.load_ttl_for_key(snapshot, key)?;
+        use sha2::{Digest, Sha256};
+
+        // Collect all footprint keys + their TTL keys for batch loading
+        let mut all_keys = Vec::new();
+        for key in footprint.read_only.iter().chain(footprint.read_write.iter()) {
+            // Skip entries already in state (e.g., created by previous TX in this ledger)
+            if self.state.get_entry(key).is_none() {
+                all_keys.push(key.clone());
+            }
+            // Add TTL key for contract data/code entries
+            if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+                let key_bytes = key
+                    .to_xdr(Limits::none())
+                    .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                    key_hash: key_hash.clone(),
+                });
+                if self.state.get_entry(&ttl_key).is_none() {
+                    all_keys.push(ttl_key);
+                }
+            }
         }
 
-        // Load read-write entries
-        for key in footprint.read_write.iter() {
-            self.load_entry(snapshot, key)?;
-            // Also load TTL for contract entries
-            self.load_ttl_for_key(snapshot, key)?;
+        if all_keys.is_empty() {
+            return Ok(());
+        }
+
+        // Batch-load all entries + TTLs in a single bucket list pass
+        let entries = snapshot.load_entries(&all_keys)?;
+        for entry in entries {
+            self.state.load_entry(entry);
         }
 
         Ok(())
@@ -3210,23 +3281,25 @@ impl TransactionExecutor {
             }
             OperationBody::AllowTrust(op_data) => {
                 let asset = allow_trust_asset(op_data, &op_source);
+                let mut keys = vec![make_account_key(&op_data.trustor)];
                 if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
-                    self.load_trustline(snapshot, &op_data.trustor, &tl_asset)?;
+                    keys.push(make_trustline_key(&op_data.trustor, &tl_asset));
                 }
-                // Load the trustor account - needed for num_sub_entries updates when removing offers
-                self.load_account(snapshot, &op_data.trustor)?;
+                self.batch_load_keys(snapshot, &keys)?;
                 // Load offers by account/asset so they can be removed if authorization is revoked
                 self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &asset)?;
             }
             OperationBody::Payment(op_data) => {
                 let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
-                self.load_account(snapshot, &dest)?;
+                let mut keys = vec![make_account_key(&dest)];
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
-                    self.load_trustline(snapshot, &op_source, &tl_asset)?;
-                    self.load_trustline(snapshot, &dest, &tl_asset)?;
+                    keys.push(make_trustline_key(&op_source, &tl_asset));
+                    keys.push(make_trustline_key(&dest, &tl_asset));
                 }
-                // Load issuer account for non-native assets
-                self.load_asset_issuer(snapshot, &op_data.asset)?;
+                if let Some(issuer) = asset_issuer_id(&op_data.asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
             }
             OperationBody::AccountMerge(dest) => {
                 let dest = stellar_core_tx::muxed_to_account_id(dest);
@@ -3263,11 +3336,11 @@ impl TransactionExecutor {
                 }
             }
             OperationBody::SetTrustLineFlags(op_data) => {
+                let mut keys = vec![make_account_key(&op_data.trustor)];
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
-                    self.load_trustline(snapshot, &op_data.trustor, &tl_asset)?;
+                    keys.push(make_trustline_key(&op_data.trustor, &tl_asset));
                 }
-                // Load the trustor account - needed for num_sub_entries updates when removing offers
-                self.load_account(snapshot, &op_data.trustor)?;
+                self.batch_load_keys(snapshot, &keys)?;
                 // Load offers by account/asset so they can be removed if authorization is revoked
                 self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &op_data.asset)?;
             }
@@ -3278,54 +3351,75 @@ impl TransactionExecutor {
                 }
             }
             OperationBody::ManageSellOffer(op_data) => {
+                let mut keys = Vec::new();
                 for asset in [&op_data.selling, &op_data.buying] {
                     if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                        keys.push(make_trustline_key(&op_source, &tl_asset));
                     }
-                    self.load_asset_issuer(snapshot, asset)?;
+                    if let Some(issuer) = asset_issuer_id(asset) {
+                        keys.push(make_account_key(&issuer));
+                    }
                 }
-                // Load existing offer if modifying/deleting (offer_id != 0)
                 if op_data.offer_id != 0 {
-                    self.load_offer(snapshot, &op_source, op_data.offer_id)?;
-                    // If the offer has a sponsor, load the sponsor account for sponsorship updates
+                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                        seller_id: op_source.clone(),
+                        offer_id: op_data.offer_id,
+                    }));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                if op_data.offer_id != 0 {
                     self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
                 }
             }
             OperationBody::CreatePassiveSellOffer(op_data) => {
+                let mut keys = Vec::new();
                 for asset in [&op_data.selling, &op_data.buying] {
                     if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                        keys.push(make_trustline_key(&op_source, &tl_asset));
                     }
-                    self.load_asset_issuer(snapshot, asset)?;
+                    if let Some(issuer) = asset_issuer_id(asset) {
+                        keys.push(make_account_key(&issuer));
+                    }
                 }
-                // Passive sell offers always create new offers, no existing offer to load
+                self.batch_load_keys(snapshot, &keys)?;
             }
             OperationBody::ManageBuyOffer(op_data) => {
+                let mut keys = Vec::new();
                 for asset in [&op_data.selling, &op_data.buying] {
                     if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                        keys.push(make_trustline_key(&op_source, &tl_asset));
                     }
-                    self.load_asset_issuer(snapshot, asset)?;
+                    if let Some(issuer) = asset_issuer_id(asset) {
+                        keys.push(make_account_key(&issuer));
+                    }
                 }
-                // Load existing offer if modifying/deleting (offer_id != 0)
                 if op_data.offer_id != 0 {
-                    self.load_offer(snapshot, &op_source, op_data.offer_id)?;
-                    // If the offer has a sponsor, load the sponsor account for sponsorship updates
+                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                        seller_id: op_source.clone(),
+                        offer_id: op_data.offer_id,
+                    }));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                if op_data.offer_id != 0 {
                     self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
                 }
             }
             OperationBody::PathPaymentStrictSend(op_data) => {
                 let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
-                self.load_account(snapshot, &dest)?;
+                let mut keys = vec![make_account_key(&dest)];
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
-                    self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                    keys.push(make_trustline_key(&op_source, &tl_asset));
                 }
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
-                    self.load_trustline(snapshot, &dest, &tl_asset)?;
+                    keys.push(make_trustline_key(&dest, &tl_asset));
                 }
-                self.load_asset_issuer(snapshot, &op_data.send_asset)?;
-                self.load_asset_issuer(snapshot, &op_data.dest_asset)?;
-                // Load liquidity pools that could be used for conversions
+                if let Some(issuer) = asset_issuer_id(&op_data.send_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                if let Some(issuer) = asset_issuer_id(&op_data.dest_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
                 self.load_path_payment_pools(
                     snapshot,
                     &op_data.send_asset,
@@ -3335,16 +3429,20 @@ impl TransactionExecutor {
             }
             OperationBody::PathPaymentStrictReceive(op_data) => {
                 let dest = stellar_core_tx::muxed_to_account_id(&op_data.destination);
-                self.load_account(snapshot, &dest)?;
+                let mut keys = vec![make_account_key(&dest)];
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
-                    self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                    keys.push(make_trustline_key(&op_source, &tl_asset));
                 }
                 if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
-                    self.load_trustline(snapshot, &dest, &tl_asset)?;
+                    keys.push(make_trustline_key(&dest, &tl_asset));
                 }
-                self.load_asset_issuer(snapshot, &op_data.send_asset)?;
-                self.load_asset_issuer(snapshot, &op_data.dest_asset)?;
-                // Load liquidity pools that could be used for conversions
+                if let Some(issuer) = asset_issuer_id(&op_data.send_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                if let Some(issuer) = asset_issuer_id(&op_data.dest_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
                 self.load_path_payment_pools(
                     snapshot,
                     &op_data.send_asset,
@@ -3424,23 +3522,22 @@ impl TransactionExecutor {
                         self.load_account_without_record(snapshot, &a.issuer)?;
                     }
                     stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
-                        // Compute pool ID and load the liquidity pool
                         use sha2::{Digest, Sha256};
                         let xdr = params
                             .to_xdr(Limits::none())
                             .map_err(|e| LedgerError::Serialization(e.to_string()))?;
                         let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
-                        self.load_liquidity_pool(snapshot, &pool_id)?;
-
-                        // Load trustlines for underlying pool assets - needed for validation
-                        // that source has trustlines for both assets
                         let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
+                        let mut keys = vec![LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+                            liquidity_pool_id: pool_id.clone(),
+                        })];
                         if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_a) {
-                            self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                            keys.push(make_trustline_key(&op_source, &tl_asset));
                         }
                         if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_b) {
-                            self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                            keys.push(make_trustline_key(&op_source, &tl_asset));
                         }
+                        self.batch_load_keys(snapshot, &keys)?;
                     }
                     _ => {}
                 }
@@ -3630,6 +3727,30 @@ fn asset_to_trustline_asset(
             stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone()),
         ),
     }
+}
+
+fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
+    match asset {
+        stellar_xdr::curr::Asset::Native => None,
+        stellar_xdr::curr::Asset::CreditAlphanum4(a) => Some(a.issuer.clone()),
+        stellar_xdr::curr::Asset::CreditAlphanum12(a) => Some(a.issuer.clone()),
+    }
+}
+
+fn make_account_key(account_id: &AccountId) -> LedgerKey {
+    LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    })
+}
+
+fn make_trustline_key(
+    account_id: &AccountId,
+    asset: &stellar_xdr::curr::TrustLineAsset,
+) -> LedgerKey {
+    LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: account_id.clone(),
+        asset: asset.clone(),
+    })
 }
 
 #[derive(Clone, Copy)]

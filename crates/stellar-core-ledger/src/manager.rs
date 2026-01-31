@@ -1947,14 +1947,39 @@ impl LedgerManager {
         });
 
         // Batch lookup function for loading multiple entries in a single pass.
-        // This is used by path payment operations to batch-load seller accounts
-        // and trustlines together instead of 2-3 separate bucket list traversals.
+        // Checks in-memory Soroban state first for ContractData/ContractCode/TTL/ConfigSetting
+        // entries (O(1) cache hits), then batch-loads remaining keys from the bucket list
+        // in a single traversal.
+        let soroban_state_batch = self.soroban_state.clone();
         let bls_for_batch = bucket_list_snapshot.clone();
         let batch_lookup_fn: crate::snapshot::BatchEntryLookupFn =
             Arc::new(move |keys: &[LedgerKey]| {
-                bls_for_batch
-                    .load_keys_result(keys)
-                    .map_err(|e| LedgerError::Bucket(e))
+                let mut result = Vec::new();
+                let mut bucket_list_keys = Vec::new();
+
+                // Check soroban state cache first for soroban types
+                {
+                    let soroban = soroban_state_batch.read();
+                    for key in keys {
+                        if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
+                            if let Some(entry) = soroban.get(key) {
+                                result.push((*entry).clone());
+                                continue;
+                            }
+                        }
+                        bucket_list_keys.push(key.clone());
+                    }
+                }
+
+                // Batch-load remaining from bucket list in a single pass
+                if !bucket_list_keys.is_empty() {
+                    let bucket_entries = bls_for_batch
+                        .load_keys_result(&bucket_list_keys)
+                        .map_err(LedgerError::Bucket)?;
+                    result.extend(bucket_entries);
+                }
+
+                Ok(result)
             });
 
         // Create a lookup function that queries the ledger header table
