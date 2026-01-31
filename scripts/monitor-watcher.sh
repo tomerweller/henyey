@@ -13,6 +13,9 @@ WATCHER_LOG="/tmp/rs-stellar-core.log"
 PROMPT_FILE="$PROJECT_DIR/scripts/watcher-check-prompt.md"
 MODEL="github-copilot/claude-opus-4.5"
 
+# OpenCode settings - increase bash timeout to 4 hours (14400000ms) for cargo builds and debugging
+export OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=14400000
+
 # Create logs directory if it doesn't exist
 mkdir -p "$LOG_DIR"
 
@@ -33,10 +36,11 @@ run_check() {
     fi
     
     # Run opencode with the prompt file
-    # Use timeout to prevent hanging indefinitely (15 minutes to allow for builds)
+    # Use timeout to prevent hanging indefinitely (240 minutes to allow for builds and fixes)
+    # Note: OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS is set above to allow long cargo builds
     # Note: message must come BEFORE --file flag to avoid being interpreted as a file path
     log_message "Running OpenCode with model $MODEL..."
-    timeout 900 opencode run \
+    timeout 14400 opencode run \
         --model "$MODEL" \
         "Execute the watcher check instructions from the attached file" \
         --file "$PROMPT_FILE" \
