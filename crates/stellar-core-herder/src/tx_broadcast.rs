@@ -46,6 +46,15 @@ use stellar_xdr::curr::{Hash, TransactionEnvelope};
 /// Default flood period in milliseconds.
 pub const DEFAULT_FLOOD_PERIOD_MS: u64 = 100;
 
+/// Data for the AddTransaction command, boxed to avoid large enum variant size difference.
+#[derive(Debug)]
+pub struct AddTransactionData {
+    /// Hash of the transaction.
+    pub tx_hash: Hash,
+    /// The transaction envelope to broadcast.
+    pub envelope: TransactionEnvelope,
+}
+
 /// Commands sent to the broadcast manager.
 #[derive(Debug)]
 pub enum BroadcastCommand {
@@ -54,10 +63,7 @@ pub enum BroadcastCommand {
     /// Force rebroadcast all transactions.
     Rebroadcast,
     /// Add a transaction to be broadcast.
-    AddTransaction {
-        tx_hash: Hash,
-        envelope: TransactionEnvelope,
-    },
+    AddTransaction(Box<AddTransactionData>),
     /// Remove a transaction (e.g., after inclusion in ledger).
     RemoveTransaction { tx_hash: Hash },
     /// Mark a transaction as already broadcast (don't rebroadcast).
@@ -89,7 +95,9 @@ impl TxBroadcastHandle {
     pub async fn add_transaction(&self, tx_hash: Hash, envelope: TransactionEnvelope) {
         let _ = self
             .sender
-            .send(BroadcastCommand::AddTransaction { tx_hash, envelope })
+            .send(BroadcastCommand::AddTransaction(Box::new(
+                AddTransactionData { tx_hash, envelope },
+            )))
             .await;
     }
 
@@ -125,7 +133,9 @@ impl TxBroadcastHandle {
     /// Try to add a transaction (non-blocking).
     pub fn try_add_transaction(&self, tx_hash: Hash, envelope: TransactionEnvelope) -> bool {
         self.sender
-            .try_send(BroadcastCommand::AddTransaction { tx_hash, envelope })
+            .try_send(BroadcastCommand::AddTransaction(Box::new(
+                AddTransactionData { tx_hash, envelope },
+            )))
             .is_ok()
     }
 }
@@ -215,8 +225,8 @@ impl<C: TxBroadcastCallback> TxBroadcastManager<C> {
                         Some(BroadcastCommand::Rebroadcast) => {
                             self.rebroadcast();
                         }
-                        Some(BroadcastCommand::AddTransaction { tx_hash, envelope }) => {
-                            self.add_transaction(tx_hash, envelope);
+                        Some(BroadcastCommand::AddTransaction(data)) => {
+                            self.add_transaction(data.tx_hash, data.envelope);
                         }
                         Some(BroadcastCommand::RemoveTransaction { tx_hash }) => {
                             self.remove_transaction(&tx_hash);

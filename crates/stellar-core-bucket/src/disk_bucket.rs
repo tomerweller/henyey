@@ -50,9 +50,7 @@ use stellar_core_common::Hash256;
 
 use crate::bloom_filter::{BucketBloomFilter, HashSeed};
 use crate::entry::BucketEntry;
-use crate::index::{
-    DiskIndex, InMemoryIndex, LiveBucketIndex, DEFAULT_PAGE_SIZE, IN_MEMORY_INDEX_THRESHOLD,
-};
+use crate::index::LiveBucketIndex;
 use crate::{BucketError, Result};
 
 /// Minimum number of entries required to build a bloom filter.
@@ -63,16 +61,14 @@ const BLOOM_FILTER_MIN_ENTRIES: usize = 2;
 /// This is used when no custom seed is provided.
 pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 
-/// Entry in the bucket index: file offset and record length.
+/// Entry in the bucket index: file offset.
 ///
-/// This is a compact 12-byte structure (with padding) that stores the
+/// This is a compact 8-byte structure that stores the
 /// location of an entry in the bucket file.
 #[derive(Debug, Clone, Copy)]
 struct IndexEntry {
     /// Byte offset in the bucket file where this entry's record mark starts.
     offset: u64,
-    /// Length of the XDR record (not including the 4-byte record mark).
-    length: u32,
 }
 
 /// The index type used by a `DiskBucket` for key lookups.
@@ -96,7 +92,7 @@ enum DiskBucketIndex {
     /// For large buckets (≥ 10K entries): page-based `DiskIndex`
     ///   - ~60K page entries for 60M keys (~10 MB)
     ///   - Bloom filter for fast negative lookups (~138 MB for 60M keys)
-    Advanced(LiveBucketIndex),
+    Advanced(Box<LiveBucketIndex>),
 }
 
 /// A disk-backed bucket that stores entries on disk with an in-memory index.
@@ -329,7 +325,7 @@ impl DiskBucket {
                 reader.read_exact(&mut record_data)?;
                 position += record_len as u64;
 
-                hasher.update(&mark_buf);
+                hasher.update(mark_buf);
                 hasher.update(&record_data);
 
                 count += 1;
@@ -354,7 +350,7 @@ impl DiskBucket {
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
-            disk_index: DiskBucketIndex::Advanced(live_index),
+            disk_index: DiskBucketIndex::Advanced(Box::new(live_index)),
             entry_count,
             mmap: Self::create_mmap(path)?,
         })
@@ -408,7 +404,7 @@ impl DiskBucket {
                 bloom_seed,
             },
             entry_count,
-            mmap: Self::create_mmap(save_path.as_ref())?,
+            mmap: Self::create_mmap(save_path)?,
         })
     }
 
@@ -466,7 +462,6 @@ impl DiskBucket {
                             key_hash,
                             IndexEntry {
                                 offset: record_start,
-                                length: record_len as u32,
                             },
                         );
                         // Also compute bloom filter hash
@@ -490,14 +485,12 @@ impl DiskBucket {
 
                 match stellar_xdr::curr::BucketEntry::read_xdr(&mut limited) {
                     Ok(xdr_entry) => {
-                        let entry_end = limited.inner.position();
                         if let Some(key) = Self::extract_key(&xdr_entry) {
                             let key_hash = Self::hash_key(&key);
                             index.insert(
                                 key_hash,
                                 IndexEntry {
                                     offset: entry_start,
-                                    length: (entry_end - entry_start) as u32,
                                 },
                             );
                             // Also compute bloom filter hash
@@ -629,7 +622,7 @@ impl DiskBucket {
                     return Ok(None);
                 }
 
-                match live_index {
+                match &**live_index {
                     LiveBucketIndex::InMemory(idx) => {
                         // Exact offset lookup
                         if let Some(offset) = idx.get_offset(key) {
@@ -704,7 +697,7 @@ impl DiskBucket {
                     return Ok(None);
                 }
 
-                match live_index {
+                match &**live_index {
                     LiveBucketIndex::InMemory(idx) => {
                         if let Some(offset) = idx.get_offset_by_key_bytes(key_bytes) {
                             let entry = self.read_entry_at(offset)?;
@@ -989,7 +982,7 @@ impl Iterator for DiskBucketIter {
                     // Update our position tracking
                     self.position = self
                         .reader
-                        .seek(SeekFrom::Current(0))
+                        .stream_position()
                         .unwrap_or(self.file_len);
                     Some(BucketEntry::from_xdr_entry(xdr_entry))
                 }

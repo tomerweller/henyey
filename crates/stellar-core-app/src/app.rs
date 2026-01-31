@@ -961,6 +961,7 @@ impl App {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&lock_path)?;
         file.try_lock_exclusive().map_err(|_| {
             anyhow::anyhow!("database is locked (lockfile: {})", lock_path.display())
@@ -6920,6 +6921,7 @@ impl App {
         peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         let now = Instant::now();
+        #[allow(clippy::type_complexity)]
         let (requests, newly_exhausted): (Vec<(Hash256, stellar_core_overlay::PeerId)>, Vec<(Hash256, usize, usize)>) = {
             let mut dont_have = self.tx_set_dont_have.write().await;
             let pending_set: HashSet<Hash256> = pending_hashes.iter().copied().collect();

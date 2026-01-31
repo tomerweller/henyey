@@ -394,6 +394,7 @@ impl SurveyDataManager {
         self.phase != SurveyPhase::Inactive
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_collecting(
         &mut self,
         msg: &TimeSlicedSurveyStartCollectingMessage,

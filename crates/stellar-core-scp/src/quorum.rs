@@ -79,6 +79,7 @@ pub const MAXIMUM_QUORUM_NODES: usize = 1000;
 ///
 /// # Returns
 /// True if the nodes satisfy this quorum slice.
+#[allow(clippy::only_used_in_recursion)]
 pub fn is_quorum_slice<F>(
     quorum_set: &ScpQuorumSet,
     nodes: &HashSet<NodeId>,

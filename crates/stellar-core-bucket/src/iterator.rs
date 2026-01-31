@@ -20,7 +20,7 @@
 //!
 //! // Stream through a bucket file
 //! let mut iter = BucketInputIterator::open(&bucket_path)?;
-//! while let Some(entry) = iter.next()? {
+//! while let Some(entry) = iter.next_entry()? {
 //!     // Process entry
 //! }
 //!
@@ -217,7 +217,7 @@ impl BucketInputIterator {
     }
 
     /// Returns the next entry, advancing the iterator.
-    pub fn next(&mut self) -> Result<Option<BucketEntry>> {
+    pub fn next_entry(&mut self) -> Result<Option<BucketEntry>> {
         let current = self.current.take();
         if current.is_some() {
             self.load_entry()?;
@@ -271,7 +271,7 @@ impl BucketInputIterator {
     /// This consumes the iterator.
     pub fn collect_all(mut self) -> Result<Vec<BucketEntry>> {
         let mut entries = Vec::new();
-        while let Some(entry) = self.next()? {
+        while let Some(entry) = self.next_entry()? {
             entries.push(entry);
         }
         Ok(entries)
@@ -692,12 +692,12 @@ impl MergeInput for FileMergeInput {
     }
 
     fn advance_old(&mut self) -> Result<()> {
-        self.old_iter.next()?;
+        self.old_iter.next_entry()?;
         Ok(())
     }
 
     fn advance_new(&mut self) -> Result<()> {
-        self.new_iter.next()?;
+        self.new_iter.next_entry()?;
         Ok(())
     }
 }
@@ -780,13 +780,13 @@ mod tests {
         assert!(reader.seen_metadata());
         assert!(reader.metadata().is_some());
 
-        let read1 = reader.next().unwrap().unwrap();
+        let read1 = reader.next_entry().unwrap().unwrap();
         assert!(matches!(read1, BucketEntry::Live(_)));
 
-        let read2 = reader.next().unwrap().unwrap();
+        let read2 = reader.next_entry().unwrap().unwrap();
         assert!(matches!(read2, BucketEntry::Live(_)));
 
-        assert!(reader.next().unwrap().is_none());
+        assert!(reader.next_entry().unwrap().is_none());
     }
 
     #[test]
@@ -805,13 +805,13 @@ mod tests {
 
         // Read and verify only one entry (the last one)
         let mut reader = BucketInputIterator::open(&path).unwrap();
-        let entry = reader.next().unwrap().unwrap();
+        let entry = reader.next_entry().unwrap().unwrap();
         if let BucketEntry::Live(le) = entry {
             if let LedgerEntryData::Account(acc) = le.data {
                 assert_eq!(acc.balance, 200); // Should be the second value
             }
         }
-        assert!(reader.next().unwrap().is_none());
+        assert!(reader.next_entry().unwrap().is_none());
     }
 
     #[test]

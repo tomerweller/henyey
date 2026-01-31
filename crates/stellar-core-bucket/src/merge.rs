@@ -298,7 +298,7 @@ pub fn merge_buckets_to_file(
     let mut entry_count = 0usize;
 
     // Helper: serialize and write one entry
-    let mut write_entry = |entry: &BucketEntry,
+    let write_entry = |entry: &BucketEntry,
                            writer: &mut BufWriter<File>,
                            hasher: &mut Sha256,
                            count: &mut usize|
@@ -314,7 +314,7 @@ pub fn merge_buckets_to_file(
         writer.write_all(&data)?;
 
         // Update hash (same format as record mark + data)
-        hasher.update(&record_mark.to_be_bytes());
+        hasher.update(record_mark.to_be_bytes());
         hasher.update(&data);
 
         *count += 1;
@@ -543,7 +543,7 @@ pub fn merge_in_memory(
         // Update hash with XDR Record Marking format
         let size = entry_buf.len() as u32;
         let record_mark = size | 0x80000000;
-        hasher.update(&record_mark.to_be_bytes());
+        hasher.update(record_mark.to_be_bytes());
         hasher.update(entry_buf.as_slice());
 
         // Build key index for non-metadata entries

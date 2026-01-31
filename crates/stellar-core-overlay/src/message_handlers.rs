@@ -139,7 +139,7 @@ impl MessageDispatcher {
                 None
             }
             StellarMessage::GeneralizedTxSet(tx_set) => {
-                self.handle_generalized_tx_set(from_peer, Box::new(tx_set.clone()));
+                self.handle_generalized_tx_set(from_peer, tx_set.clone());
                 None
             }
             StellarMessage::GetScpQuorumset(hash) => {
@@ -218,9 +218,9 @@ impl MessageDispatcher {
     fn handle_generalized_tx_set(
         &self,
         from_peer: &PeerId,
-        tx_set: Box<GeneralizedTransactionSet>,
+        tx_set: GeneralizedTransactionSet,
     ) {
-        let data = TxSetData::Generalized(*tx_set);
+        let data = TxSetData::Generalized(tx_set);
         let hash = data.hash();
 
         trace!(

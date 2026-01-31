@@ -53,7 +53,7 @@ pub enum EntryChange {
         /// The entry value before the update (for rollback/metadata).
         previous: LedgerEntry,
         /// The entry value after the update.
-        current: LedgerEntry,
+        current: Box<LedgerEntry>,
     },
     /// An entry was deleted (existed in previous state, now gone).
     Deleted {
@@ -76,7 +76,7 @@ impl EntryChange {
     pub fn current_entry(&self) -> Option<&LedgerEntry> {
         match self {
             EntryChange::Created(entry) => Some(entry),
-            EntryChange::Updated { current, .. } => Some(current),
+            EntryChange::Updated { current, .. } => Some(current.as_ref()),
             EntryChange::Deleted { .. } => None,
         }
     }
@@ -270,7 +270,7 @@ impl LedgerDelta {
                         key_bytes,
                         EntryChange::Updated {
                             previous: previous.clone(),
-                            current: entry,
+                            current: Box::new(entry),
                         },
                     );
                 }
@@ -306,7 +306,7 @@ impl LedgerDelta {
                         key_bytes,
                         EntryChange::Updated {
                             previous: orig.clone(),
-                            current,
+                            current: Box::new(current),
                         },
                     );
                 }
@@ -319,7 +319,7 @@ impl LedgerDelta {
         } else {
             self.change_order.push(key_bytes.clone());
             self.changes
-                .insert(key_bytes, EntryChange::Updated { previous, current });
+                .insert(key_bytes, EntryChange::Updated { previous, current: Box::new(current) });
         }
 
         Ok(())
@@ -447,7 +447,7 @@ impl LedgerDelta {
                                         key_bytes,
                                         EntryChange::Updated {
                                             previous: previous.clone(),
-                                            current: entry.clone(),
+                                            current: Box::new(entry.clone()),
                                         },
                                     );
                                 }
@@ -468,7 +468,7 @@ impl LedgerDelta {
                             match existing {
                                 EntryChange::Created(_) => {
                                     self.changes
-                                        .insert(key_bytes, EntryChange::Created(current.clone()));
+                                        .insert(key_bytes, EntryChange::Created(current.as_ref().clone()));
                                 }
                                 EntryChange::Updated { previous, .. } => {
                                     self.changes.insert(

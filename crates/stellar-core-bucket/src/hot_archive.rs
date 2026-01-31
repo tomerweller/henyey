@@ -195,10 +195,10 @@ impl HotArchiveBucket {
             HotArchiveStorage::DiskBacked { index, path, .. } => {
                 // Try to read metadata entry (stored at offset for empty key)
                 if let Some(&offset) = index.get(&Vec::new()) {
-                    if let Ok(entry) = Self::read_entry_at_offset(path, offset) {
-                        if let HotArchiveBucketEntry::Metaentry(meta) = entry {
-                            return meta.ledger_version;
-                        }
+                    if let Ok(HotArchiveBucketEntry::Metaentry(meta)) =
+                        Self::read_entry_at_offset(path, offset)
+                    {
+                        return meta.ledger_version;
                     }
                 }
                 0

@@ -356,7 +356,7 @@ pub fn node_id_to_short_string(node_id: &NodeId) -> String {
 /// # Arguments
 /// * `node_id` - The node ID to format
 /// * `full_keys` - If true, returns the full 64-character hex encoding.
-///                 If false, returns the short 8-character format.
+///   If false, returns the short 8-character format.
 ///
 /// This matches the C++ `toStrKey(NodeID, bool fullKeys)` method.
 pub fn node_id_to_string(node_id: &NodeId, full_keys: bool) -> String {

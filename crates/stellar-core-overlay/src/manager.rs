@@ -631,6 +631,7 @@ impl OverlayManager {
     }
 
     /// Run the peer message loop.
+    #[allow(clippy::too_many_arguments)]
     async fn run_peer_loop(
         peer_id: PeerId,
         peer: Arc<TokioMutex<Peer>>,
@@ -760,7 +761,7 @@ impl OverlayManager {
                             "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
                             peer_id,
                             hex::encode(sha2::Sha256::digest(
-                                &stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
+                                stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
                             )),
                             hex::encode(ts.previous_ledger_hash.0)
                         );
@@ -1240,6 +1241,7 @@ impl OverlayManager {
         })
     }
 
+    #[allow(clippy::incompatible_msrv)]
     fn is_public_peer(addr: &PeerAddress) -> bool {
         if addr.port == 0 {
             return false;

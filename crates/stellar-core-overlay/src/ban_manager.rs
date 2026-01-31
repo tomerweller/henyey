@@ -82,9 +82,12 @@ impl BanManager {
             info!("Loaded {} banned nodes from database", num_loaded);
         }
 
+        #[allow(clippy::arc_with_non_send_sync)]
+        let db = Arc::new(RwLock::new(conn));
+
         Ok(Self {
             cache: RwLock::new(cache),
-            db: Some(Arc::new(RwLock::new(conn))),
+            db: Some(db),
         })
     }
 
@@ -117,9 +120,12 @@ impl BanManager {
             }
         }
 
+        #[allow(clippy::arc_with_non_send_sync)]
+        let db = Arc::new(RwLock::new(conn));
+
         Ok(Self {
             cache: RwLock::new(cache),
-            db: Some(Arc::new(RwLock::new(conn))),
+            db: Some(db),
         })
     }
 

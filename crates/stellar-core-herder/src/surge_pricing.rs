@@ -398,7 +398,7 @@ impl SurgePricingPriorityQueue {
 
     pub(crate) fn peek_top(&self) -> Option<(usize, QueueEntry)> {
         let mut best: Option<(usize, QueueEntry)> = None;
-        for lane in 0..self.lane_limits.len() {
+        for (lane, _) in self.lane_limits.iter().enumerate() {
             let Some(entry) = self.top_entry(lane) else {
                 continue;
             };
@@ -441,7 +441,7 @@ impl SurgePricingPriorityQueue {
 
         loop {
             let mut best: Option<(usize, QueueEntry)> = None;
-            for lane in 0..self.lane_limits.len() {
+            for (lane, _) in self.lane_limits.iter().enumerate() {
                 if !lane_active[lane] {
                     continue;
                 }
@@ -641,9 +641,7 @@ impl SurgePricingPriorityQueue {
                     }
                 }
 
-                let Some((evict_lane, entry)) = best else {
-                    return None;
-                };
+                let (evict_lane, entry) = best?;
 
                 let can_evict = lane == GENERIC_LANE
                     || lane == evict_lane

@@ -294,6 +294,7 @@ pub fn verify_skip_list(
 ///
 /// The skip_list is copied from the previous header and then updated via
 /// `calculate_skip_values` based on the new bucket_list_hash.
+#[allow(clippy::too_many_arguments)]
 pub fn create_next_header(
     prev_header: &LedgerHeader,
     prev_header_hash: Hash256,

@@ -2221,8 +2221,11 @@ impl LedgerManager {
                 let key_bytes = key.to_xdr(Limits::none())?;
 
                 match change {
-                    EntryChange::Created(entry) | EntryChange::Updated { current: entry, .. } => {
+                    EntryChange::Created(entry) => {
                         cache.insert(key_bytes, entry.clone());
+                    }
+                    EntryChange::Updated { current, .. } => {
+                        cache.insert(key_bytes, current.as_ref().clone());
                     }
                     EntryChange::Deleted { .. } => {
                         cache.swap_remove(&key_bytes);
@@ -2253,9 +2256,14 @@ impl LedgerManager {
                 }
 
                 match change {
-                    EntryChange::Created(entry) | EntryChange::Updated { current: entry, .. } => {
+                    EntryChange::Created(entry) => {
                         if matches!(entry.data, LedgerEntryData::Offer(_)) {
                             offer_upserts.push(entry.clone());
+                        }
+                    }
+                    EntryChange::Updated { current, .. } => {
+                        if matches!(current.data, LedgerEntryData::Offer(_)) {
+                            offer_upserts.push(current.as_ref().clone());
                         }
                     }
                     EntryChange::Deleted { .. } => {

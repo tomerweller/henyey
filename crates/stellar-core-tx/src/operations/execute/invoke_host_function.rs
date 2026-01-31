@@ -173,6 +173,7 @@ pub fn execute_invoke_host_function(
 }
 
 /// Execute a contract invocation using soroban-env-host.
+#[allow(clippy::too_many_arguments)]
 fn execute_contract_invocation(
     op: &InvokeHostFunctionOp,
     source: &AccountId,
@@ -682,27 +683,27 @@ fn disk_read_bytes_exceeded(
         }
     } else {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if !is_soroban_key(key) {
-                if meter_entry(key, &mut total_read_bytes) {
-                    tracing::warn!(
-                        total_read_bytes,
-                        specified_read_bytes = limit,
-                        "Disk read bytes exceeded specified limit"
-                    );
-                    return true;
-                }
+            if !is_soroban_key(key)
+                && meter_entry(key, &mut total_read_bytes)
+            {
+                tracing::warn!(
+                    total_read_bytes,
+                    specified_read_bytes = limit,
+                    "Disk read bytes exceeded specified limit"
+                );
+                return true;
             }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if !is_soroban_key(key) {
-                if meter_entry(key, &mut total_read_bytes) {
-                    tracing::warn!(
-                        total_read_bytes,
-                        specified_read_bytes = limit,
-                        "Disk read bytes exceeded specified limit"
-                    );
-                    return true;
-                }
+            if !is_soroban_key(key)
+                && meter_entry(key, &mut total_read_bytes)
+            {
+                tracing::warn!(
+                    total_read_bytes,
+                    specified_read_bytes = limit,
+                    "Disk read bytes exceeded specified limit"
+                );
+                return true;
             }
         }
 
@@ -714,15 +715,15 @@ fn disk_read_bytes_exceeded(
                     .read_write
                     .get(*index as usize)
                 {
-                    if is_soroban_key(key) {
-                        if meter_entry(key, &mut total_read_bytes) {
-                            tracing::warn!(
-                                total_read_bytes,
-                                specified_read_bytes = limit,
-                                "Disk read bytes exceeded specified limit"
-                            );
-                            return true;
-                        }
+                    if is_soroban_key(key)
+                        && meter_entry(key, &mut total_read_bytes)
+                    {
+                        tracing::warn!(
+                            total_read_bytes,
+                            specified_read_bytes = limit,
+                            "Disk read bytes exceeded specified limit"
+                        );
+                        return true;
                     }
                 }
             }

@@ -23,7 +23,7 @@ edition = "2021"
 authors = ["Stellar Contributors"]
 license = "Apache-2.0"
 repository = "https://github.com/stellar/rs-stellar-core"
-rust-version = "1.75"
+rust-version = "1.76"
 
 [workspace.dependencies]
 # Stellar official crates

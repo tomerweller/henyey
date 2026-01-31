@@ -225,7 +225,7 @@ impl Bucket {
             // Write record mark + entry to hasher (XDR Record Marking format)
             let size = entry_bytes.len() as u32;
             let record_mark = size | 0x80000000; // Set high bit
-            hasher.update(&record_mark.to_be_bytes());
+            hasher.update(record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
 
             // Build key index (only need to serialize key if entry has one)
@@ -539,12 +539,6 @@ impl Bucket {
 
         debug!("Parsed {} bucket entries", entries.len());
         Ok(entries)
-    }
-
-    /// Compute hash for a list of entries.
-    fn compute_hash_for_entries(entries: &[BucketEntry]) -> Result<Hash256> {
-        let bytes = Self::serialize_entries(entries)?;
-        Ok(Hash256::hash(&bytes))
     }
 
     /// Serialize entries to XDR bytes WITH record marks (RFC 5531 XDR Record Marking Standard).
@@ -978,7 +972,7 @@ impl Bucket {
             // Write record mark + entry to hasher (XDR Record Marking format)
             let size = entry_bytes.len() as u32;
             let record_mark = size | 0x80000000;
-            hasher.update(&record_mark.to_be_bytes());
+            hasher.update(record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
 
             // Build key index for entries with keys

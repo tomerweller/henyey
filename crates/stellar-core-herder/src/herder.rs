@@ -808,7 +808,7 @@ impl Herder {
                 self.advance_tracking_slot(slot);
 
                 return EnvelopeState::Valid;
-            } else if lcl.map_or(false, |l| slot > l && slot <= current_slot) {
+            } else if lcl.is_some_and(|l| slot > l && slot <= current_slot) {
                 // Gap slot: between LCL and tracking_slot
                 // This happens when we fast-forwarded tracking_slot but haven't closed
                 // the intermediate ledgers. Accept EXTERNALIZE from trusted validators

@@ -52,6 +52,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
     /// Get an entry using our workspace XDR types (for internal use).
     /// This is separate from the `SnapshotSource::get()` trait impl which uses
     /// soroban-env-host's XDR types.
+    #[allow(clippy::type_complexity)]
     fn get_local(
         &self,
         key: &LedgerKey,

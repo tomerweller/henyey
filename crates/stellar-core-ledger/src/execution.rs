@@ -791,6 +791,7 @@ pub struct TransactionExecutor {
 
 impl TransactionExecutor {
     /// Create a new transaction executor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ledger_seq: u32,
         close_time: u64,
@@ -865,8 +866,8 @@ impl TransactionExecutor {
     /// 1. The executor's internal id_pool evolves correctly as transactions execute
     /// 2. The id_pool from the ledger header is the POST-execution value (after the ledger closes)
     /// 3. Using the header's id_pool would give us the wrong starting value for the next ledger
-    /// For the first ledger in a replay session, use TransactionExecutor::new() which takes
-    /// the PREVIOUS ledger's closing id_pool (which equals this ledger's starting id_pool).
+    ///    For the first ledger in a replay session, use TransactionExecutor::new() which takes
+    ///    the PREVIOUS ledger's closing id_pool (which equals this ledger's starting id_pool).
     pub fn advance_to_ledger(
         &mut self,
         ledger_seq: u32,
@@ -1536,43 +1537,6 @@ impl TransactionExecutor {
             self.state.load_entry(entry);
         }
 
-        Ok(())
-    }
-
-    /// Load the TTL entry for a contract data or code key.
-    fn load_ttl_for_key(&mut self, snapshot: &SnapshotHandle, key: &LedgerKey) -> Result<()> {
-        match key {
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-                use sha2::{Digest, Sha256};
-                // Compute the key hash for TTL lookup
-                let key_bytes = key
-                    .to_xdr(Limits::none())
-                    .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-                let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
-
-                let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                    key_hash: key_hash.clone(),
-                });
-                // Try to load TTL entry - it may not exist for:
-                // 1. Newly created entries that haven't been checkpointed
-                // 2. Entries being restored from hot archive (TTL doesn't exist in bucket list)
-                // The load_entry function now checks state first, so entries restored by
-                // a previous TX in this ledger will be found.
-                let loaded = self.load_entry(snapshot, &ttl_key)?;
-                // Debug: log when TTL is not found for entries that might be archived
-                // (This is expected for hot archive entries in their first restoration TX)
-                if !loaded {
-                    if let LedgerKey::ContractCode(cc) = key {
-                        tracing::debug!(
-                            code_hash = ?cc.hash,
-                            key_hash = ?key_hash,
-                            "load_ttl_for_key: TTL not found (expected for hot archive entries)"
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
         Ok(())
     }
 
@@ -3619,6 +3583,7 @@ impl TransactionExecutor {
     }
 
     /// Execute a single operation using the central dispatcher.
+    #[allow(clippy::too_many_arguments)]
     fn execute_single_operation(
         &mut self,
         op: &stellar_xdr::curr::Operation,
@@ -3990,16 +3955,14 @@ fn emit_classic_events_for_operation(
             }
         }
         OperationBody::ManageSellOffer(_) | OperationBody::CreatePassiveSellOffer(_) => {
-            if let OperationResult::OpInner(tr) = op_result {
-                match tr {
-                    OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(success))
-                    | OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(
-                        success,
-                    )) => {
-                        op_event_manager.events_for_claim_atoms(op_source, &success.offers_claimed);
-                    }
-                    _ => {}
-                }
+            if let OperationResult::OpInner(
+                OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(success))
+                | OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(
+                    success,
+                )),
+            ) = op_result
+            {
+                op_event_manager.events_for_claim_atoms(op_source, &success.offers_claimed);
             }
         }
         OperationBody::ManageBuyOffer(_) => {
@@ -4247,6 +4210,7 @@ fn build_entry_changes_with_state_overrides(
 /// For classic operations, entries are ordered according to the execution order tracked
 /// in `change_order` to match C++ stellar-core behavior, emitting STATE/UPDATED pairs
 /// for EACH modification (not deduplicated).
+#[allow(clippy::too_many_arguments)]
 fn build_entry_changes_with_hot_archive(
     state: &LedgerStateManager,
     created: &[LedgerEntry],
@@ -5441,6 +5405,7 @@ fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
 ///
 /// * `soroban_base_prng_seed` - The transaction set hash used as base seed for Soroban PRNG.
 ///   Each transaction gets its own seed computed as subSha256(baseSeed, txIndex).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn execute_transaction_set(
     snapshot: &SnapshotHandle,
     transactions: &[(TransactionEnvelope, Option<u32>)],
@@ -5498,6 +5463,7 @@ pub fn execute_transaction_set(
 /// - Transaction result metadata
 /// - Updated ID pool
 /// - Hot archive restored keys (for passing to HotArchiveBucketList::add_batch)
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn execute_transaction_set_with_fee_mode(
     snapshot: &SnapshotHandle,
     transactions: &[(TransactionEnvelope, Option<u32>)],
@@ -5751,12 +5717,10 @@ pub fn compute_state_size_window_entry(
     }
 
     // Update window on sample ledgers
-    if seq % sample_period == 0 {
-        if !window_vec.is_empty() {
-            window_vec.remove(0);
-            window_vec.push(soroban_state_size);
-            changed = true;
-        }
+    if seq % sample_period == 0 && !window_vec.is_empty() {
+        window_vec.remove(0);
+        window_vec.push(soroban_state_size);
+        changed = true;
     }
 
     if !changed {

@@ -311,6 +311,7 @@ pub fn replay_ledger(
 /// * `expected_tx_results` - Optional expected results for comparison
 /// * `eviction_iterator` - Current eviction scan position (Protocol 23+)
 /// * `module_cache` - Optional persistent module cache for Soroban WASM reuse
+#[allow(clippy::too_many_arguments)]
 pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
@@ -380,7 +381,7 @@ pub fn replay_ledger_with_execution(
             &mut delta,
             soroban_config,
             soroban_base_prng_seed.0,
-            classic_events.clone(),
+            classic_events,
             module_cache,
             None, // Hot archive not needed during replay - state is from history archives
         )
@@ -402,7 +403,7 @@ pub fn replay_ledger_with_execution(
                 fee_charged,
                 header.ledger_version,
                 network_id,
-                classic_events.clone(),
+                classic_events,
             );
         }
     }

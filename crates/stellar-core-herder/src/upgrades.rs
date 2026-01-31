@@ -38,6 +38,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use stellar_xdr::curr::{ConfigUpgradeSetKey, LedgerUpgrade, ReadXdr, UpgradeType};
 
@@ -211,8 +212,10 @@ impl UpgradeParameters {
         serde_json::from_str(s)
     }
 
-    /// Format as a human-readable string.
-    pub fn to_string(&self) -> String {
+}
+
+impl fmt::Display for UpgradeParameters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
 
         // Format upgrade time in ISO format
@@ -243,7 +246,7 @@ impl UpgradeParameters {
             parts.push("configupgradesetkey=<set>".to_string());
         }
 
-        parts.join(", ")
+        write!(f, "{}", parts.join(", "))
     }
 }
 
@@ -379,11 +382,6 @@ impl Upgrades {
         result
     }
 
-    /// Format as a human-readable string.
-    pub fn to_string(&self) -> String {
-        self.params.to_string()
-    }
-
     /// Remove upgrades that have been applied.
     ///
     /// Given a list of applied upgrades, removes matching parameters from
@@ -474,6 +472,12 @@ impl Upgrades {
         }
 
         (result, updated)
+    }
+}
+
+impl fmt::Display for Upgrades {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.params)
     }
 }
 

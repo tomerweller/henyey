@@ -1868,24 +1868,24 @@ async fn cmd_replay_bucket_list(
     // Collect all hashes to download
     let mut all_hashes_vec: Vec<Hash256> = Vec::new();
     for (curr, snap) in &bucket_hashes {
-        all_hashes_vec.push(curr.clone());
-        all_hashes_vec.push(snap.clone());
+        all_hashes_vec.push(*curr);
+        all_hashes_vec.push(*snap);
     }
     for state in &live_next_states {
         if let Some(ref output) = state.output {
-            all_hashes_vec.push(output.clone());
+            all_hashes_vec.push(*output);
         }
     }
     if let Some(ref ha_hashes) = hot_archive_hashes {
         for (curr, snap) in ha_hashes {
-            all_hashes_vec.push(curr.clone());
-            all_hashes_vec.push(snap.clone());
+            all_hashes_vec.push(*curr);
+            all_hashes_vec.push(*snap);
         }
     }
     if let Some(ref ha_states) = hot_archive_next_states {
         for state in ha_states {
             if let Some(ref output) = state.output {
-                all_hashes_vec.push(output.clone());
+                all_hashes_vec.push(*output);
             }
         }
     }
@@ -1903,7 +1903,7 @@ async fn cmd_replay_bucket_list(
     // to recreate any merges that should be in progress based on the checkpoint ledger timing.
     let live_bucket_hashes: Vec<Hash256> = bucket_hashes
         .iter()
-        .flat_map(|(curr, snap)| vec![curr.clone(), snap.clone()])
+        .flat_map(|(curr, snap)| vec![*curr, *snap])
         .collect();
     let mut bucket_list = BucketList::restore_from_hashes(&live_bucket_hashes, |hash| {
         bucket_manager.load_bucket(hash).map(|b| (*b).clone())
@@ -2080,7 +2080,7 @@ async fn cmd_replay_bucket_list(
                 // fee -> tx_meta -> post_fee
                 for tx_info in &tx_processing {
                     for change in tx_info.fee_meta.iter() {
-                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                        apply_change_with_prestate(&mut aggregator, bl, change);
                     }
 
                     let succeeded = tx_succeeded(&tx_info.result);
@@ -2089,7 +2089,7 @@ async fn cmd_replay_bucket_list(
                             if succeeded {
                                 for op_meta in operations.iter() {
                                     for change in op_meta.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
@@ -2097,65 +2097,65 @@ async fn cmd_replay_bucket_list(
                         stellar_xdr::curr::TransactionMeta::V1(v1) => {
                             if succeeded {
                                 for change in v1.tx_changes.iter() {
-                                    apply_change_with_prestate(&mut aggregator, &bl, change);
+                                    apply_change_with_prestate(&mut aggregator, bl, change);
                                 }
                                 for op_changes in v1.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V2(v2) => {
                             for change in v2.tx_changes_before.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                             if succeeded {
                                 for op_changes in v2.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                             for change in v2.tx_changes_after.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V3(v3) => {
                             for change in v3.tx_changes_before.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                             if succeeded {
                                 for op_changes in v3.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                             for change in v3.tx_changes_after.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V4(v4) => {
                             for change in v4.tx_changes_before.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                             if succeeded {
                                 for op_changes in v4.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                             for change in v4.tx_changes_after.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                         }
                     }
 
                     if !tx_info.post_fee_meta.is_empty() {
                         for change in tx_info.post_fee_meta.iter() {
-                            apply_change_with_prestate(&mut aggregator, &bl, change);
+                            apply_change_with_prestate(&mut aggregator, bl, change);
                         }
                     }
                 }
@@ -2179,14 +2179,14 @@ async fn cmd_replay_bucket_list(
                 }
                 for upgrade in &upgrade_metas {
                     for change in upgrade.changes.iter() {
-                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                        apply_change_with_prestate(&mut aggregator, bl, change);
                     }
                 }
 
                 // Snapshot the aggregator state BEFORE evictions to get the
                 // non-eviction dead keys (entries deleted by transactions)
                 let pre_eviction_dead: Vec<stellar_xdr::curr::LedgerKey> = {
-                    let (_, _, dead) = aggregator.clone().to_vectors();
+                    let (_, _, dead) = aggregator.clone().into_vectors();
                     dead
                 };
 
@@ -2194,7 +2194,7 @@ async fn cmd_replay_bucket_list(
                 for key in &evicted_keys {
                     apply_change_with_prestate(
                         &mut aggregator,
-                        &bl,
+                        bl,
                         &LedgerEntryChange::Removed(key.clone()),
                     );
                 }
@@ -2297,7 +2297,7 @@ async fn cmd_replay_bucket_list(
                     };
                     apply_change_with_prestate(
                         &mut aggregator,
-                        &bl,
+                        bl,
                         &LedgerEntryChange::Updated(iter_entry),
                     );
                 }
@@ -2311,14 +2311,14 @@ async fn cmd_replay_bucket_list(
                     maybe_snapshot_soroban_state_size_window(
                         seq,
                         header.ledger_version,
-                        &bl,
+                        bl,
                         soroban_state.total_size(),
                         &mut aggregator,
                         archival_override,
                     );
                 }
 
-                let (init, live, dead) = aggregator.clone().to_vectors();
+                let (init, live, dead) = aggregator.clone().into_vectors();
                 if header.ledger_version >= MIN_SOROBAN_PROTOCOL_VERSION {
                     let soroban_config = load_soroban_config_from_bucket_list(bl);
                     soroban_state
@@ -2333,7 +2333,7 @@ async fn cmd_replay_bucket_list(
                         .map_err(|e| anyhow::anyhow!("soroban state update failed: {}", e))?;
                 }
 
-                let (init, live, dead) = aggregator.to_vectors();
+                let (init, live, dead) = aggregator.into_vectors();
 
                 (init, live, dead, pre_eviction_dead)
             };
@@ -2421,14 +2421,13 @@ async fn cmd_replay_bucket_list(
             // Otherwise, we compute combined hash: SHA256(live || hot_archive)
             let our_live_hash = bucket_list.hash();
 
-            let our_hash = if live_only || hot_archive_bucket_list.is_none() {
-                our_live_hash
-            } else {
-                let hot = hot_archive_bucket_list.as_ref().unwrap();
+            let our_hash = if let (false, Some(hot)) = (live_only, hot_archive_bucket_list.as_ref()) {
                 stellar_core_crypto::sha256_multi(&[
                     our_live_hash.as_bytes(),
                     hot.hash().as_bytes(),
                 ])
+            } else {
+                our_live_hash
             };
 
             // For live_only mode, we can't compare against the header directly
@@ -2551,6 +2550,7 @@ async fn cmd_replay_bucket_list(
 ///
 /// This command always uses our execution results for bucket list updates, making it a true
 /// end-to-end verification. CDP metadata is used only for comparison to detect divergence.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_verify_execution(
     config: AppConfig,
     from: Option<u32>,
@@ -2785,24 +2785,24 @@ async fn cmd_verify_execution(
     // Collect all hashes to download (curr, snap, and completed merge outputs)
     let mut all_hashes: Vec<Hash256> = Vec::new();
     for (curr, snap) in &bucket_hashes {
-        all_hashes.push(curr.clone());
-        all_hashes.push(snap.clone());
+        all_hashes.push(*curr);
+        all_hashes.push(*snap);
     }
     for state in &live_next_states {
         if let Some(ref output) = state.output {
-            all_hashes.push(output.clone());
+            all_hashes.push(*output);
         }
     }
     if let Some(ref ha_hashes) = hot_archive_hashes {
         for (curr, snap) in ha_hashes {
-            all_hashes.push(curr.clone());
-            all_hashes.push(snap.clone());
+            all_hashes.push(*curr);
+            all_hashes.push(*snap);
         }
     }
     if let Some(ref ha_states) = hot_archive_next_states {
         for state in ha_states {
             if let Some(ref output) = state.output {
-                all_hashes.push(output.clone());
+                all_hashes.push(*output);
             }
         }
     }
@@ -3284,11 +3284,11 @@ async fn cmd_verify_execution(
                                 if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
                                     let hash_bytes = stellar_core_crypto::sha256(&key_bytes);
                                     let key_hash = stellar_xdr::curr::Hash(*hash_bytes.as_bytes());
-                                    if !ledger_start_ttls.contains_key(&key_hash) {
+                                    if let std::collections::hash_map::Entry::Vacant(vacant) = ledger_start_ttls.entry(key_hash.clone()) {
                                         // Look up TTL from snapshot (ledger-start value)
                                         let ttl_key = stellar_xdr::curr::LedgerKey::Ttl(
                                             stellar_xdr::curr::LedgerKeyTtl {
-                                                key_hash: key_hash.clone(),
+                                                key_hash,
                                             },
                                         );
                                         if let Ok(Some(entry)) = snapshot_handle.get_entry(&ttl_key)
@@ -3297,7 +3297,7 @@ async fn cmd_verify_execution(
                                                 &entry.data,
                                                 stellar_xdr::curr::LedgerEntryData::Ttl(_)
                                             ) {
-                                                ledger_start_ttls.insert(key_hash, entry);
+                                                vacant.insert(entry);
                                             }
                                         }
                                     }
@@ -3670,10 +3670,10 @@ async fn cmd_verify_execution(
             // We always use our executor's state for true end-to-end verification
             // CDP metadata is only used for comparison to detect divergence
             let bucket_update_start = std::time::Instant::now();
-            let mut delta_prep_us: u64 = 0;
+            let delta_prep_us: u64;
             let mut eviction_us: u64 = 0;
-            let mut aggregation_us: u64 = 0;
-            let mut apply_close_us: u64 = 0;
+            let aggregation_us: u64;
+            let apply_close_us: u64;
             {
                 use stellar_core_bucket::ledger_entry_to_key;
                 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
@@ -3702,7 +3702,7 @@ async fn cmd_verify_execution(
                 // Build a set of created keys for efficient lookup
                 let created_keys: std::collections::HashSet<_> = created
                     .iter()
-                    .filter_map(|e| ledger_entry_to_key(e))
+                    .filter_map(ledger_entry_to_key)
                     .collect();
 
                 // Build a set of deleted keys
@@ -3783,7 +3783,7 @@ async fn cmd_verify_execution(
                 // reject the duplicate.
                 let our_init_keys: std::collections::HashSet<_> = our_init
                     .iter()
-                    .filter_map(|e| ledger_entry_to_key(e))
+                    .filter_map(ledger_entry_to_key)
                     .collect();
                 let mut hot_archive_live_entries: Vec<LedgerEntry> = Vec::new();
                 for key in &our_hot_archive_restored_keys {
@@ -3886,7 +3886,8 @@ async fn cmd_verify_execution(
                 delta_prep_us = bucket_update_start.elapsed().as_micros() as u64;
 
                 let mut aggregator = CoalescedLedgerChanges::new();
-                let bl = ledger_manager.bucket_list().read();
+                let bl_guard = ledger_manager.bucket_list().read();
+                let bl = &*bl_guard;
 
                 // Apply per-transaction changes in ledger order.
                 // For Protocol 23+, post_fee_meta must be applied AFTER all tx_meta
@@ -3899,7 +3900,7 @@ async fn cmd_verify_execution(
                 for tx_info in &tx_processing {
                     // 1. Apply fee_meta (fee deduction)
                     for change in tx_info.fee_meta.iter() {
-                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                        apply_change_with_prestate(&mut aggregator, bl, change);
                     }
 
                     // 2. Apply tx_meta (tx_changes_before, operations, tx_changes_after)
@@ -3909,7 +3910,7 @@ async fn cmd_verify_execution(
                             if succeeded {
                                 for op_meta in operations.iter() {
                                     for change in op_meta.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
@@ -3917,58 +3918,58 @@ async fn cmd_verify_execution(
                         stellar_xdr::curr::TransactionMeta::V1(v1) => {
                             if succeeded {
                                 for change in v1.tx_changes.iter() {
-                                    apply_change_with_prestate(&mut aggregator, &bl, change);
+                                    apply_change_with_prestate(&mut aggregator, bl, change);
                                 }
                                 for op_changes in v1.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V2(v2) => {
                             for change in v2.tx_changes_before.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                             if succeeded {
                                 for op_changes in v2.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                             for change in v2.tx_changes_after.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V3(v3) => {
                             for change in v3.tx_changes_before.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                             if succeeded {
                                 for op_changes in v3.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                             for change in v3.tx_changes_after.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                         }
                         stellar_xdr::curr::TransactionMeta::V4(v4) => {
                             for change in v4.tx_changes_before.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                             if succeeded {
                                 for op_changes in v4.operations.iter() {
                                     for change in op_changes.changes.iter() {
-                                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                                        apply_change_with_prestate(&mut aggregator, bl, change);
                                     }
                                 }
                             }
                             for change in v4.tx_changes_after.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                         }
                     }
@@ -3981,7 +3982,7 @@ async fn cmd_verify_execution(
                         } else {
                             // For older protocols, apply immediately
                             for change in tx_info.post_fee_meta.iter() {
-                                apply_change_with_prestate(&mut aggregator, &bl, change);
+                                apply_change_with_prestate(&mut aggregator, bl, change);
                             }
                         }
                     }
@@ -3990,7 +3991,7 @@ async fn cmd_verify_execution(
                 // Apply deferred post_fee_meta for Protocol 23+
                 for post_fee_changes in deferred_post_fee_aggregator {
                     for change in post_fee_changes.iter() {
-                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                        apply_change_with_prestate(&mut aggregator, bl, change);
                     }
                 }
 
@@ -3999,7 +4000,7 @@ async fn cmd_verify_execution(
 
                 for upgrade in &upgrade_metas {
                     for change in upgrade.changes.iter() {
-                        apply_change_with_prestate(&mut aggregator, &bl, change);
+                        apply_change_with_prestate(&mut aggregator, bl, change);
                     }
                 }
 
@@ -4042,7 +4043,7 @@ async fn cmd_verify_execution(
                 // Snapshot the aggregator state BEFORE evictions to get the
                 // non-eviction dead keys (entries deleted by transactions)
                 let pre_eviction_dead: Vec<LedgerKey> = {
-                    let (_, _, dead) = aggregator.clone().to_vectors();
+                    let (_, _, dead) = aggregator.clone().into_vectors();
                     dead
                 };
 
@@ -4051,7 +4052,7 @@ async fn cmd_verify_execution(
                 for key in &evicted_keys {
                     apply_change_with_prestate(
                         &mut aggregator,
-                        &bl,
+                        bl,
                         &LedgerEntryChange::Removed(key.clone()),
                     );
                 }
@@ -4187,7 +4188,7 @@ async fn cmd_verify_execution(
                     // Also track in aggregator for CDP comparison
                     apply_change_with_prestate(
                         &mut aggregator,
-                        &bl,
+                        bl,
                         &LedgerEntryChange::Updated(iter_entry),
                     );
                 }
@@ -4210,7 +4211,7 @@ async fn cmd_verify_execution(
                     if let Some(window_entry) = compute_soroban_state_size_window_entry(
                         seq,
                         cdp_header.ledger_version,
-                        &bl,
+                        bl,
                         ledger_manager.soroban_state().read().total_size(),
                         archival_override.clone(),
                     ) {
@@ -4224,7 +4225,7 @@ async fn cmd_verify_execution(
                     maybe_snapshot_soroban_state_size_window(
                         seq,
                         cdp_header.ledger_version,
-                        &bl,
+                        bl,
                         ledger_manager.soroban_state().read().total_size(),
                         &mut aggregator,
                         archival_override.clone(),
@@ -4234,7 +4235,7 @@ async fn cmd_verify_execution(
                 aggregation_us = bucket_update_start.elapsed().as_micros() as u64 - delta_prep_us - eviction_us;
 
                 // Diagnostic logging: compare our execution vs CDP metadata
-                let (cdp_init, cdp_live, cdp_dead) = aggregator.to_vectors();
+                let (cdp_init, cdp_live, cdp_dead) = aggregator.into_vectors();
 
                 // Build maps keyed by LedgerKey for comparison
                 let our_init_map: std::collections::HashMap<_, _> = our_init
@@ -4488,20 +4489,19 @@ async fn cmd_verify_execution(
                 }
 
                 // Debug: log when CDP and our restored keys differ
-                if cdp_header.ledger_version >= 23 {
-                    if !restored_keys.is_empty() || !our_hot_archive_restored_keys.is_empty() {
-                        if restored_keys.len() != our_hot_archive_restored_keys.len() {
-                            tracing::info!(
-                                ledger_seq = seq,
-                                cdp_restored_count = restored_keys.len(),
-                                our_restored_count = our_hot_archive_restored_keys.len(),
-                                "Hot archive restored keys: CDP vs ours (difference = live BL restores)"
-                            );
-                        }
-                    }
+                if cdp_header.ledger_version >= 23
+                    && (!restored_keys.is_empty() || !our_hot_archive_restored_keys.is_empty())
+                    && restored_keys.len() != our_hot_archive_restored_keys.len()
+                {
+                    tracing::info!(
+                        ledger_seq = seq,
+                        cdp_restored_count = restored_keys.len(),
+                        our_restored_count = our_hot_archive_restored_keys.len(),
+                        "Hot archive restored keys: CDP vs ours (difference = live BL restores)"
+                    );
                 }
 
-                drop(bl);
+                drop(bl_guard);
 
                 // Apply all state updates via LedgerManager:
                 // bucket list, hot archive, soroban state, module cache, SQL offers, entry cache
@@ -6276,7 +6276,7 @@ impl CoalescedLedgerChanges {
         }
     }
 
-    fn to_vectors(
+    fn into_vectors(
         self,
     ) -> (
         Vec<stellar_xdr::curr::LedgerEntry>,
@@ -6416,12 +6416,10 @@ fn compute_soroban_state_size_window_entry(
         changed = true;
     }
 
-    if seq % sample_period == 0 {
-        if !window_vec.is_empty() {
-            window_vec.remove(0);
-            window_vec.push(soroban_state_size);
-            changed = true;
-        }
+    if seq % sample_period == 0 && !window_vec.is_empty() {
+        window_vec.remove(0);
+        window_vec.push(soroban_state_size);
+        changed = true;
     }
 
     if !changed {
@@ -6512,12 +6510,10 @@ fn maybe_snapshot_soroban_state_size_window(
         changed = true;
     }
 
-    if seq % sample_period == 0 {
-        if !window_vec.is_empty() {
-            window_vec.remove(0);
-            window_vec.push(soroban_state_size);
-            changed = true;
-        }
+    if seq % sample_period == 0 && !window_vec.is_empty() {
+        window_vec.remove(0);
+        window_vec.push(soroban_state_size);
+        changed = true;
     }
 
     if !changed {
@@ -7957,8 +7953,8 @@ mod tests {
             other => panic!("Expected Init, got {:?}", other),
         }
 
-        // Verify to_vectors classifies correctly
-        let (init, live, dead) = aggregator.to_vectors();
+        // Verify into_vectors classifies correctly
+        let (init, live, dead) = aggregator.into_vectors();
         assert_eq!(init.len(), 1, "Should have 1 init entry");
         assert_eq!(live.len(), 0, "Should have 0 live entries");
         assert_eq!(dead.len(), 0, "Should have 0 dead entries");
@@ -7987,7 +7983,7 @@ mod tests {
             "Creating then removing should result in empty changes"
         );
 
-        let (init, live, dead) = aggregator.to_vectors();
+        let (init, live, dead) = aggregator.into_vectors();
         assert!(init.is_empty());
         assert!(live.is_empty());
         assert!(dead.is_empty());
@@ -8015,7 +8011,7 @@ mod tests {
             other => panic!("Expected Dead, got {:?}", other),
         }
 
-        let (init, live, dead) = aggregator.to_vectors();
+        let (init, live, dead) = aggregator.into_vectors();
         assert!(init.is_empty());
         assert!(live.is_empty());
         assert_eq!(dead.len(), 1);

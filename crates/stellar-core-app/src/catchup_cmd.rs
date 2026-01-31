@@ -65,9 +65,10 @@ pub enum CatchupMode {
     Recent(u32),
 }
 
-impl CatchupMode {
-    /// Parse catchup mode from a string.
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+impl std::str::FromStr for CatchupMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
         match s.to_lowercase().as_str() {
             "minimal" => Ok(Self::Minimal),
             "complete" => Ok(Self::Complete),
@@ -451,15 +452,15 @@ mod tests {
     #[test]
     fn test_catchup_mode_from_str() {
         assert!(matches!(
-            CatchupMode::from_str("minimal").unwrap(),
+            "minimal".parse::<CatchupMode>().unwrap(),
             CatchupMode::Minimal
         ));
         assert!(matches!(
-            CatchupMode::from_str("complete").unwrap(),
+            "complete".parse::<CatchupMode>().unwrap(),
             CatchupMode::Complete
         ));
         assert!(matches!(
-            CatchupMode::from_str("recent:100").unwrap(),
+            "recent:100".parse::<CatchupMode>().unwrap(),
             CatchupMode::Recent(100)
         ));
     }

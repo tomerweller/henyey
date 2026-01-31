@@ -133,11 +133,13 @@ impl FetchingEnvelopes {
     }
 
     /// Set the callback for requesting TxSets from peers.
+    #[allow(clippy::type_complexity)]
     pub fn set_tx_set_ask_peer(&mut self, f: Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>) {
         self.tx_set_fetcher.set_ask_peer(f);
     }
 
     /// Set the callback for requesting QuorumSets from peers.
+    #[allow(clippy::type_complexity)]
     pub fn set_quorum_set_ask_peer(
         &mut self,
         f: Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>,

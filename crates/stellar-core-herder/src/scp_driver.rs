@@ -178,6 +178,7 @@ pub struct ScpDriver {
     /// Latest externalized slot.
     latest_externalized: RwLock<Option<SlotIndex>>,
     /// Envelope broadcast callback.
+    #[allow(clippy::type_complexity)]
     envelope_sender: RwLock<Option<Box<dyn Fn(ScpEnvelope) + Send + Sync>>>,
     /// Network ID for signing.
     network_id: Hash256,

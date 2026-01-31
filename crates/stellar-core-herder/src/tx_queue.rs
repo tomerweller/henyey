@@ -433,7 +433,7 @@ struct SelectedTxs {
     classic_limited: bool,
 }
 
-fn sort_txs_by_hash(txs: &mut Vec<TransactionEnvelope>) {
+fn sort_txs_by_hash(txs: &mut [TransactionEnvelope]) {
     txs.sort_by(|a, b| {
         let hash_a = Hash256::hash_xdr(a).unwrap_or_default();
         let hash_b = Hash256::hash_xdr(b).unwrap_or_default();
@@ -896,8 +896,10 @@ impl TransactionQueue {
     /// * `ban_depth` - Number of ledgers transactions stay banned
     /// * `pending_depth` - Number of ledgers before stale transactions are auto-banned
     pub fn with_depths(config: TxQueueConfig, ban_depth: u32, pending_depth: u32) -> Self {
-        let mut ctx = ValidationContext::default();
-        ctx.base_fee = config.min_fee_per_op;
+        let ctx = ValidationContext {
+            base_fee: config.min_fee_per_op,
+            ..Default::default()
+        };
 
         // Initialize the banned transactions deque with ban_depth empty sets
         let mut banned = std::collections::VecDeque::with_capacity(ban_depth as usize);
@@ -1029,6 +1031,7 @@ impl TransactionQueue {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_evictions_for_lane_config<F>(
         &self,
         by_hash: &HashMap<Hash256, QueuedTransaction>,

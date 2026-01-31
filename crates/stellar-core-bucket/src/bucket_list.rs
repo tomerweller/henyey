@@ -175,6 +175,7 @@ impl AsyncMergeHandle {
     /// # Panics
     ///
     /// Panics if called outside of a tokio runtime context. Tests should use `#[tokio::test(flavor = "multi_thread")]`.
+    #[allow(clippy::too_many_arguments)]
     fn start_merge(
         curr: Arc<Bucket>,
         snap: Arc<Bucket>,
@@ -267,6 +268,7 @@ impl AsyncMergeHandle {
     }
 
     /// Check if the merge is complete without blocking.
+    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
         self.result.is_some()
     }
@@ -1399,7 +1401,7 @@ impl BucketList {
             self.add_batch(
                 seq,
                 protocol_version,
-                bucket_list_type.clone(),
+                bucket_list_type,
                 Vec::new(), // empty init
                 Vec::new(), // empty live
                 Vec::new(), // empty dead

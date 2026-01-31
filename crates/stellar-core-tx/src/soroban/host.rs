@@ -558,6 +558,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// Get an entry using our workspace XDR types (for internal use).
     /// This is separate from the `SnapshotSource::get()` trait impl which uses
     /// soroban-env-host's XDR types.
+    #[allow(clippy::type_complexity)]
     pub fn get_local(
         &self,
         key: &LedgerKey,
@@ -640,6 +641,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// then falls back to the hot archive bucket list (for truly evicted entries).
     ///
     /// Returns entries in our workspace XDR types (not soroban-env-host's types).
+    #[allow(clippy::type_complexity)]
     pub fn get_archived(
         &self,
         key: &Rc<LedgerKey>,

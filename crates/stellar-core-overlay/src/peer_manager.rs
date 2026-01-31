@@ -202,9 +202,12 @@ impl PeerManager {
             info!("Loaded {} peers from database", num_loaded);
         }
 
+        #[allow(clippy::arc_with_non_send_sync)]
+        let db = Arc::new(RwLock::new(conn));
+
         Ok(Self {
             cache: RwLock::new(cache),
-            db: Some(Arc::new(RwLock::new(conn))),
+            db: Some(db),
         })
     }
 
@@ -214,9 +217,12 @@ impl PeerManager {
 
         let cache = Self::load_all_from_db(&conn)?;
 
+        #[allow(clippy::arc_with_non_send_sync)]
+        let db = Arc::new(RwLock::new(conn));
+
         Ok(Self {
             cache: RwLock::new(cache),
-            db: Some(Arc::new(RwLock::new(conn))),
+            db: Some(db),
         })
     }
 

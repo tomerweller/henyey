@@ -870,7 +870,6 @@ mod tests {
 
     #[test]
     fn test_save_load_with_asset_pool_map() {
-        use crate::index::AssetPoolIdMap;
         use stellar_xdr::curr::{
             AlphaNum4, Asset, AssetCode4, Hash, LiquidityPoolConstantProductParameters,
             LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
