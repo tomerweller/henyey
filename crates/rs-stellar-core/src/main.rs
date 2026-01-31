@@ -2943,6 +2943,29 @@ async fn cmd_verify_execution(
         );
     }
 
+    // Print cache/index sizes
+    {
+        let offer_count = ledger_manager.offer_store_count();
+        let aa_index_keys = ledger_manager.offer_account_asset_index_len();
+        let aa_index_ids = ledger_manager.offer_account_asset_index_total_ids();
+        let entry_cache = ledger_manager.entry_cache_count();
+        println!(
+            "[CACHE] offer_store: {} offers, account_asset_index: {} keys / {} id-entries, entry_cache: {} entries",
+            offer_count, aa_index_keys, aa_index_ids, entry_cache,
+        );
+        // Rough memory estimates (per-entry overhead)
+        // offer_store: ~1 KB per LedgerEntry (XDR OfferEntry + HashMap overhead)
+        // account_asset_index: ~80 bytes per key + 8 bytes per id in HashSet
+        // entry_cache: ~1 KB per LedgerEntry + key bytes
+        let offer_store_mb = offer_count as f64 * 1.0 / 1024.0;
+        let aa_index_mb = (aa_index_keys as f64 * 80.0 + aa_index_ids as f64 * 8.0) / 1024.0 / 1024.0;
+        let entry_cache_mb = entry_cache as f64 * 1.0 / 1024.0;
+        println!(
+            "[CACHE] Estimated memory: offer_store ~{:.1}MB, account_asset_index ~{:.1}MB, entry_cache ~{:.1}MB",
+            offer_store_mb, aa_index_mb, entry_cache_mb,
+        );
+    }
+
     tracing::info!("Post-init: starting verification loop setup");
 
     // Track results
@@ -4973,6 +4996,29 @@ async fn cmd_verify_execution(
             let pct = if total_op_us > 0 { *us as f64 / total_op_us as f64 * 100.0 } else { 0.0 };
             println!("  {:>30} {:>8} {:>10.2} {:>10.1} {:>7.1}%",
                 format!("{:?}", op_type), count, *us as f64 / 1000.0, avg_us, pct);
+        }
+    }
+
+    // Print final cache sizes and process RSS
+    {
+        let offer_count = ledger_manager.offer_store_count();
+        let aa_index_keys = ledger_manager.offer_account_asset_index_len();
+        let aa_index_ids = ledger_manager.offer_account_asset_index_total_ids();
+        let entry_cache = ledger_manager.entry_cache_count();
+        println!();
+        println!("Final Cache Sizes");
+        println!("=================");
+        println!("  offer_store:          {} offers", offer_count);
+        println!("  account_asset_index:  {} keys, {} id-entries", aa_index_keys, aa_index_ids);
+        println!("  entry_cache:          {} entries", entry_cache);
+
+        // Read RSS from /proc/self/status
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") || line.starts_with("VmHWM:") {
+                    println!("  {}", line.trim());
+                }
+            }
         }
     }
 

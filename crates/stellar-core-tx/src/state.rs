@@ -535,6 +535,10 @@ pub struct LedgerStateManager {
     /// Index of offers by asset pair for efficient best-offer lookups.
     /// This mirrors C++ stellar-core's MultiOrderBook structure.
     offer_index: OfferIndex,
+    /// Secondary index: (account_bytes, asset) → set of offer_ids.
+    /// Each offer is indexed under both (seller, selling_asset) and (seller, buying_asset).
+    /// Used for O(k) lookups in `remove_offers_by_account_and_asset`.
+    account_asset_offers: HashMap<([u8; 32], AssetKey), HashSet<i64>>,
     /// Optional callback to lazily load ledger entries from the bucket list.
     /// Used during offer crossing to load seller accounts and trustlines
     /// on demand instead of preloading all offer dependencies upfront.
@@ -615,8 +619,37 @@ impl LedgerStateManager {
             id_pool_snapshot: None,
             delta_snapshot: None,
             offer_index: OfferIndex::new(),
+            account_asset_offers: HashMap::new(),
             entry_loader: None,
             batch_entry_loader: None,
+        }
+    }
+
+    /// Insert an offer into the (account, asset) secondary index.
+    fn aa_index_insert(&mut self, offer: &OfferEntry) {
+        let seller = account_id_to_bytes(&offer.seller_id);
+        let selling_key = AssetKey::from_asset(&offer.selling);
+        let buying_key = AssetKey::from_asset(&offer.buying);
+        self.account_asset_offers
+            .entry((seller, selling_key))
+            .or_default()
+            .insert(offer.offer_id);
+        self.account_asset_offers
+            .entry((seller, buying_key))
+            .or_default()
+            .insert(offer.offer_id);
+    }
+
+    /// Remove an offer from the (account, asset) secondary index.
+    fn aa_index_remove(&mut self, offer: &OfferEntry) {
+        let seller = account_id_to_bytes(&offer.seller_id);
+        let selling_key = AssetKey::from_asset(&offer.selling);
+        let buying_key = AssetKey::from_asset(&offer.buying);
+        if let Some(set) = self.account_asset_offers.get_mut(&(seller, selling_key)) {
+            set.remove(&offer.offer_id);
+        }
+        if let Some(set) = self.account_asset_offers.get_mut(&(seller, buying_key)) {
+            set.remove(&offer.offer_id);
         }
     }
 
@@ -1041,6 +1074,7 @@ impl LedgerStateManager {
         if !preserve_offers {
             self.offers.clear();
             self.offer_index.clear();
+            self.account_asset_offers.clear();
         }
         self.data_entries.clear();
         self.contract_data.clear();
@@ -1555,6 +1589,7 @@ impl LedgerStateManager {
                 });
                 // Add to offer index for efficient best-offer lookups
                 self.offer_index.add_offer(&offer);
+                self.aa_index_insert(&offer);
                 self.offers.insert((seller_key, offer.offer_id), offer);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
@@ -2339,6 +2374,7 @@ impl LedgerStateManager {
 
         // Add to offer index for efficient best-offer lookups
         self.offer_index.add_offer(&entry);
+        self.aa_index_insert(&entry);
 
         // Insert into state
         self.offers.insert(key, entry);
@@ -2386,6 +2422,13 @@ impl LedgerStateManager {
         // Update offer index (handles price/asset changes)
         self.offer_index.update_offer(&entry);
 
+        // Update (account, asset) secondary index: remove old, insert new
+        let old_offer_clone = self.offers.get(&key).cloned();
+        if let Some(ref old_offer) = old_offer_clone {
+            self.aa_index_remove(old_offer);
+        }
+        self.aa_index_insert(&entry);
+
         // Update state
         self.offers.insert(key, entry.clone());
 
@@ -2423,6 +2466,12 @@ impl LedgerStateManager {
 
         // Remove from offer index
         self.offer_index.remove_offer(seller_id, offer_id);
+
+        // Remove from (account, asset) secondary index
+        if let Some(offer) = self.offers.get(&key) {
+            let offer_clone = offer.clone();
+            self.aa_index_remove(&offer_clone);
+        }
 
         // Remove from state
         self.clear_entry_sponsorship_metadata(&ledger_key);
@@ -2508,15 +2557,23 @@ impl LedgerStateManager {
         asset: &Asset,
     ) -> Vec<OfferEntry> {
         let account_key = account_id_to_bytes(account_id);
+        let asset_key = AssetKey::from_asset(asset);
 
-        // Find all offers by this account that buy or sell this asset, clone them before deletion
-        let offers_to_remove: Vec<_> = self
-            .offers
+        // Look up offer IDs from secondary index
+        let offer_ids: Vec<i64> = self
+            .account_asset_offers
+            .get(&(account_key, asset_key))
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default();
+
+        // Collect matching offers (verify they still match before removing)
+        let offers_to_remove: Vec<OfferEntry> = offer_ids
             .iter()
-            .filter(|((seller_key, _), offer)| {
-                *seller_key == account_key && (offer.buying == *asset || offer.selling == *asset)
+            .filter_map(|&offer_id| {
+                self.offers.get(&(account_key, offer_id)).cloned().filter(
+                    |offer| offer.buying == *asset || offer.selling == *asset,
+                )
             })
-            .map(|(_, offer)| offer.clone())
             .collect();
 
         // Remove each offer
@@ -4012,19 +4069,31 @@ impl LedgerStateManager {
             .filter(|k| !sp.offer_snapshots.contains_key(k))
             .cloned()
             .collect();
-        for key in new_offer_keys {
-            if let Some(snapshot) = self.offer_snapshots.get(&key) {
-                let offer_key = OfferKey::new(key.0, key.1);
-                match snapshot {
-                    Some(entry) => {
-                        self.offer_index.update_offer(entry);
-                        self.offers.insert(key, entry.clone());
-                    }
-                    None => {
-                        // Entry didn't exist before TX — remove it
-                        self.offer_index.remove_by_key(&offer_key);
-                        self.offers.remove(&key);
-                    }
+        // Collect snapshot values to avoid borrow conflict
+        let new_offer_snapshots: Vec<_> = new_offer_keys
+            .into_iter()
+            .filter_map(|key| {
+                self.offer_snapshots
+                    .get(&key)
+                    .map(|snap| (key, snap.clone()))
+            })
+            .collect();
+        for (key, snapshot) in new_offer_snapshots {
+            let offer_key = OfferKey::new(key.0, key.1);
+            // Remove old secondary index entries
+            if let Some(current) = self.offers.get(&key).cloned() {
+                self.aa_index_remove(&current);
+            }
+            match snapshot {
+                Some(entry) => {
+                    self.aa_index_insert(&entry);
+                    self.offer_index.update_offer(&entry);
+                    self.offers.insert(key, entry);
+                }
+                None => {
+                    // Entry didn't exist before TX — remove it
+                    self.offer_index.remove_by_key(&offer_key);
+                    self.offers.remove(&key);
                 }
             }
         }
@@ -4073,8 +4142,13 @@ impl LedgerStateManager {
         // These were modified before the savepoint AND potentially re-modified during speculation.
         for (key, value) in sp.offer_pre_values {
             let offer_key = OfferKey::new(key.0, key.1);
+            // Remove old secondary index entries
+            if let Some(current) = self.offers.get(&key).cloned() {
+                self.aa_index_remove(&current);
+            }
             match value {
                 Some(entry) => {
+                    self.aa_index_insert(&entry);
                     self.offer_index.update_offer(&entry);
                     self.offers.insert(key, entry);
                 }
@@ -4254,14 +4328,22 @@ impl LedgerStateManager {
         // Restore offer snapshots and incrementally update the index.
         // Instead of rebuilding the full index from scratch (O(n log n) for all offers),
         // we only undo index changes for offers touched by this transaction.
-        for (key, snapshot) in self.offer_snapshots.drain() {
+        let offer_snapshots: Vec<_> = self.offer_snapshots.drain().collect();
+        for (key, snapshot) in offer_snapshots {
             let offer_key = OfferKey::new(key.0, key.1);
             if self.created_offers.contains(&key) {
                 // Offer was created in this transaction — remove from index and map.
+                if let Some(current) = self.offers.get(&key).cloned() {
+                    self.aa_index_remove(&current);
+                }
                 self.offer_index.remove_by_key(&offer_key);
                 self.offers.remove(&key);
             } else if let Some(entry) = snapshot {
                 // Offer existed before — restore it and update index.
+                if let Some(current) = self.offers.get(&key).cloned() {
+                    self.aa_index_remove(&current);
+                }
+                self.aa_index_insert(&entry);
                 self.offer_index.update_offer(&entry);
                 self.offers.insert(key, entry);
             }

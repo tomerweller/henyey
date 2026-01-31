@@ -213,6 +213,12 @@ pub type EntriesLookupFn = Arc<dyn Fn() -> Result<Vec<LedgerEntry>> + Send + Syn
 /// Batch entry lookup function for loading multiple entries in a single bucket list pass.
 pub type BatchEntryLookupFn = Arc<dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>> + Send + Sync>;
 
+/// Lookup function for offers by (account, asset) pair.
+///
+/// Returns all offers owned by the given account that buy or sell the given asset.
+pub type OffersByAccountAssetFn =
+    Arc<dyn Fn(&AccountId, &stellar_xdr::curr::Asset) -> Result<Vec<LedgerEntry>> + Send + Sync>;
+
 /// Thread-safe handle to a ledger snapshot with optional lazy loading.
 ///
 /// `SnapshotHandle` wraps a [`LedgerSnapshot`] in an `Arc` for efficient
@@ -247,6 +253,8 @@ pub struct SnapshotHandle {
     entries_fn: Option<EntriesLookupFn>,
     /// Optional batch lookup for multiple entries in a single pass.
     batch_lookup_fn: Option<BatchEntryLookupFn>,
+    /// Optional index-based lookup for offers by (account, asset).
+    offers_by_account_asset_fn: Option<OffersByAccountAssetFn>,
 }
 
 impl SnapshotHandle {
@@ -258,6 +266,7 @@ impl SnapshotHandle {
             header_lookup_fn: None,
             entries_fn: None,
             batch_lookup_fn: None,
+            offers_by_account_asset_fn: None,
         }
     }
 
@@ -269,6 +278,7 @@ impl SnapshotHandle {
             header_lookup_fn: None,
             entries_fn: None,
             batch_lookup_fn: None,
+            offers_by_account_asset_fn: None,
         }
     }
 
@@ -284,6 +294,7 @@ impl SnapshotHandle {
             header_lookup_fn: Some(header_lookup_fn),
             entries_fn: None,
             batch_lookup_fn: None,
+            offers_by_account_asset_fn: None,
         }
     }
 
@@ -300,6 +311,7 @@ impl SnapshotHandle {
             header_lookup_fn: Some(header_lookup_fn),
             entries_fn: Some(entries_fn),
             batch_lookup_fn: None,
+            offers_by_account_asset_fn: None,
         }
     }
 
@@ -321,6 +333,38 @@ impl SnapshotHandle {
     /// Set the batch entry lookup function.
     pub fn set_batch_lookup(&mut self, batch_fn: BatchEntryLookupFn) {
         self.batch_lookup_fn = Some(batch_fn);
+    }
+
+    /// Set the offers-by-(account, asset) lookup function.
+    pub fn set_offers_by_account_asset(&mut self, f: OffersByAccountAssetFn) {
+        self.offers_by_account_asset_fn = Some(f);
+    }
+
+    /// Look up all offers owned by `account_id` that buy or sell `asset`.
+    ///
+    /// Uses the index-based lookup if available, otherwise falls back to
+    /// `all_entries()` with a linear scan.
+    pub fn offers_by_account_and_asset(
+        &self,
+        account_id: &AccountId,
+        asset: &stellar_xdr::curr::Asset,
+    ) -> Result<Vec<LedgerEntry>> {
+        if let Some(ref f) = self.offers_by_account_asset_fn {
+            return f(account_id, asset);
+        }
+        // Fallback: linear scan over all entries
+        let entries = self.all_entries()?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                if let LedgerEntryData::Offer(ref offer) = entry.data {
+                    offer.seller_id == *account_id
+                        && (offer.buying == *asset || offer.selling == *asset)
+                } else {
+                    false
+                }
+            })
+            .collect())
     }
 
     /// Load multiple entries by their keys.

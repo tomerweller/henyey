@@ -1443,19 +1443,11 @@ impl TransactionExecutor {
         account_id: &AccountId,
         asset: &Asset,
     ) -> Result<()> {
-        let entries = snapshot.all_entries()?;
+        let entries = snapshot.offers_by_account_and_asset(account_id, asset)?;
         for entry in entries {
-            let LedgerEntryData::Offer(offer) = &entry.data else {
+            let LedgerEntryData::Offer(ref offer) = entry.data else {
                 continue;
             };
-            // Check if this offer is by the specified account
-            if &offer.seller_id != account_id {
-                continue;
-            }
-            // Check if this offer is buying or selling the specified asset
-            if offer.buying != *asset && offer.selling != *asset {
-                continue;
-            }
             // Skip if already loaded
             let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
                 seller_id: offer.seller_id.clone(),

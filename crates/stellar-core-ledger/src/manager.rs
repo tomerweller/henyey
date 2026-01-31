@@ -40,7 +40,7 @@ use crate::{
 };
 use indexmap::IndexMap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use stellar_core_bucket::{
     BucketEntry, BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
@@ -49,6 +49,7 @@ use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::queries::offers as offers_db;
 use stellar_core_db::Database;
 use stellar_core_tx::soroban::PersistentModuleCache;
+use stellar_core_tx::state::AssetKey;
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
@@ -60,6 +61,52 @@ use stellar_xdr::curr::{
     UpgradeEntryMeta, VecM, WriteXdr,
 };
 use tracing::{debug, info};
+
+/// Secondary index type: (account_bytes, asset) → set of offer_ids.
+type OfferAccountAssetIndex = HashMap<([u8; 32], AssetKey), HashSet<i64>>;
+
+/// Extract the 32-byte public key from an AccountId.
+fn account_id_bytes(account_id: &AccountId) -> [u8; 32] {
+    match &account_id.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+    }
+}
+
+/// Insert an offer into the (account, asset) secondary index.
+///
+/// Each offer gets two entries: (seller, selling_asset) and (seller, buying_asset).
+fn index_offer_insert(
+    index: &mut OfferAccountAssetIndex,
+    offer: &stellar_xdr::curr::OfferEntry,
+) {
+    let seller = account_id_bytes(&offer.seller_id);
+    let selling_key = AssetKey::from_asset(&offer.selling);
+    let buying_key = AssetKey::from_asset(&offer.buying);
+    index
+        .entry((seller, selling_key))
+        .or_default()
+        .insert(offer.offer_id);
+    index
+        .entry((seller, buying_key))
+        .or_default()
+        .insert(offer.offer_id);
+}
+
+/// Remove an offer from the (account, asset) secondary index.
+fn index_offer_remove(
+    index: &mut OfferAccountAssetIndex,
+    offer: &stellar_xdr::curr::OfferEntry,
+) {
+    let seller = account_id_bytes(&offer.seller_id);
+    let selling_key = AssetKey::from_asset(&offer.selling);
+    let buying_key = AssetKey::from_asset(&offer.buying);
+    if let Some(set) = index.get_mut(&(seller, selling_key)) {
+        set.remove(&offer.offer_id);
+    }
+    if let Some(set) = index.get_mut(&(seller, buying_key)) {
+        set.remove(&offer.offer_id);
+    }
+}
 
 /// Prepend a fee event to transaction metadata.
 ///
@@ -332,6 +379,12 @@ pub struct LedgerManager {
     /// Eliminates the need to query SQL for orderbook operations.
     offer_store: Arc<RwLock<HashMap<i64, LedgerEntry>>>,
 
+    /// Secondary index: (account_bytes, asset) → set of offer_ids.
+    ///
+    /// Each offer is indexed under two keys: (seller, selling_asset) and (seller, buying_asset).
+    /// Used for O(k) lookups in `load_offers_by_account_and_asset` instead of O(n) full scans.
+    offer_account_asset_index: Arc<RwLock<OfferAccountAssetIndex>>,
+
     /// In-memory Soroban state for Protocol 20+ contract data/code tracking.
     ///
     /// This tracks all CONTRACT_DATA, CONTRACT_CODE, and TTL entries in memory,
@@ -375,6 +428,7 @@ impl LedgerManager {
             module_cache: RwLock::new(None),
             offers_initialized: Arc::new(RwLock::new(false)),
             offer_store: Arc::new(RwLock::new(HashMap::new())),
+            offer_account_asset_index: Arc::new(RwLock::new(HashMap::new())),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
         }
     }
@@ -450,6 +504,30 @@ impl LedgerManager {
     /// Get a reference to the offers_initialized flag.
     pub fn offers_initialized(&self) -> &Arc<RwLock<bool>> {
         &self.offers_initialized
+    }
+
+    /// Get the number of offers in the in-memory offer store.
+    pub fn offer_store_count(&self) -> usize {
+        self.offer_store.read().len()
+    }
+
+    /// Get the number of (account, asset) index entries.
+    pub fn offer_account_asset_index_len(&self) -> usize {
+        self.offer_account_asset_index.read().len()
+    }
+
+    /// Get the total number of offer_id entries across all (account, asset) buckets.
+    pub fn offer_account_asset_index_total_ids(&self) -> usize {
+        self.offer_account_asset_index
+            .read()
+            .values()
+            .map(|s| s.len())
+            .sum()
+    }
+
+    /// Get the number of entries in the general entry cache.
+    pub fn entry_cache_count(&self) -> usize {
+        self.entry_cache.read().len()
     }
 
     /// Update the ledger header and hash for offline replay scenarios.
@@ -1131,8 +1209,17 @@ impl LedgerManager {
         tx.commit()
             .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
 
+        // Build the (account, asset) secondary index from mem_offers
+        let mut account_asset_idx: OfferAccountAssetIndex = HashMap::new();
+        for entry in mem_offers.values() {
+            if let LedgerEntryData::Offer(ref offer) = entry.data {
+                index_offer_insert(&mut account_asset_idx, offer);
+            }
+        }
+
         // Store in persistent in-memory offer store
         *self.offer_store.write() = mem_offers;
+        *self.offer_account_asset_index.write() = account_asset_idx;
 
         let offer_elapsed = cache_init_start.elapsed();
         info!(offer_count, elapsed_ms = offer_elapsed.as_millis() as u64, "Cache init: Offer scan complete");
@@ -1511,8 +1598,17 @@ impl LedgerManager {
         let (mem_offers, offer_count) = offer_result?;
         let (module_cache, code_count, data_count, ttl_count, config_count) = soroban_result?;
 
+        // Build the (account, asset) secondary index from mem_offers
+        let mut account_asset_idx: OfferAccountAssetIndex = HashMap::new();
+        for entry in mem_offers.values() {
+            if let LedgerEntryData::Offer(ref offer) = entry.data {
+                index_offer_insert(&mut account_asset_idx, offer);
+            }
+        }
+
         // Store results
         *self.offer_store.write() = mem_offers;
+        *self.offer_account_asset_index.write() = account_asset_idx;
         *self.module_cache.write() = module_cache;
         *self.offers_initialized.write() = true;
 
@@ -2013,6 +2109,50 @@ impl LedgerManager {
             Ok(entries)
         });
 
+        // Create index-based lookup for offers by (account, asset).
+        let offer_store_idx = self.offer_store.clone();
+        let offer_index = self.offer_account_asset_index.clone();
+        let offers_init_idx = self.offers_initialized.clone();
+        let bucket_list_idx = self.bucket_list.clone();
+        let offers_by_account_asset_fn: crate::snapshot::OffersByAccountAssetFn = Arc::new(
+            move |account_id: &AccountId, asset: &stellar_xdr::curr::Asset| {
+                if !*offers_init_idx.read() {
+                    // Fall back to bucket list scan
+                    let bucket_list = bucket_list_idx.read();
+                    let mut entries = Vec::new();
+                    for entry_result in bucket_list.live_entries_iter() {
+                        let entry = entry_result.map_err(LedgerError::Bucket)?;
+                        if let LedgerEntryData::Offer(ref offer) = entry.data {
+                            if offer.seller_id == *account_id
+                                && (offer.buying == *asset || offer.selling == *asset)
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                    }
+                    return Ok(entries);
+                }
+
+                let idx = offer_index.read();
+                let store = offer_store_idx.read();
+                let seller = account_id_bytes(account_id);
+                let asset_key = AssetKey::from_asset(asset);
+
+                let offer_ids = match idx.get(&(seller, asset_key)) {
+                    Some(ids) => ids,
+                    None => return Ok(Vec::new()),
+                };
+
+                let mut result = Vec::with_capacity(offer_ids.len());
+                for &offer_id in offer_ids {
+                    if let Some(entry) = store.get(&offer_id) {
+                        result.push(entry.clone());
+                    }
+                }
+                Ok(result)
+            },
+        );
+
         let mut handle = SnapshotHandle::with_lookups_and_entries(
             snapshot,
             lookup_fn,
@@ -2020,6 +2160,7 @@ impl LedgerManager {
             entries_fn,
         );
         handle.set_batch_lookup(batch_lookup_fn);
+        handle.set_offers_by_account_asset(offers_by_account_asset_fn);
         Ok(handle)
     }
 
@@ -2340,14 +2481,29 @@ impl LedgerManager {
                 LedgerError::Internal(format!("Failed to commit offers transaction: {}", e))
             })?;
 
-            // Update in-memory offer store
+            // Update in-memory offer store and secondary index
             let mut store = self.offer_store.write();
+            let mut idx = self.offer_account_asset_index.write();
             for entry in &offer_upserts {
                 if let LedgerEntryData::Offer(ref offer) = entry.data {
+                    // Remove old index entries if the offer already existed
+                    if let Some(old_entry) = store.get(&offer.offer_id) {
+                        if let LedgerEntryData::Offer(ref old_offer) = old_entry.data {
+                            index_offer_remove(&mut idx, old_offer);
+                        }
+                    }
+                    // Add new index entries
+                    index_offer_insert(&mut idx, offer);
                     store.insert(offer.offer_id, entry.clone());
                 }
             }
             for offer_id in &offer_deletes {
+                // Remove index entries before removing from store
+                if let Some(old_entry) = store.get(offer_id) {
+                    if let LedgerEntryData::Offer(ref old_offer) = old_entry.data {
+                        index_offer_remove(&mut idx, old_offer);
+                    }
+                }
                 store.remove(offer_id);
             }
         }
