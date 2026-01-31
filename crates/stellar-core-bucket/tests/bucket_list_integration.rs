@@ -40,7 +40,6 @@ fn make_contract_code_key(seed: u8) -> LedgerKey {
     })
 }
 
-#[allow(dead_code)]
 fn make_contract_data_entry(
     seed: u8,
     durability: ContractDataDurability,
@@ -74,7 +73,6 @@ fn make_contract_data_key(seed: u8, durability: ContractDataDurability) -> Ledge
     })
 }
 
-#[allow(dead_code)]
 fn make_ttl_entry(key: &LedgerKey, live_until: u32, last_modified: u32) -> LedgerEntry {
     use sha2::{Digest, Sha256};
 
@@ -520,7 +518,7 @@ async fn test_init_dead_annihilation() {
     );
 
     // Verify live_entries doesn't include the deleted entry
-    let live = bl.live_entries().unwrap();
+    let live: Vec<_> = bl.live_entries_iter().collect::<std::result::Result<Vec<_>, _>>().unwrap();
     let has_key = live.iter().any(|e| {
         if let LedgerEntryData::Account(a) = &e.data {
             a.account_id

@@ -513,6 +513,7 @@ mod tests {
         }
 
         // Get entries via both methods
+        #[allow(deprecated)]
         let old_entries = bucket_list.live_entries().unwrap();
         let new_entries: Vec<_> = LiveEntriesIterator::new(&bucket_list)
             .collect::<Result<Vec<_>>>()

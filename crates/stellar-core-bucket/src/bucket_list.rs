@@ -2453,7 +2453,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = bl.live_entries().unwrap();
+        let entries: Vec<_> = bl.live_entries_iter().collect::<Result<Vec<_>>>().unwrap();
         assert!(entries.is_empty());
     }
 

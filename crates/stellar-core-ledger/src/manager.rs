@@ -860,7 +860,6 @@ impl LedgerManager {
     ///
     /// Note: This function is kept for potential future use in selective reinitialization.
     /// Normal initialization uses `initialize_all_caches()` for better memory efficiency.
-    #[allow(dead_code)]
     fn initialize_module_cache(&self, protocol_version: u32) -> Result<()> {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
 
@@ -1309,8 +1308,6 @@ impl LedgerManager {
                 scan_ms = (now - last_scan_elapsed).as_millis() as u64,
                 elapsed_ms = now.as_millis() as u64,
                 "Cache init: TTL scan complete");
-            #[allow(unused_assignments)]
-            { last_scan_elapsed = now; }
         }
 
         // --- Scan 5: ConfigSetting -> soroban state ---
