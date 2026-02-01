@@ -955,11 +955,7 @@ impl TransactionExecutor {
     /// remaining keys via `snapshot.load_entries()` which uses a single bucket
     /// list traversal for all keys. This is significantly faster than individual
     /// `load_account`/`load_trustline` calls for operations needing multiple entries.
-    fn batch_load_keys(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        keys: &[LedgerKey],
-    ) -> Result<()> {
+    fn batch_load_keys(&mut self, snapshot: &SnapshotHandle, keys: &[LedgerKey]) -> Result<()> {
         let mut needed = Vec::new();
 
         for key in keys {
@@ -980,9 +976,7 @@ impl TransactionExecutor {
                     .state
                     .get_liquidity_pool(&k.liquidity_pool_id)
                     .is_some(),
-                LedgerKey::Offer(k) => {
-                    self.state.get_offer(&k.seller_id, k.offer_id).is_some()
-                }
+                LedgerKey::Offer(k) => self.state.get_offer(&k.seller_id, k.offer_id).is_some(),
                 _ => false,
             };
 
@@ -1449,22 +1443,29 @@ impl TransactionExecutor {
             let LedgerEntryData::Offer(ref offer) = entry.data else {
                 continue;
             };
-            // Skip if already loaded
+            // Check if already loaded
             let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
                 seller_id: offer.seller_id.clone(),
                 offer_id: offer.offer_id,
             });
-            if self.state.get_entry(&offer_key).is_some() {
-                continue;
-            }
+
             // Skip if already deleted
             if self.state.delta().deleted_keys().contains(&offer_key) {
                 continue;
             }
-            // Load the offer
-            let offer = offer.clone();
-            self.state.load_entry(entry);
-            self.load_offer_dependencies(snapshot, &offer)?;
+
+            // Always load dependencies (trustlines) for the offer, even if offer is already in state.
+            // This is critical because:
+            // 1. Offers are cached in state across transactions
+            // 2. But state is cleared between transactions (except offers)
+            // 3. When revoking authorization, we need to release liabilities on trustlines
+            // 4. Those trustlines must be loaded even if the offer was cached from a previous TX
+            self.load_offer_dependencies(snapshot, offer)?;
+
+            // Only load the offer entry if not already in state
+            if self.state.get_entry(&offer_key).is_none() {
+                self.state.load_entry(entry);
+            }
         }
         Ok(())
     }
@@ -1507,7 +1508,11 @@ impl TransactionExecutor {
 
         // Collect all footprint keys + their TTL keys for batch loading
         let mut all_keys = Vec::new();
-        for key in footprint.read_only.iter().chain(footprint.read_write.iter()) {
+        for key in footprint
+            .read_only
+            .iter()
+            .chain(footprint.read_write.iter())
+        {
             // Skip entries already in state (e.g., created by previous TX in this ledger)
             if self.state.get_entry(key).is_none() {
                 all_keys.push(key.clone());
@@ -2650,7 +2655,8 @@ impl TransactionExecutor {
             self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
         }
 
-        let footprint_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us - fee_seq_us;
+        let footprint_us =
+            tx_timing_start.elapsed().as_micros() as u64 - validation_us - fee_seq_us;
 
         self.state.clear_sponsorship_stack();
 
@@ -2721,6 +2727,7 @@ impl TransactionExecutor {
         } else {
             for (op_index, op) in frame.operations().iter().enumerate() {
                 let op_type = OperationType::from_body(&op.body);
+
                 let op_source_muxed = op
                     .source_account
                     .clone()
@@ -3047,7 +3054,10 @@ impl TransactionExecutor {
             }
         }
 
-        let ops_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us - fee_seq_us - footprint_us;
+        let ops_us = tx_timing_start.elapsed().as_micros() as u64
+            - validation_us
+            - fee_seq_us
+            - footprint_us;
 
         if all_success && self.protocol_version >= 14 && self.state.has_pending_sponsorship() {
             all_success = false;
@@ -3162,7 +3172,7 @@ impl TransactionExecutor {
         if total_us > 5000 || frame.is_soroban() {
             // Build a compact string of per-op-type timings sorted by time desc
             let mut op_timing_vec: Vec<_> = op_type_timings.iter().collect();
-            op_timing_vec.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+            op_timing_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
             let op_timing_str: String = op_timing_vec
                 .iter()
                 .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
@@ -3957,9 +3967,7 @@ fn emit_classic_events_for_operation(
         OperationBody::ManageSellOffer(_) | OperationBody::CreatePassiveSellOffer(_) => {
             if let OperationResult::OpInner(
                 OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(success))
-                | OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(
-                    success,
-                )),
+                | OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(success)),
             ) = op_result
             {
                 op_event_manager.events_for_claim_atoms(op_source, &success.offers_claimed);
