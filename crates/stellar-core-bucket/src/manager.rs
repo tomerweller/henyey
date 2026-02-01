@@ -1041,6 +1041,59 @@ impl BucketManager {
 
         Ok(fetched)
     }
+
+    /// Clean up unreferenced merge temp files from the bucket directory.
+    ///
+    /// This method removes `merge-tmp-*.xdr` files that are not in the provided
+    /// set of referenced file paths. This is useful for garbage collection during
+    /// long-running operations like verify-execution where many merge temp files
+    /// are created but only a subset remain referenced by the bucket list.
+    ///
+    /// # Arguments
+    ///
+    /// * `referenced_paths` - Set of file paths that should be kept (from bucket list's
+    ///   `referenced_file_paths()` method)
+    ///
+    /// # Returns
+    ///
+    /// The number of files deleted.
+    pub fn cleanup_unreferenced_files(
+        &self,
+        referenced_paths: &std::collections::HashSet<PathBuf>,
+    ) -> Result<usize> {
+        let mut deleted = 0;
+
+        // List all files in bucket directory that match merge-tmp-*.xdr pattern
+        for entry in std::fs::read_dir(&self.bucket_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // Only consider merge temp files
+                if name.starts_with("merge-tmp-") && name.ends_with(".xdr") {
+                    // Delete if not referenced
+                    if !referenced_paths.contains(&path) {
+                        tracing::debug!(path = %path.display(), "Deleting unreferenced merge temp file");
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "Failed to delete unreferenced merge temp file"
+                            );
+                        } else {
+                            deleted += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if deleted > 0 {
+            tracing::info!(deleted, "Cleaned up unreferenced merge temp files");
+        }
+
+        Ok(deleted)
+    }
 }
 
 impl std::fmt::Debug for BucketManager {

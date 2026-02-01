@@ -356,6 +356,34 @@ impl CachedCdpDataLake {
         self.cache_path(ledger_seq).exists()
     }
 
+    /// Delete a cached ledger file to free up disk space.
+    ///
+    /// This is useful for streaming access patterns where ledgers are processed
+    /// sequentially and don't need to be retained after processing.
+    ///
+    /// Returns `true` if the file was deleted, `false` if it didn't exist.
+    pub fn delete_cached(&self, ledger_seq: u32) -> bool {
+        let path = self.cache_path(ledger_seq);
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(ledger_seq, error = %e, "Failed to delete cached CDP file");
+                false
+            } else {
+                tracing::trace!(ledger_seq, "Deleted cached CDP file");
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Delete all cached ledgers in a range.
+    ///
+    /// Returns the number of files successfully deleted.
+    pub fn delete_cached_range(&self, start: u32, end: u32) -> usize {
+        (start..=end).filter(|&seq| self.delete_cached(seq)).count()
+    }
+
     /// Get count of cached ledgers in a range.
     pub fn cached_count(&self, start: u32, end: u32) -> usize {
         (start..=end).filter(|seq| self.is_cached(*seq)).count()

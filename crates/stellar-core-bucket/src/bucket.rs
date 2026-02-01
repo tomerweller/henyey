@@ -609,10 +609,7 @@ impl Bucket {
     /// Reads the gzipped XDR stream one record at a time and writes each
     /// record (with its record mark) directly to the output file. Peak memory
     /// usage is one XDR record (typically < 1 KB, at most a few MB).
-    pub fn migrate_gz_to_xdr(
-        gz_path: impl AsRef<Path>,
-        xdr_path: impl AsRef<Path>,
-    ) -> Result<()> {
+    pub fn migrate_gz_to_xdr(gz_path: impl AsRef<Path>, xdr_path: impl AsRef<Path>) -> Result<()> {
         use std::io::Write;
 
         let gz_file = std::fs::File::open(gz_path.as_ref())?;
@@ -642,7 +639,10 @@ impl Bucket {
         }
 
         output.flush()?;
-        output.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        output
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
         Ok(())
     }
 
@@ -716,6 +716,17 @@ impl Bucket {
         matches!(&self.storage, BucketStorage::DiskBacked { .. })
     }
 
+    /// Get the backing file path for disk-backed buckets.
+    ///
+    /// Returns `Some(path)` for disk-backed buckets, `None` for in-memory buckets.
+    /// This is useful for garbage collection - tracking which files are still referenced.
+    pub fn backing_file_path(&self) -> Option<&Path> {
+        match &self.storage {
+            BucketStorage::DiskBacked { disk_bucket } => Some(disk_bucket.file_path()),
+            BucketStorage::InMemory { .. } => None,
+        }
+    }
+
     /// Iterate over entries in this bucket.
     ///
     /// For in-memory buckets, this is efficient. For disk-backed buckets,
@@ -743,10 +754,7 @@ impl Bucket {
     ///
     /// Each item is `(BucketEntry, record_size)` where `record_size` is the total
     /// bytes this entry occupies on disk.
-    pub fn iter_from_offset_with_sizes(
-        &self,
-        start_offset: u64,
-    ) -> BucketOffsetIter<'_> {
+    pub fn iter_from_offset_with_sizes(&self, start_offset: u64) -> BucketOffsetIter<'_> {
         match &self.storage {
             BucketStorage::InMemory { entries, .. } => {
                 BucketOffsetIter::InMemory(InMemoryOffsetIter {

@@ -1518,6 +1518,39 @@ impl BucketList {
         hashes
     }
 
+    /// Get all file paths referenced by disk-backed buckets in this bucket list.
+    ///
+    /// This includes:
+    /// - curr and snap buckets for all levels
+    /// - pending merge outputs that are disk-backed
+    ///
+    /// This is used for garbage collection - any files in the bucket directory
+    /// that aren't in this set can be safely deleted.
+    pub fn referenced_file_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut paths = std::collections::HashSet::new();
+
+        for level in &self.levels {
+            // Add curr bucket's backing file if disk-backed
+            if let Some(path) = level.curr.backing_file_path() {
+                paths.insert(path.to_path_buf());
+            }
+            // Add snap bucket's backing file if disk-backed
+            if let Some(path) = level.snap.backing_file_path() {
+                paths.insert(path.to_path_buf());
+            }
+            // Add pending merge output's backing file if disk-backed
+            if let Some(ref pending) = level.next {
+                if let PendingMerge::InMemory(bucket) = pending {
+                    if let Some(path) = bucket.backing_file_path() {
+                        paths.insert(path.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        paths
+    }
+
     /// Restore a bucket list from hashes and a bucket lookup function.
     pub fn restore_from_hashes<F>(hashes: &[Hash256], mut load_bucket: F) -> Result<Self>
     where

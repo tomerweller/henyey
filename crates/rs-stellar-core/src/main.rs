@@ -297,16 +297,13 @@ enum OfflineCommands {
         #[arg(long)]
         live_only: bool,
 
-        /// CDP data lake URL (default: AWS public testnet)
-        #[arg(
-            long,
-            default_value = "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet"
-        )]
-        cdp_url: String,
+        /// CDP data lake URL (default: network-specific - testnet or pubnet)
+        #[arg(long)]
+        cdp_url: Option<String>,
 
-        /// CDP date partition (default: 2025-12-18)
-        #[arg(long, default_value = "2025-12-18")]
-        cdp_date: String,
+        /// CDP date partition (default: 2025-12-18 for testnet, empty for mainnet)
+        #[arg(long)]
+        cdp_date: Option<String>,
     },
 
     /// Test transaction execution by comparing our results against CDP metadata
@@ -331,16 +328,13 @@ enum OfflineCommands {
         #[arg(long)]
         show_diff: bool,
 
-        /// CDP data lake URL (default: AWS public testnet)
-        #[arg(
-            long,
-            default_value = "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet"
-        )]
-        cdp_url: String,
+        /// CDP data lake URL (default: network-specific - testnet or pubnet)
+        #[arg(long)]
+        cdp_url: Option<String>,
 
-        /// CDP date partition (default: 2025-12-18)
-        #[arg(long, default_value = "2025-12-18")]
-        cdp_date: String,
+        /// CDP date partition (default: 2025-12-18 for testnet, empty for mainnet)
+        #[arg(long)]
+        cdp_date: Option<String>,
 
         /// Cache directory for buckets and CDP metadata (default: ~/.cache/rs-stellar-core)
         #[arg(long)]
@@ -1638,16 +1632,16 @@ async fn download_buckets_parallel(
 /// * `to` - End ledger sequence (defaults to latest available)
 /// * `stop_on_error` - Stop immediately on first hash mismatch
 /// * `live_only` - Only test live bucket list (ignore hot archive)
-/// * `cdp_url` - CDP data lake URL
-/// * `cdp_date` - CDP date partition
+/// * `cdp_url` - CDP data lake URL (defaults based on network)
+/// * `cdp_date` - CDP date partition (defaults based on network)
 async fn cmd_replay_bucket_list(
     config: AppConfig,
     from: Option<u32>,
     to: Option<u32>,
     stop_on_error: bool,
     live_only: bool,
-    cdp_url: &str,
-    cdp_date: &str,
+    cdp_url: Option<String>,
+    cdp_date: Option<String>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use stellar_core_bucket::{
@@ -1723,6 +1717,23 @@ async fn cmd_replay_bucket_list(
     }
     println!();
 
+    // Determine network and set CDP defaults
+    let is_mainnet = !config.network.passphrase.contains("Test");
+    let cdp_url = cdp_url.unwrap_or_else(|| {
+        if is_mainnet {
+            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/pubnet".to_string()
+        } else {
+            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet".to_string()
+        }
+    });
+    let cdp_date = cdp_date.unwrap_or_else(|| {
+        if is_mainnet {
+            String::new() // Empty for mainnet - no date partition
+        } else {
+            "2025-12-18".to_string()
+        }
+    });
+
     // Create archive client
     let archive = config
         .history
@@ -1733,7 +1744,8 @@ async fn cmd_replay_bucket_list(
         .ok_or_else(|| anyhow::anyhow!("No history archives available"))?;
 
     println!("Archive: {}", config.history.archives[0].url);
-    println!("CDP: {} ({})", cdp_url, cdp_date);
+    let cdp_date_display = if cdp_date.is_empty() { "none (range-based)" } else { &cdp_date };
+    println!("CDP: {} (date: {})", cdp_url, cdp_date_display);
 
     // Get current ledger and calculate range
     let root_has = archive.get_root_has().await?;
@@ -1777,7 +1789,7 @@ async fn cmd_replay_bucket_list(
     println!();
 
     // Create CDP client
-    let cdp = CdpDataLake::new(cdp_url, cdp_date);
+    let cdp = CdpDataLake::new(&cdp_url, &cdp_date);
 
     // Setup bucket manager and restore initial state from checkpoint BEFORE our test range
     let bucket_dir = tempfile::tempdir()?;
@@ -2543,8 +2555,8 @@ async fn cmd_replay_bucket_list(
 /// * `to` - End ledger sequence (defaults to latest available)
 /// * `stop_on_error` - Stop immediately on first mismatch
 /// * `show_diff` - Show detailed diff of mismatched entries
-/// * `cdp_url` - CDP data lake URL
-/// * `cdp_date` - CDP date partition
+/// * `cdp_url` - CDP data lake URL (defaults based on network)
+/// * `cdp_date` - CDP date partition (defaults based on network)
 /// * `cache_dir` - Optional cache directory for buckets and CDP metadata
 /// * `no_cache` - Disable caching (use temp directories)
 ///
@@ -2557,8 +2569,8 @@ async fn cmd_verify_execution(
     to: Option<u32>,
     stop_on_error: bool,
     show_diff: bool,
-    cdp_url: &str,
-    cdp_date: &str,
+    cdp_url: Option<String>,
+    cdp_date: Option<String>,
     cache_dir: Option<std::path::PathBuf>,
     no_cache: bool,
     quiet: bool,
@@ -2589,11 +2601,29 @@ async fn cmd_verify_execution(
     }
 
     // Determine network ID and network name
-    let (network_id, network_name) = if config.network.passphrase.contains("Test") {
-        (NetworkId::testnet(), "testnet")
+    let (network_id, network_name, is_mainnet) = if config.network.passphrase.contains("Test") {
+        (NetworkId::testnet(), "testnet", false)
     } else {
-        (NetworkId::mainnet(), "mainnet")
+        (NetworkId::mainnet(), "mainnet", true)
     };
+
+    // Set network-specific CDP defaults
+    // Mainnet (pubnet): no date partition, uses range-based directories
+    // Testnet: uses date partitions
+    let cdp_url = cdp_url.unwrap_or_else(|| {
+        if is_mainnet {
+            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/pubnet".to_string()
+        } else {
+            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet".to_string()
+        }
+    });
+    let cdp_date = cdp_date.unwrap_or_else(|| {
+        if is_mainnet {
+            String::new() // Empty for mainnet - no date partition
+        } else {
+            "2025-12-18".to_string()
+        }
+    });
 
     // Determine cache directory
     let cache_base = if no_cache {
@@ -2613,7 +2643,8 @@ async fn cmd_verify_execution(
 
     if !quiet {
         println!("Archive: {}", config.history.archives[0].url);
-        println!("CDP: {} ({})", cdp_url, cdp_date);
+        let cdp_date_display = if cdp_date.is_empty() { "none (range-based)" } else { &cdp_date };
+        println!("CDP: {} (date: {})", cdp_url, cdp_date_display);
         if let Some(ref cache) = cache_base {
             println!("Cache: {}", cache.display());
         } else {
@@ -2652,24 +2683,34 @@ async fn cmd_verify_execution(
     }
 
     // Create CDP client with caching
+    // We need to keep the temp directory alive for the duration of the function
+    let _cdp_dir_holder: Box<dyn std::any::Any>;
     let cdp = if let Some(ref cache) = cache_base {
-        CachedCdpDataLake::new(cdp_url, cdp_date, cache, network_name)?
+        _cdp_dir_holder = Box::new(());
+        CachedCdpDataLake::new(&cdp_url, &cdp_date, cache, network_name)?
     } else {
         let temp = tempfile::tempdir()?;
-        CachedCdpDataLake::new(cdp_url, cdp_date, temp.path(), network_name)?
+        let cdp = CachedCdpDataLake::new(&cdp_url, &cdp_date, temp.path(), network_name)?;
+        _cdp_dir_holder = Box::new(temp);
+        cdp
     };
 
-    // Prefetch CDP metadata for the ledger range
+    // CDP sliding window configuration
+    // Only keep CDP_WINDOW_SIZE ledgers cached at a time to limit disk usage.
+    // For 1M+ ledger verification, keeping all ledgers would use ~150GB.
+    // With a 500-ledger window: 500 * 150KB ≈ 75MB
+    const CDP_WINDOW_SIZE: u32 = 500;
+
+    // Prefetch initial CDP window (not the entire range)
     let prefetch_start = init_checkpoint + 1;
-    let prefetch_end = end_ledger;
+    let prefetch_end = std::cmp::min(prefetch_start + CDP_WINDOW_SIZE - 1, end_ledger);
     let cached = cdp.cached_count(prefetch_start, prefetch_end);
     let total = (prefetch_end - prefetch_start + 1) as usize;
     if cached < total {
         if !quiet {
             println!(
-                "Prefetching CDP metadata: {} cached, {} to download",
-                cached,
-                total - cached
+                "Prefetching initial CDP window: {} of {} ledgers (window size: {})",
+                total - cached, total, CDP_WINDOW_SIZE
             );
         }
         cdp.prefetch(prefetch_start, prefetch_end).await;
@@ -2677,11 +2718,11 @@ async fn cmd_verify_execution(
             println!();
         }
     } else if !quiet {
-        println!("CDP metadata: {} ledgers cached", cached);
+        println!("CDP metadata: {} ledgers in initial window already cached", cached);
         println!();
     }
     let t_cdp = init_start.elapsed();
-    println!("[INIT] CDP prefetch: {:.2}s", t_cdp.as_secs_f64());
+    println!("[INIT] CDP initial window prefetch: {:.2}s", t_cdp.as_secs_f64());
 
     // Setup bucket manager with persistent or temp directory
     // We need to keep the temp directory alive for the duration of the function
@@ -4769,6 +4810,72 @@ async fn cmd_verify_execution(
         }
 
         current_cp = next_cp;
+
+        // Clean up unreferenced merge temp files to prevent disk exhaustion
+        // during long-running verification. This removes merge-tmp-*.xdr files
+        // that are no longer referenced by the bucket lists.
+        {
+            let live_referenced = ledger_manager.bucket_list().read().referenced_file_paths();
+            let hot_referenced = {
+                let hot_guard = ledger_manager.hot_archive_bucket_list().read();
+                hot_guard.as_ref().map(|h| h.referenced_file_paths()).unwrap_or_default()
+            };
+            let mut all_referenced = live_referenced;
+            all_referenced.extend(hot_referenced);
+            let deleted = bucket_manager.cleanup_unreferenced_files(&all_referenced);
+            if let Ok(count) = deleted {
+                if count > 0 {
+                    tracing::debug!(
+                        checkpoint = current_cp,
+                        deleted_files = count,
+                        "Cleaned up unreferenced merge temp files"
+                    );
+                }
+            }
+        }
+
+        // CDP sliding window maintenance:
+        // 1. Delete ledgers we've already processed (before current checkpoint)
+        // 2. Prefetch ledgers ahead of our current position
+        // This keeps disk usage constant at ~CDP_WINDOW_SIZE * 150KB regardless of total range
+        {
+            let freq = stellar_core_history::CHECKPOINT_FREQUENCY;
+            // Calculate the first ledger of the checkpoint we just finished
+            let checkpoint_start = if current_cp > freq { current_cp - freq + 1 } else { 1 };
+            // Delete processed ledgers (everything before current checkpoint start)
+            if checkpoint_start > init_checkpoint + 1 {
+                let delete_end = checkpoint_start.saturating_sub(1);
+                let delete_start = delete_end.saturating_sub(freq); // Delete previous checkpoint's ledgers
+                let deleted = cdp.delete_cached_range(delete_start, delete_end);
+                if deleted > 0 {
+                    tracing::debug!(
+                        delete_start,
+                        delete_end,
+                        deleted,
+                        "Deleted processed CDP cache files"
+                    );
+                }
+            }
+
+            // Prefetch ahead: maintain a window of CDP_WINDOW_SIZE ledgers from current position
+            let prefetch_start = current_cp + 1;
+            let prefetch_end = std::cmp::min(prefetch_start + CDP_WINDOW_SIZE - 1, end_ledger);
+            if prefetch_start <= end_ledger {
+                let to_prefetch = (prefetch_start..=prefetch_end)
+                    .filter(|seq| !cdp.is_cached(*seq))
+                    .count();
+                if to_prefetch > 0 {
+                    tracing::debug!(
+                        prefetch_start,
+                        prefetch_end,
+                        to_prefetch,
+                        "Prefetching CDP window ahead"
+                    );
+                    // Prefetch in background - don't block the loop
+                    cdp.prefetch(prefetch_start, prefetch_end).await;
+                }
+            }
+        }
     }
     let total_verification_time = verification_start.elapsed();
 
@@ -6554,8 +6661,8 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
                 to,
                 stop_on_error,
                 live_only,
-                &cdp_url,
-                &cdp_date,
+                cdp_url,
+                cdp_date,
             )
             .await
         }
@@ -6576,8 +6683,8 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
                 to,
                 stop_on_error,
                 show_diff,
-                &cdp_url,
-                &cdp_date,
+                cdp_url,
+                cdp_date,
                 cache_dir,
                 no_cache,
                 quiet,

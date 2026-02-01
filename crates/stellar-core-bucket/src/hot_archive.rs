@@ -179,6 +179,17 @@ impl HotArchiveBucket {
         }
     }
 
+    /// Get the backing file path for disk-backed buckets.
+    ///
+    /// Returns `Some(path)` for disk-backed buckets, `None` for in-memory buckets.
+    /// This is used for garbage collection - tracking which files are still referenced.
+    pub fn backing_file_path(&self) -> Option<&Path> {
+        match &self.storage {
+            HotArchiveStorage::DiskBacked { path, .. } => Some(path.as_path()),
+            HotArchiveStorage::InMemory { .. } => None,
+        }
+    }
+
     /// Get the protocol version (bucket version) from the metadata entry.
     ///
     /// This matches C++ stellar-core's `getBucketVersion()` method.
@@ -771,6 +782,37 @@ impl HotArchiveBucketList {
             .iter()
             .enumerate()
             .map(|(idx, level)| (idx, level.hash(), level.curr.hash(), level.snap.hash()))
+    }
+
+    /// Get all file paths referenced by disk-backed buckets in this bucket list.
+    ///
+    /// This includes:
+    /// - curr and snap buckets for all levels
+    /// - pending merge outputs (next) that are disk-backed
+    ///
+    /// This is used for garbage collection - any files in the bucket directory
+    /// that aren't in this set can be safely deleted.
+    pub fn referenced_file_paths(&self) -> std::collections::HashSet<PathBuf> {
+        let mut paths = std::collections::HashSet::new();
+
+        for level in &self.levels {
+            // Add curr bucket's backing file if disk-backed
+            if let Some(path) = level.curr.backing_file_path() {
+                paths.insert(path.to_path_buf());
+            }
+            // Add snap bucket's backing file if disk-backed
+            if let Some(path) = level.snap.backing_file_path() {
+                paths.insert(path.to_path_buf());
+            }
+            // Add pending merge output's backing file if disk-backed
+            if let Some(ref pending) = level.next {
+                if let Some(path) = pending.backing_file_path() {
+                    paths.insert(path.to_path_buf());
+                }
+            }
+        }
+
+        paths
     }
 
     /// Get a reference to a level.
