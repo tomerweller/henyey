@@ -2003,13 +2003,12 @@ impl LedgerManager {
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
         let state = self.state.read();
-        // Convert IndexMap to HashMap for the snapshot
-        let entries: HashMap<Vec<u8>, LedgerEntry> = self
-            .entry_cache
-            .read()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Use an empty entry cache - all lookups go through lookup_fn which handles:
+        // - Soroban types (CONTRACT_DATA, CONTRACT_CODE, TTL): O(1) via in-memory soroban_state
+        // - Classic types (accounts, trustlines, offers, etc.): O(log n) via bucket list snapshot
+        // This avoids cloning up to 100k entries on every ledger, which was causing severe
+        // performance degradation (45ms per ledger once cache filled).
+        let entries = HashMap::new();
 
         let snapshot = LedgerSnapshot::new(state.header.clone(), state.header_hash, entries);
 
