@@ -232,7 +232,7 @@ This implementation intentionally limits scope:
 
 | Constraint | Rationale |
 |------------|-----------|
-| **Protocol 23+ only** | Focus on current protocol behavior |
+| **Protocol 24+ only** | Focus on current protocol behavior |
 | **SQLite-only** | Simplicity over PostgreSQL support |
 | **No metrics** | Prometheus integration out of scope |
 | **No admin API** | HTTP admin interface not implemented |

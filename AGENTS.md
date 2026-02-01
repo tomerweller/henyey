@@ -59,5 +59,5 @@
 ## Configuration & Operational Notes
 
 - SQLite is the only supported database backend.
-- Protocol support is 23+ only; do not add legacy protocol behavior.
+- Protocol support is 24+ only; do not add legacy protocol behavior.
 - The Stellar Core v25 C++ upstream is available locally under `.upstream-v25/` for parity checks.

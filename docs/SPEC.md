@@ -1,7 +1,7 @@
 # rs-stellar-core Specification
 
 **Version:** 0.1.0
-**Target Protocol:** v25.x (Protocol 23+ behavior)
+**Target Protocol:** v25.x (Protocol 24+ behavior)
 **Network:** Testnet primary; mainnet readiness is a later milestone
 
 ## 1. Overview
@@ -14,12 +14,12 @@ This project is **not** production-grade.
 
 1. Deterministic parity with stellar-core v25.x for observable behavior.
 2. Modular 1:1 mapping between upstream subsystems and crates.
-3. Protocol 23+ only to reduce legacy complexity.
+3. Protocol 24+ only to reduce legacy complexity.
 4. Educational, auditable Rust implementation.
 
 ### 1.2 Non-Goals
 
-- Legacy protocol support (1–22).
+- Legacy protocol support (1–23).
 - PostgreSQL support (SQLite only).
 - Full metrics parity with stellar-core.
 - Production deployment or operational hardening.
@@ -106,7 +106,7 @@ Each crate contains a README with subsystem documentation and upstream mapping.
 ### 4.1 Stellar Rust Crates
 
 - `stellar-xdr` (v25)
-- `soroban-env-host` (Protocol 23+ compatible)
+- `soroban-env-host` (Protocol 24+ compatible)
 - `soroban-env-common`
 
 ### 4.2 Third-Party Crates (selected)
@@ -121,7 +121,7 @@ Each crate contains a README with subsystem documentation and upstream mapping.
 
 ## 5. Protocol Support
 
-- Protocol 23+ behavior only (targeting v25.x).
+- Protocol 24+ behavior only (targeting v25.x).
 - Soroban operations supported via host integration.
 
 ## 5.1 Transaction Execution and State Management
