@@ -2912,12 +2912,11 @@ async fn cmd_verify_execution(
         LedgerManagerConfig {
             validate_bucket_hash: true,
             persist_to_db: false,
-            max_entry_cache_size: 100_000,
             ..Default::default()
         },
     );
 
-    // Initialize LedgerManager (handles soroban_state, SQL offers, module_cache, entry_cache)
+    // Initialize LedgerManager (handles soroban_state, SQL offers, module_cache)
     let init_header_hash = init_header_entry.map(|h| Hash256::from(h.hash.0));
     let t_init_caches_start = std::time::Instant::now();
     ledger_manager
@@ -2948,21 +2947,18 @@ async fn cmd_verify_execution(
         let offer_count = ledger_manager.offer_store_count();
         let aa_index_keys = ledger_manager.offer_account_asset_index_len();
         let aa_index_ids = ledger_manager.offer_account_asset_index_total_ids();
-        let entry_cache = ledger_manager.entry_cache_count();
         println!(
-            "[CACHE] offer_store: {} offers, account_asset_index: {} keys / {} id-entries, entry_cache: {} entries",
-            offer_count, aa_index_keys, aa_index_ids, entry_cache,
+            "[CACHE] offer_store: {} offers, account_asset_index: {} keys / {} id-entries",
+            offer_count, aa_index_keys, aa_index_ids,
         );
         // Rough memory estimates (per-entry overhead)
         // offer_store: ~1 KB per LedgerEntry (XDR OfferEntry + HashMap overhead)
         // account_asset_index: ~80 bytes per key + 8 bytes per id in HashSet
-        // entry_cache: ~1 KB per LedgerEntry + key bytes
         let offer_store_mb = offer_count as f64 * 1.0 / 1024.0;
         let aa_index_mb = (aa_index_keys as f64 * 80.0 + aa_index_ids as f64 * 8.0) / 1024.0 / 1024.0;
-        let entry_cache_mb = entry_cache as f64 * 1.0 / 1024.0;
         println!(
-            "[CACHE] Estimated memory: offer_store ~{:.1}MB, account_asset_index ~{:.1}MB, entry_cache ~{:.1}MB",
-            offer_store_mb, aa_index_mb, entry_cache_mb,
+            "[CACHE] Estimated memory: offer_store ~{:.1}MB, account_asset_index ~{:.1}MB",
+            offer_store_mb, aa_index_mb,
         );
     }
 
@@ -5004,13 +5000,11 @@ async fn cmd_verify_execution(
         let offer_count = ledger_manager.offer_store_count();
         let aa_index_keys = ledger_manager.offer_account_asset_index_len();
         let aa_index_ids = ledger_manager.offer_account_asset_index_total_ids();
-        let entry_cache = ledger_manager.entry_cache_count();
         println!();
         println!("Final Cache Sizes");
         println!("=================");
         println!("  offer_store:          {} offers", offer_count);
         println!("  account_asset_index:  {} keys, {} id-entries", aa_index_keys, aa_index_ids);
-        println!("  entry_cache:          {} entries", entry_cache);
 
         // Read RSS from /proc/self/status
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {

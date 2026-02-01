@@ -752,7 +752,6 @@ impl App {
                 persist_to_db: true,
                 emit_classic_events: config.events.emit_classic_events,
                 backfill_stellar_asset_events: config.events.backfill_stellar_asset_events,
-                ..Default::default()
             },
         ));
         tracing::info!("Ledger manager initialized");

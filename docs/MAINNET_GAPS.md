@@ -320,17 +320,17 @@ This represents a **~4.6x increase** in memory usage over 5 hours of operation.
 
 1. ~~**Profile memory allocation** - Identify which structures are growing~~ (Done)
 2. **Add memory metrics** - Track cache sizes, entry counts over time
-3. ~~**Implement cache eviction** - Bound memory usage for caches~~ (Done - entry_cache now has FIFO eviction)
+3. ~~**Implement cache eviction** - Bound memory usage for caches~~ (Done - general entry_cache removed; dedicated caches used instead)
 4. **Fix hash mismatch root cause** - Reduce catchup frequency
 5. **Ensure proper cleanup** - Release old slot data, tx sets, etc.
 
 ### Fixes Applied
 
-1. **Entry cache eviction** (Jan 2026)
-   - Added `max_entry_cache_size` configuration (default: 100,000 entries)
-   - Implemented FIFO eviction using `IndexMap` to maintain insertion order
-   - Oldest entries are evicted when cache exceeds limit
-   - This bounds the entry cache memory growth during normal operation
+1. **Entry cache removed** (Feb 2026)
+   - The general-purpose `entry_cache` (IndexMap of all ledger entries) has been removed
+   - Bucket list lookups are fast (~200us) with mmap and advanced indexing
+   - Dedicated caches (soroban_state, offer_store, module_cache) cover hot-path entries
+   - TX execution uses snapshot-based lookups with batch loading, not the entry cache
 
 ### Mitigation (Current)
 
@@ -361,8 +361,7 @@ After catchup completes, `initialize_all_caches()` calls `live_entries()` which:
 1. **Iterates ALL buckets** across all 11 levels
 2. **Materializes ALL entries** into a `Vec<LedgerEntry>`
 3. **Builds multiple in-memory caches:**
-   - `entry_cache` - HashMap of all ledger entries
-   - `offer_cache` - All DEX offers
+   - `offer_store` - All DEX offers
    - `soroban_state` - All Soroban entries (contracts, data, code, TTLs)
    - `module_cache` - Compiled WASM modules
 

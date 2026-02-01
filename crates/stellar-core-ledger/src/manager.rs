@@ -8,7 +8,7 @@
 //!
 //! The [`LedgerManager`] is responsible for:
 //!
-//! - **State Management**: Maintaining the current ledger header and entry cache
+//! - **State Management**: Maintaining the current ledger header
 //! - **Bucket List Integration**: Updating the Merkle tree of ledger entries
 //! - **Transaction Execution**: Coordinating transaction processing via [`LedgerCloseContext`]
 //! - **Snapshot Management**: Providing consistent point-in-time views for queries
@@ -38,7 +38,6 @@ use crate::{
     snapshot::{LedgerSnapshot, SnapshotHandle, SnapshotManager},
     LedgerError, Result,
 };
-use indexmap::IndexMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -56,9 +55,9 @@ use stellar_xdr::curr::{
     ConfigSettingScpTiming, EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet,
     Hash, LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData,
     LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
-    LedgerKeyConfigSetting, Limits, TransactionEventStage, TransactionMeta, TransactionPhase,
+    LedgerKeyConfigSetting, TransactionEventStage, TransactionMeta, TransactionPhase,
     TransactionResultMetaV1, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
-    UpgradeEntryMeta, VecM, WriteXdr,
+    UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
 
@@ -224,15 +223,6 @@ pub struct LedgerManagerConfig {
     /// Set to 0 to disable snapshot retention (not recommended for production).
     pub max_snapshots: usize,
 
-    /// Maximum number of entries to keep in the entry cache.
-    ///
-    /// When the cache exceeds this limit, the oldest entries (by insertion
-    /// order) are evicted. This prevents unbounded memory growth during
-    /// long-running validator operation.
-    ///
-    /// Set to 0 to disable caching. Default is 100,000 entries.
-    pub max_entry_cache_size: usize,
-
     /// Whether to validate bucket list hashes against header values.
     ///
     /// When enabled, the computed bucket list hash is verified against the
@@ -263,7 +253,6 @@ impl Default for LedgerManagerConfig {
     fn default() -> Self {
         Self {
             max_snapshots: 10,
-            max_entry_cache_size: 100_000,
             validate_bucket_hash: true,
             persist_to_db: true,
             emit_classic_events: false,
@@ -302,8 +291,6 @@ struct LedgerState {
 ///
 /// - **Bucket List**: The Merkle tree of all ledger entries, providing
 ///   cryptographic integrity for the state
-/// - **Entry Cache**: In-memory cache of recently accessed entries for
-///   fast lookups during transaction processing
 /// - **Database**: Persistent storage for ledger headers and metadata
 /// - **Snapshot Manager**: Provides point-in-time views for concurrent access
 ///
@@ -347,12 +334,6 @@ pub struct LedgerManager {
 
     /// Current mutable ledger state.
     state: RwLock<LedgerState>,
-
-    /// In-memory cache of recently accessed ledger entries.
-    ///
-    /// Keys are XDR-encoded LedgerKey bytes. Uses IndexMap to maintain
-    /// insertion order for FIFO eviction when the cache exceeds max_entry_cache_size.
-    entry_cache: RwLock<IndexMap<Vec<u8>, LedgerEntry>>,
 
     /// Manager for point-in-time snapshots.
     snapshots: SnapshotManager,
@@ -422,7 +403,6 @@ impl LedgerManager {
                 header_hash: Hash256::ZERO,
                 initialized: false,
             }),
-            entry_cache: RwLock::new(IndexMap::new()),
             snapshots: SnapshotManager::new(config.max_snapshots),
             config,
             module_cache: RwLock::new(None),
@@ -525,11 +505,6 @@ impl LedgerManager {
             .sum()
     }
 
-    /// Get the number of entries in the general entry cache.
-    pub fn entry_cache_count(&self) -> usize {
-        self.entry_cache.read().len()
-    }
-
     /// Update the ledger header and hash for offline replay scenarios.
     ///
     /// This updates the internal state so that `create_snapshot()` uses the
@@ -550,11 +525,6 @@ impl LedgerManager {
         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::ScpTiming,
         });
-        let key_bytes = key.to_xdr(Limits::none()).ok()?;
-
-        if let Some(entry) = self.entry_cache.read().get(&key_bytes) {
-            return extract_scp_timing(entry);
-        }
 
         let entry = self.bucket_list.read().get(&key).ok()??;
         extract_scp_timing(&entry)
@@ -577,32 +547,7 @@ impl LedgerManager {
 
     /// Load a ledger entry by key.
     pub fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        // First check the cache
-        let key_bytes = key.to_xdr(Limits::none())?;
-        if let Some(entry) = self.entry_cache.read().get(&key_bytes) {
-            return Ok(Some(entry.clone()));
-        }
-
-        // Then check the bucket list
-        let entry = self.bucket_list.read().get(key)?;
-
-        // Cache the result if found, with eviction if needed
-        if let Some(ref entry) = entry {
-            let mut cache = self.entry_cache.write();
-            cache.insert(key_bytes, entry.clone());
-
-            // Evict oldest entries if cache exceeds limit
-            let max_size = self.config.max_entry_cache_size;
-            if max_size > 0 && cache.len() > max_size {
-                let to_remove = cache.len() - max_size;
-                // Remove oldest entries (from front of IndexMap)
-                for _ in 0..to_remove {
-                    cache.shift_remove_index(0);
-                }
-            }
-        }
-
-        Ok(entry)
+        Ok(self.bucket_list.read().get(key)?)
     }
 
     /// Load an account by ID.
@@ -743,9 +688,6 @@ impl LedgerManager {
         // Release state lock before initializing caches (which need bucket_list read lock)
         drop(state);
 
-        // Clear entry cache
-        self.entry_cache.write().clear();
-
         // Initialize all caches in a single pass over live_entries().
         // This is a significant memory optimization - previously we called live_entries()
         // three times (for module cache, offer cache, and soroban state), each creating
@@ -805,9 +747,6 @@ impl LedgerManager {
         state.header_hash = header_hash;
         state.initialized = true;
 
-        // Clear entry cache
-        self.entry_cache.write().clear();
-
         // Initialize module cache for Soroban contract execution
         drop(state); // Release state lock before initializing module cache
         self.initialize_module_cache(header.ledger_version)?;
@@ -828,7 +767,6 @@ impl LedgerManager {
         *self.hot_archive_bucket_list.write() = None;
 
         // Clear all caches to release memory before re-initialization
-        self.entry_cache.write().clear();
         self.snapshots.clear();
 
         // Explicitly drop old module cache to release memory
@@ -1734,9 +1672,6 @@ impl LedgerManager {
             let header_hash_hex = state.header_hash.to_hex();
             let protocol_version = header.ledger_version;
 
-            // Clear entry cache
-            self.entry_cache.write().clear();
-
             (ledger_seq, header_hash_hex, protocol_version)
         }; // state lock dropped here, before any await points
 
@@ -2209,36 +2144,6 @@ impl LedgerManager {
             }
         }
 
-        // Update entry cache with changes
-        {
-            let mut cache = self.entry_cache.write();
-            for change in delta.changes() {
-                let key = change.key()?;
-                let key_bytes = key.to_xdr(Limits::none())?;
-
-                match change {
-                    EntryChange::Created(entry) => {
-                        cache.insert(key_bytes, entry.clone());
-                    }
-                    EntryChange::Updated { current, .. } => {
-                        cache.insert(key_bytes, current.as_ref().clone());
-                    }
-                    EntryChange::Deleted { .. } => {
-                        cache.swap_remove(&key_bytes);
-                    }
-                }
-            }
-
-            // Evict oldest entries if cache exceeds limit
-            let max_size = self.config.max_entry_cache_size;
-            if max_size > 0 && cache.len() > max_size {
-                let to_remove = cache.len() - max_size;
-                for _ in 0..to_remove {
-                    cache.shift_remove_index(0);
-                }
-            }
-        }
-
         // Update SQL offers table and in-memory offer store with offer changes
         if *self.offers_initialized.read() {
             let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
@@ -2327,8 +2232,7 @@ impl LedgerManager {
     /// 3. Soroban state update (init/live/dead)
     /// 4. Module cache update (new contract code)
     /// 5. SQL offers update (insert/update/delete)
-    /// 6. Entry cache update
-    /// 7. Internal header update
+    /// 6. Internal header update
     #[allow(clippy::too_many_arguments)]
     pub fn apply_ledger_close(
         &self,
@@ -2411,12 +2315,7 @@ impl LedgerManager {
         self.update_offers_from_entries(init_entries, live_entries, dead_entries)?;
         let offers_update_us = t0.elapsed().as_micros() as u64;
 
-        // 6. Entry cache update
-        let t0 = std::time::Instant::now();
-        self.update_entry_cache_from_entries(init_entries, live_entries, dead_entries);
-        let entry_cache_us = t0.elapsed().as_micros() as u64;
-
-        // 7. Update header
+        // 6. Update header
         self.set_state(new_header, new_header_hash);
 
         let total_us = close_start.elapsed().as_micros() as u64;
@@ -2428,7 +2327,6 @@ impl LedgerManager {
             soroban_update_us,
             module_cache_us,
             offers_update_us,
-            entry_cache_us,
             init_count = init_entries.len(),
             live_count = live_entries.len(),
             dead_count = dead_entries.len(),
@@ -2515,39 +2413,6 @@ impl LedgerManager {
         Ok(())
     }
 
-    /// Update entry cache from init/live/dead entry vectors.
-    fn update_entry_cache_from_entries(
-        &self,
-        init_entries: &[LedgerEntry],
-        live_entries: &[LedgerEntry],
-        dead_entries: &[LedgerKey],
-    ) {
-        let mut cache = self.entry_cache.write();
-
-        for entry in init_entries.iter().chain(live_entries.iter()) {
-            if let Some(key) = stellar_core_bucket::ledger_entry_to_key(entry) {
-                if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                    cache.insert(key_bytes, entry.clone());
-                }
-            }
-        }
-
-        for key in dead_entries {
-            if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                cache.swap_remove(&key_bytes);
-            }
-        }
-
-        // Evict oldest entries if cache exceeds limit
-        let max_size = self.config.max_entry_cache_size;
-        if max_size > 0 && cache.len() > max_size {
-            let to_remove = cache.len() - max_size;
-            for _ in 0..to_remove {
-                cache.shift_remove_index(0);
-            }
-        }
-    }
-
     /// Get the database handle.
     pub fn database(&self) -> &Database {
         &self.db
@@ -2557,7 +2422,6 @@ impl LedgerManager {
     pub fn stats(&self) -> LedgerManagerStats {
         LedgerManagerStats {
             ledger_seq: self.current_ledger_seq(),
-            cached_entries: self.entry_cache.read().len(),
             active_snapshots: self.snapshots.count(),
         }
     }
@@ -2583,12 +2447,6 @@ impl LedgerManager {
 pub struct LedgerManagerStats {
     /// Current ledger sequence number.
     pub ledger_seq: u32,
-
-    /// Number of entries currently in the in-memory cache.
-    ///
-    /// A high value may indicate memory pressure; consider tuning cache
-    /// eviction if this grows unbounded.
-    pub cached_entries: usize,
 
     /// Number of active point-in-time snapshots.
     ///
