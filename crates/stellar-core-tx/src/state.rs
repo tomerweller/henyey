@@ -85,7 +85,6 @@ pub struct Savepoint {
     // Liquidity pool snapshots (shouldn't change during orderbook speculation,
     // but save for completeness)
     liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
-
 }
 
 /// Trait for reading ledger entries from storage.
@@ -881,18 +880,12 @@ impl LedgerStateManager {
     /// When set, `ensure_account_loaded` and `ensure_trustline_loaded` can
     /// fetch entries on demand during offer crossing instead of requiring
     /// all dependencies to be preloaded upfront.
-    pub fn set_entry_loader(
-        &mut self,
-        loader: Arc<EntryLoaderFn>,
-    ) {
+    pub fn set_entry_loader(&mut self, loader: Arc<EntryLoaderFn>) {
         self.entry_loader = Some(loader);
     }
 
     /// Set a batch entry loader for loading multiple entries in one bucket list pass.
-    pub fn set_batch_entry_loader(
-        &mut self,
-        loader: Arc<BatchEntryLoaderFn>,
-    ) {
+    pub fn set_batch_entry_loader(&mut self, loader: Arc<BatchEntryLoaderFn>) {
         self.batch_entry_loader = Some(loader);
     }
 
@@ -970,10 +963,9 @@ impl LedgerStateManager {
             return Ok(true);
         }
         if let Some(loader) = self.entry_loader.take() {
-            let ledger_key =
-                LedgerKey::Account(LedgerKeyAccount {
-                    account_id: account_id.clone(),
-                });
+            let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+                account_id: account_id.clone(),
+            });
             let result = loader(&ledger_key);
             self.entry_loader = Some(loader); // restore before handling result
             if let Some(entry) = result? {
@@ -1000,11 +992,10 @@ impl LedgerStateManager {
         }
         if let Some(loader) = self.entry_loader.take() {
             let tl_asset = asset_to_trustline_asset(asset);
-            let ledger_key =
-                LedgerKey::Trustline(LedgerKeyTrustLine {
-                    account_id: account_id.clone(),
-                    asset: tl_asset,
-                });
+            let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                account_id: account_id.clone(),
+                asset: tl_asset,
+            });
             let result = loader(&ledger_key);
             self.entry_loader = Some(loader); // restore before handling result
             if let Some(entry) = result? {
@@ -1014,7 +1005,6 @@ impl LedgerStateManager {
         }
         Ok(false)
     }
-
 
     /// Temporarily remove large Soroban collections to make clone() cheap.
     ///
@@ -2527,11 +2517,7 @@ impl LedgerStateManager {
     /// Get all offers for a specific buying/selling asset pair.
     ///
     /// Returns cloned OfferEntry values for each offer in the pair's order book.
-    pub fn offers_for_asset_pair(
-        &self,
-        buying: &Asset,
-        selling: &Asset,
-    ) -> Vec<OfferEntry> {
+    pub fn offers_for_asset_pair(&self, buying: &Asset, selling: &Asset) -> Vec<OfferEntry> {
         self.offer_index
             .offers_for_pair(buying, selling)
             .filter_map(|key| self.offers.get(&(key.seller, key.offer_id)).cloned())
@@ -2571,9 +2557,10 @@ impl LedgerStateManager {
         let offers_to_remove: Vec<OfferEntry> = offer_ids
             .iter()
             .filter_map(|&offer_id| {
-                self.offers.get(&(account_key, offer_id)).cloned().filter(
-                    |offer| offer.buying == *asset || offer.selling == *asset,
-                )
+                self.offers
+                    .get(&(account_key, offer_id))
+                    .cloned()
+                    .filter(|offer| offer.buying == *asset || offer.selling == *asset)
             })
             .collect();
 
@@ -4194,7 +4181,8 @@ impl LedgerStateManager {
 
         // Phase 5: Truncate modified tracking vecs
         self.modified_accounts.truncate(sp.modified_accounts_len);
-        self.modified_trustlines.truncate(sp.modified_trustlines_len);
+        self.modified_trustlines
+            .truncate(sp.modified_trustlines_len);
 
         // Phase 6: Restore entry metadata
 
@@ -4638,13 +4626,12 @@ impl LedgerStateManager {
                     if should_record {
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.account_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.account_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.account_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -4672,13 +4659,12 @@ impl LedgerStateManager {
                     if should_record {
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.trustline_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.trustline_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.trustline_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -4706,13 +4692,12 @@ impl LedgerStateManager {
                     if should_record {
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.offer_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.offer_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.offer_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -4740,13 +4725,12 @@ impl LedgerStateManager {
                     if should_record {
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.data_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.data_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.data_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -4769,13 +4753,12 @@ impl LedgerStateManager {
                         });
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.contract_data_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.contract_data_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.contract_data_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -4796,13 +4779,12 @@ impl LedgerStateManager {
                         });
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.contract_code_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.contract_code_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.contract_code_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -4876,13 +4858,12 @@ impl LedgerStateManager {
                     if should_record {
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.claimable_balance_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.claimable_balance_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.claimable_balance_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -4909,13 +4890,12 @@ impl LedgerStateManager {
                     if should_record {
                         // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
                         // Otherwise fall back to transaction-level snapshot
-                        let pre_state = if let Some(op_snapshot) =
-                            self.op_entry_snapshots.get(&ledger_key)
-                        {
-                            op_snapshot.clone()
-                        } else {
-                            self.liquidity_pool_to_ledger_entry(snapshot_entry)
-                        };
+                        let pre_state =
+                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
+                                op_snapshot.clone()
+                            } else {
+                                self.liquidity_pool_to_ledger_entry(snapshot_entry)
+                            };
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.liquidity_pool_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
@@ -5935,11 +5915,7 @@ mod tests {
     }
 
     /// Helper to query the account_asset_offers index for a (seller, asset) pair.
-    fn aa_index_get(
-        manager: &LedgerStateManager,
-        seller_seed: u8,
-        asset: &Asset,
-    ) -> HashSet<i64> {
+    fn aa_index_get(manager: &LedgerStateManager, seller_seed: u8, asset: &Asset) -> HashSet<i64> {
         let seller = [seller_seed; 32];
         let asset_key = AssetKey::from_asset(asset);
         manager
@@ -6034,7 +6010,10 @@ mod tests {
         manager.create_offer(offer);
 
         // Verify initial state
-        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+        assert_eq!(
+            aa_index_get(&manager, 1, &usd_asset()),
+            HashSet::from([100])
+        );
         assert_eq!(aa_index_get(&manager, 1, &eur_asset()), HashSet::new());
 
         // Update offer to change buying asset from USD to EUR
@@ -6043,10 +6022,16 @@ mod tests {
 
         // offer_id should be removed from USD and added to EUR
         assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::new());
-        assert_eq!(aa_index_get(&manager, 1, &eur_asset()), HashSet::from([100]));
+        assert_eq!(
+            aa_index_get(&manager, 1, &eur_asset()),
+            HashSet::from([100])
+        );
 
         // Native should still have the offer
-        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
+        assert_eq!(
+            aa_index_get(&manager, 1, &Asset::Native),
+            HashSet::from([100])
+        );
     }
 
     #[test]
@@ -6118,8 +6103,14 @@ mod tests {
         manager.create_offer(offer);
 
         // Index should be populated
-        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
-        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+        assert_eq!(
+            aa_index_get(&manager, 1, &Asset::Native),
+            HashSet::from([100])
+        );
+        assert_eq!(
+            aa_index_get(&manager, 1, &usd_asset()),
+            HashSet::from([100])
+        );
 
         // Rollback should remove the offer (it was created in this tx)
         manager.rollback();
@@ -6150,8 +6141,14 @@ mod tests {
         manager.rollback();
 
         // After rollback, only offer1 should remain
-        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
-        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+        assert_eq!(
+            aa_index_get(&manager, 1, &Asset::Native),
+            HashSet::from([100])
+        );
+        assert_eq!(
+            aa_index_get(&manager, 1, &usd_asset()),
+            HashSet::from([100])
+        );
     }
 
     #[test]
@@ -6180,7 +6177,13 @@ mod tests {
         manager.rollback_to_savepoint(sp);
 
         // Only offer1 should remain
-        assert_eq!(aa_index_get(&manager, 1, &Asset::Native), HashSet::from([100]));
-        assert_eq!(aa_index_get(&manager, 1, &usd_asset()), HashSet::from([100]));
+        assert_eq!(
+            aa_index_get(&manager, 1, &Asset::Native),
+            HashSet::from([100])
+        );
+        assert_eq!(
+            aa_index_get(&manager, 1, &usd_asset()),
+            HashSet::from([100])
+        );
     }
 }

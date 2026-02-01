@@ -186,6 +186,24 @@ pub fn execute_create_claimable_balance(
         0,
     )?;
     if sponsor_account.balance < sponsor_min_balance {
+        // Rollback the balance deduction since the operation failed.
+        // In C++ stellar-core, the LedgerTxn for this operation is not committed
+        // when the operation fails, so changes are rolled back automatically.
+        // We must do this explicitly.
+        match &op.asset {
+            Asset::Native => {
+                if let Some(account) = state.get_account_mut(source) {
+                    account.balance += op.amount;
+                }
+            }
+            _ => {
+                if issuer.as_ref() != Some(source) {
+                    if let Some(tl) = state.get_trustline_mut(source, &op.asset) {
+                        tl.balance += op.amount;
+                    }
+                }
+            }
+        }
         return Ok(make_create_result(
             CreateClaimableBalanceResultCode::LowReserve,
             None,

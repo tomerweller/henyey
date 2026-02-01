@@ -63,7 +63,7 @@ pub fn execute_change_trust(
 
     if op.limit == 0 {
         // Removing trustline
-        let Some(tl) = existing else {
+        let Some(tl) = state.get_trustline_by_trustline_asset(source, &tl_asset) else {
             return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
         };
         if tl.balance > 0 {
@@ -114,12 +114,15 @@ pub fn execute_change_trust(
         state.delete_trustline_by_trustline_asset(source, &tl_asset);
     } else if existing.is_some() {
         // Updating existing trustline
-        let existing_balance = existing.map(|tl| tl.balance).unwrap_or(0);
-        let existing_buying_liab = existing
-            .map(trustline_liabilities)
-            .map(|l| l.buying)
-            .unwrap_or(0);
-        if op.limit < existing_balance.saturating_add(existing_buying_liab) {
+        // IMPORTANT: Re-read the trustline from state to get the current balance,
+        // which may have been modified by earlier operations in this transaction.
+        // The `existing` variable captured at the start of the function may be stale.
+        let current_tl = state
+            .get_trustline_by_trustline_asset(source, &tl_asset)
+            .ok_or(TxError::Internal("trustline disappeared".into()))?;
+        let current_balance = current_tl.balance;
+        let current_buying_liab = trustline_liabilities(current_tl).buying;
+        if op.limit < current_balance.saturating_add(current_buying_liab) {
             return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
         }
 
