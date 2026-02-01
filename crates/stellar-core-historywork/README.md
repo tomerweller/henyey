@@ -25,20 +25,23 @@ Work items are organized as a directed acyclic graph (DAG) of dependencies:
                    |  Fetch HAS  |
                    +------+------+
                           |
-          +---------------+---------------+
-          |               |               |
-          v               v               v
-   +------------+  +------------+  +------------+
-   |  Download  |  |  Download  |  |  Download  |
-   |  Buckets   |  |  Headers   |  |    SCP     |
-   +------------+  +------+-----+  +------------+
-                          |
-                   +------+------+
-                   v             v
-            +------------+ +------------+
-            |  Download  | |  Download  |
-            |Transactions| |  Results   |
-            +------------+ +------------+
+              +-----------+-----------+
+              |                       |
+              v                       v
+       +------------+         +------------+
+       |  Download  |         |  Download  |
+       |  Buckets   |         |  Headers   |
+       +------------+         +------+-----+
+                                     |
+                          +----------+----------+
+                          |          |          |
+                          v          v          v
+                   +----------+ +----------+ +-------+
+                   | Download | | Download | |Download|
+                   |   Txs    | | Results  | |  SCP   |
+                   +----------+ +----+-----+ +-------+
+                                     |
+                            (depends on Txs too)
 ```
 
 All work items share state through `SharedHistoryState`, a thread-safe container
@@ -50,10 +53,19 @@ that accumulates downloaded data as work progresses.
 |------|-------------|
 | `HistoryWorkState` | Shared container for downloaded history data |
 | `SharedHistoryState` | Thread-safe handle (`Arc<Mutex<...>>`) to work state |
-| `HistoryWorkBuilder` | Factory for registering work items with dependencies |
+| `HistoryWorkBuilder` | Factory for registering single-checkpoint work items with dependencies |
+| `HistoryWorkIds` | IDs returned by `HistoryWorkBuilder::register` for dependency tracking |
+| `PublishWorkIds` | IDs returned by `HistoryWorkBuilder::register_publish` |
 | `HistoryWorkStage` | Enum identifying the current work stage for progress |
 | `ArchiveWriter` | Trait for publishing data to history archives |
 | `LocalArchiveWriter` | Filesystem implementation of `ArchiveWriter` |
+| `CheckpointRange` | Range of checkpoints for batch operations |
+| `HistoryFileType` | Enum for archive file types (Ledger, Transactions, Results, Scp) |
+| `BatchDownloadWork` | Work item for downloading files across a checkpoint range |
+| `BatchDownloadWorkBuilder` | Factory for registering batch download work items |
+| `BatchDownloadState` | Shared container for multi-checkpoint download data |
+| `SharedBatchDownloadState` | Thread-safe handle to `BatchDownloadState` |
+| `CheckSingleLedgerHeaderWork` | Self-contained work item to verify a ledger header against the archive |
 
 ### Download Work Items
 
@@ -65,6 +77,8 @@ that accumulates downloaded data as work progresses.
 | `DownloadTransactionsWork` | Downloads and verifies transactions | Headers |
 | `DownloadTxResultsWork` | Downloads and verifies results | Headers, Transactions |
 | `DownloadScpHistoryWork` | Downloads SCP consensus history | Headers |
+| `CheckSingleLedgerHeaderWork` | Verifies a single ledger header against archive | None (self-contained) |
+| `BatchDownloadWork` | Downloads a file type across a checkpoint range | Varies by file type |
 
 ### Publish Work Items
 
@@ -85,7 +99,7 @@ that accumulates downloaded data as work progresses.
 use stellar_core_historywork::{
     HistoryWorkBuilder, SharedHistoryState, build_checkpoint_data
 };
-use stellar_core_work::WorkScheduler;
+use stellar_core_work::{WorkScheduler, WorkSchedulerConfig};
 use std::sync::Arc;
 
 // Create shared state for work items
@@ -93,11 +107,11 @@ let state: SharedHistoryState = Default::default();
 
 // Build and register work items
 let builder = HistoryWorkBuilder::new(archive, checkpoint, state.clone());
-let mut scheduler = WorkScheduler::new();
+let mut scheduler = WorkScheduler::new(WorkSchedulerConfig::default());
 let work_ids = builder.register(&mut scheduler);
 
 // Run the scheduler to completion
-scheduler.run_to_completion().await?;
+scheduler.run_until_done().await;
 
 // Extract downloaded data for catchup
 let checkpoint_data = build_checkpoint_data(&state).await?;
@@ -120,7 +134,7 @@ let download_ids = builder.register(&mut scheduler);
 let publish_ids = builder.register_publish(&mut scheduler, writer, download_ids);
 
 // Run all work to completion
-scheduler.run_to_completion().await?;
+scheduler.run_until_done().await;
 ```
 
 ### Monitoring Progress
@@ -153,6 +167,29 @@ impl ArchiveWriter for S3ArchiveWriter {
         self.client.put_object(&self.bucket, path, data).await
     }
 }
+```
+
+### Batch Downloads (Multi-Checkpoint)
+
+For catching up across multiple checkpoints, use the batch download API:
+
+```rust
+use stellar_core_historywork::{BatchDownloadWorkBuilder, CheckpointRange};
+use stellar_core_work::{WorkScheduler, WorkSchedulerConfig};
+
+// Download headers, transactions, results, and SCP for checkpoints 64-512
+let range = CheckpointRange::new(64, 512);
+let builder = BatchDownloadWorkBuilder::new(archive, range);
+
+let state = builder.state();
+let mut scheduler = WorkScheduler::new(WorkSchedulerConfig::default());
+let ids = builder.register(&mut scheduler);
+
+scheduler.run_until_done().await;
+
+// Access downloaded data from state
+let guard = state.lock().await;
+let headers_for_checkpoint_128 = &guard.headers[&128];
 ```
 
 ## Design Notes

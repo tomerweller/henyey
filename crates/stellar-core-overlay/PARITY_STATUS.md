@@ -46,7 +46,7 @@ This document tracks feature parity between this Rust crate and the C++ upstream
 **Peer** (`peer.rs`, `connection.rs`) - Corresponds to `Peer.h/cpp`, `TCPPeer.h/cpp`
 - Full Hello/Auth handshake implementation
 - Message send/receive with MAC authentication
-- Peer state machine: `CONNECTING -> CONNECTED -> GOT_HELLO -> GOT_AUTH -> CLOSING`
+- Peer state machine: `Connecting -> Handshaking -> Authenticated -> Closing -> Disconnected`
 - Per-peer statistics (messages/bytes sent/received) - matches `PeerMetrics` struct
 - Flow control via SendMore/SendMoreExtended
 - Connection direction tracking (inbound vs outbound) - `PeerRole`
@@ -230,7 +230,7 @@ This document tracks feature parity between this Rust crate and the C++ upstream
 
 5. **Curve25519 Survey Response Encryption** - Full encryption for privacy
    - C++: Encrypts survey responses with peer's Curve25519 key
-   - Rust: **Implemented** in `stellar-core-app/src/app.rs` using `stellar_core_crypto::seal_to_curve25519_public_key` for encryption and `open_from_curve25519_secret_key` for decryption
+   - Rust: Implemented outside this crate, in `stellar-core-app/src/app.rs` using `stellar_core_crypto::seal_to_curve25519_public_key` for encryption and `open_from_curve25519_secret_key` for decryption
 
 ### Testing Status
 
@@ -250,6 +250,7 @@ This document tracks feature parity between this Rust crate and the C++ upstream
 
 **Integration Tests**
 - `tests/overlay_scp_integration.rs`: Basic SCP message handling integration
+- `tests/item_fetcher_tests.rs`: ItemFetcher fetch lifecycle and retry logic
 
 **Not Yet Tested**
 - Real network connectivity

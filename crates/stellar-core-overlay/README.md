@@ -22,22 +22,40 @@ The crate is organized around these key components:
 | `OverlayManager` | Central coordinator managing all peer connections and message routing |
 | `Peer` | Represents a fully authenticated connection to a single peer |
 | `FloodGate` | Tracks seen messages to prevent duplicate flooding |
+| `FlowControl` | Bandwidth management via SendMore/SendMoreExtended capacity tracking |
 | `AuthContext` | Manages the authentication handshake and message MAC verification |
 | `Connection` | Low-level TCP connection with framed message I/O |
+| `ItemFetcher` | Fetches missing items (tx sets, quorum sets) from peers with retry logic |
+| `MessageDispatcher` | Routes fetch-protocol messages (GetTxSet, ScpQuorumset, DontHave) |
+| `BanManager` | Tracks banned peers with SQLite persistence |
+| `PeerManager` | SQLite-backed peer address storage with failure tracking and backoff |
+| `TxAdverts` | Manages outgoing/incoming transaction flood adverts |
+| `TxDemandsManager` | Tracks transaction demand lifecycle with retries and latency metrics |
+| `SurveyManager` | Time-sliced network survey collection and reporting |
+| `OverlayMetrics` | Thread-safe counters and timers for overlay statistics |
 
 ### Module Structure
 
 ```
 stellar-core-overlay/
 ├── src/
-│   ├── lib.rs         # Public API, configuration, and common types
-│   ├── manager.rs     # OverlayManager - connection and message coordination
-│   ├── peer.rs        # Peer - individual peer connection handling
-│   ├── auth.rs        # Authentication handshake and MAC verification
-│   ├── codec.rs       # Message framing (length-prefixed XDR)
-│   ├── connection.rs  # TCP connection management
-│   ├── flood.rs       # Duplicate detection and rate limiting
-│   └── error.rs       # Error types
+│   ├── lib.rs              # Public API, configuration, and common types
+│   ├── manager.rs          # OverlayManager - connection and message coordination
+│   ├── peer.rs             # Peer - individual peer connection handling
+│   ├── auth.rs             # Authentication handshake and MAC verification
+│   ├── codec.rs            # Message framing (length-prefixed XDR)
+│   ├── connection.rs       # TCP connection management
+│   ├── flood.rs            # Duplicate detection and message flooding
+│   ├── flow_control.rs     # SendMore/SendMoreExtended capacity tracking
+│   ├── item_fetcher.rs     # Fetching missing items (tx sets, quorum sets)
+│   ├── message_handlers.rs # Fetch-protocol message dispatch
+│   ├── ban_manager.rs      # Peer banning with SQLite persistence
+│   ├── peer_manager.rs     # Peer address storage, failure tracking, backoff
+│   ├── tx_adverts.rs       # Transaction flood advert queuing and batching
+│   ├── tx_demands.rs       # Transaction demand lifecycle and retries
+│   ├── survey.rs           # Time-sliced network survey protocol
+│   ├── metrics.rs          # Overlay metrics (counters, timers)
+│   └── error.rs            # Error types
 ```
 
 ## Protocol Overview
@@ -69,10 +87,12 @@ The overlay handles various Stellar XDR message types:
 |----------|----------|
 | Handshake | `Hello`, `Auth` |
 | Discovery | `Peers` |
-| Consensus | `ScpMessage`, `GetScpState`, `ScpQuorumset` |
+| Consensus | `ScpMessage`, `GetScpState`, `ScpQuorumset`, `GetScpQuorumset` |
 | Transactions | `Transaction`, `FloodAdvert`, `FloodDemand` |
 | Transaction Sets | `GetTxSet`, `TxSet`, `GeneralizedTxSet` |
 | Flow Control | `SendMore`, `SendMoreExtended` |
+| Errors | `ErrorMsg`, `DontHave` |
+| Surveys | `TimeSlicedSurveyStartCollecting`, `TimeSlicedSurveyStopCollecting`, `TimeSlicedSurveyRequest`, `SignedTimeSlicedSurveyResponse` |
 
 ### Flow Control
 
@@ -208,9 +228,17 @@ The FloodGate enforces a soft rate limit on incoming messages (default 1000/sec)
 This crate corresponds to the following C++ stellar-core components:
 
 - `src/overlay/OverlayManager.*` - Connection management
-- `src/overlay/Peer.*` - Individual peer handling
-- `src/overlay/FlowControl.*` - SendMore/SendMoreExtended
-- `src/overlay/SurveyManager.*` - Network surveys (partial)
+- `src/overlay/Peer.*`, `src/overlay/TCPPeer.*` - Individual peer handling
+- `src/overlay/FlowControl.*`, `src/overlay/FlowControlCapacity.*` - SendMore/SendMoreExtended
+- `src/overlay/Floodgate.*` - Message deduplication and flooding
+- `src/overlay/ItemFetcher.*`, `src/overlay/Tracker.*` - Item fetching with retries
+- `src/overlay/BanManager.*` - Peer banning
+- `src/overlay/PeerManager.*`, `src/overlay/RandomPeerSource.*` - Peer address management
+- `src/overlay/TxAdverts.*` - Transaction advert queuing
+- `src/overlay/TxDemandsManager.*` - Transaction demand tracking
+- `src/overlay/SurveyManager.*`, `src/overlay/SurveyDataManager.*` - Network surveys
+- `src/overlay/OverlayMetrics.*` - Overlay statistics
+- `src/overlay/PeerAuth.*`, `src/overlay/Hmac.*` - Authentication and MAC
 
 ## Testing
 
@@ -224,9 +252,10 @@ RUST_LOG=stellar_core_overlay=debug cargo test -p stellar-core-overlay
 
 ## Related Crates
 
-- `stellar-core-common` - Shared types and utilities
-- `stellar-core-crypto` - Ed25519 keys and signatures
+- `stellar-core-common` - Shared types and utilities (NetworkId, Hash256)
+- `stellar-core-crypto` - Ed25519 keys, signatures, and Curve25519 operations
 - `stellar-xdr` - Stellar XDR type definitions
+- `stellar-strkey` - Stellar strkey encoding for public key display
 
 ---
 

@@ -161,6 +161,17 @@ This crate supports all Stellar protocol versions with special handling for:
 
 ## Design Notes
 
+### Per-Operation Savepoints
+
+The operation execution loop wraps each operation with a per-operation savepoint to
+match C++ stellar-core's nested `LedgerTxn` behavior. Before executing each operation,
+`create_savepoint()` is called on the state manager. If the operation fails
+(`!is_operation_success`), `rollback_to_savepoint()` undoes all state mutations from
+that operation so subsequent operations see clean state. Successful operations keep
+their mutations in place. This ensures that a failed operation (e.g., a
+`CreateClaimableBalance` that hits `LowReserve`) does not leave partial state changes
+visible to later operations in the same transaction.
+
 ### Change Coalescing
 
 When multiple operations affect the same entry within a ledger, changes are coalesced:

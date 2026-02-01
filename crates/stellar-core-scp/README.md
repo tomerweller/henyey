@@ -54,14 +54,18 @@ SCP operates in two phases:
 
 | Type | Description |
 |------|-------------|
-| `SCP<D>` | Main coordinator, parameterized by driver |
+| `SCP<D>` | Main coordinator, parameterized by driver (`D: SCPDriver`) |
 | `Slot` | Per-slot consensus state |
 | `SCPDriver` | Trait for application callbacks |
 | `NominationProtocol` | Nomination phase state machine |
 | `BallotProtocol` | Ballot phase state machine |
 | `EnvelopeState` | Result of processing an SCP message |
-| `ValidationLevel` | Value validation result |
+| `ValidationLevel` | Value validation result (Invalid/MaybeValid/FullyValidated) |
 | `BallotPhase` | Current phase (Prepare/Confirm/Externalize) |
+| `SCPTimerType` | Timer identifier (Nomination/Ballot) |
+| `ScpError` | Error types for SCP operations |
+| `SlotState` | Debugging snapshot of slot consensus state |
+| `QuorumSetJson` | JSON-serializable quorum set for persistence and debugging |
 
 ## Usage
 
@@ -116,10 +120,13 @@ The `SCPDriver` trait connects SCP to your application:
 ```rust
 pub trait SCPDriver: Send + Sync {
     // Validate a proposed value
-    fn validate_value(&self, slot: u64, value: &Value, nomination: bool) -> ValidationLevel;
+    fn validate_value(&self, slot_index: u64, value: &Value, nomination: bool) -> ValidationLevel;
 
     // Combine multiple candidates into one
-    fn combine_candidates(&self, slot: u64, candidates: &[Value]) -> Option<Value>;
+    fn combine_candidates(&self, slot_index: u64, candidates: &[Value]) -> Option<Value>;
+
+    // Extract a valid value from a potentially invalid composite
+    fn extract_valid_value(&self, slot_index: u64, value: &Value) -> Option<Value>;
 
     // Broadcast an envelope to peers
     fn emit_envelope(&self, envelope: &ScpEnvelope);
@@ -127,14 +134,29 @@ pub trait SCPDriver: Send + Sync {
     // Get a node's quorum set
     fn get_quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet>;
 
-    // Called when consensus is reached
-    fn value_externalized(&self, slot: u64, value: &Value);
+    // Notification callbacks
+    fn nominating_value(&self, slot_index: u64, value: &Value);
+    fn value_externalized(&self, slot_index: u64, value: &Value);
+    fn ballot_did_prepare(&self, slot_index: u64, ballot: &ScpBallot);
+    fn ballot_did_confirm(&self, slot_index: u64, ballot: &ScpBallot);
+
+    // Deterministic hash computations (must match across all nodes)
+    fn compute_hash_node(&self, slot_index: u64, prev_value: &Value,
+        is_priority: bool, round: u32, node_id: &NodeId) -> u64;
+    fn compute_value_hash(&self, slot_index: u64, prev_value: &Value,
+        round: u32, value: &Value) -> u64;
+    fn compute_timeout(&self, round: u32, is_nomination: bool) -> Duration;
 
     // Cryptographic operations
     fn sign_envelope(&self, envelope: &mut ScpEnvelope);
     fn verify_envelope(&self, envelope: &ScpEnvelope) -> bool;
 
-    // ... and more
+    // ... and more (with default implementations):
+    // get_quorum_set_by_hash, hash_quorum_set, get_node_weight,
+    // get_value_string, get_hash_of, setup_timer, stop_timer,
+    // accepted_ballot_prepared, confirmed_ballot_prepared,
+    // accepted_commit, ballot_did_hear_from_quorum,
+    // started_ballot_protocol, updated_candidate_value, timer_expired
 }
 ```
 
@@ -149,9 +171,10 @@ use stellar_core_scp::quorum_config::{testnet_quorum_config, config_to_quorum_se
 let config = testnet_quorum_config();
 let quorum_set = config_to_quorum_set(&config)?;
 
-// Or create custom configuration
+// Or create custom configuration (QuorumSetConfig is from stellar_core_common)
+use stellar_core_common::config::QuorumSetConfig;
 let config = QuorumSetConfig {
-    threshold_percent: 67,
+    threshold_percent: 67.into(),
     validators: vec![
         "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y".to_string(),
         // ... more validators

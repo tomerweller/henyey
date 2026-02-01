@@ -182,6 +182,17 @@ rs-stellar-core check-quorum-intersection network.json
 Verifies that a network enjoys quorum intersection (all quorums share at least
 one node). This is a critical safety property for SCP.
 
+#### http-command
+
+Send a command to a running stellar-core node's HTTP interface:
+
+```bash
+rs-stellar-core http-command info
+rs-stellar-core http-command "peers?fullkeys=true"
+rs-stellar-core http-command "ll?level=DEBUG"
+rs-stellar-core http-command --port 11627 info
+```
+
 #### sample-config
 
 Print sample configuration:
@@ -197,13 +208,22 @@ Offline utilities that don't require network access:
 
 ##### convert-key
 
-Convert key formats:
+Convert Stellar keys between formats. Supports public keys (`G...`), secret
+seeds (`S...`), pre-auth transaction hashes (`T...`), SHA256 hashes (`X...`),
+muxed accounts (`M...`), contract addresses (`C...`), signed payloads (`P...`),
+and 64-character hex strings:
 
 ```bash
-# StrKey to hex
+# Public key (G...) - shows strKey and hex
 rs-stellar-core offline convert-key GDKXE2OZM...
 
-# Hex to strkey
+# Secret seed (S...) - shows seed and derived public key
+rs-stellar-core offline convert-key SB7BVQG...
+
+# Contract address (C...)
+rs-stellar-core offline convert-key CAAAA...
+
+# 64-char hex - shows all possible interpretations
 rs-stellar-core offline convert-key a1b2c3d4...
 ```
 
@@ -219,13 +239,17 @@ rs-stellar-core offline decode-xdr --type TransactionResult <base64>
 
 ##### encode-xdr
 
-Encode values to XDR:
+Encode values to XDR (output as base64). Supported types: `AccountId`,
+`MuxedAccount`, `Asset`, `Hash`, `Uint256`, `LedgerHeader`,
+`TransactionEnvelope`, `TransactionResult`. Simple types accept string values;
+complex types accept JSON:
 
 ```bash
 rs-stellar-core offline encode-xdr --type AccountId GDKXE2OZM...
 rs-stellar-core offline encode-xdr --type Asset "USD:GDKXE2OZM..."
 rs-stellar-core offline encode-xdr --type Asset native
 rs-stellar-core offline encode-xdr --type Hash <64-char-hex>
+rs-stellar-core offline encode-xdr --type LedgerHeader '<json>'
 ```
 
 ##### bucket-info
@@ -286,6 +310,77 @@ rs-stellar-core --testnet offline debug-bucket-entry \
   --account a1b2c3d4e5f6...  # 64-char hex
 ```
 
+##### sign-transaction
+
+Add a signature to a transaction envelope (equivalent to C++ `sign-transaction`):
+
+```bash
+# Sign from base64 string (prompts for secret key on stdin)
+rs-stellar-core offline sign-transaction \
+  --netid "Test SDF Network ; September 2015" \
+  <base64-envelope>
+
+# Read envelope from stdin
+echo "<base64>" | rs-stellar-core offline sign-transaction \
+  --netid "Test SDF Network ; September 2015" -
+```
+
+##### sec-to-pub
+
+Print the public key corresponding to a secret key (reads from stdin):
+
+```bash
+echo "SB7BVQG..." | rs-stellar-core offline sec-to-pub
+```
+
+##### dump-ledger
+
+Dump ledger entries from the bucket list to a JSON file:
+
+```bash
+# Dump all entries
+rs-stellar-core --testnet offline dump-ledger --output entries.json
+
+# Filter by entry type
+rs-stellar-core --testnet offline dump-ledger --output accounts.json --entry-type account
+
+# Limit output count
+rs-stellar-core --testnet offline dump-ledger --output entries.json --limit 1000
+
+# Only entries modified in the last N ledgers
+rs-stellar-core --testnet offline dump-ledger --output entries.json --last-modified-ledger-count 100
+```
+
+Supported entry types: `account`, `trustline`, `offer`, `data`,
+`claimable_balance`, `liquidity_pool`, `contract_data`, `contract_code`,
+`config_setting`, `ttl`.
+
+##### self-check
+
+Perform diagnostic self-checks on the local database and buckets:
+
+```bash
+rs-stellar-core --testnet offline self-check
+```
+
+Checks performed:
+- Header chain verification (hash linkage across ledgers)
+- Bucket hash verification (all bucket files have correct hashes)
+- Crypto benchmarking (Ed25519 sign/verify performance)
+
+##### verify-checkpoints
+
+Download and verify checkpoint headers from history archives, then write
+verified hashes to a JSON file:
+
+```bash
+rs-stellar-core --testnet offline verify-checkpoints --output checkpoints.json
+rs-stellar-core --testnet offline verify-checkpoints --output checkpoints.json --from 63 --to 10000
+```
+
+The output file can be used with `--trusted-checkpoint-hashes` during catchup
+to verify against known-good hashes.
+
 ## HTTP API
 
 When running, the node exposes an HTTP API (default port 11626):
@@ -314,6 +409,13 @@ When running, the node exposes an HTTP API (default port 11626):
 | `/tx` | POST | Submit transaction |
 | `/shutdown` | POST | Request graceful shutdown |
 | `/health` | GET | Health check |
+| `/ll` | GET/POST | Dynamic log level changes (query: `level`) |
+| `/sorobaninfo` | GET | Soroban network configuration |
+| `/manualclose` | POST | Manual ledger close (requires validator + manual_close config) |
+| `/clearmetrics` | POST | Request metrics clearing |
+| `/logrotate` | POST | Request log rotation |
+| `/maintenance` | POST | Manual database maintenance (cleans old SCP/ledger history) |
+| `/dumpproposedsettings` | GET | Returns ConfigUpgradeSet from ledger |
 
 ### Example Usage
 

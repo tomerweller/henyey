@@ -4008,9 +4008,16 @@ impl LedgerStateManager {
 
     /// Create a savepoint capturing current state for potential rollback.
     ///
-    /// Used by path payment speculation to avoid cloning the entire state.
+    /// Used for two purposes:
+    /// 1. **Per-operation rollback**: Each operation in a multi-op transaction gets
+    ///    a savepoint. If the operation fails, `rollback_to_savepoint()` undoes all
+    ///    state changes so subsequent operations see clean state (matching C++ nested
+    ///    `LedgerTxn` behavior).
+    /// 2. **Path payment speculation**: `convert_with_offers_and_pools` runs the
+    ///    orderbook path speculatively, rolling back if the pool provides a better rate.
+    ///
     /// The savepoint records the current values of all modified entries so
-    /// they can be restored if the speculative path is abandoned.
+    /// they can be restored if the operation fails or the speculative path is abandoned.
     pub fn create_savepoint(&self) -> Savepoint {
         Savepoint {
             // Clone snapshot maps (small: only entries modified in current TX)

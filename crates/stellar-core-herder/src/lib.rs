@@ -15,6 +15,11 @@
 //! - [`HerderState`]: The state machine for the Herder
 //! - [`HerderConfig`]: Configuration options for the Herder
 //! - [`EnvelopeState`]: Result of receiving an SCP envelope
+//! - [`FetchingEnvelopes`]: Envelope dependency fetching (TxSet/QuorumSet)
+//! - [`ScpDriver`]: Bridge between SCP consensus and application logic
+//! - [`QuorumTracker`]: Transitive quorum set membership tracking
+//! - [`LedgerCloseData`]: Complete ledger close information from consensus
+//! - [`ScpPersistenceManager`]: SCP state persistence for crash recovery
 //!
 //! # Architecture
 //!
@@ -23,17 +28,18 @@
 //! |  Overlay Network | --> |      Herder      |
 //! +------------------+     +------------------+
 //!                                |
-//!          +---------------------+---------------------+
-//!          |                     |                     |
-//!          v                     v                     v
-//! +------------------+  +------------------+  +------------------+
-//! | TransactionQueue |  | PendingEnvelopes |  |    ScpDriver     |
-//! +------------------+  +------------------+  +------------------+
-//!          |                                          |
-//!          v                                          v
-//! +------------------+                       +------------------+
-//! |   Surge Pricing  |                       |  SCP Consensus   |
-//! +------------------+                       +------------------+
+//!      +------------+------------+------------+
+//!      |            |            |            |
+//!      v            v            v            v
+//! +----------+ +----------+ +---------+ +----------+
+//! |  TxQueue | | Fetching | | Pending | | ScpDriver|
+//! +----------+ | Envelopes| | Envlps  | +----------+
+//!      |       +----------+ +---------+      |
+//!      v                                     v
+//! +----------+                       +----------------+
+//! |  Surge   |                       | SCP Consensus  |
+//! | Pricing  |                       +----------------+
+//! +----------+
 //! ```
 //!
 //! # State Machine
@@ -78,18 +84,26 @@
 //! # Modules
 //!
 //! - [`error`]: Error types for Herder operations
-//! - [`herder`]: Main Herder implementation
-//! - [`herder_utils`]: Utility functions (value extraction, node ID formatting)
-//! - [`ledger_close_data`]: Ledger close data for consensus output
-//! - [`pending`]: Pending SCP envelope management
-//! - [`persistence`]: SCP state persistence for crash recovery
-//! - [`quorum_tracker`]: Quorum participation tracking
-//! - [`scp_driver`]: SCP integration callbacks
-//! - [`state`]: Herder state machine
-//! - [`surge_pricing`]: Lane configuration and priority queues
+//! - [`herder`]: Main Herder implementation and configuration
+//! - [`scp_driver`]: SCP integration callbacks (value validation, signing)
 //! - [`tx_queue`]: Transaction queue and set building
 //! - [`tx_queue_limiter`]: Resource-aware queue limiting with eviction
+//! - [`surge_pricing`]: Lane configuration and priority queues
+//! - [`pending`]: Pending SCP envelope management (future slots)
+//! - [`fetching_envelopes`]: Envelopes waiting for TxSet/QuorumSet from peers
+//! - [`quorum_tracker`]: Quorum participation and security tracking
+//! - [`persistence`]: SCP state persistence for crash recovery (SQLite)
+//! - [`upgrades`]: Ledger upgrade scheduling and validation
+//! - [`ledger_close_data`]: Ledger close data for consensus output
+//! - [`herder_utils`]: Utility functions (value extraction, node ID formatting)
+//! - [`timer_manager`]: SCP nomination/ballot timeout scheduling (tokio)
+//! - [`sync_recovery`]: Out-of-sync detection and recovery
+//! - [`tx_broadcast`]: Periodic transaction flooding to peers
+//! - [`drift_tracker`]: Close time drift monitoring
+//! - [`dead_node_tracker`]: Missing/dead validator detection
+//! - [`flow_control`]: Flow control constants (transaction size limits)
 //! - [`json_api`]: JSON structures for admin/diagnostic endpoints
+//! - [`state`]: Herder state machine definition
 
 pub mod dead_node_tracker;
 pub mod drift_tracker;

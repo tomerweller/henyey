@@ -191,10 +191,10 @@ let all_ids = sequence.ids();
 A wrapper that invokes a callback after work completes:
 
 ```rust
-let callback = Arc::new(|outcome, ctx| {
+let callback: Arc<dyn Fn(WorkOutcome, WorkContext) + Send + Sync> = Arc::new(|outcome, ctx| {
     println!("Work {} finished: {:?}", ctx.id, outcome);
 });
-let wrapped = WorkWithCallback::new(my_work, callback);
+let wrapped = WorkWithCallback::new(Box::new(my_work), callback);
 scheduler.add_work(Box::new(wrapped), vec![], 0);
 ```
 

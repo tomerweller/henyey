@@ -23,6 +23,8 @@ This section documents the implementation status relative to the C++ stellar-cor
 | BucketApplicator | Complete | Chunked entry application for catchup |
 | Metrics/Counters | Complete | MergeCounters, EvictionCounters, BucketListMetrics |
 | Streaming Iterators | Complete | BucketInputIterator, BucketOutputIterator |
+| Live Entries Iterator | Complete | Memory-efficient streaming with HashSet deduplication |
+| Index Persistence | Complete | DiskIndex serialization to `.index` files for fast startup |
 | BucketManager State | Complete | loadCompleteLedgerState, mergeAllBuckets, ensureBucketsExist |
 | In-Memory Level 0 | Complete | merge_in_memory, level_zero_entries optimization |
 
@@ -211,6 +213,25 @@ This section documents the implementation status relative to the C++ stellar-cor
   - `MemoryMergeInput` - In-memory merge of two sorted vectors
   - `FileMergeInput` - File-based merge of two bucket iterators
 
+#### Live Entries Streaming Iterator (`live_iterator.rs`)
+- **LiveEntriesIterator** - Memory-efficient streaming iterator over all live entries in a bucket list:
+  - Iterates levels 0-10, curr then snap at each level
+  - `HashSet<LedgerKey>` deduplication matching C++ `BucketApplicator` pattern
+  - Dead entries tracked in seen set to shadow older live entries
+  - O(unique keys) memory instead of O(total entries) for full materialization
+  - `next()` yields `Result<LedgerEntry>` one at a time
+- **LiveEntriesStats** - Statistics from a completed iteration:
+  - `entries_yielded`, `entries_skipped`, `unique_keys`
+
+#### Index Persistence (`index_persistence.rs`)
+- **save_disk_index** / **load_disk_index** - Serialize/deserialize `DiskIndex` to `.index` files:
+  - Bincode format with version header for forward compatibility
+  - Stores page ranges, bloom filter data, entry counters, type ranges, asset-to-pool mapping
+  - `BUCKET_INDEX_VERSION` (currently 2) for version checking; stale files are rebuilt
+- **index_path_for_bucket** - Derives `.index` path from bucket file path
+- **cleanup_orphaned_indexes** - Removes `.index` files without matching bucket files
+- **delete_index** - Removes a specific index file
+
 #### BucketManager State Operations
 - **load_complete_ledger_state** - Load full state from bucket list:
   - Iterates buckets from oldest to newest
@@ -324,7 +345,7 @@ In our Rust implementation:
 
 - Bucket file format is fully compatible (gzip-compressed XDR with RFC 5531 record marking)
 - Hash computation matches C++ (SHA-256 over uncompressed XDR including record marks)
-- Bucket filenames follow same convention: `<hash>.bucket.gz`
+- Bucket filenames use `<hash>.bucket.xdr` (canonical) with legacy `<hash>.bucket.gz` support and transparent migration
 
 ### Future Work Priority
 
@@ -362,6 +383,8 @@ In our Rust implementation:
 | BucketUtils.h/cpp | entry.rs, eviction.rs | Complete |
 | BinaryFuseFilter.h/cpp | bloom_filter.rs, disk_bucket.rs | Complete |
 | RandomEvictionCache.h/cpp | cache.rs | Complete |
+| (BucketApplicator iteration) | live_iterator.rs | Complete |
+| (BucketIndex persistence) | index_persistence.rs | Complete |
 
 ---
 

@@ -17,14 +17,16 @@ This crate provides shared types, traits, and utilities used across all rs-stell
 
 | Module | Description |
 |--------|-------------|
+| `asset` | Asset validation, comparison, balance utilities, price comparison, ledger key extraction, and string/numeric helpers |
 | `config` | Configuration types for node setup (network, database, history archives, logging) |
 | `error` | Common error types and the `Result` type alias |
+| `math` | 128-bit arithmetic, overflow-safe math (`big_divide`, `saturating_multiply`, `big_square_root`) |
 | `meta` | Ledger metadata normalization for deterministic hashing |
 | `network` | Network identity derived from network passphrases |
 | `protocol` | Protocol version constants and feature gating utilities |
 | `resource` | Resource accounting for transaction limits and surge pricing |
 | `time` | Time utilities for Unix/Stellar timestamp conversions |
-| `types` | Core types like `Hash256` used throughout the codebase |
+| `types` | The `Hash256` type (32-byte SHA-256 hash) used throughout the codebase |
 
 ## Key Types
 

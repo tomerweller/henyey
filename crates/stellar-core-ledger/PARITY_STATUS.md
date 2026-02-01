@@ -14,7 +14,6 @@ This section documents the implementation status compared to the C++ upstream in
 - [x] Network passphrase and network ID handling
 - [x] Invariant validation during ledger close
 - [x] Snapshot management for concurrent reads
-- [x] Entry cache for fast lookups
 - [x] Initialize from buckets (catchup scenario)
 - [x] Reinitialize from buckets (re-sync scenario)
 - [x] Apply historical ledger (replay mode)
@@ -85,6 +84,7 @@ This section documents the implementation status compared to the C++ upstream in
 - [x] Operation-level invariant validation
 - [x] Refundable fee tracking and refund calculation
 - [x] Transaction executor with state manager integration
+- [x] Per-operation savepoints for automatic rollback on failure (matches C++ nested LedgerTxn)
 - [x] HashX signature verification (variable length preimages)
 
 #### Network Configuration (`NetworkConfig.h/.cpp` -> `execution.rs`)
@@ -131,7 +131,8 @@ This section documents the implementation status compared to the C++ upstream in
 ### Not Yet Implemented (Gaps)
 
 #### LedgerTxn Nested Transaction System (`LedgerTxn.h`, `LedgerTxnImpl.h`)
-- [ ] **Nested transaction support** - C++ has `LedgerTxn` that can nest with parent/child relationships for rollback isolation. Rust uses `LedgerDelta` without nesting.
+- [x] **Per-operation rollback isolation** - Rust uses savepoints (`create_savepoint` / `rollback_to_savepoint`) around each operation to match C++ nested `LedgerTxn` commit/rollback semantics. Failed operations have their state mutations fully reverted.
+- [ ] **General-purpose nested transactions** - C++ supports arbitrary nesting depth with parent/child relationships. Rust supports single-level savepoints (sufficient for the operation execution loop).
 - [ ] **Entry activation tracking** - C++ tracks "active" entries to prevent concurrent access bugs via `LedgerTxnEntry::Impl`
 - [ ] **EntryPtrState tracking** (INIT/LIVE/DELETED states with merging logic)
 - [ ] **LedgerTxnConsistency modes** (EXACT vs EXTRA_DELETES)
@@ -210,7 +211,7 @@ This section documents the implementation status compared to the C++ upstream in
 
 1. **State Management Model**
    - C++: Uses `LedgerTxn` with nested parent/child relationships for transactional isolation. Each nested transaction can be independently committed or rolled back.
-   - Rust: Uses flat `LedgerDelta` with change coalescing. Simpler but less flexible for partial rollbacks.
+   - Rust: Uses `LedgerDelta` with change coalescing and per-operation savepoints. The savepoint mechanism provides the same per-operation rollback isolation as C++ nested `LedgerTxn`, ensuring failed operations do not leave partial state changes.
 
 2. **Threading Model**
    - C++: Multi-threaded with dedicated apply thread and parallel Soroban execution. Uses phase-based state machine (SETTING_UP_STATE -> READY_TO_APPLY -> APPLYING -> COMMITTING) to coordinate thread access.
@@ -226,7 +227,7 @@ This section documents the implementation status compared to the C++ upstream in
 
 5. **State Lookup Strategy**
    - C++: In-memory Soroban state + bucket list with prefetching for known transaction footprints.
-   - Rust: Direct bucket list lookups with entry caching.
+   - Rust: Direct bucket list lookups with in-memory Soroban state.
 
 6. **Entry Tracking**
    - C++: Uses `LedgerEntryPtr` with INIT/LIVE/DELETED states and sophisticated merging logic.
@@ -235,12 +236,12 @@ This section documents the implementation status compared to the C++ upstream in
 #### Design Rationale
 
 The Rust implementation prioritizes:
-- **Simplicity**: Flat delta model vs nested transactions
+- **Simplicity**: Delta model with targeted savepoints vs fully general nested transactions
 - **Determinism**: All operations produce identical results
-- **Correctness**: Focus on matching C++ ledger close semantics
+- **Correctness**: Focus on matching C++ ledger close semantics (per-operation rollback via savepoints)
 
 Trade-offs made:
-- Less flexible transaction isolation (no nested rollback)
+- No general-purpose nested transactions (savepoints cover the operation execution use case)
 - No parallel apply (simpler concurrency model)
 - Potentially slower Soroban execution (no module cache)
 - No SQL backend (bucket list only)
@@ -257,7 +258,7 @@ Trade-offs made:
 | Network Config Loading | Full | Full | 100% |
 | Fee/Reserve Calc | Full | Full | 100% |
 | In-Memory Soroban State | Full | Full | 100% |
-| Nested Transactions | Full | None | 0% |
+| Nested Transactions | Full | Per-operation savepoints | 50% |
 | Parallel Apply | Full | None | 0% |
 | Module Cache | Full | None | 0% |
 | SQL Backend | Full | None | 0% |
@@ -266,8 +267,8 @@ Trade-offs made:
 
 **Overall Parity Estimate: ~85%**
 
-The core ledger close functionality has full parity. The gaps are primarily in:
-1. Advanced concurrency features (parallel apply, nested transactions)
+The core ledger close functionality has full parity. Per-operation rollback isolation is implemented via savepoints, matching C++ nested `LedgerTxn` behavior for the operation execution loop. The remaining gaps are primarily in:
+1. Advanced concurrency features (parallel apply, general-purpose nested transactions)
 2. Performance optimizations (module cache, prefetching)
 3. Legacy SQL backend support
 4. Operational tooling (metrics, eviction)
@@ -282,5 +283,6 @@ From `src/ledger/test/`:
 - [ ] Entry change coalescing
 - [ ] Soroban resource fee calculation
 - [ ] Network config loading
-- [ ] Nested transaction rollback semantics
+- [x] Per-operation rollback semantics (via savepoints)
+- [ ] General nested transaction rollback semantics (arbitrary nesting depth)
 - [ ] Parallel apply correctness

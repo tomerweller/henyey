@@ -22,7 +22,7 @@ This section documents the feature parity between this Rust implementation and t
 | `sample-config` | Implemented | Configuration template generation |
 | `convert-id` / `convert-key` | Implemented | Key format conversion (strkey/hex) |
 | `decode-xdr` | Implemented | Base64 input only; partial `print-xdr` parity for LedgerHeader, TransactionEnvelope, TransactionResult |
-| `encode-xdr` | Implemented | Encodes AccountId, MuxedAccount, Asset, Hash (covers `encode-asset`) |
+| `encode-xdr` | Implemented | Encodes AccountId, MuxedAccount, Asset, Hash, Uint256, LedgerHeader, TransactionEnvelope, TransactionResult (covers `encode-asset`) |
 | `sign-transaction` | Implemented | Add signature to transaction envelope |
 | `sec-to-pub` | Implemented | Print public key from secret key (stdin) |
 | `http-command` | Implemented | Send HTTP command to running node |

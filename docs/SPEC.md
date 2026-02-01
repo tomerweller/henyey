@@ -73,12 +73,11 @@ This project is **not** production-grade.
 rs-stellar-core/
 ├── Cargo.toml                 # Workspace root
 ├── README.md                  # Project overview
-├── PARITY_GAPS.md             # Master parity gap list
-├── SPEC.md                    # This document
-├── DOCUMENTATION_ISSUES.md    # Upstream doc issues found
+├── docs/                      # Specifications and architecture docs
+│   ├── SPEC.md                # This document
+│   └── ARCHITECTURE_EVAL.md   # Architecture evaluation
 ├── configs/                   # Example configs
-├── crates/                    # Subsystem crates
-└── tests/                     # Integration tests
+└── crates/                    # Subsystem crates (14 crates)
 ```
 
 Each crate contains a README with subsystem documentation and upstream mapping.
@@ -98,6 +97,9 @@ Each crate contains a README with subsystem documentation and upstream mapping.
 | `stellar-core-crypto` | `src/crypto/` | Hashing, signatures, keys |
 | `stellar-core-db` | `src/database/` | SQLite persistence |
 | `stellar-core-common` | `src/util/` | Shared utilities |
+| `stellar-core-work` | `src/work/` | Async work scheduler |
+| `stellar-core-historywork` | `src/historywork/` | History work scheduling |
+| `rs-stellar-core` | `src/main/` | CLI binary |
 
 ## 4. Dependencies
 
@@ -122,11 +124,23 @@ Each crate contains a README with subsystem documentation and upstream mapping.
 - Protocol 23+ behavior only (targeting v25.x).
 - Soroban operations supported via host integration.
 
+## 5.1 Transaction Execution and State Management
+
+Transaction execution uses a per-operation savepoint mechanism to match C++ stellar-core's nested `LedgerTxn` behavior:
+
+- **Savepoint creation**: Before each operation executes, a savepoint captures the current state (`LedgerStateManager::create_savepoint()` in `stellar-core-tx`).
+- **Automatic rollback**: If an operation fails, `rollback_to_savepoint()` reverts all state mutations from that operation so subsequent operations see clean state.
+- **Successful operations**: Keep their mutations in place without rollback.
+
+This design replaces C++ stellar-core's general-purpose nested `LedgerTxn` transactions with a simpler, targeted savepoint model. The savepoint captures all entry types (accounts, trustlines, offers, contract data, etc.) and their associated delta tracking, providing the same per-operation isolation guarantees as the C++ implementation.
+
+The execution loop integration lives in `stellar-core-ledger` (`execution.rs`), while the `Savepoint` data structure and `LedgerStateManager` rollback methods are in `stellar-core-tx` (`state.rs`).
+
 ## 6. Testing Strategy
 
-- Unit and integration tests live within each crate and under `tests/`.
+- Unit and integration tests live within each crate (`crates/*/src` and `crates/*/tests`).
 - Upstream test vectors should be ported where possible.
-- Parity and regression gaps are tracked in `PARITY_GAPS.md`.
+- Parity gaps are tracked in each crate's `PARITY_STATUS.md`.
 
 ## 7. Configuration
 

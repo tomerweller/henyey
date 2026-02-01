@@ -14,28 +14,32 @@ This crate provides the top-level application layer that wires together all subs
 
 ## Architecture
 
-The `App` struct is the central coordinator that owns handles to all subsystems:
+The `App` struct is the central coordinator that directly owns handles to all subsystems:
 
 ```
-                    +-----------------+
-                    |      App        |
-                    |  (Coordinator)  |
-                    +--------+--------+
-                             |
-        +--------------------+--------------------+
-        |                    |                    |
-        v                    v                    v
-+---------------+   +---------------+   +---------------+
-|   Database    |   |    Herder     |   |   Overlay     |
-|   (SQLite)    |   |  (Consensus)  |   |   (P2P)       |
-+---------------+   +---------------+   +---------------+
-        |                    |                    |
-        v                    v                    v
-+---------------+   +---------------+   +---------------+
-|    Bucket     |   |    Ledger     |   |   History     |
-|   Manager     |   |   Manager     |   |   Archives    |
-+---------------+   +---------------+   +---------------+
+                         +------------------+
+                         |       App        |
+                         |  (Coordinator)   |
+                         +--------+---------+
+                                  |
+          +-----------+-----------+-----------+-----------+
+          |           |           |           |           |
+          v           v           v           v           v
+    +-----------+ +---------+ +---------+ +---------+ +---------+
+    | Database  | | Bucket  | | Ledger  | | Overlay | | Herder  |
+    | (SQLite)  | | Manager | | Manager | | (P2P)   | | (SCP)   |
+    +-----------+ +---------+ +---------+ +---------+ +---------+
+
+    Supporting components (also owned by App):
+
+    +----------------+  +------------------+  +------------------+
+    | WorkScheduler  |  | SurveyDataMgr    |  | SyncRecoveryMgr  |
+    | (history work) |  | (topology data)  |  | (stuck recovery) |
+    +----------------+  +------------------+  +------------------+
 ```
+
+All subsystems are direct children of `App`, coordinated through `Arc`-based shared
+ownership and async channels. The Tokio runtime handles all task scheduling.
 
 ## Key Types
 
@@ -45,7 +49,13 @@ The `App` struct is the central coordinator that owns handles to all subsystems:
 | `AppConfig` | Configuration loaded from TOML with defaults for testnet/mainnet |
 | `AppState` | Application lifecycle state (Initializing, CatchingUp, Synced, etc.) |
 | `RunMode` | Node running mode (Full, Validator, Watcher) |
+| `RunOptions` | Configuration for the run command (mode, force catchup, sync behavior) |
 | `CatchupMode` | History download mode (Minimal, Complete, Recent) |
+| `CatchupOptions` | Configuration for the catchup command (target, mode, parallelism) |
+| `CatchupResult` | Result of a catchup operation (final ledger, buckets applied, etc.) |
+| `Maintainer` | Background database maintenance scheduler |
+| `StatusServer` | HTTP server for monitoring and control endpoints |
+| `ConfigBuilder` | Builder API for programmatic configuration construction |
 
 ## Usage
 
@@ -168,17 +178,25 @@ When enabled, the status server provides REST endpoints:
 | `/tx` | POST | Submit a transaction |
 | `/shutdown` | POST | Request graceful shutdown |
 | `/health` | GET | Health check endpoint |
+| `/ll` | GET/POST | Query or change log levels dynamically |
+| `/manualclose` | POST | Trigger manual ledger close (requires `manual_close` config) |
+| `/sorobaninfo` | GET | Soroban network configuration from ledger |
+| `/clearmetrics` | POST | Request metrics clearing |
+| `/logrotate` | POST | Request log rotation |
+| `/maintenance` | POST | Trigger manual database maintenance |
+| `/dumpproposedsettings` | GET | Dump proposed ConfigUpgradeSet from ledger |
 
 ## Module Structure
 
 ```
 src/
 ├── lib.rs          # Crate root with re-exports
-├── app.rs          # Core App struct and lifecycle
+├── app.rs          # Core App struct and lifecycle (~7600 lines)
 ├── config.rs       # Configuration types and loading
-├── run_cmd.rs      # Run command and HTTP server
+├── run_cmd.rs      # Run command, HTTP server, and status endpoints
 ├── catchup_cmd.rs  # Catchup command implementation
 ├── logging.rs      # Logging setup and progress tracking
+├── maintainer.rs   # Background database maintenance scheduler
 └── survey.rs       # Network topology survey support
 ```
 
@@ -189,11 +207,22 @@ src/
 The application transitions through well-defined states:
 
 ```
-Initializing --> CatchingUp --> Synced <--> Validating
-                     ^              |
-                     |              v
-                     +---- ShuttingDown
+Initializing ----> CatchingUp ----> Synced <----> Validating
+     |                  ^              |
+     |                  |              |
+     +------------------+-- (already   |
+     |                      up-to-date)|
+     +--- Synced <------+              |
+                                       v
+                 Any state -----> ShuttingDown
 ```
+
+- `Initializing -> CatchingUp`: Node is behind and must download history
+- `Initializing -> Synced`: Node is already up-to-date (no catchup needed)
+- `CatchingUp -> Synced`: Catchup completed successfully
+- `Synced -> Validating`: Validator begins consensus participation
+- `Synced -> CatchingUp`: Node falls behind and needs to re-sync
+- Any state -> `ShuttingDown`: Shutdown signal received
 
 ### Consensus Stuck Recovery
 

@@ -17,6 +17,7 @@ This document provides a detailed comparison between the Rust `stellar-core-tx` 
 | Soroban Operations (3) | Full | Via e2e_invoke API |
 | Event Emission | Full | SAC events, lumen reconciliation |
 | Metadata Building | Full | V2/V3/V4 TransactionMeta |
+| Per-Operation Rollback | Full | Savepoint mechanism matches C++ nested LedgerTxn |
 | Parallel Execution | N/A | Not needed for current use case |
 
 ## Implemented Components
@@ -255,6 +256,26 @@ Corresponds to: `OperationFrame.h` enum `ThresholdLevel`
 
 This matches C++ stellar-core's `MultiOrderBook` functionality in `OrderBook.h/.cpp`.
 
+### Per-Operation Savepoint Rollback (`state.rs`)
+
+Corresponds to: `LedgerTxn.h/cpp` (nested commit/rollback)
+
+| C++ Concept | Rust Implementation | Status |
+|------------|---------------------|--------|
+| Nested `LedgerTxn` per operation | `Savepoint` struct + `create_savepoint()` / `rollback_to_savepoint()` | Full |
+| Child `LedgerTxn::commit()` on success | Savepoint dropped (no-op, changes kept) | Full |
+| Child `LedgerTxn::rollback()` on failure | `rollback_to_savepoint()` with three-phase restore | Full |
+| All entry types covered | Accounts, trustlines, offers, data, contract_data, contract_code, TTL, claimable_balances, liquidity_pools | Full |
+| Delta truncation on rollback | `LedgerDelta::truncate_to()` via `DeltaLengths` | Full |
+| Metadata/sponsorship restore | `entry_last_modified`, `entry_sponsorship` snapshots | Full |
+| ID pool restore | `id_pool` field in `Savepoint` | Full |
+| Speculative orderbook exchange | `create_savepoint()` in path payment comparison | Full |
+
+This replaces manual per-operation rollback code that previously existed in individual operation
+implementations (e.g., `claimable_balance.rs`, `payment.rs`, `change_trust.rs`). The automatic
+savepoint mechanism is more robust and matches C++ stellar-core's approach of running each
+operation in a nested transaction scope.
+
 ## Not Implemented (By Design)
 
 ### Parallel Execution Infrastructure
@@ -295,8 +316,8 @@ The Rust crate supports both live execution and catchup/replay modes as first-cl
 - **Catchup mode**: Trusts archived results, fast synchronization
 
 ### 2. State Layer
-- **C++**: Uses `AbstractLedgerTxn` with SQL backing
-- **Rust**: Uses in-memory `LedgerStateManager` targeting bucket list
+- **C++**: Uses `AbstractLedgerTxn` with SQL backing and nested `LedgerTxn` for per-operation commit/rollback
+- **Rust**: Uses in-memory `LedgerStateManager` targeting bucket list, with `Savepoint` for per-operation rollback (functionally equivalent to C++ nested `LedgerTxn`)
 
 ### 3. Protocol Versioning
 - **C++**: Version-aware code paths within single codebase

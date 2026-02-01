@@ -10,9 +10,16 @@ This crate provides all cryptographic operations needed by Stellar Core, impleme
 
 - **Ed25519 Signatures**: Key generation, signing, and verification
 - **SHA-256 Hashing**: Single-shot and streaming hash computation
-- **StrKey Encoding**: Stellar's base32 key format (G..., S..., T..., X..., M...)
+- **BLAKE2 Hashing**: Single-shot and streaming BLAKE2b-256 hash computation
+- **HMAC-SHA256**: Message authentication with constant-time verification
+- **HKDF**: Key derivation (extract, expand, and combined)
+- **XDR Hashing**: SHA-256 and BLAKE2 hashing of XDR-encoded values
+- **StrKey Encoding**: Stellar's base32 key format (G..., S..., T..., X..., M..., P..., C...)
 - **Short Hashing**: SipHash-2-4 for deterministic ordering in bucket lists
 - **Sealed Boxes**: Curve25519-based anonymous encryption for survey payloads
+- **Curve25519 ECDH**: Key exchange for P2P overlay authentication
+- **Hex Encoding**: Hex encode/decode utilities matching C++ `Hex.h`
+- **SignerKey Utilities**: Construction and inspection of transaction authorization signer keys
 - **Secure Random**: Cryptographically secure random number generation
 
 ## Key Types
@@ -22,6 +29,8 @@ This crate provides all cryptographic operations needed by Stellar Core, impleme
 | `PublicKey` | Ed25519 public key (32 bytes), encodes to account ID (G...) |
 | `SecretKey` | Ed25519 secret key (32 bytes), encodes to seed (S...), zeroized on drop |
 | `Signature` | Ed25519 signature (64 bytes) |
+| `Curve25519Secret` | X25519 secret scalar for ECDH key exchange, zeroized on drop |
+| `Curve25519Public` | X25519 public point for ECDH key exchange |
 | `Hash256` | SHA-256 hash (32 bytes), re-exported from `stellar-core-common` |
 | `SignedMessage` | Message bundled with signature and signer hint |
 | `CryptoError` | Error type for all cryptographic operations |
@@ -112,13 +121,16 @@ assert_eq!(decrypted, plaintext);
 ```
 src/
 ├── lib.rs          # Crate root, re-exports
+├── curve25519.rs   # Curve25519 ECDH key exchange for P2P overlay
 ├── error.rs        # CryptoError type
-├── hash.rs         # SHA-256 hashing
+├── hash.rs         # SHA-256, BLAKE2, HMAC-SHA256, HKDF, XDR hashing
+├── hex.rs          # Hex encoding/decoding utilities
 ├── keys.rs         # PublicKey, SecretKey, Signature
 ├── random.rs       # Secure random generation
 ├── sealed_box.rs   # Curve25519 sealed box encryption
 ├── short_hash.rs   # SipHash-2-4 for deterministic ordering
 ├── signature.rs    # Signing utilities, SignedMessage
+├── signer_key.rs   # SignerKey construction and inspection
 └── strkey.rs       # StrKey encode/decode
 ```
 
@@ -127,16 +139,24 @@ src/
 | Crate | Purpose |
 |-------|---------|
 | `ed25519-dalek` | Ed25519 signatures |
+| `x25519-dalek` | X25519 ECDH key exchange |
 | `sha2` | SHA-256 hashing |
+| `blake2` | BLAKE2b hashing |
+| `hmac` | HMAC-SHA256 message authentication |
+| `hkdf` | HKDF key derivation |
 | `siphasher` | SipHash-2-4 |
 | `crypto_box` | Sealed box encryption (X25519 + XSalsa20-Poly1305) |
 | `rand` | Random number generation |
 | `base32` | StrKey encoding |
+| `hex` | Hex encoding/decoding |
+| `zeroize` | Secure memory clearing for key material |
+| `thiserror` | Error type derivation |
 
 ## Security Notes
 
-- **Key Zeroization**: `SecretKey` is zeroized on drop to minimize key material exposure
-- **Debug Safety**: `SecretKey::Debug` shows `[REDACTED]` instead of key material
+- **Key Zeroization**: `SecretKey` and `Curve25519Secret` are zeroized on drop to minimize key material exposure
+- **Debug Safety**: `SecretKey` and `Curve25519Secret` show `[REDACTED]` instead of key material in debug output
+- **Constant-Time HMAC Verification**: `hmac_sha256_verify` uses constant-time comparison to prevent timing attacks
 - **Deterministic Ordering**: Short hashes use a process-global key that cannot be changed after first use
 - **No Libsodium**: Pure Rust implementation ensures reproducible builds and auditable code
 

@@ -34,7 +34,6 @@ This crate provides SQLite-based database persistence for rs-stellar-core, corre
 - [x] Transaction history
 - [x] Publish queue
 - [x] Bucket list snapshots
-- [x] Account CRUD (basic)
 - [x] Old entry cleanup/garbage collection
 - [ ] PostgreSQL support (intentional - SQLite only)
 - [ ] Misc database splitting (v25+ C++ feature)
@@ -61,7 +60,7 @@ This crate provides SQLite-based database persistence for rs-stellar-core, corre
 | `DatabaseTests.cpp` | `Database splitting migration works correctly` | None | ❌ **Gap** (no misc DB support) |
 | `DatabaseConnectionStringTest.cpp` | `remove password from database connection string` (15 cases) | None | ❌ **Gap** (not implemented) |
 
-### Rust Tests (36 total)
+### Rust Tests (33 total)
 
 #### migrations.rs (5 tests)
 | Test Name | C++ Equivalent | Notes |
@@ -78,20 +77,13 @@ This crate provides SQLite-based database persistence for rs-stellar-core, corre
 | `test_sqlite_scp_persistence` | Covered in HerderPersistence tests | ✅ |
 | `test_sqlite_tx_set_persistence` | Covered in HerderPersistence tests | ✅ |
 
-#### queries/accounts.rs (3 tests)
-| Test Name | C++ Equivalent | Notes |
-|-----------|----------------|-------|
-| `test_store_and_load_account` | LedgerTxnAccountSQL tests | ✅ |
-| `test_delete_account` | LedgerTxnAccountSQL tests | ✅ |
-| `test_account_with_liabilities` | LedgerTxnAccountSQL tests | ✅ |
-
 #### queries/bucket_list.rs (2 tests)
 | Test Name | C++ Equivalent | Notes |
 |-----------|----------------|-------|
 | `test_store_and_load_bucket_list` | None (Rust-specific) | ✅ Rust-only |
 | `test_load_missing_bucket_list` | None (Rust-specific) | ✅ Rust-only |
 
-#### queries/history.rs (5 tests)
+#### queries/history.rs (6 tests)
 | Test Name | C++ Equivalent | Notes |
 |-----------|----------------|-------|
 | `test_store_and_load_transaction` | TransactionSQL tests | ✅ |
@@ -119,7 +111,7 @@ This crate provides SQLite-based database persistence for rs-stellar-core, corre
 | `test_remove_peers_with_failures` | PeerManager tests | ✅ |
 | `test_load_random_peers` | PeerManager tests | ✅ |
 
-#### queries/scp.rs (4 tests)
+#### queries/scp.rs (5 tests)
 | Test Name | C++ Equivalent | Notes |
 |-----------|----------------|-------|
 | `test_scp_slot_state_roundtrip` | HerderPersistence tests | ✅ |

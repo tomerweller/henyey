@@ -45,18 +45,27 @@ Re-executing historical transactions is problematic for several reasons:
     +-------------+         +---------------+        +---------------+
                                                             |
                                                             v
-                                    +--------------------------------------+
-                                    |           LedgerDelta                |
-                                    | (Accumulates state changes)          |
-                                    |                                      |
-                                    | - Creates (new entries)              |
-                                    | - Updates (modified entries)         |
-                                    | - Deletes (removed entries)          |
-                                    | - Change ordering for metadata       |
-                                    +--------------------------------------+
-                                                            |
-                                                            v
-                                                    To Bucket List
+                            +--------------------------------------+
+                            |       LedgerStateManager             |
+                            |       (state.rs)                     |
+                            |                                      |
+                            |  In-memory entries + snapshots       |
+                            |  Per-operation Savepoint rollback    |
+                            +------------------+-------------------+
+                                               |
+                                               v
+                            +--------------------------------------+
+                            |           LedgerDelta                |
+                            | (Accumulates state changes)          |
+                            |                                      |
+                            | - Creates (new entries)              |
+                            | - Updates (modified entries)         |
+                            | - Deletes (removed entries)          |
+                            | - Change ordering for metadata       |
+                            +--------------------------------------+
+                                               |
+                                               v
+                                        To Bucket List
 ```
 
 ### Module Structure
@@ -205,10 +214,13 @@ if let Some(account) = state.get_account(&account_id) {
 ```
 
 Features:
-- Per-operation snapshots for rollback on failure
+- **Savepoint-based rollback**: Lightweight state checkpoints (`Savepoint`) that can undo all entry types on failure (see [Savepoint Architecture](#savepoint-architecture) below)
+- Per-operation savepoints for automatic rollback of failed operations
+- Speculative orderbook exchange savepoints (path payments)
 - Multi-operation transaction tracking
 - Sponsorship stack management
 - Minimum balance calculations
+- BTreeMap-based offer index for O(log n) best-offer lookups
 
 #### `LedgerContext`
 
@@ -508,13 +520,96 @@ let ledger_changes = apply_transaction_set_from_history(
 
 ## Design Notes
 
+### Savepoint Architecture
+
+The crate provides a `Savepoint` mechanism for lightweight, granular rollback of
+state changes. This is the Rust equivalent of C++ stellar-core's nested `LedgerTxn`
+commit/rollback pattern.
+
+```
+                     Savepoint / Rollback Flow
+
+  +-----------------------+
+  | LedgerStateManager    |
+  |                       |       create_savepoint()
+  |  accounts             | ─────────────────────────────> +------------------+
+  |  trustlines           |                                |    Savepoint     |
+  |  offers               |                                |                  |
+  |  data_entries         |       rollback_to_savepoint()  | - snapshot maps  |
+  |  contract_data        | <───────────────────────────── | - pre-values     |
+  |  contract_code        |                                | - created sets   |
+  |  ttl_entries          |         (on failure)           | - delta lengths  |
+  |  claimable_balances   |                                | - modified lens  |
+  |  liquidity_pools      |                                | - metadata state |
+  |  ...                  |                                | - id_pool        |
+  +-----------+-----------+                                +------------------+
+              |
+              | flush_modified_entries()
+              v
+  +-----------------------+
+  |     LedgerDelta       |  (output change log)
+  |                       |
+  |  - created entries    |  Savepoint rollback also
+  |  - updated entries    |  truncates the delta back
+  |  - deleted entries    |  to its pre-savepoint lengths.
+  |  - restored entries   |
+  +-----------------------+
+              |
+              v
+       To Bucket List /
+       Transaction Meta
+```
+
+**Key concepts:**
+
+- **Savepoint**: A lightweight state checkpoint that captures the current values of all
+  entry types (accounts, trustlines, offers, data, contract_data, contract_code, TTL,
+  claimable_balances, liquidity_pools), along with metadata tracking, delta vector lengths,
+  modified tracking vec lengths, created entry sets, and the id_pool. Creating a savepoint
+  is O(k) where k is the number of entries modified so far in the current transaction.
+
+- **Per-operation rollback**: Each operation in a multi-operation transaction gets a
+  savepoint before execution (in the `stellar-core-ledger` execution loop). If the
+  operation fails, `rollback_to_savepoint()` undoes all state changes so subsequent
+  operations see clean state. This matches C++ stellar-core's nested `LedgerTxn`
+  behavior where each operation runs in a child transaction that is committed on
+  success or rolled back on failure.
+
+- **Speculative orderbook exchange**: Path payment operations use savepoints when
+  comparing orderbook vs. liquidity pool routes. The orderbook path is executed
+  speculatively on the real state; if the pool provides a better rate, the savepoint
+  rolls back the speculative orderbook changes. This avoids cloning the entire state
+  (which would be O(n) for 911K+ offers).
+
+- **LedgerDelta vs Savepoint**: `LedgerDelta` is the output change log that records
+  creates, updates, and deletes for transaction metadata and bucket list updates.
+  `Savepoint` is the internal undo mechanism. They interact because savepoint rollback
+  also truncates the delta's vectors back to their pre-savepoint lengths, ensuring no
+  stale entries from failed operations appear in the final output.
+
+- **Three-phase rollback** (`rollback_to_savepoint`):
+  1. **Phase 1 -- Restore newly snapshot'd entries**: Entries that were first touched
+     after the savepoint have their snapshot values restored (these snapshots hold the
+     pre-TX bucket list values).
+  2. **Phase 2 -- Restore pre-savepoint entries**: Entries that were already in the
+     snapshot map at savepoint creation time are restored to their pre-savepoint
+     current values (captured in the savepoint's `*_pre_values` vecs).
+  3. **Phase 3 -- Restore tracking state**: Snapshot maps, created entry sets,
+     modified vec lengths, entry metadata (last_modified, sponsorships), delta vector
+     lengths, op_entry_snapshots, and id_pool are all restored to their savepoint values.
+
+- **No manual rollback in operations**: Individual operation implementations (e.g.,
+  `claimable_balance.rs`, `payment.rs`, `change_trust.rs`) do not contain manual
+  rollback code. All rollback is handled automatically by the per-operation savepoint
+  in the execution loop.
+
 ### State Management Philosophy
 
 The crate separates state reading (via `LedgerReader` trait) from state modification (via `LedgerDelta`). This allows:
 
 1. **Lazy loading**: State is loaded on-demand from the bucket list
 2. **Atomic updates**: All changes are accumulated then applied together
-3. **Rollback support**: Failed operations don't corrupt state
+3. **Savepoint rollback**: Failed operations are automatically rolled back via per-operation savepoints, matching C++ stellar-core's nested `LedgerTxn` pattern (see [Savepoint Architecture](#savepoint-architecture) above)
 
 ### Delta Tracking
 
@@ -543,7 +638,7 @@ This crate corresponds to the following C++ stellar-core components:
 | `live_execution.rs` | `src/transactions/TransactionFrame.cpp` (processFeeSeqNum, processPostApply, etc.) |
 | `validation.rs` | `src/transactions/TransactionUtils.cpp` |
 | `apply.rs` | `src/ledger/LedgerTxn.cpp` |
-| `state.rs` | `src/ledger/LedgerStateSnapshot.cpp` |
+| `state.rs` | `src/ledger/LedgerStateSnapshot.cpp`, `src/ledger/LedgerTxn.cpp` (nested commit/rollback via Savepoint) |
 | `meta_builder.rs` | `src/transactions/TransactionMetaBuilder.cpp` |
 | `fee_bump.rs` | `src/transactions/FeeBumpTransactionFrame.cpp` |
 | `signature_checker.rs` | `src/transactions/SignatureChecker.cpp` |

@@ -31,11 +31,11 @@ rs-stellar-core is organized as a Cargo workspace with 14 crates following a lay
 │  │ scp           │  │ tx            │  │ bucket        │  │ ledger        │ │
 │  │ (consensus)   │  │ (execution)   │  │ (state store) │  │ (close logic) │ │
 │  └───────────────┘  └───────────────┘  └───────────────┘  └───────────────┘ │
-│  ┌───────────────┐  ┌───────────────┐                                       │
-│  │ stellar-core- │  │ stellar-core- │                                       │
-│  │ invariant     │  │ history       │                                       │
-│  │ (validation)  │  │ (archives)    │                                       │
-│  └───────────────┘  └───────────────┘                                       │
+│  ┌───────────────┐                                                          │
+│  │ stellar-core- │                                                          │
+│  │ history       │                                                          │
+│  │ (archives)    │                                                          │
+│  └───────────────┘                                                          │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -70,11 +70,10 @@ Internal dependencies (excluding external crates):
 | stellar-core-db | common |
 | stellar-core-overlay | common, crypto |
 | stellar-core-scp | common, crypto |
-| stellar-core-invariant | common, crypto |
 | stellar-core-tx | common, crypto, db |
 | stellar-core-bucket | common, crypto, db |
-| stellar-core-ledger | common, crypto, db, bucket, tx, invariant |
-| stellar-core-history | common, crypto, db, bucket, ledger, tx, invariant |
+| stellar-core-ledger | common, crypto, db, bucket, tx |
+| stellar-core-history | common, crypto, db, bucket, ledger, tx |
 | stellar-core-historywork | common, history, ledger, work |
 | stellar-core-herder | common, crypto, db, scp, overlay, ledger, tx |
 | stellar-core-app | (all of the above) |
@@ -131,6 +130,8 @@ Internal dependencies (excluding external crates):
 - All operation types (payments, offers, Soroban, etc.)
 - Fee and fee-bump handling
 - Soroban WASM contract execution
+- `Savepoint` mechanism for per-operation state rollback (matches C++ nested `LedgerTxn`)
+- `LedgerStateManager` with savepoint-based rollback for all entry types
 
 **stellar-core-bucket** - BucketList state management
 - 11-level bucket list with live/dead/init entries
@@ -143,13 +144,9 @@ Internal dependencies (excluding external crates):
 - `LedgerManager` orchestration
 - `LedgerDelta` for accumulating state changes
 - Transaction application and fee charging
+- Per-operation savepoints in the execution loop (wraps each operation with `create_savepoint`/`rollback_to_savepoint` to match C++ nested `LedgerTxn` behavior)
 - Bucket list merging and Merkle root computation
-
-**stellar-core-invariant** - Ledger validation rules
-- Balance conservation checks
-- Reserve requirement validation
-- Order book consistency
-- Soroban entry validation
+- Inline invariant validation during ledger close
 
 **stellar-core-history** - History archive operations
 - Catchup from history archives
@@ -200,8 +197,8 @@ HERDER (Consensus Coordinator)
 LEDGER MANAGER
     ├─→ LedgerCloseContext (transactional context)
     ├─→ Transaction Execution (stellar-core-tx)
+    │     └─→ Per-operation savepoints (rollback on failure)
     ├─→ LedgerDelta (accumulate state changes)
-    ├─→ Invariant Validation
     └─→ BucketList Application
         ├─→ Merkle root computation
         └─→ Disk persistence
@@ -221,9 +218,10 @@ HISTORY ARCHIVE (Async)
 2. `TransactionFrame` - Validation wrapper with cached hash
 3. `LedgerCloseData` - SCP output (tx set hash, close time, etc.)
 4. `LedgerDelta` - Accumulator for ledger state changes
-5. `LedgerCloseMeta` - Result metadata for history
-6. `BucketList` - Persistent Merkle state
-7. `LedgerHeader` - Consensus-confirmed state summary
+5. `Savepoint` - State checkpoint for per-operation rollback (captures all entry types and delta lengths)
+6. `LedgerCloseMeta` - Result metadata for history
+7. `BucketList` - Persistent Merkle state
+8. `LedgerHeader` - Consensus-confirmed state summary
 
 ## Design Principles
 
@@ -239,7 +237,6 @@ HISTORY ARCHIVE (Async)
 
 ### Trait-Based Composition
 - `Work` trait for async task composition
-- `Invariant` framework for validation rules
 - Query traits for database abstraction
 - `HerderCallback` for SCP integration
 
@@ -247,6 +244,13 @@ HISTORY ARCHIVE (Async)
 - Tokio runtime throughout
 - Non-blocking I/O for network and database
 - Cancellation propagation via work scheduler
+
+### Per-Operation Savepoints
+- Each operation in a transaction is wrapped with a savepoint before execution
+- Failed operations have all state mutations rolled back via `rollback_to_savepoint()`
+- This matches C++ stellar-core's nested `LedgerTxn` commit/rollback behavior
+- The `Savepoint` struct captures entry maps, delta vector lengths, and created entry sets
+- Simpler than C++'s general-purpose nested transactions while providing the same isolation guarantees for the operation execution loop
 
 ### Determinism
 - All observable behavior matches C++ stellar-core
@@ -260,7 +264,6 @@ Largest files (potential complexity hotspots):
 | File | Lines | Notes |
 |------|-------|-------|
 | app.rs | ~6,600 | Could benefit from splitting |
-| invariant/lib.rs | ~5,000 | Validation rules, cohesive |
 | main.rs | ~4,400 | CLI binary, acceptable |
 | execution.rs | ~4,300 | Ledger close, cohesive |
 | tx_queue.rs | ~4,000 | Transaction queue, cohesive |

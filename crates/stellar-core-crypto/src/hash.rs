@@ -94,7 +94,7 @@ pub fn sha256_multi(chunks: &[&[u8]]) -> Hash256 {
 /// Computes a sub-seed SHA-256 hash from a seed and counter.
 ///
 /// This is used for per-transaction PRNG sub-seeding in Soroban.
-/// Formula: `SHA256(seed || counter_le)`
+/// Formula: `SHA256(seed || counter_be)` (counter in big-endian / XDR network byte order)
 ///
 /// # Arguments
 ///

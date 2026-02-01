@@ -51,12 +51,6 @@ This Rust implementation aims to mirror stellar-core v25.x behavior for educatio
 │  (transaction   │     │    (BucketList      │     │       (SQLite           │
 │   execution)    │     │     state store)    │     │      persistence)       │
 └─────────────────┘     └─────────────────────┘     └─────────────────────────┘
-           │
-           ▼
-┌─────────────────┐
-│    invariant    │
-│   (validation)  │
-└─────────────────┘
 
 Supporting crates: crypto, common, work, historywork
 ```
@@ -73,7 +67,7 @@ Supporting crates: crypto, common, work, historywork
 
 ## Requirements
 
-- **Rust**: 1.75+ (2021 edition)
+- **Rust**: 1.76+ (2021 edition)
 - **SQLite**: System library (usually pre-installed)
 - **Platform**: Linux, macOS (Windows untested)
 
@@ -187,7 +181,6 @@ rs-stellar-core/
 │   ├── stellar-core-db/          # SQLite persistence
 │   ├── stellar-core-crypto/      # Cryptographic primitives
 │   ├── stellar-core-common/      # Shared types
-│   ├── stellar-core-invariant/   # Ledger invariants
 │   └── stellar-core-work/        # Work scheduler
 └── configs/                      # Example configurations
 ```
@@ -216,16 +209,15 @@ rs-stellar-core/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Ledger close pipeline, state snapshots, delta tracking | [~85%](crates/stellar-core-ledger/PARITY_STATUS.md) |
-| [`stellar-core-tx`](crates/stellar-core-tx/README.md) | Transaction validation and execution (classic + Soroban) | [100%](crates/stellar-core-tx/PARITY_STATUS.md) |
+| [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [~85%](crates/stellar-core-ledger/PARITY_STATUS.md) |
+| [`stellar-core-tx`](crates/stellar-core-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [100%](crates/stellar-core-tx/PARITY_STATUS.md) |
 | [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | BucketList implementation, merges, on-disk state | [~98%](crates/stellar-core-bucket/PARITY_STATUS.md) |
-| [`stellar-core-invariant`](crates/stellar-core-invariant/README.md) | Ledger transition validation, consistency checks | [~87%](crates/stellar-core-invariant/PARITY_STATUS.md) |
 
 ### History & Sync
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`stellar-core-history`](crates/stellar-core-history/README.md) | History archive I/O, catchup, replay, verification | [~90%](crates/stellar-core-history/PARITY_STATUS.md) |
+| [`stellar-core-history`](crates/stellar-core-history/README.md) | History archive I/O, catchup, replay, verification | [~85%](crates/stellar-core-history/PARITY_STATUS.md) |
 | [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | History work scheduling, publish/catchup task management | [~82%](crates/stellar-core-historywork/PARITY_STATUS.md) |
 
 ### Utilities

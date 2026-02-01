@@ -20,12 +20,13 @@ The crate is organized into the following modules:
 ```
 crates/stellar-core-db/
 ├── src/
-│   ├── lib.rs          # Main entry point and Database methods
-│   ├── error.rs        # Error types (DbError)
-│   ├── pool.rs         # Connection pool (Database struct)
-│   ├── schema.rs       # SQL schema definitions
-│   ├── migrations.rs   # Schema versioning and migrations
-│   └── queries/        # Typed query traits
+│   ├── lib.rs              # Main entry point and Database methods
+│   ├── error.rs            # Error types (DbError)
+│   ├── pool.rs             # Connection pool (Database struct)
+│   ├── schema.rs           # SQL schema definitions
+│   ├── migrations.rs       # Schema versioning and migrations
+│   ├── scp_persistence.rs  # SCP state persistence (SqliteScpPersistence)
+│   └── queries/            # Typed query traits
 │       ├── mod.rs
 │       ├── ban.rs          # Node ban list
 │       ├── bucket_list.rs  # Bucket list snapshots
@@ -46,6 +47,7 @@ crates/stellar-core-db/
 | `DbError` | Unified error type for all database operations |
 | `PooledConnection` | A connection borrowed from the pool |
 | `PeerRecord` | Network peer connection metadata |
+| `SqliteScpPersistence` | SCP state persistence backed by SQLite |
 
 ### Query Traits
 
@@ -56,6 +58,7 @@ Query functionality is organized into domain-specific traits:
 | `LedgerQueries` | Ledger header storage and retrieval |
 | `HistoryQueries` | Transaction history and results |
 | `ScpQueries` | SCP envelopes and quorum sets |
+| `ScpStatePersistenceQueries` | SCP slot state and tx set persistence for crash recovery |
 | `StateQueries` | Key-value state storage |
 | `PeerQueries` | Network peer tracking |
 | `BucketListQueries` | Bucket list snapshots |
@@ -207,3 +210,4 @@ This crate corresponds to the following C++ stellar-core components:
 | `queries/history.rs` | `src/transactions/TransactionSQL.cpp` |
 | `queries/publish_queue.rs` | `src/history/HistoryManagerImpl.cpp` |
 | `queries/bucket_list.rs` | No direct C++ equivalent (new in Rust) |
+| `scp_persistence.rs` | `src/herder/HerderPersistenceImpl.cpp` (SCP state persistence) |

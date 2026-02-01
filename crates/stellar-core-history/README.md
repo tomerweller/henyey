@@ -46,10 +46,17 @@ archive/
 |------|-------------|
 | `HistoryArchive` | Client for accessing a single history archive |
 | `HistoryManager` | Manages multiple archives with automatic failover |
+| `HistoryArchiveManager` | Full archive manager with read/write capability tracking and config validation |
+| `ArchiveEntry` | Single archive entry combining HTTP read and shell-command write capabilities |
 | `HistoryArchiveState` | Parsed History Archive State (HAS) file |
 | `CatchupManager` | Orchestrates the complete catchup process |
+| `CatchupMode` | Catchup strategy: Minimal, Complete, or Recent(N) |
+| `CatchupOutput` | Full catchup result including bucket list state and ledger header |
 | `ReplayConfig` | Configuration for ledger replay and verification |
+| `CheckpointBuilder` | Crash-safe checkpoint file builder using dirty-file-then-rename pattern |
 | `PublishManager` | Publishes checkpoint data to archives |
+| `PublishQueue` | SQLite-backed persistent queue for pending checkpoint publications |
+| `RemoteArchive` | Shell-command-based archive upload client (put, mkdir) |
 | `CdpDataLake` | Fetches LedgerCloseMeta from CDP (SEP-0054) |
 
 ## Quick Start
@@ -148,18 +155,21 @@ All downloaded data is cryptographically verified:
 
 ```
 src/
-  lib.rs           # Crate root with main type re-exports
-  archive.rs       # HistoryArchive client
-  archive_state.rs # HAS parsing
-  catchup.rs       # CatchupManager
-  cdp.rs           # CDP data lake client (SEP-0054)
-  checkpoint.rs    # Checkpoint utilities
-  download.rs      # HTTP download with retry logic
-  error.rs         # Error types
-  paths.rs         # Archive URL path generation
-  publish.rs       # PublishManager for validators
-  replay.rs        # Ledger replay functions
-  verify.rs        # Cryptographic verification
+  lib.rs                # Crate root, HistoryManager, HistoryArchiveManager, CatchupMode/Output
+  archive.rs            # HistoryArchive HTTP client
+  archive_state.rs      # HAS JSON parsing/serialization
+  catchup.rs            # CatchupManager orchestration
+  cdp.rs                # CDP data lake client (SEP-0054)
+  checkpoint.rs         # Checkpoint frequency, boundary, and range utilities
+  checkpoint_builder.rs # Crash-safe checkpoint file construction
+  download.rs           # HTTP download with retry, gzip decompression, XDR stream parsing
+  error.rs              # HistoryError type
+  paths.rs              # Archive URL path generation
+  publish.rs            # PublishManager for validators
+  publish_queue.rs      # SQLite-backed persistent publish queue
+  remote_archive.rs     # Shell-command-based archive upload (put/mkdir)
+  replay.rs             # Ledger replay and transaction re-execution
+  verify.rs             # Cryptographic verification (hashes, header chains)
 ```
 
 ## Upstream Mapping

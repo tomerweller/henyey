@@ -11,6 +11,8 @@
 //!   ([`run_cmd`] and [`catchup_cmd`] modules)
 //! - **Logging and progress tracking**: Setting up structured logging and providing
 //!   progress reporting for long-running operations ([`logging`] module)
+//! - **Database maintenance**: Background cleanup of old ledger headers and SCP
+//!   history to prevent unbounded database growth ([`maintainer`] module)
 //! - **Network surveys**: Collecting and reporting overlay network topology data
 //!   ([`survey`] module)
 //!
@@ -44,6 +46,7 @@
 //! - [`catchup_cmd`]: History catchup command implementation
 //! - [`config`]: Configuration loading and validation
 //! - [`logging`]: Logging setup and progress tracking utilities
+//! - [`maintainer`]: Background database maintenance scheduler
 //! - [`run_cmd`]: Node run command and HTTP status server
 //! - [`survey`]: Time-sliced overlay network survey management
 

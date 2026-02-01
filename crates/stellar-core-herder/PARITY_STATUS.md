@@ -99,6 +99,20 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [x] `evict_expired()` - Age-based cleanup
 - [x] Statistics tracking
 
+#### Fetching Envelopes (`fetching_envelopes.rs` -> `PendingEnvelopes.h/cpp` fetching logic)
+- [x] `FetchingEnvelopes` - SCP envelope dependency fetching manager
+- [x] `ItemFetcher` integration for TxSet and QuorumSet fetching from peers
+- [x] Per-slot envelope state tracking (fetching, ready, processed, discarded)
+- [x] TxSet cache with slot-based eviction
+- [x] QuorumSet cache with size-based eviction
+- [x] `recv_envelope()` - Receive and check dependencies, start fetching if needed
+- [x] `recv_tx_set()` / `recv_quorum_set()` - Handle received dependencies
+- [x] `pop()` - Pop ready envelopes for processing
+- [x] `erase_below()` / `trim_stale()` - Memory management for old slots
+- [x] `peer_doesnt_have()` - Handle DONT_HAVE responses
+- [x] `process_pending()` - Process pending fetch requests
+- [x] `FetchingStats` - Statistics tracking
+
 #### Quorum Tracker (`quorum_tracker.rs` -> `QuorumTracker.h/cpp`)
 - [x] `SlotQuorumTracker` - Per-slot quorum monitoring
 - [x] `has_quorum()` / `is_v_blocking()` checks
@@ -199,13 +213,13 @@ This section documents the parity between this Rust crate and the upstream C++ s
 - [ ] **Encoded size calculation**: `encodedSize()` for flow control
 - [ ] **Inclusion fee map**: Per-transaction base fee tracking
 
-#### Pending Envelopes (`PendingEnvelopes`)
-- [ ] **ItemFetcher integration**: `mTxSetFetcher`, `mQuorumSetFetcher` for async network fetching
-- [ ] **Fetching state tracking**: `mFetchingEnvelopes` with timestamps
-- [ ] **Ready envelope queuing**: `mReadyEnvelopes` with wrappers
+#### Pending Envelopes (`PendingEnvelopes`) / Fetching Envelopes (`fetching_envelopes.rs`)
+- [x] **ItemFetcher integration**: `mTxSetFetcher`, `mQuorumSetFetcher` for async network fetching (via `FetchingEnvelopes`)
+- [x] **Fetching state tracking**: `mFetchingEnvelopes` with timestamps (via `SlotEnvelopes.fetching`)
+- [x] **Ready envelope queuing**: `mReadyEnvelopes` with wrappers (via `SlotEnvelopes.ready`)
+- [x] **Discarded envelope tracking**: `mDiscardedEnvelopes`, `discardSCPEnvelope()` (via `SlotEnvelopes.discarded`)
+- [x] **Envelope processing callbacks**: `envelopeProcessed()`, `envelopeReady()` (via `pop()` and `check_and_move_to_ready()`)
 - [ ] **Cost tracking**: `mReceivedCost` per validator, `reportCostOutliersForSlot()`
-- [ ] **Envelope processing callbacks**: `envelopeProcessed()`, `envelopeReady()`
-- [ ] **Discarded envelope tracking**: `mDiscardedEnvelopes`, `discardSCPEnvelope()`
 - [ ] **Quorum tracker integration**: `rebuildQuorumTrackerState()`, `forceRebuildQuorum()`
 - [ ] **Value size caching**: `mValueSizeCache` for txset/qset sizes
 
@@ -260,7 +274,7 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 6. **Envelope Fetching**
    - **C++**: `ItemFetcher` for async network requests with callbacks
-   - **Rust**: Synchronous processing; overlay integration pending
+   - **Rust**: `FetchingEnvelopes` with `ItemFetcher` from `stellar-core-overlay`; per-slot tracking of fetching/ready/processed/discarded envelopes
 
 7. **Error Handling**
    - **C++**: Exceptions and result codes
@@ -281,11 +295,11 @@ This section documents the parity between this Rust crate and the upstream C++ s
 
 #### Missing Integration Points
 
-- Overlay network `ItemFetcher` equivalent for async data fetching
 - Metrics collection and reporting infrastructure
 - Quorum intersection analysis for network health
 - Parallel Soroban execution planning
 - Config upgrade application to ledger state
+- Per-validator cost tracking for outlier detection
 
 #### App Integration Status
 
@@ -309,11 +323,11 @@ The following herder features are integrated with the main application:
 | SCP Driver | ~80% |
 | Transaction Queue | ~75% |
 | Surge Pricing | ~95% |
-| Pending Envelopes | ~70% |
+| Pending Envelopes | ~85% |
 | Quorum Tracker | ~90% |
 | Upgrades | ~80% |
 | TxSetFrame | ~60% |
 | Persistence | ~85% |
 | Quorum Intersection | 0% |
 | Parallel TxSet Builder | 0% |
-| **Overall** | **~82%** |
+| **Overall** | **~83%** |
