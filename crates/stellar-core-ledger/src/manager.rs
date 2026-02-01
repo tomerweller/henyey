@@ -11,7 +11,7 @@
 //! - **State Management**: Maintaining the current ledger header
 //! - **Bucket List Integration**: Updating the Merkle tree of ledger entries
 //! - **Transaction Execution**: Coordinating transaction processing via [`LedgerCloseContext`]
-//! - **Snapshot Management**: Providing consistent point-in-time views for queries
+//! - **Snapshots**: Providing consistent point-in-time views for queries
 //!
 //! # Thread Safety
 //!
@@ -35,7 +35,7 @@ use crate::{
         TransactionExecutionResult,
     },
     header::{compute_header_hash, create_next_header},
-    snapshot::{LedgerSnapshot, SnapshotHandle, SnapshotManager},
+    snapshot::{LedgerSnapshot, SnapshotHandle},
     LedgerError, Result,
 };
 use parking_lot::RwLock;
@@ -45,7 +45,6 @@ use stellar_core_bucket::{
     BucketEntry, BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
 };
 use stellar_core_common::{Hash256, NetworkId};
-use stellar_core_db::queries::offers as offers_db;
 use stellar_core_db::Database;
 use stellar_core_tx::soroban::PersistentModuleCache;
 use stellar_core_tx::state::AssetKey;
@@ -217,12 +216,6 @@ fn load_state_archival_settings_from_snapshot(
 /// to disable certain validations for faster execution.
 #[derive(Debug, Clone)]
 pub struct LedgerManagerConfig {
-    /// Maximum number of historical snapshots to retain.
-    ///
-    /// Older snapshots are automatically pruned when this limit is exceeded.
-    /// Set to 0 to disable snapshot retention (not recommended for production).
-    pub max_snapshots: usize,
-
     /// Whether to validate bucket list hashes against header values.
     ///
     /// When enabled, the computed bucket list hash is verified against the
@@ -252,7 +245,6 @@ pub struct LedgerManagerConfig {
 impl Default for LedgerManagerConfig {
     fn default() -> Self {
         Self {
-            max_snapshots: 10,
             validate_bucket_hash: true,
             persist_to_db: true,
             emit_classic_events: false,
@@ -292,7 +284,7 @@ struct LedgerState {
 /// - **Bucket List**: The Merkle tree of all ledger entries, providing
 ///   cryptographic integrity for the state
 /// - **Database**: Persistent storage for ledger headers and metadata
-/// - **Snapshot Manager**: Provides point-in-time views for concurrent access
+/// - **Snapshots**: Point-in-time views for concurrent access
 ///
 /// # Initialization
 ///
@@ -335,9 +327,6 @@ pub struct LedgerManager {
     /// Current mutable ledger state.
     state: RwLock<LedgerState>,
 
-    /// Manager for point-in-time snapshots.
-    snapshots: SnapshotManager,
-
     /// Configuration options.
     config: LedgerManagerConfig,
 
@@ -348,9 +337,9 @@ pub struct LedgerManager {
     /// repeated compilation of the same contract code.
     module_cache: RwLock<Option<PersistentModuleCache>>,
 
-    /// Flag indicating whether the SQL offers table has been populated.
+    /// Flag indicating whether the in-memory offer store has been populated.
     ///
-    /// The offers table is populated once during initialization from the bucket list
+    /// The offer store is populated once during initialization from the bucket list
     /// and updated as offers are created/modified/deleted during ledger closes.
     /// This avoids expensive full bucket list scans during orderbook operations.
     offers_initialized: Arc<RwLock<bool>>,
@@ -403,7 +392,6 @@ impl LedgerManager {
                 header_hash: Hash256::ZERO,
                 initialized: false,
             }),
-            snapshots: SnapshotManager::new(config.max_snapshots),
             config,
             module_cache: RwLock::new(None),
             offers_initialized: Arc::new(RwLock::new(false)),
@@ -766,18 +754,9 @@ impl LedgerManager {
         *self.bucket_list.write() = BucketList::default();
         *self.hot_archive_bucket_list.write() = None;
 
-        // Clear all caches to release memory before re-initialization
-        self.snapshots.clear();
-
         // Explicitly drop old module cache to release memory
         let _ = self.module_cache.write().take();
 
-        // Clear SQL offers table
-        if let Ok(conn) = self.db.connection() {
-            if let Err(e) = offers_db::drop_offers(&conn) {
-                tracing::warn!(error = %e, "Failed to drop offers table during reset");
-            }
-        }
         *self.offers_initialized.write() = false;
         self.soroban_state.write().clear();
 
@@ -840,65 +819,6 @@ impl LedgerManager {
         );
 
         *self.module_cache.write() = Some(cache);
-        Ok(())
-    }
-
-    /// Pre-load all offers from the bucket list into the SQL offers table.
-    ///
-    /// This is called once during initialization to avoid expensive bucket list
-    /// scans during orderbook operations. The SQL table is then maintained
-    /// incrementally as offers are created/updated/deleted.
-    ///
-    /// Note: This function is kept for potential future use in selective reinitialization.
-    /// Normal initialization uses `initialize_all_caches()` for better memory efficiency.
-    #[allow(dead_code)]
-    fn initialize_offers_sql(&self) -> Result<()> {
-        let bucket_list = self.bucket_list.read();
-
-        // Initialize schema and clear existing offers
-        let mut conn = self.db.connection().map_err(LedgerError::from)?;
-        offers_db::drop_offers(&conn)
-            .map_err(|e| LedgerError::Internal(format!("Failed to drop offers table: {}", e)))?;
-
-        let tx = conn
-            .transaction()
-            .map_err(|e| LedgerError::Internal(format!("Failed to start transaction: {}", e)))?;
-
-        // Collect offer entries using streaming iteration and batch insert
-        let mut offer_batch: Vec<LedgerEntry> = Vec::with_capacity(1000);
-        let mut offer_count = 0u64;
-        const BATCH_SIZE: usize = 1000;
-
-        for entry_result in bucket_list.live_entries_iter() {
-            let entry = entry_result.map_err(|e| {
-                LedgerError::Internal(format!("Failed to iterate live entries for offers: {}", e))
-            })?;
-            if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                offer_batch.push(entry);
-                if offer_batch.len() >= BATCH_SIZE {
-                    offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
-                        LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
-                    })?;
-                    offer_count += offer_batch.len() as u64;
-                    offer_batch.clear();
-                }
-            }
-        }
-
-        // Flush remaining offers
-        if !offer_batch.is_empty() {
-            offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
-                LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
-            })?;
-            offer_count += offer_batch.len() as u64;
-        }
-
-        tx.commit()
-            .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
-        *self.offers_initialized.write() = true;
-
-        info!(offer_count, "Initialized SQL offers table from bucket list");
-
         Ok(())
     }
 
@@ -1103,48 +1023,20 @@ impl LedgerManager {
         let mut soroban_state = self.soroban_state.write();
         soroban_state.clear();
 
-        // --- Scan 1: Offers -> SQL table ---
+        // --- Scan 1: Offers -> in-memory store ---
         info!("Cache init: scanning Offer entries...");
-        let mut conn = self.db.connection().map_err(LedgerError::from)?;
-        offers_db::drop_offers(&conn)
-            .map_err(|e| LedgerError::Internal(format!("Failed to drop offers table: {}", e)))?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| LedgerError::Internal(format!("Failed to start transaction: {}", e)))?;
-
-        let mut offer_batch: Vec<LedgerEntry> = Vec::with_capacity(1000);
         let mut offer_count = 0u64;
         let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
-        const BATCH_SIZE: usize = 1000;
 
         bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
             if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                // Insert into persistent in-memory store
                 if let LedgerEntryData::Offer(ref offer) = entry.data {
                     mem_offers.insert(offer.offer_id, entry.clone());
-                }
-
-                offer_batch.push(entry.clone());
-                if offer_batch.len() >= BATCH_SIZE {
-                    if let Err(e) = offers_db::bulk_upsert_offers(&tx, &offer_batch) {
-                        tracing::warn!(error = %e, "Failed to bulk upsert offers");
-                    }
-                    offer_count += offer_batch.len() as u64;
-                    offer_batch.clear();
+                    offer_count += 1;
                 }
             }
             true
         });
-
-        if !offer_batch.is_empty() {
-            offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
-                LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
-            })?;
-            offer_count += offer_batch.len() as u64;
-        }
-
-        tx.commit()
-            .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
 
         // Build the (account, asset) secondary index from mem_offers
         let mut account_asset_idx: OfferAccountAssetIndex = HashMap::new();
@@ -1339,56 +1231,28 @@ impl LedgerManager {
         let bucket_list_a = self.bucket_list.clone();
         let bucket_list_b = self.bucket_list.clone();
         let soroban_state = self.soroban_state.clone();
-        let db = self.db.clone();
 
         // Clear soroban state before spawning tasks
         soroban_state.write().clear();
 
-        // Task A — Offers: scan for Offer entries → SQL + in-memory HashMap
+        // Task A — Offers: scan for Offer entries → in-memory HashMap
         let offer_task = tokio::task::spawn_blocking(move || -> Result<(HashMap<i64, LedgerEntry>, u64)> {
             let task_start = std::time::Instant::now();
             info!("Cache init (parallel): scanning Offer entries...");
 
             let bucket_list = bucket_list_a.read();
-            let mut conn = db.connection().map_err(LedgerError::from)?;
-            offers_db::drop_offers(&conn)
-                .map_err(|e| LedgerError::Internal(format!("Failed to drop offers table: {}", e)))?;
-            let tx = conn
-                .transaction()
-                .map_err(|e| LedgerError::Internal(format!("Failed to start transaction: {}", e)))?;
-
-            let mut offer_batch: Vec<LedgerEntry> = Vec::with_capacity(1000);
             let mut offer_count = 0u64;
             let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
-            const BATCH_SIZE: usize = 1000;
 
             bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
                 if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
                     if let LedgerEntryData::Offer(ref offer) = entry.data {
                         mem_offers.insert(offer.offer_id, entry.clone());
-                    }
-
-                    offer_batch.push(entry.clone());
-                    if offer_batch.len() >= BATCH_SIZE {
-                        if let Err(e) = offers_db::bulk_upsert_offers(&tx, &offer_batch) {
-                            tracing::warn!(error = %e, "Failed to bulk upsert offers");
-                        }
-                        offer_count += offer_batch.len() as u64;
-                        offer_batch.clear();
+                        offer_count += 1;
                     }
                 }
                 true
             });
-
-            if !offer_batch.is_empty() {
-                offers_db::bulk_upsert_offers(&tx, &offer_batch).map_err(|e| {
-                    LedgerError::Internal(format!("Failed to bulk upsert offers: {}", e))
-                })?;
-                offer_count += offer_batch.len() as u64;
-            }
-
-            tx.commit()
-                .map_err(|e| LedgerError::Internal(format!("Failed to commit transaction: {}", e)))?;
 
             info!(
                 offer_count,
@@ -2095,11 +1959,6 @@ impl LedgerManager {
         Ok(handle)
     }
 
-    /// Get a historical snapshot by sequence number.
-    pub fn get_snapshot(&self, seq: u32) -> Option<SnapshotHandle> {
-        self.snapshots.get(seq)
-    }
-
     /// Commit a ledger close.
     ///
     /// This is called by LedgerCloseContext::commit().
@@ -2144,7 +2003,7 @@ impl LedgerManager {
             }
         }
 
-        // Update SQL offers table and in-memory offer store with offer changes
+        // Update in-memory offer store with offer changes
         if *self.offers_initialized.read() {
             let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
             let mut offer_deletes: Vec<i64> = Vec::new();
@@ -2176,29 +2035,8 @@ impl LedgerManager {
                 }
             }
 
-            // Apply changes to SQL in a transaction
+            // Update in-memory offer store
             if !offer_upserts.is_empty() || !offer_deletes.is_empty() {
-                let mut conn = self.db.connection().map_err(LedgerError::from)?;
-                let tx = conn.transaction().map_err(|e| {
-                    LedgerError::Internal(format!("Failed to start transaction: {}", e))
-                })?;
-
-                if !offer_upserts.is_empty() {
-                    offers_db::bulk_upsert_offers(&tx, &offer_upserts).map_err(|e| {
-                        LedgerError::Internal(format!("Failed to upsert offers: {}", e))
-                    })?;
-                }
-                if !offer_deletes.is_empty() {
-                    offers_db::bulk_delete_offers(&tx, &offer_deletes).map_err(|e| {
-                        LedgerError::Internal(format!("Failed to delete offers: {}", e))
-                    })?;
-                }
-
-                tx.commit().map_err(|e| {
-                    LedgerError::Internal(format!("Failed to commit offers transaction: {}", e))
-                })?;
-
-                // Update in-memory offer store
                 let mut store = self.offer_store.write();
                 for entry in &offer_upserts {
                     if let LedgerEntryData::Offer(ref offer) = entry.data {
@@ -2231,7 +2069,7 @@ impl LedgerManager {
     /// 2. Hot archive add_batch (if protocol 23+)
     /// 3. Soroban state update (init/live/dead)
     /// 4. Module cache update (new contract code)
-    /// 5. SQL offers update (insert/update/delete)
+    /// 5. In-memory offers update (insert/update/delete)
     /// 6. Internal header update
     #[allow(clippy::too_many_arguments)]
     pub fn apply_ledger_close(
@@ -2310,7 +2148,7 @@ impl LedgerManager {
         }
         let module_cache_us = t0.elapsed().as_micros() as u64;
 
-        // 5. SQL offers update
+        // 5. In-memory offers update
         let t0 = std::time::Instant::now();
         self.update_offers_from_entries(init_entries, live_entries, dead_entries)?;
         let offers_update_us = t0.elapsed().as_micros() as u64;
@@ -2336,7 +2174,7 @@ impl LedgerManager {
         Ok(())
     }
 
-    /// Update SQL offers table and in-memory offer store from init/live/dead entry vectors.
+    /// Update in-memory offer store and secondary index from init/live/dead entry vectors.
     fn update_offers_from_entries(
         &self,
         init_entries: &[LedgerEntry],
@@ -2363,26 +2201,6 @@ impl LedgerManager {
         }
 
         if !offer_upserts.is_empty() || !offer_deletes.is_empty() {
-            let mut conn = self.db.connection().map_err(LedgerError::from)?;
-            let tx = conn.transaction().map_err(|e| {
-                LedgerError::Internal(format!("Failed to start transaction: {}", e))
-            })?;
-
-            if !offer_upserts.is_empty() {
-                offers_db::bulk_upsert_offers(&tx, &offer_upserts).map_err(|e| {
-                    LedgerError::Internal(format!("Failed to upsert offers: {}", e))
-                })?;
-            }
-            if !offer_deletes.is_empty() {
-                offers_db::bulk_delete_offers(&tx, &offer_deletes).map_err(|e| {
-                    LedgerError::Internal(format!("Failed to delete offers: {}", e))
-                })?;
-            }
-
-            tx.commit().map_err(|e| {
-                LedgerError::Internal(format!("Failed to commit offers transaction: {}", e))
-            })?;
-
             // Update in-memory offer store and secondary index
             let mut store = self.offer_store.write();
             let mut idx = self.offer_account_asset_index.write();
@@ -2418,14 +2236,6 @@ impl LedgerManager {
         &self.db
     }
 
-    /// Get statistics about the current state.
-    pub fn stats(&self) -> LedgerManagerStats {
-        LedgerManagerStats {
-            ledger_seq: self.current_ledger_seq(),
-            active_snapshots: self.snapshots.count(),
-        }
-    }
-
     /// Get Soroban network configuration information.
     ///
     /// Returns the Soroban-related configuration settings from the current ledger
@@ -2437,22 +2247,6 @@ impl LedgerManager {
         let snapshot = self.create_snapshot().ok()?;
         load_soroban_network_info(&snapshot)
     }
-}
-
-/// Runtime statistics about the ledger manager.
-///
-/// Use [`LedgerManager::stats`] to obtain current statistics for monitoring
-/// and debugging purposes.
-#[derive(Debug, Clone)]
-pub struct LedgerManagerStats {
-    /// Current ledger sequence number.
-    pub ledger_seq: u32,
-
-    /// Number of active point-in-time snapshots.
-    ///
-    /// Snapshots are retained for historical queries and are automatically
-    /// pruned based on the configured maximum.
-    pub active_snapshots: usize,
 }
 
 /// Context for closing a single ledger.
@@ -3598,7 +3392,6 @@ mod tests {
     #[test]
     fn test_ledger_manager_config_default() {
         let config = LedgerManagerConfig::default();
-        assert_eq!(config.max_snapshots, 10);
         assert!(config.validate_bucket_hash);
         assert!(config.persist_to_db);
     }

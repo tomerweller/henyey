@@ -8,7 +8,6 @@
 //!
 //! Queries are organized by domain:
 //!
-//! - [`AccountQueries`]: Stellar account management
 //! - [`BanQueries`]: Node ban list management
 //! - [`BucketListQueries`]: Bucket list snapshot storage
 //! - [`HistoryQueries`]: Transaction history and results
@@ -32,23 +31,19 @@
 //! })?;
 //! ```
 
-pub mod accounts;
 pub mod ban;
 pub mod bucket_list;
 pub mod history;
 pub mod ledger;
-pub mod offers;
 pub mod peers;
 pub mod publish_queue;
 pub mod scp;
 pub mod state;
 
-pub use accounts::AccountQueries;
 pub use ban::BanQueries;
 pub use bucket_list::BucketListQueries;
 pub use history::HistoryQueries;
 pub use ledger::LedgerQueries;
-pub use offers::OfferDbError;
 pub use peers::{PeerQueries, PeerRecord};
 pub use publish_queue::PublishQueueQueries;
 pub use scp::{ScpQueries, ScpStatePersistenceQueries};

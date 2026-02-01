@@ -27,7 +27,6 @@ crates/stellar-core-db/
 │   ├── migrations.rs   # Schema versioning and migrations
 │   └── queries/        # Typed query traits
 │       ├── mod.rs
-│       ├── accounts.rs     # Account CRUD
 │       ├── ban.rs          # Node ban list
 │       ├── bucket_list.rs  # Bucket list snapshots
 │       ├── history.rs      # Transaction history
@@ -58,7 +57,6 @@ Query functionality is organized into domain-specific traits:
 | `HistoryQueries` | Transaction history and results |
 | `ScpQueries` | SCP envelopes and quorum sets |
 | `StateQueries` | Key-value state storage |
-| `AccountQueries` | Stellar account management |
 | `PeerQueries` | Network peer tracking |
 | `BucketListQueries` | Bucket list snapshots |
 | `PublishQueueQueries` | History archive publish queue |
@@ -151,29 +149,14 @@ db.upgrade()?;
 - `storestate` - Key-value configuration and state
 - `ledgerheaders` - Block headers with sequence, hash, timestamp
 
-### Ledger Entries
-- `accounts` - Stellar accounts with balances and settings
-- `trustlines` - Asset trust relationships
-- `offers` - DEX offers
-- `accountdata` - Account data entries
-- `claimablebalance` - Claimable balances
-- `liquiditypool` - AMM liquidity pools
-
-### Soroban (Smart Contracts)
-- `contractdata` - Contract storage
-- `contractcode` - WASM bytecode
-- `ttl` - Entry expiration tracking
-
 ### History
 - `txhistory` - Individual transactions
 - `txsets` - Per-ledger transaction sets
 - `txresults` - Per-ledger transaction results
-- `txfeehistory` - Fee-related ledger changes
 
 ### Consensus
 - `scphistory` - SCP envelopes per ledger
 - `scpquorums` - Quorum set definitions
-- `upgradehistory` - Protocol upgrade records
 
 ### Operations
 - `peers` - Known network peers
@@ -224,4 +207,3 @@ This crate corresponds to the following C++ stellar-core components:
 | `queries/history.rs` | `src/transactions/TransactionSQL.cpp` |
 | `queries/publish_queue.rs` | `src/history/HistoryManagerImpl.cpp` |
 | `queries/bucket_list.rs` | No direct C++ equivalent (new in Rust) |
-| `queries/accounts.rs` | `src/ledger/LedgerTxnAccountSQL.cpp` (partial) |

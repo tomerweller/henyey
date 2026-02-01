@@ -10,13 +10,11 @@
 //!
 //! - **State management**: `storestate` - key-value store for node configuration
 //! - **Ledger data**: `ledgerheaders` - block headers with sequence numbers and hashes
-//! - **Ledger entries**: `accounts`, `trustlines`, `offers`, `accountdata`,
-//!   `claimablebalance`, `liquiditypool` - the current state of the ledger
-//! - **Soroban**: `contractdata`, `contractcode`, `ttl` - smart contract state
-//! - **Transaction history**: `txhistory`, `txsets`, `txresults`, `txfeehistory`
-//! - **Consensus**: `scphistory`, `scpquorums`, `upgradehistory`
+//! - **Transaction history**: `txhistory`, `txsets`, `txresults`
+//! - **Bucket list**: `bucketlist` - checkpoint bucket hashes
+//! - **Consensus**: `scphistory`, `scpquorums`
 //! - **Networking**: `peers`, `ban`
-//! - **Publishing**: `publishqueue`, `bucketlist`
+//! - **Publishing**: `publishqueue`
 //!
 //! # Versioning
 //!
@@ -51,117 +49,6 @@ CREATE TABLE IF NOT EXISTS ledgerheaders (
 );
 CREATE INDEX IF NOT EXISTS ledgerheaders_seq ON ledgerheaders(ledgerseq);
 
--- Accounts
-CREATE TABLE IF NOT EXISTS accounts (
-    accountid TEXT PRIMARY KEY,
-    balance BIGINT NOT NULL,
-    seqnum BIGINT NOT NULL,
-    numsubentries INTEGER NOT NULL,
-    inflationdest TEXT,
-    homedomain TEXT,
-    thresholds TEXT NOT NULL,
-    flags INTEGER NOT NULL,
-    lastmodified INTEGER NOT NULL,
-    buyingliabilities BIGINT DEFAULT 0,
-    sellingliabilities BIGINT DEFAULT 0,
-    signers TEXT,
-    extension BLOB
-);
-
--- Trust lines
-CREATE TABLE IF NOT EXISTS trustlines (
-    accountid TEXT NOT NULL,
-    assettype INTEGER NOT NULL,
-    issuer TEXT NOT NULL,
-    assetcode TEXT NOT NULL,
-    tlimit BIGINT NOT NULL,
-    balance BIGINT NOT NULL,
-    flags INTEGER NOT NULL,
-    lastmodified INTEGER NOT NULL,
-    buyingliabilities BIGINT DEFAULT 0,
-    sellingliabilities BIGINT DEFAULT 0,
-    extension BLOB,
-    PRIMARY KEY (accountid, assettype, issuer, assetcode)
-);
-
--- Offers
-CREATE TABLE IF NOT EXISTS offers (
-    offerid BIGINT PRIMARY KEY,
-    sellerid TEXT NOT NULL,
-    sellingassettype INTEGER NOT NULL,
-    sellingissuer TEXT,
-    sellingassetcode TEXT,
-    buyingassettype INTEGER NOT NULL,
-    buyingissuer TEXT,
-    buyingassetcode TEXT,
-    amount BIGINT NOT NULL,
-    pricen INTEGER NOT NULL,
-    priced INTEGER NOT NULL,
-    flags INTEGER NOT NULL,
-    lastmodified INTEGER NOT NULL,
-    extension BLOB
-);
-CREATE INDEX IF NOT EXISTS offers_seller ON offers(sellerid);
-
--- Account data entries
-CREATE TABLE IF NOT EXISTS accountdata (
-    accountid TEXT NOT NULL,
-    dataname TEXT NOT NULL,
-    datavalue TEXT NOT NULL,
-    lastmodified INTEGER NOT NULL,
-    extension BLOB,
-    PRIMARY KEY (accountid, dataname)
-);
-
--- Claimable balances
-CREATE TABLE IF NOT EXISTS claimablebalance (
-    balanceid TEXT PRIMARY KEY,
-    claimants TEXT NOT NULL,
-    asset TEXT NOT NULL,
-    amount BIGINT NOT NULL,
-    lastmodified INTEGER NOT NULL,
-    extension BLOB
-);
-
--- Liquidity pools
-CREATE TABLE IF NOT EXISTS liquiditypool (
-    poolid TEXT PRIMARY KEY,
-    type INTEGER NOT NULL,
-    assetA TEXT NOT NULL,
-    assetB TEXT NOT NULL,
-    fee INTEGER NOT NULL,
-    reserveA BIGINT NOT NULL,
-    reserveB BIGINT NOT NULL,
-    totalshares BIGINT NOT NULL,
-    poolshareholders INTEGER NOT NULL,
-    lastmodified INTEGER NOT NULL,
-    extension BLOB
-);
-
--- Soroban contract data
-CREATE TABLE IF NOT EXISTS contractdata (
-    contractid TEXT NOT NULL,
-    key BLOB NOT NULL,
-    keytype INTEGER NOT NULL,
-    durability INTEGER NOT NULL,
-    val BLOB NOT NULL,
-    lastmodified INTEGER NOT NULL,
-    PRIMARY KEY (contractid, key)
-);
-
--- Soroban contract code
-CREATE TABLE IF NOT EXISTS contractcode (
-    hash TEXT PRIMARY KEY,
-    code BLOB NOT NULL,
-    lastmodified INTEGER NOT NULL
-);
-
--- Soroban TTL entries
-CREATE TABLE IF NOT EXISTS ttl (
-    keyhash TEXT PRIMARY KEY,
-    liveuntilledgerseq INTEGER NOT NULL
-);
-
 -- Transaction history
 CREATE TABLE IF NOT EXISTS txhistory (
     txid TEXT PRIMARY KEY,
@@ -195,15 +82,6 @@ CREATE TABLE IF NOT EXISTS bucketlist (
 );
 CREATE INDEX IF NOT EXISTS bucketlist_ledger ON bucketlist(ledgerseq);
 
--- Transaction fee history
-CREATE TABLE IF NOT EXISTS txfeehistory (
-    txid TEXT PRIMARY KEY,
-    ledgerseq INTEGER NOT NULL,
-    txindex INTEGER NOT NULL,
-    txchanges BLOB NOT NULL
-);
-CREATE INDEX IF NOT EXISTS txfeehistory_ledger ON txfeehistory(ledgerseq);
-
 -- SCP state
 CREATE TABLE IF NOT EXISTS scphistory (
     nodeid TEXT NOT NULL,
@@ -217,15 +95,6 @@ CREATE TABLE IF NOT EXISTS scpquorums (
     qsethash TEXT PRIMARY KEY,
     lastledgerseq INTEGER NOT NULL,
     qset BLOB NOT NULL
-);
-
--- Upgrade history
-CREATE TABLE IF NOT EXISTS upgradehistory (
-    ledgerseq INTEGER NOT NULL,
-    upgradeindex INTEGER NOT NULL,
-    upgrade BLOB NOT NULL,
-    changes BLOB NOT NULL,
-    PRIMARY KEY (ledgerseq, upgradeindex)
 );
 
 -- Peers

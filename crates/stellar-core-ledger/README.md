@@ -12,7 +12,7 @@ This crate provides the core ledger state management for the Stellar network. It
 - **State Management**: Maintains ledger entries through the bucket list Merkle tree
 - **Transaction Execution**: Bridges to `stellar-core-tx` for per-transaction processing
 - **Invariant Validation**: Enforces ledger consistency rules after each close
-- **Snapshot Management**: Provides consistent point-in-time views for concurrent access
+- **Snapshots**: Provides consistent point-in-time views for concurrent access
 
 ## Architecture
 
@@ -25,7 +25,7 @@ This crate provides the core ledger state management for the Stellar network. It
           +---------------+---------------+
           |               |               |
    +------+------+ +------+------+ +------+------+
-   | BucketList  | | SnapshotMgr | | InvariantMgr|
+   | BucketList  | | Snapshots   | | InvariantMgr|
    | (Merkle tree)| | (point-in-  | | (validation)|
    |             | | time views) | |             |
    +-------------+ +-------------+ +-------------+
@@ -176,7 +176,6 @@ All public APIs are thread-safe:
 
 - `LedgerManager` uses internal RwLocks for state protection
 - `SnapshotHandle` wraps snapshots in Arc for efficient sharing
-- `SnapshotManager` handles concurrent registration/lookup
 
 ### Determinism
 
