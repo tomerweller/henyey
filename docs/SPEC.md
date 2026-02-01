@@ -23,6 +23,10 @@ This project is **not** production-grade.
 - PostgreSQL support (SQLite only).
 - Full metrics parity with stellar-core.
 - Production deployment or operational hardening.
+- **Local state durability.** A crashed node recovers by catching up from a
+  published history checkpoint, not from local database state. This means
+  SQL tables do not need to survive restarts and the database is treated as
+  an ephemeral cache rather than a durable store.
 
 ## 2. Architecture Overview
 

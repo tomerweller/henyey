@@ -63,7 +63,7 @@ This section documents the implementation status compared to the C++ upstream in
 - [x] Entry lookup with bucket list fallback
 - [x] Header lookup for historical queries
 - [x] Full entries enumeration
-- [x] Snapshot lifecycle management (`SnapshotManager`)
+- [x] Snapshot lifecycle management
 - [x] Builder pattern for snapshot construction
 - [x] Account lookup utilities
 

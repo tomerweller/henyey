@@ -747,7 +747,6 @@ impl App {
             db.clone(),
             config.network.passphrase.clone(),
             LedgerManagerConfig {
-                max_snapshots: 10,
                 validate_bucket_hash: true,
                 persist_to_db: true,
                 emit_classic_events: config.events.emit_classic_events,

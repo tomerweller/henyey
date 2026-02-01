@@ -14,7 +14,6 @@
 //! - [`LedgerSnapshot`]: The actual point-in-time state (header + cached entries)
 //! - [`SnapshotHandle`]: Thread-safe wrapper with optional lookup functions
 //! - [`SnapshotBuilder`]: Fluent API for constructing snapshots
-//! - [`SnapshotManager`]: Lifecycle management and retention policy
 //!
 //! # Lazy Loading
 //!
@@ -23,7 +22,6 @@
 //! the entire ledger state upfront.
 
 use crate::{LedgerError, Result};
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use stellar_core_common::Hash256;
@@ -579,95 +577,6 @@ impl SnapshotBuilder {
     }
 }
 
-/// Manager for snapshot lifecycle and retention.
-///
-/// `SnapshotManager` handles the creation, storage, and cleanup of
-/// ledger snapshots. It enforces a configurable retention policy,
-/// automatically pruning old snapshots when the limit is exceeded.
-///
-/// # Retention Policy
-///
-/// When the number of snapshots exceeds `max_snapshots`, the oldest
-/// snapshots (by ledger sequence) are removed to make room for new ones.
-///
-/// # Thread Safety
-///
-/// All methods are safe to call from multiple threads. The internal
-/// storage is protected by an RwLock.
-pub struct SnapshotManager {
-    /// Active snapshots indexed by ledger sequence.
-    snapshots: RwLock<HashMap<u32, SnapshotHandle>>,
-
-    /// Maximum number of snapshots to retain before pruning.
-    max_snapshots: usize,
-}
-
-impl SnapshotManager {
-    /// Create a new snapshot manager.
-    pub fn new(max_snapshots: usize) -> Self {
-        Self {
-            snapshots: RwLock::new(HashMap::new()),
-            max_snapshots,
-        }
-    }
-
-    /// Register a new snapshot.
-    pub fn register(&self, snapshot: LedgerSnapshot) -> SnapshotHandle {
-        let seq = snapshot.ledger_seq;
-        let handle = SnapshotHandle::new(snapshot);
-
-        let mut snapshots = self.snapshots.write();
-        snapshots.insert(seq, handle.clone());
-
-        // Prune old snapshots if needed
-        if snapshots.len() > self.max_snapshots {
-            let mut seqs: Vec<_> = snapshots.keys().copied().collect();
-            seqs.sort();
-            for seq in seqs.into_iter().take(snapshots.len() - self.max_snapshots) {
-                snapshots.remove(&seq);
-            }
-        }
-
-        handle
-    }
-
-    /// Get a snapshot by sequence number.
-    pub fn get(&self, seq: u32) -> Option<SnapshotHandle> {
-        self.snapshots.read().get(&seq).cloned()
-    }
-
-    /// Get the latest snapshot.
-    pub fn latest(&self) -> Option<SnapshotHandle> {
-        let snapshots = self.snapshots.read();
-        snapshots
-            .keys()
-            .max()
-            .copied()
-            .and_then(|seq| snapshots.get(&seq).cloned())
-    }
-
-    /// Remove a snapshot.
-    pub fn remove(&self, seq: u32) -> Option<SnapshotHandle> {
-        self.snapshots.write().remove(&seq)
-    }
-
-    /// Get the number of active snapshots.
-    pub fn count(&self) -> usize {
-        self.snapshots.read().len()
-    }
-
-    /// Clear all snapshots.
-    pub fn clear(&self) {
-        self.snapshots.write().clear();
-    }
-}
-
-impl Default for SnapshotManager {
-    fn default() -> Self {
-        Self::new(10)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,27 +626,6 @@ mod tests {
 
         assert_eq!(snapshot.ledger_seq(), 10);
         assert!(snapshot.get_entry(&key).unwrap().is_some());
-    }
-
-    #[test]
-    fn test_snapshot_manager() {
-        let manager = SnapshotManager::new(3);
-
-        // Add snapshots
-        for seq in 1..=5 {
-            let snapshot = LedgerSnapshot::empty(seq);
-            manager.register(snapshot);
-        }
-
-        // Should only keep the last 3
-        assert_eq!(manager.count(), 3);
-
-        // Check that we have the latest ones
-        assert!(manager.get(3).is_some());
-        assert!(manager.get(4).is_some());
-        assert!(manager.get(5).is_some());
-        assert!(manager.get(1).is_none());
-        assert!(manager.get(2).is_none());
     }
 
     #[test]
