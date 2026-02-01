@@ -715,15 +715,7 @@ impl TransactionMetaBuilder {
     /// Determine the XDR meta version based on protocol.
     fn meta_version(&self) -> u32 {
         // Protocol 20+ uses V4 for Soroban support
-        // Protocol 19 uses V3
-        // Earlier protocols use V2
-        if self.protocol_version >= 20 {
-            4
-        } else if self.protocol_version >= 19 {
-            3
-        } else {
-            2
-        }
+        4
     }
 
     /// Finalize and consume, producing the TransactionMeta XDR.

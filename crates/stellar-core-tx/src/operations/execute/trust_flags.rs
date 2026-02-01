@@ -23,7 +23,6 @@ use crate::Result;
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
     TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
-const AUTH_REQUIRED_FLAG: u32 = 0x1;
 const AUTH_REVOCABLE_FLAG: u32 = 0x2;
 
 /// Trustline auth flags mask
@@ -37,7 +36,7 @@ pub fn execute_allow_trust(
     op: &AllowTrustOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    context: &LedgerContext,
+    _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the issuer)
     // NOTE: C++ stellar-core loads the source account in a nested LedgerTxn (ltxSource)
@@ -50,16 +49,8 @@ pub fn execute_allow_trust(
         }
     };
 
-    // Check if issuer has AUTH_REQUIRED flag (only for protocol versions before 16)
-    // In protocol 16+, this check was removed as part of CAP-0035.
-    if context.protocol_version < 16 && issuer.flags & AUTH_REQUIRED_FLAG == 0 {
-        return Ok(make_allow_trust_result(
-            AllowTrustResultCode::TrustNotRequired,
-        ));
-    }
-
-    // Check if trustor == source (self not allowed) - protocol 3+
-    if context.protocol_version >= 3 && &op.trustor == source {
+    // Check if trustor == source (self not allowed)
+    if &op.trustor == source {
         return Ok(make_allow_trust_result(
             AllowTrustResultCode::SelfNotAllowed,
         ));
@@ -70,11 +61,6 @@ pub fn execute_allow_trust(
     let auth_revocable = issuer.flags & AUTH_REVOCABLE_FLAG != 0;
     if !auth_revocable && op.authorize == 0 {
         return Ok(make_allow_trust_result(AllowTrustResultCode::CantRevoke));
-    }
-
-    // For protocol <= 2, trustor == source just returns success
-    if &op.trustor == source {
-        return Ok(make_allow_trust_result(AllowTrustResultCode::Success));
     }
 
     // Convert the asset code to a full Asset
@@ -447,6 +433,8 @@ fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilit
 mod tests {
     use super::*;
     use stellar_xdr::curr::*;
+
+    const AUTH_REQUIRED_FLAG: u32 = 0x1;
 
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))

@@ -374,8 +374,7 @@ pub fn validate_fee_bump(
             });
         }
     } else {
-        let allow_negative_inner =
-            context.protocol_version >= 23 && frame.inner_frame().is_soroban();
+        let allow_negative_inner = frame.inner_frame().is_soroban();
         if !allow_negative_inner {
             return Err(FeeBumpError::InvalidInnerTxType);
         }

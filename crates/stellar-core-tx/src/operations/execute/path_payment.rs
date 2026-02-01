@@ -313,22 +313,11 @@ struct TransferError {
 }
 
 fn check_issuer(
-    asset: &Asset,
-    state: &LedgerStateManager,
-    context: &LedgerContext,
+    _asset: &Asset,
+    _state: &LedgerStateManager,
+    _context: &LedgerContext,
 ) -> std::result::Result<(), TransferError> {
     // In protocol 13+, issuer checks were removed (CAP-0017)
-    if context.protocol_version >= 13 {
-        return Ok(());
-    }
-    if let Some(issuer) = issuer_for_asset(asset) {
-        if state.get_account(issuer).is_none() {
-            return Err(TransferError {
-                code: PathPaymentStrictReceiveResultCode::NoIssuer,
-                no_issuer_asset: Some(asset.clone()),
-            });
-        }
-    }
     Ok(())
 }
 
@@ -1455,7 +1444,6 @@ fn make_strict_send_result_with_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_core_common::NetworkId;
     use stellar_xdr::curr::*;
 
     const AUTH_REQUIRED_FLAG: u32 = 0x1;
@@ -1485,20 +1473,6 @@ mod tests {
 
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
-    }
-
-    /// Create a test context with a specific protocol version.
-    /// Used for testing pre-protocol-13 behavior (like NoIssuer checks).
-    fn create_test_context_with_protocol(protocol_version: u32) -> LedgerContext {
-        LedgerContext {
-            sequence: 1,
-            close_time: 1000,
-            base_fee: 100,
-            base_reserve: 5_000_000,
-            protocol_version,
-            network_id: NetworkId::testnet(),
-            soroban_prng_seed: None,
-        }
     }
 
     fn create_test_trustline(
@@ -1635,63 +1609,6 @@ mod tests {
     }
 
     #[test]
-    fn test_path_payment_credit_no_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        // Use protocol 12 (before CAP-0017 in protocol 13 removed issuer checks)
-        let context = create_test_context_with_protocol(12);
-
-        let issuer_id = create_test_account_id(9);
-        let source_id = create_test_account_id(0);
-        let dest_id = create_test_account_id(1);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-
-        let asset = create_asset(&issuer_id);
-        state.create_trustline(create_test_trustline(
-            source_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            100,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-        state.create_trustline(create_test_trustline(
-            dest_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            0,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-
-        let op = PathPaymentStrictReceiveOp {
-            send_asset: asset.clone(),
-            send_max: 100,
-            destination: create_test_muxed_account(1),
-            dest_asset: asset,
-            dest_amount: 10,
-            path: vec![].try_into().unwrap(),
-        };
-
-        let result =
-            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
-        match result {
-            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
-                if let PathPaymentStrictReceiveResult::NoIssuer(asset) = r {
-                    assert_eq!(asset, create_asset(&issuer_id));
-                } else {
-                    panic!("Unexpected result type");
-                }
-            }
-            _ => panic!("Unexpected result type"),
-        }
-    }
-
-    #[test]
     fn test_path_payment_credit_src_not_authorized() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
@@ -1797,63 +1714,6 @@ mod tests {
         match result {
             OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
                 assert!(matches!(r, PathPaymentStrictReceiveResult::NotAuthorized));
-            }
-            _ => panic!("Unexpected result type"),
-        }
-    }
-
-    #[test]
-    fn test_path_payment_strict_send_credit_no_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        // Use protocol 12 (before CAP-0017 in protocol 13 removed issuer checks)
-        let context = create_test_context_with_protocol(12);
-
-        let issuer_id = create_test_account_id(9);
-        let source_id = create_test_account_id(0);
-        let dest_id = create_test_account_id(1);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-
-        let asset = create_asset(&issuer_id);
-        state.create_trustline(create_test_trustline(
-            source_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            100,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-        state.create_trustline(create_test_trustline(
-            dest_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            0,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-
-        let op = PathPaymentStrictSendOp {
-            send_asset: asset.clone(),
-            send_amount: 10,
-            destination: create_test_muxed_account(1),
-            dest_asset: asset,
-            dest_min: 1,
-            path: vec![].try_into().unwrap(),
-        };
-
-        let result =
-            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
-        match result {
-            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
-                if let PathPaymentStrictSendResult::NoIssuer(asset) = r {
-                    assert_eq!(asset, create_asset(&issuer_id));
-                } else {
-                    panic!("Unexpected result type");
-                }
             }
             _ => panic!("Unexpected result type"),
         }

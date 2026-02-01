@@ -27,25 +27,19 @@ pub fn execute_bump_sequence(
         .ok_or(TxError::SourceAccountNotFound)?;
 
     let current = source_account.seq_num.0;
-    let mut changed = false;
 
-    // Only bump if new sequence is higher, but always refresh seq metadata on v19+
+    // Only bump if new sequence is higher
     if op.bump_to.0 > current {
         source_account.seq_num.0 = op.bump_to.0;
-        changed = true;
     }
-    if op.bump_to.0 > current || context.protocol_version >= 19 {
-        crate::state::update_account_seq_info(
-            &mut source_account,
-            context.sequence,
-            context.close_time,
-        );
-        changed = true;
-    }
+    // Always refresh seq metadata (protocol 19+ behavior)
+    crate::state::update_account_seq_info(
+        &mut source_account,
+        context.sequence,
+        context.close_time,
+    );
 
-    if changed {
-        state.update_account(source_account);
-    }
+    state.update_account(source_account);
 
     Ok(make_result(BumpSequenceResultCode::Success))
 }

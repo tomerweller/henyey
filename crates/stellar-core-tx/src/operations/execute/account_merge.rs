@@ -16,7 +16,7 @@ pub fn execute_account_merge(
     dest: &MuxedAccount,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    context: &LedgerContext,
+    _context: &LedgerContext,
 ) -> Result<OperationResult> {
     let dest_account_id = muxed_to_account_id(dest);
 
@@ -39,15 +39,13 @@ pub fn execute_account_merge(
         return Ok(make_result(AccountMergeResultCode::HasSubEntries));
     }
 
-    if context.protocol_version >= 14 && num_sponsoring(&source_account) > 0 {
+    if num_sponsoring(&source_account) > 0 {
         return Ok(make_result(AccountMergeResultCode::IsSponsor));
     }
 
-    if context.protocol_version >= 19 {
-        let starting_seq = state.starting_sequence_number()?;
-        if source_account.seq_num.0 >= starting_seq {
-            return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
-        }
+    let starting_seq = state.starting_sequence_number()?;
+    if source_account.seq_num.0 >= starting_seq {
+        return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
     }
 
     // Check source is not immutable

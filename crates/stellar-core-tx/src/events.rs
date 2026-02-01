@@ -51,16 +51,12 @@ pub struct ClassicEventConfig {
 }
 
 impl ClassicEventConfig {
-    pub fn events_enabled(self, protocol_version: u32) -> bool {
-        if protocol_version >= 23 {
-            self.emit_classic_events
-        } else {
-            self.backfill_stellar_asset_events
-        }
+    pub fn events_enabled(self, _protocol_version: u32) -> bool {
+        self.emit_classic_events
     }
 
-    pub fn backfill_to_protocol23(self, protocol_version: u32) -> bool {
-        self.backfill_stellar_asset_events && protocol_version < 23
+    pub fn backfill_to_protocol23(self, _protocol_version: u32) -> bool {
+        false
     }
 }
 

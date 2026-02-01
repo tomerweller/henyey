@@ -30,10 +30,6 @@ pub fn execute_manage_data(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationResult> {
-    if context.protocol_version < 2 {
-        return Ok(make_result(ManageDataResultCode::NotSupportedYet));
-    }
-
     // Validate data name
     let data_name = op.data_name.to_string();
     if data_name.is_empty() || data_name.len() > MAX_DATA_NAME_LENGTH {
@@ -105,11 +101,9 @@ pub fn execute_manage_data(
                 {
                     return Ok(OperationResult::OpTooManySubentries);
                 }
-                if context.protocol_version >= 18 {
-                    let total = source_account.num_sub_entries as u64 + num_sponsoring as u64 + 1;
-                    if total > u32::MAX as u64 {
-                        return Ok(OperationResult::OpTooManySubentries);
-                    }
+                let total = source_account.num_sub_entries as u64 + num_sponsoring as u64 + 1;
+                if total > u32::MAX as u64 {
+                    return Ok(OperationResult::OpTooManySubentries);
                 }
 
                 // Check source can afford new sub-entry
@@ -124,11 +118,9 @@ pub fn execute_manage_data(
                         1,
                         0,
                     )?;
-                    let mut available = sponsor_account.balance;
-                    if context.protocol_version >= 10 {
-                        available =
-                            available.saturating_sub(account_liabilities(sponsor_account).selling);
-                    }
+                    let available = sponsor_account
+                        .balance
+                        .saturating_sub(account_liabilities(sponsor_account).selling);
                     if available < new_min_balance {
                         return Ok(make_result(ManageDataResultCode::LowReserve));
                     }
@@ -138,11 +130,9 @@ pub fn execute_manage_data(
                         context.protocol_version,
                         1,
                     )?;
-                    let mut available = source_account.balance;
-                    if context.protocol_version >= 10 {
-                        available =
-                            available.saturating_sub(account_liabilities(source_account).selling);
-                    }
+                    let available = source_account
+                        .balance
+                        .saturating_sub(account_liabilities(source_account).selling);
                     if available < new_min_balance {
                         return Ok(make_result(ManageDataResultCode::LowReserve));
                     }
@@ -278,31 +268,6 @@ mod tests {
 
         // Verify sub-entries increased
         assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 1);
-    }
-
-    #[test]
-    fn test_manage_data_not_supported_pre_v2() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        let mut context = create_test_context();
-        context.protocol_version = 1;
-
-        let source_id = create_test_account_id(0);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-
-        let op = ManageDataOp {
-            data_name: make_string64("test_key"),
-            data_value: Some(vec![1, 2, 3].try_into().unwrap()),
-        };
-
-        let result =
-            execute_manage_data(&op, &source_id, &mut state, &context).expect("manage data result");
-
-        match result {
-            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
-                assert!(matches!(r, ManageDataResult::NotSupportedYet));
-            }
-            other => panic!("unexpected result: {:?}", other),
-        }
     }
 
     #[test]

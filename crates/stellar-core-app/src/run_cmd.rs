@@ -1807,17 +1807,7 @@ async fn sorobaninfo_handler(
 ) -> impl IntoResponse {
     let format = params.format.as_deref().unwrap_or("basic");
 
-    // Check if Soroban is active
     let (_, _, _, protocol_version) = state.app.ledger_info();
-    if protocol_version < 20 {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "error": "Soroban is not active in current ledger version",
-                "protocol_version": protocol_version
-            })),
-        );
-    }
 
     match format {
         "basic" => {

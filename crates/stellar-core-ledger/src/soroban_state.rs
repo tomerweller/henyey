@@ -987,7 +987,7 @@ impl InMemorySorobanState {
     ///
     /// Called after a protocol upgrade or config change that affects
     /// compiled module sizing.
-    pub fn recompute_contract_code_sizes(&mut self, protocol_version: u32) {
+    pub fn recompute_contract_code_sizes(&mut self, _protocol_version: u32) {
         let mut total_size: i64 = 0;
 
         for entry in self.contract_code_entries.values_mut() {
@@ -998,11 +998,7 @@ impl InMemorySorobanState {
                 .unwrap_or(0);
 
             // Apply protocol-specific sizing
-            let adjusted_size = if protocol_version >= 23 {
-                new_size * 2 // Placeholder for compiled module overhead
-            } else {
-                new_size
-            };
+            let adjusted_size = new_size * 2; // Placeholder for compiled module overhead
 
             entry.size_bytes = adjusted_size;
             total_size += adjusted_size as i64;

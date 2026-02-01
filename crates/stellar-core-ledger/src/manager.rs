@@ -1974,8 +1974,8 @@ impl LedgerManager {
             let bucket_list = self.bucket_list.read();
             let live_hash = bucket_list.hash();
 
-            // For Protocol 23+, compute combined hash
-            let computed = if new_header.ledger_version >= 23 {
+            // Compute combined hash including hot archive
+            let computed = {
                 let hot_archive_guard = self.hot_archive_bucket_list.read();
                 if let Some(ref hot_archive) = *hot_archive_guard {
                     use sha2::{Digest, Sha256};
@@ -1990,8 +1990,6 @@ impl LedgerManager {
                 } else {
                     live_hash
                 }
-            } else {
-                live_hash
             };
 
             let expected = Hash256::from(new_header.bucket_list_hash.0);
@@ -2099,17 +2097,15 @@ impl LedgerManager {
         )?;
         let bl_add_batch_us = t0.elapsed().as_micros() as u64;
 
-        // 2. Hot archive add_batch (protocol 23+)
+        // 2. Hot archive add_batch
         let t0 = std::time::Instant::now();
-        if protocol_version >= 23 {
-            if let Some(ref mut hot_archive) = *self.hot_archive_bucket_list.write() {
-                hot_archive.add_batch(
-                    ledger_seq,
-                    protocol_version,
-                    archived_entries,
-                    restored_keys,
-                )?;
-            }
+        if let Some(ref mut hot_archive) = *self.hot_archive_bucket_list.write() {
+            hot_archive.add_batch(
+                ledger_seq,
+                protocol_version,
+                archived_entries,
+                restored_keys,
+            )?;
         }
         let ha_add_batch_us = t0.elapsed().as_micros() as u64;
 

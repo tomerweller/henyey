@@ -44,11 +44,7 @@ pub fn execute_change_trust(
             let source_key = account_id_to_key(source);
             let issuer_key = account_id_to_key(&issuer_id);
             if source_key == issuer_key {
-                return Ok(make_result(if context.protocol_version >= 16 {
-                    ChangeTrustResultCode::Malformed
-                } else {
-                    ChangeTrustResultCode::SelfNotAllowed
-                }));
+                return Ok(make_result(ChangeTrustResultCode::Malformed));
             }
         }
     }
@@ -722,34 +718,6 @@ mod tests {
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
                 assert!(matches!(r, ChangeTrustResult::Malformed));
-            }
-            other => panic!("unexpected result: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_change_trust_self_issuer_not_allowed_pre_16() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        let mut context = create_test_context();
-        context.protocol_version = 15;
-
-        let source_id = create_test_account_id(0);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-
-        let asset = AlphaNum4 {
-            asset_code: AssetCode4(*b"USD\0"),
-            issuer: source_id.clone(),
-        };
-
-        let op = ChangeTrustOp {
-            line: ChangeTrustAsset::CreditAlphanum4(asset),
-            limit: 1_000,
-        };
-
-        let result = execute_change_trust(&op, &source_id, &mut state, &context);
-        match result.unwrap() {
-            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
-                assert!(matches!(r, ChangeTrustResult::SelfNotAllowed));
             }
             other => panic!("unexpected result: {:?}", other),
         }

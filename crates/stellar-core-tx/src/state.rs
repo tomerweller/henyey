@@ -836,22 +836,12 @@ impl LedgerStateManager {
     /// Calculate the minimum balance for a hypothetical account state.
     pub fn minimum_balance_with_counts(
         &self,
-        protocol_version: u32,
+        _protocol_version: u32,
         num_sub_entries: i64,
         num_sponsoring: i64,
         num_sponsored: i64,
     ) -> Result<i64> {
-        if protocol_version < 14 && (num_sponsoring != 0 || num_sponsored != 0) {
-            return Err(TxError::Internal(
-                "unexpected sponsorship state for protocol < 14".to_string(),
-            ));
-        }
-
-        let effective_entries = if protocol_version < 9 {
-            2 + num_sub_entries
-        } else {
-            2 + num_sub_entries + num_sponsoring - num_sponsored
-        };
+        let effective_entries = 2 + num_sub_entries + num_sponsoring - num_sponsored;
 
         if effective_entries < 0 {
             return Err(TxError::Internal(

@@ -1992,7 +1992,7 @@ impl TransactionExecutor {
                     });
                 }
             } else {
-                let allow_negative_inner = self.protocol_version >= 23 && inner_is_soroban;
+                let allow_negative_inner = inner_is_soroban;
                 if !allow_negative_inner {
                     return Ok(TransactionExecutionResult {
                         success: false,
@@ -2438,19 +2438,6 @@ impl TransactionExecutor {
                     "Fee deducted from account"
                 );
             }
-            if self.protocol_version < 10 {
-                if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-                    // CAP-0021: Set the account's seq_num to the transaction's seq_num.
-                    // This handles the case where minSeqNum allows sequence gaps - the
-                    // account's final seq must be the tx's seq, not just account_seq + 1.
-                    acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
-                    stellar_core_tx::state::update_account_seq_info(
-                        acc,
-                        self.ledger_seq,
-                        self.close_time,
-                    );
-                }
-            }
             self.state.delta_mut().add_fee(fee);
 
             self.state.flush_modified_entries();
@@ -2472,147 +2459,139 @@ impl TransactionExecutor {
             fee_changes
         };
 
-        let mut tx_changes_before = empty_entry_changes();
-        let mut seq_created = Vec::new();
-        let mut seq_updated = Vec::new();
-        let mut seq_deleted = Vec::new();
+        let tx_changes_before: LedgerEntryChanges;
+        let seq_created;
+        let seq_updated;
+        let seq_deleted;
         let mut signer_created = Vec::new();
         let mut signer_updated = Vec::new();
         let mut signer_deleted = Vec::new();
 
-        if self.protocol_version >= 10 {
-            // For fee bump transactions in two-phase mode, C++ stellar-core's
-            // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
-            // which loads the fee source account, generating a STATE/UPDATED pair even if
-            // the fee source equals the inner source. This happens BEFORE the inner transaction's
-            // sequence bump. We capture this to match C++ stellar-core ordering.
-            let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
-                let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                    account_id: fee_source_id.clone(),
-                });
-                if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
-                    // Both STATE and UPDATED use the same (current) state value.
-                    // In C++ stellar-core, the fee bump wrapper's tx_changes_before captures
-                    // the fee source state AFTER fee processing (which happened in fee_meta).
-                    // This is just for removeOneTimeSignerKeyFromFeeSource() which doesn't
-                    // change the balance - hence STATE and UPDATED have the same value.
-                    // We ignore fee_source_pre_state as it's not needed.
-                    let _ = fee_source_pre_state; // Explicitly ignore the parameter
-                    vec![
-                        LedgerEntryChange::State(fee_source_entry.clone()),
-                        LedgerEntryChange::Updated(fee_source_entry),
-                    ]
-                } else {
-                    vec![]
-                }
+        // For fee bump transactions in two-phase mode, C++ stellar-core's
+        // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
+        // which loads the fee source account, generating a STATE/UPDATED pair even if
+        // the fee source equals the inner source. This happens BEFORE the inner transaction's
+        // sequence bump. We capture this to match C++ stellar-core ordering.
+        let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
+            let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: fee_source_id.clone(),
+            });
+            if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
+                // Both STATE and UPDATED use the same (current) state value.
+                // In C++ stellar-core, the fee bump wrapper's tx_changes_before captures
+                // the fee source state AFTER fee processing (which happened in fee_meta).
+                // This is just for removeOneTimeSignerKeyFromFeeSource() which doesn't
+                // change the balance - hence STATE and UPDATED have the same value.
+                // We ignore fee_source_pre_state as it's not needed.
+                let _ = fee_source_pre_state; // Explicitly ignore the parameter
+                vec![
+                    LedgerEntryChange::State(fee_source_entry.clone()),
+                    LedgerEntryChange::Updated(fee_source_entry),
+                ]
             } else {
                 vec![]
-            };
+            }
+        } else {
+            vec![]
+        };
 
-            let mut signer_changes = empty_entry_changes();
-            if self.protocol_version != 7 {
-                let mut source_accounts = Vec::new();
-                source_accounts.push(inner_source_id.clone());
-                for op in frame.operations().iter() {
-                    if let Some(ref source) = op.source_account {
-                        source_accounts.push(stellar_core_tx::muxed_to_account_id(source));
-                    }
+        let mut signer_changes = empty_entry_changes();
+        if self.protocol_version != 7 {
+            let mut source_accounts = Vec::new();
+            source_accounts.push(inner_source_id.clone());
+            for op in frame.operations().iter() {
+                if let Some(ref source) = op.source_account {
+                    source_accounts.push(stellar_core_tx::muxed_to_account_id(source));
                 }
-                source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
-                source_accounts.dedup_by(|a, b| a.0 == b.0);
+            }
+            source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
+            source_accounts.dedup_by(|a, b| a.0 == b.0);
 
-                let delta_before_signers = delta_snapshot(&self.state);
-                let mut signer_state_overrides = HashMap::new();
-                for account_id in &source_accounts {
-                    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                        account_id: account_id.clone(),
-                    });
-                    if let Some(entry) = self.state.get_entry(&key) {
-                        signer_state_overrides.insert(key, entry);
-                    }
+            let delta_before_signers = delta_snapshot(&self.state);
+            let mut signer_state_overrides = HashMap::new();
+            for account_id in &source_accounts {
+                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: account_id.clone(),
+                });
+                if let Some(entry) = self.state.get_entry(&key) {
+                    signer_state_overrides.insert(key, entry);
                 }
-
-                self.state.remove_one_time_signers_from_all_sources(
-                    &outer_hash,
-                    &source_accounts,
-                    self.protocol_version,
-                );
-                self.state.flush_modified_entries();
-                let delta_after_signers = delta_snapshot(&self.state);
-                let delta_changes = delta_changes_between(
-                    self.state.delta(),
-                    delta_before_signers,
-                    delta_after_signers,
-                );
-                signer_created = delta_changes.created;
-                signer_updated = delta_changes.updated;
-                signer_deleted = delta_changes.deleted;
-                signer_changes = build_entry_changes_with_state_overrides(
-                    &self.state,
-                    &signer_created,
-                    &signer_updated,
-                    &signer_deleted,
-                    &signer_state_overrides,
-                );
             }
 
-            let delta_before_seq = delta_snapshot(&self.state);
-            // Capture the current account state BEFORE modification for STATE entry.
-            // We can't use snapshot_entry() here because the snapshot might not exist yet.
-            // After flush_modified_entries, the snapshot is updated to the post-modification
-            // value, so we need to save the original here.
-            let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                account_id: inner_source_id.clone(),
-            });
-            let seq_state_override = self.state.get_entry(&inner_source_key);
-
-            if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-                // CAP-0021: Set the account's seq_num to the transaction's seq_num.
-                // This handles the case where minSeqNum allows sequence gaps - the
-                // account's final seq must be the tx's seq, not just account_seq + 1.
-                acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
-                stellar_core_tx::state::update_account_seq_info(
-                    acc,
-                    self.ledger_seq,
-                    self.close_time,
-                );
-            }
+            self.state.remove_one_time_signers_from_all_sources(
+                &outer_hash,
+                &source_accounts,
+                self.protocol_version,
+            );
             self.state.flush_modified_entries();
-            let delta_after_seq = delta_snapshot(&self.state);
-            let delta_changes =
-                delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
-            // Use the pre-modification snapshot for STATE entry via state_overrides.
-            let mut seq_state_overrides = HashMap::new();
-            if let Some(entry) = seq_state_override {
-                seq_state_overrides.insert(inner_source_key.clone(), entry);
-            }
-            let seq_changes = build_entry_changes_with_state_overrides(
+            let delta_after_signers = delta_snapshot(&self.state);
+            let delta_changes = delta_changes_between(
+                self.state.delta(),
+                delta_before_signers,
+                delta_after_signers,
+            );
+            signer_created = delta_changes.created;
+            signer_updated = delta_changes.updated;
+            signer_deleted = delta_changes.deleted;
+            signer_changes = build_entry_changes_with_state_overrides(
                 &self.state,
-                &delta_changes.created,
-                &delta_changes.updated,
-                &delta_changes.deleted,
-                &seq_state_overrides,
+                &signer_created,
+                &signer_updated,
+                &signer_deleted,
+                &signer_state_overrides,
             );
-            seq_created = delta_changes.created;
-            seq_updated = delta_changes.updated;
-            seq_deleted = delta_changes.deleted;
+        }
 
-            // Merge all changes into tx_changes_before.
-            // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
-            // This matches C++ stellar-core where FeeBumpFrame captures fee source state,
-            // then inner tx does seq bump.
-            let mut combined = Vec::with_capacity(
-                fee_bump_wrapper_changes.len() + signer_changes.len() + seq_changes.len(),
-            );
-            combined.extend(fee_bump_wrapper_changes);
-            combined.extend(signer_changes.iter().cloned());
-            combined.extend(seq_changes.iter().cloned());
-            tx_changes_before = combined.try_into().unwrap_or_default();
+        let delta_before_seq = delta_snapshot(&self.state);
+        // Capture the current account state BEFORE modification for STATE entry.
+        // We can't use snapshot_entry() here because the snapshot might not exist yet.
+        // After flush_modified_entries, the snapshot is updated to the post-modification
+        // value, so we need to save the original here.
+        let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: inner_source_id.clone(),
+        });
+        let seq_state_override = self.state.get_entry(&inner_source_key);
+
+        if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+            // CAP-0021: Set the account's seq_num to the transaction's seq_num.
+            // This handles the case where minSeqNum allows sequence gaps - the
+            // account's final seq must be the tx's seq, not just account_seq + 1.
+            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+            stellar_core_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
         }
+        self.state.flush_modified_entries();
+        let delta_after_seq = delta_snapshot(&self.state);
+        let delta_changes =
+            delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
+        // Use the pre-modification snapshot for STATE entry via state_overrides.
+        let mut seq_state_overrides = HashMap::new();
+        if let Some(entry) = seq_state_override {
+            seq_state_overrides.insert(inner_source_key.clone(), entry);
+        }
+        let seq_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            &delta_changes.created,
+            &delta_changes.updated,
+            &delta_changes.deleted,
+            &seq_state_overrides,
+        );
+        seq_created = delta_changes.created;
+        seq_updated = delta_changes.updated;
+        seq_deleted = delta_changes.deleted;
+
+        // Merge all changes into tx_changes_before.
+        // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
+        // This matches C++ stellar-core where FeeBumpFrame captures fee source state,
+        // then inner tx does seq bump.
+        let mut combined = Vec::with_capacity(
+            fee_bump_wrapper_changes.len() + signer_changes.len() + seq_changes.len(),
+        );
+        combined.extend(fee_bump_wrapper_changes);
+        combined.extend(signer_changes.iter().cloned());
+        combined.extend(seq_changes.iter().cloned());
+        tx_changes_before = combined.try_into().unwrap_or_default();
         // Persist sequence updates so failed transactions still consume sequence numbers.
-        if self.protocol_version >= 10 {
-            self.state.commit();
-        }
+        self.state.commit();
 
         // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
@@ -3066,7 +3045,7 @@ impl TransactionExecutor {
             - fee_seq_us
             - footprint_us;
 
-        if all_success && self.protocol_version >= 14 && self.state.has_pending_sponsorship() {
+        if all_success && self.state.has_pending_sponsorship() {
             all_success = false;
             failure = Some(ExecutionFailure::BadSponsorship);
         }
@@ -3092,15 +3071,13 @@ impl TransactionExecutor {
             if deduct_fee && fee > 0 {
                 self.state.delta_mut().add_fee(fee);
             }
-            if self.protocol_version >= 10 {
-                restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
-                restore_delta_entries(
-                    &mut self.state,
-                    &signer_created,
-                    &signer_updated,
-                    &signer_deleted,
-                );
-            }
+            restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
+            restore_delta_entries(
+                &mut self.state,
+                &signer_created,
+                &signer_updated,
+                &signer_deleted,
+            );
             op_changes.clear();
             op_events.clear();
             diagnostic_events.clear();
@@ -3144,21 +3121,7 @@ impl TransactionExecutor {
                 tracker.consumed_rent_fee,
             ));
             let refund = tracker.refund_amount();
-            // For protocol < 23, apply refund immediately to the transaction's delta.
-            // For protocol >= 23, refund is applied after ALL transactions in the tx set,
-            // so we do NOT modify the delta here - it's handled separately in ledger close.
-            if refund > 0 && self.protocol_version < 23 {
-                // Apply refund directly to the last account update in the delta.
-                // In C++ stellar-core (pre-v23), the refund is NOT a separate meta change - it's
-                // incorporated into the final account balance of the existing update.
-                self.state.apply_refund_to_delta(&fee_source_id, refund);
-                self.state.delta_mut().add_fee(-refund);
-            }
-            let stage = if self.protocol_version >= 23 {
-                TransactionEventStage::AfterAllTxs
-            } else {
-                TransactionEventStage::AfterTx
-            };
+            let stage = TransactionEventStage::AfterAllTxs;
             tx_event_manager.new_fee_event(&fee_source_id, -refund, stage);
             fee_refund = refund;
         }
@@ -5587,7 +5550,7 @@ pub fn execute_transaction_set_with_fee_mode(
 
     // Protocol 23+: Apply Soroban fee refunds after ALL transactions
     // This matches C++ stellar-core's processPostTxSetApply() phase
-    if protocol_version >= 23 && deduct_fee {
+    if deduct_fee {
         let mut total_refunds = 0i64;
         for (idx, (tx, _)) in transactions.iter().enumerate() {
             let refund = results[idx].fee_refund;

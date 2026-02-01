@@ -259,11 +259,6 @@ impl ConfigUpgradeSetFrame {
     /// Returns true if any entry in the upgrade set differs from the current
     /// ledger state.
     pub fn upgrade_needed(&self, snapshot: &SnapshotHandle) -> bool {
-        // Only applicable for Soroban-enabled protocols
-        if snapshot.header().ledger_version < 20 {
-            return false;
-        }
-
         for entry in self.config_upgrade_set.updated_entry.iter() {
             let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
                 config_setting_id: entry.discriminant(),
@@ -461,7 +456,7 @@ impl ConfigUpgradeSetFrame {
     }
 
     /// Validate a config setting entry against constraints.
-    fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, ledger_version: u32) -> bool {
+    fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, _ledger_version: u32) -> bool {
         match entry {
             ConfigSettingEntry::ContractMaxSizeBytes(v) => *v >= min_config::MAX_CONTRACT_SIZE,
             ConfigSettingEntry::ContractCostParamsCpuInstructions(_) => {
@@ -533,18 +528,15 @@ impl ConfigUpgradeSetFrame {
             ConfigSettingEntry::LiveSorobanStateSizeWindow(_) => true,
             ConfigSettingEntry::EvictionIterator(_) => true,
             ConfigSettingEntry::ContractParallelComputeV0(parallel) => {
-                ledger_version >= 23
-                    && parallel.ledger_max_dependent_tx_clusters > 0
+                parallel.ledger_max_dependent_tx_clusters > 0
                     && parallel.ledger_max_dependent_tx_clusters < 128
             }
             ConfigSettingEntry::ContractLedgerCostExtV0(ext) => {
-                ledger_version >= 23
-                    && ext.tx_max_footprint_entries >= min_config::TX_MAX_READ_LEDGER_ENTRIES
+                ext.tx_max_footprint_entries >= min_config::TX_MAX_READ_LEDGER_ENTRIES
                     && ext.fee_write1_kb >= 0
             }
             ConfigSettingEntry::ScpTiming(timing) => {
-                ledger_version >= 23
-                    && timing.ledger_target_close_time_milliseconds
+                timing.ledger_target_close_time_milliseconds
                         >= min_config::LEDGER_TARGET_CLOSE_TIME_MILLISECONDS
                     && timing.ledger_target_close_time_milliseconds
                         <= max_config::LEDGER_TARGET_CLOSE_TIME_MILLISECONDS

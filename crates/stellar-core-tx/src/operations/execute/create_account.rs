@@ -44,10 +44,8 @@ pub fn execute_create_account(
     // Check source has sufficient available balance
     let source_min_balance =
         state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
-    let mut available = source_account.balance - source_min_balance;
-    if context.protocol_version >= 10 {
-        available = available.saturating_sub(account_liabilities(source_account).selling);
-    }
+    let available = (source_account.balance - source_min_balance)
+        .saturating_sub(account_liabilities(source_account).selling);
     if available < op.starting_balance {
         return Ok(make_result(CreateAccountResultCode::Underfunded));
     }

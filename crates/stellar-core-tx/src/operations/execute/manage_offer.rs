@@ -26,9 +26,6 @@ use crate::{Result, TxError};
 /// This limit is enforced starting from protocol version 11.
 const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
-/// First protocol version that enforces operation limits (subentry limit, offers to cross limit).
-const FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS: u32 = 11;
-
 /// Execute a ManageSellOffer operation.
 ///
 /// This operation creates, updates, or deletes an offer to sell one asset for another.
@@ -92,27 +89,6 @@ fn execute_manage_offer(
     // C++ stellar-core checks trustlines BEFORE checking offer existence.
     // This is done in checkOfferValid() which is called before loadOffer().
     // We need to match this order to produce identical error codes.
-
-    // Check issuer existence for protocols < 13
-    if context.protocol_version < 13 {
-        if let Some(issuer) = issuer_for_asset(selling) {
-            if state.get_account(issuer).is_none() {
-                return Ok(make_sell_offer_result(
-                    ManageSellOfferResultCode::SellNoIssuer,
-                    None,
-                ));
-            }
-        }
-
-        if let Some(issuer) = issuer_for_asset(buying) {
-            if state.get_account(issuer).is_none() {
-                return Ok(make_sell_offer_result(
-                    ManageSellOfferResultCode::BuyNoIssuer,
-                    None,
-                ));
-            }
-        }
-    }
 
     // For selling non-native assets, check trustline exists and has balance
     // This must happen BEFORE we check if the offer exists (NotFound).
@@ -209,14 +185,11 @@ fn execute_manage_offer(
 
     if old_offer.is_none() {
         // Check subentry limit before creating a new offer.
-        // This check applies from protocol 11 onwards (FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS).
-        if context.protocol_version >= FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS {
-            let source_account = state
-                .get_account(source)
-                .ok_or(TxError::SourceAccountNotFound)?;
-            if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
-                return Ok(OperationResult::OpTooManySubentries);
-            }
+        let source_account = state
+            .get_account(source)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
+            return Ok(OperationResult::OpTooManySubentries);
         }
 
         if let Some(sponsor) = &sponsor {
@@ -1476,162 +1449,6 @@ mod tests {
         };
 
         let result = execute_manage_sell_offer(&op, &issuer_id, &mut state, &context).unwrap();
-        match result {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
-                assert!(matches!(r, ManageSellOfferResult::Success(_)));
-            }
-            _ => panic!("Unexpected result type"),
-        }
-    }
-
-    #[test]
-    fn test_manage_sell_offer_sell_no_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        let mut context = create_test_context();
-        context.protocol_version = 12;
-
-        let source_id = create_test_account_id(0);
-        let issuer_id = create_test_account_id(1);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-
-        let asset = create_asset(&issuer_id);
-        state.create_trustline(create_test_trustline(
-            source_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            100,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-
-        let op = ManageSellOfferOp {
-            selling: asset,
-            buying: Asset::Native,
-            amount: 10,
-            price: Price { n: 1, d: 1 },
-            offer_id: 0,
-        };
-
-        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
-        match result {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
-                assert!(matches!(r, ManageSellOfferResult::SellNoIssuer));
-            }
-            _ => panic!("Unexpected result type"),
-        }
-    }
-
-    #[test]
-    fn test_manage_sell_offer_sell_missing_issuer_protocol_13_ok() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        let mut context = create_test_context();
-        context.protocol_version = 13;
-
-        let source_id = create_test_account_id(0);
-        let issuer_id = create_test_account_id(1);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-
-        let asset = create_asset(&issuer_id);
-        state.create_trustline(create_test_trustline(
-            source_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            100,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-
-        let op = ManageSellOfferOp {
-            selling: asset,
-            buying: Asset::Native,
-            amount: 10,
-            price: Price { n: 1, d: 1 },
-            offer_id: 0,
-        };
-
-        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
-        match result {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
-                assert!(matches!(r, ManageSellOfferResult::Success(_)));
-            }
-            _ => panic!("Unexpected result type"),
-        }
-    }
-
-    #[test]
-    fn test_manage_sell_offer_buy_no_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        let mut context = create_test_context();
-        context.protocol_version = 12;
-
-        let source_id = create_test_account_id(0);
-        let issuer_id = create_test_account_id(1);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-
-        let asset = create_asset(&issuer_id);
-        state.create_trustline(create_test_trustline(
-            source_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            0,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-
-        let op = ManageSellOfferOp {
-            selling: Asset::Native,
-            buying: asset,
-            amount: 10,
-            price: Price { n: 1, d: 1 },
-            offer_id: 0,
-        };
-
-        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
-        match result {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
-                assert!(matches!(r, ManageSellOfferResult::BuyNoIssuer));
-            }
-            _ => panic!("Unexpected result type"),
-        }
-    }
-
-    #[test]
-    fn test_manage_sell_offer_buy_missing_issuer_protocol_13_ok() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        let mut context = create_test_context();
-        context.protocol_version = 13;
-
-        let source_id = create_test_account_id(0);
-        let issuer_id = create_test_account_id(1);
-        state.create_account(create_test_account(source_id.clone(), 100_000_000));
-
-        let asset = create_asset(&issuer_id);
-        state.create_trustline(create_test_trustline(
-            source_id.clone(),
-            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
-                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
-                issuer: issuer_id.clone(),
-            }),
-            0,
-            1_000_000,
-            AUTHORIZED_FLAG,
-        ));
-
-        let op = ManageSellOfferOp {
-            selling: Asset::Native,
-            buying: asset,
-            amount: 10,
-            price: Price { n: 1, d: 1 },
-            offer_id: 0,
-        };
-
-        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
                 assert!(matches!(r, ManageSellOfferResult::Success(_)));

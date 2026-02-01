@@ -901,13 +901,11 @@ impl BucketManager {
         // Create bucket entries with metadata
         let mut bucket_entries: Vec<crate::BucketEntry> = Vec::with_capacity(entries.len() + 1);
 
-        // Add metadata for protocol 11+
-        if protocol_version >= 11 {
-            bucket_entries.push(crate::BucketEntry::Metadata(BucketMetadata {
-                ledger_version: protocol_version,
-                ext: stellar_xdr::curr::BucketMetadataExt::V0,
-            }));
-        }
+        // Add metadata
+        bucket_entries.push(crate::BucketEntry::Metadata(BucketMetadata {
+            ledger_version: protocol_version,
+            ext: stellar_xdr::curr::BucketMetadataExt::V0,
+        }));
 
         // Add all entries as LIVE (not INIT since these are resolved entries)
         bucket_entries.extend(entries.into_iter().map(crate::BucketEntry::Live));

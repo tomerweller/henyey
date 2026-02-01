@@ -7,8 +7,7 @@ use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountId, OperationResult, OperationResultTr, PublicKey,
     SetOptionsOp, SetOptionsResult, SetOptionsResultCode, Signer, SignerKey,
-    SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS,
-    MASK_ACCOUNT_FLAGS_V17,
+    SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS_V17,
 };
 
 use crate::state::{ensure_account_ext_v2, LedgerStateManager};
@@ -44,11 +43,7 @@ pub fn execute_set_options(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationResult> {
-    let mask = if context.protocol_version >= 17 {
-        MASK_ACCOUNT_FLAGS_V17 as u32
-    } else {
-        MASK_ACCOUNT_FLAGS as u32
-    };
+    let mask = MASK_ACCOUNT_FLAGS_V17 as u32;
 
     if let Some(set_flags) = op.set_flags {
         if set_flags & !mask != 0 {
@@ -228,9 +223,6 @@ pub fn execute_set_options(
         }
 
         if signer_key.discriminant() == SignerKeyType::Ed25519SignedPayload {
-            if context.protocol_version < 19 {
-                return Ok(make_result(SetOptionsResultCode::BadSigner));
-            }
             if let SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
                 payload, ..
             }) = signer_key
@@ -306,11 +298,8 @@ pub fn execute_set_options(
                 }
             } else {
                 let num_sub_entries = current_num_sub_entries as i64 + 1;
-                let effective_entries = if context.protocol_version < 9 {
-                    2 + num_sub_entries
-                } else {
-                    2 + num_sub_entries + current_num_sponsoring - current_num_sponsored
-                };
+                let effective_entries =
+                    2 + num_sub_entries + current_num_sponsoring - current_num_sponsored;
                 if effective_entries < 0 {
                     return Err(TxError::Internal(
                         "unexpected account state while computing minimum balance".to_string(),

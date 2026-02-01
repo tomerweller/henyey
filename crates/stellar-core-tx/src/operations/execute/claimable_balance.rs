@@ -193,19 +193,17 @@ pub fn execute_create_claimable_balance(
     }
 
     let mut claimable_flags = 0u32;
-    if context.protocol_version >= 17 {
-        if let Some(issuer_id) = issuer.as_ref() {
-            let clawback_enabled = if issuer_id == source {
-                account.flags & (AccountFlags::ClawbackEnabledFlag as u32) != 0
-            } else {
-                source_trustline_flags
-                    .map(|flags| flags & TRUSTLINE_CLAWBACK_ENABLED_FLAG != 0)
-                    .unwrap_or(false)
-            };
-            if clawback_enabled {
-                claimable_flags |=
-                    ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32;
-            }
+    if let Some(issuer_id) = issuer.as_ref() {
+        let clawback_enabled = if issuer_id == source {
+            account.flags & (AccountFlags::ClawbackEnabledFlag as u32) != 0
+        } else {
+            source_trustline_flags
+                .map(|flags| flags & TRUSTLINE_CLAWBACK_ENABLED_FLAG != 0)
+                .unwrap_or(false)
+        };
+        if clawback_enabled {
+            claimable_flags |=
+                ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32;
         }
     }
 

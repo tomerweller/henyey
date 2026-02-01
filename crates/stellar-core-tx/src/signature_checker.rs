@@ -22,7 +22,7 @@
 //! ```ignore
 //! use stellar_core_tx::signature_checker::SignatureChecker;
 //!
-//! let mut checker = SignatureChecker::new(21, tx_hash, &signatures);
+//! let mut checker = SignatureChecker::new(tx_hash, &signatures);
 //!
 //! // Check if transaction source has sufficient weight
 //! if checker.check_signature(&signers, needed_threshold) {
@@ -45,8 +45,6 @@ use stellar_xdr::curr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
 ///
 /// This implements the same logic as C++ stellar-core's SignatureChecker class.
 pub struct SignatureChecker<'a> {
-    /// Protocol version for behavior differences.
-    protocol_version: u32,
     /// Hash of the transaction contents being signed.
     contents_hash: Hash256,
     /// Reference to the signatures on the transaction.
@@ -60,16 +58,13 @@ impl<'a> SignatureChecker<'a> {
     ///
     /// # Arguments
     ///
-    /// * `protocol_version` - Current protocol version (affects weight capping)
     /// * `contents_hash` - Transaction hash that signatures are verified against
     /// * `signatures` - Slice of decorated signatures from the transaction
     pub fn new(
-        protocol_version: u32,
         contents_hash: Hash256,
         signatures: &'a [DecoratedSignature],
     ) -> Self {
         Self {
-            protocol_version,
             contents_hash,
             signatures,
             used_signatures: vec![false; signatures.len()],
@@ -90,11 +85,6 @@ impl<'a> SignatureChecker<'a> {
     ///
     /// `true` if the accumulated weight meets or exceeds the needed weight.
     pub fn check_signature(&mut self, signers: &[Signer], needed_weight: i32) -> bool {
-        // Protocol 7 bypass (matches C++ behavior for fuzzing)
-        if self.protocol_version == 7 {
-            return true;
-        }
-
         // Split signers by type for ordered processing
         let mut signers_by_type = split_signers_by_type(signers);
 
@@ -202,12 +192,12 @@ impl<'a> SignatureChecker<'a> {
         false
     }
 
-    /// Cap weight at u8::MAX for protocol 10+.
+    /// Cap weight at u8::MAX.
     ///
-    /// Per the C++ implementation, signer weights are capped at 255 starting
-    /// from protocol version 10 to prevent overflow issues.
+    /// Per the C++ implementation, signer weights are capped at 255
+    /// to prevent overflow issues.
     fn cap_weight(&self, weight: u32) -> u32 {
-        if self.protocol_version >= 10 && weight > u8::MAX as u32 {
+        if weight > u8::MAX as u32 {
             u8::MAX as u32
         } else {
             weight
@@ -223,11 +213,6 @@ impl<'a> SignatureChecker<'a> {
     ///
     /// `true` if all signatures were used, `false` if any signature is unused.
     pub fn check_all_signatures_used(&self) -> bool {
-        // Protocol 7 bypass
-        if self.protocol_version == 7 {
-            return true;
-        }
-
         self.used_signatures.iter().all(|&used| used)
     }
 
@@ -439,7 +424,7 @@ mod tests {
         let signer = create_signer_from_secret(&secret, 10);
         let signers = vec![signer];
 
-        let mut checker = SignatureChecker::new(21, hash, &signatures);
+        let mut checker = SignatureChecker::new(hash, &signatures);
 
         // Threshold of 10 should be met with weight 10
         assert!(checker.check_signature(&signers, 10));
@@ -456,7 +441,7 @@ mod tests {
         let signer = create_signer_from_secret(&secret, 5);
         let signers = vec![signer];
 
-        let mut checker = SignatureChecker::new(21, hash, &signatures);
+        let mut checker = SignatureChecker::new(hash, &signatures);
 
         // Threshold of 10 should not be met with weight 5
         assert!(!checker.check_signature(&signers, 10));
@@ -476,7 +461,7 @@ mod tests {
         let signer2 = create_signer_from_secret(&secret2, 5);
         let signers = vec![signer1, signer2];
 
-        let mut checker = SignatureChecker::new(21, hash, &signatures);
+        let mut checker = SignatureChecker::new(hash, &signatures);
 
         // Threshold of 10 should be met with 5 + 5
         assert!(checker.check_signature(&signers, 10));
@@ -493,27 +478,11 @@ mod tests {
         let signer = create_signer_from_secret(&secret, 1000); // Above u8::MAX
         let signers = vec![signer];
 
-        let mut checker = SignatureChecker::new(21, hash, &signatures);
+        let mut checker = SignatureChecker::new(hash, &signatures);
 
         // With protocol 21, weight should be capped at 255
         assert!(checker.check_signature(&signers, 255));
         assert!(!checker.check_signature(&signers.clone(), 256)); // Can't meet this
-    }
-
-    #[test]
-    fn test_weight_no_cap_protocol_9() {
-        let secret = SecretKey::from_seed(&[6u8; 32]);
-        let hash = create_test_hash();
-        let sig = create_signed_signature(&secret, &hash);
-        let signatures = vec![sig];
-
-        let signer = create_signer_from_secret(&secret, 1000);
-        let signers = vec![signer];
-
-        let mut checker = SignatureChecker::new(9, hash, &signatures);
-
-        // With protocol 9, weight should not be capped
-        assert!(checker.check_signature(&signers, 1000));
     }
 
     #[test]
@@ -530,7 +499,7 @@ mod tests {
         let signer1 = create_signer_from_secret(&secret1, 10);
         let signers = vec![signer1];
 
-        let mut checker = SignatureChecker::new(21, hash, &signatures);
+        let mut checker = SignatureChecker::new(hash, &signatures);
 
         // Threshold is met
         assert!(checker.check_signature(&signers, 10));
@@ -549,7 +518,7 @@ mod tests {
         };
         let signers = vec![signer];
 
-        let mut checker = SignatureChecker::new(21, hash, &signatures);
+        let mut checker = SignatureChecker::new(hash, &signatures);
 
         // Pre-auth TX matches the hash directly
         assert!(checker.check_signature(&signers, 10));
@@ -580,21 +549,9 @@ mod tests {
         let signers = vec![signer];
 
         let tx_hash = create_test_hash(); // Irrelevant for HashX
-        let mut checker = SignatureChecker::new(21, tx_hash, &signatures);
+        let mut checker = SignatureChecker::new(tx_hash, &signatures);
 
         assert!(checker.check_signature(&signers, 10));
-        assert!(checker.check_all_signatures_used());
-    }
-
-    #[test]
-    fn test_protocol_7_bypass() {
-        let hash = create_test_hash();
-        let signatures = vec![]; // No signatures
-
-        let mut checker = SignatureChecker::new(7, hash, &signatures);
-
-        // Protocol 7 always returns true
-        assert!(checker.check_signature(&[], 100));
         assert!(checker.check_all_signatures_used());
     }
 
@@ -645,7 +602,7 @@ mod tests {
         let signer = create_signer_from_secret(&secret, 5);
         let signers = vec![signer];
 
-        let mut checker = SignatureChecker::new(21, hash, &signatures);
+        let mut checker = SignatureChecker::new(hash, &signatures);
 
         // Only weight 5 should be counted (signer used once)
         assert!(!checker.check_signature(&signers, 10));
