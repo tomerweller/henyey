@@ -2773,8 +2773,11 @@ impl TransactionExecutor {
                     self.classic_events,
                 );
 
-                // Execute the operation
+                // Execute the operation with a per-operation savepoint.
+                // If the operation fails, we roll back its state changes so
+                // subsequent operations see clean state (matching C++ LedgerTxn).
                 let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
+                let op_savepoint = self.state.create_savepoint();
                 let result = self.execute_single_operation(
                     op,
                     &op_source,
@@ -2832,6 +2835,9 @@ impl TransactionExecutor {
                             if matches!(op_result, OperationResult::OpNotSupported) {
                                 failure = Some(ExecutionFailure::NotSupported);
                             }
+                            // Roll back failed operation's state changes so subsequent
+                            // operations see clean state (matches C++ nested LedgerTxn).
+                            self.state.rollback_to_savepoint(op_savepoint);
                         }
                         operation_results.push(op_result.clone());
 
@@ -3031,6 +3037,7 @@ impl TransactionExecutor {
                         }
                     }
                     Err(e) => {
+                        self.state.rollback_to_savepoint(op_savepoint);
                         self.state.end_op_snapshot();
                         all_success = false;
                         eprintln!("[ERROR] execute_single_operation failed: op_index={}, op_type={:?}, error={:?}",

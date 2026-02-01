@@ -35,34 +35,54 @@ pub struct SorobanState {
     pub ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
 }
 
-/// Savepoint for rolling back speculative state modifications within a transaction.
+/// Savepoint for rolling back state modifications within a transaction.
 ///
-/// Used by `convert_with_offers_and_pools` to speculatively run the orderbook path
-/// on the real state and undo changes if the liquidity pool path wins. This avoids
-/// cloning the entire state (911K+ offers) for speculation.
+/// Used for per-operation rollback (failed operations have their state changes
+/// undone so subsequent operations see clean state) and by
+/// `convert_with_offers_and_pools` for speculative orderbook exchange.
 ///
 /// The savepoint captures:
 /// - Snapshot maps (to restore snapshot tracking state)
-/// - Current entry values for snapshot'd entries (pre-speculation values)
+/// - Current entry values for snapshot'd entries (pre-savepoint values)
 /// - Delta vector lengths (for truncation)
 /// - Modified tracking vec lengths
 /// - Entry metadata snapshot state
+/// - Created entry sets
+/// - ID pool value
 #[allow(clippy::type_complexity)]
 pub struct Savepoint {
     // Snapshot maps clones (small: only entries modified earlier in TX)
     offer_snapshots: HashMap<([u8; 32], i64), Option<OfferEntry>>,
     account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
     trustline_snapshots: HashMap<([u8; 32], AssetKey), Option<TrustLineEntry>>,
+    data_snapshots: HashMap<([u8; 32], String), Option<DataEntry>>,
+    contract_data_snapshots: HashMap<ContractDataKey, Option<ContractDataEntry>>,
+    contract_code_snapshots: HashMap<[u8; 32], Option<ContractCodeEntry>>,
+    ttl_snapshots: HashMap<[u8; 32], Option<TtlEntry>>,
+    claimable_balance_snapshots: HashMap<[u8; 32], Option<ClaimableBalanceEntry>>,
+    liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
 
-    // Pre-speculation values of entries in snapshot maps.
-    // For entries modified earlier in TX and potentially re-modified during speculation.
+    // Pre-savepoint values of entries in snapshot maps.
     offer_pre_values: Vec<(([u8; 32], i64), Option<OfferEntry>)>,
     account_pre_values: Vec<([u8; 32], Option<AccountEntry>)>,
     trustline_pre_values: Vec<(([u8; 32], AssetKey), Option<TrustLineEntry>)>,
+    data_pre_values: Vec<(([u8; 32], String), Option<DataEntry>)>,
+    contract_data_pre_values: Vec<(ContractDataKey, Option<ContractDataEntry>)>,
+    contract_code_pre_values: Vec<([u8; 32], Option<ContractCodeEntry>)>,
+    ttl_pre_values: Vec<([u8; 32], Option<TtlEntry>)>,
+    claimable_balance_pre_values: Vec<([u8; 32], Option<ClaimableBalanceEntry>)>,
+    liquidity_pool_pre_values: Vec<([u8; 32], Option<LiquidityPoolEntry>)>,
 
-    // Created entry sets (path payments don't create entries during crossing,
-    // but save for correctness)
+    // Created entry sets
     created_offers: HashSet<([u8; 32], i64)>,
+    created_accounts: HashSet<[u8; 32]>,
+    created_trustlines: HashSet<([u8; 32], AssetKey)>,
+    created_data: HashSet<([u8; 32], String)>,
+    created_contract_data: HashSet<ContractDataKey>,
+    created_contract_code: HashSet<[u8; 32]>,
+    created_ttl: HashSet<[u8; 32]>,
+    created_claimable_balances: HashSet<[u8; 32]>,
+    created_liquidity_pools: HashSet<[u8; 32]>,
 
     // Delta vector lengths for truncation
     delta_lengths: DeltaLengths,
@@ -70,6 +90,13 @@ pub struct Savepoint {
     // Modified tracking vec lengths
     modified_accounts_len: usize,
     modified_trustlines_len: usize,
+    modified_offers_len: usize,
+    modified_data_len: usize,
+    modified_contract_data_len: usize,
+    modified_contract_code_len: usize,
+    modified_ttl_len: usize,
+    modified_claimable_balances_len: usize,
+    modified_liquidity_pools_len: usize,
 
     // Entry metadata snapshots
     entry_last_modified_snapshots: HashMap<LedgerKey, Option<u32>>,
@@ -82,9 +109,8 @@ pub struct Savepoint {
     // Op entry snapshot keys (to remove entries added during speculation)
     op_entry_snapshot_keys: HashSet<LedgerKey>,
 
-    // Liquidity pool snapshots (shouldn't change during orderbook speculation,
-    // but save for completeness)
-    liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
+    // ID pool value for rollback
+    id_pool: u64,
 }
 
 /// Trait for reading ledger entries from storage.
@@ -3991,8 +4017,14 @@ impl LedgerStateManager {
             offer_snapshots: self.offer_snapshots.clone(),
             account_snapshots: self.account_snapshots.clone(),
             trustline_snapshots: self.trustline_snapshots.clone(),
+            data_snapshots: self.data_snapshots.clone(),
+            contract_data_snapshots: self.contract_data_snapshots.clone(),
+            contract_code_snapshots: self.contract_code_snapshots.clone(),
+            ttl_snapshots: self.ttl_snapshots.clone(),
+            claimable_balance_snapshots: self.claimable_balance_snapshots.clone(),
+            liquidity_pool_snapshots: self.liquidity_pool_snapshots.clone(),
 
-            // Save current values of entries in snapshot maps (pre-speculation values)
+            // Save current values of entries in snapshot maps (pre-savepoint values)
             offer_pre_values: self
                 .offer_snapshots
                 .keys()
@@ -4008,11 +4040,59 @@ impl LedgerStateManager {
                 .keys()
                 .map(|k| (k.clone(), self.trustlines.get(k).cloned()))
                 .collect(),
+            data_pre_values: self
+                .data_snapshots
+                .keys()
+                .map(|k| (k.clone(), self.data_entries.get(k).cloned()))
+                .collect(),
+            contract_data_pre_values: self
+                .contract_data_snapshots
+                .keys()
+                .map(|k| (k.clone(), self.contract_data.get(k).cloned()))
+                .collect(),
+            contract_code_pre_values: self
+                .contract_code_snapshots
+                .keys()
+                .map(|k| (*k, self.contract_code.get(k).cloned()))
+                .collect(),
+            ttl_pre_values: self
+                .ttl_snapshots
+                .keys()
+                .map(|k| (*k, self.ttl_entries.get(k).cloned()))
+                .collect(),
+            claimable_balance_pre_values: self
+                .claimable_balance_snapshots
+                .keys()
+                .map(|k| (*k, self.claimable_balances.get(k).cloned()))
+                .collect(),
+            liquidity_pool_pre_values: self
+                .liquidity_pool_snapshots
+                .keys()
+                .map(|k| (*k, self.liquidity_pools.get(k).cloned()))
+                .collect(),
 
+            // Created entry sets
             created_offers: self.created_offers.clone(),
+            created_accounts: self.created_accounts.clone(),
+            created_trustlines: self.created_trustlines.clone(),
+            created_data: self.created_data.clone(),
+            created_contract_data: self.created_contract_data.clone(),
+            created_contract_code: self.created_contract_code.clone(),
+            created_ttl: self.created_ttl.clone(),
+            created_claimable_balances: self.created_claimable_balances.clone(),
+            created_liquidity_pools: self.created_liquidity_pools.clone(),
+
+            // Delta and modified vec lengths
             delta_lengths: self.delta.snapshot_lengths(),
             modified_accounts_len: self.modified_accounts.len(),
             modified_trustlines_len: self.modified_trustlines.len(),
+            modified_offers_len: self.modified_offers.len(),
+            modified_data_len: self.modified_data.len(),
+            modified_contract_data_len: self.modified_contract_data.len(),
+            modified_contract_code_len: self.modified_contract_code.len(),
+            modified_ttl_len: self.modified_ttl.len(),
+            modified_claimable_balances_len: self.modified_claimable_balances.len(),
+            modified_liquidity_pools_len: self.modified_liquidity_pools.len(),
 
             // Entry metadata
             entry_last_modified_snapshots: self.entry_last_modified_snapshots.clone(),
@@ -4035,7 +4115,7 @@ impl LedgerStateManager {
                 .collect(),
 
             op_entry_snapshot_keys: self.op_entry_snapshots.keys().cloned().collect(),
-            liquidity_pool_snapshots: self.liquidity_pool_snapshots.clone(),
+            id_pool: self.id_pool,
         }
     }
 
@@ -4046,9 +4126,9 @@ impl LedgerStateManager {
     /// where k = entries modified during speculation (typically < 50),
     /// compared to O(n) for cloning 911K+ offers.
     pub fn rollback_to_savepoint(&mut self, sp: Savepoint) {
-        // Phase 1: Restore entries newly snapshot'd during speculation.
+        // Phase 1: Restore entries newly snapshot'd since the savepoint.
         // These entries have snapshots added after the savepoint, so their
-        // snapshot values ARE their pre-speculation (= pre-TX) values.
+        // snapshot values ARE their pre-savepoint (= pre-TX) values.
 
         // Offers: collect new snapshot keys first to avoid borrow conflict
         let new_offer_keys: Vec<_> = self
@@ -4057,7 +4137,6 @@ impl LedgerStateManager {
             .filter(|k| !sp.offer_snapshots.contains_key(k))
             .cloned()
             .collect();
-        // Collect snapshot values to avoid borrow conflict
         let new_offer_snapshots: Vec<_> = new_offer_keys
             .into_iter()
             .filter_map(|key| {
@@ -4068,7 +4147,6 @@ impl LedgerStateManager {
             .collect();
         for (key, snapshot) in new_offer_snapshots {
             let offer_key = OfferKey::new(key.0, key.1);
-            // Remove old secondary index entries
             if let Some(current) = self.offers.get(&key).cloned() {
                 self.aa_index_remove(&current);
             }
@@ -4079,14 +4157,13 @@ impl LedgerStateManager {
                     self.offers.insert(key, entry);
                 }
                 None => {
-                    // Entry didn't exist before TX — remove it
                     self.offer_index.remove_by_key(&offer_key);
                     self.offers.remove(&key);
                 }
             }
         }
 
-        // Accounts: collect new snapshot keys
+        // Accounts: restore newly snapshot'd entries
         let new_account_keys: Vec<_> = self
             .account_snapshots
             .keys()
@@ -4106,7 +4183,7 @@ impl LedgerStateManager {
             }
         }
 
-        // Trustlines: collect new snapshot keys
+        // Trustlines: restore newly snapshot'd entries
         let new_trustline_keys: Vec<_> = self
             .trustline_snapshots
             .keys()
@@ -4126,11 +4203,130 @@ impl LedgerStateManager {
             }
         }
 
-        // Phase 2: Restore pre-speculation values for entries already in snapshot maps.
-        // These were modified before the savepoint AND potentially re-modified during speculation.
+        // Data entries: restore newly snapshot'd entries
+        let new_data_keys: Vec<_> = self
+            .data_snapshots
+            .keys()
+            .filter(|k| !sp.data_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        for key in new_data_keys {
+            if let Some(snapshot) = self.data_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.data_entries.insert(key, entry.clone());
+                    }
+                    None => {
+                        self.data_entries.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Contract data: restore newly snapshot'd entries
+        let new_cd_keys: Vec<_> = self
+            .contract_data_snapshots
+            .keys()
+            .filter(|k| !sp.contract_data_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        for key in new_cd_keys {
+            if let Some(snapshot) = self.contract_data_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.contract_data.insert(key, entry.clone());
+                    }
+                    None => {
+                        self.contract_data.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Contract code: restore newly snapshot'd entries
+        let new_cc_keys: Vec<_> = self
+            .contract_code_snapshots
+            .keys()
+            .filter(|k| !sp.contract_code_snapshots.contains_key(*k))
+            .copied()
+            .collect();
+        for key in new_cc_keys {
+            if let Some(snapshot) = self.contract_code_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.contract_code.insert(key, entry.clone());
+                    }
+                    None => {
+                        self.contract_code.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // TTL entries: restore newly snapshot'd entries
+        let new_ttl_keys: Vec<_> = self
+            .ttl_snapshots
+            .keys()
+            .filter(|k| !sp.ttl_snapshots.contains_key(*k))
+            .copied()
+            .collect();
+        for key in new_ttl_keys {
+            if let Some(snapshot) = self.ttl_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.ttl_entries.insert(key, entry.clone());
+                    }
+                    None => {
+                        self.ttl_entries.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Claimable balances: restore newly snapshot'd entries
+        let new_cb_keys: Vec<_> = self
+            .claimable_balance_snapshots
+            .keys()
+            .filter(|k| !sp.claimable_balance_snapshots.contains_key(*k))
+            .copied()
+            .collect();
+        for key in new_cb_keys {
+            if let Some(snapshot) = self.claimable_balance_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.claimable_balances.insert(key, entry.clone());
+                    }
+                    None => {
+                        self.claimable_balances.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Liquidity pools: restore newly snapshot'd entries
+        let new_lp_keys: Vec<_> = self
+            .liquidity_pool_snapshots
+            .keys()
+            .filter(|k| !sp.liquidity_pool_snapshots.contains_key(*k))
+            .copied()
+            .collect();
+        for key in new_lp_keys {
+            if let Some(snapshot) = self.liquidity_pool_snapshots.get(&key) {
+                match snapshot {
+                    Some(entry) => {
+                        self.liquidity_pools.insert(key, entry.clone());
+                    }
+                    None => {
+                        self.liquidity_pools.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Restore pre-savepoint values for entries already in snapshot maps.
+        // These were modified before the savepoint AND potentially re-modified since.
         for (key, value) in sp.offer_pre_values {
             let offer_key = OfferKey::new(key.0, key.1);
-            // Remove old secondary index entries
             if let Some(current) = self.offers.get(&key).cloned() {
                 self.aa_index_remove(&current);
             }
@@ -4169,20 +4365,111 @@ impl LedgerStateManager {
             }
         }
 
+        for (key, value) in sp.data_pre_values {
+            match value {
+                Some(entry) => {
+                    self.data_entries.insert(key, entry);
+                }
+                None => {
+                    self.data_entries.remove(&key);
+                }
+            }
+        }
+
+        for (key, value) in sp.contract_data_pre_values {
+            match value {
+                Some(entry) => {
+                    self.contract_data.insert(key, entry);
+                }
+                None => {
+                    self.contract_data.remove(&key);
+                }
+            }
+        }
+
+        for (key, value) in sp.contract_code_pre_values {
+            match value {
+                Some(entry) => {
+                    self.contract_code.insert(key, entry);
+                }
+                None => {
+                    self.contract_code.remove(&key);
+                }
+            }
+        }
+
+        for (key, value) in sp.ttl_pre_values {
+            match value {
+                Some(entry) => {
+                    self.ttl_entries.insert(key, entry);
+                }
+                None => {
+                    self.ttl_entries.remove(&key);
+                }
+            }
+        }
+
+        for (key, value) in sp.claimable_balance_pre_values {
+            match value {
+                Some(entry) => {
+                    self.claimable_balances.insert(key, entry);
+                }
+                None => {
+                    self.claimable_balances.remove(&key);
+                }
+            }
+        }
+
+        for (key, value) in sp.liquidity_pool_pre_values {
+            match value {
+                Some(entry) => {
+                    self.liquidity_pools.insert(key, entry);
+                }
+                None => {
+                    self.liquidity_pools.remove(&key);
+                }
+            }
+        }
+
         // Phase 3: Restore snapshot maps and created sets
         self.offer_snapshots = sp.offer_snapshots;
         self.account_snapshots = sp.account_snapshots;
         self.trustline_snapshots = sp.trustline_snapshots;
-        self.created_offers = sp.created_offers;
+        self.data_snapshots = sp.data_snapshots;
+        self.contract_data_snapshots = sp.contract_data_snapshots;
+        self.contract_code_snapshots = sp.contract_code_snapshots;
+        self.ttl_snapshots = sp.ttl_snapshots;
+        self.claimable_balance_snapshots = sp.claimable_balance_snapshots;
         self.liquidity_pool_snapshots = sp.liquidity_pool_snapshots;
 
-        // Phase 4: Truncate delta (undo offer update/delete records from speculation)
+        self.created_offers = sp.created_offers;
+        self.created_accounts = sp.created_accounts;
+        self.created_trustlines = sp.created_trustlines;
+        self.created_data = sp.created_data;
+        self.created_contract_data = sp.created_contract_data;
+        self.created_contract_code = sp.created_contract_code;
+        self.created_ttl = sp.created_ttl;
+        self.created_claimable_balances = sp.created_claimable_balances;
+        self.created_liquidity_pools = sp.created_liquidity_pools;
+
+        // Phase 4: Truncate delta
         self.delta.truncate_to(&sp.delta_lengths);
 
         // Phase 5: Truncate modified tracking vecs
         self.modified_accounts.truncate(sp.modified_accounts_len);
         self.modified_trustlines
             .truncate(sp.modified_trustlines_len);
+        self.modified_offers.truncate(sp.modified_offers_len);
+        self.modified_data.truncate(sp.modified_data_len);
+        self.modified_contract_data
+            .truncate(sp.modified_contract_data_len);
+        self.modified_contract_code
+            .truncate(sp.modified_contract_code_len);
+        self.modified_ttl.truncate(sp.modified_ttl_len);
+        self.modified_claimable_balances
+            .truncate(sp.modified_claimable_balances_len);
+        self.modified_liquidity_pools
+            .truncate(sp.modified_liquidity_pools_len);
 
         // Phase 6: Restore entry metadata
 
@@ -4205,7 +4492,6 @@ impl LedgerStateManager {
                 }
             }
         }
-        // Restore pre-speculation values for existing entries
         for (key, value) in sp.entry_last_modified_pre_values {
             match value {
                 Some(seq) => {
@@ -4274,9 +4560,10 @@ impl LedgerStateManager {
         }
         self.entry_sponsorship_ext_snapshots = sp.entry_sponsorship_ext_snapshots;
 
-        // Phase 7: Restore op entry snapshots
+        // Phase 7: Restore op entry snapshots and id_pool
         self.op_entry_snapshots
             .retain(|k, _| sp.op_entry_snapshot_keys.contains(k));
+        self.id_pool = sp.id_pool;
     }
 
     // ==================== Rollback Support ====================
@@ -6185,5 +6472,143 @@ mod tests {
             aa_index_get(&manager, 1, &usd_asset()),
             HashSet::from([100])
         );
+    }
+
+    #[test]
+    fn test_savepoint_rollback_accounts() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create and commit an account
+        let account = create_test_account_entry(1);
+        let account_id = account.account_id.clone();
+        manager.create_account(account);
+        manager.commit();
+
+        // Modify account balance
+        if let Some(acc) = manager.get_account_mut(&account_id) {
+            acc.balance = 500_000_000;
+        }
+
+        // Create savepoint after first modification
+        let sp = manager.create_savepoint();
+
+        // Modify account again after savepoint
+        if let Some(acc) = manager.get_account_mut(&account_id) {
+            acc.balance = 100_000;
+        }
+        assert_eq!(
+            manager.get_account(&account_id).unwrap().balance,
+            100_000
+        );
+
+        // Rollback — should restore to pre-savepoint value
+        manager.rollback_to_savepoint(sp);
+        assert_eq!(
+            manager.get_account(&account_id).unwrap().balance,
+            500_000_000
+        );
+    }
+
+    #[test]
+    fn test_savepoint_rollback_data_entries() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create savepoint on empty state
+        let sp = manager.create_savepoint();
+
+        // Create a data entry after savepoint
+        let data_entry = DataEntry {
+            account_id: create_test_account_id(1),
+            data_name: "test_key".as_bytes().to_vec().try_into().unwrap(),
+            data_value: DataValue(vec![1, 2, 3].try_into().unwrap()),
+            ext: DataEntryExt::V0,
+        };
+        manager.create_data(data_entry);
+
+        assert!(manager.get_data(&create_test_account_id(1), "test_key").is_some());
+
+        // Rollback — data entry should be gone
+        manager.rollback_to_savepoint(sp);
+        assert!(manager.get_data(&create_test_account_id(1), "test_key").is_none());
+    }
+
+    #[test]
+    fn test_savepoint_rollback_claimable_balances() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create savepoint
+        let sp = manager.create_savepoint();
+
+        // Create a claimable balance after savepoint
+        let cb_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([42; 32]));
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: cb_id.clone(),
+            claimants: vec![].try_into().unwrap(),
+            asset: Asset::Native,
+            amount: 1_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        manager.create_claimable_balance(cb_entry);
+
+        assert!(manager.get_claimable_balance(&cb_id).is_some());
+
+        // Rollback — claimable balance should be gone
+        manager.rollback_to_savepoint(sp);
+        assert!(manager.get_claimable_balance(&cb_id).is_none());
+    }
+
+    #[test]
+    fn test_savepoint_rollback_preserves_pre_savepoint_changes() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create account and commit
+        let account = create_test_account_entry(1);
+        let account_id = account.account_id.clone();
+        manager.create_account(account);
+        manager.commit();
+
+        // Modify balance to 500M (pre-savepoint change)
+        if let Some(acc) = manager.get_account_mut(&account_id) {
+            acc.balance = 500_000_000;
+        }
+
+        // Create savepoint
+        let sp = manager.create_savepoint();
+
+        // Create a new account and modify original after savepoint
+        let account2 = create_test_account_entry(2);
+        let account2_id = account2.account_id.clone();
+        manager.create_account(account2);
+
+        if let Some(acc) = manager.get_account_mut(&account_id) {
+            acc.balance = 100;
+        }
+
+        // Rollback
+        manager.rollback_to_savepoint(sp);
+
+        // Original account should have pre-savepoint balance
+        assert_eq!(
+            manager.get_account(&account_id).unwrap().balance,
+            500_000_000
+        );
+        // New account created after savepoint should be gone
+        assert!(manager.get_account(&account2_id).is_none());
+    }
+
+    #[test]
+    fn test_savepoint_rollback_restores_id_pool() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let initial_id = manager.id_pool;
+        let sp = manager.create_savepoint();
+
+        // Advance id_pool (simulating offer creation)
+        manager.id_pool += 5;
+        assert_eq!(manager.id_pool, initial_id + 5);
+
+        // Rollback — id_pool should be restored
+        manager.rollback_to_savepoint(sp);
+        assert_eq!(manager.id_pool, initial_id);
     }
 }

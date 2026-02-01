@@ -175,24 +175,12 @@ fn execute_credit_payment(
         let source_trustline = match state.get_trustline(source, asset) {
             Some(tl) => tl,
             None => {
-                // Rollback destination credit if source check fails
-                if issuer != dest {
-                    if let Some(dest_tl) = state.get_trustline_mut(dest, asset) {
-                        dest_tl.balance -= amount;
-                    }
-                }
                 return Ok(make_result(PaymentResultCode::SrcNoTrust));
             }
         };
 
         // Check source is authorized
         if !is_trustline_authorized(source_trustline.flags) {
-            // Rollback destination credit
-            if issuer != dest {
-                if let Some(dest_tl) = state.get_trustline_mut(dest, asset) {
-                    dest_tl.balance -= amount;
-                }
-            }
             return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
         }
 
@@ -201,12 +189,6 @@ fn execute_credit_payment(
         let selling_liabilities = trustline_liabilities(source_trustline).selling;
         let available = source_trustline.balance - selling_liabilities;
         if available < amount {
-            // Rollback destination credit
-            if issuer != dest {
-                if let Some(dest_tl) = state.get_trustline_mut(dest, asset) {
-                    dest_tl.balance -= amount;
-                }
-            }
             return Ok(make_result(PaymentResultCode::Underfunded));
         }
 

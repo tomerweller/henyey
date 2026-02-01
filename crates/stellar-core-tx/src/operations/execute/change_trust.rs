@@ -112,14 +112,8 @@ pub fn execute_change_trust(
         state.flush_all_accounts();
 
         state.delete_trustline_by_trustline_asset(source, &tl_asset);
-    } else if existing.is_some() {
+    } else if let Some(current_tl) = existing {
         // Updating existing trustline
-        // IMPORTANT: Re-read the trustline from state to get the current balance,
-        // which may have been modified by earlier operations in this transaction.
-        // The `existing` variable captured at the start of the function may be stale.
-        let current_tl = state
-            .get_trustline_by_trustline_asset(source, &tl_asset)
-            .ok_or(TxError::Internal("trustline disappeared".into()))?;
         let current_balance = current_tl.balance;
         let current_buying_liab = trustline_liabilities(current_tl).buying;
         if op.limit < current_balance.saturating_add(current_buying_liab) {
