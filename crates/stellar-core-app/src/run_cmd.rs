@@ -1031,6 +1031,7 @@ async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResp
     let (ledger_seq, _hash, _close_time, _protocol_version) = state.app.ledger_info();
     let peer_count = state.app.peer_snapshots().await.len();
     let pending_transactions = state.app.pending_transaction_count() as u64;
+    let app_info = state.app.info();
 
     // Get metrics from herder (we don't have direct access, so use available info)
     let metrics = MetricsResponse {
@@ -1039,11 +1040,11 @@ async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResp
         pending_transactions,
         uptime_seconds: uptime,
         state: format!("{}", app_state),
-        is_validator: state.app.info().is_validator,
+        is_validator: app_info.is_validator,
     };
 
     // Return Prometheus-style text format
-    let prometheus_text = format!(
+    let mut prometheus_text = format!(
         "# HELP stellar_ledger_sequence Current ledger sequence number\n\
          # TYPE stellar_ledger_sequence gauge\n\
          stellar_ledger_sequence {}\n\
@@ -1065,6 +1066,19 @@ async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResp
         metrics.uptime_seconds,
         if metrics.is_validator { 1 } else { 0 }
     );
+
+    // Add meta stream metrics if active
+    if app_info.meta_stream_bytes_total > 0 || app_info.meta_stream_writes_total > 0 {
+        prometheus_text.push_str(&format!(
+            "# HELP stellar_meta_stream_bytes_total Total bytes written to metadata output stream\n\
+             # TYPE stellar_meta_stream_bytes_total counter\n\
+             stellar_meta_stream_bytes_total {}\n\
+             # HELP stellar_meta_stream_writes_total Total frames written to metadata output stream\n\
+             # TYPE stellar_meta_stream_writes_total counter\n\
+             stellar_meta_stream_writes_total {}\n",
+            app_info.meta_stream_bytes_total, app_info.meta_stream_writes_total
+        ));
+    }
 
     (
         StatusCode::OK,

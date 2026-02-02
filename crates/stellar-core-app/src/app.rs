@@ -96,6 +96,7 @@ use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 
 use crate::config::AppConfig;
 use crate::logging::CatchupProgress;
+use crate::meta_stream::{MetaStreamError, MetaStreamManager};
 use crate::survey::{SurveyDataManager, SurveyMessageLimiter, SurveyPhase};
 use stellar_core_ledger::{
     close_time as ledger_close_time, compute_header_hash, verify_header_chain, verify_skip_list,
@@ -362,6 +363,9 @@ pub struct App {
     survey_reporting: RwLock<SurveyReportingState>,
     /// SCP timeout scheduling state.
     scp_timeouts: RwLock<ScpTimeoutState>,
+
+    /// Metadata output stream manager for emitting LedgerCloseMeta.
+    meta_stream: std::sync::Mutex<Option<MetaStreamManager>>,
 
     /// Close time drift tracker for clock synchronization monitoring.
     drift_tracker: std::sync::Mutex<CloseTimeDriftTracker>,
@@ -739,7 +743,7 @@ impl App {
             .join("buckets");
         std::fs::create_dir_all(&bucket_dir)?;
 
-        let bucket_manager = Arc::new(BucketManager::new(bucket_dir)?);
+        let bucket_manager = Arc::new(BucketManager::new(bucket_dir.clone())?);
         tracing::info!("Bucket manager initialized");
 
         // Initialize ledger manager
@@ -791,6 +795,26 @@ impl App {
                 tracing::warn!(error = %err, "Failed to store local quorum set");
             }
         }
+
+        // Initialize metadata stream if configured
+        let meta_stream = if config.metadata.output_stream.is_some()
+            || config.metadata.debug_ledgers > 0
+        {
+            match MetaStreamManager::new(&config.metadata, &bucket_dir) {
+                Ok(ms) => {
+                    if ms.is_streaming() {
+                        tracing::info!("Metadata output stream initialized");
+                    }
+                    Some(ms)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to initialize metadata stream");
+                    return Err(e.into());
+                }
+            }
+        } else {
+            None
+        };
 
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -857,6 +881,7 @@ impl App {
             survey_throttle,
             survey_reporting: RwLock::new(SurveyReportingState::new()),
             scp_timeouts: RwLock::new(ScpTimeoutState::new()),
+            meta_stream: std::sync::Mutex::new(meta_stream),
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
@@ -7091,6 +7116,13 @@ impl App {
 
     /// Get application info.
     pub fn info(&self) -> AppInfo {
+        let (meta_bytes, meta_writes) = self
+            .meta_stream
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|ms| ms.metrics()))
+            .unwrap_or((0, 0));
+
         AppInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             node_name: self.config.node.name.clone(),
@@ -7098,6 +7130,8 @@ impl App {
             network_passphrase: self.config.network.passphrase.clone(),
             is_validator: self.config.node.is_validator,
             database_path: self.config.database.path.clone(),
+            meta_stream_bytes_total: meta_bytes,
+            meta_stream_writes_total: meta_writes,
         }
     }
 
@@ -7226,6 +7260,10 @@ pub struct AppInfo {
     pub is_validator: bool,
     /// Database path.
     pub database_path: std::path::PathBuf,
+    /// Total bytes written to metadata output stream.
+    pub meta_stream_bytes_total: u64,
+    /// Total frames written to metadata output stream.
+    pub meta_stream_writes_total: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -7260,6 +7298,12 @@ impl std::fmt::Display for AppInfo {
         writeln!(f)?;
         writeln!(f, "Storage:")?;
         writeln!(f, "  Database:   {}", self.database_path.display())?;
+        if self.meta_stream_bytes_total > 0 || self.meta_stream_writes_total > 0 {
+            writeln!(f)?;
+            writeln!(f, "Metadata Stream:")?;
+            writeln!(f, "  Bytes Written:  {}", self.meta_stream_bytes_total)?;
+            writeln!(f, "  Writes:         {}", self.meta_stream_writes_total)?;
+        }
         Ok(())
     }
 }
@@ -7388,6 +7432,27 @@ impl HerderCallback for App {
             stellar_core_herder::HerderError::Internal(format!("Failed to commit ledger: {}", e))
         })?;
         tracing::debug!(ledger_seq, "Ledger close context committed");
+
+        // Emit LedgerCloseMeta to stream — after state commit, before DB persist.
+        // This matches C++ ordering: emitNextMeta() before database commit.
+        if let Some(ref meta) = result.meta {
+            let mut guard = self.meta_stream.lock().unwrap();
+            if let Some(ref mut stream) = *guard {
+                if let Err(e) = stream.maybe_rotate_debug_stream(ledger_seq) {
+                    tracing::warn!(error = %e, ledger_seq, "Failed to rotate debug meta stream");
+                }
+                match stream.emit_meta(meta) {
+                    Ok(()) => {}
+                    Err(MetaStreamError::MainStreamWrite(e)) => {
+                        tracing::error!(error = %e, ledger_seq, "Fatal: metadata output stream write failed");
+                        std::process::abort();
+                    }
+                    Err(MetaStreamError::DebugStreamWrite(e)) => {
+                        tracing::warn!(error = %e, ledger_seq, "Debug metadata stream write failed");
+                    }
+                }
+            }
+        }
 
         let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
         tracing::debug!(ledger_seq, "Persisting ledger close data");

@@ -98,6 +98,10 @@ struct Cli {
     #[arg(long, global = true)]
     mainnet: bool,
 
+    /// Stream LedgerCloseMeta XDR frames to a file, named pipe, or fd:N
+    #[arg(long = "metadata-output-stream", value_name = "STREAM", global = true)]
+    metadata_output_stream: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -515,7 +519,7 @@ fn init_logging(cli: &Cli) -> anyhow::Result<()> {
 
 /// Load configuration from file or use defaults.
 fn load_config(cli: &Cli) -> anyhow::Result<AppConfig> {
-    let config = if let Some(ref config_path) = cli.config {
+    let mut config = if let Some(ref config_path) = cli.config {
         tracing::info!(path = ?config_path, "Loading configuration from file");
         AppConfig::from_file_with_env(config_path)?
     } else if cli.mainnet {
@@ -529,6 +533,11 @@ fn load_config(cli: &Cli) -> anyhow::Result<AppConfig> {
         config.apply_env_overrides();
         config
     };
+
+    // CLI --metadata-output-stream overrides config file
+    if let Some(ref stream) = cli.metadata_output_stream {
+        config.metadata.output_stream = Some(stream.clone());
+    }
 
     Ok(config)
 }

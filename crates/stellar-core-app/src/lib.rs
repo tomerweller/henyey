@@ -55,6 +55,7 @@ pub mod catchup_cmd;
 pub mod config;
 pub mod logging;
 pub mod maintainer;
+pub mod meta_stream;
 pub mod run_cmd;
 pub mod survey;
 

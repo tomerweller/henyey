@@ -53,6 +53,7 @@ pub mod protocol;
 pub mod resource;
 pub mod time;
 pub mod types;
+pub mod xdr_stream;
 
 // Re-export key types at crate root for convenience
 pub use config::Config;

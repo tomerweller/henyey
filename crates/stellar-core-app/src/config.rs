@@ -121,6 +121,10 @@ pub struct AppConfig {
     /// Classic event emission configuration.
     #[serde(default)]
     pub events: EventsConfig,
+
+    /// Metadata output stream configuration.
+    #[serde(default)]
+    pub metadata: MetadataConfig,
 }
 
 /// Node identity and behavior configuration.
@@ -314,6 +318,38 @@ pub struct EventsConfig {
     /// Backfill classic asset events to pre-23 format.
     #[serde(default)]
     pub backfill_stellar_asset_events: bool,
+}
+
+/// Metadata output stream configuration.
+///
+/// Controls how `LedgerCloseMeta` frames are streamed to external consumers
+/// (e.g., Horizon ingestion pipelines). This is the Rust equivalent of
+/// C++ stellar-core's `--metadata-output-stream` feature.
+///
+/// # Example
+///
+/// ```toml
+/// [metadata]
+/// output_stream = "/tmp/meta.pipe"
+/// debug_ledgers = 100
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetadataConfig {
+    /// Stream destination: file path, named pipe, or "fd:N" for a pre-opened
+    /// file descriptor. When set, every `LedgerCloseMeta` is written as a
+    /// size-prefixed XDR frame to this destination.
+    #[serde(default)]
+    pub output_stream: Option<String>,
+
+    /// Number of ledgers to retain in debug meta files. 0 = disabled.
+    /// Debug meta files are written to `<bucket_dir>/meta-debug/` with gzip
+    /// compression and segment rotation every 256 ledgers.
+    #[serde(default = "default_metadata_debug_ledgers")]
+    pub debug_ledgers: u32,
+}
+
+fn default_metadata_debug_ledgers() -> u32 {
+    0
 }
 
 /// Proposed protocol upgrades configuration.
@@ -780,6 +816,7 @@ impl AppConfig {
             http: HttpConfig::default(),
             surge_pricing: SurgePricingConfig::default(),
             events: EventsConfig::default(),
+            metadata: MetadataConfig::default(),
         }
     }
 
@@ -843,6 +880,7 @@ impl AppConfig {
             http: HttpConfig::default(),
             surge_pricing: SurgePricingConfig::default(),
             events: EventsConfig::default(),
+            metadata: MetadataConfig::default(),
         }
     }
 
@@ -968,6 +1006,14 @@ impl AppConfig {
         if self.events.backfill_stellar_asset_events && !self.events.emit_classic_events {
             anyhow::bail!(
                 "events.backfill_stellar_asset_events requires events.emit_classic_events"
+            );
+        }
+
+        // Warn if metadata stream is configured on a validator node
+        if self.metadata.output_stream.is_some() && self.node.is_validator {
+            tracing::warn!(
+                "metadata.output_stream is set on a validator node; \
+                 this may impact consensus performance"
             );
         }
 
@@ -1208,5 +1254,34 @@ mod tests {
             })
             .collect();
         assert!(bytes[0] <= bytes[1]);
+    }
+
+    #[test]
+    fn test_metadata_config_defaults() {
+        let config = AppConfig::default();
+        assert!(config.metadata.output_stream.is_none());
+        assert_eq!(config.metadata.debug_ledgers, 0);
+    }
+
+    #[test]
+    fn test_metadata_config_from_toml() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[metadata]
+output_stream = "/tmp/meta.pipe"
+debug_ledgers = 200
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.metadata.output_stream.as_deref(),
+            Some("/tmp/meta.pipe")
+        );
+        assert_eq!(config.metadata.debug_ledgers, 200);
     }
 }
