@@ -203,7 +203,10 @@ fn execute_manage_offer(
                 1,
                 0,
             )?;
-            if sponsor_account.balance < min_balance {
+            let available = sponsor_account
+                .balance
+                .saturating_sub(account_liabilities(sponsor_account).selling);
+            if available < min_balance {
                 return Ok(make_sell_offer_result(
                     ManageSellOfferResultCode::LowReserve,
                     None,
@@ -212,7 +215,10 @@ fn execute_manage_offer(
         } else if let Some(account) = state.get_account(source) {
             let min_balance =
                 state.minimum_balance_for_account(account, context.protocol_version, 1)?;
-            if account.balance < min_balance {
+            let available = account
+                .balance
+                .saturating_sub(account_liabilities(account).selling);
+            if available < min_balance {
                 return Ok(make_sell_offer_result(
                     ManageSellOfferResultCode::LowReserve,
                     None,
@@ -2183,6 +2189,81 @@ mod tests {
                 assert!(matches!(r, ManageSellOfferResult::LineFull));
             }
             _ => panic!("Unexpected result type"),
+        }
+    }
+
+    #[test]
+    fn test_manage_sell_offer_low_reserve_with_selling_liabilities() {
+        // Tests that selling liabilities are subtracted from balance when checking
+        // if account can afford a new subentry reserve for a new offer.
+        // This is a regression test for a bug where the LowReserve check only
+        // compared balance to min_balance without considering liabilities.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut context = create_test_context();
+        context.protocol_version = 25;
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        // Calculate the exact balance needed: min_balance + 1 subentry + selling liabilities
+        // With selling liabilities, the available balance = balance - selling_liabilities
+        // needs to be >= min_balance + 1 subentry reserve
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
+        let subentry_reserve = state
+            .minimum_balance_with_counts(context.protocol_version, 1, 0, 0)
+            .unwrap()
+            - min_balance;
+
+        let selling_liabilities = 1_000_000i64;
+        // Set balance to exactly min_balance + subentry_reserve + selling_liabilities - 1
+        // This means: available = balance - selling_liabilities = min_balance + subentry_reserve - 1
+        // Which is less than the required min_balance + subentry_reserve, so LowReserve should trigger.
+        let balance = min_balance + subentry_reserve + selling_liabilities - 1;
+
+        let mut account = create_test_account(source_id.clone(), balance);
+        // Add selling liabilities to the account
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: selling_liabilities,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(account);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageSellOfferOp {
+            selling: asset.clone(),
+            buying: Asset::Native,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::LowReserve),
+                    "Expected LowReserve when selling liabilities make available balance insufficient, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result type: {:?}", other),
         }
     }
 }

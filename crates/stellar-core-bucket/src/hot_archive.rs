@@ -1284,7 +1284,12 @@ impl HotArchiveBucketList {
             }
         }
 
-        // For levels that don't have HAS input hashes, fall back to regular restart_merges
+        // For levels that don't have HAS input hashes (state 0 = clear),
+        // fall back to regular restart_merges which examines bucket structure
+        // to determine if a merge should be in progress.
+        //
+        // This matches C++ stellar-core behavior: when next.isClear() for a level,
+        // restartMerges() uses the previous level's snap to start a merge if needed.
         self.restart_merges(ledger, protocol_version)
     }
 

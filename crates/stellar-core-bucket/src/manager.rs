@@ -1060,6 +1060,7 @@ impl BucketManager {
         referenced_paths: &std::collections::HashSet<PathBuf>,
     ) -> Result<usize> {
         let mut deleted = 0;
+        let current_pid = std::process::id();
 
         // List all files in bucket directory that match merge-tmp-*.xdr pattern
         for entry in std::fs::read_dir(&self.bucket_dir)? {
@@ -1069,9 +1070,35 @@ impl BucketManager {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 // Only consider merge temp files
                 if name.starts_with("merge-tmp-") && name.ends_with(".xdr") {
-                    // Delete if not referenced
+                    // Parse the process ID from the filename: merge-tmp-{pid}-{counter}.xdr
+                    // Only delete files from PREVIOUS runs (different PID) to avoid race
+                    // conditions with in-flight async merges whose output files may not
+                    // yet be tracked in referenced_paths.
+                    let is_current_process = name
+                        .strip_prefix("merge-tmp-")
+                        .and_then(|s| s.split('-').next())
+                        .and_then(|pid_str| pid_str.parse::<u32>().ok())
+                        .map(|pid| pid == current_pid)
+                        .unwrap_or(false);
+
+                    // Skip files from the current process - they may be in-flight
+                    // and we can't reliably track all output files from async merges.
+                    // Files from previous processes are safe to delete.
+                    if is_current_process {
+                        // For current process files, only delete if explicitly referenced
+                        // This is conservative but prevents race conditions.
+                        if !referenced_paths.contains(&path) {
+                            tracing::trace!(
+                                path = %path.display(),
+                                "Skipping current-process temp file (may be in-flight)"
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Delete unreferenced files from previous runs
                     if !referenced_paths.contains(&path) {
-                        tracing::debug!(path = %path.display(), "Deleting unreferenced merge temp file");
+                        tracing::debug!(path = %path.display(), "Deleting unreferenced merge temp file from previous run");
                         if let Err(e) = std::fs::remove_file(&path) {
                             tracing::warn!(
                                 path = %path.display(),
@@ -1555,5 +1582,96 @@ mod tests {
         manager.save_index_for_bucket(&hash, &index).unwrap();
         let loaded = manager.try_load_index_for_bucket(&hash, 10).unwrap();
         assert!(loaded.is_none());
+    }
+
+    /// Regression test: Verify that cleanup_unreferenced_files only deletes
+    /// merge temp files from PREVIOUS process runs, not from the current process.
+    ///
+    /// This prevents a race condition where an async merge output file could be
+    /// deleted before it's registered in referenced_paths. The fix uses PID-based
+    /// filtering: files with the current process's PID in their name are skipped.
+    #[test]
+    fn test_cleanup_merge_temps_respects_current_pid() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = BucketManager::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let current_pid = std::process::id();
+        let other_pid = current_pid.wrapping_add(12345); // Different PID
+
+        // Create temp files simulating:
+        // 1. A file from the current process (should NOT be deleted)
+        // 2. A file from a previous process (should be deleted if unreferenced)
+        let current_process_file = temp_dir
+            .path()
+            .join(format!("merge-tmp-{}-1.xdr", current_pid));
+        let previous_process_file = temp_dir
+            .path()
+            .join(format!("merge-tmp-{}-1.xdr", other_pid));
+
+        std::fs::write(&current_process_file, b"current process data").unwrap();
+        std::fs::write(&previous_process_file, b"previous process data").unwrap();
+
+        // Empty referenced paths - nothing is "in use"
+        let referenced = std::collections::HashSet::new();
+
+        // Run cleanup
+        let deleted = manager
+            .cleanup_unreferenced_files(&referenced)
+            .unwrap();
+
+        // The previous process file should be deleted (1 file deleted)
+        assert_eq!(deleted, 1, "Should delete exactly one file (from previous process)");
+
+        // Current process file should still exist
+        assert!(
+            current_process_file.exists(),
+            "File from current process should NOT be deleted (may be in-flight async merge)"
+        );
+
+        // Previous process file should be gone
+        assert!(
+            !previous_process_file.exists(),
+            "File from previous process should be deleted"
+        );
+    }
+
+    /// Regression test: Verify that cleanup_unreferenced_files preserves
+    /// files that are explicitly referenced, regardless of PID.
+    #[test]
+    fn test_cleanup_merge_temps_preserves_referenced_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = BucketManager::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let other_pid = std::process::id().wrapping_add(99999);
+
+        // Create temp files from a "previous process"
+        let referenced_file = temp_dir
+            .path()
+            .join(format!("merge-tmp-{}-1.xdr", other_pid));
+        let unreferenced_file = temp_dir
+            .path()
+            .join(format!("merge-tmp-{}-2.xdr", other_pid));
+
+        std::fs::write(&referenced_file, b"referenced").unwrap();
+        std::fs::write(&unreferenced_file, b"unreferenced").unwrap();
+
+        // Mark one file as referenced
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert(referenced_file.clone());
+
+        // Run cleanup
+        let deleted = manager
+            .cleanup_unreferenced_files(&referenced)
+            .unwrap();
+
+        assert_eq!(deleted, 1, "Should delete exactly one unreferenced file");
+        assert!(
+            referenced_file.exists(),
+            "Referenced file should be preserved"
+        );
+        assert!(
+            !unreferenced_file.exists(),
+            "Unreferenced file should be deleted"
+        );
     }
 }

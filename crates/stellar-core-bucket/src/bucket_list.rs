@@ -163,6 +163,10 @@ pub struct AsyncMergeHandle {
     level: usize,
     /// Cached result after resolution (allows multiple reads).
     result: Option<Arc<Bucket>>,
+    /// Input bucket file paths that must not be deleted while merge is in progress.
+    /// These paths are needed for garbage collection - we can't delete files that
+    /// are being read by in-flight merges.
+    input_file_paths: Vec<std::path::PathBuf>,
 }
 
 impl AsyncMergeHandle {
@@ -187,6 +191,22 @@ impl AsyncMergeHandle {
         bucket_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let (sender, receiver) = oneshot::channel();
+
+        // Capture input bucket file paths for garbage collection tracking.
+        // These files must not be deleted while this merge is in progress.
+        let mut input_file_paths = Vec::new();
+        if let Some(path) = curr.backing_file_path() {
+            input_file_paths.push(path.to_path_buf());
+        }
+        if let Some(path) = snap.backing_file_path() {
+            input_file_paths.push(path.to_path_buf());
+        }
+        // Also track shadow bucket paths
+        for shadow in &shadow_buckets {
+            if let Some(path) = shadow.backing_file_path() {
+                input_file_paths.push(path.to_path_buf());
+            }
+        }
 
         // Spawn the merge on tokio's blocking thread pool.
         // This is better than std::thread::spawn because:
@@ -264,6 +284,7 @@ impl AsyncMergeHandle {
             receiver: Some(receiver),
             level,
             result: None,
+            input_file_paths,
         }
     }
 
@@ -1523,6 +1544,7 @@ impl BucketList {
     /// This includes:
     /// - curr and snap buckets for all levels
     /// - pending merge outputs that are disk-backed
+    /// - input buckets for in-flight async merges (critical for correctness!)
     ///
     /// This is used for garbage collection - any files in the bucket directory
     /// that aren't in this set can be safely deleted.
@@ -1538,11 +1560,27 @@ impl BucketList {
             if let Some(path) = level.snap.backing_file_path() {
                 paths.insert(path.to_path_buf());
             }
-            // Add pending merge output's backing file if disk-backed
+            // Add pending merge files
             if let Some(ref pending) = level.next {
-                if let PendingMerge::InMemory(bucket) = pending {
-                    if let Some(path) = bucket.backing_file_path() {
-                        paths.insert(path.to_path_buf());
+                match pending {
+                    PendingMerge::InMemory(bucket) => {
+                        // Add the output bucket's backing file if disk-backed
+                        if let Some(path) = bucket.backing_file_path() {
+                            paths.insert(path.to_path_buf());
+                        }
+                    }
+                    PendingMerge::Async(handle) => {
+                        // Add input bucket files that the merge is reading from.
+                        // These MUST NOT be deleted while the merge is in progress!
+                        for path in &handle.input_file_paths {
+                            paths.insert(path.clone());
+                        }
+                        // If the merge has completed, also add the result's backing file
+                        if let Some(ref result) = handle.result {
+                            if let Some(path) = result.backing_file_path() {
+                                paths.insert(path.to_path_buf());
+                            }
+                        }
                     }
                 }
             }
@@ -1786,7 +1824,12 @@ impl BucketList {
             }
         }
 
-        // For levels that don't have HAS input hashes, fall back to regular restart_merges
+        // For levels that don't have HAS input hashes (state 0 = clear),
+        // fall back to regular restart_merges which examines bucket structure
+        // to determine if a merge should be in progress.
+        //
+        // This matches C++ stellar-core behavior: when next.isClear() for a level,
+        // restartMerges() uses the previous level's snap to start a merge if needed.
         self.restart_merges(ledger, protocol_version)
     }
 
@@ -2857,5 +2900,74 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// Regression test: Verify that AsyncMergeHandle tracks input file paths.
+    ///
+    /// This is critical for garbage collection correctness. Without tracking input files,
+    /// the garbage collector could delete bucket files that are being read by an async merge,
+    /// causing data corruption or panics.
+    ///
+    /// The fix adds `input_file_paths` to `AsyncMergeHandle` which are included in `referenced_file_paths()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_async_merge_handle_tracks_input_paths() {
+        use crate::bucket::Bucket;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create entries and save bucket to disk, then load it as disk-backed
+        // We need larger buckets to exceed the disk-backed threshold,
+        // so instead we'll use the lower-level Bucket::from_xdr_file_disk_backed API
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+
+        // Create and save bucket 1
+        let bucket1_mem = Bucket::from_entries(vec![BucketListEntry::Live(entry1)]).unwrap();
+        let path1 = temp_dir.path().join("bucket1.xdr");
+        bucket1_mem.save_to_xdr_file(&path1).unwrap();
+
+        // Create and save bucket 2
+        let bucket2_mem = Bucket::from_entries(vec![BucketListEntry::Live(entry2)]).unwrap();
+        let path2 = temp_dir.path().join("bucket2.xdr");
+        bucket2_mem.save_to_xdr_file(&path2).unwrap();
+
+        // Load as disk-backed buckets
+        let bucket1 = Arc::new(Bucket::from_xdr_file_disk_backed(&path1).unwrap());
+        let bucket2 = Arc::new(Bucket::from_xdr_file_disk_backed(&path2).unwrap());
+
+        // Verify buckets are disk-backed
+        assert!(bucket1.is_disk_backed(), "bucket1 should be disk-backed");
+        assert!(bucket2.is_disk_backed(), "bucket2 should be disk-backed");
+
+        // Create an async merge handle
+        let handle = AsyncMergeHandle::start_merge(
+            bucket1.clone(),
+            bucket2.clone(),
+            false,
+            TEST_PROTOCOL,
+            true,
+            vec![],
+            1,
+            Some(temp_dir.path().to_path_buf()),
+        );
+
+        // Set up bucket list with the pending merge
+        let mut bl = BucketList::new();
+        bl.levels[1].next = Some(PendingMerge::Async(handle));
+
+        // Get referenced_file_paths - it should include the async merge input files
+        let paths = bl.referenced_file_paths();
+
+        assert!(
+            paths.contains(&path1),
+            "referenced_file_paths should include first async merge input file. Paths: {:?}",
+            paths
+        );
+        assert!(
+            paths.contains(&path2),
+            "referenced_file_paths should include second async merge input file. Paths: {:?}",
+            paths
+        );
     }
 }

@@ -299,14 +299,14 @@ pub fn merge_buckets_to_file(
 
     // Helper: serialize and write one entry
     let write_entry = |entry: &BucketEntry,
-                           writer: &mut BufWriter<File>,
-                           hasher: &mut Sha256,
-                           count: &mut usize|
+                       writer: &mut BufWriter<File>,
+                       hasher: &mut Sha256,
+                       count: &mut usize|
      -> Result<()> {
         let xdr_entry = entry.to_xdr_entry();
-        let data = xdr_entry.to_xdr(Limits::none()).map_err(|e| {
-            BucketError::Serialization(format!("Failed to serialize entry: {}", e))
-        })?;
+        let data = xdr_entry
+            .to_xdr(Limits::none())
+            .map_err(|e| BucketError::Serialization(format!("Failed to serialize entry: {}", e)))?;
 
         // Write XDR record mark + data
         let record_mark = (data.len() as u32) | 0x80000000;
@@ -395,12 +395,15 @@ pub fn merge_buckets_to_file(
 
     // Flush and sync
     writer.flush()?;
-    writer.into_inner().map_err(|e| {
-        BucketError::Io(std::io::Error::other(format!(
-            "Failed to flush writer: {}",
-            e
-        )))
-    })?.sync_all()?;
+    writer
+        .into_inner()
+        .map_err(|e| {
+            BucketError::Io(std::io::Error::other(format!(
+                "Failed to flush writer: {}",
+                e
+            )))
+        })?
+        .sync_all()?;
 
     let hash_bytes: [u8; 32] = hasher.finalize().into();
     let hash = Hash256::from_bytes(hash_bytes);

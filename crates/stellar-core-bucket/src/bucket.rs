@@ -738,7 +738,15 @@ impl Bucket {
                 // For disk-backed, we create an iterator that reads from disk
                 match disk_bucket.iter() {
                     Ok(iter) => BucketIter::DiskBacked(iter),
-                    Err(_) => BucketIter::Empty,
+                    Err(e) => {
+                        tracing::warn!(
+                            hash = %self.hash,
+                            file_path = ?disk_bucket.file_path(),
+                            error = %e,
+                            "Failed to create disk bucket iterator, returning empty iterator"
+                        );
+                        BucketIter::Empty
+                    }
                 }
             }
         }
