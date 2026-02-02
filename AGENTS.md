@@ -56,6 +56,11 @@
 
 - Format assistant messages in a Claude-like style: concise, direct, and structured with short sections or bullets when helpful.
 
+## Storage & Disk Usage
+
+- Use `~/data` for all artifacts: build cache, data files, build artifacts, and any other generated output. Do not use the local filesystem outside the repo for these purposes to avoid running out of space.
+- `~/data` is a shared volume used by multiple developers and agents. Namespace your data under `~/data/<agent-session-id>/` to avoid collisions, since multiple agents may run concurrently under the same user (e.g., `~/data/a1b2c3/cargo-target/`).
+
 ## Configuration & Operational Notes
 
 - SQLite is the only supported database backend.
