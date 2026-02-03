@@ -1067,4 +1067,342 @@ mod tests {
         assert_eq!(get_needed_threshold(&account, ThresholdLevel::Medium), 5);
         assert_eq!(get_needed_threshold(&account, ThresholdLevel::High), 10);
     }
+
+    /// Test validate_path_payment_strict_receive.
+    #[test]
+    fn test_validate_path_payment_strict_receive() {
+        let valid = PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 1000,
+            destination: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+            dest_asset: Asset::Native,
+            dest_amount: 500,
+            path: vec![].try_into().unwrap(),
+        };
+        assert!(validate_path_payment_strict_receive(&valid).is_ok());
+
+        // Zero send_max
+        let invalid_send = PathPaymentStrictReceiveOp {
+            send_max: 0,
+            ..valid.clone()
+        };
+        assert!(validate_path_payment_strict_receive(&invalid_send).is_err());
+
+        // Zero dest_amount
+        let invalid_dest = PathPaymentStrictReceiveOp {
+            dest_amount: 0,
+            ..valid.clone()
+        };
+        assert!(validate_path_payment_strict_receive(&invalid_dest).is_err());
+
+        // Negative send_max
+        let negative_send = PathPaymentStrictReceiveOp {
+            send_max: -100,
+            ..valid.clone()
+        };
+        assert!(validate_path_payment_strict_receive(&negative_send).is_err());
+
+        // Negative dest_amount
+        let negative_dest = PathPaymentStrictReceiveOp {
+            dest_amount: -100,
+            ..valid
+        };
+        assert!(validate_path_payment_strict_receive(&negative_dest).is_err());
+    }
+
+    /// Test validate_path_payment_strict_send.
+    #[test]
+    fn test_validate_path_payment_strict_send() {
+        let valid = PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 1000,
+            destination: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+            dest_asset: Asset::Native,
+            dest_min: 500,
+            path: vec![].try_into().unwrap(),
+        };
+        assert!(validate_path_payment_strict_send(&valid).is_ok());
+
+        // Zero send_amount
+        let invalid_send = PathPaymentStrictSendOp {
+            send_amount: 0,
+            ..valid.clone()
+        };
+        assert!(validate_path_payment_strict_send(&invalid_send).is_err());
+
+        // Negative dest_min
+        let negative_dest = PathPaymentStrictSendOp {
+            dest_min: -100,
+            ..valid
+        };
+        assert!(validate_path_payment_strict_send(&negative_dest).is_err());
+    }
+
+    /// Test validate_manage_sell_offer.
+    #[test]
+    fn test_validate_manage_sell_offer() {
+        let valid = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+                asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            }),
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+        assert!(validate_manage_sell_offer(&valid).is_ok());
+
+        // Zero amount is valid (delete offer)
+        let zero_amount = ManageSellOfferOp {
+            amount: 0,
+            ..valid.clone()
+        };
+        assert!(validate_manage_sell_offer(&zero_amount).is_ok());
+
+        // Negative amount
+        let negative = ManageSellOfferOp {
+            amount: -100,
+            ..valid.clone()
+        };
+        assert!(validate_manage_sell_offer(&negative).is_err());
+
+        // Zero price numerator
+        let zero_price_n = ManageSellOfferOp {
+            price: Price { n: 0, d: 1 },
+            ..valid.clone()
+        };
+        assert!(validate_manage_sell_offer(&zero_price_n).is_err());
+
+        // Zero price denominator
+        let zero_price_d = ManageSellOfferOp {
+            price: Price { n: 1, d: 0 },
+            ..valid.clone()
+        };
+        assert!(validate_manage_sell_offer(&zero_price_d).is_err());
+
+        // Negative price
+        let negative_price = ManageSellOfferOp {
+            price: Price { n: -1, d: 1 },
+            ..valid
+        };
+        assert!(validate_manage_sell_offer(&negative_price).is_err());
+    }
+
+    /// Test validate_manage_buy_offer.
+    #[test]
+    fn test_validate_manage_buy_offer() {
+        let valid = ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+                asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            }),
+            buy_amount: 1000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+        assert!(validate_manage_buy_offer(&valid).is_ok());
+
+        // Negative buy_amount
+        let negative = ManageBuyOfferOp {
+            buy_amount: -100,
+            ..valid
+        };
+        assert!(validate_manage_buy_offer(&negative).is_err());
+    }
+
+    /// Test validate_set_options.
+    #[test]
+    fn test_validate_set_options() {
+        let valid = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+        assert!(validate_set_options(&valid).is_ok());
+
+        // Valid master weight
+        let valid_weight = SetOptionsOp {
+            master_weight: Some(100),
+            ..valid.clone()
+        };
+        assert!(validate_set_options(&valid_weight).is_ok());
+
+        // Invalid master weight (> 255)
+        let invalid_weight = SetOptionsOp {
+            master_weight: Some(256),
+            ..valid.clone()
+        };
+        assert!(validate_set_options(&invalid_weight).is_err());
+
+        // Invalid low threshold (> 255)
+        let invalid_low = SetOptionsOp {
+            low_threshold: Some(256),
+            ..valid.clone()
+        };
+        assert!(validate_set_options(&invalid_low).is_err());
+
+        // Invalid med threshold (> 255)
+        let invalid_med = SetOptionsOp {
+            med_threshold: Some(256),
+            ..valid.clone()
+        };
+        assert!(validate_set_options(&invalid_med).is_err());
+
+        // Invalid high threshold (> 255)
+        let invalid_high = SetOptionsOp {
+            high_threshold: Some(256),
+            ..valid
+        };
+        assert!(validate_set_options(&invalid_high).is_err());
+    }
+
+    /// Test validate_change_trust.
+    #[test]
+    fn test_validate_change_trust() {
+        use stellar_xdr::curr::ChangeTrustAsset;
+
+        let valid = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+                asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            }),
+            limit: 1000,
+        };
+        assert!(validate_change_trust(&valid).is_ok());
+
+        // Negative limit
+        let negative = ChangeTrustOp {
+            limit: -100,
+            ..valid
+        };
+        assert!(validate_change_trust(&negative).is_err());
+    }
+
+    /// Test validate_bump_sequence.
+    #[test]
+    fn test_validate_bump_sequence() {
+        let valid = BumpSequenceOp {
+            bump_to: stellar_xdr::curr::SequenceNumber(100),
+        };
+        assert!(validate_bump_sequence(&valid).is_ok());
+
+        // Negative bump_to
+        let negative = BumpSequenceOp {
+            bump_to: stellar_xdr::curr::SequenceNumber(-1),
+        };
+        assert!(validate_bump_sequence(&negative).is_err());
+    }
+
+    /// Test validate_manage_data.
+    #[test]
+    fn test_validate_manage_data() {
+        let valid = ManageDataOp {
+            data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
+            data_value: Some(b"value".to_vec().try_into().unwrap()),
+        };
+        assert!(validate_manage_data(&valid).is_ok());
+
+        // Delete operation (None value) is also valid
+        let delete = ManageDataOp {
+            data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
+            data_value: None,
+        };
+        assert!(validate_manage_data(&delete).is_ok());
+    }
+
+    /// Test all operation types have names.
+    #[test]
+    fn test_all_operation_type_names() {
+        // Classic operations
+        assert!(!OperationType::CreateAccount.name().is_empty());
+        assert!(!OperationType::Payment.name().is_empty());
+        assert!(!OperationType::PathPaymentStrictReceive.name().is_empty());
+        assert!(!OperationType::ManageSellOffer.name().is_empty());
+        assert!(!OperationType::CreatePassiveSellOffer.name().is_empty());
+        assert!(!OperationType::SetOptions.name().is_empty());
+        assert!(!OperationType::ChangeTrust.name().is_empty());
+        assert!(!OperationType::AllowTrust.name().is_empty());
+        assert!(!OperationType::AccountMerge.name().is_empty());
+        assert!(!OperationType::Inflation.name().is_empty());
+        assert!(!OperationType::ManageData.name().is_empty());
+        assert!(!OperationType::BumpSequence.name().is_empty());
+        assert!(!OperationType::ManageBuyOffer.name().is_empty());
+        assert!(!OperationType::PathPaymentStrictSend.name().is_empty());
+        assert!(!OperationType::CreateClaimableBalance.name().is_empty());
+        assert!(!OperationType::ClaimClaimableBalance.name().is_empty());
+        assert!(!OperationType::BeginSponsoringFutureReserves.name().is_empty());
+        assert!(!OperationType::EndSponsoringFutureReserves.name().is_empty());
+        assert!(!OperationType::RevokeSponsorship.name().is_empty());
+        assert!(!OperationType::Clawback.name().is_empty());
+        assert!(!OperationType::ClawbackClaimableBalance.name().is_empty());
+        assert!(!OperationType::SetTrustLineFlags.name().is_empty());
+        assert!(!OperationType::LiquidityPoolDeposit.name().is_empty());
+        assert!(!OperationType::LiquidityPoolWithdraw.name().is_empty());
+
+        // Soroban operations
+        assert!(!OperationType::InvokeHostFunction.name().is_empty());
+        assert!(!OperationType::ExtendFootprintTtl.name().is_empty());
+        assert!(!OperationType::RestoreFootprint.name().is_empty());
+    }
+
+    /// Test OperationType from_body for all operation types.
+    #[test]
+    fn test_operation_type_from_body_all() {
+        // Test CreateAccount
+        let create_account = OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            starting_balance: 10_000_000,
+        });
+        assert_eq!(OperationType::from_body(&create_account), OperationType::CreateAccount);
+
+        // Test ManageSellOffer
+        let manage_sell = OperationBody::ManageSellOffer(ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        });
+        assert_eq!(OperationType::from_body(&manage_sell), OperationType::ManageSellOffer);
+
+        // Test ManageBuyOffer
+        let manage_buy = OperationBody::ManageBuyOffer(ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: Asset::Native,
+            buy_amount: 100,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        });
+        assert_eq!(OperationType::from_body(&manage_buy), OperationType::ManageBuyOffer);
+
+        // Test Inflation
+        let inflation = OperationBody::Inflation;
+        assert_eq!(OperationType::from_body(&inflation), OperationType::Inflation);
+    }
+
+    /// Test OperationValidationError display.
+    #[test]
+    fn test_operation_validation_error_display() {
+        let err = OperationValidationError::InvalidAmount(-100);
+        let display = err.to_string();
+        assert!(display.contains("-100") || display.contains("amount"));
+
+        let err = OperationValidationError::InvalidAsset("same asset".to_string());
+        assert!(err.to_string().contains("same asset"));
+
+        let err = OperationValidationError::InvalidPrice;
+        let display = err.to_string();
+        assert!(display.contains("price") || display.contains("Price"));
+
+        let err = OperationValidationError::InvalidDestination;
+        assert!(!err.to_string().is_empty());
+    }
 }
