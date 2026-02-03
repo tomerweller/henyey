@@ -1243,4 +1243,154 @@ mod tests {
             TransactionEventStage::AfterAllTxs
         );
     }
+
+    // === Additional LiveExecutionContext tests ===
+
+    #[test]
+    fn test_live_execution_context_without_state() {
+        let ctx = make_test_context(25);
+        assert!(ctx.state().is_none());
+        assert_eq!(ctx.protocol_version(), 25);
+        assert_eq!(ctx.fee_pool_delta(), 0);
+    }
+
+    #[test]
+    fn test_live_execution_context_take_and_restore_state() {
+        let mut ctx = make_test_context_with_state(23);
+        assert!(ctx.state().is_some());
+
+        // Take state
+        let state = ctx.take_state();
+        assert!(state.is_some());
+        assert!(ctx.state().is_none());
+
+        // Restore state
+        ctx.restore_state(state.unwrap());
+        assert!(ctx.state().is_some());
+    }
+
+    #[test]
+    fn test_live_execution_context_close_time() {
+        let ctx = make_test_context(21);
+        assert_eq!(ctx.close_time(), 1700000000);
+    }
+
+    #[test]
+    fn test_live_execution_context_network_id() {
+        let ctx = make_test_context(21);
+        let network_id = ctx.network_id();
+        // Should be testnet
+        assert_eq!(*network_id, stellar_core_common::NetworkId::testnet());
+    }
+
+    #[test]
+    fn test_live_execution_context_base_reserve() {
+        let ctx = make_test_context(21);
+        assert_eq!(ctx.base_reserve(), 5_000_000);
+    }
+
+    #[test]
+    fn test_fee_pool_negative_after_refunds() {
+        let mut ctx = make_test_context(21);
+
+        // Start with some fees collected
+        ctx.add_to_fee_pool(100);
+        assert_eq!(ctx.fee_pool_delta(), 100);
+
+        // Refund more than collected (shouldn't happen in practice but test the math)
+        ctx.subtract_from_fee_pool(150);
+        assert_eq!(ctx.fee_pool_delta(), -50);
+    }
+
+    // === FeeSeqNumResult tests ===
+
+    #[test]
+    fn test_fee_seq_num_result_debug() {
+        let result = FeeSeqNumResult {
+            fee_charged: 100,
+            should_apply: true,
+            tx_result: MutableTransactionResult::new(100),
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("FeeSeqNumResult"));
+        assert!(debug_str.contains("fee_charged"));
+    }
+
+    #[test]
+    fn test_fee_seq_num_result_fields() {
+        let result = FeeSeqNumResult {
+            fee_charged: 250,
+            should_apply: false,
+            tx_result: MutableTransactionResult::new(250),
+        };
+
+        assert_eq!(result.fee_charged, 250);
+        assert!(!result.should_apply);
+    }
+
+    // === Protocol constants tests ===
+
+    #[test]
+    fn test_protocol_constants() {
+        // These are critical protocol boundaries
+        assert_eq!(FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY, 10);
+        assert_eq!(PROTOCOL_VERSION_23, 23);
+    }
+
+    // === Edge case tests ===
+
+    #[test]
+    fn test_process_fee_seq_num_exactly_zero_balance() {
+        let mut ctx = make_test_context_with_state(21);
+        let account_id = make_account_id(1);
+        let account = make_account_entry(account_id.clone(), 0, 1); // Zero balance
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(account);
+        }
+
+        let frame = make_test_frame(account_id, 200, 2);
+
+        let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
+
+        assert!(!result.should_apply);
+        assert_eq!(result.fee_charged, 0);
+    }
+
+    #[test]
+    fn test_process_fee_seq_num_exact_fee_match() {
+        let mut ctx = make_test_context_with_state(21);
+        let account_id = make_account_id(1);
+        // Account has exactly 100 stroops (the base fee)
+        let account = make_account_entry(account_id.clone(), 100, 1);
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(account);
+        }
+
+        let frame = make_test_frame(account_id, 200, 2);
+
+        let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
+
+        // Should succeed with exactly 100 charged
+        assert!(result.should_apply);
+        assert_eq!(result.fee_charged, 100);
+
+        // Account should be at 0
+        if let Some(state) = ctx.state() {
+            let updated_account = state.get_account(&make_account_id(1)).unwrap();
+            assert_eq!(updated_account.balance, 0);
+        }
+    }
+
+    #[test]
+    fn test_calculate_fee_to_charge_with_zero_base_fee() {
+        let account_id = make_account_id(1);
+        let frame = make_test_frame(account_id, 100, 1);
+
+        // With base_fee=0, required_fee = 0 * 1 = 0
+        // Fee charged should be min(100, 0) = 0
+        let fee = calculate_fee_to_charge(&frame, 21, Some(0));
+        assert_eq!(fee, 0, "With base_fee=0, fee should be 0");
+    }
 }

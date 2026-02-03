@@ -1361,14 +1361,14 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 702
-- **Tests added:** 332
-- **Latest:** Added 13 tests to operations/execute/mod.rs:
-  - OperationExecutionResult constructors
-  - SorobanOperationMeta struct tests
-  - HotArchiveRestore struct tests
-  - ledger_key_hash function tests
-  - Operation dispatch tests (BumpSequence, CreateAccount, Payment, ManageData)
+- **Current test count:** 714
+- **Tests added:** 344
+- **Latest:** Added 12 tests to live_execution.rs:
+  - LiveExecutionContext accessors (close_time, network_id, base_reserve)
+  - State management (take_state, restore_state, without_state)
+  - FeeSeqNumResult struct tests
+  - Protocol constants verification
+  - Edge cases (zero balance, exact fee match, zero base fee)
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---
