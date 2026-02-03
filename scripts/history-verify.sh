@@ -11,6 +11,8 @@
 #   BINARY       - Path to rs-stellar-core binary (default: ./target/release/rs-stellar-core)
 #   BATCH_SIZE   - Override default batch size
 #   START_LEDGER - Override starting ledger (ignores progress file)
+#   CACHE_DIR    - Override cache directory
+#   OPENCODE_MODEL - Model to use (default: github-copilot/claude-opus-4.5)
 #
 
 set -euo pipefail
@@ -21,6 +23,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="${BINARY:-$REPO_DIR/target/release/rs-stellar-core}"
 PROGRESS_DIR="${HOME}/.rs-stellar-core"
+
+# Extended timeout for bash commands in OpenCode (4 hours for cargo builds)
+export OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=14400000
 
 # Colors for output
 RED='\033[0;31m'
@@ -34,11 +39,13 @@ case "$NETWORK" in
     testnet)
         DEFAULT_START_LEDGER=64
         DEFAULT_BATCH_SIZE=5000
+        DEFAULT_CACHE_DIR="${HOME}/data/rs-stellar-core/cache"
         HORIZON_URL="https://horizon-testnet.stellar.org"
         ;;
     mainnet)
         DEFAULT_START_LEDGER=59501299
-        DEFAULT_BATCH_SIZE=2500
+        DEFAULT_BATCH_SIZE=10000
+        DEFAULT_CACHE_DIR="${HOME}/data/rs-stellar-core/cache"
         HORIZON_URL="https://horizon.stellar.org"
         ;;
     *)
@@ -54,12 +61,14 @@ case "$NETWORK" in
         echo "  BINARY        - Path to rs-stellar-core binary"
         echo "  BATCH_SIZE    - Override default batch size"
         echo "  START_LEDGER  - Override starting ledger (ignores progress)"
-        echo "  OPENCODE_MODEL - Model to use (default: github-copilot/claude-sonnet-4)"
+        echo "  CACHE_DIR     - Override cache directory"
+        echo "  OPENCODE_MODEL - Model to use (default: github-copilot/claude-opus-4.5)"
         exit 1
         ;;
 esac
 
 BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_BATCH_SIZE}"
+CACHE_DIR="${CACHE_DIR:-$DEFAULT_CACHE_DIR}"
 PROGRESS_FILE="${PROGRESS_DIR}/history-verify-${NETWORK}.progress"
 
 # --- Functions ---
@@ -108,6 +117,9 @@ fi
 # Create progress directory
 mkdir -p "$PROGRESS_DIR"
 
+# Create cache directory if it doesn't exist
+mkdir -p "$CACHE_DIR"
+
 # Determine starting ledger
 if [ -n "${START_LEDGER:-}" ]; then
     # User override - ignore progress file
@@ -135,7 +147,9 @@ echo "Binary:        $BINARY"
 echo "Start ledger:  $CURRENT_LEDGER"
 echo "Latest ledger: $LATEST_LEDGER"
 echo "Batch size:    $BATCH_SIZE"
+echo "Cache dir:     $CACHE_DIR"
 echo "Progress file: $PROGRESS_FILE"
+echo "OpenCode model: ${OPENCODE_MODEL:-github-copilot/claude-opus-4.5}"
 echo "==========================================="
 echo ""
 
@@ -163,6 +177,7 @@ while [ "$CURRENT_LEDGER" -lt "$LATEST_LEDGER" ]; do
         --${NETWORK} \
         --from "$CURRENT_LEDGER" \
         --to "$END_LEDGER" \
+        --cache-dir "$CACHE_DIR" \
         --stop-on-error \
         --quiet 2>&1)
     EXIT_CODE=$?
@@ -191,7 +206,7 @@ while [ "$CURRENT_LEDGER" -lt "$LATEST_LEDGER" ]; do
         echo ""
 
         # Build the reproduction command
-        REPRO_CMD="$BINARY offline verify-execution --${NETWORK} --from $FAILING_LEDGER --to $FAILING_LEDGER --stop-on-error --show-diff"
+        REPRO_CMD="$BINARY offline verify-execution --${NETWORK} --from $FAILING_LEDGER --to $FAILING_LEDGER --cache-dir $CACHE_DIR --stop-on-error --show-diff"
 
         echo "Reproduction command:"
         echo "  $REPRO_CMD"
@@ -212,29 +227,87 @@ REPRO_CMD_PLACEHOLDER
 
 ## Instructions
 
-1. Run the reproduction command to see the detailed diff output
-2. Investigate why the header hash doesn't match. The mismatch could be in:
-   - bucket_list_hash: Issue in bucket list computation (spills, merges, entry updates)
-   - fee_pool: Issue in fee calculation or accumulation
-   - tx_result_hash: Issue in transaction result computation
-   - header_hash: Issue in header field computation
-3. Find and fix the root cause in the appropriate crate (stellar-core-tx, stellar-core-ledger, stellar-core-bucket, etc.)
-4. Add regression tests if applicable to prevent future regressions
-5. Ensure `cargo test --all` passes
-6. Ensure `cargo clippy --all` passes
-7. Commit with a descriptive message
-8. Push to remote
+1. **Reproduce**: Run the reproduction command to see the detailed diff output
 
-The script will automatically rebuild and retry verification after you're done.
+2. **Classify the mismatch**: Determine the type:
+   - Transaction execution mismatch (e.g., wrong operation result, OpTooManySubentries, etc.)
+   - Ledger entry state mismatch (e.g., wrong balance, flags, liabilities)
+   - Bucket list / header-only mismatch (meta differences but execution correct)
+   - Soroban/InvokeHostFunction issue (host function execution divergence)
+
+3. **Investigate**: Find the root cause in the appropriate crate:
+   - `stellar-core-tx` - Transaction/operation execution (ChangeTrust, PathPayment, ManageOffer, etc.)
+   - `stellar-core-ledger` - Ledger close, fee pool, header computation
+   - `stellar-core-bucket` - Bucket list computation
+   - `stellar-core-soroban` - Soroban host function execution
+
+4. **Fix**: Implement the fix with clear comments explaining the bug
+
+5. **Add regression tests**: Add unit tests in the relevant module to prevent future regressions
+
+6. **Full test suite**: Run `cargo test --all` and ensure ALL tests pass
+
+7. **Clippy**: Run `cargo clippy --all` and fix any warnings
+
+8. **Verify fix**: Re-run the reproduction command to confirm the mismatch is resolved
+
+9. **Check for regressions**: Verify a few ledgers before the failing one still pass:
+   ```bash
+   BINARY_PLACEHOLDER offline verify-execution --NETWORK_PLACEHOLDER --from PREV_LEDGER_PLACEHOLDER --to PREV_LEDGER_PLACEHOLDER --cache-dir CACHE_DIR_PLACEHOLDER
+   ```
+
+10. **Commit**: Create a descriptive commit message explaining:
+    - What was broken (e.g., "ChangeTrust missing OpTooManySubentries check")
+    - Why it was broken (e.g., "subentries limit not enforced before creating trustline")
+    - How it was fixed (e.g., "added check for ACCOUNT_SUBENTRY_LIMIT before trustline creation")
+    - Which ledger exposed the bug (e.g., "Bug discovered at mainnet ledger 54003784")
+
+11. **Push**: Push to remote with `git push`
+
+## Known Bug Patterns (for reference)
+
+These bugs have been fixed previously - similar patterns may appear:
+
+- **PathPayment liabilities ordering**: `cross_offer_v10` must release offer liabilities BEFORE calculating `can_sell_at_most`/`can_buy_at_most`. The seller's available balance depends on liabilities being released first.
+
+- **ChangeTrust subentries limit**: Must check `num_sub_entries + multiplier > ACCOUNT_SUBENTRY_LIMIT` (1000) before creating new trustlines. Pool share trustlines count as 2 subentries.
+
+- **ManageOffer subentries**: Similar limit checks required when creating new offers.
+
+- **Sponsorship accounting**: `num_sponsoring`/`num_sponsored` counters must be updated correctly when creating/deleting sponsored entries.
+
+- **Liabilities calculation**: Available balance = balance - selling_liabilities. Available limit = limit - balance - buying_liabilities.
+
+## Important Notes
+
+- The verification script will automatically rebuild and retry after you finish
+- Always run the full test suite (`cargo test --all`) before committing
+- If you cannot fix an issue after thorough investigation, document what you found and exit
+- Prefer minimal, targeted fixes over broad refactoring
+- Check the C++ stellar-core reference in `.upstream-v25/` for expected behavior
 PROMPT_EOF
 )
         # Substitute placeholders
         PROMPT="${PROMPT//LEDGER_PLACEHOLDER/$FAILING_LEDGER}"
         PROMPT="${PROMPT//NETWORK_PLACEHOLDER/$NETWORK}"
         PROMPT="${PROMPT//REPRO_CMD_PLACEHOLDER/$REPRO_CMD}"
+        PROMPT="${PROMPT//BINARY_PLACEHOLDER/$BINARY}"
+        PROMPT="${PROMPT//CACHE_DIR_PLACEHOLDER/$CACHE_DIR}"
+        # Calculate previous ledger for regression check
+        PREV_LEDGER=$((FAILING_LEDGER - 1))
+        PROMPT="${PROMPT//PREV_LEDGER_PLACEHOLDER/$PREV_LEDGER}"
 
-        # Run opencode with model specification
-        opencode run -m "${OPENCODE_MODEL:-github-copilot/claude-sonnet-4}" "$PROMPT"
+        # Run opencode with model specification and timeout (4 hours)
+        set +e
+        timeout 14400 opencode run -m "${OPENCODE_MODEL:-github-copilot/claude-opus-4.5}" "$PROMPT"
+        OPENCODE_EXIT=$?
+        set -e
+
+        if [ $OPENCODE_EXIT -eq 124 ]; then
+            log_warn "OpenCode timed out after 4 hours"
+        elif [ $OPENCODE_EXIT -ne 0 ]; then
+            log_warn "OpenCode exited with code $OPENCODE_EXIT"
+        fi
 
         echo ""
         log_info "OpenCode finished. Rebuilding binary..."
