@@ -160,4 +160,96 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test make_inflation_result with success code.
+    #[test]
+    fn test_make_inflation_result_success() {
+        let payout = InflationPayout {
+            destination: create_test_account_id(4),
+            amount: 1000000,
+        };
+        let result = make_inflation_result(InflationResultCode::Success, vec![payout]);
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
+                match r {
+                    InflationResult::Success(payouts) => {
+                        assert_eq!(payouts.len(), 1);
+                        assert_eq!(payouts[0].amount, 1000000);
+                    }
+                    _ => panic!("Expected Success"),
+                }
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test make_inflation_result with NOT_TIME code.
+    #[test]
+    fn test_make_inflation_result_not_time() {
+        let result = make_inflation_result(InflationResultCode::NotTime, vec![]);
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
+                assert!(matches!(r, InflationResult::NotTime));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test inflation with multiple accounts.
+    #[test]
+    fn test_inflation_multiple_accounts() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(5);
+        let other_id1 = create_test_account_id(6);
+        let other_id2 = create_test_account_id(7);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(other_id1, 50_000_000));
+        state.create_account(create_test_account(other_id2, 200_000_000));
+
+        let result = execute_inflation(&source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Inflation is deprecated, always returns NOT_TIME
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
+                assert!(matches!(r, InflationResult::NotTime));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test inflation with different ledger contexts.
+    #[test]
+    fn test_inflation_different_context() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        // Create context with different ledger parameters
+        let context = LedgerContext::new(
+            1000,       // ledger sequence
+            2000000000, // close time (far in the future)
+            100,        // base fee
+            5_000_000,  // base reserve
+            25,         // protocol version
+            stellar_core_common::NetworkId::testnet(),
+        );
+
+        let source_id = create_test_account_id(8);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let result = execute_inflation(&source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Still NOT_TIME regardless of context
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
+                assert!(matches!(r, InflationResult::NotTime));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }
