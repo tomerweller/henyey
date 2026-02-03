@@ -1354,14 +1354,15 @@ Key areas:
 - [x] Inflation: 3 tests total (was 5 missing, added 2)
 - [x] BumpSequence: 6 tests total (was 5 missing, added 3)
 - [x] ManageData: 14 tests total (has subentries tests)
+- [x] OfferExchange: 8 tests total (new math utility tests)
 
 ### Soroban (Phase 13)
 - [ ] InvokeHostFunction: 100+ tests (separate project)
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 459
-- **Tests added:** 89
+- **Current test count:** 464
+- **Tests added:** 94
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---
