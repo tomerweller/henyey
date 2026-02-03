@@ -561,4 +561,138 @@ mod tests {
         assert!(!OperationType::Payment.is_soroban());
         assert_eq!(OperationType::Payment.name(), "Payment");
     }
+
+    /// Test all Soroban operation types.
+    #[test]
+    fn test_soroban_operation_types() {
+        assert!(OperationType::InvokeHostFunction.is_soroban());
+        assert!(OperationType::ExtendFootprintTtl.is_soroban());
+        assert!(OperationType::RestoreFootprint.is_soroban());
+    }
+
+    /// Test all classic operation types are not Soroban.
+    #[test]
+    fn test_classic_operation_types() {
+        let classic_ops = [
+            OperationType::CreateAccount,
+            OperationType::Payment,
+            OperationType::PathPaymentStrictReceive,
+            OperationType::ManageSellOffer,
+            OperationType::CreatePassiveSellOffer,
+            OperationType::SetOptions,
+            OperationType::ChangeTrust,
+            OperationType::AllowTrust,
+            OperationType::AccountMerge,
+            OperationType::Inflation,
+            OperationType::ManageData,
+            OperationType::BumpSequence,
+            OperationType::ManageBuyOffer,
+            OperationType::PathPaymentStrictSend,
+            OperationType::CreateClaimableBalance,
+            OperationType::ClaimClaimableBalance,
+            OperationType::BeginSponsoringFutureReserves,
+            OperationType::EndSponsoringFutureReserves,
+            OperationType::RevokeSponsorship,
+            OperationType::Clawback,
+            OperationType::ClawbackClaimableBalance,
+            OperationType::SetTrustLineFlags,
+            OperationType::LiquidityPoolDeposit,
+            OperationType::LiquidityPoolWithdraw,
+        ];
+
+        for op in classic_ops {
+            assert!(
+                !op.is_soroban(),
+                "{} should not be a Soroban operation",
+                op.name()
+            );
+        }
+    }
+
+    /// Test ValidationResult enum.
+    #[test]
+    fn test_validation_result() {
+        let valid = ValidationResult::Valid;
+        assert!(matches!(valid, ValidationResult::Valid));
+
+        let invalid = ValidationResult::Invalid;
+        assert!(matches!(invalid, ValidationResult::Invalid));
+
+        let no_account = ValidationResult::NoAccount;
+        assert!(matches!(no_account, ValidationResult::NoAccount));
+
+        let bad_seq = ValidationResult::BadSequence;
+        assert!(matches!(bad_seq, ValidationResult::BadSequence));
+
+        let insuff_fee = ValidationResult::InsufficientFee;
+        assert!(matches!(insuff_fee, ValidationResult::InsufficientFee));
+
+        let invalid_sig = ValidationResult::InvalidSignature;
+        assert!(matches!(invalid_sig, ValidationResult::InvalidSignature));
+    }
+
+    /// Test TxError variants.
+    #[test]
+    fn test_tx_error_display() {
+        let err = TxError::ValidationFailed("test error".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("test error"));
+
+        let err = TxError::InvalidSignature;
+        let display = format!("{}", err);
+        assert!(display.contains("signature"));
+
+        let err = TxError::SourceAccountNotFound;
+        let display = format!("{}", err);
+        assert!(display.contains("account"));
+    }
+
+    /// Test OperationError variants.
+    #[test]
+    fn test_operation_error() {
+        let err = OperationError::Underfunded;
+        assert!(matches!(err, OperationError::Underfunded));
+
+        let err = OperationError::LineFull;
+        assert!(matches!(err, OperationError::LineFull));
+
+        let err = OperationError::NotAuthorized;
+        assert!(matches!(err, OperationError::NotAuthorized));
+
+        let err = OperationError::NoAccount;
+        assert!(matches!(err, OperationError::NoAccount));
+
+        let err = OperationError::OpFailed;
+        assert!(matches!(err, OperationError::OpFailed));
+
+        let err = OperationError::Other("custom error".to_string());
+        assert!(matches!(err, OperationError::Other(_)));
+    }
+
+    /// Test TransactionFrame with fee bump detection.
+    #[test]
+    fn test_frame_fee_bump_detection() {
+        // Regular transaction is not fee bump
+        let envelope = create_test_envelope();
+        let frame = TransactionFrame::new(envelope);
+        assert!(!frame.is_fee_bump());
+    }
+
+    /// Test TransactionValidator with different network contexts.
+    #[test]
+    fn test_validator_networks() {
+        let testnet_validator = TransactionValidator::testnet(1, 1000);
+        let mainnet_validator = TransactionValidator::mainnet(1, 1000);
+
+        let envelope = create_test_envelope();
+        // Both should validate basic transaction structure
+        assert_eq!(
+            testnet_validator.validate(&envelope),
+            ValidationResult::Valid
+        );
+        assert_eq!(
+            mainnet_validator.validate(&envelope),
+            ValidationResult::Valid
+        );
+    }
 }
