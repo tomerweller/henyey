@@ -1343,7 +1343,7 @@ Key areas:
 - [x] AccountMerge: 14 tests total (was 15 missing, added 9)
 - [x] ChangeTrust: 22 tests total (was 9 missing, added 3)
 - [x] ManageOffer: 33 tests total (was 30+ missing, added 12)
-- [x] PathPayment: 13 tests total (was 25+ missing, added 7)
+- [x] PathPayment: 17 tests total (was 25+ missing, added 11)
 - [x] SetOptions: 24 tests total (was 20 missing, added 6)
 - [x] ClaimableBalance: 22 tests total (was 20 missing, added 4)
 - [x] LiquidityPool: 13 tests total (was 20 missing, added 6)
@@ -1360,8 +1360,8 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 444
-- **Tests added:** 74
+- **Current test count:** 448
+- **Tests added:** 78
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---

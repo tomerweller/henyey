@@ -2072,4 +2072,180 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test PathPaymentStrictReceive with dest_amount of zero returns Malformed.
+    ///
+    /// C++ Reference: PathPaymentTests.cpp - "dest amount zero" test section
+    #[test]
+    fn test_path_payment_dest_amount_zero() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(60);
+        let dest_id = create_test_account_id(61);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 1000,
+            destination: create_test_muxed_account(61),
+            dest_asset: Asset::Native,
+            dest_amount: 0, // Zero dest amount
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictReceiveResult::Malformed),
+                    "Expected Malformed for zero dest_amount, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test PathPaymentStrictSend with dest_min of zero returns Malformed.
+    /// Zero dest_min is not allowed - must be positive.
+    ///
+    /// C++ Reference: PathPaymentStrictSendTests.cpp - "dest min zero" test section
+    #[test]
+    fn test_path_payment_strict_send_dest_min_zero() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(62);
+        let dest_id = create_test_account_id(63);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 1000,
+            destination: create_test_muxed_account(63),
+            dest_asset: Asset::Native,
+            dest_min: 0, // Zero dest_min is malformed
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::Malformed),
+                    "Expected Malformed for zero dest_min, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test PathPaymentStrictReceive with negative dest_amount returns Malformed.
+    ///
+    /// C++ Reference: PathPaymentTests.cpp - "negative dest amount" test section
+    #[test]
+    fn test_path_payment_negative_dest_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(64);
+        let dest_id = create_test_account_id(65);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 1000,
+            destination: create_test_muxed_account(65),
+            dest_asset: Asset::Native,
+            dest_amount: -100, // Negative
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictReceiveResult::Malformed),
+                    "Expected Malformed for negative dest_amount, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test PathPaymentStrictReceive line full when destination trustline is at limit.
+    ///
+    /// C++ Reference: PathPaymentTests.cpp - "line full" test section
+    #[test]
+    fn test_path_payment_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(70);
+        let dest_id = create_test_account_id(71);
+        let issuer_id = create_test_account_id(72);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_asset(&issuer_id);
+
+        // Source trustline with balance
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            10_000,
+            100_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        // Destination trustline already at limit
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1000,
+            1000, // At limit!
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+        state.get_account_mut(&dest_id).unwrap().num_sub_entries += 1;
+
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: asset.clone(),
+            send_max: 100,
+            destination: create_test_muxed_account(71),
+            dest_asset: asset,
+            dest_amount: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictReceiveResult::LineFull),
+                    "Expected LineFull when dest trustline at limit, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }
