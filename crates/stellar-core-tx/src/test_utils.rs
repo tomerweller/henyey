@@ -427,4 +427,96 @@ mod tests {
             _ => panic!("expected V1 extension"),
         }
     }
+
+    /// Test create_test_account basic functionality.
+    #[test]
+    fn test_create_test_account_basic() {
+        let id = create_test_account_id(5);
+        let account = create_test_account(id.clone(), 1_000_000);
+
+        assert_eq!(account.account_id, id);
+        assert_eq!(account.balance, 1_000_000);
+        assert_eq!(account.seq_num.0, 1);
+        assert_eq!(account.num_sub_entries, 0);
+        assert_eq!(account.flags, 0);
+    }
+
+    /// Test create_test_account_with_flags.
+    #[test]
+    fn test_create_test_account_with_flags() {
+        let id = create_test_account_id(6);
+        let auth_required = 0x1; // AUTH_REQUIRED_FLAG
+        let account = create_test_account_with_flags(id.clone(), 2_000_000, auth_required);
+
+        assert_eq!(account.account_id, id);
+        assert_eq!(account.balance, 2_000_000);
+        assert_eq!(account.flags, auth_required);
+    }
+
+    /// Test create_test_account_with_subentries.
+    #[test]
+    fn test_create_test_account_with_subentries() {
+        let id = create_test_account_id(7);
+        let account = create_test_account_with_subentries(id.clone(), 3_000_000, 50);
+
+        assert_eq!(account.account_id, id);
+        assert_eq!(account.balance, 3_000_000);
+        assert_eq!(account.num_sub_entries, 50);
+    }
+
+    /// Test create_account_near_subentry_limit.
+    #[test]
+    fn test_create_account_near_subentry_limit() {
+        let account = create_account_near_subentry_limit(create_test_account_id(8), 100_000_000);
+        assert_eq!(account.num_sub_entries, ACCOUNT_SUBENTRY_LIMIT - 1);
+        assert_eq!(account.num_sub_entries, 999);
+    }
+
+    /// Test create_test_asset.
+    #[test]
+    fn test_create_test_asset() {
+        let issuer = create_test_account_id(10);
+        let asset = create_test_asset(b"USDC", issuer.clone());
+
+        match asset {
+            Asset::CreditAlphanum4(alpha) => {
+                assert_eq!(alpha.asset_code.0, *b"USDC");
+                assert_eq!(alpha.issuer, issuer);
+            }
+            _ => panic!("expected CreditAlphanum4"),
+        }
+    }
+
+    /// Test create_test_trustline_asset.
+    #[test]
+    fn test_create_test_trustline_asset() {
+        let issuer = create_test_account_id(11);
+        let asset = create_test_trustline_asset(b"EUR\0", issuer.clone());
+
+        match asset {
+            TrustLineAsset::CreditAlphanum4(alpha) => {
+                assert_eq!(alpha.asset_code.0, *b"EUR\0");
+                assert_eq!(alpha.issuer, issuer);
+            }
+            _ => panic!("expected CreditAlphanum4"),
+        }
+    }
+
+    /// Test create_test_context.
+    #[test]
+    fn test_create_test_context() {
+        let context = create_test_context();
+        assert_eq!(context.sequence, 1);
+        assert_eq!(context.close_time, 1000);
+    }
+
+    /// Test constants.
+    #[test]
+    fn test_constants() {
+        assert_eq!(ACCOUNT_SUBENTRY_LIMIT, 1000);
+        assert_eq!(MAX_SIGNERS, 20);
+        assert_eq!(MAX_INT64, i64::MAX);
+        assert!(NEAR_MAX_INT64 < MAX_INT64);
+        assert!(NEAR_MAX_INT64 > MAX_INT64 - 2_000_000);
+    }
 }
