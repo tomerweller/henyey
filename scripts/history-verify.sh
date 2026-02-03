@@ -298,15 +298,43 @@ PROMPT_EOF
         PROMPT="${PROMPT//PREV_LEDGER_PLACEHOLDER/$PREV_LEDGER}"
 
         # Run opencode with model specification and timeout (4 hours)
+        # Use unbuffered output to show progress in real-time
         set +e
-        timeout 14400 opencode run -m "${OPENCODE_MODEL:-github-copilot/claude-opus-4.5}" "$PROMPT"
-        OPENCODE_EXIT=$?
+        echo ""
+        echo "==========================================="
+        echo "      OpenCode Investigation Started"
+        echo "==========================================="
+        echo ""
+        echo "Model: ${OPENCODE_MODEL:-github-copilot/claude-opus-4.5}"
+        echo "Timeout: 4 hours"
+        echo ""
+        echo "--- OpenCode Output Begin ---"
+        echo ""
+        
+        # Run with unbuffered output (-u flag for stdbuf where available)
+        # Use script command to preserve output in terminal and capture it
+        OPENCODE_LOG="${PROGRESS_DIR}/opencode-${NETWORK}-${FAILING_LEDGER}.log"
+        if command -v stdbuf &> /dev/null; then
+            timeout 14400 stdbuf -oL -eL opencode run -m "${OPENCODE_MODEL:-github-copilot/claude-opus-4.5}" "$PROMPT" 2>&1 | tee "$OPENCODE_LOG"
+            OPENCODE_EXIT=${PIPESTATUS[0]}
+        else
+            timeout 14400 opencode run -m "${OPENCODE_MODEL:-github-copilot/claude-opus-4.5}" "$PROMPT" 2>&1 | tee "$OPENCODE_LOG"
+            OPENCODE_EXIT=${PIPESTATUS[0]}
+        fi
         set -e
+        
+        echo ""
+        echo "--- OpenCode Output End ---"
+        echo ""
+        echo "Full log saved to: $OPENCODE_LOG"
+        echo ""
 
         if [ $OPENCODE_EXIT -eq 124 ]; then
             log_warn "OpenCode timed out after 4 hours"
         elif [ $OPENCODE_EXIT -ne 0 ]; then
             log_warn "OpenCode exited with code $OPENCODE_EXIT"
+        else
+            log_success "OpenCode completed successfully"
         fi
 
         echo ""
