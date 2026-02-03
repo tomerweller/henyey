@@ -959,6 +959,11 @@ impl TransactionExecutor {
         let mut needed = Vec::new();
 
         for key in keys {
+            // Skip if the entry was deleted in this ledger (don't reload it from snapshot)
+            if self.state.delta().deleted_keys().contains(key) {
+                continue;
+            }
+
             let already_loaded = match key {
                 LedgerKey::Account(k) => {
                     let key_bytes = account_id_to_key(&k.account_id);

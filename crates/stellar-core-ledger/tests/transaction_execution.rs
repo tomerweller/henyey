@@ -3577,3 +3577,248 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
     // We don't assert success here because that depends on many factors -
     // the key test is that the API correctly accepts and processes the hot_archive parameter.
 }
+
+/// Regression test for deleted offers being incorrectly reloaded from snapshot.
+///
+/// This test reproduces a bug found at mainnet ledger 59501248:
+/// 1. TX1 (path payment) fully crosses an offer, consuming it entirely and deleting it
+/// 2. TX2 (manage sell offer) from the offer owner tries to delete the same offer by ID
+///
+/// Without the fix, TX2 would reload the offer from the snapshot because:
+/// - `state.get_offer()` returns `None` (offer was removed from memory)
+/// - `batch_load_keys()` would reload it from snapshot (ignoring that it was deleted)
+/// - The offer would appear to exist with full amount but trustline liabilities = 0
+/// - This caused "liabilities underflow" errors
+///
+/// The fix adds a check in `batch_load_keys()` to skip entries that were deleted
+/// in the current ledger (by checking `state.delta().deleted_keys()`).
+///
+/// Expected behavior after fix: TX2 should return `ManageSellOfferResult::NotFound`
+/// because the offer was already deleted by TX1.
+#[test]
+fn test_deleted_offer_not_reloaded_from_snapshot() {
+    // Create accounts:
+    // - source: initiates the path payment (TX1)
+    // - offer_owner: owns the offer and tries to delete it (TX2)
+    // - dest: destination for path payment
+    // - issuer: issues the USD asset
+    let source_secret = SecretKey::from_seed(&[200u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    let offer_owner_secret = SecretKey::from_seed(&[201u8; 32]);
+    let offer_owner_id: AccountId = (&offer_owner_secret.public_key()).into();
+
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([202u8; 32])));
+
+    let issuer_secret = SecretKey::from_seed(&[203u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+
+    // Create USD asset
+    let asset_usd = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+        issuer: issuer_id.clone(),
+    });
+
+    // Create account entries
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 500_000_000);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 200_000_000);
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
+
+    // Offer owner account with selling liabilities for the XLM they're selling
+    let (offer_owner_key, mut offer_owner_entry) =
+        create_account_entry(offer_owner_id.clone(), 1, 500_000_000);
+    // Set selling liabilities equal to offer amount (50 XLM)
+    set_account_liabilities(&mut offer_owner_entry, 50_000_000, 0);
+
+    // Source needs USD trustline to send USD
+    let (source_tl_key, source_tl_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        100_000_000, // balance: 100 USD
+        200_000_000, // limit
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+
+    // Offer owner needs USD trustline to receive USD (buying side of their offer)
+    let (offer_owner_tl_key, mut offer_owner_tl_entry) = create_trustline_entry(
+        offer_owner_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        0,           // balance: 0 USD
+        100_000_000, // limit
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+    // Set buying liabilities for the USD they're buying
+    set_trustline_liabilities(&mut offer_owner_tl_entry, 0, 50_000_000);
+
+    // Create the offer: offer_owner sells 50 XLM for USD at 1:1 price
+    let offer_id: i64 = 12345;
+    let (offer_key, offer_entry) = create_offer_entry(
+        offer_owner_id.clone(),
+        offer_id,
+        Asset::Native,     // selling XLM
+        asset_usd.clone(), // buying USD
+        50_000_000,        // amount: 50 XLM
+        Price { n: 1, d: 1 },
+    );
+
+    // Build snapshot with all entries
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(dest_key, dest_entry)
+        .expect("add dest")
+        .add_entry(offer_owner_key, offer_owner_entry)
+        .expect("add offer_owner")
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(source_tl_key, source_tl_entry)
+        .expect("add source trustline")
+        .add_entry(offer_owner_tl_key, offer_owner_tl_entry)
+        .expect("add offer_owner trustline")
+        .add_entry(offer_key.clone(), offer_entry)
+        .expect("add offer")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+
+    // Create executor
+    let mut executor = TransactionExecutor::new(
+        1,         // ledger_seq
+        1_000,     // close_time
+        5_000_000, // base_reserve
+        25,        // protocol_version
+        network_id,
+        0, // base_fee (not used directly)
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load orderbook");
+
+    // ===== TX1: Path payment that fully crosses the offer =====
+    // Source sends 50 USD, which crosses offer_owner's offer fully, resulting in dest receiving 50 XLM
+    let path_payment_op = Operation {
+        source_account: None,
+        body: OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+            send_asset: asset_usd.clone(),
+            send_amount: 50_000_000, // Send exactly 50 USD to fully consume the offer
+            destination: dest_id.clone().into(),
+            dest_asset: Asset::Native, // Receive XLM
+            dest_min: 1,               // Minimum acceptable
+            path: VecM::default(),     // Direct path through the offer
+        }),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![path_payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    let decorated1 = sign_envelope(&envelope1, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope1 {
+        env.signatures = vec![decorated1].try_into().unwrap();
+    }
+
+    // Execute TX1
+    let result1 = executor
+        .execute_transaction(&snapshot, &envelope1, 100, None)
+        .expect("TX1 execute");
+
+    assert!(
+        result1.success,
+        "TX1 (path payment) should succeed. Result: {:?}",
+        result1.operation_results
+    );
+
+    // Verify the offer was crossed
+    match result1.operation_results.get(0) {
+        Some(OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
+            PathPaymentStrictSendResult::Success(success),
+        ))) => {
+            assert!(
+                !success.offers.is_empty(),
+                "Should have crossed at least one offer"
+            );
+        }
+        other => panic!("Unexpected TX1 result: {:?}", other),
+    }
+
+    // Snapshot delta before TX2 (simulates ledger execution flow between transactions)
+    // This preserves changes from TX1 so they're visible to TX2
+    executor.state_mut().snapshot_delta();
+
+    // ===== TX2: Offer owner tries to delete their offer (which was already consumed) =====
+    // The offer was fully crossed by TX1, so it should no longer exist.
+    // Without the fix, the offer would be reloaded from snapshot and cause issues.
+    let delete_offer_op = Operation {
+        source_account: None,
+        body: OperationBody::ManageSellOffer(ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: asset_usd.clone(),
+            amount: 0, // amount=0 means delete the offer
+            price: Price { n: 1, d: 1 },
+            offer_id, // The offer ID that was consumed by TX1
+        }),
+    };
+
+    let tx2 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*offer_owner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![delete_offer_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope2 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx2,
+        signatures: VecM::default(),
+    });
+    let decorated2 = sign_envelope(&envelope2, &offer_owner_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope2 {
+        env.signatures = vec![decorated2].try_into().unwrap();
+    }
+
+    // Execute TX2
+    let result2 = executor
+        .execute_transaction(&snapshot, &envelope2, 100, None)
+        .expect("TX2 execute");
+
+    // TX2 should fail at the operation level (not succeed!) because the offer doesn't exist
+    // The transaction itself succeeds (fee charged) but the operation fails with NotFound
+    assert!(
+        !result2.success,
+        "TX2 should fail because offer no longer exists"
+    );
+
+    // Verify the operation result is NotFound
+    match result2.operation_results.get(0) {
+        Some(OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+            ManageSellOfferResult::NotFound,
+        ))) => {
+            // This is the expected result - the offer was already deleted by TX1
+        }
+        other => panic!(
+            "TX2 should return ManageSellOffer::NotFound, got: {:?}",
+            other
+        ),
+    }
+}
