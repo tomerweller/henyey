@@ -2551,4 +2551,112 @@ mod tests {
         let hash = compute_key_hash(&key);
         assert_ne!(hash.0, [0u8; 32]);
     }
+
+    /// Test compute_key_hash produces different hashes for different keys.
+    #[test]
+    fn test_compute_key_hash_different_keys() {
+        let key1 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([2u8; 32]),
+        });
+
+        let hash1 = compute_key_hash(&key1);
+        let hash2 = compute_key_hash(&key2);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    /// Test compute_key_hash is deterministic.
+    #[test]
+    fn test_compute_key_hash_deterministic() {
+        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([42u8; 32]),
+        });
+
+        let hash1 = compute_key_hash(&key);
+        let hash2 = compute_key_hash(&key);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    /// Test compute_key_hash with ContractData key.
+    #[test]
+    fn test_compute_key_hash_contract_data() {
+        use stellar_xdr::curr::{ContractDataDurability, LedgerKeyContractData, ScAddress};
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash([3u8; 32]))),
+            key: ScVal::U32(100),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let hash = compute_key_hash(&key);
+        assert_ne!(hash.0, [0u8; 32]);
+    }
+
+    /// Test StorageChange struct with new entry (create/update).
+    #[test]
+    fn test_storage_change_with_new_entry() {
+        let change = StorageChange {
+            key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                hash: Hash([4u8; 32]),
+            }),
+            new_entry: Some(LedgerEntry {
+                last_modified_ledger_seq: 100,
+                data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
+                    ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                    hash: Hash([4u8; 32]),
+                    code: vec![0xDE, 0xAD].try_into().unwrap(),
+                }),
+                ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            }),
+            live_until: Some(1000),
+            ttl_extended: false,
+            is_rent_related: false,
+            is_read_only_ttl_bump: false,
+        };
+
+        assert!(change.new_entry.is_some());
+        assert_eq!(change.live_until, Some(1000));
+    }
+
+    /// Test StorageChange struct with TTL extension.
+    #[test]
+    fn test_storage_change_ttl_extended() {
+        let change = StorageChange {
+            key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                hash: Hash([5u8; 32]),
+            }),
+            new_entry: None,
+            live_until: Some(2000),
+            ttl_extended: true,
+            is_rent_related: true,
+            is_read_only_ttl_bump: true,
+        };
+
+        assert!(change.ttl_extended);
+        assert!(change.is_rent_related);
+        assert!(change.is_read_only_ttl_bump);
+    }
+
+    /// Test StorageChange struct representing a delete (new_entry = None).
+    #[test]
+    fn test_storage_change_delete() {
+        let change = StorageChange {
+            key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                hash: Hash([6u8; 32]),
+            }),
+            new_entry: None,
+            live_until: None,
+            ttl_extended: false,
+            is_rent_related: false,
+            is_read_only_ttl_bump: false,
+        };
+
+        assert!(change.new_entry.is_none());
+        assert!(change.live_until.is_none());
+        assert!(matches!(change.key, LedgerKey::ContractCode(_)));
+    }
 }

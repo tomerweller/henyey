@@ -247,4 +247,160 @@ mod tests {
         assert_eq!(events.events().len(), 1);
         assert_eq!(events.diagnostic_events().len(), 1);
     }
+
+    /// Test system event for entry creation.
+    #[test]
+    fn test_entry_created_event() {
+        let contract_id = ContractId(Hash([2u8; 32]));
+        let key = ScVal::U32(42);
+        let event = ContractEvent::entry_created(&contract_id, &key);
+
+        assert_eq!(event.event_type, EventType::System);
+        assert!(event.contract_id.is_some());
+        assert_eq!(event.topics.len(), 1);
+        assert!(matches!(event.data, ScVal::U32(42)));
+    }
+
+    /// Test system event for entry deletion.
+    #[test]
+    fn test_entry_deleted_event() {
+        let contract_id = ContractId(Hash([3u8; 32]));
+        let key = ScVal::I64(100);
+        let event = ContractEvent::entry_deleted(&contract_id, &key);
+
+        assert_eq!(event.event_type, EventType::System);
+        assert!(event.contract_id.is_some());
+        assert_eq!(event.topics.len(), 1);
+        assert!(matches!(event.data, ScVal::I64(100)));
+    }
+
+    /// Test event hash computation.
+    #[test]
+    fn test_event_hash() {
+        let event1 = ContractEvent::new(
+            EventType::Contract,
+            Some(ContractId(Hash([1u8; 32]))),
+            vec![ScVal::I32(1)],
+            ScVal::I64(100),
+        );
+        let event2 = ContractEvent::new(
+            EventType::Contract,
+            Some(ContractId(Hash([2u8; 32]))),
+            vec![ScVal::I32(1)],
+            ScVal::I64(100),
+        );
+
+        let hash1 = event1.hash();
+        let hash2 = event2.hash();
+
+        // Different contract IDs should produce different hashes
+        assert_ne!(hash1, hash2);
+
+        // Same event should produce same hash
+        let hash1_again = event1.hash();
+        assert_eq!(hash1, hash1_again);
+    }
+
+    /// Test events collection hash.
+    #[test]
+    fn test_events_collection_hash() {
+        let mut events = ContractEvents::new();
+
+        // Empty events should have zero hash
+        let empty_hash = events.hash();
+        assert_eq!(empty_hash, Hash([0u8; 32]));
+
+        // Add an event
+        events.push(ContractEvent::new(
+            EventType::Contract,
+            None,
+            vec![],
+            ScVal::I32(42),
+        ));
+
+        let hash = events.hash();
+        assert_ne!(hash, Hash([0u8; 32]));
+    }
+
+    /// Test events clear.
+    #[test]
+    fn test_events_clear() {
+        let mut events = ContractEvents::new();
+
+        events.push(ContractEvent::new(
+            EventType::Contract,
+            None,
+            vec![],
+            ScVal::Void,
+        ));
+        events.push(ContractEvent::new(
+            EventType::Diagnostic,
+            None,
+            vec![],
+            ScVal::Void,
+        ));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.diagnostic_events().len(), 1);
+
+        events.clear();
+
+        assert!(events.is_empty());
+        assert!(events.diagnostic_events().is_empty());
+    }
+
+    /// Test to_xdr conversion.
+    #[test]
+    fn test_events_to_xdr() {
+        let mut events = ContractEvents::new();
+
+        events.push(ContractEvent::new(
+            EventType::Contract,
+            Some(ContractId(Hash([4u8; 32]))),
+            vec![ScVal::Symbol("test".try_into().unwrap())],
+            ScVal::U64(999),
+        ));
+        events.push(ContractEvent::new(
+            EventType::System,
+            None,
+            vec![],
+            ScVal::Void,
+        ));
+
+        let xdr_events = events.to_xdr();
+        assert_eq!(xdr_events.len(), 2);
+    }
+
+    /// Test event without contract_id.
+    #[test]
+    fn test_event_no_contract_id() {
+        let event = ContractEvent::new(
+            EventType::Contract,
+            None,
+            vec![ScVal::Bool(true)],
+            ScVal::I32(-1),
+        );
+
+        assert!(event.contract_id.is_none());
+        // Hash should still work
+        let hash = event.hash();
+        assert_ne!(hash.0, [0u8; 32]);
+    }
+
+    /// Test event with multiple topics.
+    #[test]
+    fn test_event_multiple_topics() {
+        let event = ContractEvent::new(
+            EventType::Contract,
+            Some(ContractId(Hash([5u8; 32]))),
+            vec![
+                ScVal::Symbol("transfer".try_into().unwrap()),
+                ScVal::I64(100),
+                ScVal::I64(200),
+            ],
+            ScVal::Bool(true),
+        );
+
+        assert_eq!(event.topics.len(), 3);
+    }
 }
