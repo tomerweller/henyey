@@ -609,4 +609,141 @@ mod tests {
         // Second signature should be unused
         assert!(!checker.check_all_signatures_used());
     }
+
+    /// Test that zero master weight doesn't add master as signer.
+    #[test]
+    fn test_collect_signers_zero_master_weight() {
+        let master_key_bytes = Uint256([11u8; 32]);
+
+        let account = AccountEntry {
+            account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(master_key_bytes.clone())),
+            balance: 1000,
+            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: stellar_xdr::curr::String32::default(),
+            thresholds: Thresholds([0, 1, 2, 3]), // Master weight = 0
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        };
+
+        let signers = collect_signers_for_account(&account);
+
+        // No signers when master weight is 0 and no extra signers
+        assert_eq!(signers.len(), 0);
+    }
+
+    /// Test hash_x with wrong hint fails.
+    #[test]
+    fn test_hash_x_wrong_hint() {
+        let preimage = [42u8; 32];
+        let hash_of_preimage = Hash256::hash(&preimage);
+
+        // Create a signature with wrong hint
+        let sig = DecoratedSignature {
+            hint: SignatureHint([0, 0, 0, 0]), // Wrong hint
+            signature: XdrSignature(preimage.to_vec().try_into().unwrap()),
+        };
+        let signatures = vec![sig];
+
+        let signer = Signer {
+            key: SignerKey::HashX(Uint256(hash_of_preimage.0)),
+            weight: 10,
+        };
+        let signers = vec![signer];
+
+        let tx_hash = create_test_hash();
+        let mut checker = SignatureChecker::new(tx_hash, &signatures);
+
+        // Should fail due to wrong hint
+        assert!(!checker.check_signature(&signers, 10));
+    }
+
+    /// Test hash_x with wrong preimage fails.
+    #[test]
+    fn test_hash_x_wrong_preimage() {
+        let correct_preimage = [42u8; 32];
+        let wrong_preimage = [99u8; 32];
+        let hash_of_correct = Hash256::hash(&correct_preimage);
+
+        // Create a signature with wrong preimage but correct hint
+        let sig = DecoratedSignature {
+            hint: SignatureHint([
+                hash_of_correct.0[28],
+                hash_of_correct.0[29],
+                hash_of_correct.0[30],
+                hash_of_correct.0[31],
+            ]),
+            signature: XdrSignature(wrong_preimage.to_vec().try_into().unwrap()),
+        };
+        let signatures = vec![sig];
+
+        let signer = Signer {
+            key: SignerKey::HashX(Uint256(hash_of_correct.0)),
+            weight: 10,
+        };
+        let signers = vec![signer];
+
+        let tx_hash = create_test_hash();
+        let mut checker = SignatureChecker::new(tx_hash, &signatures);
+
+        // Should fail due to wrong preimage
+        assert!(!checker.check_signature(&signers, 10));
+    }
+
+    /// Test ed25519 with wrong hint fails.
+    #[test]
+    fn test_ed25519_wrong_hint() {
+        let secret = SecretKey::from_seed(&[12u8; 32]);
+        let hash = create_test_hash();
+        let mut sig = create_signed_signature(&secret, &hash);
+        sig.hint = SignatureHint([0, 0, 0, 0]); // Wrong hint
+
+        let signatures = vec![sig];
+
+        let signer = create_signer_from_secret(&secret, 10);
+        let signers = vec![signer];
+
+        let mut checker = SignatureChecker::new(hash, &signatures);
+
+        // Should fail due to wrong hint
+        assert!(!checker.check_signature(&signers, 10));
+    }
+
+    /// Test empty signatures list.
+    #[test]
+    fn test_empty_signatures() {
+        let hash = create_test_hash();
+        let signatures: Vec<DecoratedSignature> = vec![];
+
+        let secret = SecretKey::from_seed(&[13u8; 32]);
+        let signer = create_signer_from_secret(&secret, 10);
+        let signers = vec![signer];
+
+        let mut checker = SignatureChecker::new(hash, &signatures);
+
+        // No signatures means threshold can't be met
+        assert!(!checker.check_signature(&signers, 10));
+        assert!(checker.check_all_signatures_used()); // No signatures to use
+    }
+
+    /// Test pre_auth_tx signer doesn't match wrong hash.
+    #[test]
+    fn test_pre_auth_tx_wrong_hash() {
+        let hash = create_test_hash();
+        let wrong_hash = Hash256([99u8; 32]);
+        let signatures = vec![];
+
+        let signer = Signer {
+            key: SignerKey::PreAuthTx(Uint256(wrong_hash.0)), // Different hash
+            weight: 10,
+        };
+        let signers = vec![signer];
+
+        let mut checker = SignatureChecker::new(hash, &signatures);
+
+        // Pre-auth TX doesn't match
+        assert!(!checker.check_signature(&signers, 10));
+    }
 }
