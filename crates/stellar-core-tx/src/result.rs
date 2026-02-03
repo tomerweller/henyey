@@ -1149,4 +1149,173 @@ mod tests {
         assert_eq!(result.fee_charged(), 50);
         assert_eq!(result.result_code(), TxResultCode::TxNoAccount);
     }
+
+    /// Test TxApplyResult::failure constructor.
+    #[test]
+    fn test_tx_apply_result_failure() {
+        let result = create_failed_result();
+        let wrapper = TxResultWrapper::from_xdr(result);
+
+        let apply_result = TxApplyResult::failure(100, wrapper);
+        assert!(!apply_result.success);
+        assert_eq!(apply_result.fee_charged, 100);
+        assert_eq!(apply_result.result.result_code(), TxResultCode::TxBadSeq);
+    }
+
+    /// Test TxResultWrapper::success constructor.
+    #[test]
+    fn test_tx_result_wrapper_success_constructor() {
+        let wrapper = TxResultWrapper::success();
+        assert!(wrapper.is_success());
+        assert_eq!(wrapper.result_code(), TxResultCode::TxSuccess);
+    }
+
+    /// Test TxSetResultSummary with empty set.
+    #[test]
+    fn test_tx_set_result_summary_empty() {
+        let summary = TxSetResultSummary::new();
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.successful, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.total_fee, 0);
+        assert_eq!(summary.total_operations, 0);
+        // Empty set has 0% success rate (or could be NaN, but we'll check for 0)
+        assert!(summary.success_rate().is_nan() || summary.success_rate() == 0.0);
+    }
+
+    /// Test TxSetResultSummary with all successful transactions.
+    #[test]
+    fn test_tx_set_result_summary_all_success() {
+        let mut summary = TxSetResultSummary::new();
+
+        for _ in 0..5 {
+            let success_result = TxApplyResult {
+                success: true,
+                fee_charged: 100,
+                result: TxResultWrapper::from_xdr(create_success_result()),
+            };
+            summary.add(&success_result, 1);
+        }
+
+        assert_eq!(summary.total, 5);
+        assert_eq!(summary.successful, 5);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.success_rate(), 100.0);
+    }
+
+    /// Test TxSetResultSummary with all failed transactions.
+    #[test]
+    fn test_tx_set_result_summary_all_failed() {
+        let mut summary = TxSetResultSummary::new();
+
+        for _ in 0..3 {
+            let failed_result = TxApplyResult {
+                success: false,
+                fee_charged: 50,
+                result: TxResultWrapper::from_xdr(create_failed_result()),
+            };
+            summary.add(&failed_result, 2);
+        }
+
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.successful, 0);
+        assert_eq!(summary.failed, 3);
+        assert_eq!(summary.total_fee, 150);
+        assert_eq!(summary.total_operations, 6);
+        assert_eq!(summary.success_rate(), 0.0);
+    }
+
+    /// Test all TxResultCode variants have names.
+    #[test]
+    fn test_all_tx_result_code_names() {
+        // Test common result codes
+        assert!(!TxResultCode::TxSuccess.name().is_empty());
+        assert!(!TxResultCode::TxFailed.name().is_empty());
+        assert!(!TxResultCode::TxTooEarly.name().is_empty());
+        assert!(!TxResultCode::TxTooLate.name().is_empty());
+        assert!(!TxResultCode::TxMissingOperation.name().is_empty());
+        assert!(!TxResultCode::TxBadSeq.name().is_empty());
+        assert!(!TxResultCode::TxNoAccount.name().is_empty());
+        assert!(!TxResultCode::TxInsufficientBalance.name().is_empty());
+        assert!(!TxResultCode::TxBadAuth.name().is_empty());
+        assert!(!TxResultCode::TxBadAuthExtra.name().is_empty());
+    }
+
+    /// Test all OpResultCode variants have names.
+    #[test]
+    fn test_all_op_result_code_names() {
+        assert!(!OpResultCode::OpInner.name().is_empty());
+        assert!(!OpResultCode::OpBadAuth.name().is_empty());
+        assert!(!OpResultCode::OpNoAccount.name().is_empty());
+        assert!(!OpResultCode::OpNotSupported.name().is_empty());
+        assert!(!OpResultCode::OpTooManySubentries.name().is_empty());
+        assert!(!OpResultCode::OpExceededWorkLimit.name().is_empty());
+    }
+
+    /// Test RefundableFeeTracker with events size consumption.
+    #[test]
+    fn test_refundable_fee_tracker_events_size() {
+        let mut tracker = RefundableFeeTracker::new(1000);
+
+        tracker.consume_events_size(100);
+        assert_eq!(tracker.consumed_events_size_bytes(), 100);
+
+        tracker.consume_events_size(200);
+        assert_eq!(tracker.consumed_events_size_bytes(), 300);
+    }
+
+    /// Test RefundableFeeTracker exhaustion boundary.
+    #[test]
+    fn test_refundable_fee_tracker_exact_boundary() {
+        let mut tracker = RefundableFeeTracker::new(100);
+
+        // Consuming exactly max should succeed
+        assert!(tracker.consume_rent_fee(100).is_ok());
+        assert_eq!(tracker.consumed_rent_fee(), 100);
+        assert_eq!(tracker.get_fee_refund(), 0);
+    }
+
+    /// Test MutableTransactionResult with soroban result.
+    #[test]
+    fn test_mutable_result_soroban() {
+        let mut result = MutableTransactionResult::new(500);
+        result.initialize_refundable_fee_tracker(300);
+
+        assert!(result.refundable_fee_tracker().is_some());
+
+        // Consume some refundable fee
+        if let Some(tracker) = result.refundable_fee_tracker_mut() {
+            tracker.consume_rent_fee(50).unwrap();
+            assert!(tracker.update_consumed_refundable_fee(100).is_ok());
+        }
+
+        let tracker = result.refundable_fee_tracker().unwrap();
+        assert_eq!(tracker.consumed_rent_fee(), 50);
+        assert_eq!(tracker.consumed_refundable_fee(), 150); // 50 rent + 100 other
+    }
+
+    /// Test TxResultWrapper with inner transaction (fee bump).
+    #[test]
+    fn test_tx_result_wrapper_fee_bump() {
+        let inner_result = TransactionResult {
+            fee_charged: 100,
+            result: TransactionResultResult::TxFeeBumpInnerSuccess(
+                stellar_xdr::curr::InnerTransactionResultPair {
+                    transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    result: stellar_xdr::curr::InnerTransactionResult {
+                        fee_charged: 50,
+                        result: InnerTransactionResultResult::TxSuccess(
+                            vec![].try_into().unwrap(),
+                        ),
+                        ext: stellar_xdr::curr::InnerTransactionResultExt::V0,
+                    },
+                },
+            ),
+            ext: TransactionResultExt::V0,
+        };
+
+        let wrapper = TxResultWrapper::from_xdr(inner_result);
+        assert!(wrapper.is_success());
+        assert_eq!(wrapper.result_code(), TxResultCode::TxFeeBumpInnerSuccess);
+    }
 }

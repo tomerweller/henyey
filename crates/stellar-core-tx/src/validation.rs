@@ -1457,4 +1457,356 @@ mod tests {
             Err(ValidationError::BadSequence { .. })
         ));
     }
+
+    /// Test LedgerContext creation methods.
+    #[test]
+    fn test_ledger_context_creation() {
+        let testnet = LedgerContext::testnet(100, 5000);
+        assert_eq!(testnet.sequence, 100);
+        assert_eq!(testnet.close_time, 5000);
+        assert_eq!(testnet.network_id, NetworkId::testnet());
+
+        let mainnet = LedgerContext::mainnet(200, 6000);
+        assert_eq!(mainnet.sequence, 200);
+        assert_eq!(mainnet.close_time, 6000);
+        assert_eq!(mainnet.network_id, NetworkId::mainnet());
+
+        // Test custom context
+        let custom = LedgerContext::new(
+            300,
+            7000,
+            100,  // base_fee
+            5000000, // base_reserve
+            25,   // protocol_version
+            NetworkId::testnet(),
+        );
+        assert_eq!(custom.sequence, 300);
+        assert_eq!(custom.close_time, 7000);
+        assert_eq!(custom.base_fee, 100);
+        assert_eq!(custom.protocol_version, 25);
+    }
+
+    /// Test validate_sequence with correct sequence number.
+    #[test]
+    fn test_validate_sequence_correct() {
+        let frame = create_test_frame();
+        // Transaction seq_num is 1, so account should have seq_num = 0
+        let account_id = AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+        let account = create_account_entry(account_id, 0);
+
+        assert!(validate_sequence(&frame, Some(&account)).is_ok());
+    }
+
+    /// Test validate_sequence without account.
+    #[test]
+    fn test_validate_sequence_no_account() {
+        let frame = create_test_frame();
+        // When account is None, sequence validation should pass (for basic validation)
+        assert!(validate_sequence(&frame, None).is_ok());
+    }
+
+    /// Test validate_ledger_bounds within valid range.
+    #[test]
+    fn test_validate_ledger_bounds_valid() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let payment_op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        // Ledger bounds: min_ledger = 50, max_ledger = 150
+        // Context ledger: 100 (within bounds)
+        let ledger_bounds = LedgerBounds {
+            min_ledger: 50,
+            max_ledger: 150,
+        };
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: Some(ledger_bounds),
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![].try_into().unwrap(),
+        });
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![payment_op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(100, 1000); // ledger = 100
+
+        assert!(validate_ledger_bounds(&frame, &context).is_ok());
+    }
+
+    /// Test validate_time_bounds within valid range.
+    #[test]
+    fn test_validate_time_bounds_valid() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let payment_op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        // Time bounds: min_time = 500, max_time = 1500
+        // Context close time: 1000 (within bounds)
+        let time_bounds = TimeBounds {
+            min_time: TimePoint(500),
+            max_time: TimePoint(1500),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::Time(time_bounds),
+            memo: Memo::None,
+            operations: vec![payment_op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(1, 1000); // close_time = 1000
+
+        assert!(validate_time_bounds(&frame, &context).is_ok());
+    }
+
+    /// Test validate_time_bounds with unbounded max_time (0).
+    #[test]
+    fn test_validate_time_bounds_no_max() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let payment_op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        // Time bounds: min_time = 100, max_time = 0 (no max)
+        let time_bounds = TimeBounds {
+            min_time: TimePoint(100),
+            max_time: TimePoint(0),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::Time(time_bounds),
+            memo: Memo::None,
+            operations: vec![payment_op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(1, 999999); // Any large close_time
+
+        assert!(validate_time_bounds(&frame, &context).is_ok());
+    }
+
+    /// Test validate_ledger_bounds with unbounded max_ledger (0).
+    #[test]
+    fn test_validate_ledger_bounds_no_max() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let payment_op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        // Ledger bounds: min_ledger = 10, max_ledger = 0 (no max)
+        let ledger_bounds = LedgerBounds {
+            min_ledger: 10,
+            max_ledger: 0,
+        };
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: Some(ledger_bounds),
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![].try_into().unwrap(),
+        });
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![payment_op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(999999, 1000); // Any large ledger
+
+        assert!(validate_ledger_bounds(&frame, &context).is_ok());
+    }
+
+    /// Test validation with multiple operations.
+    #[test]
+    fn test_validate_multiple_operations() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let op1 = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest.clone(),
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        let op2 = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 2000,
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200, // 100 per op * 2 ops
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op1, op2].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+
+        assert!(validate_basic(&frame, &context).is_ok());
+    }
+
+    /// Test validation with insufficient fee for multiple operations.
+    #[test]
+    fn test_validate_insufficient_fee_multiple_ops() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let op1 = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest.clone(),
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        let op2 = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 2000,
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 150, // Too low for 2 ops (need 200)
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op1, op2].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+
+        assert!(matches!(
+            validate_fee(&frame, &context),
+            Err(ValidationError::InsufficientFee { .. })
+        ));
+    }
+
+    /// Test ValidationError display.
+    #[test]
+    fn test_validation_error_display() {
+        let err = ValidationError::InvalidStructure("bad memo".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("bad memo"));
+
+        let err = ValidationError::InsufficientFee {
+            required: 200,
+            provided: 100,
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("200"));
+        assert!(display.contains("100"));
+
+        let err = ValidationError::BadSequence {
+            expected: 5,
+            actual: 3,
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("5"));
+        assert!(display.contains("3"));
+    }
 }
