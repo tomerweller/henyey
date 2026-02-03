@@ -139,3 +139,112 @@ impl HotArchiveLookup for NoHotArchive {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        AccountId, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
+        LedgerEntryData, LedgerEntryExt, LedgerKeyContractData, PublicKey, ScAddress, ScVal,
+        Uint256,
+    };
+
+    fn test_contract_data_key() -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([1u8; 32]))),
+            key: ScVal::Void,
+            durability: ContractDataDurability::Persistent,
+        })
+    }
+
+    fn test_contract_data_entry() -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([1u8; 32]))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::I32(42),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Test NoHotArchive always returns None.
+    #[test]
+    fn test_no_hot_archive_get() {
+        let archive = NoHotArchive;
+        let key = test_contract_data_key();
+        assert!(archive.get(&key).is_none());
+    }
+
+    /// Test NoHotArchive returns None for various key types.
+    #[test]
+    fn test_no_hot_archive_different_keys() {
+        let archive = NoHotArchive;
+
+        // Contract data key
+        let contract_key = test_contract_data_key();
+        assert!(archive.get(&contract_key).is_none());
+
+        // Account key
+        let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+        });
+        assert!(archive.get(&account_key).is_none());
+    }
+
+    /// Test a custom HotArchiveLookup implementation.
+    #[test]
+    fn test_custom_hot_archive_lookup() {
+        use std::collections::HashMap;
+
+        struct TestHotArchive {
+            entries: HashMap<Vec<u8>, LedgerEntry>,
+        }
+
+        impl HotArchiveLookup for TestHotArchive {
+            fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+                let key_bytes = stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none()).ok()?;
+                self.entries.get(&key_bytes).cloned()
+            }
+        }
+
+        let mut entries = HashMap::new();
+        let key = test_contract_data_key();
+        let entry = test_contract_data_entry();
+        let key_bytes = stellar_xdr::curr::WriteXdr::to_xdr(&key, stellar_xdr::curr::Limits::none()).unwrap();
+        entries.insert(key_bytes, entry.clone());
+
+        let archive = TestHotArchive { entries };
+
+        // Key that exists
+        let result = archive.get(&key);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().last_modified_ledger_seq, 100);
+
+        // Key that doesn't exist
+        let other_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([2u8; 32]))),
+            key: ScVal::Void,
+            durability: ContractDataDurability::Persistent,
+        });
+        assert!(archive.get(&other_key).is_none());
+    }
+
+    /// Test trait object usage for HotArchiveLookup.
+    #[test]
+    fn test_hot_archive_trait_object() {
+        let archive: Box<dyn HotArchiveLookup> = Box::new(NoHotArchive);
+        let key = test_contract_data_key();
+        assert!(archive.get(&key).is_none());
+    }
+
+    /// Test NoHotArchive is Send + Sync (required by trait bounds).
+    #[test]
+    fn test_no_hot_archive_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NoHotArchive>();
+    }
+}

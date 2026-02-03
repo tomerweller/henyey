@@ -1361,9 +1361,12 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 650
-- **Tests added:** 280
-- **Latest:** Added 61 tests to events.rs (0 → 61)
+- **Current test count:** 689
+- **Tests added:** 319
+- **Latest:** Added 39 tests to soroban modules:
+  - soroban/error.rs: 15 tests (error code conversion)
+  - soroban/mod.rs: 5 tests (HotArchiveLookup trait)
+  - soroban/protocol/types.rs: 19 tests (InvokeHostFunctionOutput, TtlChange, etc.)
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---
