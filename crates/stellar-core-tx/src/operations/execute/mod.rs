@@ -758,4 +758,300 @@ mod tests {
             _ => panic!("Expected Inflation result"),
         }
     }
+
+    // === OperationExecutionResult tests ===
+
+    #[test]
+    fn test_operation_execution_result_new() {
+        let op_result = OperationResult::OpBadAuth;
+        let result = OperationExecutionResult::new(op_result);
+
+        assert!(result.soroban_meta.is_none());
+        match result.result {
+            OperationResult::OpBadAuth => {}
+            _ => panic!("Expected OpBadAuth"),
+        }
+    }
+
+    #[test]
+    fn test_operation_execution_result_with_soroban_meta() {
+        let op_result = OperationResult::OpInner(OperationResultTr::Inflation(
+            InflationResult::NotTime,
+        ));
+        let meta = SorobanOperationMeta {
+            events: vec![],
+            diagnostic_events: vec![],
+            return_value: None,
+            event_size_bytes: 100,
+            rent_fee: 500,
+            live_bucket_list_restores: vec![],
+            hot_archive_restores: vec![],
+            actual_restored_indices: vec![],
+        };
+
+        let result = OperationExecutionResult::with_soroban_meta(op_result, meta);
+
+        assert!(result.soroban_meta.is_some());
+        let soroban_meta = result.soroban_meta.unwrap();
+        assert_eq!(soroban_meta.event_size_bytes, 100);
+        assert_eq!(soroban_meta.rent_fee, 500);
+    }
+
+    // === SorobanOperationMeta tests ===
+
+    #[test]
+    fn test_soroban_operation_meta_default_values() {
+        let meta = SorobanOperationMeta {
+            events: vec![],
+            diagnostic_events: vec![],
+            return_value: None,
+            event_size_bytes: 0,
+            rent_fee: 0,
+            live_bucket_list_restores: vec![],
+            hot_archive_restores: vec![],
+            actual_restored_indices: vec![],
+        };
+
+        assert!(meta.events.is_empty());
+        assert!(meta.diagnostic_events.is_empty());
+        assert!(meta.return_value.is_none());
+        assert_eq!(meta.event_size_bytes, 0);
+        assert_eq!(meta.rent_fee, 0);
+    }
+
+    #[test]
+    fn test_soroban_operation_meta_with_return_value() {
+        let meta = SorobanOperationMeta {
+            events: vec![],
+            diagnostic_events: vec![],
+            return_value: Some(ScVal::I32(42)),
+            event_size_bytes: 50,
+            rent_fee: 100,
+            live_bucket_list_restores: vec![],
+            hot_archive_restores: vec![],
+            actual_restored_indices: vec![1, 2, 3],
+        };
+
+        assert!(meta.return_value.is_some());
+        match meta.return_value.unwrap() {
+            ScVal::I32(v) => assert_eq!(v, 42),
+            _ => panic!("Expected I32"),
+        }
+        assert_eq!(meta.actual_restored_indices.len(), 3);
+    }
+
+    // === HotArchiveRestore tests ===
+
+    #[test]
+    fn test_hot_archive_restore_struct() {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: create_test_account_id(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(create_test_account(
+                create_test_account_id(),
+                1_000_000,
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let restore = HotArchiveRestore {
+            key: key.clone(),
+            entry: entry.clone(),
+        };
+
+        assert_eq!(restore.entry.last_modified_ledger_seq, 100);
+    }
+
+    #[test]
+    fn test_hot_archive_restore_debug() {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: create_test_account_id(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 50,
+            data: LedgerEntryData::Account(create_test_account(
+                create_test_account_id(),
+                500_000,
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let restore = HotArchiveRestore { key, entry };
+        let debug_str = format!("{:?}", restore);
+        assert!(debug_str.contains("HotArchiveRestore"));
+    }
+
+    // === ledger_key_hash tests ===
+
+    #[test]
+    fn test_ledger_key_hash_account() {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: create_test_account_id(),
+        });
+
+        let hash = ledger_key_hash(&key);
+        // Hash should be 32 bytes (256 bits)
+        assert_eq!(hash.0.len(), 32);
+        // Same key should produce same hash
+        let hash2 = ledger_key_hash(&key);
+        assert_eq!(hash.0, hash2.0);
+    }
+
+    #[test]
+    fn test_ledger_key_hash_different_keys() {
+        let key1 = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+        });
+        let key2 = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+        });
+
+        let hash1 = ledger_key_hash(&key1);
+        let hash2 = ledger_key_hash(&key2);
+
+        // Different keys should produce different hashes
+        assert_ne!(hash1.0, hash2.0);
+    }
+
+    // === BumpSequence operation dispatch ===
+
+    #[test]
+    fn test_bump_sequence_operation_dispatch() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id();
+
+        state.create_account(create_test_account(source.clone(), 100_000_000));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::BumpSequence(BumpSequenceOp { bump_to: SequenceNumber(10) }),
+        };
+
+        let result = execute_operation(&op, &source, &mut state, &context).expect("execute op");
+
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::BumpSequence(r)) => {
+                assert!(matches!(r, BumpSequenceResult::Success));
+            }
+            _ => panic!("Expected BumpSequence result"),
+        }
+    }
+
+    // === CreateAccount operation dispatch ===
+
+    #[test]
+    fn test_create_account_operation_dispatch() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id();
+
+        state.create_account(create_test_account(source.clone(), 100_000_000));
+
+        let new_account = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32])));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: new_account.clone(),
+                starting_balance: 10_000_000,
+            }),
+        };
+
+        let result = execute_operation(&op, &source, &mut state, &context).expect("execute op");
+
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(matches!(r, CreateAccountResult::Success));
+            }
+            _ => panic!("Expected CreateAccount result"),
+        }
+    }
+
+    // === Payment operation dispatch ===
+
+    #[test]
+    fn test_payment_operation_dispatch_no_dest() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id();
+
+        state.create_account(create_test_account(source.clone(), 100_000_000));
+
+        let dest = MuxedAccount::Ed25519(Uint256([5u8; 32]));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1_000_000,
+            }),
+        };
+
+        let result = execute_operation(&op, &source, &mut state, &context).expect("execute op");
+
+        // Should fail because destination account doesn't exist
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::Payment(PaymentResult::NoDestination)) => {}
+            _ => panic!("Expected Payment NoDestination result"),
+        }
+    }
+
+    // === ManageData operation dispatch ===
+
+    #[test]
+    fn test_manage_data_operation_dispatch() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id();
+
+        state.create_account(create_test_account(source.clone(), 100_000_000));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: String64::try_from(b"testkey".to_vec()).unwrap(),
+                data_value: Some(DataValue(vec![1, 2, 3, 4].try_into().unwrap())),
+            }),
+        };
+
+        let result = execute_operation(&op, &source, &mut state, &context).expect("execute op");
+
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::ManageData(ManageDataResult::Success)) => {}
+            _ => panic!("Expected ManageData Success result"),
+        }
+    }
+
+    // === Operation with explicit source ===
+
+    #[test]
+    fn test_operation_with_explicit_source() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let tx_source = create_test_account_id();
+        let op_source = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
+
+        // Create both accounts
+        state.create_account(create_test_account(tx_source.clone(), 100_000_000));
+        state.create_account(create_test_account(op_source.clone(), 100_000_000));
+
+        // Operation with explicit source different from tx source
+        let op = Operation {
+            source_account: Some(MuxedAccount::Ed25519(Uint256([9u8; 32]))),
+            body: OperationBody::BumpSequence(BumpSequenceOp { bump_to: SequenceNumber(10) }),
+        };
+
+        let result = execute_operation(&op, &tx_source, &mut state, &context).expect("execute op");
+
+        match result.result {
+            OperationResult::OpInner(OperationResultTr::BumpSequence(r)) => {
+                assert!(matches!(r, BumpSequenceResult::Success));
+            }
+            _ => panic!("Expected BumpSequence result"),
+        }
+    }
 }
