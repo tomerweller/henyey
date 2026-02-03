@@ -198,6 +198,8 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::*;
 
+    const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
+
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
     }
@@ -655,5 +657,164 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    /// Test Clawback partial amount succeeds and updates trustline correctly.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "partial amount" test section
+    #[test]
+    fn test_clawback_partial_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(25);
+        let holder_id = create_test_account_id(26);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            asset.clone(),
+            1000, // 1000 balance
+            10_000,
+            TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+
+        let holder_id_clone = holder_id.clone();
+        let op = ClawbackOp {
+            asset: asset.clone(),
+            from: MuxedAccount::Ed25519(match holder_id_clone.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 300, // Clawback only 300
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify trustline balance was reduced
+        let trustline = state.get_trustline(&holder_id, &asset).unwrap();
+        assert_eq!(trustline.balance, 700, "Expected balance to be reduced to 700");
+    }
+
+    /// Test Clawback with trustline not authorized returns NotClawbackEnabled.
+    /// Clawback requires the trustline to have TRUSTLINE_CLAWBACK_ENABLED_FLAG.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "trustline not clawback enabled"
+    #[test]
+    fn test_clawback_trustline_not_clawback_enabled() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(27);
+        let holder_id = create_test_account_id(28);
+
+        // Issuer has AUTH_CLAWBACK_ENABLED_FLAG
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        // Trustline does NOT have TRUSTLINE_CLAWBACK_ENABLED_FLAG
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            asset.clone(),
+            1000,
+            10_000,
+            AUTHORIZED_FLAG, // Only authorized, not clawback enabled
+        ));
+
+        let op = ClawbackOp {
+            asset,
+            from: MuxedAccount::Ed25519(match holder_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 100,
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::NotClawbackEnabled),
+                    "Expected NotClawbackEnabled, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback entire balance succeeds.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "full amount"
+    #[test]
+    fn test_clawback_full_balance() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(29);
+        let holder_id = create_test_account_id(30);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            asset.clone(),
+            500,
+            10_000,
+            TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+
+        let holder_id_clone = holder_id.clone();
+        let op = ClawbackOp {
+            asset: asset.clone(),
+            from: MuxedAccount::Ed25519(match holder_id_clone.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 500, // Clawback entire balance
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify trustline balance is now zero
+        let trustline = state.get_trustline(&holder_id, &asset).unwrap();
+        assert_eq!(trustline.balance, 0, "Expected balance to be 0");
     }
 }

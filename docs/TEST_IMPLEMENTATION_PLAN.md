@@ -1348,7 +1348,7 @@ Key areas:
 - [x] ClaimableBalance: 22 tests total (was 20 missing, added 4)
 - [x] LiquidityPool: 13 tests total (was 20 missing, added 6)
 - [x] Sponsorship: 15 tests total (was 15 missing, added 4)
-- [x] Clawback: 7 tests total (added in previous session)
+- [x] Clawback: 12 tests total (was 7 missing, added 3)
 - [x] SetTrustLineFlags: 11 tests total (was 6 missing, added 4)
 - [x] AllowTrust: included in SetTrustLineFlags tests
 - [x] Inflation: 3 tests total (was 5 missing, added 2)
@@ -1360,8 +1360,8 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 448
-- **Tests added:** 78
+- **Current test count:** 451
+- **Tests added:** 81
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---
