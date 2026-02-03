@@ -348,4 +348,182 @@ mod tests {
         assert!(!footprint.is_writable(&key1));
         assert!(footprint.is_writable(&key2));
     }
+
+    /// Test StorageEntry expiration.
+    #[test]
+    fn test_storage_entry_expiration() {
+        let key = make_storage_key(1);
+        let entry = StorageEntry::new(key, ScVal::I64(100), 1000);
+
+        // Not expired at ledger 999
+        assert!(!entry.is_expired(999));
+
+        // Not expired at ledger 1000 (expires AFTER this)
+        assert!(!entry.is_expired(1000));
+
+        // Expired at ledger 1001
+        assert!(entry.is_expired(1001));
+    }
+
+    /// Test storage key hash computation.
+    #[test]
+    fn test_storage_key_hash() {
+        let key1 = make_storage_key(1);
+        let key2 = make_storage_key(2);
+
+        let hash1 = key1.hash();
+        let hash2 = key2.hash();
+
+        // Different keys should produce different hashes
+        assert_ne!(hash1, hash2);
+
+        // Same key should produce same hash
+        let key1_copy = make_storage_key(1);
+        let hash1_copy = key1_copy.hash();
+        assert_eq!(hash1, hash1_copy);
+    }
+
+    /// Test storage key to_ledger_key conversion.
+    #[test]
+    fn test_storage_key_to_ledger_key() {
+        let key = StorageKey::new(
+            make_contract_address(5),
+            ScVal::U32(42),
+            ContractDataDurability::Temporary,
+        );
+
+        let ledger_key = key.to_ledger_key();
+        match ledger_key {
+            LedgerKey::ContractData(cd) => {
+                assert_eq!(cd.durability, ContractDataDurability::Temporary);
+                assert!(matches!(cd.key, ScVal::U32(42)));
+            }
+            _ => panic!("Expected ContractData key"),
+        }
+    }
+
+    /// Test storage created_entries iterator.
+    #[test]
+    fn test_storage_created_entries() {
+        let mut storage = SorobanStorage::new();
+
+        let key1 = make_storage_key(1);
+        let key2 = make_storage_key(2);
+
+        // key1 is read first then written (update, not create)
+        storage.record_read(
+            key1.clone(),
+            Some(StorageEntry::new(key1.clone(), ScVal::I64(100), 1000)),
+        );
+        storage.put(key1, ScVal::I64(200), 2000);
+
+        // key2 is only written (create)
+        storage.put(key2, ScVal::I64(300), 3000);
+
+        // Should have 1 created entry (key2)
+        let created: Vec<_> = storage.created_entries().collect();
+        assert_eq!(created.len(), 1);
+        assert!(matches!(created[0].value, ScVal::I64(300)));
+    }
+
+    /// Test storage updated_entries iterator.
+    #[test]
+    fn test_storage_updated_entries() {
+        let mut storage = SorobanStorage::new();
+
+        let key1 = make_storage_key(1);
+        let key2 = make_storage_key(2);
+
+        // key1 is read first then written (update)
+        storage.record_read(
+            key1.clone(),
+            Some(StorageEntry::new(key1.clone(), ScVal::I64(100), 1000)),
+        );
+        storage.put(key1, ScVal::I64(200), 2000);
+
+        // key2 is only written (create, not update)
+        storage.put(key2, ScVal::I64(300), 3000);
+
+        // Should have 1 updated entry (key1)
+        let updated: Vec<_> = storage.updated_entries().collect();
+        assert_eq!(updated.len(), 1);
+        assert!(matches!(updated[0].value, ScVal::I64(200)));
+    }
+
+    /// Test storage clear.
+    #[test]
+    fn test_storage_clear() {
+        let mut storage = SorobanStorage::new();
+
+        let key = make_storage_key(1);
+        storage.put(key.clone(), ScVal::I64(100), 1000);
+        storage.record_code_read(Hash([1u8; 32]), Some(vec![1, 2, 3]));
+
+        assert!(storage.has(&key));
+        assert!(storage.get_code(&Hash([1u8; 32])).is_some());
+
+        storage.clear();
+
+        assert!(!storage.has(&key));
+        assert!(storage.get_code(&Hash([1u8; 32])).is_none());
+        assert_eq!(storage.read_count(), 0);
+        assert_eq!(storage.write_count(), 0);
+    }
+
+    /// Test storage code entries.
+    #[test]
+    fn test_storage_code_entries() {
+        let mut storage = SorobanStorage::new();
+        let code_hash = Hash([42u8; 32]);
+        let code = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        storage.record_code_read(code_hash.clone(), Some(code.clone()));
+
+        let retrieved = storage.get_code(&code_hash);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), &code);
+
+        // Non-existent code
+        let missing_hash = Hash([99u8; 32]);
+        assert!(storage.get_code(&missing_hash).is_none());
+    }
+
+    /// Test footprint read_only to read_write promotion.
+    #[test]
+    fn test_footprint_promotion() {
+        let mut footprint = Footprint::new();
+
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+
+        // Add as read_only
+        footprint.add_read_only(key.clone());
+        assert!(!footprint.is_writable(&key));
+        assert_eq!(footprint.read_only.len(), 1);
+        assert_eq!(footprint.read_write.len(), 0);
+
+        // Promote to read_write
+        footprint.add_read_write(key.clone());
+        assert!(footprint.is_writable(&key));
+        assert_eq!(footprint.read_only.len(), 0); // Removed from read_only
+        assert_eq!(footprint.read_write.len(), 1);
+    }
+
+    /// Test StorageEntry to_contract_data_entry conversion.
+    #[test]
+    fn test_storage_entry_to_contract_data() {
+        let key = StorageKey::new(
+            make_contract_address(10),
+            ScVal::Bytes(vec![1, 2, 3, 4].try_into().unwrap()),
+            ContractDataDurability::Persistent,
+        );
+        // Use a simple ScVal type
+        let value = ScVal::I128(stellar_xdr::curr::Int128Parts { hi: 0, lo: 42 });
+        let entry = StorageEntry::new(key, value.clone(), 5000);
+
+        let contract_data = entry.to_contract_data_entry();
+        assert!(matches!(contract_data.val, ScVal::I128(_)));
+        assert_eq!(contract_data.durability, ContractDataDurability::Persistent);
+    }
 }
