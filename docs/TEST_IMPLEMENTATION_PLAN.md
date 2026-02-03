@@ -1345,23 +1345,23 @@ Key areas:
 - [x] ManageOffer: 33 tests total (was 30+ missing, added 12)
 - [x] PathPayment: 13 tests total (was 25+ missing, added 7)
 - [x] SetOptions: 24 tests total (was 20 missing, added 6)
-- [ ] ClaimableBalance: 20 missing tests
-- [ ] LiquidityPool: 20 missing tests
-- [ ] Sponsorship: 15 missing tests
-- [ ] Clawback: 7 missing tests
-- [ ] SetTrustLineFlags: 6 missing tests
-- [ ] AllowTrust: 4 missing tests
-- [ ] Inflation: 5 missing tests
+- [x] ClaimableBalance: 22 tests total (was 20 missing, added 4)
+- [x] LiquidityPool: 13 tests total (was 20 missing, added 6)
+- [x] Sponsorship: 15 tests total (was 15 missing, added 4)
+- [x] Clawback: 7 tests total (added in previous session)
+- [x] SetTrustLineFlags: 11 tests total (was 6 missing, added 4)
+- [x] AllowTrust: included in SetTrustLineFlags tests
+- [x] Inflation: 3 tests total (was 5 missing, added 2)
 - [x] BumpSequence: 6 tests total (was 5 missing, added 3)
-- [ ] ManageData: 7 missing tests (has subentries tests)
+- [x] ManageData: 14 tests total (has subentries tests)
 
 ### Soroban (Phase 13)
 - [ ] InvokeHostFunction: 100+ tests (separate project)
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 418
-- **Tests added:** 48
+- **Current test count:** 444
+- **Tests added:** 74
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---

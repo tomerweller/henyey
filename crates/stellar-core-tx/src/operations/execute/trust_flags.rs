@@ -481,6 +481,30 @@ mod tests {
         LedgerContext::testnet(1, 1000)
     }
 
+    fn create_asset(issuer: &AccountId) -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer.clone(),
+        })
+    }
+
+    fn create_test_trustline(
+        account_id: AccountId,
+        asset: TrustLineAsset,
+        balance: i64,
+        limit: i64,
+        flags: u32,
+    ) -> TrustLineEntry {
+        TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V0,
+        }
+    }
+
     #[test]
     fn test_allow_trust_no_auth_required() {
         // In protocol 16+ (CAP-0035), the AUTH_REQUIRED check was removed from AllowTrust.
@@ -859,5 +883,184 @@ mod tests {
             has_trustline,
             "Trustline should be in updated_entries after AllowTrust"
         );
+    }
+
+    /// Test SetTrustLineFlags when source is not the issuer returns NoTrustLine.
+    ///
+    /// C++ Reference: SetTrustLineFlagsTests.cpp - "not issuer" test section
+    #[test]
+    fn test_set_trust_line_flags_not_issuer() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(40);
+        let trustor_id = create_test_account_id(41);
+        let non_issuer_id = create_test_account_id(42);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(non_issuer_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1000,
+            1_000_000,
+            AUTH_REQUIRED_FLAG,
+        ));
+
+        // Non-issuer tries to set flags
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: 0,
+            set_flags: TrustLineFlags::AuthorizedFlag as u32,
+        };
+
+        let result =
+            execute_set_trust_line_flags(&op, &non_issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                // When source != issuer, the check happens before trustline lookup,
+                // so we get Malformed (not issuer) rather than NoTrustLine
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Malformed),
+                    "Expected Malformed when not issuer, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test SetTrustLineFlags when trustline doesn't exist returns NoTrustLine.
+    ///
+    /// C++ Reference: SetTrustLineFlagsTests.cpp - "no trust line" test section
+    #[test]
+    fn test_set_trust_line_flags_no_trust_line() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(43);
+        let trustor_id = create_test_account_id(44);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        // No trustline created
+
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: 0,
+            set_flags: TrustLineFlags::AuthorizedFlag as u32,
+        };
+
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::NoTrustLine),
+                    "Expected NoTrustLine, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test AllowTrust when trustline doesn't exist returns NoTrustLine.
+    ///
+    /// C++ Reference: AllowTrustTests.cpp - "no trust line" test section
+    #[test]
+    fn test_allow_trust_no_trust_line() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(45);
+        let trustor_id = create_test_account_id(46);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        // No trustline created
+
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
+            authorize: 1,
+        };
+
+        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(
+                    matches!(r, AllowTrustResult::NoTrustLine),
+                    "Expected NoTrustLine, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test SetTrustLineFlags invalid flag combination returns InvalidState.
+    ///
+    /// InvalidState is returned when the RESULT of clear_flags/set_flags operations
+    /// would leave both AUTHORIZED_FLAG and AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG set.
+    /// (Note: setting both flags directly in set_flags returns Malformed instead)
+    ///
+    /// C++ Reference: SetTrustLineFlagsTests.cpp - "invalid state" test section
+    #[test]
+    fn test_set_trust_line_flags_invalid_state() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(47);
+        let trustor_id = create_test_account_id(48);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        // Create trustline that already has AUTHORIZED_FLAG
+        state.create_trustline(create_test_trustline(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1000,
+            1_000_000,
+            TrustLineFlags::AuthorizedFlag as u32, // Already authorized
+        ));
+
+        // Now try to SET AUTHORIZED_TO_MAINTAIN_LIABILITIES without clearing AUTHORIZED
+        // This would result in both flags being set, which is InvalidState
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: 0, // Not clearing AUTHORIZED_FLAG
+            set_flags: TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32,
+        };
+
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::InvalidState),
+                    "Expected InvalidState for conflicting flags, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
     }
 }

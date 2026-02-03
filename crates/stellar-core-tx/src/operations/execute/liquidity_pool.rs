@@ -1194,4 +1194,550 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    /// Test successful deposit into an empty pool.
+    ///
+    /// C++ Reference: LiquidityPoolDepositTests.cpp - "deposit into empty pool"
+    #[test]
+    fn test_deposit_empty_pool_success() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(20);
+        let issuer_a = create_test_account_id(21);
+        let issuer_b = create_test_account_id(22);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([20u8; 32]));
+        // Empty pool - no reserves, no shares
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            0,
+            0,
+            0,
+        ));
+
+        // Create authorized trustlines with sufficient balance
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 10_000,
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 10_000,
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 1000,
+            max_amount_b: 1000,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 2, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::Success),
+                    "Expected Success for empty pool deposit, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test deposit fails when user doesn't have enough balance (Underfunded).
+    ///
+    /// C++ Reference: LiquidityPoolDepositTests.cpp - "underfunded" section
+    #[test]
+    fn test_deposit_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(25);
+        let issuer_a = create_test_account_id(26);
+        let issuer_b = create_test_account_id(27);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([25u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            0,
+            0,
+            0,
+        ));
+
+        // Create trustlines with INSUFFICIENT balance (only 50 but trying to deposit 1000)
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 50, // Not enough
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 10_000,
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 1000, // Trying to deposit more than balance
+            max_amount_b: 1000,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 2, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::Underfunded),
+                    "Expected Underfunded, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test successful withdrawal from a pool with shares.
+    ///
+    /// C++ Reference: LiquidityPoolWithdrawTests.cpp - "basic withdraw"
+    #[test]
+    fn test_withdraw_basic_success() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(30);
+        let issuer_a = create_test_account_id(31);
+        let issuer_b = create_test_account_id(32);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([30u8; 32]));
+        // Pool with reserves
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        ));
+
+        // Create trustlines with room to receive assets
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Pool share trustline with balance to withdraw
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100_000,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id,
+            amount: 50_000, // Withdraw half of our shares
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test withdraw fails when user doesn't have enough pool shares (Underfunded).
+    ///
+    /// C++ Reference: LiquidityPoolWithdrawTests.cpp - "underfunded" section
+    #[test]
+    fn test_withdraw_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(35);
+        let issuer_a = create_test_account_id(36);
+        let issuer_b = create_test_account_id(37);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([35u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        ));
+
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Pool share trustline with only 100 shares
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id,
+            amount: 50_000, // Trying to withdraw more than we have
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::Underfunded),
+                    "Expected Underfunded, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test deposit fails when price is outside specified bounds (BadPrice).
+    ///
+    /// C++ Reference: LiquidityPoolDepositTests.cpp - "bad price" section
+    #[test]
+    fn test_deposit_bad_price() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(40);
+        let issuer_a = create_test_account_id(41);
+        let issuer_b = create_test_account_id(42);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([40u8; 32]));
+        // Pool with 10:1 ratio (reserve_a: 1_000_000, reserve_b: 100_000)
+        // Price (b/a) = 100_000/1_000_000 = 0.1
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1_000_000,
+            100_000,
+            316_227, // sqrt(1_000_000 * 100_000) approx
+        ));
+
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 10_000,
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 10_000,
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Set min_price to 0.5 (1/2), but pool price is 0.1
+        // Pool price is lower than min_price, so should fail
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 1000,
+            max_amount_b: 1000,
+            min_price: Price { n: 1, d: 2 }, // 0.5 - min acceptable price
+            max_price: Price { n: 2, d: 1 }, // 2.0 - max acceptable price
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::BadPrice),
+                    "Expected BadPrice, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test withdraw fails when min amounts aren't met (UnderMinimum).
+    ///
+    /// C++ Reference: LiquidityPoolWithdrawTests.cpp - "under minimum" section
+    #[test]
+    fn test_withdraw_under_minimum() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(45);
+        let issuer_a = create_test_account_id(46);
+        let issuer_b = create_test_account_id(47);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([45u8; 32]));
+        // Pool: 1M reserves each, 1M total shares
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        ));
+
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // User has 1000 pool shares (0.1% of pool)
+        // Withdrawing 1000 shares would give ~1000 of each asset
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 1_000,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Withdraw with unreasonably high min_amount requirements
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id,
+            amount: 1_000,
+            min_amount_a: 10_000, // Expecting way more than withdrawal would provide
+            min_amount_b: 10_000,
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::UnderMinimum),
+                    "Expected UnderMinimum, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

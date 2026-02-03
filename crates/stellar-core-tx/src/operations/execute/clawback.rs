@@ -221,6 +221,35 @@ mod tests {
         LedgerContext::testnet(1, 1000)
     }
 
+    fn create_asset(issuer: &AccountId) -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer.clone(),
+        })
+    }
+
+    fn create_test_trustline(
+        account_id: AccountId,
+        asset: Asset,
+        balance: i64,
+        limit: i64,
+        flags: u32,
+    ) -> TrustLineEntry {
+        let tl_asset = match asset {
+            Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a),
+            Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a),
+            Asset::Native => TrustLineAsset::Native,
+        };
+        TrustLineEntry {
+            account_id,
+            asset: tl_asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V0,
+        }
+    }
+
     #[test]
     fn test_clawback_not_enabled() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -343,6 +372,286 @@ mod tests {
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(r)) => {
                 assert!(matches!(r, ClawbackClaimableBalanceResult::DoesNotExist));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback with negative amount returns Malformed.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "malformed negative" test section
+    #[test]
+    fn test_clawback_malformed_negative_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(10);
+        let holder_id = create_test_account_id(11);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            asset.clone(),
+            1000,
+            10_000,
+            TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+        ));
+
+        let op = ClawbackOp {
+            asset,
+            from: MuxedAccount::Ed25519(match holder_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: -1, // Negative
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Malformed),
+                    "Expected Malformed for negative amount, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback with zero amount returns Malformed.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "malformed zero" test section
+    #[test]
+    fn test_clawback_malformed_zero_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(12);
+        let holder_id = create_test_account_id(13);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            asset.clone(),
+            1000,
+            10_000,
+            TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+        ));
+
+        let op = ClawbackOp {
+            asset,
+            from: MuxedAccount::Ed25519(match holder_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 0, // Zero
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Malformed),
+                    "Expected Malformed for zero amount, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback on native asset returns Malformed.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "malformed native" test section
+    #[test]
+    fn test_clawback_malformed_native_asset() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(14);
+        let holder_id = create_test_account_id(15);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let op = ClawbackOp {
+            asset: Asset::Native, // Native asset
+            from: MuxedAccount::Ed25519(match holder_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 100,
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Malformed),
+                    "Expected Malformed for native asset, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback when source is not the issuer returns Malformed.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "not issuer" test section
+    #[test]
+    fn test_clawback_not_issuer() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(16);
+        let holder_id = create_test_account_id(17);
+        let non_issuer_id = create_test_account_id(18);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(
+            non_issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            asset.clone(),
+            1000,
+            10_000,
+            TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+        ));
+
+        // Try to clawback from non-issuer account
+        let op = ClawbackOp {
+            asset,
+            from: MuxedAccount::Ed25519(match holder_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 100,
+        };
+
+        let result = execute_clawback(&op, &non_issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Malformed),
+                    "Expected Malformed when not issuer, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback when trustline doesn't exist returns NoTrust.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "no trust" test section
+    #[test]
+    fn test_clawback_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(19);
+        let holder_id = create_test_account_id(20);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        // No trustline created
+
+        let op = ClawbackOp {
+            asset,
+            from: MuxedAccount::Ed25519(match holder_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 100,
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::NoTrust),
+                    "Expected NoTrust, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback underfunded - clawback amount exceeds trustline balance.
+    ///
+    /// C++ Reference: ClawbackTests.cpp - "underfunded" test section
+    #[test]
+    fn test_clawback_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(21);
+        let holder_id = create_test_account_id(22);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            asset.clone(),
+            100, // Only 100 balance
+            10_000,
+            TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+        ));
+
+        let op = ClawbackOp {
+            asset,
+            from: MuxedAccount::Ed25519(match holder_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 200, // More than balance
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Underfunded),
+                    "Expected Underfunded, got {:?}",
+                    r
+                );
             }
             _ => panic!("Unexpected result type"),
         }

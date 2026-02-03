@@ -107,4 +107,57 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test inflation with source account that doesn't exist.
+    ///
+    /// C++ Reference: InflationTests.cpp - "no account" section
+    #[test]
+    fn test_inflation_no_source_account() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(1);
+        // Don't create the account
+
+        let result = execute_inflation(&source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Even without source account, returns NOT_TIME (deprecated operation)
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
+                assert!(matches!(r, InflationResult::NotTime));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test inflation with account that has inflation destination set.
+    /// Still returns NOT_TIME since inflation is deprecated.
+    ///
+    /// C++ Reference: InflationTests.cpp - "with inflation dest" section
+    #[test]
+    fn test_inflation_with_inflation_dest() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(2);
+        let dest_id = create_test_account_id(3);
+
+        // Create accounts, source has inflation_dest set
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.inflation_dest = Some(dest_id.clone());
+        state.create_account(source_account);
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let result = execute_inflation(&source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        // Still returns NOT_TIME because inflation is deprecated
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
+                assert!(matches!(r, InflationResult::NotTime));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }

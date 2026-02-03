@@ -895,4 +895,270 @@ mod tests {
             ))
         ));
     }
+
+    /// Test revoke sponsorship for a trustline entry.
+    ///
+    /// C++ Reference: RevokeSponsorshipTests.cpp - "trustline revoke"
+    #[test]
+    fn test_revoke_sponsorship_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(10);
+        let holder_id = create_test_account_id(11);
+        let issuer_id = create_test_account_id(12);
+
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+        state.create_account(create_test_account(holder_id.clone(), 50_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let _asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create a sponsored trustline
+        let trustline = TrustLineEntry {
+            account_id: holder_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 1000,
+            limit: 100_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline);
+        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+
+        // Set up sponsorship
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: holder_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+        });
+        state.set_entry_sponsor(ledger_key, sponsor_id.clone());
+
+        // Update sponsor's num_sponsoring
+        if let Some(account) = state.get_account_mut(&sponsor_id) {
+            let ext = crate::state::ensure_account_ext_v2(account);
+            ext.num_sponsoring = 1;
+        }
+
+        // Update holder's num_sponsored (since the trustline is sponsored)
+        if let Some(account) = state.get_account_mut(&holder_id) {
+            let ext = crate::state::ensure_account_ext_v2(account);
+            ext.num_sponsored = 1;
+        }
+
+        // Revoke the sponsorship (sponsor is the source, holder takes over reserve)
+        let op = RevokeSponsorshipOp::LedgerEntry(LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: holder_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+        }));
+
+        let result = execute_revoke_sponsorship(&op, &sponsor_id, &mut state, &context);
+
+        assert!(
+            matches!(
+                result.unwrap(),
+                OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
+                    RevokeSponsorshipResult::Success
+                ))
+            ),
+            "Expected success revoking trustline sponsorship"
+        );
+    }
+
+    /// Test revoke sponsorship for an offer entry.
+    ///
+    /// C++ Reference: RevokeSponsorshipTests.cpp - "offer revoke"
+    #[test]
+    fn test_revoke_sponsorship_offer() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(20);
+        let seller_id = create_test_account_id(21);
+        let issuer_id = create_test_account_id(22);
+
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+        state.create_account(create_test_account(seller_id.clone(), 50_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        // Create a sponsored offer
+        let offer = OfferEntry {
+            seller_id: seller_id.clone(),
+            offer_id: 123,
+            selling: Asset::Native,
+            buying: Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        state.create_offer(offer);
+        state.get_account_mut(&seller_id).unwrap().num_sub_entries += 1;
+
+        // Set up sponsorship
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id: 123,
+        });
+        state.set_entry_sponsor(ledger_key, sponsor_id.clone());
+
+        // Update sponsor's num_sponsoring
+        if let Some(account) = state.get_account_mut(&sponsor_id) {
+            let ext = crate::state::ensure_account_ext_v2(account);
+            ext.num_sponsoring = 1;
+        }
+
+        // Update seller's num_sponsored (since the offer is sponsored)
+        if let Some(account) = state.get_account_mut(&seller_id) {
+            let ext = crate::state::ensure_account_ext_v2(account);
+            ext.num_sponsored = 1;
+        }
+
+        // Revoke the sponsorship
+        let op = RevokeSponsorshipOp::LedgerEntry(LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id: 123,
+        }));
+
+        let result = execute_revoke_sponsorship(&op, &sponsor_id, &mut state, &context);
+
+        assert!(
+            matches!(
+                result.unwrap(),
+                OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
+                    RevokeSponsorshipResult::Success
+                ))
+            ),
+            "Expected success revoking offer sponsorship"
+        );
+    }
+
+    /// Test begin sponsoring fails when target is already being sponsored (AlreadySponsored).
+    ///
+    /// C++ Reference: BeginSponsoringFutureReservesTests.cpp - "already sponsored"
+    #[test]
+    fn test_begin_sponsoring_already_sponsored() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor1_id = create_test_account_id(30);
+        let sponsor2_id = create_test_account_id(31);
+        let sponsored_id = create_test_account_id(32);
+
+        state.create_account(create_test_account(sponsor1_id.clone(), 100_000_000));
+        state.create_account(create_test_account(sponsor2_id.clone(), 100_000_000));
+        state.create_account(create_test_account(sponsored_id.clone(), 50_000_000));
+
+        // First sponsor begins sponsoring
+        let op1 = BeginSponsoringFutureReservesOp {
+            sponsored_id: sponsored_id.clone(),
+        };
+        let result1 =
+            execute_begin_sponsoring_future_reserves(&op1, &sponsor1_id, &mut state, &context);
+        assert!(
+            matches!(
+                result1.unwrap(),
+                OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(
+                    BeginSponsoringFutureReservesResult::Success
+                ))
+            ),
+            "First sponsor should succeed"
+        );
+
+        // Second sponsor tries to begin sponsoring the same account
+        let op2 = BeginSponsoringFutureReservesOp {
+            sponsored_id: sponsored_id.clone(),
+        };
+        let result2 =
+            execute_begin_sponsoring_future_reserves(&op2, &sponsor2_id, &mut state, &context);
+
+        match result2.unwrap() {
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(r)) => {
+                assert!(
+                    matches!(r, BeginSponsoringFutureReservesResult::AlreadySponsored),
+                    "Expected AlreadySponsored, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test revoke sponsorship fails when sponsored account can't afford reserve (LowReserve).
+    ///
+    /// C++ Reference: RevokeSponsorshipTests.cpp - "low reserve"
+    #[test]
+    fn test_revoke_sponsorship_low_reserve() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(40);
+        let holder_id = create_test_account_id(41);
+
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+        // Holder has very low balance - can't afford reserve if sponsorship is revoked
+        // min_balance = 2 * 5_000_000 = 10_000_000 for 0 subentries
+        // With 1 subentry, min_balance = 15_000_000
+        // But holder only has 10_000_001 - just above min for 0 subentries
+        state.create_account(create_test_account(holder_id.clone(), 10_000_001));
+
+        // Create a sponsored data entry
+        let data_entry = create_data_entry(&holder_id, "mydata");
+        state.create_data(data_entry);
+        state.get_account_mut(&holder_id).unwrap().num_sub_entries += 1;
+
+        // Set up sponsorship
+        let data_name = String64::try_from("mydata".as_bytes().to_vec()).unwrap();
+        let ledger_key = LedgerKey::Data(LedgerKeyData {
+            account_id: holder_id.clone(),
+            data_name,
+        });
+        state.set_entry_sponsor(ledger_key, sponsor_id.clone());
+
+        // Update sponsor's num_sponsoring
+        if let Some(account) = state.get_account_mut(&sponsor_id) {
+            let ext = crate::state::ensure_account_ext_v2(account);
+            ext.num_sponsoring = 1;
+        }
+
+        // Update holder's num_sponsored
+        if let Some(account) = state.get_account_mut(&holder_id) {
+            let ext = crate::state::ensure_account_ext_v2(account);
+            ext.num_sponsored = 1;
+        }
+
+        // Try to revoke the sponsorship - holder can't afford the reserve
+        let data_name2 = String64::try_from("mydata".as_bytes().to_vec()).unwrap();
+        let op = RevokeSponsorshipOp::LedgerEntry(LedgerKey::Data(LedgerKeyData {
+            account_id: holder_id.clone(),
+            data_name: data_name2,
+        }));
+
+        let result = execute_revoke_sponsorship(&op, &sponsor_id, &mut state, &context);
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(r)) => {
+                assert!(
+                    matches!(r, RevokeSponsorshipResult::LowReserve),
+                    "Expected LowReserve, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }
