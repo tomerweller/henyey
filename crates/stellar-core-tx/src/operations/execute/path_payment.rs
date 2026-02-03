@@ -598,7 +598,11 @@ fn convert_with_offers_and_pools(
     if use_book {
         // Book wins — keep speculative changes (drop savepoint)
         if savepoint_us > 100 {
-            tracing::info!(savepoint_us, rollback = false, "savepoint profiling (book wins)");
+            tracing::info!(
+                savepoint_us,
+                rollback = false,
+                "savepoint profiling (book wins)"
+            );
         }
         *amount_send = book_amount_send;
         *amount_recv = book_amount_recv;
@@ -715,37 +719,15 @@ fn convert_with_offers(
         cross_offer_us += t1.elapsed().as_micros() as u64;
         offers_crossed += 1;
 
+        // Update totals and remaining limits
         *amount_send += send;
         *amount_recv += recv;
         max_send -= send;
         max_recv -= recv;
+
+        // C++ logic for continuing the loop:
+        // needMore = !wheatStays && (maxWheatReceive > 0 && maxSheepSend > 0)
         need_more = !wheat_stays && max_send > 0 && max_recv > 0;
-        if !need_more {
-            let total_us = loop_start.elapsed().as_micros() as u64;
-            if total_us > 1000 {
-                tracing::info!(
-                    offers_crossed,
-                    total_us,
-                    best_offer_us,
-                    cross_offer_us,
-                    "convert_with_offers profiling"
-                );
-            }
-            return Ok(ConvertResult::Ok);
-        }
-        if wheat_stays {
-            let total_us = loop_start.elapsed().as_micros() as u64;
-            if total_us > 1000 {
-                tracing::info!(
-                    offers_crossed,
-                    total_us,
-                    best_offer_us,
-                    cross_offer_us,
-                    "convert_with_offers profiling"
-                );
-            }
-            return Ok(ConvertResult::Partial);
-        }
     }
 
     let total_us = loop_start.elapsed().as_micros() as u64;
@@ -784,6 +766,9 @@ fn cross_offer_v10(
     // re-traversing upper bucket list levels for each entry.
     state.ensure_offer_entries_loaded(&seller, &wheat, &sheep)?;
 
+    // Step 1: Release liabilities FIRST (matches C++ exactly)
+    // This is critical - the available balance calculation depends on liabilities
+    // being released first.
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
     apply_liabilities_delta(
         &seller,
@@ -794,17 +779,21 @@ fn cross_offer_v10(
         state,
     )?;
 
+    // Step 2: Calculate available amounts AFTER liabilities are released
     let max_wheat_send = offer
         .amount
         .min(can_sell_at_most(&seller, &wheat, state, context)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+
+    // Step 3: Adjust offer amount (C++ calls adjustOffer here as "preventative measure")
     let adjusted_offer_amount =
         adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
             .map_err(map_exchange_error)?;
-    let max_wheat_send = adjusted_offer_amount;
+
+    // Step 4: Perform the exchange calculation
     let exchange = exchange_v10(
         offer.price.clone(),
-        max_wheat_send,
+        adjusted_offer_amount,
         max_recv,
         max_send,
         max_sheep_receive,
@@ -816,6 +805,7 @@ fn cross_offer_v10(
     let num_sheep_send = exchange.num_sheep_send;
     let wheat_stays = exchange.wheat_stays;
 
+    // Step 5: Apply balance changes (if any)
     if num_sheep_send != 0 {
         apply_balance_delta(&seller, &sheep, num_sheep_send, state)?;
     }
@@ -823,20 +813,28 @@ fn cross_offer_v10(
         apply_balance_delta(&seller, &wheat, -num_wheat_received, state)?;
     }
 
-    let mut new_amount = adjusted_offer_amount;
-    if wheat_stays {
-        new_amount = new_amount.saturating_sub(num_wheat_received);
-        if new_amount > 0 {
-            let max_wheat_send = new_amount.min(can_sell_at_most(&seller, &wheat, state, context)?);
-            let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
-            new_amount =
-                adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
-                    .map_err(map_exchange_error)?;
+    // Step 6: Calculate new offer amount and handle offer update/deletion
+    let new_amount = if wheat_stays {
+        let tentative = adjusted_offer_amount.saturating_sub(num_wheat_received);
+        if tentative > 0 {
+            // Re-adjust after balance changes
+            let post_change_wheat_send =
+                tentative.min(can_sell_at_most(&seller, &wheat, state, context)?);
+            let post_change_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+            adjust_offer_amount(
+                offer.price.clone(),
+                post_change_wheat_send,
+                post_change_sheep_receive,
+            )
+            .map_err(map_exchange_error)?
+        } else {
+            0
         }
     } else {
-        new_amount = 0;
-    }
+        0
+    };
 
+    // Step 7: Delete or update offer
     if new_amount == 0 {
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: seller.clone(),
@@ -854,6 +852,7 @@ fn cross_offer_v10(
             }
         }
     } else {
+        // Update offer and re-acquire liabilities
         let updated = stellar_xdr::curr::OfferEntry {
             amount: new_amount,
             ..offer.clone()
@@ -870,16 +869,26 @@ fn cross_offer_v10(
         )?;
     }
 
-    if num_wheat_received > 0 && num_sheep_send > 0 {
-        offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
-            seller_id: seller,
-            offer_id: offer.offer_id,
-            asset_sold: wheat,
-            amount_sold: num_wheat_received,
-            asset_bought: sheep,
-            amount_bought: num_sheep_send,
-        }));
+    // Step 8: Add ClaimAtom (C++ always adds one, even for 0-0 exchanges)
+    // However, for PathPaymentStrictSend with wheat_received=0 but sheep_send>0,
+    // don't add a ClaimAtom - the caller handles this case specially.
+    if round == RoundingType::PathPaymentStrictSend && num_wheat_received == 0 && num_sheep_send > 0
+    {
+        // Special case: strict send with rounding to 0 on receive side.
+        // Return the amounts without a ClaimAtom - the path payment will complete
+        // and then fail with UnderDestmin.
+        return Ok((num_wheat_received, num_sheep_send, wheat_stays));
     }
+
+    // For normal cases, add the ClaimAtom
+    offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
+        seller_id: seller,
+        offer_id: offer.offer_id,
+        asset_sold: wheat,
+        amount_sold: num_wheat_received,
+        asset_bought: sheep,
+        amount_bought: num_sheep_send,
+    }));
 
     Ok((num_wheat_received, num_sheep_send, wheat_stays))
 }

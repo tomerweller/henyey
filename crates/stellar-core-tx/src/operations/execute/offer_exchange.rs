@@ -213,8 +213,14 @@ pub fn exchange_v10(
         } else {
             check_price_error_bound(price, res.num_wheat_received, res.num_sheep_send, true)?;
         }
-    } else if round == RoundingType::PathPaymentStrictSend && res.num_sheep_send == 0 {
-        return Err(ExchangeError::InvalidAmount);
+    } else if round == RoundingType::PathPaymentStrictSend {
+        // For strict send: when wheat_received=0 and sheep_send=0, it means the offer
+        // can't trade (e.g., adjusted_offer_amount=0 or severe rounding).
+        // When wheat_received=0 but sheep_send>0, it means rounding reduced output to 0.
+        // In both cases, return the result as-is and let the caller handle it.
+        // The path payment logic will either try the next offer or complete with 0 output.
+        // Note: cross_offer_v10 must NOT apply balance changes when wheat_received=0.
+        res.num_wheat_received = 0;
     } else {
         res.num_wheat_received = 0;
         res.num_sheep_send = 0;
