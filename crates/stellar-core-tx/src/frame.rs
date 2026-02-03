@@ -859,4 +859,55 @@ mod tests {
         assert_eq!(frame.declared_soroban_resource_fee(), 150);
         assert_eq!(frame.inclusion_fee(), 750);
     }
+
+    /// Test TransactionFrame::with_network creates frame with network ID.
+    #[test]
+    fn test_frame_with_network() {
+        let envelope = create_test_transaction();
+        let network = NetworkId::testnet();
+        let frame = TransactionFrame::with_network(envelope, network.clone());
+
+        // Hash should be computed with the network ID
+        let hash_result = frame.hash(&network);
+        assert!(hash_result.is_ok());
+    }
+
+    /// Test operation_count for classic transactions.
+    #[test]
+    fn test_operation_count() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.operation_count(), 1);
+    }
+
+    /// Test fee extraction.
+    #[test]
+    fn test_fee_extraction() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.fee(), 100);
+    }
+
+    /// Test source_account extraction.
+    #[test]
+    fn test_source_account() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let source = frame.source_account();
+        // Should be MuxedAccount::Ed25519 with all zeros
+        match source {
+            MuxedAccount::Ed25519(key) => {
+                assert_eq!(key.0, [0u8; 32]);
+            }
+            _ => panic!("Expected MuxedAccount::Ed25519"),
+        }
+    }
+
+    /// Test memo extraction.
+    #[test]
+    fn test_memo() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(matches!(frame.memo(), Memo::None));
+    }
 }
