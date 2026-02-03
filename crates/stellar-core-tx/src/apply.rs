@@ -736,4 +736,232 @@ mod tests {
             _ => panic!("Expected Account key"),
         }
     }
+
+    /// Test LedgerDelta snapshot and truncate for savepoint support.
+    #[test]
+    fn test_ledger_delta_snapshot_and_truncate() {
+        let mut delta = LedgerDelta::new(100);
+
+        let account_id1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let entry1 = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id1.clone(),
+                balance: 1000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Add first entry
+        delta.record_create(entry1.clone());
+        assert_eq!(delta.change_count(), 1);
+
+        // Take snapshot
+        let snapshot = delta.snapshot_lengths();
+
+        // Add more entries
+        let account_id2 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
+        let entry2 = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id2.clone(),
+                balance: 2000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        delta.record_create(entry2.clone());
+        assert_eq!(delta.change_count(), 2);
+
+        // Truncate back to snapshot
+        delta.truncate_to(&snapshot);
+        assert_eq!(delta.change_count(), 1);
+        assert_eq!(delta.created_entries().len(), 1);
+    }
+
+    /// Test LedgerDelta apply_refund_to_account modifies the correct account.
+    #[test]
+    fn test_ledger_delta_apply_refund() {
+        let mut delta = LedgerDelta::new(100);
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32])));
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 1000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let pre_state = entry.clone();
+        let mut post_state = entry.clone();
+        if let LedgerEntryData::Account(ref mut acc) = post_state.data {
+            acc.balance = 900000000; // Reduced by fee
+        }
+        delta.record_update(pre_state, post_state);
+
+        // Apply refund
+        delta.apply_refund_to_account(&account_id, 50000000);
+
+        // Check the balance was updated
+        let updated = &delta.updated_entries()[0];
+        if let LedgerEntryData::Account(acc) = &updated.data {
+            assert_eq!(acc.balance, 950000000); // 900000000 + 50000000 refund
+        } else {
+            panic!("Expected account entry");
+        }
+    }
+
+    /// Test change_order preserves execution order.
+    #[test]
+    fn test_ledger_delta_change_order() {
+        let mut delta = LedgerDelta::new(100);
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32])));
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 1000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Create, then update, then delete
+        delta.record_create(entry.clone());
+        delta.record_update(entry.clone(), entry.clone());
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        delta.record_delete(key, entry);
+
+        let order = delta.change_order();
+        assert_eq!(order.len(), 3);
+        assert!(matches!(order[0], ChangeRef::Created(0)));
+        assert!(matches!(order[1], ChangeRef::Updated(0)));
+        assert!(matches!(order[2], ChangeRef::Deleted(0)));
+    }
+
+    /// Test AssetKey from different asset types.
+    #[test]
+    fn test_asset_key_variants() {
+        // Native
+        let native = stellar_xdr::curr::Asset::Native;
+        let key = AssetKey::from_asset(&native);
+        assert!(matches!(key, AssetKey::Native));
+
+        // CreditAlphanum4
+        let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32])));
+        let alpha4 = stellar_xdr::curr::Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer.clone(),
+        });
+        let key = AssetKey::from_asset(&alpha4);
+        match key {
+            AssetKey::CreditAlphanum4(code, _) => {
+                assert_eq!(&code, b"USD\0");
+            }
+            _ => panic!("Expected CreditAlphanum4"),
+        }
+
+        // CreditAlphanum12
+        let alpha12 = stellar_xdr::curr::Asset::CreditAlphanum12(AlphaNum12 {
+            asset_code: AssetCode12(*b"LONGASSET123"),
+            issuer: issuer.clone(),
+        });
+        let key = AssetKey::from_asset(&alpha12);
+        match key {
+            AssetKey::CreditAlphanum12(code, _) => {
+                assert_eq!(&code, b"LONGASSET123");
+            }
+            _ => panic!("Expected CreditAlphanum12"),
+        }
+    }
+
+    /// Test LedgerDelta merge preserves change order with correct offsets.
+    #[test]
+    fn test_ledger_delta_merge_change_order() {
+        let mut delta1 = LedgerDelta::new(100);
+        let mut delta2 = LedgerDelta::new(100);
+
+        let account_id1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([6u8; 32])));
+        let entry1 = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id1.clone(),
+                balance: 1000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let account_id2 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([7u8; 32])));
+        let entry2 = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id2.clone(),
+                balance: 2000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        delta1.record_create(entry1.clone());
+        delta2.record_create(entry2.clone());
+
+        delta1.merge(delta2);
+
+        assert_eq!(delta1.created_entries().len(), 2);
+        let order = delta1.change_order();
+        assert_eq!(order.len(), 2);
+        // First entry at index 0, second at index 1 (offset applied)
+        assert!(matches!(order[0], ChangeRef::Created(0)));
+        assert!(matches!(order[1], ChangeRef::Created(1)));
+    }
 }
