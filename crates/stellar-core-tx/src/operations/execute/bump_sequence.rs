@@ -140,4 +140,97 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    /// Test bumping sequence to INT64_MAX.
+    ///
+    /// C++ Reference: BumpSequenceTests.cpp - "bump to max" test section
+    #[test]
+    fn test_bump_sequence_to_max() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 100));
+
+        let op = BumpSequenceOp {
+            bump_to: SequenceNumber(i64::MAX),
+        };
+
+        let result = execute_bump_sequence(&op, &source_id, &mut state, &context)
+            .expect("bump sequence result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::BumpSequence(r)) => {
+                assert!(matches!(r, BumpSequenceResult::Success));
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Verify sequence was bumped to max
+        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, i64::MAX);
+    }
+
+    /// Test bumping sequence to exactly current sequence (no-op but success).
+    ///
+    /// C++ Reference: BumpSequenceTests.cpp - "bump same" test section
+    #[test]
+    fn test_bump_sequence_same() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 100));
+
+        let op = BumpSequenceOp {
+            bump_to: SequenceNumber(100), // Same as current
+        };
+
+        let result = execute_bump_sequence(&op, &source_id, &mut state, &context)
+            .expect("bump sequence result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::BumpSequence(r)) => {
+                assert!(
+                    matches!(r, BumpSequenceResult::Success),
+                    "Bump to same should succeed"
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Sequence should remain 100
+        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, 100);
+    }
+
+    /// Test bumping sequence to zero (valid - noop if current > 0).
+    ///
+    /// C++ Reference: BumpSequenceTests.cpp - "bump to zero" test section
+    #[test]
+    fn test_bump_sequence_to_zero() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(3);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 100));
+
+        let op = BumpSequenceOp {
+            bump_to: SequenceNumber(0),
+        };
+
+        let result = execute_bump_sequence(&op, &source_id, &mut state, &context)
+            .expect("bump sequence result");
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::BumpSequence(r)) => {
+                assert!(
+                    matches!(r, BumpSequenceResult::Success),
+                    "Bump to 0 should succeed (no-op)"
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Sequence should remain 100 (not bumped down)
+        assert_eq!(state.get_account(&source_id).unwrap().seq_num.0, 100);
+    }
 }

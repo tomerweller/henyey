@@ -1416,6 +1416,157 @@ mod tests {
         );
     }
 
+    /// Test ChangeTrust with source account having native selling liabilities.
+    ///
+    /// Selling liabilities don't affect the reserve check for creating trustlines.
+    /// The reserve check is purely based on balance >= minimum_balance, not available balance.
+    /// This test verifies that selling liabilities don't block trustline creation.
+    ///
+    /// C++ Reference: ChangeTrustTests.cpp - selling liabilities don't affect entry creation
+    #[test]
+    fn test_change_trust_with_native_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        // Calculate minimum balance needed for 1 trustline
+        let min_balance_with_tl = state
+            .minimum_balance_with_counts(context.protocol_version, 1, 0, 0)
+            .unwrap();
+
+        // Create source with selling liabilities - but balance is sufficient for reserve
+        let mut source = create_test_account(source_id.clone(), min_balance_with_tl + 100);
+        source.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 200, // Selling liabilities don't affect reserve check
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(source);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        };
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 1_000_000,
+        };
+
+        // ChangeTrust should succeed - selling liabilities don't affect reserve check
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::Success),
+                    "Expected Success (selling liabilities don't block entry creation), got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Verify trustline was created
+        assert_eq!(state.get_account(&source_id).unwrap().num_sub_entries, 1);
+    }
+
+    /// Test ChangeTrust update existing trustline with issuer that was deleted.
+    ///
+    /// If updating an existing trustline and the issuer account no longer exists,
+    /// should return NoIssuer.
+    ///
+    /// C++ Reference: ChangeTrustTests.cpp - "no issuer on update" test section
+    #[test]
+    fn test_change_trust_update_no_issuer() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        // Create issuer initially
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        };
+
+        // Create trustline
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(asset.clone()),
+            0,
+            1_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        // Delete the issuer
+        state.delete_account(&issuer_id);
+
+        // Try to update the trustline
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 2_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::NoIssuer),
+                    "Expected NoIssuer when issuer deleted, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test ChangeTrust with negative limit returns Malformed.
+    ///
+    /// C++ Reference: ChangeTrustTests.cpp - "negative limit" test section
+    #[test]
+    fn test_change_trust_negative_limit_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        };
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: -1,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::Malformed),
+                    "Expected Malformed for negative limit, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
     /// Test that pool share trustlines (which count as 2 subentries) are properly
     /// checked against the subentries limit.
     #[test]

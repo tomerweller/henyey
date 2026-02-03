@@ -1142,4 +1142,342 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test native payment to self succeeds (no-op, but valid).
+    ///
+    /// C++ Reference: PaymentTests.cpp - "pay self" test section
+    #[test]
+    fn test_native_payment_to_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(50);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Pay self
+        let op = PaymentOp {
+            destination: create_test_muxed_account(50), // Same as source
+            asset: Asset::Native,
+            amount: 1000,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::Success),
+                    "Self-payment should succeed"
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Balance should be unchanged (self-payment is a no-op)
+        assert_eq!(state.get_account(&source_id).unwrap().balance, 100_000_000);
+    }
+
+    /// Test native payment source only has minimum reserve fails with Underfunded.
+    ///
+    /// C++ Reference: PaymentTests.cpp - "source only has reserve" test section
+    #[test]
+    fn test_native_payment_source_only_has_reserve() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(51);
+        let dest_id = create_test_account_id(52);
+
+        // Calculate exact minimum balance
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
+
+        // Source has exactly minimum balance
+        state.create_account(create_test_account(source_id.clone(), min_balance));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        // Try to pay any amount - should fail
+        let op = PaymentOp {
+            destination: create_test_muxed_account(52),
+            asset: Asset::Native,
+            amount: 1,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::Underfunded),
+                    "Expected Underfunded when source only has reserve, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test native payment negative amount returns Malformed.
+    ///
+    /// C++ Reference: PaymentTests.cpp - "malformed negative amount" test section
+    #[test]
+    fn test_native_payment_negative_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(53);
+        let dest_id = create_test_account_id(54);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(54),
+            asset: Asset::Native,
+            amount: -1,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::Malformed),
+                    "Expected Malformed for negative amount, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test credit payment underfunded - source has zero balance in trustline.
+    ///
+    /// C++ Reference: PaymentTests.cpp - "underfunded credit" test section
+    #[test]
+    fn test_credit_payment_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(55);
+        let dest_id = create_test_account_id(56);
+        let issuer_id = create_test_account_id(57);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Source trustline with zero balance
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            0, // Zero balance
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Destination trustline
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id,
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(56),
+            asset,
+            amount: 100,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::Underfunded),
+                    "Expected Underfunded for zero balance, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test credit payment line full - destination trustline at limit.
+    ///
+    /// C++ Reference: PaymentTests.cpp - "line full" test section
+    #[test]
+    fn test_credit_payment_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(58);
+        let dest_id = create_test_account_id(59);
+        let issuer_id = create_test_account_id(60);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Source trustline with balance
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            1000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Destination trustline already at limit
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id,
+            }),
+            1000,
+            1000, // Limit equals balance - no room
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(59),
+            asset,
+            amount: 100,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::LineFull),
+                    "Expected LineFull when dest at limit, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test credit payment source no trust - paying credit without trustline.
+    ///
+    /// C++ Reference: PaymentTests.cpp - "src no trust" test section
+    #[test]
+    fn test_credit_payment_source_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(61);
+        let dest_id = create_test_account_id(62);
+        let issuer_id = create_test_account_id(63);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // No trustline for source - only for dest
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id,
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(62),
+            asset,
+            amount: 100,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::SrcNoTrust),
+                    "Expected SrcNoTrust, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test credit payment destination no trust.
+    ///
+    /// C++ Reference: PaymentTests.cpp - "no trust dest" test section
+    #[test]
+    fn test_credit_payment_no_trust_dest() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(64);
+        let dest_id = create_test_account_id(65);
+        let issuer_id = create_test_account_id(66);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Source has trustline, dest doesn't
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id,
+            }),
+            1000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PaymentOp {
+            destination: create_test_muxed_account(65),
+            asset,
+            amount: 100,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::NoTrust),
+                    "Expected NoTrust for dest, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }
