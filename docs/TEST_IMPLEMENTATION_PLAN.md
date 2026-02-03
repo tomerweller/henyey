@@ -1361,14 +1361,15 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 714
-- **Tests added:** 344
-- **Latest:** Added 12 tests to live_execution.rs:
-  - LiveExecutionContext accessors (close_time, network_id, base_reserve)
-  - State management (take_state, restore_state, without_state)
-  - FeeSeqNumResult struct tests
-  - Protocol constants verification
-  - Edge cases (zero balance, exact fee match, zero base fee)
+- **Current test count:** 734
+- **Tests added:** 364
+- **Latest:** Added 20 tests to frame.rs:
+  - TransactionFrame constructors (new, with_network, into_envelope)
+  - Hash caching (cached_hash, compute_hash)
+  - Account ID extraction (source_account_id, fee_source_account_id, inner_source_account_id)
+  - Soroban detection and data access
+  - Fees (total_fee, declared_soroban_resource_fee, refundable_fee)
+  - Operations, signatures, preconditions accessors
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---

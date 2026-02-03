@@ -910,4 +910,179 @@ mod tests {
         let frame = TransactionFrame::new(envelope);
         assert!(matches!(frame.memo(), Memo::None));
     }
+
+    // === Additional TransactionFrame tests ===
+
+    #[test]
+    fn test_into_envelope() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope.clone());
+        let recovered = frame.into_envelope();
+        // Verify the envelope was recovered
+        match recovered {
+            TransactionEnvelope::Tx(_) => {}
+            _ => panic!("Expected Tx envelope"),
+        }
+    }
+
+    #[test]
+    fn test_cached_hash_none_initially() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.cached_hash().is_none());
+    }
+
+    #[test]
+    fn test_compute_hash_caches() {
+        let envelope = create_test_transaction();
+        let mut frame = TransactionFrame::new(envelope);
+        let network = NetworkId::testnet();
+
+        assert!(frame.cached_hash().is_none());
+
+        let hash = frame.compute_hash(&network).unwrap();
+
+        assert!(frame.cached_hash().is_some());
+        assert_eq!(frame.cached_hash().unwrap(), hash);
+    }
+
+    #[test]
+    fn test_source_account_id() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let account_id = frame.source_account_id();
+
+        // Should be AccountId with all zeros
+        match account_id.0 {
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+                assert_eq!(key.0, [0u8; 32]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_fee_source_account_id() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+
+        // For non-fee-bump, fee source is same as inner source
+        assert_eq!(frame.fee_source_account_id(), frame.inner_source_account_id());
+    }
+
+    #[test]
+    fn test_inner_source_account_id() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let inner_source = frame.inner_source_account_id();
+
+        match inner_source.0 {
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+                assert_eq!(key.0, [0u8; 32]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_total_fee() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.total_fee(), 100);
+    }
+
+    #[test]
+    fn test_is_fee_bump_false() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(!frame.is_fee_bump());
+    }
+
+    #[test]
+    fn test_is_soroban_false_for_classic() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(!frame.is_soroban());
+    }
+
+    #[test]
+    fn test_is_soroban_true_for_soroban() {
+        let envelope = create_soroban_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.is_soroban());
+    }
+
+    #[test]
+    fn test_refundable_fee_classic() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.refundable_fee().is_none());
+    }
+
+    #[test]
+    fn test_refundable_fee_soroban() {
+        let envelope = create_soroban_transaction_with_fees(200, 1000);
+        let frame = TransactionFrame::new(envelope);
+        let refundable = frame.refundable_fee();
+        assert!(refundable.is_some());
+        assert_eq!(refundable.unwrap(), 200);
+    }
+
+    #[test]
+    fn test_soroban_data_none_for_classic() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.soroban_data().is_none());
+    }
+
+    #[test]
+    fn test_soroban_data_some_for_soroban() {
+        let envelope = create_soroban_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let data = frame.soroban_data();
+        assert!(data.is_some());
+    }
+
+    #[test]
+    fn test_operations() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let ops = frame.operations();
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn test_is_valid_structure_true() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.is_valid_structure());
+    }
+
+    #[test]
+    fn test_declared_soroban_resource_fee_zero_for_classic() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.declared_soroban_resource_fee(), 0);
+    }
+
+    #[test]
+    fn test_declared_soroban_resource_fee_for_soroban() {
+        let envelope = create_soroban_transaction_with_fees(300, 500);
+        let frame = TransactionFrame::new(envelope);
+        assert_eq!(frame.declared_soroban_resource_fee(), 300);
+    }
+
+    #[test]
+    fn test_signatures() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let sigs = frame.signatures();
+        assert!(sigs.is_empty());
+    }
+
+    #[test]
+    fn test_preconditions() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        let precond = frame.preconditions();
+        assert!(matches!(precond, Preconditions::None));
+    }
 }
