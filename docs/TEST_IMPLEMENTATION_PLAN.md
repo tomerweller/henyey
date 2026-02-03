@@ -1361,15 +1361,13 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 734
-- **Tests added:** 364
-- **Latest:** Added 20 tests to frame.rs:
-  - TransactionFrame constructors (new, with_network, into_envelope)
-  - Hash caching (cached_hash, compute_hash)
-  - Account ID extraction (source_account_id, fee_source_account_id, inner_source_account_id)
-  - Soroban detection and data access
-  - Fees (total_fee, declared_soroban_resource_fee, refundable_fee)
-  - Operations, signatures, preconditions accessors
+- **Current test count:** 744
+- **Tests added:** 374
+- **Latest:** Added 10 tests to apply.rs:
+  - ChangeRef and DeltaLengths struct tests
+  - LedgerDelta state accessors (update_states, delete_states)
+  - entry_to_key for different entry types (Trustline, Offer, Data)
+  - Clone trait verification
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---

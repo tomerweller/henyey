@@ -964,4 +964,248 @@ mod tests {
         assert!(matches!(order[0], ChangeRef::Created(0)));
         assert!(matches!(order[1], ChangeRef::Created(1)));
     }
+
+    // === Additional LedgerDelta tests ===
+
+    #[test]
+    fn test_change_ref_debug() {
+        let ref1 = ChangeRef::Created(0);
+        let ref2 = ChangeRef::Updated(5);
+        let ref3 = ChangeRef::Deleted(10);
+
+        let debug1 = format!("{:?}", ref1);
+        let debug2 = format!("{:?}", ref2);
+        let debug3 = format!("{:?}", ref3);
+
+        assert!(debug1.contains("Created"));
+        assert!(debug2.contains("Updated"));
+        assert!(debug3.contains("Deleted"));
+    }
+
+    #[test]
+    fn test_delta_lengths_struct() {
+        let lengths = DeltaLengths {
+            created: 5,
+            updated: 3,
+            deleted: 2,
+            change_order: 10,
+        };
+
+        assert_eq!(lengths.created, 5);
+        assert_eq!(lengths.updated, 3);
+        assert_eq!(lengths.deleted, 2);
+        assert_eq!(lengths.change_order, 10);
+    }
+
+    #[test]
+    fn test_ledger_delta_update_states() {
+        let mut delta = LedgerDelta::new(100);
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([8u8; 32])));
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 1000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let pre_state = entry.clone();
+        let mut post_state = entry.clone();
+        if let LedgerEntryData::Account(ref mut acc) = post_state.data {
+            acc.balance = 500000000;
+        }
+
+        delta.record_update(pre_state, post_state);
+
+        assert_eq!(delta.update_states().len(), 1);
+        assert_eq!(delta.updated_entries().len(), 1);
+
+        // Verify pre_state is preserved
+        if let LedgerEntryData::Account(acc) = &delta.update_states()[0].data {
+            assert_eq!(acc.balance, 1000000000);
+        }
+        // Verify post_state is correct
+        if let LedgerEntryData::Account(acc) = &delta.updated_entries()[0].data {
+            assert_eq!(acc.balance, 500000000);
+        }
+    }
+
+    #[test]
+    fn test_ledger_delta_delete_states() {
+        let mut delta = LedgerDelta::new(100);
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 2000000000,
+                seq_num: SequenceNumber(5),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        delta.record_delete(key, entry);
+
+        assert_eq!(delta.deleted_keys().len(), 1);
+        assert_eq!(delta.delete_states().len(), 1);
+
+        // Verify pre_state is preserved
+        if let LedgerEntryData::Account(acc) = &delta.delete_states()[0].data {
+            assert_eq!(acc.balance, 2000000000);
+            assert_eq!(acc.seq_num.0, 5);
+        }
+    }
+
+    #[test]
+    fn test_ledger_delta_has_changes_false() {
+        let delta = LedgerDelta::new(200);
+        assert!(!delta.has_changes());
+    }
+
+    #[test]
+    fn test_ledger_delta_has_changes_after_create() {
+        let mut delta = LedgerDelta::new(200);
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([10u8; 32])));
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 200,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 1000000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        delta.record_create(entry);
+        assert!(delta.has_changes());
+    }
+
+    #[test]
+    fn test_ledger_delta_clone() {
+        let mut delta = LedgerDelta::new(300);
+        delta.add_fee(500);
+
+        let cloned = delta.clone();
+
+        assert_eq!(cloned.ledger_seq(), 300);
+        assert_eq!(cloned.fee_charged(), 500);
+    }
+
+    #[test]
+    fn test_entry_to_key_trustline() {
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([11u8; 32])));
+        let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([12u8; 32])));
+        let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer,
+        });
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Trustline(TrustLineEntry {
+                account_id: account_id.clone(),
+                asset: asset.clone(),
+                balance: 5000000,
+                limit: 10000000,
+                flags: 0,
+                ext: TrustLineEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = entry_to_key(&entry);
+        match key {
+            LedgerKey::Trustline(k) => {
+                assert_eq!(k.account_id, account_id);
+            }
+            _ => panic!("Expected Trustline key"),
+        }
+    }
+
+    #[test]
+    fn test_entry_to_key_offer() {
+        let seller = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([13u8; 32])));
+        let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([14u8; 32])));
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Offer(OfferEntry {
+                seller_id: seller.clone(),
+                offer_id: 12345,
+                selling: Asset::Native,
+                buying: Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4(*b"USD\0"),
+                    issuer,
+                }),
+                amount: 1000,
+                price: Price { n: 1, d: 1 },
+                flags: 0,
+                ext: OfferEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = entry_to_key(&entry);
+        match key {
+            LedgerKey::Offer(k) => {
+                assert_eq!(k.seller_id, seller);
+                assert_eq!(k.offer_id, 12345);
+            }
+            _ => panic!("Expected Offer key"),
+        }
+    }
+
+    #[test]
+    fn test_entry_to_key_data() {
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([15u8; 32])));
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Data(DataEntry {
+                account_id: account_id.clone(),
+                data_name: String64::try_from(b"mykey".to_vec()).unwrap(),
+                data_value: DataValue(vec![1, 2, 3, 4].try_into().unwrap()),
+                ext: DataEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = entry_to_key(&entry);
+        match key {
+            LedgerKey::Data(k) => {
+                assert_eq!(k.account_id, account_id);
+            }
+            _ => panic!("Expected Data key"),
+        }
+    }
 }
