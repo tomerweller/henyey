@@ -360,4 +360,129 @@ mod tests {
         assert_eq!(result.num_wheat_received, 50);
         assert_eq!(result.num_sheep_send, 50);
     }
+
+    /// Test exchange with large amounts near overflow.
+    #[test]
+    fn test_exchange_v10_large_amounts() {
+        let price = Price { n: 1, d: 1 };
+        let large = 1_000_000_000_000i64;
+        let result = exchange_v10(
+            price,
+            large,
+            large,
+            large,
+            large,
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        assert!(result.num_wheat_received > 0);
+        assert!(result.num_sheep_send > 0);
+    }
+
+    /// Test exchange with asymmetric limits.
+    #[test]
+    fn test_exchange_v10_asymmetric_limits() {
+        let price = Price { n: 1, d: 1 };
+        let result = exchange_v10(
+            price,
+            1000,  // wheat_send
+            10,    // wheat_receive (very limited)
+            1000,  // sheep_send
+            1000,  // sheep_receive
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        // Wheat receive is limiting
+        assert!(result.num_wheat_received <= 10);
+    }
+
+    /// Test exchange with fractional price.
+    #[test]
+    fn test_exchange_v10_fractional_price() {
+        let price = Price { n: 3, d: 7 };
+        let result = exchange_v10(
+            price,
+            100,
+            100,
+            100,
+            100,
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        // At 3/7 price, wheat is cheaper than sheep
+        assert!(result.num_wheat_received > 0);
+        assert!(result.num_sheep_send > 0);
+    }
+
+    /// Test big_multiply helper function.
+    #[test]
+    fn test_big_multiply() {
+        assert_eq!(big_multiply(100, 200), 20000);
+        assert_eq!(big_multiply(i64::MAX, 1), i64::MAX as i128);
+        assert_eq!(big_multiply(0, i64::MAX), 0);
+        assert_eq!(big_multiply(-100, 50), -5000);
+    }
+
+    /// Test big_divide_or_throw helper function.
+    #[test]
+    fn test_big_divide_or_throw() {
+        // Round down
+        assert_eq!(big_divide_or_throw(10, 3, Round::Down).unwrap(), 3);
+        assert_eq!(big_divide_or_throw(9, 3, Round::Down).unwrap(), 3);
+
+        // Round up
+        assert_eq!(big_divide_or_throw(10, 3, Round::Up).unwrap(), 4);
+        assert_eq!(big_divide_or_throw(9, 3, Round::Up).unwrap(), 3);
+
+        // Zero numerator
+        assert_eq!(big_divide_or_throw(0, 5, Round::Down).unwrap(), 0);
+        assert_eq!(big_divide_or_throw(0, 5, Round::Up).unwrap(), 0);
+
+        // Invalid denominator
+        assert!(big_divide_or_throw(10, 0, Round::Down).is_err());
+        assert!(big_divide_or_throw(10, -1, Round::Down).is_err());
+    }
+
+    /// Test ExchangeResult struct.
+    #[test]
+    fn test_exchange_result_struct() {
+        let result = ExchangeResult {
+            num_wheat_received: 100,
+            num_sheep_send: 50,
+            wheat_stays: true,
+        };
+
+        assert_eq!(result.num_wheat_received, 100);
+        assert_eq!(result.num_sheep_send, 50);
+        assert!(result.wheat_stays);
+    }
+
+    /// Test exchange when all limits are zero.
+    #[test]
+    fn test_exchange_v10_all_zero() {
+        let price = Price { n: 1, d: 1 };
+        let result = exchange_v10(
+            price,
+            0,
+            0,
+            0,
+            0,
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        assert_eq!(result.num_wheat_received, 0);
+        assert_eq!(result.num_sheep_send, 0);
+    }
+
+    /// Test RoundingType enum.
+    #[test]
+    fn test_rounding_type_enum() {
+        assert_eq!(RoundingType::Normal, RoundingType::Normal);
+        assert_ne!(RoundingType::Normal, RoundingType::PathPaymentStrictSend);
+        assert_ne!(RoundingType::PathPaymentStrictSend, RoundingType::PathPaymentStrictReceive);
+    }
 }
