@@ -429,4 +429,102 @@ mod tests {
             other => panic!("Unexpected result: {:?}", other),
         }
     }
+
+    /// Test CreateAccount with negative starting balance returns LowReserve.
+    ///
+    /// Negative balance is less than minimum reserve, so returns LowReserve.
+    #[test]
+    fn test_create_account_negative_balance() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(10);
+        let dest_id = create_test_account_id(11);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = CreateAccountOp {
+            destination: dest_id,
+            starting_balance: -1,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                // Negative balance < min_balance, so returns LowReserve
+                assert!(
+                    matches!(r, CreateAccountResult::LowReserve),
+                    "Expected LowReserve for negative balance, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test CreateAccount where destination is the source account returns AlreadyExist.
+    ///
+    /// When trying to create an account that already exists (including self), returns AlreadyExist.
+    #[test]
+    fn test_create_account_self_destination() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(12);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = CreateAccountOp {
+            destination: source_id.clone(), // Same as source - already exists
+            starting_balance: 10_000_000,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                // Source account already exists, so creating it again returns AlreadyExist
+                assert!(
+                    matches!(r, CreateAccountResult::AlreadyExist),
+                    "Expected AlreadyExist when dest==source, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test CreateAccount with zero starting balance returns LowReserve (without sponsorship).
+    ///
+    /// Without sponsorship, the minimum balance is typically > 0, so zero balance fails.
+    #[test]
+    fn test_create_account_zero_balance_fails_without_sponsorship() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(13);
+        let dest_id = create_test_account_id(14);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 0,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                // Without sponsorship, minimum balance > 0, so zero balance fails
+                assert!(
+                    matches!(r, CreateAccountResult::LowReserve),
+                    "Zero balance without sponsorship should fail with LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
 }
