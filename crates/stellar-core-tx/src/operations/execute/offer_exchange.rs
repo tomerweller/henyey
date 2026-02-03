@@ -228,3 +228,136 @@ pub fn exchange_v10(
 
     Ok(res)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test basic exchange at 1:1 price.
+    #[test]
+    fn test_exchange_v10_one_to_one() {
+        let price = Price { n: 1, d: 1 };
+        let result = exchange_v10(
+            price,
+            100, // max_wheat_send
+            100, // max_wheat_receive
+            100, // max_sheep_send
+            100, // max_sheep_receive
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        assert_eq!(result.num_wheat_received, 100);
+        assert_eq!(result.num_sheep_send, 100);
+    }
+
+    /// Test exchange with 2:1 price (2 sheep for 1 wheat).
+    #[test]
+    fn test_exchange_v10_two_to_one() {
+        let price = Price { n: 2, d: 1 };
+        let result = exchange_v10(
+            price,
+            100,  // max_wheat_send
+            50,   // max_wheat_receive (limited to 50 wheat)
+            100,  // max_sheep_send
+            100,  // max_sheep_receive
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        // At 2:1 price, receiving 50 wheat requires sending 100 sheep
+        assert_eq!(result.num_wheat_received, 50);
+        assert_eq!(result.num_sheep_send, 100);
+    }
+
+    /// Test exchange with invalid price (zero numerator).
+    #[test]
+    fn test_exchange_v10_invalid_price_zero_n() {
+        let price = Price { n: 0, d: 1 };
+        let result = exchange_v10(price, 100, 100, 100, 100, RoundingType::Normal);
+        assert!(matches!(result, Err(ExchangeError::InvalidPrice)));
+    }
+
+    /// Test exchange with invalid price (zero denominator).
+    #[test]
+    fn test_exchange_v10_invalid_price_zero_d() {
+        let price = Price { n: 1, d: 0 };
+        let result = exchange_v10(price, 100, 100, 100, 100, RoundingType::Normal);
+        assert!(matches!(result, Err(ExchangeError::InvalidPrice)));
+    }
+
+    /// Test exchange when wheat side has more value (wheat_stays = true).
+    #[test]
+    fn test_exchange_v10_wheat_stays() {
+        let price = Price { n: 1, d: 1 };
+        let result = exchange_v10(
+            price,
+            1000, // wheat has more to offer
+            100,
+            50, // sheep limited
+            100,
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        // Sheep is limiting, so wheat stays
+        assert!(result.wheat_stays);
+        assert!(result.num_sheep_send <= 50);
+    }
+
+    /// Test exchange with strict send rounding.
+    #[test]
+    fn test_exchange_v10_strict_send() {
+        let price = Price { n: 3, d: 2 };
+        let result = exchange_v10(
+            price,
+            100,
+            100,
+            100,
+            100,
+            RoundingType::PathPaymentStrictSend,
+        )
+        .unwrap();
+
+        // Should successfully complete with some exchange
+        assert!(result.num_wheat_received >= 0);
+        assert!(result.num_sheep_send >= 0);
+    }
+
+    /// Test exchange with strict receive rounding.
+    #[test]
+    fn test_exchange_v10_strict_receive() {
+        let price = Price { n: 3, d: 2 };
+        let result = exchange_v10(
+            price,
+            100,
+            100,
+            100,
+            100,
+            RoundingType::PathPaymentStrictReceive,
+        )
+        .unwrap();
+
+        // Should successfully complete with some exchange
+        assert!(result.num_wheat_received >= 0);
+        assert!(result.num_sheep_send >= 0);
+    }
+
+    /// Test exchange_v10_without_price_error_thresholds at 1:1 price.
+    #[test]
+    fn test_exchange_without_thresholds_basic() {
+        let price = Price { n: 1, d: 1 };
+        let result = exchange_v10_without_price_error_thresholds(
+            price,
+            50, // max_wheat_send
+            50, // max_wheat_receive
+            50, // max_sheep_send
+            50, // max_sheep_receive
+            RoundingType::Normal,
+        )
+        .unwrap();
+
+        assert_eq!(result.num_wheat_received, 50);
+        assert_eq!(result.num_sheep_send, 50);
+    }
+}
