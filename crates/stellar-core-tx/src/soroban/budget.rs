@@ -264,4 +264,136 @@ mod tests {
         let _ = budget.charge_cpu(200);
         assert!(budget.is_exhausted());
     }
+
+    /// Test memory budget tracking.
+    #[test]
+    fn test_budget_memory_tracking() {
+        let mut budget = SorobanBudget::new(ResourceLimits {
+            memory_bytes: 1024,
+            ..Default::default()
+        });
+
+        assert!(budget.charge_mem(512).is_ok());
+        assert_eq!(budget.mem_used, 512);
+        assert_eq!(budget.remaining_mem(), 512);
+
+        assert!(budget.charge_mem(512).is_ok());
+        assert_eq!(budget.mem_used, 1024);
+        assert_eq!(budget.remaining_mem(), 0);
+
+        // Exceeds limit
+        let result = budget.charge_mem(1);
+        assert!(matches!(result, Err(BudgetError::MemoryLimitExceeded)));
+    }
+
+    /// Test read bytes budget tracking.
+    #[test]
+    fn test_budget_read_tracking() {
+        let mut budget = SorobanBudget::new(ResourceLimits {
+            read_bytes: 200,
+            ..Default::default()
+        });
+
+        assert!(budget.charge_read(100).is_ok());
+        assert_eq!(budget.read_bytes_used, 100);
+
+        assert!(budget.charge_read(100).is_ok());
+        assert_eq!(budget.read_bytes_used, 200);
+
+        let result = budget.charge_read(1);
+        assert!(matches!(result, Err(BudgetError::ReadLimitExceeded)));
+    }
+
+    /// Test write bytes budget tracking.
+    #[test]
+    fn test_budget_write_tracking() {
+        let mut budget = SorobanBudget::new(ResourceLimits {
+            write_bytes: 150,
+            ..Default::default()
+        });
+
+        assert!(budget.charge_write(75).is_ok());
+        assert_eq!(budget.write_bytes_used, 75);
+
+        assert!(budget.charge_write(75).is_ok());
+        assert_eq!(budget.write_bytes_used, 150);
+
+        let result = budget.charge_write(1);
+        assert!(matches!(result, Err(BudgetError::WriteLimitExceeded)));
+    }
+
+    /// Test budget reset.
+    #[test]
+    fn test_budget_reset() {
+        let mut budget = SorobanBudget::new(ResourceLimits::default());
+
+        budget.cpu_used = 1000;
+        budget.mem_used = 2000;
+        budget.read_bytes_used = 3000;
+        budget.write_bytes_used = 4000;
+
+        budget.reset();
+
+        assert_eq!(budget.cpu_used, 0);
+        assert_eq!(budget.mem_used, 0);
+        assert_eq!(budget.read_bytes_used, 0);
+        assert_eq!(budget.write_bytes_used, 0);
+    }
+
+    /// Test SorobanConfig default values.
+    #[test]
+    fn test_soroban_config_default() {
+        let config = SorobanConfig::default();
+
+        assert_eq!(config.tx_max_instructions, 100_000_000);
+        assert_eq!(config.tx_max_memory_bytes, 40 * 1024 * 1024);
+        assert_eq!(config.min_temp_entry_ttl, 16);
+        assert_eq!(config.min_persistent_entry_ttl, 120960);
+        assert_eq!(config.max_entry_ttl, 6312000);
+        // Default has empty cost params
+        assert!(!config.has_valid_cost_params());
+    }
+
+    /// Test ResourceLimits default values.
+    #[test]
+    fn test_resource_limits_default() {
+        let limits = ResourceLimits::default();
+
+        assert_eq!(limits.cpu_instructions, 100_000_000);
+        assert_eq!(limits.memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.read_bytes, 200 * 1024);
+        assert_eq!(limits.write_bytes, 65 * 1024);
+        assert_eq!(limits.read_entries, 40);
+        assert_eq!(limits.write_entries, 25);
+    }
+
+    /// Test is_exhausted with multiple resource types.
+    #[test]
+    fn test_budget_exhausted_multiple_resources() {
+        let limits = ResourceLimits {
+            cpu_instructions: 100,
+            memory_bytes: 100,
+            read_bytes: 100,
+            write_bytes: 100,
+            read_entries: 10,
+            write_entries: 10,
+        };
+        let mut budget = SorobanBudget::new(limits);
+
+        assert!(!budget.is_exhausted());
+
+        // Memory exhausted
+        budget.mem_used = 200;
+        assert!(budget.is_exhausted());
+        budget.mem_used = 0;
+
+        // Read exhausted
+        budget.read_bytes_used = 200;
+        assert!(budget.is_exhausted());
+        budget.read_bytes_used = 0;
+
+        // Write exhausted
+        budget.write_bytes_used = 200;
+        assert!(budget.is_exhausted());
+    }
 }

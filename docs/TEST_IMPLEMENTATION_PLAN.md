@@ -1361,8 +1361,8 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 488
-- **Tests added:** 118
+- **Current test count:** 495
+- **Tests added:** 125
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---
