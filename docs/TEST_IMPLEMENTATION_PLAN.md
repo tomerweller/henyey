@@ -1361,8 +1361,9 @@ Key areas:
 
 ### Progress Summary
 - **Starting test count:** 370
-- **Current test count:** 589
-- **Tests added:** 219
+- **Current test count:** 650
+- **Tests added:** 280
+- **Latest:** Added 61 tests to events.rs (0 → 61)
 - **Bugs fixed:** 2 (SetOptions subentries, ManageOffer check ordering)
 
 ---

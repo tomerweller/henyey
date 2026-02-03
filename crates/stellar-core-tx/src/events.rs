@@ -979,3 +979,1010 @@ fn get_asset_from_event(event: &ContractEvent, network_id: &NetworkId) -> Option
     }
     Some(asset)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{MuxedAccountMed25519, PublicKey, Uint256};
+
+    fn test_account_id(seed: u8) -> AccountId {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
+    }
+
+    fn test_asset_alphanum4(seed: u8) -> Asset {
+        Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+            asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: test_account_id(seed),
+        })
+    }
+
+    fn test_asset_alphanum12(seed: u8) -> Asset {
+        Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
+            asset_code: stellar_xdr::curr::AssetCode12([
+                b'L', b'O', b'N', b'G', b'A', b'S', b'S', b'E', b'T', 0, 0, 0,
+            ]),
+            issuer: test_account_id(seed),
+        })
+    }
+
+    // === ClassicEventConfig tests ===
+
+    #[test]
+    fn test_classic_event_config_default() {
+        let config = ClassicEventConfig::default();
+        assert!(!config.emit_classic_events);
+        assert!(!config.backfill_stellar_asset_events);
+    }
+
+    #[test]
+    fn test_classic_event_config_events_enabled() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        assert!(config.events_enabled(25));
+        assert!(config.events_enabled(23));
+
+        let disabled = ClassicEventConfig {
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
+        };
+        assert!(!disabled.events_enabled(25));
+    }
+
+    #[test]
+    fn test_classic_event_config_backfill() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: true,
+        };
+        // backfill_to_protocol23 always returns false in current implementation
+        assert!(!config.backfill_to_protocol23(22));
+        assert!(!config.backfill_to_protocol23(23));
+    }
+
+    // === OpEventManager tests ===
+
+    #[test]
+    fn test_op_event_manager_disabled() {
+        let manager = OpEventManager::disabled();
+        assert!(!manager.is_enabled());
+        assert!(!manager.is_finalized());
+        assert_eq!(manager.event_count(), 0);
+    }
+
+    #[test]
+    fn test_op_event_manager_new_enabled() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let manager = OpEventManager::new(
+            true,  // meta_enabled
+            false, // is_soroban
+            25,    // protocol_version
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+        assert!(manager.is_enabled());
+        assert!(!manager.is_finalized());
+        assert_eq!(manager.event_count(), 0);
+    }
+
+    #[test]
+    fn test_op_event_manager_new_disabled_no_meta() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let manager = OpEventManager::new(
+            false, // meta_enabled = false
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+        assert!(!manager.is_enabled());
+    }
+
+    #[test]
+    fn test_op_event_manager_new_soroban_enabled() {
+        let config = ClassicEventConfig {
+            emit_classic_events: false, // classic events disabled
+            backfill_stellar_asset_events: false,
+        };
+        let manager = OpEventManager::new(
+            true,
+            true, // is_soroban = true
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+        // Soroban operations enable events even without classic events config
+        assert!(manager.is_enabled());
+    }
+
+    #[test]
+    fn test_op_event_manager_finalize() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        assert!(!manager.is_finalized());
+        let events = manager.finalize();
+        assert!(manager.is_finalized());
+        assert!(events.is_empty());
+
+        // Second finalize returns empty
+        let events2 = manager.finalize();
+        assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn test_op_event_manager_into_events() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+        let events = manager.into_events();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_op_event_manager_transfer_event() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let from = ScAddress::Account(test_account_id(1));
+        let to = ScAddress::Account(test_account_id(2));
+        manager.new_transfer_event(&Asset::Native, &from, &to, 1000, false);
+
+        assert_eq!(manager.event_count(), 1);
+        let events = manager.finalize();
+        assert_eq!(events.len(), 1);
+
+        // Verify event structure
+        let event = &events[0];
+        assert!(event.contract_id.is_some());
+        assert_eq!(event.type_, ContractEventType::Contract);
+    }
+
+    #[test]
+    fn test_op_event_manager_mint_event() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let to = ScAddress::Account(test_account_id(1));
+        manager.new_mint_event(&Asset::Native, &to, 5000, false);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_op_event_manager_mint_event_at_beginning() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let to1 = ScAddress::Account(test_account_id(1));
+        let to2 = ScAddress::Account(test_account_id(2));
+
+        // Add first mint event normally
+        manager.new_mint_event(&Asset::Native, &to1, 1000, false);
+        // Add second at beginning
+        manager.new_mint_event_at_beginning(&Asset::Native, &to2, 2000);
+
+        assert_eq!(manager.event_count(), 2);
+    }
+
+    #[test]
+    fn test_op_event_manager_burn_event() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let from = ScAddress::Account(test_account_id(1));
+        manager.new_burn_event(&Asset::Native, &from, 500);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_op_event_manager_clawback_event() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let from = ScAddress::Account(test_account_id(1));
+        manager.new_clawback_event(&test_asset_alphanum4(10), &from, 100);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_op_event_manager_set_authorized_event() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let account = test_account_id(1);
+        manager.new_set_authorized_event(&test_asset_alphanum4(10), &account, true);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_op_event_manager_disabled_no_events() {
+        let mut manager = OpEventManager::disabled();
+
+        let from = ScAddress::Account(test_account_id(1));
+        let to = ScAddress::Account(test_account_id(2));
+
+        manager.new_transfer_event(&Asset::Native, &from, &to, 1000, false);
+        manager.new_mint_event(&Asset::Native, &to, 500, false);
+        manager.new_burn_event(&Asset::Native, &from, 200);
+
+        // No events should be added when disabled
+        assert_eq!(manager.event_count(), 0);
+    }
+
+    #[test]
+    fn test_op_event_manager_no_events_after_finalize() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        manager.finalize();
+        assert!(manager.is_finalized());
+
+        // Events after finalize should be ignored
+        let to = ScAddress::Account(test_account_id(1));
+        manager.new_mint_event(&Asset::Native, &to, 1000, false);
+        manager.new_burn_event(&Asset::Native, &to, 500);
+
+        assert_eq!(manager.event_count(), 0);
+    }
+
+    #[test]
+    fn test_op_event_manager_transfer_with_issuer_check_mint() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let issuer_id = test_account_id(10);
+        let asset = test_asset_alphanum4(10); // uses issuer_id as issuer
+        let issuer = ScAddress::Account(issuer_id.clone());
+        let receiver = ScAddress::Account(test_account_id(2));
+
+        // From issuer to non-issuer = mint
+        manager.event_for_transfer_with_issuer_check(&asset, &issuer, &receiver, 1000, false);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_op_event_manager_transfer_with_issuer_check_burn() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let issuer_id = test_account_id(10);
+        let asset = test_asset_alphanum4(10);
+        let issuer = ScAddress::Account(issuer_id.clone());
+        let sender = ScAddress::Account(test_account_id(2));
+
+        // From non-issuer to issuer = burn
+        manager.event_for_transfer_with_issuer_check(&asset, &sender, &issuer, 500, false);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_op_event_manager_transfer_with_issuer_check_regular() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let asset = test_asset_alphanum4(10);
+        let from = ScAddress::Account(test_account_id(1));
+        let to = ScAddress::Account(test_account_id(2));
+
+        // Neither is issuer = regular transfer
+        manager.event_for_transfer_with_issuer_check(&asset, &from, &to, 1000, false);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_op_event_manager_set_events() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = OpEventManager::new(
+            true,
+            true, // Soroban
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+        );
+
+        let event = ContractEvent {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![].try_into().unwrap(),
+                data: ScVal::Void,
+            }),
+        };
+
+        manager.set_events(vec![event]);
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    // === TxEventManager tests ===
+
+    #[test]
+    fn test_tx_event_manager_disabled() {
+        let manager = TxEventManager::disabled();
+        assert!(!manager.is_enabled());
+        assert!(!manager.is_finalized());
+        assert_eq!(manager.event_count(), 0);
+    }
+
+    #[test]
+    fn test_tx_event_manager_new_enabled() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let manager = TxEventManager::new(true, 25, NetworkId::testnet(), config);
+        assert!(manager.is_enabled());
+        assert!(!manager.is_finalized());
+    }
+
+    #[test]
+    fn test_tx_event_manager_fee_event() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = TxEventManager::new(true, 25, NetworkId::testnet(), config);
+
+        let fee_source = test_account_id(1);
+        manager.new_fee_event(&fee_source, -100, TransactionEventStage::BeforeAllTxs);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_tx_event_manager_zero_fee_skipped() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = TxEventManager::new(true, 25, NetworkId::testnet(), config);
+
+        let fee_source = test_account_id(1);
+        manager.new_fee_event(&fee_source, 0, TransactionEventStage::BeforeAllTxs);
+
+        // Zero amount should be skipped
+        assert_eq!(manager.event_count(), 0);
+    }
+
+    #[test]
+    fn test_tx_event_manager_charge_fee() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = TxEventManager::new(true, 25, NetworkId::testnet(), config);
+
+        let fee_source = test_account_id(1);
+        manager.charge_fee(&fee_source, 200, TransactionEventStage::BeforeAllTxs);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_tx_event_manager_refund_fee() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = TxEventManager::new(true, 25, NetworkId::testnet(), config);
+
+        let fee_source = test_account_id(1);
+        manager.refund_fee(&fee_source, 50, TransactionEventStage::BeforeAllTxs);
+
+        assert_eq!(manager.event_count(), 1);
+    }
+
+    #[test]
+    fn test_tx_event_manager_finalize() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = TxEventManager::new(true, 25, NetworkId::testnet(), config);
+
+        let fee_source = test_account_id(1);
+        manager.new_fee_event(&fee_source, -100, TransactionEventStage::BeforeAllTxs);
+
+        let events = manager.finalize();
+        assert!(manager.is_finalized());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, TransactionEventStage::BeforeAllTxs);
+    }
+
+    #[test]
+    fn test_tx_event_manager_into_events() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut manager = TxEventManager::new(true, 25, NetworkId::testnet(), config);
+
+        let fee_source = test_account_id(1);
+        manager.charge_fee(&fee_source, 100, TransactionEventStage::BeforeAllTxs);
+
+        let events = manager.into_events();
+        assert_eq!(events.len(), 1);
+    }
+
+    // === EventManagerHierarchy tests ===
+
+    #[test]
+    fn test_event_manager_hierarchy_new() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let hierarchy = EventManagerHierarchy::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+            3, // 3 operations
+        );
+
+        assert_eq!(hierarchy.operation_count(), 3);
+        assert!(hierarchy.tx_event_manager_ref().is_enabled());
+        assert!(hierarchy.op_event_manager_ref(0).is_enabled());
+        assert!(hierarchy.op_event_manager_ref(1).is_enabled());
+        assert!(hierarchy.op_event_manager_ref(2).is_enabled());
+    }
+
+    #[test]
+    fn test_event_manager_hierarchy_disabled() {
+        let hierarchy = EventManagerHierarchy::disabled(2);
+
+        assert_eq!(hierarchy.operation_count(), 2);
+        assert!(!hierarchy.tx_event_manager_ref().is_enabled());
+        assert!(!hierarchy.op_event_manager_ref(0).is_enabled());
+        assert!(!hierarchy.op_event_manager_ref(1).is_enabled());
+    }
+
+    #[test]
+    fn test_event_manager_hierarchy_finalize() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut hierarchy = EventManagerHierarchy::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+            2,
+        );
+
+        // Add events to op managers
+        let to = ScAddress::Account(test_account_id(1));
+        hierarchy
+            .op_event_manager(0)
+            .new_mint_event(&Asset::Native, &to, 1000, false);
+        hierarchy
+            .op_event_manager(1)
+            .new_burn_event(&Asset::Native, &to, 500);
+
+        // Add fee event
+        hierarchy
+            .tx_event_manager()
+            .charge_fee(&test_account_id(2), 100, TransactionEventStage::BeforeAllTxs);
+
+        let (op_events, tx_events) = hierarchy.finalize();
+
+        assert_eq!(op_events.len(), 2);
+        assert_eq!(op_events[0].len(), 1);
+        assert_eq!(op_events[1].len(), 1);
+        assert_eq!(tx_events.len(), 1);
+    }
+
+    #[test]
+    fn test_event_manager_hierarchy_into_events() {
+        let config = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let mut hierarchy = EventManagerHierarchy::new(
+            true,
+            false,
+            25,
+            NetworkId::testnet(),
+            Memo::None,
+            config,
+            1,
+        );
+
+        let to = ScAddress::Account(test_account_id(1));
+        hierarchy
+            .op_event_manager(0)
+            .new_mint_event(&Asset::Native, &to, 1000, false);
+
+        let (op_events, tx_events) = hierarchy.into_events();
+        assert_eq!(op_events.len(), 1);
+        assert_eq!(op_events[0].len(), 1);
+        assert!(tx_events.is_empty());
+    }
+
+    // === Helper function tests ===
+
+    #[test]
+    fn test_make_muxed_account_address_ed25519() {
+        let pk = Uint256([1; 32]);
+        let muxed = MuxedAccount::Ed25519(pk.clone());
+        let addr = make_muxed_account_address(&muxed);
+
+        match addr {
+            ScAddress::Account(account) => {
+                assert!(matches!(account.0, PublicKey::PublicKeyTypeEd25519(_)));
+            }
+            _ => panic!("Expected Account address"),
+        }
+    }
+
+    #[test]
+    fn test_make_muxed_account_address_muxed() {
+        let muxed_account = MuxedAccountMed25519 {
+            id: 12345,
+            ed25519: Uint256([2; 32]),
+        };
+        let muxed = MuxedAccount::MuxedEd25519(muxed_account);
+        let addr = make_muxed_account_address(&muxed);
+
+        match addr {
+            ScAddress::MuxedAccount(m) => {
+                assert_eq!(m.id, 12345);
+            }
+            _ => panic!("Expected MuxedAccount address"),
+        }
+    }
+
+    #[test]
+    fn test_make_account_address() {
+        let account = test_account_id(5);
+        let addr = make_account_address(&account);
+
+        match addr {
+            ScAddress::Account(a) => {
+                assert_eq!(a, account);
+            }
+            _ => panic!("Expected Account address"),
+        }
+    }
+
+    #[test]
+    fn test_make_claimable_balance_address() {
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([42; 32]));
+        let addr = make_claimable_balance_address(&balance_id);
+
+        match addr {
+            ScAddress::ClaimableBalance(b) => {
+                assert_eq!(b, balance_id);
+            }
+            _ => panic!("Expected ClaimableBalance address"),
+        }
+    }
+
+    #[test]
+    fn test_get_address_with_dropped_muxed_info() {
+        // Test with regular account - should return unchanged
+        let account_addr = ScAddress::Account(test_account_id(1));
+        let result = get_address_with_dropped_muxed_info(&account_addr);
+        assert!(matches!(result, ScAddress::Account(_)));
+
+        // Test with muxed account - should return regular account
+        let muxed_addr = ScAddress::MuxedAccount(MuxedEd25519Account {
+            id: 12345,
+            ed25519: Uint256([3; 32]),
+        });
+        let result = get_address_with_dropped_muxed_info(&muxed_addr);
+        match result {
+            ScAddress::Account(_) => {}
+            _ => panic!("Expected Account address after dropping muxed info"),
+        }
+    }
+
+    #[test]
+    fn test_is_issuer_native() {
+        let addr = ScAddress::Account(test_account_id(1));
+        // Native asset has no issuer
+        assert!(!is_issuer(&addr, &Asset::Native));
+    }
+
+    #[test]
+    fn test_is_issuer_alphanum4() {
+        let issuer_id = test_account_id(10);
+        let issuer_addr = ScAddress::Account(issuer_id.clone());
+        let non_issuer_addr = ScAddress::Account(test_account_id(5));
+        let asset = test_asset_alphanum4(10);
+
+        assert!(is_issuer(&issuer_addr, &asset));
+        assert!(!is_issuer(&non_issuer_addr, &asset));
+    }
+
+    #[test]
+    fn test_is_issuer_alphanum12() {
+        let issuer_id = test_account_id(20);
+        let issuer_addr = ScAddress::Account(issuer_id.clone());
+        let non_issuer_addr = ScAddress::Account(test_account_id(5));
+        let asset = test_asset_alphanum12(20);
+
+        assert!(is_issuer(&issuer_addr, &asset));
+        assert!(!is_issuer(&non_issuer_addr, &asset));
+    }
+
+    #[test]
+    fn test_is_issuer_non_account() {
+        // Non-account addresses can't be issuers
+        let pool_addr = ScAddress::LiquidityPool(Hash([0; 32]).into());
+        let asset = test_asset_alphanum4(10);
+
+        assert!(!is_issuer(&pool_addr, &asset));
+    }
+
+    #[test]
+    fn test_make_symbol_scval() {
+        let val = make_symbol_scval("transfer");
+        match val {
+            ScVal::Symbol(sym) => {
+                let bytes: &[u8] = sym.0.as_ref();
+                assert_eq!(bytes, b"transfer");
+            }
+            _ => panic!("Expected Symbol"),
+        }
+    }
+
+    #[test]
+    fn test_make_string_scval() {
+        let val = make_string_scval("hello");
+        match val {
+            ScVal::String(s) => {
+                let bytes: &[u8] = s.0.as_ref();
+                assert_eq!(bytes, b"hello");
+            }
+            _ => panic!("Expected String"),
+        }
+    }
+
+    #[test]
+    fn test_make_i128_scval() {
+        let val = make_i128_scval(1000);
+        match val {
+            ScVal::I128(parts) => {
+                assert_eq!(parts.hi, 0);
+                assert_eq!(parts.lo, 1000);
+            }
+            _ => panic!("Expected I128"),
+        }
+
+        // Test negative value
+        let val_neg = make_i128_scval(-500);
+        match val_neg {
+            ScVal::I128(parts) => {
+                // -500 as i128 has all bits set in high part
+                assert_eq!(parts.hi, -1);
+                // lo is the lower 64 bits of -500 as i128
+                let expected_lo = -500i128 as u64;
+                assert_eq!(parts.lo, expected_lo);
+            }
+            _ => panic!("Expected I128"),
+        }
+    }
+
+    #[test]
+    fn test_make_u64_scval() {
+        let val = make_u64_scval(999);
+        match val {
+            ScVal::U64(v) => assert_eq!(v, 999),
+            _ => panic!("Expected U64"),
+        }
+    }
+
+    #[test]
+    fn test_make_bytes_scval() {
+        let bytes = vec![1, 2, 3, 4];
+        let val = make_bytes_scval(&bytes);
+        match val {
+            ScVal::Bytes(b) => {
+                let b_slice: &[u8] = b.as_ref();
+                assert_eq!(b_slice, &[1, 2, 3, 4]);
+            }
+            _ => panic!("Expected Bytes"),
+        }
+    }
+
+    #[test]
+    fn test_asset_code_to_string() {
+        // Test 4-char asset code
+        let code4 = [b'U', b'S', b'D', 0];
+        assert_eq!(asset_code_to_string(&code4), "USD");
+
+        // Test 4-char full code
+        let code4_full = [b'A', b'B', b'C', b'D'];
+        assert_eq!(asset_code_to_string(&code4_full), "ABCD");
+
+        // Test 12-char asset code with nulls
+        let code12 = [b'L', b'O', b'N', b'G', 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(asset_code_to_string(&code12), "LONG");
+    }
+
+    #[test]
+    fn test_make_sep0011_asset_string_scval_native() {
+        let val = make_sep0011_asset_string_scval(&Asset::Native);
+        match val {
+            ScVal::String(s) => {
+                let bytes: &[u8] = s.0.as_ref();
+                assert_eq!(bytes, b"native");
+            }
+            _ => panic!("Expected String"),
+        }
+    }
+
+    #[test]
+    fn test_make_sep0011_asset_string_scval_alphanum4() {
+        let asset = test_asset_alphanum4(1);
+        let val = make_sep0011_asset_string_scval(&asset);
+        match val {
+            ScVal::String(s) => {
+                let str_val = std::str::from_utf8(s.0.as_ref()).unwrap();
+                assert!(str_val.starts_with("USD:"));
+            }
+            _ => panic!("Expected String"),
+        }
+    }
+
+    #[test]
+    fn test_get_asset_contract_id() {
+        let network_id = NetworkId::testnet();
+        let contract_id = get_asset_contract_id(&network_id, &Asset::Native);
+
+        // Just verify it returns a valid contract ID
+        assert!(!contract_id.0 .0.is_empty());
+    }
+
+    #[test]
+    fn test_scval_symbol_bytes() {
+        let symbol = make_symbol_scval("test");
+        let bytes = scval_symbol_bytes(&symbol);
+        assert_eq!(bytes, Some(b"test".to_vec()));
+
+        // Non-symbol should return None
+        let non_symbol = ScVal::Void;
+        assert_eq!(scval_symbol_bytes(&non_symbol), None);
+    }
+
+    #[test]
+    fn test_make_possible_muxed_data_simple() {
+        let to = ScAddress::Account(test_account_id(1));
+        let data = make_possible_muxed_data(&to, 1000, &Memo::None, false);
+
+        // Without muxed or memo, should be simple i128
+        match data {
+            ScVal::I128(_) => {}
+            _ => panic!("Expected I128 for simple case"),
+        }
+    }
+
+    #[test]
+    fn test_make_possible_muxed_data_with_muxed() {
+        let to = ScAddress::MuxedAccount(MuxedEd25519Account {
+            id: 12345,
+            ed25519: Uint256([1; 32]),
+        });
+        let data = make_possible_muxed_data(&to, 1000, &Memo::None, true);
+
+        // With muxed account and allow_muxed_id_or_memo, should be a Map
+        match data {
+            ScVal::Map(Some(_)) => {}
+            _ => panic!("Expected Map for muxed case"),
+        }
+    }
+
+    #[test]
+    fn test_make_possible_muxed_data_with_memo() {
+        let to = ScAddress::Account(test_account_id(1));
+        let memo = Memo::Id(999);
+        let data = make_possible_muxed_data(&to, 1000, &memo, true);
+
+        // With memo and allow_muxed_id_or_memo, should be a Map
+        match data {
+            ScVal::Map(Some(_)) => {}
+            _ => panic!("Expected Map for memo case"),
+        }
+    }
+
+    #[test]
+    fn test_make_classic_memo_scval_text() {
+        let memo = Memo::Text(b"hello".to_vec().try_into().unwrap());
+        let val = make_classic_memo_scval(&memo);
+        match val {
+            ScVal::String(s) => {
+                let bytes: &[u8] = s.0.as_ref();
+                assert_eq!(bytes, b"hello");
+            }
+            _ => panic!("Expected String"),
+        }
+    }
+
+    #[test]
+    fn test_make_classic_memo_scval_id() {
+        let memo = Memo::Id(12345);
+        let val = make_classic_memo_scval(&memo);
+        match val {
+            ScVal::U64(v) => assert_eq!(v, 12345),
+            _ => panic!("Expected U64"),
+        }
+    }
+
+    #[test]
+    fn test_make_classic_memo_scval_hash() {
+        let memo = Memo::Hash(Hash([42; 32]));
+        let val = make_classic_memo_scval(&memo);
+        match val {
+            ScVal::Bytes(b) => {
+                let bytes: &[u8] = b.as_ref();
+                assert_eq!(bytes, &[42; 32]);
+            }
+            _ => panic!("Expected Bytes"),
+        }
+    }
+
+    #[test]
+    fn test_make_classic_memo_scval_return() {
+        let memo = Memo::Return(Hash([99; 32]));
+        let val = make_classic_memo_scval(&memo);
+        match val {
+            ScVal::Bytes(b) => {
+                let bytes: &[u8] = b.as_ref();
+                assert_eq!(bytes, &[99; 32]);
+            }
+            _ => panic!("Expected Bytes"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "memo type cannot be None")]
+    fn test_make_classic_memo_scval_none_panics() {
+        make_classic_memo_scval(&Memo::None);
+    }
+}
