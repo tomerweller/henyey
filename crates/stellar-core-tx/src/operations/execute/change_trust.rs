@@ -13,6 +13,9 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
+/// Maximum number of sub-entries per account (trustlines, offers, data entries, signers).
+const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
+
 /// Execute a ChangeTrust operation.
 pub fn execute_change_trust(
     op: &ChangeTrustOp,
@@ -131,6 +134,16 @@ pub fn execute_change_trust(
         }
     } else {
         // Creating new trustline
+
+        // Check subentries limit before creating trustline
+        // Pool share trustlines count as 2 subentries (multiplier)
+        let source_account = state
+            .get_account(source)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
+            return Ok(OperationResult::OpTooManySubentries);
+        }
+
         if is_pool_share {
             let params = pool_params.expect("pool params must exist");
             if let Err(code) = validate_pool_share_trustlines(source, params, state) {
@@ -1356,5 +1369,125 @@ mod tests {
             state.entry_sponsor(&ledger_key).is_none(),
             "Entry sponsorship should be removed"
         );
+    }
+
+    /// Regression test: ChangeTrust should return OpTooManySubentries when account
+    /// has reached the maximum subentries limit (1000).
+    ///
+    /// Bug discovered at mainnet ledger 54003784 TX 94 - the account had 1000 subentries
+    /// and ChangeTrust was incorrectly allowing a new trustline to be created.
+    #[test]
+    fn test_change_trust_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        // Create source account with max subentries (1000)
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = 1000; // At the limit
+        state.create_account(source_account);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        };
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 1_000_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Expected - account has max subentries, can't create new trustline
+            }
+            other => panic!("expected OpTooManySubentries, got {:?}", other),
+        }
+
+        // Verify num_sub_entries was not changed
+        assert_eq!(
+            state.get_account(&source_id).unwrap().num_sub_entries,
+            1000,
+            "num_sub_entries should remain unchanged"
+        );
+    }
+
+    /// Test that pool share trustlines (which count as 2 subentries) are properly
+    /// checked against the subentries limit.
+    #[test]
+    fn test_change_trust_pool_share_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+
+        // Create source account with 999 subentries (pool share needs 2, so this should fail)
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = 999; // One below limit, but pool share needs 2
+        state.create_account(source_account);
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+
+        // Create existing trustlines for the pool assets (required for pool share)
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+
+        let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a,
+                asset_b,
+                fee: 30,
+            },
+        );
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(params),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Expected - 999 + 2 = 1001 > 1000 limit
+            }
+            other => panic!("expected OpTooManySubentries, got {:?}", other),
+        }
     }
 }
