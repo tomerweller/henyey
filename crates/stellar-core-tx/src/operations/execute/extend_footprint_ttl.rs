@@ -319,4 +319,194 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test ExtendFootprintTtl succeeds with empty footprint (no-op).
+    ///
+    /// C++ Reference: SorobanTest.cpp - "extend ttl empty footprint" test section
+    #[test]
+    fn test_extend_footprint_ttl_success_empty_footprint() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000, // Valid extend_to value
+        };
+
+        // Empty footprint is valid
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::Success),
+                    "Empty footprint should succeed, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test ExtendFootprintTtl at max valid extend_to (MAX_ENTRY_TTL - 1).
+    ///
+    /// C++ Reference: SorobanTest.cpp - "extend ttl boundary" test section
+    #[test]
+    fn test_extend_footprint_ttl_at_max_boundary() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        // MAX_ENTRY_TTL - 1 is the highest valid value
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: MAX_ENTRY_TTL - 1,
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::Success),
+                    "Max boundary should succeed, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test ExtendFootprintTtl with ContractCode entry.
+    ///
+    /// C++ Reference: SorobanTest.cpp - "extend contract code ttl" test section
+    #[test]
+    fn test_extend_footprint_ttl_contract_code_not_found() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000,
+        };
+
+        // ContractCode key - valid for TTL but entry doesn't exist
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::ResourceLimitExceeded),
+                    "Missing entry should fail with ResourceLimitExceeded, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test ExtendFootprintTtl with ContractData entry.
+    ///
+    /// C++ Reference: SorobanTest.cpp - "extend contract data ttl" test section
+    #[test]
+    fn test_extend_footprint_ttl_contract_data_not_found() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000,
+        };
+
+        // ContractData key - valid for TTL but entry doesn't exist
+        let contract_data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Account(create_test_account_id(1)),
+            key: ScVal::I32(42),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_data_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::ResourceLimitExceeded),
+                    "Missing entry should fail with ResourceLimitExceeded, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }

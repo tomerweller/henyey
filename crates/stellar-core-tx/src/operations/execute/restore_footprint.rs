@@ -398,4 +398,230 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test RestoreFootprint rejects Account entries (not Soroban).
+    ///
+    /// C++ Reference: SorobanTest.cpp - "restore rejects account key" test section
+    #[test]
+    fn test_restore_footprint_rejects_account_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: create_test_account_id(1),
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![account_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            TEST_MIN_PERSISTENT_TTL,
+            &[],
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                assert!(
+                    matches!(r, RestoreFootprintResult::Malformed),
+                    "Account key should be rejected, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test RestoreFootprint with persistent ContractCode entry succeeds.
+    ///
+    /// Entry doesn't exist but that's OK - we just skip it.
+    ///
+    /// C++ Reference: SorobanTest.cpp - "restore contract code" test section
+    #[test]
+    fn test_restore_footprint_contract_code_missing() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        // ContractCode is always persistent
+        let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([10u8; 32]),
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![code_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            TEST_MIN_PERSISTENT_TTL,
+            &[],
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                // Missing entry is skipped - operation succeeds
+                assert!(
+                    matches!(r, RestoreFootprintResult::Success),
+                    "Missing entry should be skipped, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test RestoreFootprint with persistent ContractData entry succeeds.
+    ///
+    /// C++ Reference: SorobanTest.cpp - "restore persistent data" test section
+    #[test]
+    fn test_restore_footprint_persistent_data_missing() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([20u8; 32]))),
+            key: ScVal::I32(100),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![data_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            TEST_MIN_PERSISTENT_TTL,
+            &[],
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                assert!(
+                    matches!(r, RestoreFootprintResult::Success),
+                    "Missing persistent entry should be skipped, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test RestoreFootprint rejects TrustLine entry.
+    ///
+    /// C++ Reference: SorobanTest.cpp - "restore rejects trustline" test section
+    #[test]
+    fn test_restore_footprint_rejects_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: create_test_account_id(1),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: create_test_account_id(2),
+            }),
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![tl_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            TEST_MIN_PERSISTENT_TTL,
+            &[],
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                assert!(
+                    matches!(r, RestoreFootprintResult::Malformed),
+                    "TrustLine key should be rejected, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }
