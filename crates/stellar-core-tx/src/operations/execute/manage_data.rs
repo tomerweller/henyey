@@ -596,4 +596,83 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    /// Test that ManageData returns OpTooManySubentries when account has reached
+    /// the maximum subentries limit (1000).
+    ///
+    /// C++ Reference: ManageDataTests.cpp - tooManySubentries tests via SponsorshipTestUtils
+    #[test]
+    fn test_manage_data_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(15);
+
+        // Create source account with max subentries (1000)
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = ACCOUNT_SUBENTRY_LIMIT; // At the limit
+        state.create_account(source_account);
+
+        let op = ManageDataOp {
+            data_name: make_string64("new_key"),
+            data_value: Some(vec![1, 2, 3, 4].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Expected - account has max subentries, can't create new data entry
+            }
+            other => panic!("expected OpTooManySubentries, got {:?}", other),
+        }
+
+        // Verify num_sub_entries was not changed
+        assert_eq!(
+            state.get_account(&source_id).unwrap().num_sub_entries,
+            ACCOUNT_SUBENTRY_LIMIT,
+            "num_sub_entries should remain unchanged"
+        );
+    }
+
+    /// Test that updating existing data entry works even when at subentry limit.
+    /// Updating doesn't create a new subentry, so it should succeed.
+    #[test]
+    fn test_manage_data_update_at_subentry_limit_succeeds() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(16);
+
+        // Create source account with max subentries
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = ACCOUNT_SUBENTRY_LIMIT;
+        state.create_account(source_account);
+
+        // Create existing data entry
+        let existing_entry = DataEntry {
+            account_id: source_id.clone(),
+            data_name: make_string64("existing_key"),
+            data_value: vec![1, 2, 3].try_into().unwrap(),
+            ext: DataEntryExt::V0,
+        };
+        state.create_data(existing_entry);
+
+        // Update existing data entry - should succeed even at limit
+        let op = ManageDataOp {
+            data_name: make_string64("existing_key"),
+            data_value: Some(vec![4, 5, 6, 7, 8].try_into().unwrap()),
+        };
+
+        let result = execute_manage_data(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
+                assert!(matches!(r, ManageDataResult::Success));
+            }
+            other => panic!("expected Success, got {:?}", other),
+        }
+
+        // Verify the value was updated
+        let entry = state.get_data(&source_id, "existing_key").unwrap();
+        assert_eq!(entry.data_value.as_slice(), &[4, 5, 6, 7, 8]);
+    }
 }

@@ -17,6 +17,9 @@ use crate::{Result, TxError};
 /// Maximum number of signers allowed on an account.
 const MAX_SIGNERS: usize = 20;
 
+/// Maximum number of sub-entries per account (trustlines, offers, data entries, signers).
+const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
+
 /// Execute a SetOptions operation.
 ///
 /// This operation modifies account settings including:
@@ -290,6 +293,14 @@ pub fn execute_set_options(
         } else {
             if current_signer_count >= MAX_SIGNERS {
                 return Ok(make_result(SetOptionsResultCode::TooManySigners));
+            }
+
+            // Check subentries limit before adding new signer.
+            // Adding a signer increases num_sub_entries by 1.
+            if current_num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT
+                || current_num_sub_entries.saturating_add(1) > ACCOUNT_SUBENTRY_LIMIT
+            {
+                return Ok(OperationResult::OpTooManySubentries);
             }
 
             if let Some((_, sponsor_balance, sponsor_min_balance)) = sponsor_info.as_ref() {
@@ -947,5 +958,115 @@ mod tests {
 
         let account = state.get_account(&source_id).unwrap();
         assert_eq!(account.inflation_dest, Some(dest_id));
+    }
+
+    /// Test that SetOptions returns OpTooManySubentries when adding a signer
+    /// to an account that has reached the maximum subentries limit (1000).
+    ///
+    /// C++ Reference: SetOptionsTests.cpp - tooManySubentries tests via SponsorshipTestUtils
+    #[test]
+    fn test_set_options_signer_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(100);
+
+        // Create source account with max subentries (1000)
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = ACCOUNT_SUBENTRY_LIMIT; // At the limit
+        state.create_account(source_account);
+
+        // Create a new signer key
+        let signer_key = SignerKey::Ed25519(Uint256([99u8; 32]));
+
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: signer_key,
+                weight: 1, // Adding a new signer
+            }),
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Expected - account has max subentries, can't add new signer
+            }
+            other => panic!("expected OpTooManySubentries, got {:?}", other),
+        }
+
+        // Verify num_sub_entries was not changed
+        assert_eq!(
+            state.get_account(&source_id).unwrap().num_sub_entries,
+            ACCOUNT_SUBENTRY_LIMIT,
+            "num_sub_entries should remain unchanged"
+        );
+
+        // Verify no signer was added
+        assert_eq!(
+            state.get_account(&source_id).unwrap().signers.len(),
+            0,
+            "no signer should have been added"
+        );
+    }
+
+    /// Test that updating an existing signer weight works even when at subentry limit.
+    /// Updating doesn't create a new subentry, so it should succeed.
+    #[test]
+    fn test_set_options_update_signer_at_subentry_limit_succeeds() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(101);
+
+        // Create a signer key
+        let signer_key = SignerKey::Ed25519(Uint256([98u8; 32]));
+
+        // Create source account with max subentries and one existing signer
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = ACCOUNT_SUBENTRY_LIMIT;
+        source_account.signers = vec![Signer {
+            key: signer_key.clone(),
+            weight: 1,
+        }]
+        .try_into()
+        .unwrap();
+        state.create_account(source_account);
+
+        // Update the existing signer's weight - should succeed
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: signer_key.clone(),
+                weight: 5, // Update weight
+            }),
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(matches!(r, SetOptionsResult::Success));
+            }
+            other => panic!("expected Success, got {:?}", other),
+        }
+
+        // Verify the signer weight was updated
+        let account = state.get_account(&source_id).unwrap();
+        let signer = account.signers.iter().find(|s| s.key == signer_key).unwrap();
+        assert_eq!(signer.weight, 5);
     }
 }

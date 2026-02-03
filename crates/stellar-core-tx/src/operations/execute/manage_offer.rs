@@ -160,6 +160,17 @@ fn execute_manage_offer(
             None,
         ));
     }
+    // For new offers, check subentry limit FIRST (before any balance/reserve checks).
+    // This matches C++ stellar-core's check ordering.
+    if old_offer.is_none() {
+        let source_account = state
+            .get_account(source)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
+            return Ok(OperationResult::OpTooManySubentries);
+        }
+    }
+
     let sponsor = if old_offer.is_none() {
         state.active_sponsor_for(source)
     } else {
@@ -184,13 +195,6 @@ fn execute_manage_offer(
     }
 
     if old_offer.is_none() {
-        // Check subentry limit before creating a new offer.
-        let source_account = state
-            .get_account(source)
-            .ok_or(TxError::SourceAccountNotFound)?;
-        if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
-            return Ok(OperationResult::OpTooManySubentries);
-        }
 
         if let Some(sponsor) = &sponsor {
             let sponsor_account = state
@@ -2264,6 +2268,155 @@ mod tests {
                 );
             }
             other => panic!("Unexpected result type: {:?}", other),
+        }
+    }
+
+    /// Test that ManageSellOffer returns OpTooManySubentries when account has reached
+    /// the maximum subentries limit (1000).
+    ///
+    /// C++ Reference: OfferTests.cpp - tooManySubentries tests via SponsorshipTestUtils
+    #[test]
+    fn test_manage_sell_offer_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(100);
+        let issuer_id = create_test_account_id(101);
+
+        // Create source account with max subentries (1000)
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = ACCOUNT_SUBENTRY_LIMIT; // At the limit
+        state.create_account(source_account);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        // Set up trustline for the selling asset
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000_000, // Has balance to sell
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Try to create a new offer (offer_id=0 means new offer)
+        let op = ManageSellOfferOp {
+            selling: asset,
+            buying: Asset::Native,
+            amount: 10_000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0, // New offer
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Expected - account has max subentries, can't create new offer
+            }
+            other => panic!("expected OpTooManySubentries, got {:?}", other),
+        }
+
+        // Verify num_sub_entries was not changed
+        assert_eq!(
+            state.get_account(&source_id).unwrap().num_sub_entries,
+            ACCOUNT_SUBENTRY_LIMIT,
+            "num_sub_entries should remain unchanged"
+        );
+    }
+
+    /// Test that ManageBuyOffer returns OpTooManySubentries when account has reached
+    /// the maximum subentries limit (1000).
+    #[test]
+    fn test_manage_buy_offer_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(102);
+        let issuer_id = create_test_account_id(103);
+
+        // Create source account with max subentries (1000)
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = ACCOUNT_SUBENTRY_LIMIT; // At the limit
+        state.create_account(source_account);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        // Set up trustline for the buying asset
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Try to create a new buy offer (offer_id=0 means new offer)
+        let op = ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: asset,
+            buy_amount: 10_000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0, // New offer
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Expected - account has max subentries, can't create new offer
+            }
+            other => panic!("expected OpTooManySubentries, got {:?}", other),
+        }
+    }
+
+    /// Test that CreatePassiveSellOffer returns OpTooManySubentries when account has reached
+    /// the maximum subentries limit (1000).
+    #[test]
+    fn test_create_passive_sell_offer_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(104);
+        let issuer_id = create_test_account_id(105);
+
+        // Create source account with max subentries (1000)
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = ACCOUNT_SUBENTRY_LIMIT; // At the limit
+        state.create_account(source_account);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        // Set up trustline for the selling asset
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000_000,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Try to create a passive offer
+        let op = CreatePassiveSellOfferOp {
+            selling: asset,
+            buying: Asset::Native,
+            amount: 10_000,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result = execute_create_passive_sell_offer(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpTooManySubentries => {
+                // Expected - account has max subentries, can't create new offer
+            }
+            other => panic!("expected OpTooManySubentries, got {:?}", other),
         }
     }
 }

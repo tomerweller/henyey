@@ -125,6 +125,8 @@ mod result;
 pub mod signature_checker;
 pub mod soroban;
 pub mod state;
+#[cfg(test)]
+pub mod test_utils;
 pub mod validation;
 
 // Re-export error types

@@ -237,4 +237,196 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test CreateAccount fails with Underfunded when source doesn't have enough balance.
+    ///
+    /// C++ Reference: CreateAccountTests.cpp - "underfunded" test section
+    #[test]
+    fn test_create_account_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        // Source has exactly minimum balance (10M) - no available balance to give
+        state.create_account(create_test_account(source_id.clone(), 10_000_000));
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 20_000_000, // More than source can provide
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(matches!(r, CreateAccountResult::Underfunded));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test CreateAccount respects selling liabilities when checking source balance.
+    ///
+    /// C++ Reference: CreateAccountTests.cpp - "with native selling liabilities" test section
+    #[test]
+    fn test_create_account_underfunded_with_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        // Create source with 50M balance but 30M selling liabilities
+        // min_balance = 10M, available = (50M - 10M) - 30M = 10M
+        let mut source_account = create_test_account(source_id.clone(), 50_000_000);
+        source_account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 30_000_000, // Selling liabilities reduce available balance
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(source_account);
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 15_000_000, // More than available 10M
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(
+                    matches!(r, CreateAccountResult::Underfunded),
+                    "Should be Underfunded due to selling liabilities, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test CreateAccount succeeds when source has selling liabilities but enough available.
+    #[test]
+    fn test_create_account_success_with_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        // Create source with 100M balance but 30M selling liabilities
+        // min_balance = 10M, available = (100M - 10M) - 30M = 60M
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 30_000_000,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(source_account);
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 20_000_000, // Less than available 60M
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(matches!(r, CreateAccountResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify destination was created
+        assert!(state.get_account(&dest_id).is_some());
+        assert_eq!(state.get_account(&dest_id).unwrap().balance, 20_000_000);
+    }
+
+    /// Test CreateAccount with sponsorship - sponsor pays reserve.
+    ///
+    /// C++ Reference: CreateAccountTests.cpp - "with sponsorship" test section
+    #[test]
+    fn test_create_account_with_sponsorship() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let sponsor_id = create_test_account_id(2);
+
+        // Source needs to provide the starting balance
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        // Sponsor needs to have enough for the reserve
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+
+        // Set up sponsorship: sponsor will pay reserve for the new account
+        state.push_sponsorship(sponsor_id.clone(), dest_id.clone());
+
+        // With sponsorship, starting balance can be 0 (sponsor pays reserve)
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 0, // Sponsor pays reserve, source gives 0
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(matches!(r, CreateAccountResult::Success), "got {:?}", r);
+            }
+            other => panic!("Unexpected result type: {:?}", other),
+        }
+
+        // Verify destination was created with 0 balance
+        let dest_acc = state.get_account(&dest_id);
+        assert!(dest_acc.is_some());
+        assert_eq!(dest_acc.unwrap().balance, 0);
+    }
+
+    /// Test CreateAccount with sponsor having insufficient balance.
+    #[test]
+    fn test_create_account_sponsor_low_reserve() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let sponsor_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        // Sponsor has minimum balance only - can't afford to sponsor
+        state.create_account(create_test_account(sponsor_id.clone(), 10_000_000));
+
+        state.push_sponsorship(sponsor_id.clone(), dest_id.clone());
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 0,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(
+                    matches!(r, CreateAccountResult::LowReserve),
+                    "Should fail with LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
 }

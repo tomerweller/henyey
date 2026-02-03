@@ -931,4 +931,215 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// Test credit payment from issuer to trustline holder.
+    /// Issuer has infinite supply so their balance doesn't change.
+    ///
+    /// C++ Reference: PaymentTests.cpp - "issuer large amounts" section
+    #[test]
+    fn test_credit_payment_issuer_to_holder() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let holder_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create trustline for holder to receive the asset
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            0, // Start with 0 balance
+            1_000_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Issuer pays holder 1000 units
+        let op = PaymentOp {
+            destination: create_test_muxed_account(1),
+            asset,
+            amount: 1000,
+        };
+
+        let result = execute_payment(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify holder received the payment
+        let trustline = state
+            .get_trustline(
+                &holder_id,
+                &Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4(*b"USD\0"),
+                    issuer: issuer_id.clone(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(trustline.balance, 1000);
+
+        // Issuer's XLM balance unchanged (issuer doesn't need trustline for own asset)
+        let issuer_account = state.get_account(&issuer_id).unwrap();
+        assert_eq!(issuer_account.balance, 100_000_000);
+    }
+
+    /// Test credit payment from trustline holder to issuer.
+    /// The issuer absorbs the payment (their balance is conceptually infinite).
+    ///
+    /// C++ Reference: PaymentTests.cpp - holder to issuer test
+    #[test]
+    fn test_credit_payment_holder_to_issuer() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let holder_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create trustline for holder with some balance
+        state.create_trustline(create_test_trustline(
+            holder_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"EUR\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000, // Holder has 5000 units
+            1_000_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Holder pays issuer 3000 units
+        let op = PaymentOp {
+            destination: create_test_muxed_account(0), // Issuer
+            asset,
+            amount: 3000,
+        };
+
+        let result = execute_payment(&op, &holder_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify holder's trustline was debited
+        let trustline = state
+            .get_trustline(
+                &holder_id,
+                &Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4(*b"EUR\0"),
+                    issuer: issuer_id.clone(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(trustline.balance, 2000); // 5000 - 3000
+    }
+
+    /// Test credit payment respects destination buying liabilities.
+    /// Available room = limit - balance - buyingLiabilities
+    ///
+    /// C++ Reference: PaymentTests.cpp - "with buying liabilities" section
+    #[test]
+    fn test_credit_payment_destination_buying_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(0);
+        let source_id = create_test_account_id(1);
+        let dest_id = create_test_account_id(2);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"JPY\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create source trustline with balance
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"JPY\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            1_000_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Create destination trustline with limit=1000, balance=500, buying_liabilities=400
+        // Available room = 1000 - 500 - 400 = 100
+        let mut dest_trustline = create_test_trustline(
+            dest_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"JPY\0"),
+                issuer: issuer_id.clone(),
+            }),
+            500,
+            1000,
+            AUTHORIZED_FLAG,
+        );
+        dest_trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
+            liabilities: Liabilities {
+                buying: 400,
+                selling: 0,
+            },
+            ext: TrustLineEntryV1Ext::V0,
+        });
+        state.create_trustline(dest_trustline);
+
+        // Try to pay 200 - should fail with LineFull (only 100 room available)
+        let op = PaymentOp {
+            destination: create_test_muxed_account(2),
+            asset: asset.clone(),
+            amount: 200,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::LineFull),
+                    "Expected LineFull due to buying liabilities, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Pay exactly 100 - should succeed
+        let op_exact = PaymentOp {
+            destination: create_test_muxed_account(2),
+            asset,
+            amount: 100,
+        };
+
+        let result = execute_payment(&op_exact, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(matches!(r, PaymentResult::Success));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
 }
