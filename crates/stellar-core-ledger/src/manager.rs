@@ -369,16 +369,7 @@ impl LedgerManager {
     ///
     /// The ledger starts uninitialized and must be initialized via
     /// `initialize_from_buckets` or by loading from the database.
-    pub fn new(db: Database, network_passphrase: String) -> Self {
-        Self::with_config(db, network_passphrase, LedgerManagerConfig::default())
-    }
-
-    /// Create a new ledger manager with custom configuration.
-    pub fn with_config(
-        db: Database,
-        network_passphrase: String,
-        config: LedgerManagerConfig,
-    ) -> Self {
+    pub fn new(db: Database, network_passphrase: String, config: LedgerManagerConfig) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
 
         Self {

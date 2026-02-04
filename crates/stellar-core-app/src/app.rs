@@ -747,7 +747,7 @@ impl App {
         tracing::info!("Bucket manager initialized");
 
         // Initialize ledger manager
-        let ledger_manager = Arc::new(LedgerManager::with_config(
+        let ledger_manager = Arc::new(LedgerManager::new(
             db.clone(),
             config.network.passphrase.clone(),
             LedgerManagerConfig {

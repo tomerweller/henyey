@@ -2941,7 +2941,7 @@ async fn cmd_verify_execution(
 
     // Create LedgerManager with in-memory database
     let db = stellar_core_db::Database::open_in_memory()?;
-    let ledger_manager = LedgerManager::with_config(
+    let ledger_manager = LedgerManager::new(
         db,
         config.network.passphrase.clone(),
         LedgerManagerConfig {

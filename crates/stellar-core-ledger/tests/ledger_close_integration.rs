@@ -48,7 +48,7 @@ fn test_ledger_close_with_empty_tx_set() {
         validate_bucket_hash: false,
         ..Default::default()
     };
-    let ledger = LedgerManager::with_config(db, "Test Network".to_string(), config);
+    let ledger = LedgerManager::new(db, "Test Network".to_string(), config);
 
     let bucket_list = BucketList::new();
     let header = make_genesis_header();

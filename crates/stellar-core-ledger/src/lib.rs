@@ -55,10 +55,10 @@
 //! # Example Usage
 //!
 //! ```ignore
-//! use stellar_core_ledger::{LedgerManager, LedgerCloseData, TransactionSetVariant};
+//! use stellar_core_ledger::{LedgerManager, LedgerManagerConfig, LedgerCloseData, TransactionSetVariant};
 //!
 //! // Create a ledger manager
-//! let manager = LedgerManager::new(db, network_passphrase);
+//! let manager = LedgerManager::new(db, network_passphrase, LedgerManagerConfig::default());
 //!
 //! // Initialize from buckets (during catchup)
 //! manager.initialize_from_buckets(bucket_list, None, header, Some(header_hash))?;
