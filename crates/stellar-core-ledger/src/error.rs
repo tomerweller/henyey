@@ -84,7 +84,7 @@ pub enum LedgerError {
 
     /// Attempted to initialize an already-initialized ledger manager.
     ///
-    /// Use `reinitialize_from_buckets` to reset state if needed.
+    /// Use `reset_for_catchup` then `initialize_from_buckets` to reset state if needed.
     #[error("ledger already initialized")]
     AlreadyInitialized,
 

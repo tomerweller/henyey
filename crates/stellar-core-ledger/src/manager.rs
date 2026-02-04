@@ -291,7 +291,7 @@ struct LedgerState {
 /// Before use, the manager must be initialized via one of:
 ///
 /// - [`initialize_from_buckets`](Self::initialize_from_buckets): For catchup from history archives
-/// - [`reinitialize_from_buckets`](Self::reinitialize_from_buckets): For re-syncing after falling behind
+/// - [`reset_for_catchup`](Self::reset_for_catchup): To clear state before re-initialization
 ///
 /// # Ledger Close Flow
 ///
@@ -693,22 +693,13 @@ impl LedgerManager {
         Ok(())
     }
 
-    /// Reinitialize the ledger from bucket list state.
+    /// Reset the ledger manager state for re-initialization.
     ///
-    /// This is used when catchup needs to reset state while the ledger manager
-    /// was already initialized (e.g., after falling behind in live mode).
-    pub fn reinitialize_from_buckets(
-        &self,
-        bucket_list: BucketList,
-        hot_archive_bucket_list: Option<HotArchiveBucketList>,
-        header: LedgerHeader,
-        header_hash: Option<Hash256>,
-    ) -> Result<()> {
-        self.reset_for_catchup();
-        self.initialize_from_buckets(bucket_list, hot_archive_bucket_list, header, header_hash)
-    }
-
-    fn reset_for_catchup(&self) {
+    /// This clears all caches, bucket lists, and state to allow a fresh
+    /// `initialize_from_buckets` call. Used when catchup needs to reset
+    /// state while the ledger manager was already initialized (e.g., after
+    /// falling behind in live mode).
+    pub fn reset_for_catchup(&self) {
         debug!("Resetting ledger manager for catchup");
 
         // Clear bucket lists
