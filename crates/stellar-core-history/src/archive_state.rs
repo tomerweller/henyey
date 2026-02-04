@@ -327,6 +327,125 @@ impl HistoryArchiveState {
     pub fn hot_archive_bucket_level_count(&self) -> usize {
         self.hot_archive_buckets.as_ref().map_or(0, |v| v.len())
     }
+
+    /// Get bucket hashes as (curr, snap) tuples for all levels.
+    ///
+    /// This format is suitable for `BucketList::restore_from_has`.
+    pub fn bucket_hash_pairs(&self) -> Vec<(Hash256, Hash256)> {
+        let zero_hash = "0".repeat(64);
+        self.current_buckets
+            .iter()
+            .map(|level| {
+                let curr = if level.curr != zero_hash {
+                    Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO)
+                } else {
+                    Hash256::ZERO
+                };
+                let snap = if level.snap != zero_hash {
+                    Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO)
+                } else {
+                    Hash256::ZERO
+                };
+                (curr, snap)
+            })
+            .collect()
+    }
+
+    /// Get hot archive bucket hashes as (curr, snap) tuples for all levels.
+    ///
+    /// This format is suitable for `HotArchiveBucketList::restore_from_has`.
+    pub fn hot_archive_bucket_hash_pairs(&self) -> Option<Vec<(Hash256, Hash256)>> {
+        let zero_hash = "0".repeat(64);
+        self.hot_archive_buckets.as_ref().map(|levels| {
+            levels
+                .iter()
+                .map(|level| {
+                    let curr = if level.curr != zero_hash {
+                        Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO)
+                    } else {
+                        Hash256::ZERO
+                    };
+                    let snap = if level.snap != zero_hash {
+                        Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO)
+                    } else {
+                        Hash256::ZERO
+                    };
+                    (curr, snap)
+                })
+                .collect()
+        })
+    }
+
+    /// Get the next bucket merge states for all live bucket levels.
+    ///
+    /// This extracts the FutureBucket state from each level for use with
+    /// `BucketList::restore_from_has` and `restart_merges_from_has`.
+    pub fn live_next_states(&self) -> Vec<LiveBucketNextState> {
+        self.current_buckets
+            .iter()
+            .map(|level| LiveBucketNextState {
+                state: level.next.state,
+                output: level
+                    .next
+                    .output
+                    .as_ref()
+                    .and_then(|h| Hash256::from_hex(h).ok()),
+                input_curr: level
+                    .next
+                    .curr
+                    .as_ref()
+                    .and_then(|h| Hash256::from_hex(h).ok()),
+                input_snap: level
+                    .next
+                    .snap
+                    .as_ref()
+                    .and_then(|h| Hash256::from_hex(h).ok()),
+            })
+            .collect()
+    }
+
+    /// Get the next bucket merge states for hot archive bucket levels.
+    pub fn hot_archive_next_states(&self) -> Option<Vec<LiveBucketNextState>> {
+        self.hot_archive_buckets.as_ref().map(|levels| {
+            levels
+                .iter()
+                .map(|level| LiveBucketNextState {
+                    state: level.next.state,
+                    output: level
+                        .next
+                        .output
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_curr: level
+                        .next
+                        .curr
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_snap: level
+                        .next
+                        .snap
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                })
+                .collect()
+        })
+    }
+}
+
+/// State of a pending bucket merge from History Archive State.
+///
+/// This is a local copy of the structure expected by `BucketList::restore_from_has`
+/// to avoid cross-crate dependencies.
+#[derive(Clone, Debug, Default)]
+pub struct LiveBucketNextState {
+    /// Merge state (0 = clear, 1 = output, 2 = inputs)
+    pub state: u32,
+    /// Output bucket hash if merge is complete (state == 1)
+    pub output: Option<Hash256>,
+    /// Input curr bucket hash for pending merge (state == 2)
+    pub input_curr: Option<Hash256>,
+    /// Input snap bucket hash for pending merge (state == 2)
+    pub input_snap: Option<Hash256>,
 }
 
 #[cfg(test)]

@@ -4340,7 +4340,7 @@ fn build_entry_changes_with_hot_archive(
     // Key insight: change_order captures the execution sequence. For Soroban, we must preserve
     // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
     // (TTL, ContractData, ContractCode) by their associated key_hash to match C++ behavior.
-    if let Some(fp) = footprint {
+    if footprint.is_some() {
         use std::collections::HashSet;
 
         fn is_soroban_entry(entry: &LedgerEntry) -> bool {
@@ -4351,16 +4351,6 @@ fn build_entry_changes_with_hot_archive(
                     | stellar_xdr::curr::LedgerEntryData::ContractCode(_)
             )
         }
-
-        // Build set of read-only TTL keys. In C++ stellar-core, TTL updates for entries in the
-        // read-only footprint are NOT emitted in transaction meta (they're handled separately via
-        // mRoTTLBumps which are flushed at different points). We must skip emitting STATE/UPDATED
-        // for these TTL keys to match C++ behavior.
-        let ro_ttl_keys: HashSet<LedgerKey> = fp
-            .read_only
-            .iter()
-            .filter_map(stellar_core_bucket::get_ttl_key)
-            .collect();
 
         // Track which keys have been created (for deduplication)
         let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
@@ -4488,13 +4478,10 @@ fn build_entry_changes_with_hot_archive(
                             );
                         }
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            // Skip TTL updates for entries in the read-only footprint.
-                            // In C++ stellar-core, these are accumulated in mRoTTLBumps and not
-                            // emitted in transaction meta. See buildRoTTLSet and
-                            // commitChangeFromSuccessfulOp in ParallelApplyUtils.cpp.
-                            if ro_ttl_keys.contains(&key) {
-                                continue;
-                            }
+                            // NOTE: RO TTL bumps ARE included in transaction meta (per C++
+                            // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
+                            // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
+                            // not transaction meta. Do NOT skip ro_ttl_keys here.
                             if restored.hot_archive.contains(&key)
                                 || restored.live_bucket_list.contains(&key)
                             {

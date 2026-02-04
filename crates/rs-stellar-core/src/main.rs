@@ -147,9 +147,9 @@ enum Commands {
         #[arg(value_name = "TARGET", default_value = "current")]
         target: String,
 
-        /// Catchup mode: minimal, complete, or recent:N
+        /// Catchup mode: minimal, complete, or recent:N (e.g., recent:128)
         #[arg(long, default_value = "minimal")]
-        mode: CliCatchupMode,
+        mode: String,
 
         /// Skip verification after catchup
         #[arg(long)]
@@ -226,18 +226,6 @@ enum Commands {
     /// Offline commands (no network required)
     #[command(subcommand)]
     Offline(OfflineCommands),
-}
-
-/// Catchup mode for CLI
-#[derive(Clone, Debug, Default, clap::ValueEnum)]
-enum CliCatchupMode {
-    /// Download only the latest state
-    #[default]
-    Minimal,
-    /// Download complete history from genesis
-    Complete,
-    /// Download recent history only (use --recent-count to specify)
-    Recent,
 }
 
 /// Offline commands that don't require network access
@@ -574,15 +562,12 @@ async fn cmd_run(
 async fn cmd_catchup(
     config: AppConfig,
     target: String,
-    mode: CliCatchupMode,
+    mode: String,
     verify: bool,
     parallelism: usize,
 ) -> anyhow::Result<()> {
-    let mode = match mode {
-        CliCatchupMode::Minimal => CatchupModeInternal::Minimal,
-        CliCatchupMode::Complete => CatchupModeInternal::Complete,
-        CliCatchupMode::Recent => CatchupModeInternal::Recent(1000), // Default to 1000 ledgers
-    };
+    // Parse mode string into CatchupMode (supports "minimal", "complete", "recent:N")
+    let mode: CatchupModeInternal = mode.parse()?;
 
     let options = CatchupOptions {
         target,
@@ -4253,12 +4238,13 @@ async fn cmd_verify_execution(
 
                 // Compute state size window update for our execution
                 if !our_has_window {
+                    let soroban_size = ledger_manager.soroban_state().read().total_size();
                     // Create state size window entry directly for our delta
                     if let Some(window_entry) = compute_soroban_state_size_window_entry(
                         seq,
                         cdp_header.ledger_version,
                         bl,
-                        ledger_manager.soroban_state().read().total_size(),
+                        soroban_size,
                         archival_override.clone(),
                     ) {
                         our_live.push(window_entry);

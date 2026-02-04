@@ -454,6 +454,27 @@ impl BucketLevel {
         self.next.is_some()
     }
 
+    /// Resolve any pending async merge without committing it.
+    ///
+    /// This ensures that if this level has an async merge in progress,
+    /// we wait for it to complete and cache its result. This is necessary
+    /// before cloning the bucket list, as unresolved async merges would be
+    /// lost during cloning.
+    pub fn resolve_pending_merge(&mut self) {
+        if let Some(PendingMerge::Async(ref mut handle)) = self.next {
+            if handle.result.is_none() {
+                // Resolve the async merge, which caches the result in the handle
+                if let Err(e) = handle.resolve() {
+                    tracing::error!(
+                        level = self.level,
+                        error = %e,
+                        "Failed to resolve async merge"
+                    );
+                }
+            }
+        }
+    }
+
     /// Get a reference to the next bucket if any (pending merge result).
     /// Used for lookups to check pending merges.
     ///
@@ -838,6 +859,17 @@ impl BucketList {
     /// at higher levels can be tens of GB.
     pub fn set_bucket_dir(&mut self, dir: std::path::PathBuf) {
         self.bucket_dir = Some(dir);
+    }
+
+    /// Resolve all pending async merges without committing them.
+    ///
+    /// This should be called before cloning a bucket list to ensure that all
+    /// async merges are resolved and their results are cached, preventing data
+    /// loss during cloning.
+    pub fn resolve_all_pending_merges(&mut self) {
+        for level in &mut self.levels {
+            level.resolve_pending_merge();
+        }
     }
 
     /// Get the hash of the entire BucketList.

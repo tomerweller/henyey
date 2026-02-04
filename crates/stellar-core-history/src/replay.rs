@@ -81,6 +81,94 @@ fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchiv
     }
 }
 
+/// Compute the LiveSorobanStateSizeWindow entry if it needs updating at this ledger.
+///
+/// The window tracks Soroban state size samples over time for resource limiting.
+/// Updates occur when:
+/// - The sample size changes (window is resized)
+/// - We're at a sample boundary (seq % sample_period == 0)
+fn compute_soroban_state_size_window_entry(
+    seq: u32,
+    bucket_list: &stellar_core_bucket::BucketList,
+    soroban_state_size: u64,
+    archival_override: Option<&stellar_xdr::curr::StateArchivalSettings>,
+) -> Option<LedgerEntry> {
+    use stellar_xdr::curr::VecM;
+
+    // Load StateArchival settings
+    let archival = if let Some(override_settings) = archival_override {
+        override_settings.clone()
+    } else {
+        let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::StateArchival,
+        });
+        let archival_entry = bucket_list.get(&archival_key).ok()??;
+        match archival_entry.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => settings,
+            _ => return None,
+        }
+    };
+
+    let sample_period = archival.live_soroban_state_size_window_sample_period;
+    let sample_size = archival.live_soroban_state_size_window_sample_size as usize;
+    if sample_period == 0 || sample_size == 0 {
+        return None;
+    }
+
+    // Load current window
+    let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+    });
+    let window_entry = bucket_list.get(&window_key).ok()??;
+    let window = match window_entry.data {
+        LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(w)) => w,
+        _ => return None,
+    };
+
+    let mut window_vec: Vec<u64> = window.into();
+    if window_vec.is_empty() {
+        return None;
+    }
+
+    let mut changed = false;
+
+    // Resize window if sample size changed
+    if window_vec.len() != sample_size {
+        if sample_size < window_vec.len() {
+            let remove_count = window_vec.len() - sample_size;
+            window_vec.drain(0..remove_count);
+        } else {
+            let oldest = window_vec[0];
+            let insert_count = sample_size - window_vec.len();
+            for _ in 0..insert_count {
+                window_vec.insert(0, oldest);
+            }
+        }
+        changed = true;
+    }
+
+    // Sample at period boundary
+    if seq % sample_period == 0 && !window_vec.is_empty() {
+        window_vec.remove(0);
+        window_vec.push(soroban_state_size);
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let window_vecm: VecM<u64> = window_vec.try_into().ok()?;
+
+    Some(LedgerEntry {
+        last_modified_ledger_seq: seq,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+            window_vecm,
+        )),
+        ext: LedgerEntryExt::V0,
+    })
+}
+
 /// The result of replaying a single ledger.
 ///
 /// This contains both summary statistics and the actual ledger entry changes
@@ -322,10 +410,15 @@ pub fn replay_ledger_with_execution(
     expected_tx_results: Option<&[TransactionResultPair]>,
     eviction_iterator: Option<EvictionIterator>,
     module_cache: Option<&PersistentModuleCache>,
+    soroban_state_size: Option<u64>,
 ) -> Result<LedgerReplayResult> {
     if config.verify_results {
         verify::verify_tx_set(header, tx_set)?;
     }
+
+    // Resolve all pending async merges before cloning.
+    // This ensures merge results are cached and won't be lost during clone.
+    bucket_list.resolve_all_pending_merges();
 
     let snapshot = LedgerSnapshot::empty(header.ledger_seq);
     let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
@@ -510,18 +603,32 @@ pub fn replay_ledger_with_execution(
         }
     }
 
-    bucket_list
-        .add_batch(
-            header.ledger_seq,
-            header.ledger_version,
-            BucketListType::Live,
-            init_entries.clone(),
-            all_live_entries,
-            all_dead_entries,
+    // Update LiveSorobanStateSizeWindow if needed.
+    // C++ stellar-core calls snapshotSorobanStateSizeWindow() at the end of ledger close.
+    // This samples the current Soroban state size at periodic intervals.
+    // Check if already present in live_entries (from transaction delta)
+    let has_window_entry = all_live_entries.iter().any(|e| {
+        matches!(
+            &e.data,
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(_))
         )
-        .map_err(HistoryError::Bucket)?;
+    });
+    if !has_window_entry {
+        if let Some(state_size) = soroban_state_size {
+            if let Some(window_entry) =
+                compute_soroban_state_size_window_entry(header.ledger_seq, bucket_list, state_size, None)
+            {
+                tracing::debug!(
+                    ledger_seq = header.ledger_seq,
+                    soroban_state_size = state_size,
+                    "Added LiveSorobanStateSizeWindow entry to live entries"
+                );
+                all_live_entries.push(window_entry);
+            }
+        }
+    }
 
-    // Update hot archive with archived persistent entries.
+    // Update hot archive FIRST (matches C++ order: addHotArchiveBatch before addLiveBatch).
     // IMPORTANT: Must always call add_batch for protocol 23+ even with empty entries,
     // because the hot archive bucket list needs to run spill logic at the same
     // ledger boundaries as the live bucket list.
@@ -556,6 +663,25 @@ pub fn replay_ledger_with_execution(
             "Hot archive bucket list is None - skipping add_batch"
         );
     }
+
+    // Apply changes to live bucket list SECOND (after hot archive update).
+    tracing::debug!(
+        ledger_seq = header.ledger_seq,
+        init_count = init_entries.len(),
+        live_count = all_live_entries.len(),
+        dead_count = all_dead_entries.len(),
+        "Replay add_batch entry counts"
+    );
+    bucket_list
+        .add_batch(
+            header.ledger_seq,
+            header.ledger_version,
+            BucketListType::Live,
+            init_entries.clone(),
+            all_live_entries,
+            all_dead_entries,
+        )
+        .map_err(HistoryError::Bucket)?;
 
     if config.verify_bucket_list {
         // Bucket list verification during replay is only reliable at checkpoints.
@@ -1240,6 +1366,7 @@ mod tests {
             None,
             None,
             None, // module_cache
+            None, // soroban_state_size
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
@@ -1271,6 +1398,7 @@ mod tests {
             None,
             None,
             None, // module_cache
+            None, // soroban_state_size
         );
 
         assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
@@ -1305,8 +1433,137 @@ mod tests {
             None,
             None,
             None, // module_cache
+            None, // soroban_state_size
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_compute_soroban_state_size_window_entry_at_sample_boundary() {
+        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+
+        // Create archival settings with sample_period=100, sample_size=5
+        let archival = StateArchivalSettings {
+            live_soroban_state_size_window_sample_period: 100,
+            live_soroban_state_size_window_sample_size: 5,
+            ..StateArchivalSettings::default()
+        };
+
+        // Create initial window with 5 samples
+        let initial_window: stellar_xdr::curr::VecM<u64> = vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
+
+        // Set up bucket list with required config entries
+        let mut bucket_list = BucketList::new();
+
+        // Add StateArchival config
+        let archival_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival.clone())),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list.add_batch(1, 25, BucketListType::Live, vec![], vec![archival_entry], vec![]).expect("add archival");
+
+        // Add LiveSorobanStateSizeWindow config
+        let window_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(initial_window)),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list.add_batch(2, 25, BucketListType::Live, vec![], vec![window_entry], vec![]).expect("add window");
+
+        // Test at sample boundary (seq % 100 == 0) with new state size 6000
+        let result = compute_soroban_state_size_window_entry(200, &bucket_list, 6000, Some(&archival));
+        assert!(result.is_some(), "Should produce window entry at sample boundary");
+
+        let entry = result.unwrap();
+        match entry.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) => {
+                let window_vec: Vec<u64> = window.into();
+                // Old window: [1000, 2000, 3000, 4000, 5000]
+                // After sample: [2000, 3000, 4000, 5000, 6000]
+                assert_eq!(window_vec, vec![2000, 3000, 4000, 5000, 6000]);
+            }
+            _ => panic!("Expected LiveSorobanStateSizeWindow config entry"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compute_soroban_state_size_window_entry_not_at_boundary() {
+        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+
+        // Create archival settings with sample_period=100
+        let archival = StateArchivalSettings {
+            live_soroban_state_size_window_sample_period: 100,
+            live_soroban_state_size_window_sample_size: 5,
+            ..StateArchivalSettings::default()
+        };
+
+        let initial_window: stellar_xdr::curr::VecM<u64> = vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
+
+        let mut bucket_list = BucketList::new();
+
+        let archival_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival.clone())),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list.add_batch(1, 25, BucketListType::Live, vec![], vec![archival_entry], vec![]).expect("add archival");
+
+        let window_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(initial_window)),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list.add_batch(2, 25, BucketListType::Live, vec![], vec![window_entry], vec![]).expect("add window");
+
+        // Test NOT at sample boundary (seq % 100 != 0)
+        let result = compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
+        assert!(result.is_none(), "Should NOT produce window entry when not at sample boundary");
+    }
+
+    #[tokio::test]
+    async fn test_compute_soroban_state_size_window_entry_resize_smaller() {
+        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+
+        // New settings want size 3 instead of 5
+        let archival = StateArchivalSettings {
+            live_soroban_state_size_window_sample_period: 100,
+            live_soroban_state_size_window_sample_size: 3,
+            ..StateArchivalSettings::default()
+        };
+
+        // Current window has 5 entries
+        let initial_window: stellar_xdr::curr::VecM<u64> = vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
+
+        let mut bucket_list = BucketList::new();
+
+        let archival_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival.clone())),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list.add_batch(1, 25, BucketListType::Live, vec![], vec![archival_entry], vec![]).expect("add archival");
+
+        let window_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(initial_window)),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list.add_batch(2, 25, BucketListType::Live, vec![], vec![window_entry], vec![]).expect("add window");
+
+        // Even when not at sample boundary, resize should trigger update
+        let result = compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
+        assert!(result.is_some(), "Should produce window entry when resizing");
+
+        let entry = result.unwrap();
+        match entry.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) => {
+                let window_vec: Vec<u64> = window.into();
+                // Old: [1000, 2000, 3000, 4000, 5000] -> resized to [3000, 4000, 5000]
+                assert_eq!(window_vec, vec![3000, 4000, 5000]);
+            }
+            _ => panic!("Expected LiveSorobanStateSizeWindow config entry"),
+        }
     }
 }

@@ -1892,17 +1892,16 @@ fn execute_host_function_p24(
     let storage_changes = result.ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // C++ stellar-core behavior for transaction meta emission:
+            // C++ stellar-core behavior for transaction meta and state updates:
             //
-            // 1. For read-WRITE entries: Include in meta if modified, deleted, or TTL extended
-            // 2. For read-ONLY entries: TTL-only changes should be applied to state (bucket list)
-            //    but NOT included in transaction meta. C++ accumulates read-only TTL bumps
-            //    separately (mRoTTLBumps) and flushes them at write barriers, NOT in individual
-            //    transaction meta. This is per CAP-0063.
+            // 1. Transaction meta (setLedgerChangesFromSuccessfulOp): Uses raw res.getModifiedEntryMap()
+            //    which includes ALL entries, including RO TTL bumps. RO TTL bumps ARE in transaction meta.
+            // 2. State updates (commitChangesFromSuccessfulOp): Filters RO TTL bumps to mRoTTLBumps
+            //    (not the entry map) and flushes them at write barriers. This is for visibility ordering.
             //
             // We track read-only TTL bumps with is_read_only_ttl_bump flag so they can be:
-            // - Applied to state (bucket list correctness)
-            // - Filtered out when building transaction meta
+            // - Included in transaction meta (per C++ behavior)
+            // - Deferred for state visibility (so subsequent TXs don't see the bump)
             
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
@@ -2416,13 +2415,9 @@ fn execute_host_function_p25(
         .ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // C++ stellar-core behavior for transaction meta emission:
-            //
-            // 1. For read-WRITE entries: Include in meta if modified, deleted, or TTL extended
-            // 2. For read-ONLY entries: TTL-only changes should be applied to state (bucket list)
-            //    but NOT included in transaction meta. C++ accumulates read-only TTL bumps
-            //    separately (mRoTTLBumps) and flushes them at write barriers, NOT in individual
-            //    transaction meta. This is per CAP-0063.
+            // C++ stellar-core behavior: RO TTL bumps ARE included in transaction meta.
+            // State updates defer them to mRoTTLBumps for visibility ordering, but that's
+            // separate from meta. See setLedgerChangesFromSuccessfulOp vs commitChangesFromSuccessfulOp.
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
             let is_modification = change.encoded_new_value.is_some();
             let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
