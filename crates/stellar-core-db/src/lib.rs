@@ -564,7 +564,7 @@ impl Database {
 
     /// Loads random outbound peers by failure count only.
     ///
-    /// Similar to [`load_random_peers_any_outbound`] but ignores the next
+    /// Similar to [`Self::load_random_peers_any_outbound`] but ignores the next
     /// attempt time, useful for aggressive peer discovery.
     pub fn load_random_peers_any_outbound_max_failures(
         &self,

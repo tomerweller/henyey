@@ -7,9 +7,9 @@
 //!
 //! - **Ed25519 signatures**: Key generation, signing, and verification via [`SecretKey`] and [`PublicKey`]
 //! - **SHA-256 hashing**: Single-shot ([`sha256`]) and streaming ([`Sha256Hasher`]) hash computation
-//! - **BLAKE2 hashing**: Single-shot ([`blake2`]) and streaming ([`Blake2Hasher`]) hash computation
+//! - **BLAKE2 hashing**: Single-shot ([`fn@blake2`]) and streaming ([`Blake2Hasher`]) hash computation
 //! - **HMAC-SHA256**: Message authentication via [`hmac_sha256`] and [`hmac_sha256_verify`]
-//! - **HKDF**: Key derivation via [`hkdf_extract`], [`hkdf_expand`], and [`hkdf`]
+//! - **HKDF**: Key derivation via [`hkdf_extract`], [`hkdf_expand`], and [`hkdf()`]
 //! - **XDR hashing**: [`xdr_sha256`] and [`xdr_blake2`] for hashing XDR-encoded values
 //! - **StrKey encoding**: Stellar's base32 key format for account IDs, secret seeds, and more
 //! - **Short hashing**: SipHash-2-4 for deterministic ordering in bucket lists and ledger state

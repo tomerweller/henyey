@@ -15,7 +15,7 @@
 //! To add a new migration:
 //!
 //! 1. Increment [`CURRENT_VERSION`]
-//! 2. Add a new [`Migration`] entry to the [`MIGRATIONS`] array
+//! 2. Add a new `Migration` entry to the `MIGRATIONS` array
 //! 3. The `from_version` should be the previous `CURRENT_VERSION`
 //! 4. Provide idempotent SQL (use `IF NOT EXISTS`, `IF EXISTS`, etc.)
 //!

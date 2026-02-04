@@ -958,7 +958,7 @@ impl AppConfig {
     /// Load configuration with environment variable overrides.
     ///
     /// Environment variables take precedence over file configuration.
-    /// Variables use the pattern: RS_STELLAR_CORE_<SECTION>_<KEY>
+    /// Variables use the pattern: `RS_STELLAR_CORE_<SECTION>_<KEY>`
     ///
     /// Examples:
     /// - RS_STELLAR_CORE_NODE_NAME

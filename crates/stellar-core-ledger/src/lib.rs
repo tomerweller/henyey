@@ -260,7 +260,7 @@ pub mod fees {
     /// # Note
     ///
     /// This is a simplified check that doesn't account for minimum balance
-    /// requirements. Use [`reserves::available_to_send`] for a complete check.
+    /// requirements. Use `reserves::available_to_send` for a complete check.
     pub fn can_afford_fee(account: &AccountEntry, fee: u64) -> bool {
         // Account must have enough XLM to pay the fee
         // considering selling liabilities

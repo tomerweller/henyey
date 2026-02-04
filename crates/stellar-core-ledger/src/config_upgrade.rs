@@ -420,7 +420,7 @@ impl ConfigUpgradeSetFrame {
         // Check hash matches
         let bytes = upgrade_set.to_xdr(Limits::none()).unwrap_or_default();
         let computed_hash = Sha256::digest(&bytes);
-        if computed_hash.as_slice() != key.content_hash.0 {
+        if &computed_hash[..] != key.content_hash.0 {
             debug!(
                 expected = format!("{:02x?}", &key.content_hash.0[..8]),
                 computed = format!("{:02x?}", &computed_hash[..8]),

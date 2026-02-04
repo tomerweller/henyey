@@ -65,15 +65,15 @@ pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
 ///
 /// The skip list is only updated when ledger_seq is divisible by SKIP_1 (50).
 /// At those points:
-/// - skipList[0] = current bucket_list_hash
-/// - skipList[1] = previous skipList[0] (when appropriate interval conditions are met)
-/// - skipList[2] = previous skipList[1] (when appropriate interval conditions are met)
-/// - skipList[3] = previous skipList[2] (when appropriate interval conditions are met)
+/// - `skipList[0]` = current bucket_list_hash
+/// - `skipList[1]` = previous `skipList[0]` (when appropriate interval conditions are met)
+/// - `skipList[2]` = previous `skipList[1]` (when appropriate interval conditions are met)
+/// - `skipList[3]` = previous `skipList[2]` (when appropriate interval conditions are met)
 ///
 /// The cascading updates happen based on complex interval conditions:
-/// - skipList[1] updates when (seq - SKIP_1) % SKIP_2 == 0
-/// - skipList[2] updates when additionally (seq - SKIP_2 - SKIP_1) % SKIP_3 == 0
-/// - skipList[3] updates when additionally (seq - SKIP_3 - SKIP_2 - SKIP_1) % SKIP_4 == 0
+/// - `skipList[1]` updates when (seq - SKIP_1) % SKIP_2 == 0
+/// - `skipList[2]` updates when additionally (seq - SKIP_2 - SKIP_1) % SKIP_3 == 0
+/// - `skipList[3]` updates when additionally (seq - SKIP_3 - SKIP_2 - SKIP_1) % SKIP_4 == 0
 ///
 /// # Arguments
 ///

@@ -4,7 +4,7 @@
 //! node configuration and runtime state. It stores values like the network
 //! passphrase, last closed ledger, and SCP state.
 //!
-//! See [`state_keys`](crate::schema::state_keys) for well-known key constants.
+//! See [`state_keys`] for well-known key constants.
 
 use rusqlite::{params, Connection, OptionalExtension};
 

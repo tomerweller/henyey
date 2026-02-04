@@ -19,7 +19,7 @@
 //! # Wire Format
 //!
 //! Both streams use the same size-prefixed XDR framing as C++ stellar-core's
-//! `XDROutputFileStream`, implemented by [`XdrOutputStream`](stellar_core_common::xdr_stream::XdrOutputStream).
+//! `XDROutputFileStream`, implemented by [`XdrOutputStream`].
 
 use std::io;
 use std::path::{Path, PathBuf};

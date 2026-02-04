@@ -225,7 +225,7 @@ impl DiskBucket {
     /// Create a disk bucket from an XDR file.
     ///
     /// This parses the file to build the index but doesn't keep entries in memory.
-    /// For large files, prefer [`from_file_streaming`] which uses O(1) memory.
+    /// For large files, prefer `from_file_streaming` which uses O(1) memory.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_file_with_seed(path, DEFAULT_BLOOM_SEED)
     }
@@ -234,7 +234,7 @@ impl DiskBucket {
     ///
     /// This parses the file to build the index but doesn't keep entries in memory.
     /// Note: This loads the entire file into memory for hash computation and index
-    /// building. For large files, prefer [`from_file_streaming`].
+    /// building. For large files, prefer `from_file_streaming`.
     pub fn from_file_with_seed(path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;

@@ -365,7 +365,7 @@ impl TransactionValidator {
 /// - **Historical replay**: Use [`apply_historical`](Self::apply_historical) with
 ///   known results and metadata from archives.
 ///
-/// - **Live execution**: Use [`execute_with_state`] (when available) with a
+/// - **Live execution**: Use `execute_with_state` (when available) with a
 ///   state reader for full transaction execution.
 ///
 /// # Note

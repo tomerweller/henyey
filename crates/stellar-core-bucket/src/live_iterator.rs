@@ -95,7 +95,7 @@ pub struct LiveEntriesIterator<'a> {
     /// Iterator over the current bucket's entries.
     bucket_iter: Option<BucketIter<'a>>,
 
-    /// Set of seen keys for deduplication (matches C++ unordered_set<LedgerKey>).
+    /// Set of seen keys for deduplication (matches C++ `unordered_set<LedgerKey>`).
     seen_keys: HashSet<LedgerKey>,
 
     /// Number of entries yielded (for statistics).

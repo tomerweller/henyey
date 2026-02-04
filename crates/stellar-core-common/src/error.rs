@@ -1,11 +1,11 @@
 //! Common error types for rs-stellar-core.
 //!
-//! This module provides the unified error type [`Error`] and the convenience
+//! This module provides the unified error type [`enum@Error`] and the convenience
 //! type alias [`Result`] used throughout the rs-stellar-core crates.
 //!
 //! # Error Handling Philosophy
 //!
-//! The [`Error`] enum provides broad categories of errors that can occur
+//! The [`enum@Error`] enum provides broad categories of errors that can occur
 //! during stellar-core operations. More specific error types can be wrapped
 //! in the appropriate variant using the string message.
 //!

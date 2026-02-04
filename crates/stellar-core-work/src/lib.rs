@@ -509,7 +509,7 @@ impl Default for WorkSchedulerConfig {
 ///
 /// Work items are moved into the scheduler and remain there until the scheduler
 /// is dropped. The scheduler temporarily moves work items out during execution
-/// (replacing them with a placeholder [`EmptyWork`]) and moves them back after
+/// (replacing them with a placeholder `EmptyWork`) and moves them back after
 /// completion. This design satisfies Rust's ownership rules while allowing
 /// stateful work items to be retried.
 ///

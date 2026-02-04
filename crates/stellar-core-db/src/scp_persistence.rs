@@ -38,7 +38,7 @@ impl SqliteScpPersistence {
         Self { db }
     }
 
-    /// Create a new SQLite SCP persistence instance from an Arc<Database>.
+    /// Create a new SQLite SCP persistence instance from an `Arc<Database>`.
     pub fn from_arc(db: Arc<Database>) -> Self {
         // Clone the database handle (this clones the connection pool reference)
         Self { db: (*db).clone() }

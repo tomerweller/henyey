@@ -1602,7 +1602,7 @@ impl HistoryWorkBuilder {
     ///
     /// * `scheduler` - The work scheduler to register with
     /// * `writer` - The archive writer to publish data to
-    /// * `deps` - Work IDs from a prior [`register`] call to use as dependencies
+    /// * `deps` - Work IDs from a prior `register` call to use as dependencies
     ///
     /// # Returns
     ///

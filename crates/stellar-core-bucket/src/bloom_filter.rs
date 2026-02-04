@@ -170,7 +170,7 @@ impl BucketBloomFilter {
     /// # Hash Computation
     ///
     /// This method computes the hash internally. If you need to check many keys
-    /// and already have the hashes, use [`may_contain_hash`] instead.
+    /// and already have the hashes, use [`Self::may_contain_hash`] instead.
     pub fn may_contain(&self, key: &LedgerKey, seed: &HashSeed) -> bool {
         let hash = Self::hash_key(key, seed);
         self.may_contain_hash(hash)

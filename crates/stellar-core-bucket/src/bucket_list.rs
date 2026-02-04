@@ -1088,7 +1088,7 @@ impl BucketList {
 
     /// Scan the bucket list for live entries matching ANY of the given types.
     ///
-    /// This is similar to [`scan_for_entries_of_type`] but accepts multiple types and
+    /// This is similar to `scan_for_entries_of_type` but accepts multiple types and
     /// performs a single pass over the bucket list, avoiding redundant I/O when multiple
     /// types need to be loaded together (e.g., ContractCode + ContractData + TTL +
     /// ConfigSetting for Soroban state initialization).
@@ -1623,7 +1623,7 @@ impl BucketList {
 
     /// Restore a bucket list from hashes and a bucket lookup function.
     ///
-    /// This is a convenience wrapper around [`restore_from_has`] for cases where
+    /// This is a convenience wrapper around [`Self::restore_from_has`] for cases where
     /// you only have bucket hashes without HAS next state information. It assumes
     /// no pending merges (state=0 for all levels), which is the common case at
     /// checkpoints.
@@ -1662,7 +1662,7 @@ impl BucketList {
     /// the HAS indicates a completed merge (state == HAS_NEXT_STATE_OUTPUT), which is
     /// necessary for correct bucket list hash computation at checkpoints.
     ///
-    /// For convenience, [`restore_from_hashes`] wraps this function with default
+    /// For convenience, [`Self::restore_from_hashes`] wraps this function with default
     /// next states (all state=0).
     ///
     /// # Arguments

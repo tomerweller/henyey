@@ -776,7 +776,7 @@ impl UpgradeContext {
 /// # Usage
 ///
 /// Statistics are accumulated during transaction processing and can be
-/// accessed via [`LedgerCloseContext::stats`].
+/// accessed via `LedgerCloseContext::stats`.
 ///
 /// ```ignore
 /// let ctx = manager.begin_close(close_data)?;

@@ -1075,7 +1075,7 @@ impl HotArchiveBucketList {
     ///
     /// Restore a hot archive bucket list from hashes and a bucket lookup function.
     ///
-    /// This is a convenience wrapper around [`restore_from_has`] for cases where
+    /// This is a convenience wrapper around [`Self::restore_from_has`] for cases where
     /// you only have bucket hashes without HAS next state information. It assumes
     /// no pending merges (state=0 for all levels), which is the common case at
     /// checkpoints.
@@ -1114,7 +1114,7 @@ impl HotArchiveBucketList {
     /// the HAS indicates a completed merge (state == HAS_NEXT_STATE_OUTPUT), which is
     /// necessary for correct bucket list hash computation at checkpoints.
     ///
-    /// For convenience, [`restore_from_hashes`] wraps this function with default
+    /// For convenience, [`Self::restore_from_hashes`] wraps this function with default
     /// next states (all state=0).
     ///
     /// # Arguments

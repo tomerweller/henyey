@@ -241,7 +241,7 @@ impl BucketManager {
     /// Supports both the canonical `.bucket.xdr` format and the legacy
     /// `.bucket.gz` format (with automatic migration).
     ///
-    /// Files larger than [`DISK_BACKED_THRESHOLD`] are loaded as DiskBacked
+    /// Files larger than `DISK_BACKED_THRESHOLD` are loaded as DiskBacked
     /// buckets (only the index is in memory); smaller files are loaded entirely
     /// into memory for faster access.
     pub fn load_bucket(&self, hash: &Hash256) -> Result<Arc<Bucket>> {
@@ -758,7 +758,7 @@ impl BucketManager {
 
     /// Visits all ledger entries of a specific type in the given buckets.
     ///
-    /// This is a convenience wrapper around [`visit_ledger_entries`] that
+    /// This is a convenience wrapper around `visit_ledger_entries` that
     /// filters by entry type.
     pub fn visit_ledger_entries_of_type<A>(
         &self,

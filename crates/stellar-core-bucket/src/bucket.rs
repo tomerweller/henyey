@@ -659,7 +659,7 @@ impl Bucket {
     /// Save this bucket to a gzipped file.
     ///
     /// This is the legacy format used for backward compatibility and archive publishing.
-    /// For normal on-disk storage, use [`save_to_xdr_file`] instead.
+    /// For normal on-disk storage, use `save_to_xdr_file` instead.
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
         let path = path.as_ref().to_path_buf();
 

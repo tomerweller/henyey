@@ -91,7 +91,7 @@ impl CdpDataLake {
     /// Create a new CDP data lake client.
     ///
     /// # Arguments
-    /// * `base_url` - Base URL for the data lake (e.g., "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet")
+    /// * `base_url` - Base URL for the data lake (e.g., `https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet`)
     /// * `date_partition` - Date partition to use (e.g., "2025-12-18")
     pub fn new(base_url: &str, date_partition: &str) -> Self {
         Self {
