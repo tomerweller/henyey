@@ -422,15 +422,6 @@ impl LedgerManager {
         self.state.read().header_hash
     }
 
-    /// Get the in-memory Soroban state size (CONTRACT_DATA + CONTRACT_CODE).
-    ///
-    /// This returns the incrementally tracked total size, avoiding expensive
-    /// bucket list scans. The size includes the compiled module memory cost
-    /// for CONTRACT_CODE entries (Protocol 23+).
-    pub fn soroban_state_size(&self) -> u64 {
-        self.soroban_state.read().total_size()
-    }
-
     /// Get a reference to the shared Soroban state.
     pub fn soroban_state(&self) -> &Arc<crate::soroban_state::SharedSorobanState> {
         &self.soroban_state
@@ -493,11 +484,6 @@ impl LedgerManager {
 
         let entry = self.bucket_list.read().get(&key).ok()??;
         extract_scp_timing(&entry)
-    }
-
-    /// Get the bucket list hash.
-    pub fn bucket_list_hash(&self) -> Hash256 {
-        self.bucket_list.read().hash()
     }
 
     /// Get bucket list level hashes (curr, snap) for persistence.
@@ -1830,11 +1816,6 @@ impl<'a> LedgerCloseContext<'a> {
     /// Get the stats.
     pub fn stats(&self) -> &LedgerCloseStats {
         &self.stats
-    }
-
-    /// Get a mutable reference to the stats.
-    pub fn stats_mut(&mut self) -> &mut LedgerCloseStats {
-        &mut self.stats
     }
 
     /// Load an entry from the snapshot.
