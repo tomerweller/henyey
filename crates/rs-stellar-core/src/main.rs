@@ -2955,16 +2955,15 @@ async fn cmd_verify_execution(
     let init_header_hash = init_header_entry.map(|h| Hash256::from(h.hash.0));
     let t_init_caches_start = std::time::Instant::now();
     ledger_manager
-        .initialize_from_buckets_parallel(
+        .initialize_from_buckets(
             bucket_list,
             hot_archive_bucket_list,
             init_header_entry
                 .map(|h| h.header.clone())
                 .unwrap_or_default(),
             init_header_hash,
-        )
-        .await?;
-    println!("[INIT] initialize_from_buckets_parallel (hash verify + all caches): {:.2}s", t_init_caches_start.elapsed().as_secs_f64());
+        )?;
+    println!("[INIT] initialize_from_buckets (hash verify + all caches): {:.2}s", t_init_caches_start.elapsed().as_secs_f64());
     println!("[INIT] TOTAL initialization: {:.2}s", init_start.elapsed().as_secs_f64());
 
     if !quiet {
