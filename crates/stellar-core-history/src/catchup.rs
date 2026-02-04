@@ -49,6 +49,7 @@
 use crate::{
     archive::HistoryArchive,
     archive_state::HistoryArchiveState,
+    catchup_range::{CatchupMode, CatchupRange},
     checkpoint,
     replay::{self, LedgerReplayResult, ReplayConfig, ReplayedLedgerState},
     verify, CatchupOutput, CatchupResult, HistoryError, Result,
@@ -506,6 +507,276 @@ impl CatchupManager {
                 ledger_hash: final_hash,
                 ledgers_applied,
                 buckets_downloaded: buckets_total,
+            },
+            bucket_list,
+            hot_archive_bucket_list,
+            header: final_header,
+            header_hash: final_hash,
+        })
+    }
+
+    /// Catch up to a target ledger with a specific catchup mode.
+    ///
+    /// This method calculates the appropriate checkpoint and replay range based on
+    /// the mode (Minimal, Complete, or Recent(N)).
+    ///
+    /// # Arguments
+    ///
+    /// * `target` - The target ledger sequence to catch up to
+    /// * `mode` - The catchup mode determining history depth
+    /// * `lcl` - The current Last Closed Ledger (use GENESIS_LEDGER_SEQ if starting fresh)
+    ///
+    /// # Returns
+    ///
+    /// A `CatchupOutput` containing the bucket list, header, and summary information.
+    pub async fn catchup_to_ledger_with_mode(
+        &mut self,
+        target: u32,
+        mode: CatchupMode,
+        lcl: u32,
+    ) -> Result<CatchupOutput> {
+        info!(
+            "Starting catchup to ledger {} with mode {:?}, lcl={}",
+            target, mode, lcl
+        );
+        self.progress.target_ledger = target;
+
+        // Calculate the catchup range based on mode
+        let range = CatchupRange::calculate(lcl, target, mode);
+        info!(
+            "Catchup range: apply_buckets={}, bucket_apply_ledger={}, replay_first={}, replay_count={}",
+            range.apply_buckets(),
+            if range.apply_buckets() { range.bucket_apply_ledger() } else { 0 },
+            range.replay_first(),
+            range.replay_count()
+        );
+
+        let (mut bucket_list, mut hot_archive_bucket_list, checkpoint_seq, network_id) =
+            if range.apply_buckets() {
+                // Apply buckets at the calculated checkpoint
+                let bucket_apply_at = range.bucket_apply_ledger();
+                info!("Applying buckets at checkpoint {}", bucket_apply_at);
+
+                // Download HAS
+                self.update_progress(
+                    CatchupStatus::DownloadingHAS,
+                    1,
+                    "Downloading History Archive State",
+                );
+                let has = self.download_has(bucket_apply_at).await?;
+                verify::verify_has_structure(&has)?;
+                verify::verify_has_checkpoint(&has, bucket_apply_at)?;
+
+                let scp_history = self.download_scp_history(bucket_apply_at).await?;
+                if !scp_history.is_empty() {
+                    verify::verify_scp_history_entries(&scp_history)?;
+                    self.persist_scp_history_entries(&scp_history)?;
+                }
+
+                // Download buckets
+                self.update_progress(
+                    CatchupStatus::DownloadingBuckets,
+                    2,
+                    "Downloading bucket files",
+                );
+                let bucket_hashes = has.unique_bucket_hashes();
+                self.progress.buckets_total = bucket_hashes.len() as u32;
+                let buckets = self.download_buckets(&bucket_hashes).await?;
+
+                // Apply buckets
+                self.update_progress(
+                    CatchupStatus::ApplyingBuckets,
+                    3,
+                    "Applying buckets to build initial state",
+                );
+                let (bl, hot_bl, live_next_states, hot_next_states) =
+                    self.apply_buckets(&has, &buckets).await?;
+
+                let mut bucket_list = bl;
+                let mut hot_archive_bucket_list = hot_bl;
+
+                // Restart merges
+                let protocol_version = 25u32;
+                let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
+                let load_bucket_for_merge = |hash: &Hash256| -> stellar_core_bucket::Result<Bucket> {
+                    if hash.is_zero() {
+                        return Ok(Bucket::empty());
+                    }
+                    let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                    if bucket_path.exists() {
+                        let data = std::fs::read(&bucket_path).map_err(|e| {
+                            stellar_core_bucket::BucketError::NotFound(format!(
+                                "failed to read bucket from disk: {}",
+                                e
+                            ))
+                        })?;
+                        Bucket::from_xdr_bytes(&data)
+                    } else {
+                        Err(stellar_core_bucket::BucketError::NotFound(format!(
+                            "bucket {} not found on disk",
+                            hash
+                        )))
+                    }
+                };
+
+                bucket_list
+                    .restart_merges_from_has(
+                        bucket_apply_at,
+                        protocol_version,
+                        &live_next_states,
+                        load_bucket_for_merge,
+                    )
+                    .map_err(|e| {
+                        HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
+                    })?;
+
+                if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+                    use stellar_core_bucket::HotArchiveBucket;
+                    let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
+                    let load_hot_bucket_for_merge =
+                        |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
+                            if hash.is_zero() {
+                                return Ok(HotArchiveBucket::empty());
+                            }
+                            let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                            if bucket_path.exists() {
+                                let data = std::fs::read(&bucket_path).map_err(|e| {
+                                    stellar_core_bucket::BucketError::NotFound(format!(
+                                        "failed to read bucket from disk: {}",
+                                        e
+                                    ))
+                                })?;
+                                HotArchiveBucket::from_xdr_bytes(&data)
+                            } else {
+                                Err(stellar_core_bucket::BucketError::NotFound(format!(
+                                    "hot archive bucket {} not found on disk",
+                                    hash
+                                )))
+                            }
+                        };
+                    hot_archive
+                        .restart_merges_from_has(
+                            bucket_apply_at,
+                            protocol_version,
+                            &hot_next_states,
+                            load_hot_bucket_for_merge,
+                        )
+                        .map_err(|e| {
+                            HistoryError::CatchupFailed(format!(
+                                "Failed to restart hot archive merges: {}",
+                                e
+                            ))
+                        })?;
+                }
+
+                info!(
+                    "Bucket list hash after restart_merges_from_has: {}",
+                    bucket_list.hash()
+                );
+
+                self.persist_bucket_list_snapshot(bucket_apply_at, &bucket_list)?;
+
+                let network_id = has
+                    .network_passphrase
+                    .as_ref()
+                    .map(|p| NetworkId::from_passphrase(p))
+                    .unwrap_or_else(NetworkId::testnet);
+
+                (bucket_list, hot_archive_bucket_list, bucket_apply_at, network_id)
+            } else {
+                // No bucket application - we're replaying from current state
+                // This only happens when LCL > genesis (case 1)
+                return Err(HistoryError::CatchupFailed(
+                    "Catchup from LCL > genesis not yet supported (requires existing bucket list)".to_string()
+                ));
+            };
+
+        // Download ledger data for replay range
+        let replay_first = range.replay_first();
+        let replay_count = range.replay_count();
+
+        let (final_header, final_hash, ledgers_applied) = if replay_count == 0 {
+            // No replay needed - target is exactly at checkpoint
+            info!(
+                "Catching up to checkpoint {} (no ledgers to replay)",
+                checkpoint_seq
+            );
+            let (header, hash) = self.download_checkpoint_header(checkpoint_seq).await?;
+            (header, hash, 0)
+        } else {
+            // Download ledger data for replay
+            self.update_progress(
+                CatchupStatus::DownloadingLedgers,
+                4,
+                "Downloading ledger data",
+            );
+
+            // We need to download ledgers from replay_first to target
+            // The download_ledger_data expects (checkpoint, target) where it downloads
+            // ledgers from checkpoint+1 to target. So we need to adjust.
+            let download_from_checkpoint = replay_first - 1;
+            let ledger_data = self.download_ledger_data(download_from_checkpoint, target).await?;
+
+            // Verify the header chain
+            self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
+            self.verify_downloaded_data(&ledger_data)?;
+
+            // Replay ledgers
+            self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
+
+            let final_state = self
+                .replay_ledgers(
+                    &mut bucket_list,
+                    hot_archive_bucket_list.as_mut(),
+                    &ledger_data,
+                    network_id,
+                )
+                .await?;
+
+            // Get final header
+            let (final_header, final_hash) = match self.download_checkpoint_header(target).await {
+                Ok((header, hash)) => (header, hash),
+                Err(_) => {
+                    warn!("Could not download final header, using replay state");
+                    let header = create_header_from_replay_state(
+                        &final_state,
+                        &bucket_list,
+                        hot_archive_bucket_list.as_ref(),
+                    );
+                    (header, final_state.ledger_hash)
+                }
+            };
+
+            self.persist_ledger_history(&ledger_data, &network_id)?;
+
+            (final_header, final_hash, replay_count)
+        };
+
+        // Verify final state
+        if let Err(e) =
+            self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)
+        {
+            warn!("Final state verification warning: {}", e);
+        }
+
+        if replay_count == 0 {
+            self.persist_header_only(&final_header)?;
+        }
+
+        // Complete!
+        self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
+
+        info!(
+            "Catchup completed: ledger {}, hash {}, {} ledgers replayed",
+            final_header.ledger_seq, final_hash, ledgers_applied
+        );
+
+        Ok(CatchupOutput {
+            result: CatchupResult {
+                ledger_seq: final_header.ledger_seq,
+                ledger_hash: final_hash,
+                ledgers_applied,
+                buckets_downloaded: self.progress.buckets_total,
             },
             bucket_list,
             hot_archive_bucket_list,

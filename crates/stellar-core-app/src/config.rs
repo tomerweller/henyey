@@ -57,6 +57,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use stellar_core_crypto;
+use stellar_core_history::CatchupMode;
 
 /// Main application configuration.
 ///
@@ -125,6 +126,10 @@ pub struct AppConfig {
     /// Metadata output stream configuration.
     #[serde(default)]
     pub metadata: MetadataConfig,
+
+    /// Catchup behavior configuration.
+    #[serde(default)]
+    pub catchup: CatchupConfig,
 }
 
 /// Node identity and behavior configuration.
@@ -350,6 +355,63 @@ pub struct MetadataConfig {
 
 fn default_metadata_debug_ledgers() -> u32 {
     0
+}
+
+/// Catchup behavior configuration.
+///
+/// Controls how the node catches up to the network when joining or recovering.
+/// This matches the C++ stellar-core CATCHUP_COMPLETE and CATCHUP_RECENT settings.
+///
+/// # Examples
+///
+/// Minimal catchup (default, fastest startup):
+/// ```toml
+/// [catchup]
+/// # No configuration needed, defaults to minimal
+/// ```
+///
+/// Complete history from genesis:
+/// ```toml
+/// [catchup]
+/// complete = true
+/// ```
+///
+/// Recent history (last N ledgers):
+/// ```toml
+/// [catchup]
+/// recent = 10000
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatchupConfig {
+    /// If true, download complete history from genesis.
+    /// Equivalent to C++ CATCHUP_COMPLETE.
+    /// Takes precedence over `recent` if both are set.
+    #[serde(default)]
+    pub complete: bool,
+
+    /// Number of recent ledgers to download during catchup.
+    /// Equivalent to C++ CATCHUP_RECENT.
+    /// Set to 0 for minimal catchup (default).
+    #[serde(default)]
+    pub recent: u32,
+}
+
+impl CatchupConfig {
+    /// Convert config to CatchupMode.
+    ///
+    /// Priority:
+    /// 1. If `complete` is true -> Complete mode
+    /// 2. If `recent` > 0 -> Recent(n) mode
+    /// 3. Otherwise -> Minimal mode
+    pub fn to_mode(&self) -> CatchupMode {
+        if self.complete {
+            CatchupMode::Complete
+        } else if self.recent > 0 {
+            CatchupMode::Recent(self.recent)
+        } else {
+            CatchupMode::Minimal
+        }
+    }
 }
 
 /// Proposed protocol upgrades configuration.
@@ -817,6 +879,7 @@ impl AppConfig {
             surge_pricing: SurgePricingConfig::default(),
             events: EventsConfig::default(),
             metadata: MetadataConfig::default(),
+            catchup: CatchupConfig::default(),
         }
     }
 
@@ -881,6 +944,7 @@ impl AppConfig {
             surge_pricing: SurgePricingConfig::default(),
             events: EventsConfig::default(),
             metadata: MetadataConfig::default(),
+            catchup: CatchupConfig::default(),
         }
     }
 
@@ -1283,5 +1347,78 @@ debug_ledgers = 200
             Some("/tmp/meta.pipe")
         );
         assert_eq!(config.metadata.debug_ledgers, 200);
+    }
+
+    #[test]
+    fn test_catchup_config_defaults() {
+        let config = CatchupConfig::default();
+        assert!(!config.complete);
+        assert_eq!(config.recent, 0);
+        assert!(matches!(config.to_mode(), CatchupMode::Minimal));
+    }
+
+    #[test]
+    fn test_catchup_config_complete() {
+        let config = CatchupConfig {
+            complete: true,
+            recent: 0,
+        };
+        assert!(matches!(config.to_mode(), CatchupMode::Complete));
+    }
+
+    #[test]
+    fn test_catchup_config_recent() {
+        let config = CatchupConfig {
+            complete: false,
+            recent: 10000,
+        };
+        assert!(matches!(config.to_mode(), CatchupMode::Recent(10000)));
+    }
+
+    #[test]
+    fn test_catchup_config_complete_takes_precedence() {
+        // If both complete and recent are set, complete wins
+        let config = CatchupConfig {
+            complete: true,
+            recent: 10000,
+        };
+        assert!(matches!(config.to_mode(), CatchupMode::Complete));
+    }
+
+    #[test]
+    fn test_catchup_config_from_toml() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[catchup]
+recent = 5000
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.catchup.complete);
+        assert_eq!(config.catchup.recent, 5000);
+        assert!(matches!(config.catchup.to_mode(), CatchupMode::Recent(5000)));
+    }
+
+    #[test]
+    fn test_catchup_config_complete_from_toml() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[catchup]
+complete = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.catchup.complete);
+        assert!(matches!(config.catchup.to_mode(), CatchupMode::Complete));
     }
 }

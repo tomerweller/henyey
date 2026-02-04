@@ -104,6 +104,7 @@ pub mod paths;
 
 // Catchup and synchronization
 pub mod catchup;
+pub mod catchup_range;
 pub mod checkpoint;
 pub mod replay;
 pub mod verify;
@@ -124,13 +125,15 @@ pub use archive_state::HistoryArchiveState;
 pub use catchup::{
     CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData, LedgerData,
 };
+pub use catchup_range::{CatchupMode, CatchupRange, LedgerRange, GENESIS_LEDGER_SEQ};
 pub use cdp::{
     extract_ledger_header, extract_transaction_envelopes, extract_transaction_metas, CacheStats,
     CachedCdpDataLake, CdpDataLake,
 };
 pub use checkpoint::{
-    checkpoint_containing, is_checkpoint_ledger, latest_checkpoint_before_or_at,
-    CHECKPOINT_FREQUENCY,
+    checkpoint_containing, first_ledger_in_checkpoint_containing, is_checkpoint_ledger,
+    last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
+    size_of_checkpoint_containing, CHECKPOINT_FREQUENCY,
 };
 pub use download::DownloadConfig;
 pub use error::HistoryError;
@@ -336,33 +339,6 @@ impl HistoryManager {
         }
         Err(HistoryError::CheckpointNotFound(checkpoint))
     }
-}
-
-/// Catchup mode determining how much history to download.
-///
-/// The catchup mode controls the trade-off between synchronization time and
-/// historical data availability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatchupMode {
-    /// Download only the latest checkpoint state.
-    ///
-    /// This is the fastest mode - downloads only the bucket list and a few
-    /// ledger headers needed to start validating. Suitable for validators
-    /// that do not need to serve historical queries.
-    Minimal,
-
-    /// Download complete history from genesis.
-    ///
-    /// Downloads all checkpoints from ledger 0 to the current tip. Required
-    /// for archival nodes that need to serve any historical query. This can
-    /// take hours or days depending on network age.
-    Complete,
-
-    /// Download the last N ledgers of history.
-    ///
-    /// A middle ground that provides some historical context while limiting
-    /// sync time. The value specifies how many ledgers of history to retain.
-    Recent(u32),
 }
 
 /// Summary result of a successful catchup operation.

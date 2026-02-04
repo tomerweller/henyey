@@ -64,8 +64,8 @@ use stellar_core_herder::{
     EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
 };
 use stellar_core_history::{
-    is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupOutput,
-    CheckpointData, HistoryArchive, CHECKPOINT_FREQUENCY,
+    is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupMode,
+    CatchupOutput, CheckpointData, HistoryArchive, GENESIS_LEDGER_SEQ, CHECKPOINT_FREQUENCY,
 };
 use stellar_core_historywork::{
     build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
@@ -1923,16 +1923,30 @@ impl App {
         secret
     }
 
-    /// Run catchup to a target ledger.
+    /// Run catchup to a target ledger with minimal mode.
     ///
     /// This downloads history from archives and applies it to bring the
-    /// node up to date with the network.
+    /// node up to date with the network. Uses Minimal mode by default.
     pub async fn catchup(&self, target: CatchupTarget) -> anyhow::Result<CatchupResult> {
+        self.catchup_with_mode(target, CatchupMode::Minimal).await
+    }
+
+    /// Run catchup to a target ledger with a specific mode.
+    ///
+    /// The mode controls how much history is downloaded:
+    /// - Minimal: Only download bucket state at latest checkpoint
+    /// - Recent(N): Download and replay the last N ledgers
+    /// - Complete: Download complete history from genesis
+    pub async fn catchup_with_mode(
+        &self,
+        target: CatchupTarget,
+        mode: CatchupMode,
+    ) -> anyhow::Result<CatchupResult> {
         self.set_state(AppState::CatchingUp).await;
 
         let progress = Arc::new(CatchupProgress::new());
 
-        tracing::info!(?target, "Starting catchup");
+        tracing::info!(?target, ?mode, "Starting catchup");
 
         // Determine target ledger
         let target_ledger = match target {
@@ -1969,7 +1983,7 @@ impl App {
 
         // Run catchup work
         let output = self
-            .run_catchup_work(target_ledger, progress.clone())
+            .run_catchup_work(target_ledger, mode, progress.clone())
             .await?;
 
         // Initialize ledger manager with catchup results.
@@ -2171,6 +2185,7 @@ impl App {
     async fn run_catchup_work(
         &self,
         target_ledger: u32,
+        mode: CatchupMode,
         progress: Arc<CatchupProgress>,
     ) -> anyhow::Result<CatchupOutput> {
         use crate::logging::CatchupPhase;
@@ -2208,25 +2223,36 @@ impl App {
         })?;
 
         let archives_arc: Vec<Arc<HistoryArchive>> = archives.into_iter().map(Arc::new).collect();
-        let checkpoint_data = if let Some(primary) = archives_arc.first() {
-            match self
-                .download_checkpoint_with_historywork(Arc::clone(primary), checkpoint_seq)
-                .await
-            {
-                Ok(data) => {
-                    tracing::info!(checkpoint_seq, "Using historywork for checkpoint downloads");
-                    Some(data)
+
+        // Only use historywork for Minimal mode - other modes require mode-aware catchup
+        // which handles downloading from different checkpoints and replay
+        let checkpoint_data = if mode == CatchupMode::Minimal {
+            if let Some(primary) = archives_arc.first() {
+                match self
+                    .download_checkpoint_with_historywork(Arc::clone(primary), checkpoint_seq)
+                    .await
+                {
+                    Ok(data) => {
+                        tracing::info!(checkpoint_seq, "Using historywork for checkpoint downloads");
+                        Some(data)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            checkpoint_seq,
+                            error = %err,
+                            "Historywork download failed, falling back to direct catchup"
+                        );
+                        None
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        checkpoint_seq,
-                        error = %err,
-                        "Historywork download failed, falling back to direct catchup"
-                    );
-                    None
-                }
+            } else {
+                None
             }
         } else {
+            tracing::info!(
+                ?mode,
+                "Using mode-aware catchup (historywork only supported for Minimal mode)"
+            );
             None
         };
 
@@ -2239,13 +2265,27 @@ impl App {
 
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
+
+        // Get current LCL for mode calculation
+        // Use GENESIS_LEDGER_SEQ when there's no state (get_current_ledger returns 0 or Err)
+        let lcl = match self.get_current_ledger().await {
+            Ok(seq) if seq >= GENESIS_LEDGER_SEQ => seq,
+            _ => GENESIS_LEDGER_SEQ,
+        };
+
         let output = match checkpoint_data {
             Some(data) => {
+                // With checkpoint data, use direct method (minimal mode behavior)
                 catchup_manager
                     .catchup_to_ledger_with_checkpoint_data(target_ledger, data)
                     .await
             }
-            None => catchup_manager.catchup_to_ledger(target_ledger).await,
+            None => {
+                // Use mode-aware catchup
+                catchup_manager
+                    .catchup_to_ledger_with_mode(target_ledger, mode, lcl)
+                    .await
+            }
         }
         .map_err(|e| anyhow::anyhow!("Catchup failed: {}", e))?;
 

@@ -1073,11 +1073,18 @@ impl HotArchiveBucketList {
     ///
     /// This is used to restore state from a history archive checkpoint.
     ///
+    /// Restore a hot archive bucket list from hashes and a bucket lookup function.
+    ///
+    /// This is a convenience wrapper around [`restore_from_has`] for cases where
+    /// you only have bucket hashes without HAS next state information. It assumes
+    /// no pending merges (state=0 for all levels), which is the common case at
+    /// checkpoints.
+    ///
     /// # Arguments
     ///
-    /// * `hashes` - The bucket hashes (curr and snap for each level, 22 total)
+    /// * `hashes` - Flat array of bucket hashes (curr, snap for each level, 22 total)
     /// * `load_bucket` - Function to load a HotArchiveBucket by hash
-    pub fn restore_from_hashes<F>(hashes: &[Hash256], mut load_bucket: F) -> Result<Self>
+    pub fn restore_from_hashes<F>(hashes: &[Hash256], load_bucket: F) -> Result<Self>
     where
         F: FnMut(&Hash256) -> Result<HotArchiveBucket>,
     {
@@ -1089,41 +1096,26 @@ impl HotArchiveBucketList {
             )));
         }
 
-        let mut levels = Vec::with_capacity(HOT_ARCHIVE_BUCKET_LIST_LEVELS);
+        // Convert flat array to (curr, snap) pairs
+        let pairs: Vec<(Hash256, Hash256)> = hashes
+            .chunks(2)
+            .map(|chunk| (chunk[0], chunk[1]))
+            .collect();
 
-        for (i, chunk) in hashes.chunks(2).enumerate() {
-            let curr_hash = &chunk[0];
-            let snap_hash = &chunk[1];
+        // Use default next states (all state=0, no pending merges)
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
 
-            let curr = if curr_hash.is_zero() {
-                HotArchiveBucket::empty()
-            } else {
-                load_bucket(curr_hash)?
-            };
-
-            let snap = if snap_hash.is_zero() {
-                HotArchiveBucket::empty()
-            } else {
-                load_bucket(snap_hash)?
-            };
-
-            let mut level = HotArchiveBucketLevel::new(i);
-            level.curr = curr;
-            level.snap = snap;
-            levels.push(level);
-        }
-
-        Ok(Self {
-            levels,
-            ledger_seq: 0,
-        })
+        Self::restore_from_has(&pairs, &next_states, load_bucket)
     }
 
     /// Restore a hot archive bucket list from History Archive State with full FutureBucket support.
     ///
-    /// Unlike `restore_from_hashes`, this function also restores pending merge results
-    /// when the HAS indicates a completed merge (state == HAS_NEXT_STATE_OUTPUT). This is
+    /// This is the primary restoration method. It restores pending merge results when
+    /// the HAS indicates a completed merge (state == HAS_NEXT_STATE_OUTPUT), which is
     /// necessary for correct bucket list hash computation at checkpoints.
+    ///
+    /// For convenience, [`restore_from_hashes`] wraps this function with default
+    /// next states (all state=0).
     ///
     /// # Arguments
     ///

@@ -94,6 +94,54 @@ pub fn checkpoint_start(seq: u32) -> u32 {
     (seq / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY
 }
 
+/// Alias for checkpoint_start to match C++ HistoryManager naming.
+///
+/// Returns the first ledger in the checkpoint containing `seq`.
+pub use checkpoint_start as first_ledger_in_checkpoint_containing;
+
+/// Get the ledger immediately before the checkpoint containing `seq`.
+///
+/// Returns `None` if `seq` is in the first checkpoint (ledgers 0-63).
+///
+/// # Examples
+///
+/// ```
+/// use stellar_core_history::checkpoint::last_ledger_before_checkpoint_containing;
+///
+/// assert_eq!(last_ledger_before_checkpoint_containing(0), None);
+/// assert_eq!(last_ledger_before_checkpoint_containing(63), None);
+/// assert_eq!(last_ledger_before_checkpoint_containing(64), Some(63));
+/// assert_eq!(last_ledger_before_checkpoint_containing(127), Some(63));
+/// assert_eq!(last_ledger_before_checkpoint_containing(128), Some(127));
+/// ```
+pub fn last_ledger_before_checkpoint_containing(seq: u32) -> Option<u32> {
+    let start = checkpoint_start(seq);
+    if start == 0 {
+        None
+    } else {
+        Some(start - 1)
+    }
+}
+
+/// Get the size (number of ledgers) in the checkpoint containing `seq`.
+///
+/// This is always 64 except for the first checkpoint which contains
+/// ledgers 0-63 (64 ledgers total, but ledger 0 is genesis).
+///
+/// # Examples
+///
+/// ```
+/// use stellar_core_history::checkpoint::size_of_checkpoint_containing;
+///
+/// assert_eq!(size_of_checkpoint_containing(0), 64);
+/// assert_eq!(size_of_checkpoint_containing(63), 64);
+/// assert_eq!(size_of_checkpoint_containing(64), 64);
+/// assert_eq!(size_of_checkpoint_containing(127), 64);
+/// ```
+pub fn size_of_checkpoint_containing(_seq: u32) -> u32 {
+    CHECKPOINT_FREQUENCY
+}
+
 /// Get the range of ledgers in the checkpoint identified by `checkpoint_ledger_seq`.
 ///
 /// Returns (start, end) inclusive range where end == checkpoint_ledger_seq.
@@ -201,5 +249,36 @@ mod tests {
         let path = has_path(0xaabbcc00 + 63);
         assert!(path.starts_with("history/"));
         assert!(path.ends_with(".json"));
+    }
+
+    #[test]
+    fn test_last_ledger_before_checkpoint_containing() {
+        // First checkpoint (0-63) has no ledger before it
+        assert_eq!(last_ledger_before_checkpoint_containing(0), None);
+        assert_eq!(last_ledger_before_checkpoint_containing(63), None);
+        // Second checkpoint (64-127) is preceded by ledger 63
+        assert_eq!(last_ledger_before_checkpoint_containing(64), Some(63));
+        assert_eq!(last_ledger_before_checkpoint_containing(127), Some(63));
+        // Third checkpoint (128-191) is preceded by ledger 127
+        assert_eq!(last_ledger_before_checkpoint_containing(128), Some(127));
+        assert_eq!(last_ledger_before_checkpoint_containing(191), Some(127));
+    }
+
+    #[test]
+    fn test_size_of_checkpoint_containing() {
+        assert_eq!(size_of_checkpoint_containing(0), 64);
+        assert_eq!(size_of_checkpoint_containing(63), 64);
+        assert_eq!(size_of_checkpoint_containing(64), 64);
+        assert_eq!(size_of_checkpoint_containing(1000), 64);
+    }
+
+    #[test]
+    fn test_first_ledger_in_checkpoint_containing() {
+        // Alias for checkpoint_start
+        assert_eq!(first_ledger_in_checkpoint_containing(0), 0);
+        assert_eq!(first_ledger_in_checkpoint_containing(63), 0);
+        assert_eq!(first_ledger_in_checkpoint_containing(64), 64);
+        assert_eq!(first_ledger_in_checkpoint_containing(127), 64);
+        assert_eq!(first_ledger_in_checkpoint_containing(128), 128);
     }
 }

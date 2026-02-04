@@ -40,60 +40,7 @@
 
 use crate::app::{App, CatchupResult, CatchupTarget};
 use crate::config::AppConfig;
-
-/// Catchup mode determining how much history to download.
-///
-/// The mode affects both download time and the amount of historical data
-/// available for queries after catchup completes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CatchupMode {
-    /// Download only the latest bucket state (fastest).
-    ///
-    /// This mode downloads the minimum data needed to participate in consensus.
-    /// Historical transaction data will not be available.
-    #[default]
-    Minimal,
-    /// Download complete history from genesis.
-    ///
-    /// This mode downloads all historical data, enabling full transaction
-    /// history queries. This can take significant time and storage.
-    Complete,
-    /// Download the last N ledgers of history.
-    ///
-    /// A compromise between speed and history availability. The node will
-    /// have transaction history for the specified number of recent ledgers.
-    Recent(u32),
-}
-
-impl std::str::FromStr for CatchupMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s.to_lowercase().as_str() {
-            "minimal" => Ok(Self::Minimal),
-            "complete" => Ok(Self::Complete),
-            _ => {
-                // Try to parse as "recent:N"
-                if let Some(count) = s.strip_prefix("recent:") {
-                    let n: u32 = count.parse()?;
-                    Ok(Self::Recent(n))
-                } else {
-                    anyhow::bail!("Unknown catchup mode: {}", s)
-                }
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for CatchupMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CatchupMode::Minimal => write!(f, "minimal"),
-            CatchupMode::Complete => write!(f, "complete"),
-            CatchupMode::Recent(n) => write!(f, "recent:{}", n),
-        }
-    }
-}
+pub use stellar_core_history::CatchupMode;
 
 /// Configuration options for the catchup command.
 ///
@@ -173,6 +120,34 @@ impl CatchupOptions {
     pub fn parse_target(&self) -> anyhow::Result<CatchupTarget> {
         parse_target(&self.target)
     }
+
+    /// Parse the target and get the effective mode.
+    ///
+    /// Mode precedence (highest to lowest):
+    /// 1. Explicit mode from CLI (if not default Minimal)
+    /// 2. Mode from target string (e.g., "1000000/100" -> Recent(100))
+    /// 3. Default (Minimal)
+    pub fn parse_target_and_mode(&self) -> anyhow::Result<(CatchupTarget, CatchupMode)> {
+        let parsed = parse_target_with_mode(&self.target)?;
+
+        // If explicit mode is set (not default), use it; otherwise use target's mode
+        let effective_mode = if self.mode != CatchupMode::Minimal {
+            self.mode
+        } else {
+            parsed.mode_from_target.unwrap_or(CatchupMode::Minimal)
+        };
+
+        Ok((parsed.target, effective_mode))
+    }
+}
+
+/// Parsed catchup target with optional mode override from "ledger/count" format.
+#[derive(Debug, Clone)]
+pub struct ParsedCatchupTarget {
+    /// The target ledger.
+    pub target: CatchupTarget,
+    /// Mode override from target string (e.g., from "1000000/100" format).
+    pub mode_from_target: Option<CatchupMode>,
 }
 
 /// Parse a target ledger specification.
@@ -180,26 +155,56 @@ impl CatchupOptions {
 /// Formats:
 /// - "current" -> CatchupTarget::Current
 /// - "12345" -> CatchupTarget::Ledger(12345)
-/// - "12345/100" -> CatchupTarget::Ledger(12345) with 100 ledgers of history
+/// - "12345/100" -> CatchupTarget::Ledger(12345) with Recent(100) mode
+/// - "12345/max" -> CatchupTarget::Ledger(12345) with Complete mode
 pub fn parse_target(target: &str) -> anyhow::Result<CatchupTarget> {
+    Ok(parse_target_with_mode(target)?.target)
+}
+
+/// Parse a target ledger specification including optional count for mode.
+///
+/// Formats:
+/// - "current" -> CatchupTarget::Current, None
+/// - "12345" -> CatchupTarget::Ledger(12345), None
+/// - "12345/100" -> CatchupTarget::Ledger(12345), Some(Recent(100))
+/// - "12345/max" -> CatchupTarget::Ledger(12345), Some(Complete)
+pub fn parse_target_with_mode(target: &str) -> anyhow::Result<ParsedCatchupTarget> {
     let target = target.trim().to_lowercase();
 
     if target == "current" || target == "latest" {
-        return Ok(CatchupTarget::Current);
+        return Ok(ParsedCatchupTarget {
+            target: CatchupTarget::Current,
+            mode_from_target: None,
+        });
     }
 
     // Check for "ledger/count" format
     if let Some(slash_pos) = target.find('/') {
         let ledger_str = &target[..slash_pos];
-        let _count_str = &target[slash_pos + 1..];
+        let count_str = &target[slash_pos + 1..];
 
         let ledger: u32 = ledger_str
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid ledger number: {}", ledger_str))?;
 
-        // For now, ignore the count and just target the ledger
-        // A full implementation would use this for "recent" mode
-        return Ok(CatchupTarget::Ledger(ledger));
+        // Parse count: "max" means complete, number means recent
+        let mode = if count_str == "max" {
+            CatchupMode::Complete
+        } else {
+            let count: u32 = count_str
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid count: {}", count_str))?;
+            if count == 0 {
+                CatchupMode::Minimal
+            } else {
+                CatchupMode::Recent(count)
+            }
+        };
+
+        return Ok(ParsedCatchupTarget {
+            target: CatchupTarget::Ledger(ledger),
+            mode_from_target: Some(mode),
+        });
     }
 
     // Just a ledger number
@@ -210,7 +215,10 @@ pub fn parse_target(target: &str) -> anyhow::Result<CatchupTarget> {
         )
     })?;
 
-    Ok(CatchupTarget::Ledger(ledger))
+    Ok(ParsedCatchupTarget {
+        target: CatchupTarget::Ledger(ledger),
+        mode_from_target: None,
+    })
 }
 
 /// Run the catchup command.
@@ -224,17 +232,23 @@ pub async fn run_catchup(
         "Starting catchup command"
     );
 
-    // Parse target
-    let target = options.parse_target()?;
+    // Parse target and determine effective mode
+    let (target, effective_mode) = options.parse_target_and_mode()?;
+
+    tracing::info!(
+        ?target,
+        effective_mode = %effective_mode,
+        "Resolved catchup parameters"
+    );
 
     // Create application
     let app = App::new(config).await?;
 
     // Print catchup info
-    print_catchup_info(&options, &target);
+    print_catchup_info(&options, &target, effective_mode);
 
-    // Run catchup
-    let result = app.catchup(target).await?;
+    // Run catchup with mode
+    let result = app.catchup_with_mode(target, effective_mode).await?;
 
     // Print result
     print_catchup_result(&result);
@@ -248,10 +262,10 @@ pub async fn run_catchup(
 }
 
 /// Print information before starting catchup.
-fn print_catchup_info(options: &CatchupOptions, target: &CatchupTarget) {
+fn print_catchup_info(options: &CatchupOptions, target: &CatchupTarget, effective_mode: CatchupMode) {
     println!("Catchup Configuration:");
     println!("  Target: {:?}", target);
-    println!("  Mode: {}", options.mode);
+    println!("  Mode: {}", effective_mode);
     println!("  Parallelism: {}", options.parallelism);
     println!("  Verify: {}", options.verify);
     println!();
@@ -476,5 +490,68 @@ mod tests {
         assert!(matches!(options.mode, CatchupMode::Complete));
         assert!(!options.verify);
         assert_eq!(options.parallelism, 16);
+    }
+
+    #[test]
+    fn test_parse_target_with_mode_current() {
+        let parsed = parse_target_with_mode("current").unwrap();
+        assert!(matches!(parsed.target, CatchupTarget::Current));
+        assert!(parsed.mode_from_target.is_none());
+    }
+
+    #[test]
+    fn test_parse_target_with_mode_ledger_only() {
+        let parsed = parse_target_with_mode("1000000").unwrap();
+        assert!(matches!(parsed.target, CatchupTarget::Ledger(1000000)));
+        assert!(parsed.mode_from_target.is_none());
+    }
+
+    #[test]
+    fn test_parse_target_with_mode_recent() {
+        let parsed = parse_target_with_mode("1000000/100").unwrap();
+        assert!(matches!(parsed.target, CatchupTarget::Ledger(1000000)));
+        assert!(matches!(parsed.mode_from_target, Some(CatchupMode::Recent(100))));
+    }
+
+    #[test]
+    fn test_parse_target_with_mode_complete() {
+        let parsed = parse_target_with_mode("1000000/max").unwrap();
+        assert!(matches!(parsed.target, CatchupTarget::Ledger(1000000)));
+        assert!(matches!(parsed.mode_from_target, Some(CatchupMode::Complete)));
+    }
+
+    #[test]
+    fn test_parse_target_with_mode_minimal() {
+        let parsed = parse_target_with_mode("1000000/0").unwrap();
+        assert!(matches!(parsed.target, CatchupTarget::Ledger(1000000)));
+        assert!(matches!(parsed.mode_from_target, Some(CatchupMode::Minimal)));
+    }
+
+    #[test]
+    fn test_effective_mode_explicit_takes_precedence() {
+        // Explicit mode takes precedence over target's mode
+        let options = CatchupOptions {
+            target: "1000000/100".to_string(),
+            mode: CatchupMode::Complete,
+            verify: true,
+            parallelism: 8,
+            keep_temp: false,
+        };
+        let (_, mode) = options.parse_target_and_mode().unwrap();
+        assert!(matches!(mode, CatchupMode::Complete));
+    }
+
+    #[test]
+    fn test_effective_mode_from_target_when_default() {
+        // Target's mode used when CLI mode is default (Minimal)
+        let options = CatchupOptions {
+            target: "1000000/100".to_string(),
+            mode: CatchupMode::Minimal, // default
+            verify: true,
+            parallelism: 8,
+            keep_temp: false,
+        };
+        let (_, mode) = options.parse_target_and_mode().unwrap();
+        assert!(matches!(mode, CatchupMode::Recent(100)));
     }
 }
