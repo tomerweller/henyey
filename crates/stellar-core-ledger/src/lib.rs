@@ -15,21 +15,13 @@
 //!
 //! # Ledger Close Process
 //!
-//! The ledger close process follows these steps:
+//! The ledger close process is handled by [`LedgerManager::close_ledger`]:
 //!
 //! 1. **Receive externalized data**: SCP consensus provides a [`LedgerCloseData`]
 //!    containing the transaction set, close time, and any protocol upgrades.
 //!
-//! 2. **Begin close**: [`LedgerManager::begin_close`] creates a [`LedgerCloseContext`]
-//!    with a snapshot of the current state for consistent reads.
-//!
-//! 3. **Apply transactions**: Each transaction is executed in order, with state
-//!    changes recorded in the [`LedgerDelta`].
-//!
-//! 4. **Update bucket list**: The delta is applied to the bucket list, computing
-//!    the new Merkle root hash.
-//!
-//! 5. **Commit**: The new ledger header is constructed and the state is finalized.
+//! 2. **Close ledger**: [`LedgerManager::close_ledger`] executes all transactions,
+//!    updates the bucket list, and commits the new ledger header.
 //!
 //! # State Model
 //!
@@ -63,15 +55,9 @@
 //! // Initialize from buckets (during catchup)
 //! manager.initialize_from_buckets(bucket_list, None, header, Some(header_hash))?;
 //!
-//! // Begin a ledger close
+//! // Close a ledger
 //! let close_data = LedgerCloseData::new(seq, tx_set, close_time, prev_hash);
-//! let mut ctx = manager.begin_close(close_data)?;
-//!
-//! // Apply transactions (this handles fee charging and state updates)
-//! let results = ctx.apply_transactions()?;
-//!
-//! // Commit the ledger and get the result
-//! let result = ctx.commit()?;
+//! let result = manager.close_ledger(close_data)?;
 //! println!("Closed ledger {}", result.ledger_seq());
 //! ```
 //!

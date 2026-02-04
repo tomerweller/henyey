@@ -81,20 +81,14 @@ use stellar_core_ledger::{LedgerManager, LedgerManagerConfig, LedgerCloseData, T
 let manager = LedgerManager::new(db, network_passphrase, LedgerManagerConfig::default());
 manager.initialize_from_buckets(bucket_list, None, header)?;
 
-// Begin a ledger close with externalized data
+// Close a ledger with externalized data
 let close_data = LedgerCloseData::new(
     ledger_seq,
     tx_set,
     close_time,
     prev_ledger_hash,
 );
-let mut ctx = manager.begin_close(close_data)?;
-
-// Apply all transactions
-let results = ctx.apply_transactions()?;
-
-// Commit the ledger
-let result = ctx.commit()?;
+let result = manager.close_ledger(close_data)?;
 println!("Closed ledger {} with hash {}",
     result.header.ledger_seq,
     result.header_hash.to_hex());

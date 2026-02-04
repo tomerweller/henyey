@@ -1106,10 +1106,34 @@ impl LedgerManager {
         Ok(())
     }
 
+    /// Close a ledger by executing transactions and committing state changes.
+    ///
+    /// This is the main entry point for ledger close in live mode. It:
+    /// 1. Validates the close data against current state
+    /// 2. Executes all transactions in the set
+    /// 3. Updates bucket list, soroban state, and other caches
+    /// 4. Computes and returns the new ledger header
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let close_data = LedgerCloseData::new(seq, tx_set, close_time, prev_hash);
+    /// let result = manager.close_ledger(close_data)?;
+    /// println!("Closed ledger {}", result.ledger_seq());
+    /// ```
+    pub fn close_ledger(&self, close_data: LedgerCloseData) -> Result<LedgerCloseResult> {
+        let mut ctx = self.begin_close(close_data)?;
+        ctx.apply_transactions()?;
+        ctx.commit()
+    }
+
     /// Begin closing a new ledger.
     ///
     /// Returns a LedgerCloseContext for applying transactions and
     /// committing the ledger.
+    ///
+    /// Note: For most use cases, prefer [`close_ledger`](Self::close_ledger) which
+    /// handles the full close process in a single call.
     pub fn begin_close(&self, close_data: LedgerCloseData) -> Result<LedgerCloseContext<'_>> {
         let state = self.state.read();
         if !state.initialized {

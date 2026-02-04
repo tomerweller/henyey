@@ -66,11 +66,8 @@ fn test_ledger_close_with_empty_tx_set() {
         ledger.current_header_hash(),
     );
 
-    let mut ctx = ledger.begin_close(close_data).expect("begin close");
-    let results = ctx.apply_transactions().expect("apply txs");
-    assert!(results.is_empty());
-
-    let result = ctx.commit().expect("commit");
+    let result = ledger.close_ledger(close_data).expect("close ledger");
+    assert!(result.tx_results.is_empty());
     assert_eq!(result.header.ledger_seq, 1);
     assert_eq!(ledger.current_ledger_seq(), 1);
     assert_ne!(ledger.current_header_hash(), Hash256::ZERO);

@@ -7436,34 +7436,10 @@ impl HerderCallback for App {
             close_data = close_data.with_scp_history(vec![entry]);
         }
 
-        // Begin the ledger close
-        let mut close_ctx = self.ledger_manager.begin_close(close_data).map_err(|e| {
-            stellar_core_herder::HerderError::Internal(format!("Failed to begin close: {}", e))
+        // Close the ledger (execute transactions and commit)
+        let result = self.ledger_manager.close_ledger(close_data).map_err(|e| {
+            stellar_core_herder::HerderError::Internal(format!("Failed to close ledger: {}", e))
         })?;
-
-        // Apply transactions
-        let results = close_ctx.apply_transactions().map_err(|e| {
-            stellar_core_herder::HerderError::Internal(format!(
-                "Failed to apply transactions: {}",
-                e
-            ))
-        })?;
-
-        let success_count = results.iter().filter(|r| r.success).count();
-        let fail_count = results.len() - success_count;
-        tracing::info!(
-            ledger_seq,
-            tx_success = success_count,
-            tx_failed = fail_count,
-            "Transactions applied"
-        );
-
-        // Commit the ledger
-        tracing::debug!(ledger_seq, "Committing ledger close context");
-        let result = close_ctx.commit().map_err(|e| {
-            stellar_core_herder::HerderError::Internal(format!("Failed to commit ledger: {}", e))
-        })?;
-        tracing::debug!(ledger_seq, "Ledger close context committed");
 
         // Emit LedgerCloseMeta to stream — after state commit, before DB persist.
         // This matches C++ ordering: emitNextMeta() before database commit.
@@ -7502,9 +7478,16 @@ impl HerderCallback for App {
         // Results are in the same order as tx_set.transactions.
         let mut applied_hashes = Vec::new();
         let mut failed_hashes = Vec::new();
-        for (tx, result) in tx_set.transactions.iter().zip(results.iter()) {
+        for (tx, tx_result) in tx_set.transactions.iter().zip(result.tx_results.iter()) {
             if let Some(hash) = self.tx_hash(tx) {
-                if result.success {
+                // Check if transaction succeeded by examining the result discriminant
+                use stellar_xdr::curr::TransactionResultResult;
+                let is_success = matches!(
+                    tx_result.result.result,
+                    TransactionResultResult::TxSuccess(_)
+                        | TransactionResultResult::TxFeeBumpInnerSuccess(_)
+                );
+                if is_success {
                     applied_hashes.push(hash);
                 } else {
                     failed_hashes.push(hash);
