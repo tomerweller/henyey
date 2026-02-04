@@ -1676,19 +1676,7 @@ impl LedgerManager {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
         let close_start = std::time::Instant::now();
 
-        // 1. Bucket list add_batch
-        let t0 = std::time::Instant::now();
-        self.bucket_list.write().add_batch(
-            ledger_seq,
-            protocol_version,
-            BucketListType::Live,
-            init_entries.to_vec(),
-            live_entries.to_vec(),
-            dead_entries.to_vec(),
-        )?;
-        let bl_add_batch_us = t0.elapsed().as_micros() as u64;
-
-        // 2. Hot archive add_batch
+        // 1. Hot archive add_batch (FIRST - matches C++ order: addHotArchiveBatch before addLiveBatch)
         let t0 = std::time::Instant::now();
         if let Some(ref mut hot_archive) = *self.hot_archive_bucket_list.write() {
             hot_archive.add_batch(
@@ -1699,6 +1687,18 @@ impl LedgerManager {
             )?;
         }
         let ha_add_batch_us = t0.elapsed().as_micros() as u64;
+
+        // 2. Live bucket list add_batch (SECOND)
+        let t0 = std::time::Instant::now();
+        self.bucket_list.write().add_batch(
+            ledger_seq,
+            protocol_version,
+            BucketListType::Live,
+            init_entries.to_vec(),
+            live_entries.to_vec(),
+            dead_entries.to_vec(),
+        )?;
+        let bl_add_batch_us = t0.elapsed().as_micros() as u64;
 
         // 3. Soroban state update
         // Load rent config BEFORE acquiring soroban_state write lock to avoid deadlock.

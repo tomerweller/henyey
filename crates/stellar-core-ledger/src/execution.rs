@@ -3607,7 +3607,7 @@ impl TransactionExecutor {
     }
 
     /// Apply all state changes to the delta.
-    pub fn apply_to_delta(&self, snapshot: &SnapshotHandle, delta: &mut LedgerDelta) -> Result<()> {
+    pub fn apply_to_delta(&self, _snapshot: &SnapshotHandle, delta: &mut LedgerDelta) -> Result<()> {
         let state_delta = self.state.delta();
 
         // Apply created entries
@@ -3615,22 +3615,18 @@ impl TransactionExecutor {
             delta.record_create(entry.clone())?;
         }
 
-        // Apply updated entries
-        for entry in state_delta.updated_entries() {
-            let key = crate::delta::entry_to_key(entry)?;
-            if let Some(prev) = snapshot.get_entry(&key)? {
-                delta.record_update(prev, entry.clone())?;
-            } else {
-                delta.record_create(entry.clone())?;
-            }
+        // Apply updated entries with their pre-states
+        let update_states = state_delta.update_states();
+        for (i, entry) in state_delta.updated_entries().iter().enumerate() {
+            let prev = &update_states[i];
+            delta.record_update(prev.clone(), entry.clone())?;
         }
 
-        // Apply deleted entries
-        for key in state_delta.deleted_keys() {
-            // We need the previous entry for deletion
-            if let Some(prev) = snapshot.get_entry(key)? {
-                delta.record_delete(prev)?;
-            }
+        // Apply deleted entries with their pre-states
+        let delete_states = state_delta.delete_states();
+        for (i, _key) in state_delta.deleted_keys().iter().enumerate() {
+            let prev = &delete_states[i];
+            delta.record_delete(prev.clone())?;
         }
 
         Ok(())

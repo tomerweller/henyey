@@ -45,7 +45,7 @@
 //! 3. Update `EvictionIterator` ConfigSettingEntry
 //! 4. Combined hash = SHA256(live_hash || hot_archive_hash)
 
-use crate::{verify, HistoryError, Result};
+use crate::{is_checkpoint_ledger, verify, HistoryError, Result};
 use sha2::{Digest, Sha256};
 use stellar_core_bucket::{EvictionIterator, StateArchivalSettings};
 use stellar_core_common::{Hash256, NetworkId};
@@ -79,6 +79,64 @@ fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchiv
         },
         _ => None,
     }
+}
+
+/// Compute the size of a Soroban entry for state size tracking.
+///
+/// Returns the entry size in bytes for ContractData/ContractCode entries,
+/// or 0 for other entry types. ContractCode uses rent-adjusted size.
+fn soroban_entry_size(entry: &LedgerEntry, protocol_version: u32) -> i64 {
+    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
+    use stellar_xdr::curr::WriteXdr;
+
+    match &entry.data {
+        LedgerEntryData::ContractData(_) => {
+            // Contract data uses XDR size
+            entry
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map(|xdr_bytes| xdr_bytes.len() as i64)
+                .unwrap_or(0)
+        }
+        LedgerEntryData::ContractCode(_) => {
+            // Contract code uses rent-adjusted size (includes compiled module memory)
+            entry
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map(|xdr_bytes| {
+                    let xdr_size = xdr_bytes.len() as u32;
+                    entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size) as i64
+                })
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// Compute the net change in Soroban state size from entry changes.
+///
+/// This processes the delta's changes to accurately compute the size difference:
+/// - INIT (created): +size of new Soroban entries
+/// - LIVE (updated): +(new_size - old_size) for modified Soroban entries
+/// - DEAD (deleted): -size of removed Soroban entries
+fn compute_soroban_state_size_delta(changes: &[EntryChange], protocol_version: u32) -> i64 {
+    let mut delta: i64 = 0;
+
+    for change in changes {
+        match change {
+            EntryChange::Created(entry) => {
+                delta += soroban_entry_size(entry, protocol_version);
+            }
+            EntryChange::Updated { previous, current } => {
+                let old_size = soroban_entry_size(previous, protocol_version);
+                let new_size = soroban_entry_size(current.as_ref(), protocol_version);
+                delta += new_size - old_size;
+            }
+            EntryChange::Deleted { previous } => {
+                delta -= soroban_entry_size(previous, protocol_version);
+            }
+        }
+    }
+
+    delta
 }
 
 /// Compute the LiveSorobanStateSizeWindow entry if it needs updating at this ledger.
@@ -220,6 +278,16 @@ pub struct LedgerReplayResult {
     /// Only present when running eviction scan (protocol 23+).
     /// Should be passed to the next ledger's replay call.
     pub eviction_iterator: Option<EvictionIterator>,
+
+    /// Net change in Soroban state size (bytes) during this ledger.
+    ///
+    /// This includes:
+    /// - Added size from new ContractData/ContractCode entries (INIT)
+    /// - Size difference from updated entries (LIVE)
+    /// - Subtracted size from deleted entries (DEAD)
+    ///
+    /// Used for accurate `LiveSorobanStateSizeWindow` tracking during catchup.
+    pub soroban_state_size_delta: i64,
 }
 
 /// Configuration for ledger replay behavior and verification.
@@ -367,6 +435,15 @@ pub fn replay_ledger(
     // Compute the ledger hash
     let ledger_hash = verify::compute_header_hash(header)?;
 
+    // Compute soroban state size delta for metadata-based replay.
+    // NOTE: This is an approximation since we don't have pre-update/pre-delete states.
+    // We add size for INIT entries, but can't accurately track LIVE (updates) or DEAD (deletes).
+    // For accurate tracking, use execution-based replay.
+    let mut soroban_state_size_delta: i64 = 0;
+    for entry in &init_entries {
+        soroban_state_size_delta += soroban_entry_size(entry, header.ledger_version);
+    }
+
     Ok(LedgerReplayResult {
         sequence: header.ledger_seq,
         protocol_version: header.ledger_version,
@@ -380,6 +457,7 @@ pub fn replay_ledger(
         dead_entries,
         changes: Vec::new(),
         eviction_iterator: None, // Metadata-based replay doesn't track eviction
+        soroban_state_size_delta,
     })
 }
 
@@ -533,9 +611,90 @@ pub fn replay_ledger_with_execution(
     };
     let total_coins_delta = delta.total_coins_delta();
     let changes = delta.changes().cloned().collect::<Vec<_>>();
-    let init_entries = delta.init_entries();
-    let live_entries = delta.live_entries();
-    let dead_entries = delta.dead_entries();
+    let delta_init_entries = delta.init_entries();
+    let delta_init_count = delta_init_entries.len();
+    let mut live_entries = delta.live_entries();
+    let delta_live_count = live_entries.len();
+    let mut dead_entries = delta.dead_entries();
+
+    // Check if "init" entries already exist in the LIVE bucket list.
+    // This can happen when restoring from hot archive when another contract still uses
+    // the same ContractCode (shared WASM). In such cases, the entry should be treated
+    // as an update (LIVEENTRY) rather than a create (INITENTRY), otherwise the bucket
+    // list hash will diverge due to different entry type handling during merges.
+    //
+    // IMPORTANT: We must check only the LIVE bucket list, not the hot archive.
+    // Entries that exist only in hot archive should still be INITENTRY in the live list.
+    let mut init_entries: Vec<LedgerEntry> = Vec::new();
+    let mut moved_to_live_count = 0u32;
+    for entry in delta_init_entries {
+        let key = match stellar_core_ledger::entry_to_key(&entry) {
+            Ok(k) => k,
+            Err(_) => {
+                init_entries.push(entry);
+                continue;
+            }
+        };
+        // Check if entry exists in the LIVE bucket list (not hot archive)
+        if let Ok(Some(_prev)) = bucket_list.get(&key) {
+            // Entry already exists in live bucket list - treat as update (LIVEENTRY)
+            tracing::debug!(
+                ledger_seq = header.ledger_seq,
+                key_type = ?std::mem::discriminant(&key),
+                "Moving INIT entry to LIVE - already exists in bucket list"
+            );
+            live_entries.push(entry);
+            moved_to_live_count += 1;
+        } else {
+            // Entry doesn't exist in live bucket list - keep as create (INITENTRY)
+            init_entries.push(entry);
+        }
+    }
+    if moved_to_live_count > 0 || is_checkpoint_ledger(header.ledger_seq) {
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            delta_init_count = delta_init_count,
+            final_init_count = init_entries.len(),
+            moved_to_live_count = moved_to_live_count,
+            delta_live_count = delta_live_count,
+            final_live_count = live_entries.len(),
+            delta_dead_count = dead_entries.len(),
+            "Entry counts after INIT→LIVE check"
+        );
+    }
+
+    // Handle hot archive restored entries.
+    // These entries were loaded from hot archive during transaction execution but may not
+    // have been added to the delta if they already existed in the bucket list (e.g., shared
+    // contract code). We need to ensure they're included in the bucket list update.
+    let init_entry_keys: std::collections::HashSet<_> = init_entries
+        .iter()
+        .filter_map(|e| stellar_core_ledger::entry_to_key(e).ok())
+        .collect();
+    for key in &hot_archive_restored_keys {
+        // Skip if already in init_entries (added from delta's created entries)
+        if init_entry_keys.contains(key) {
+            continue;
+        }
+        // Get the entry from the bucket list (pre-transaction state)
+        if let Ok(Some(mut entry)) = bucket_list.get(key) {
+            // Entry already exists in bucket list - treat as update (LIVE)
+            // Update last_modified_ledger_seq to current ledger
+            entry.last_modified_ledger_seq = header.ledger_seq;
+            live_entries.push(entry);
+        }
+        // If entry doesn't exist in bucket list and not in init_entries, it means the
+        // delta already handled it or there's nothing to restore. Skip.
+    }
+
+    // Remove restored entries from dead_entries - they shouldn't be deleted.
+    // When an entry is restored from hot archive, it might have been marked as deleted
+    // in the live bucket list when it was evicted. We need to ensure it's not re-deleted.
+    if !hot_archive_restored_keys.is_empty() {
+        let restored_set: std::collections::HashSet<_> = hot_archive_restored_keys.iter().collect();
+        dead_entries.retain(|k| !restored_set.contains(k));
+    }
+
     // Run incremental eviction scan for protocol 23+ before applying transaction changes
     // This matches C++ stellar-core's behavior: eviction is determined by TTL state
     // from the current bucket list, then evicted entries are added as DEAD entries
@@ -665,12 +824,12 @@ pub fn replay_ledger_with_execution(
     }
 
     // Apply changes to live bucket list SECOND (after hot archive update).
-    tracing::debug!(
+    tracing::info!(
         ledger_seq = header.ledger_seq,
         init_count = init_entries.len(),
         live_count = all_live_entries.len(),
         dead_count = all_dead_entries.len(),
-        "Replay add_batch entry counts"
+        "Replay add_batch entry counts - FINAL"
     );
     bucket_list
         .add_batch(
@@ -761,6 +920,11 @@ pub fn replay_ledger_with_execution(
         .sum();
     let ledger_hash = verify::compute_header_hash(header)?;
 
+    // Compute accurate soroban state size delta from the full change records.
+    // This uses the before/after state to accurately track size changes from
+    // created, updated, and deleted entries.
+    let soroban_state_size_delta = compute_soroban_state_size_delta(&changes, header.ledger_version);
+
     Ok(LedgerReplayResult {
         sequence: header.ledger_seq,
         protocol_version: header.ledger_version,
@@ -774,6 +938,7 @@ pub fn replay_ledger_with_execution(
         dead_entries,
         changes,
         eviction_iterator: updated_eviction_iterator,
+        soroban_state_size_delta,
     })
 }
 

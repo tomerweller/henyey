@@ -63,8 +63,8 @@ use stellar_core_db::Database;
 use stellar_core_ledger::TransactionSetVariant;
 use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerKey, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    GeneralizedTransactionSet, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
+    ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionMeta,
     TransactionResultPair, TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
 };
@@ -2159,14 +2159,13 @@ impl CatchupManager {
                 None, // TODO: Initialize module cache for catchup performance
                 soroban_state_size, // Soroban state size for window updates
             )?;
-            // Update Soroban state size tracking based on delta from this ledger
-            soroban_state_size = Some(update_soroban_state_size(
-                soroban_state_size.unwrap_or(0),
-                &result.init_entries,
-                &result.live_entries,
-                &result.dead_entries,
-                data.header.ledger_version,
-            ));
+            // Update Soroban state size tracking based on accurate delta from replay.
+            // The replay result computes this delta from the full change records,
+            // which includes before/after state for updates and deletes.
+            soroban_state_size = Some(
+                (soroban_state_size.unwrap_or(0) as i64 + result.soroban_state_size_delta).max(0)
+                    as u64,
+            );
 
             // Update eviction iterator for next ledger
             eviction_iterator = result.eviction_iterator;
@@ -2192,7 +2191,34 @@ impl CatchupManager {
         // Checkpoint verification is reliable because we restore from archive.
         let is_checkpoint = final_header.ledger_seq % 64 == 63;
         if self.replay_config.verify_bucket_list && is_checkpoint {
-            let bucket_list_hash = bucket_list.hash();
+            // For protocol 23+, the header's bucket_list_hash is the combined hash
+            // of the live bucket list and hot archive bucket list: SHA256(live || hot)
+            let bucket_list_hash = if final_header.ledger_version >= 23 {
+                if let Some(ref hot_archive) = hot_archive_bucket_list {
+                    use sha2::{Digest, Sha256};
+                    let live_hash = bucket_list.hash();
+                    let hot_hash = hot_archive.hash();
+                    tracing::info!(
+                        ledger_seq = final_header.ledger_seq,
+                        live_hash = %live_hash,
+                        hot_archive_hash = %hot_hash,
+                        "Computing combined bucket list hash for verification"
+                    );
+                    let mut hasher = Sha256::new();
+                    hasher.update(live_hash.as_bytes());
+                    hasher.update(hot_hash.as_bytes());
+                    let result = hasher.finalize();
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&result);
+                    Hash256::from_bytes(bytes)
+                } else {
+                    // Hot archive not available, use live hash only
+                    bucket_list.hash()
+                }
+            } else {
+                // Pre-protocol 23: just live hash
+                bucket_list.hash()
+            };
             replay::verify_replay_consistency(&final_header, &bucket_list_hash)?;
         }
 
@@ -2435,57 +2461,6 @@ fn compute_initial_soroban_state_size(bucket_list: &BucketList, protocol_version
     }
 
     total_size
-}
-
-/// Update the Soroban state size based on ledger entry changes.
-///
-/// This tracks the delta from init/live/dead entries to maintain an accurate
-/// running total of Soroban state size across ledgers.
-fn update_soroban_state_size(
-    current_size: u64,
-    init_entries: &[LedgerEntry],
-    live_entries: &[LedgerEntry],
-    dead_entries: &[LedgerKey],
-    protocol_version: u32,
-) -> u64 {
-    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
-    use stellar_xdr::curr::WriteXdr;
-
-    let mut new_size = current_size;
-
-    // Add size of new entries
-    for entry in init_entries {
-        match &entry.data {
-            LedgerEntryData::ContractData(_) => {
-                if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
-                    new_size += xdr_bytes.len() as u64;
-                }
-            }
-            LedgerEntryData::ContractCode(_) => {
-                // Contract code uses rent-adjusted size
-                if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
-                    let xdr_size = xdr_bytes.len() as u32;
-                    let rent_size = entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size);
-                    new_size += rent_size as u64;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // For live entries, the size might change. For simplicity, we assume
-    // the size change is minimal (updates don't drastically change size).
-    // A more accurate implementation would track old vs new size.
-    // TODO: Track old size for updates to be more accurate
-
-    // Subtract size of deleted entries (we don't have the actual entries,
-    // so we can't accurately compute. Skip for now as this is a minor factor.)
-    // The window entry uses this size periodically, so small inaccuracies
-    // in the delta won't significantly affect the window.
-    let _ = dead_entries; // Acknowledge unused for now
-    let _ = live_entries; // Acknowledge unused for now
-
-    new_size
 }
 
 /// Load the EvictionIterator from the bucket list's ConfigSettingEntry.
