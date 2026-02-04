@@ -421,15 +421,6 @@ impl LedgerManager {
         self.state.read().header.ledger_seq
     }
 
-    /// Set the current ledger sequence number.
-    /// This is used when fast-forwarding to catch up with the network.
-    pub fn set_ledger_sequence(&self, seq: u32) {
-        let mut state = self.state.write();
-        state.header.ledger_seq = seq;
-        state.initialized = true;
-        tracing::info!(ledger_seq = seq, "Fast-forwarded ledger sequence");
-    }
-
     /// Get the current ledger header.
     pub fn current_header(&self) -> LedgerHeader {
         self.state.read().header.clone()
@@ -467,11 +458,6 @@ impl LedgerManager {
     /// Get a reference to the module cache.
     pub fn module_cache(&self) -> &RwLock<Option<PersistentModuleCache>> {
         &self.module_cache
-    }
-
-    /// Get a reference to the offers_initialized flag.
-    pub fn offers_initialized(&self) -> &Arc<RwLock<bool>> {
-        &self.offers_initialized
     }
 
     /// Get the number of offers in the in-memory offer store.
@@ -1141,66 +1127,6 @@ impl LedgerManager {
         );
 
         Ok(())
-    }
-
-    /// Check if the SQL offers table has been initialized.
-    pub fn is_offers_initialized(&self) -> bool {
-        *self.offers_initialized.read()
-    }
-
-    /// Apply a ledger from history (replay mode).
-    ///
-    /// This is used during catchup to replay historical ledgers.
-    pub fn apply_ledger(
-        &self,
-        header: LedgerHeader,
-        _tx_set: TransactionSetVariant,
-        _results: Vec<stellar_xdr::curr::TransactionResultPair>,
-    ) -> Result<LedgerCloseResult> {
-        let state = self.state.read();
-        if !state.initialized {
-            return Err(LedgerError::NotInitialized);
-        }
-
-        // Validate sequence
-        let expected_seq = state.header.ledger_seq + 1;
-        if header.ledger_seq != expected_seq {
-            return Err(LedgerError::InvalidSequence {
-                expected: expected_seq,
-                actual: header.ledger_seq,
-            });
-        }
-
-        // Validate previous hash
-        let expected_prev = state.header_hash;
-        let actual_prev = Hash256::from(header.previous_ledger_hash.0);
-        if actual_prev != expected_prev {
-            return Err(LedgerError::HashMismatch {
-                expected: expected_prev.to_hex(),
-                actual: actual_prev.to_hex(),
-            });
-        }
-
-        drop(state);
-
-        // In replay mode, we trust the header is correct
-        // and just update our state to match
-        let header_hash = compute_header_hash(&header)?;
-
-        // Create close result
-        let result = LedgerCloseResult::new(header.clone(), header_hash);
-
-        // Update state
-        let mut state = self.state.write();
-        state.header = header;
-        state.header_hash = header_hash;
-
-        info!(
-            ledger_seq = state.header.ledger_seq,
-            "Applied historical ledger"
-        );
-
-        Ok(result)
     }
 
     /// Begin closing a new ledger.
