@@ -1731,4 +1731,189 @@ mod tests {
             _ => panic!("Expected LiveSorobanStateSizeWindow config entry"),
         }
     }
+
+    /// Helper to create a ContractData entry with specific size characteristics.
+    fn make_contract_data_entry(seq: u32, key_bytes: &[u8], val_bytes: &[u8]) -> LedgerEntry {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, ScAddress,
+            ScVal,
+        };
+        LedgerEntry {
+            last_modified_ledger_seq: seq,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(std::array::from_fn(|i| {
+                    key_bytes.get(i).copied().unwrap_or(0)
+                })))),
+                key: ScVal::Bytes(
+                    stellar_xdr::curr::ScBytes::try_from(key_bytes.to_vec()).unwrap(),
+                ),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bytes(
+                    stellar_xdr::curr::ScBytes::try_from(val_bytes.to_vec()).unwrap(),
+                ),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Helper to create an Account entry (non-Soroban) for testing.
+    fn make_account_entry(seq: u32) -> LedgerEntry {
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, Thresholds,
+            Uint256,
+        };
+        LedgerEntry {
+            last_modified_ledger_seq: seq,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                balance: 1000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: stellar_xdr::curr::VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_soroban_state_size_delta_created_entries() {
+        // Test that created ContractData entries add to the delta
+        let entry1 = make_contract_data_entry(1, b"key1", b"value1_data");
+        let entry2 = make_contract_data_entry(1, b"key2", b"value2_longer_data");
+
+        let changes = vec![
+            EntryChange::Created(entry1.clone()),
+            EntryChange::Created(entry2.clone()),
+        ];
+
+        let delta = compute_soroban_state_size_delta(&changes, 25);
+
+        // Delta should be positive (sum of both entry sizes)
+        assert!(delta > 0, "Delta should be positive for created entries");
+
+        // Verify it equals the sum of individual entry sizes
+        let expected = soroban_entry_size(&entry1, 25) + soroban_entry_size(&entry2, 25);
+        assert_eq!(delta, expected);
+    }
+
+    #[test]
+    fn test_soroban_state_size_delta_updated_entries() {
+        // Test that updated entries compute size difference correctly
+        let old_entry = make_contract_data_entry(1, b"key1", b"small");
+        let new_entry = make_contract_data_entry(2, b"key1", b"much_larger_value_here");
+
+        let changes = vec![EntryChange::Updated {
+            previous: old_entry.clone(),
+            current: Box::new(new_entry.clone()),
+        }];
+
+        let delta = compute_soroban_state_size_delta(&changes, 25);
+
+        // Delta should be positive (new > old)
+        let old_size = soroban_entry_size(&old_entry, 25);
+        let new_size = soroban_entry_size(&new_entry, 25);
+        assert_eq!(delta, new_size - old_size);
+        assert!(delta > 0, "Delta should be positive when entry grows");
+    }
+
+    #[test]
+    fn test_soroban_state_size_delta_updated_entries_shrink() {
+        // Test that shrinking entries produce negative delta
+        let old_entry = make_contract_data_entry(1, b"key1", b"this_is_a_very_long_value");
+        let new_entry = make_contract_data_entry(2, b"key1", b"tiny");
+
+        let changes = vec![EntryChange::Updated {
+            previous: old_entry.clone(),
+            current: Box::new(new_entry.clone()),
+        }];
+
+        let delta = compute_soroban_state_size_delta(&changes, 25);
+
+        // Delta should be negative (new < old)
+        let old_size = soroban_entry_size(&old_entry, 25);
+        let new_size = soroban_entry_size(&new_entry, 25);
+        assert_eq!(delta, new_size - old_size);
+        assert!(delta < 0, "Delta should be negative when entry shrinks");
+    }
+
+    #[test]
+    fn test_soroban_state_size_delta_deleted_entries() {
+        // Test that deleted entries subtract from the delta
+        let entry = make_contract_data_entry(1, b"key1", b"some_value_to_delete");
+
+        let changes = vec![EntryChange::Deleted {
+            previous: entry.clone(),
+        }];
+
+        let delta = compute_soroban_state_size_delta(&changes, 25);
+
+        // Delta should be negative (size subtracted)
+        let expected = -soroban_entry_size(&entry, 25);
+        assert_eq!(delta, expected);
+        assert!(delta < 0, "Delta should be negative for deleted entries");
+    }
+
+    #[test]
+    fn test_soroban_state_size_delta_ignores_non_soroban_entries() {
+        // Test that non-Soroban entries (like Account) are ignored
+        let account_entry = make_account_entry(1);
+        let contract_entry = make_contract_data_entry(1, b"key", b"value");
+
+        let changes = vec![
+            EntryChange::Created(account_entry.clone()),
+            EntryChange::Created(contract_entry.clone()),
+        ];
+
+        let delta = compute_soroban_state_size_delta(&changes, 25);
+
+        // Should only count the ContractData entry, not Account
+        let expected = soroban_entry_size(&contract_entry, 25);
+        assert_eq!(delta, expected);
+
+        // Account entry size should be 0
+        assert_eq!(soroban_entry_size(&account_entry, 25), 0);
+    }
+
+    #[test]
+    fn test_soroban_state_size_delta_mixed_operations() {
+        // Test a realistic scenario with creates, updates, and deletes
+        let created = make_contract_data_entry(1, b"new_key", b"new_value");
+        let old_updated = make_contract_data_entry(1, b"upd_key", b"old");
+        let new_updated = make_contract_data_entry(2, b"upd_key", b"new_larger");
+        let deleted = make_contract_data_entry(1, b"del_key", b"to_delete");
+
+        let changes = vec![
+            EntryChange::Created(created.clone()),
+            EntryChange::Updated {
+                previous: old_updated.clone(),
+                current: Box::new(new_updated.clone()),
+            },
+            EntryChange::Deleted {
+                previous: deleted.clone(),
+            },
+        ];
+
+        let delta = compute_soroban_state_size_delta(&changes, 25);
+
+        // Expected: +created + (new_updated - old_updated) - deleted
+        let expected = soroban_entry_size(&created, 25)
+            + (soroban_entry_size(&new_updated, 25) - soroban_entry_size(&old_updated, 25))
+            - soroban_entry_size(&deleted, 25);
+
+        assert_eq!(delta, expected);
+    }
+
+    #[test]
+    fn test_soroban_state_size_delta_empty_changes() {
+        // Test that empty changes produce zero delta
+        let changes: Vec<EntryChange> = vec![];
+        let delta = compute_soroban_state_size_delta(&changes, 25);
+        assert_eq!(delta, 0);
+    }
 }
