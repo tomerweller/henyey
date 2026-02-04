@@ -48,12 +48,16 @@ fn test_ledger_close_with_empty_tx_set() {
     let db = Database::open_in_memory().expect("db");
     let _bucket_dir = tempfile::tempdir().expect("bucket dir");
 
-    let ledger = LedgerManager::new(db, "Test Network".to_string());
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = LedgerManager::with_config(db, "Test Network".to_string(), config);
 
     let bucket_list = BucketList::new();
     let header = make_genesis_header();
     ledger
-        .initialize_from_buckets_skip_verify(bucket_list, header)
+        .initialize_from_buckets(bucket_list, None, header, None)
         .expect("init");
 
     let close_data = LedgerCloseData::new(

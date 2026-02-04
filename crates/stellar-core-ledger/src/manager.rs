@@ -708,45 +708,6 @@ impl LedgerManager {
         self.initialize_from_buckets(bucket_list, hot_archive_bucket_list, header, header_hash)
     }
 
-    /// Initialize the ledger from bucket list state, skipping hash verification.
-    ///
-    /// This is a temporary workaround for debugging hash mismatches.
-    pub fn initialize_from_buckets_skip_verify(
-        &self,
-        bucket_list: BucketList,
-        header: LedgerHeader,
-    ) -> Result<()> {
-        let mut state = self.state.write();
-        if state.initialized {
-            return Err(LedgerError::AlreadyInitialized);
-        }
-
-        tracing::warn!(
-            ledger_seq = header.ledger_seq,
-            "Initializing ledger WITHOUT bucket hash verification"
-        );
-
-        // Compute header hash
-        let header_hash = compute_header_hash(&header)?;
-
-        // Update state
-        *self.bucket_list.write() = bucket_list;
-        state.header = header.clone();
-        state.header_hash = header_hash;
-        state.initialized = true;
-
-        // Initialize module cache for Soroban contract execution
-        drop(state); // Release state lock before initializing module cache
-        self.initialize_module_cache(header.ledger_version)?;
-
-        info!(
-            ledger_seq = header.ledger_seq,
-            "Ledger initialized from buckets (verification skipped)"
-        );
-
-        Ok(())
-    }
-
     fn reset_for_catchup(&self) {
         debug!("Resetting ledger manager for catchup");
 
@@ -777,6 +738,7 @@ impl LedgerManager {
     ///
     /// Note: This function is kept for potential future use in selective reinitialization.
     /// Normal initialization uses `initialize_all_caches()` for better memory efficiency.
+    #[allow(dead_code)]
     fn initialize_module_cache(&self, protocol_version: u32) -> Result<()> {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
 
@@ -1431,8 +1393,8 @@ impl LedgerManager {
 
     /// Initialize from bucket list state with parallel cache initialization.
     ///
-    /// This is the async version of [`initialize_from_buckets`] that uses
-    /// [`initialize_all_caches_parallel`] for concurrent offer and soroban scanning.
+    /// This is the async version of `initialize_from_buckets` that uses
+    /// `initialize_all_caches_parallel` for concurrent offer and soroban scanning.
     /// The synchronous preamble (hash verification, state update) is identical.
     pub async fn initialize_from_buckets_parallel(
         &self,
