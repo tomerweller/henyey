@@ -52,6 +52,11 @@ impl<'a> LedgerSnapshotAdapter<'a> {
     /// Get an entry using our workspace XDR types (for internal use).
     /// This is separate from the `SnapshotSource::get()` trait impl which uses
     /// soroban-env-host's XDR types.
+    ///
+    /// IMPORTANT: This function filters out expired Soroban entries (ContractData, ContractCode)
+    /// to match C++ stellar-core behavior. In C++, entries with expired TTL are not passed to
+    /// the host during invoke_host_function - expired temporary entries are skipped entirely,
+    /// and expired persistent entries are treated as archived (requiring restoration).
     #[allow(clippy::type_complexity)]
     fn get_local(
         &self,
@@ -77,22 +82,74 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                     data: LedgerEntryData::Trustline(tl.clone()),
                     ext: LedgerEntryExt::V0,
                 }),
-            LedgerKey::ContractData(cd_key) => self
-                .state
-                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                .map(|cd| LedgerEntry {
-                    last_modified_ledger_seq: self.current_ledger,
-                    data: LedgerEntryData::ContractData(cd.clone()),
-                    ext: LedgerEntryExt::V0,
-                }),
+            LedgerKey::ContractData(cd_key) => {
+                // Check TTL: In C++ stellar-core, ContractData entries are only passed to
+                // the host if they have a valid (non-expired) TTL entry. Entries without
+                // a TTL entry or with expired TTL are not passed to the host.
+                // - If TTL exists and is live (live_until >= current_ledger): pass to host
+                // - If TTL exists and is expired (live_until < current_ledger): skip
+                // - If TTL doesn't exist: skip (entry is not properly initialized or was deleted)
+                match live_until {
+                    Some(lu) if lu >= self.current_ledger => {
+                        // TTL exists and is live - return the entry
+                        self.state
+                            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                            .map(|cd| LedgerEntry {
+                                last_modified_ledger_seq: self.current_ledger,
+                                data: LedgerEntryData::ContractData(cd.clone()),
+                                ext: LedgerEntryExt::V0,
+                            })
+                    }
+                    Some(lu) => {
+                        // TTL exists but is expired
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            live_until = lu,
+                            "get_local: ContractData entry has expired TTL, not passing to host"
+                        );
+                        None
+                    }
+                    None => {
+                        // No TTL entry found - in C++ this means the entry is not live
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            "get_local: ContractData entry has no TTL, not passing to host"
+                        );
+                        None
+                    }
+                }
+            }
             LedgerKey::ContractCode(cc_key) => {
-                self.state
-                    .get_contract_code(&cc_key.hash)
-                    .map(|code| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractCode(code.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
+                // Same as ContractData - require valid TTL to pass to host
+                match live_until {
+                    Some(lu) if lu >= self.current_ledger => {
+                        // TTL exists and is live - return the entry
+                        self.state
+                            .get_contract_code(&cc_key.hash)
+                            .map(|code| LedgerEntry {
+                                last_modified_ledger_seq: self.current_ledger,
+                                data: LedgerEntryData::ContractCode(code.clone()),
+                                ext: LedgerEntryExt::V0,
+                            })
+                    }
+                    Some(lu) => {
+                        // TTL exists but is expired
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            live_until = lu,
+                            "get_local: ContractCode entry has expired TTL, not passing to host"
+                        );
+                        None
+                    }
+                    None => {
+                        // No TTL entry found
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            "get_local: ContractCode entry has no TTL, not passing to host"
+                        );
+                        None
+                    }
+                }
             }
             LedgerKey::Ttl(ttl_key) => {
                 self.state
@@ -149,27 +206,70 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     ext: LedgerEntryExt::V0,
                 }),
             LedgerKey::ContractData(cd_key) => {
-                // NOTE: In production, entries with expired TTL would be evicted to
-                // hot archive. But in verification mode we don't run eviction, so
-                // we pass all entries to Soroban and let it handle TTL checking.
-                // The live_until value is still included for Soroban to use.
-                self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                    .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractData(cd.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
+                // Check TTL: In C++ stellar-core, ContractData entries are only accessible
+                // if they have a valid (non-expired) TTL entry. Entries without a TTL entry
+                // or with expired TTL are treated as archived and not accessible.
+                match live_until {
+                    Some(lu) if lu >= self.current_ledger => {
+                        // TTL exists and is live - return the entry
+                        self.state
+                            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                            .map(|cd| LedgerEntry {
+                                last_modified_ledger_seq: self.current_ledger,
+                                data: LedgerEntryData::ContractData(cd.clone()),
+                                ext: LedgerEntryExt::V0,
+                            })
+                    }
+                    Some(lu) => {
+                        // TTL exists but is expired
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            live_until = lu,
+                            "ContractData entry has expired TTL, treating as archived"
+                        );
+                        return Ok(None);
+                    }
+                    None => {
+                        // No TTL entry found - entry is not properly initialized
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            "ContractData entry has no TTL, treating as not live"
+                        );
+                        return Ok(None);
+                    }
+                }
             }
             LedgerKey::ContractCode(cc_key) => {
-                // NOTE: Same as ContractData - let Soroban handle TTL checking.
-                self.state
-                    .get_contract_code(&cc_key.hash)
-                    .map(|code| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractCode(code.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
+                // Same as ContractData - require valid TTL
+                match live_until {
+                    Some(lu) if lu >= self.current_ledger => {
+                        // TTL exists and is live - return the entry
+                        self.state
+                            .get_contract_code(&cc_key.hash)
+                            .map(|code| LedgerEntry {
+                                last_modified_ledger_seq: self.current_ledger,
+                                data: LedgerEntryData::ContractCode(code.clone()),
+                                ext: LedgerEntryExt::V0,
+                            })
+                    }
+                    Some(lu) => {
+                        // TTL exists but is expired
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            live_until = lu,
+                            "ContractCode entry has expired TTL, treating as archived"
+                        );
+                        return Ok(None);
+                    }
+                    None => {
+                        // No TTL entry found
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            "ContractCode entry has no TTL, treating as not live"
+                        );
+                        return Ok(None);
+                    }
+                }
             }
             LedgerKey::Ttl(ttl_key) => {
                 self.state
@@ -694,4 +794,203 @@ pub fn invoke_host_function(
         mem_bytes,
         live_bucket_list_restores: live_bl_restores,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        ContractDataDurability, ContractDataEntry, ContractId, LedgerKeyContractData, ScAddress,
+        ScVal, TtlEntry,
+    };
+
+    /// Helper to create a test contract data key.
+    fn make_contract_data_key(contract_hash: [u8; 32], key_val: i32) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+            key: ScVal::I32(key_val),
+            durability: ContractDataDurability::Persistent,
+        })
+    }
+
+    /// Helper to create a test contract data entry.
+    fn make_contract_data_entry(contract_hash: [u8; 32], key_val: i32, val: i32) -> ContractDataEntry {
+        ContractDataEntry {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+            key: ScVal::I32(key_val),
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::I32(val),
+        }
+    }
+
+    /// Test that get_local returns entry when TTL is valid (live_until >= current_ledger).
+    ///
+    /// This is a regression test for the fix where entries without valid TTL should
+    /// not be passed to the Soroban host. Previously, entries were returned even when
+    /// TTL was missing or expired.
+    #[test]
+    fn test_get_local_with_valid_ttl() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger = 1000u32;
+
+        let contract_hash = [1u8; 32];
+        let key = make_contract_data_key(contract_hash, 42);
+        let entry = make_contract_data_entry(contract_hash, 42, 100);
+
+        // Create the contract data entry
+        state.create_contract_data(entry);
+
+        // Create TTL entry with live_until >= current_ledger (valid)
+        let key_hash = compute_key_hash(&key);
+        let ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: current_ledger + 100, // Valid: 1100 >= 1000
+        };
+        state.create_ttl(ttl);
+
+        // Test get_local returns the entry
+        let snapshot = LedgerSnapshotAdapter::new(&state, current_ledger);
+        let result = snapshot.get_local(&key).expect("get_local should succeed");
+
+        assert!(result.is_some(), "Entry with valid TTL should be returned");
+        let (entry, live_until) = result.unwrap();
+        assert_eq!(live_until, Some(current_ledger + 100));
+        assert!(matches!(entry.data, LedgerEntryData::ContractData(_)));
+    }
+
+    /// Test that get_local returns None when TTL is expired (live_until < current_ledger).
+    ///
+    /// This matches C++ stellar-core behavior where entries with expired TTL are not
+    /// passed to the Soroban host during invoke_host_function.
+    #[test]
+    fn test_get_local_with_expired_ttl() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger = 1000u32;
+
+        let contract_hash = [2u8; 32];
+        let key = make_contract_data_key(contract_hash, 42);
+        let entry = make_contract_data_entry(contract_hash, 42, 100);
+
+        // Create the contract data entry
+        state.create_contract_data(entry);
+
+        // Create TTL entry with live_until < current_ledger (expired)
+        let key_hash = compute_key_hash(&key);
+        let ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: current_ledger - 1, // Expired: 999 < 1000
+        };
+        state.create_ttl(ttl);
+
+        // Test get_local returns None for expired entry
+        let snapshot = LedgerSnapshotAdapter::new(&state, current_ledger);
+        let result = snapshot.get_local(&key).expect("get_local should succeed");
+
+        assert!(
+            result.is_none(),
+            "Entry with expired TTL should not be returned"
+        );
+    }
+
+    /// Test that get_local returns None when TTL entry doesn't exist.
+    ///
+    /// This matches C++ stellar-core behavior where entries without a TTL entry
+    /// are not considered live and are not passed to the Soroban host.
+    #[test]
+    fn test_get_local_without_ttl() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger = 1000u32;
+
+        let contract_hash = [3u8; 32];
+        let key = make_contract_data_key(contract_hash, 42);
+        let entry = make_contract_data_entry(contract_hash, 42, 100);
+
+        // Create the contract data entry but NO TTL entry
+        state.create_contract_data(entry);
+
+        // Test get_local returns None when TTL doesn't exist
+        let snapshot = LedgerSnapshotAdapter::new(&state, current_ledger);
+        let result = snapshot.get_local(&key).expect("get_local should succeed");
+
+        assert!(
+            result.is_none(),
+            "Entry without TTL should not be returned"
+        );
+    }
+
+    /// Test that get_local returns entry when TTL equals current_ledger (boundary case).
+    ///
+    /// An entry with live_until == current_ledger is still live (it lives through
+    /// the current ledger).
+    #[test]
+    fn test_get_local_with_ttl_at_boundary() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger = 1000u32;
+
+        let contract_hash = [4u8; 32];
+        let key = make_contract_data_key(contract_hash, 42);
+        let entry = make_contract_data_entry(contract_hash, 42, 100);
+
+        // Create the contract data entry
+        state.create_contract_data(entry);
+
+        // Create TTL entry with live_until == current_ledger (boundary - still live)
+        let key_hash = compute_key_hash(&key);
+        let ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: current_ledger, // Boundary: 1000 >= 1000
+        };
+        state.create_ttl(ttl);
+
+        // Test get_local returns the entry (boundary is still live)
+        let snapshot = LedgerSnapshotAdapter::new(&state, current_ledger);
+        let result = snapshot.get_local(&key).expect("get_local should succeed");
+
+        assert!(
+            result.is_some(),
+            "Entry with TTL at boundary should be returned (still live)"
+        );
+    }
+
+    /// Test that non-Soroban entries (Account, Trustline) are returned without TTL check.
+    #[test]
+    fn test_get_local_account_no_ttl_required() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger = 1000u32;
+
+        // Create an account
+        let account_id = AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([5u8; 32]),
+        ));
+        let account = stellar_xdr::curr::AccountEntry {
+            account_id: account_id.clone(),
+            balance: 1_000_000_000,
+            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: stellar_xdr::curr::String32::default(),
+            thresholds: stellar_xdr::curr::Thresholds([1, 0, 0, 0]),
+            signers: stellar_xdr::curr::VecM::default(),
+            ext: stellar_xdr::curr::AccountEntryExt::V0,
+        };
+        state.create_account(account);
+
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        // Test get_local returns the account (no TTL required for classic entries)
+        let snapshot = LedgerSnapshotAdapter::new(&state, current_ledger);
+        let result = snapshot.get_local(&key).expect("get_local should succeed");
+
+        assert!(
+            result.is_some(),
+            "Account entry should be returned without TTL"
+        );
+        let (entry, live_until) = result.unwrap();
+        assert!(live_until.is_none(), "Account should have no TTL");
+        assert!(matches!(entry.data, LedgerEntryData::Account(_)));
+    }
 }
