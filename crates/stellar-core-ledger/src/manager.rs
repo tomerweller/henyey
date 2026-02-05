@@ -289,9 +289,6 @@ pub struct LedgerManager {
     /// with the live bucket list hash for the header's bucket_list_hash.
     hot_archive_bucket_list: Arc<RwLock<Option<HotArchiveBucketList>>>,
 
-    /// Network passphrase (e.g., "Public Global Stellar Network ; September 2015").
-    network_passphrase: String,
-
     /// Network ID derived from SHA-256 of the passphrase.
     network_id: NetworkId,
 
@@ -346,7 +343,6 @@ impl LedgerManager {
         Self {
             bucket_list: Arc::new(RwLock::new(BucketList::default())),
             hot_archive_bucket_list: Arc::new(RwLock::new(None)),
-            network_passphrase,
             network_id,
             state: RwLock::new(LedgerState {
                 header: create_genesis_header(),
@@ -367,11 +363,6 @@ impl LedgerManager {
         &self.network_id
     }
 
-    /// Get the network passphrase.
-    pub fn network_passphrase(&self) -> &str {
-        &self.network_passphrase
-    }
-
     /// Check if the ledger has been initialized.
     pub fn is_initialized(&self) -> bool {
         self.state.read().initialized
@@ -390,45 +381,6 @@ impl LedgerManager {
     /// Get the current header hash.
     pub fn current_header_hash(&self) -> Hash256 {
         self.state.read().header_hash
-    }
-
-    /// Get a reference to the shared Soroban state.
-    pub fn soroban_state(&self) -> &Arc<crate::soroban_state::SharedSorobanState> {
-        &self.soroban_state
-    }
-
-    /// Get a reference to the bucket list.
-    pub fn bucket_list(&self) -> &Arc<RwLock<BucketList>> {
-        &self.bucket_list
-    }
-
-    /// Get a reference to the hot archive bucket list.
-    pub fn hot_archive_bucket_list(&self) -> &Arc<RwLock<Option<HotArchiveBucketList>>> {
-        &self.hot_archive_bucket_list
-    }
-
-    /// Get a reference to the module cache.
-    pub fn module_cache(&self) -> &RwLock<Option<PersistentModuleCache>> {
-        &self.module_cache
-    }
-
-    /// Get the number of offers in the in-memory offer store.
-    pub fn offer_store_count(&self) -> usize {
-        self.offer_store.read().len()
-    }
-
-    /// Get the number of (account, asset) index entries.
-    pub fn offer_account_asset_index_len(&self) -> usize {
-        self.offer_account_asset_index.read().len()
-    }
-
-    /// Get the total number of offer_id entries across all (account, asset) buckets.
-    pub fn offer_account_asset_index_total_ids(&self) -> usize {
-        self.offer_account_asset_index
-            .read()
-            .values()
-            .map(|s| s.len())
-            .sum()
     }
 
     /// Get bucket list level hashes (curr, snap) for persistence.
