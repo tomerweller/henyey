@@ -178,6 +178,11 @@ pub struct SorobanNetworkInfo {
     pub starting_eviction_scan_level: u32,
     /// Computed value: average bucket list size.
     pub average_bucket_list_size: u64,
+    /// SCP timing settings (Protocol 23+).
+    pub nomination_timeout_initial_ms: u32,
+    pub nomination_timeout_increment_ms: u32,
+    pub ballot_timeout_initial_ms: u32,
+    pub ballot_timeout_increment_ms: u32,
 }
 
 /// Load a ConfigSettingEntry from the snapshot by ID.
@@ -604,6 +609,16 @@ pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNet
             }
             info.average_bucket_list_size = sum / window.len() as u64;
         }
+    }
+
+    // Load SCP timing settings (Protocol 23+)
+    if let Some(ConfigSettingEntry::ScpTiming(timing)) =
+        load_config_setting(snapshot, ConfigSettingId::ScpTiming)
+    {
+        info.nomination_timeout_initial_ms = timing.nomination_timeout_initial_milliseconds;
+        info.nomination_timeout_increment_ms = timing.nomination_timeout_increment_milliseconds;
+        info.ballot_timeout_initial_ms = timing.ballot_timeout_initial_milliseconds;
+        info.ballot_timeout_increment_ms = timing.ballot_timeout_increment_milliseconds;
     }
 
     Some(info)

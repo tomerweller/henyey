@@ -1364,13 +1364,13 @@ impl SCPDriver for HerderScpCallback {
         if let Some(manager) = self.driver.ledger_manager.read().as_ref() {
             let header = manager.current_header();
             if header.ledger_version >= 23 {
-                if let Some(timing) = manager.scp_timing() {
+                if let Some(info) = manager.soroban_network_info() {
                     if is_nomination {
-                        initial_ms = timing.nomination_timeout_initial_milliseconds as u64;
-                        increment_ms = timing.nomination_timeout_increment_milliseconds as u64;
+                        initial_ms = info.nomination_timeout_initial_ms as u64;
+                        increment_ms = info.nomination_timeout_increment_ms as u64;
                     } else {
-                        initial_ms = timing.ballot_timeout_initial_milliseconds as u64;
-                        increment_ms = timing.ballot_timeout_increment_milliseconds as u64;
+                        initial_ms = info.ballot_timeout_initial_ms as u64;
+                        increment_ms = info.ballot_timeout_increment_ms as u64;
                     }
                 }
             }

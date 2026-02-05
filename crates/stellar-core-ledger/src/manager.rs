@@ -50,9 +50,9 @@ use stellar_core_tx::state::AssetKey;
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
-    ConfigSettingScpTiming, EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet,
-    Hash, LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData,
-    LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
+    EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet, Hash, LedgerCloseMeta,
+    LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
     LedgerKeyConfigSetting, TransactionEventStage, TransactionMeta, TransactionPhase,
     TransactionResultMetaV1, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
     UpgradeEntryMeta, VecM,
@@ -429,20 +429,6 @@ impl LedgerManager {
             .values()
             .map(|s| s.len())
             .sum()
-    }
-
-    /// Get the SCP timing configuration from the current ledger state.
-    pub fn scp_timing(&self) -> Option<ConfigSettingScpTiming> {
-        if !self.is_initialized() {
-            return None;
-        }
-
-        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ScpTiming,
-        });
-
-        let entry = self.bucket_list.read().get(&key).ok()??;
-        extract_scp_timing(&entry)
     }
 
     /// Get bucket list level hashes (curr, snap) for persistence.
@@ -2616,15 +2602,6 @@ fn create_genesis_header() -> LedgerHeader {
         max_tx_set_size: 1000,
         skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
         ext: stellar_xdr::curr::LedgerHeaderExt::V0,
-    }
-}
-
-fn extract_scp_timing(entry: &LedgerEntry) -> Option<ConfigSettingScpTiming> {
-    match &entry.data {
-        LedgerEntryData::ConfigSetting(ConfigSettingEntry::ScpTiming(timing)) => {
-            Some(timing.clone())
-        }
-        _ => None,
     }
 }
 
