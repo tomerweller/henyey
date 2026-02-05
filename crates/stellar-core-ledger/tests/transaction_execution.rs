@@ -3822,3 +3822,361 @@ fn test_deleted_offer_not_reloaded_from_snapshot() {
         ),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Parallel Soroban cluster execution tests
+// ---------------------------------------------------------------------------
+
+/// Helper: build an ExtendFootprintTtl Soroban TX for a given contract code entry.
+///
+/// Returns the signed envelope and all the ledger entries (account, contract code,
+/// TTL) that must be in the snapshot for execution to succeed.
+fn build_extend_ttl_tx(
+    seed: [u8; 32],
+    seq_num: i64,
+    code_hash_bytes: [u8; 32],
+    extend_to: u32,
+    network_id: &NetworkId,
+) -> (
+    TransactionEnvelope,
+    Vec<(LedgerKey, LedgerEntry)>, // entries to add to snapshot
+) {
+    let secret = SecretKey::from_seed(&seed);
+    let source_id: AccountId = (&secret.public_key()).into();
+
+    // Account entry
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), seq_num - 1, 20_000_000);
+
+    // Contract code entry
+    let code_hash = Hash(code_hash_bytes);
+    let contract_code = ContractCodeEntry {
+        ext: ContractCodeEntryExt::V0,
+        hash: code_hash.clone(),
+        code: BytesM::try_from(vec![1u8, 2u8, 3u8]).unwrap(),
+    };
+    let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: code_hash.clone(),
+    });
+    let contract_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ContractCode(contract_code),
+        ext: LedgerEntryExt::V0,
+    };
+
+    // TTL entry for the contract code
+    let key_hash = {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::WriteXdr;
+        let mut hasher = Sha256::new();
+        let bytes = contract_key
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
+        hasher.update(&bytes);
+        Hash(hasher.finalize().into())
+    };
+    let ttl_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 10,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let ttl_key = LedgerKey::Ttl(LedgerKeyTtl { key_hash });
+
+    // Build TX
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to,
+        }),
+    };
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: vec![contract_key.clone()].try_into().unwrap(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        },
+        resource_fee: 900,
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 1000,
+        seq_num: SequenceNumber(seq_num),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, &secret, network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let entries = vec![
+        (source_key, source_entry),
+        (contract_key, contract_entry),
+        (ttl_key, ttl_entry),
+    ];
+    (envelope, entries)
+}
+
+/// Test that `execute_soroban_parallel_phase` with multiple clusters in a single
+/// stage actually executes them via the `spawn_blocking` parallel path and
+/// produces correct results.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parallel_soroban_multi_cluster_execution() {
+    use stellar_core_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
+        SnapshotHandle,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    // Build two independent Soroban TXs that touch different contract codes.
+    let (tx1, entries1) =
+        build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) =
+        build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+
+    // Build snapshot with all entries
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
+        builder = builder.add_entry(key, entry).expect("add entry");
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    // Create a phase with 1 stage and 2 clusters (triggers parallel path).
+    let phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![
+            vec![(tx1.clone(), None)], // cluster 0
+            vec![(tx2.clone(), None)], // cluster 1
+        ]],
+    };
+
+    let mut delta = LedgerDelta::new(1);
+    let (results, tx_results, tx_result_metas, _id_pool, _restored) =
+        execute_soroban_parallel_phase(
+            &snapshot,
+            &phase,
+            1,          // ledger_seq
+            1_000,      // close_time
+            100,        // base_fee
+            5_000_000,  // base_reserve
+            25,         // protocol_version
+            network_id,
+            &mut delta,
+            SorobanConfig::default(),
+            [0u8; 32],
+            ClassicEventConfig::default(),
+            None,
+            None,
+        )
+        .expect("execute parallel phase");
+
+    // Both TXs should have executed.
+    assert_eq!(results.len(), 2, "expected 2 execution results");
+    assert_eq!(tx_results.len(), 2, "expected 2 TX result pairs");
+    assert_eq!(tx_result_metas.len(), 2, "expected 2 TX result metas");
+
+    // Both should succeed.
+    assert!(results[0].success, "TX1 should succeed");
+    assert!(results[1].success, "TX2 should succeed");
+
+    // Fees should be collected (each TX has fee=1000, base_fee=100 → charged 100 each).
+    assert_eq!(results[0].fee_charged, 100, "TX1 fee charged");
+    assert_eq!(results[1].fee_charged, 100, "TX2 fee charged");
+
+    // Delta should have changes from both clusters.
+    // Each cluster modifies: account (fee deduction) + TTL entry (extend).
+    assert!(delta.num_changes() > 0, "delta should have changes");
+    assert!(delta.fee_pool_delta() > 0, "fees should be collected");
+}
+
+/// Test that parallel execution produces the same result as single-cluster
+/// (sequential) execution.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parallel_soroban_matches_sequential() {
+    use stellar_core_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
+        SnapshotHandle,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    let (tx1, entries1) =
+        build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) =
+        build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+
+    // Build snapshot with all entries.
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
+        builder = builder.add_entry(key, entry).expect("add entry");
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    let common_args = |phase: &SorobanPhaseStructure| {
+        (
+            phase.clone(),
+            1u32,       // ledger_seq
+            1_000u64,   // close_time
+            100u32,     // base_fee
+            5_000_000u32,
+            25u32,
+            network_id,
+            SorobanConfig::default(),
+            [0u8; 32],
+            ClassicEventConfig::default(),
+        )
+    };
+
+    // Run with 2 clusters in 1 stage (parallel path).
+    let parallel_phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![
+            vec![(tx1.clone(), None)],
+            vec![(tx2.clone(), None)],
+        ]],
+    };
+    let args = common_args(&parallel_phase);
+    let mut parallel_delta = LedgerDelta::new(1);
+    let (par_results, par_tx_results, par_tx_result_metas, par_id_pool, par_restored) =
+        execute_soroban_parallel_phase(
+            &snapshot,
+            &args.0,
+            args.1, args.2, args.3, args.4, args.5, args.6,
+            &mut parallel_delta,
+            args.7, args.8, args.9,
+            None, None,
+        )
+        .expect("parallel");
+
+    // Run with 2 stages of 1 cluster each (sequential path — each stage has ≤1 cluster).
+    let sequential_phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![
+            vec![vec![(tx1.clone(), None)]],
+            vec![vec![(tx2.clone(), None)]],
+        ],
+    };
+    let args = common_args(&sequential_phase);
+    let mut sequential_delta = LedgerDelta::new(1);
+    let (seq_results, seq_tx_results, seq_tx_result_metas, seq_id_pool, seq_restored) =
+        execute_soroban_parallel_phase(
+            &snapshot,
+            &args.0,
+            args.1, args.2, args.3, args.4, args.5, args.6,
+            &mut sequential_delta,
+            args.7, args.8, args.9,
+            None, None,
+        )
+        .expect("sequential");
+
+    // Results should match.
+    assert_eq!(par_results.len(), seq_results.len(), "result count");
+    for i in 0..par_results.len() {
+        assert_eq!(par_results[i].success, seq_results[i].success, "success[{i}]");
+        assert_eq!(par_results[i].fee_charged, seq_results[i].fee_charged, "fee_charged[{i}]");
+        assert_eq!(par_results[i].fee_refund, seq_results[i].fee_refund, "fee_refund[{i}]");
+    }
+    assert_eq!(par_tx_results.len(), seq_tx_results.len(), "tx_results count");
+    assert_eq!(par_tx_result_metas.len(), seq_tx_result_metas.len(), "metas count");
+    assert_eq!(par_id_pool, seq_id_pool, "id_pool");
+    assert_eq!(par_restored.len(), seq_restored.len(), "restored keys");
+
+    // Fee pool deltas should match.
+    assert_eq!(
+        parallel_delta.fee_pool_delta(),
+        sequential_delta.fee_pool_delta(),
+        "fee pool delta"
+    );
+
+    // Both should have the same number of state changes.
+    assert_eq!(
+        parallel_delta.num_changes(),
+        sequential_delta.num_changes(),
+        "number of delta changes"
+    );
+}
+
+/// Test that parallel execution is deterministic across runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parallel_soroban_deterministic() {
+    use stellar_core_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
+        SnapshotHandle,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    let (tx1, entries1) =
+        build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) =
+        build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
+        builder = builder.add_entry(key, entry).expect("add entry");
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    let phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![
+            vec![(tx1.clone(), None)],
+            vec![(tx2.clone(), None)],
+        ]],
+    };
+
+    // Run the same phase multiple times.
+    let mut prev_fee_delta = None;
+    let mut prev_num_changes = None;
+    let mut prev_results: Option<Vec<(bool, i64, i64)>> = None;
+
+    for run in 0..5 {
+        let mut delta = LedgerDelta::new(1);
+        let (results, _tx_results, _metas, _id_pool, _restored) =
+            execute_soroban_parallel_phase(
+                &snapshot,
+                &phase,
+                1, 1_000, 100, 5_000_000, 25, network_id,
+                &mut delta,
+                SorobanConfig::default(),
+                [0u8; 32],
+                ClassicEventConfig::default(),
+                None, None,
+            )
+            .expect("execute");
+
+        let result_tuples: Vec<(bool, i64, i64)> = results
+            .iter()
+            .map(|r| (r.success, r.fee_charged, r.fee_refund))
+            .collect();
+
+        if let Some(ref prev) = prev_results {
+            assert_eq!(&result_tuples, prev, "results differ on run {run}");
+        }
+        if let Some(prev) = prev_fee_delta {
+            assert_eq!(delta.fee_pool_delta(), prev, "fee delta differs on run {run}");
+        }
+        if let Some(prev) = prev_num_changes {
+            assert_eq!(delta.num_changes(), prev, "num changes differs on run {run}");
+        }
+
+        prev_results = Some(result_tuples);
+        prev_fee_delta = Some(delta.fee_pool_delta());
+        prev_num_changes = Some(delta.num_changes());
+    }
+}

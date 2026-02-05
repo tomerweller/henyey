@@ -463,18 +463,18 @@ impl LedgerDelta {
                                 .insert(key_bytes, EntryChange::Created(entry.clone()));
                         }
                     }
-                    EntryChange::Updated { current, .. } => {
+                    EntryChange::Updated { previous, current } => {
                         if let Some(existing) = self.changes.get(&key_bytes) {
                             match existing {
                                 EntryChange::Created(_) => {
                                     self.changes
                                         .insert(key_bytes, EntryChange::Created(current.as_ref().clone()));
                                 }
-                                EntryChange::Updated { previous, .. } => {
+                                EntryChange::Updated { previous: orig, .. } => {
                                     self.changes.insert(
                                         key_bytes,
                                         EntryChange::Updated {
-                                            previous: previous.clone(),
+                                            previous: orig.clone(),
                                             current: current.clone(),
                                         },
                                     );
@@ -486,9 +486,18 @@ impl LedgerDelta {
                                 }
                             }
                         } else {
-                            return Err(LedgerError::MissingEntry(
-                                "update on non-existent entry".to_string(),
-                            ));
+                            // Entry not in target delta — insert the full update.
+                            // This occurs when merging independent deltas (e.g. parallel
+                            // cluster execution) where each delta carries its own
+                            // previous/current state.
+                            self.change_order.push(key_bytes.clone());
+                            self.changes.insert(
+                                key_bytes,
+                                EntryChange::Updated {
+                                    previous: previous.clone(),
+                                    current: current.clone(),
+                                },
+                            );
                         }
                     }
                     EntryChange::Deleted { previous } => {

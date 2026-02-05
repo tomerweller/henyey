@@ -5629,6 +5629,9 @@ pub fn execute_transaction_set_with_fee_mode(
 // Parallel Soroban Phase Execution
 // ---------------------------------------------------------------------------
 
+/// Transaction envelope paired with an optional per-TX base fee override.
+type TxWithFee = (TransactionEnvelope, Option<u32>);
+
 /// Result of executing one cluster of Soroban transactions.
 struct ClusterResult {
     results: Vec<TransactionExecutionResult>,
@@ -5782,11 +5785,133 @@ pub fn execute_soroban_parallel_phase(
     ))
 }
 
+/// Execute a single cluster of transactions independently.
+///
+/// Creates its own `TransactionExecutor` and `LedgerDelta`.
+/// Returns `(ClusterResult, per_cluster_delta, total_fees)`.
+#[allow(clippy::too_many_arguments)]
+fn execute_single_cluster(
+    snapshot: &SnapshotHandle,
+    cluster: &[(TransactionEnvelope, Option<u32>)],
+    cluster_offset: usize,
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    soroban_config: &SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<&std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    id_pool: u64,
+) -> Result<(ClusterResult, LedgerDelta, i64)> {
+    let mut executor = TransactionExecutor::new(
+        ledger_seq,
+        close_time,
+        base_reserve,
+        protocol_version,
+        network_id,
+        id_pool,
+        soroban_config.clone(),
+        classic_events,
+    );
+    if let Some(cache) = module_cache {
+        executor.set_module_cache(cache.clone());
+    }
+    if let Some(ha) = hot_archive {
+        executor.set_hot_archive(ha.clone());
+    }
+
+    let mut results = Vec::with_capacity(cluster.len());
+    let mut tx_results = Vec::with_capacity(cluster.len());
+    let mut tx_result_metas = Vec::with_capacity(cluster.len());
+
+    for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
+        executor.state.snapshot_delta();
+
+        let tx_fee = tx_base_fee.unwrap_or(base_fee);
+        let global_idx = cluster_offset + local_idx;
+        let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_idx as u32);
+        let result = executor.execute_transaction_with_fee_mode(
+            snapshot,
+            tx,
+            tx_fee,
+            Some(tx_prng_seed),
+            true,
+        )?;
+        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+        let tx_result = build_tx_result_pair(
+            &frame,
+            &executor.network_id,
+            &result,
+            tx_fee as i64,
+            protocol_version,
+        )?;
+        let tx_meta = result
+            .tx_meta
+            .clone()
+            .unwrap_or_else(empty_transaction_meta);
+        let fee_changes = result
+            .fee_changes
+            .clone()
+            .unwrap_or_else(empty_entry_changes);
+        let post_fee_changes = result
+            .post_fee_changes
+            .clone()
+            .unwrap_or_else(empty_entry_changes);
+        let tx_result_meta = TransactionResultMetaV1 {
+            ext: ExtensionPoint::V0,
+            result: tx_result.clone(),
+            fee_processing: fee_changes,
+            tx_apply_processing: tx_meta,
+            post_tx_apply_fee_processing: post_fee_changes,
+        };
+
+        results.push(result);
+        tx_results.push(tx_result);
+        tx_result_metas.push(tx_result_meta);
+    }
+
+    // Flush deferred RO TTL bumps within this cluster.
+    executor.state_mut().flush_deferred_ro_ttl_bumps();
+
+    // Collect hot archive restored keys.
+    let mut restored_keys: Vec<LedgerKey> = Vec::new();
+    for r in &results {
+        restored_keys.extend(r.hot_archive_restored_keys.iter().cloned());
+    }
+
+    let total_fees = executor.total_fees();
+    let final_id_pool = executor.id_pool();
+
+    // Apply this cluster's state changes to a local delta.
+    let mut cluster_delta = LedgerDelta::new(ledger_seq);
+    executor.apply_to_delta(snapshot, &mut cluster_delta)?;
+
+    Ok((
+        ClusterResult {
+            results,
+            tx_results,
+            tx_result_metas,
+            id_pool: final_id_pool,
+            hot_archive_restored_keys: restored_keys,
+        },
+        cluster_delta,
+        total_fees,
+    ))
+}
+
 /// Execute all clusters within a stage.
 ///
 /// Each cluster gets its own `TransactionExecutor` with isolated state.
 /// The executor's state changes are applied to the main delta via `apply_to_delta`.
 /// Soroban TXs don't use the orderbook so `load_orderbook_offers` is skipped.
+///
+/// When a stage has multiple clusters, they are executed in parallel using
+/// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
+/// merged into `delta` in deterministic cluster order.
 #[allow(clippy::too_many_arguments)]
 fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
@@ -5814,104 +5939,108 @@ fn execute_stage_clusters(
         offset += cluster.len();
     }
 
-    let mut cluster_results = Vec::with_capacity(clusters.len());
-    for (cluster_idx, cluster) in clusters.iter().enumerate() {
-        let mut executor = TransactionExecutor::new(
-            ledger_seq,
-            close_time,
-            base_reserve,
-            protocol_version,
-            network_id,
-            id_pool,
-            soroban_config.clone(),
-            classic_events,
-        );
-        if let Some(cache) = module_cache {
-            executor.set_module_cache(cache.clone());
-        }
-        if let Some(ref ha) = hot_archive {
-            executor.set_hot_archive(ha.clone());
-        }
-
-        let mut results = Vec::with_capacity(cluster.len());
-        let mut tx_results = Vec::with_capacity(cluster.len());
-        let mut tx_result_metas = Vec::with_capacity(cluster.len());
-
-        for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
-            executor.state.snapshot_delta();
-
-            let tx_fee = tx_base_fee.unwrap_or(base_fee);
-            let global_idx = offsets[cluster_idx] + local_idx;
-            let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_idx as u32);
-            let result = executor.execute_transaction_with_fee_mode(
+    // Single-cluster fast path: execute inline, no thread overhead.
+    if clusters.len() <= 1 {
+        let mut cluster_results = Vec::with_capacity(clusters.len());
+        for (cluster_idx, cluster) in clusters.iter().enumerate() {
+            let (cr, cluster_delta, total_fees) = execute_single_cluster(
                 snapshot,
-                tx,
-                tx_fee,
-                Some(tx_prng_seed),
-                true,
-            )?;
-            let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
-            let tx_result = build_tx_result_pair(
-                &frame,
-                &executor.network_id,
-                &result,
-                tx_fee as i64,
+                cluster,
+                offsets[cluster_idx],
+                ledger_seq,
+                close_time,
+                base_fee,
+                base_reserve,
                 protocol_version,
+                network_id,
+                soroban_config,
+                soroban_base_prng_seed,
+                classic_events,
+                module_cache,
+                hot_archive.as_ref(),
+                id_pool,
             )?;
-            let tx_meta = result
-                .tx_meta
-                .clone()
-                .unwrap_or_else(empty_transaction_meta);
-            let fee_changes = result
-                .fee_changes
-                .clone()
-                .unwrap_or_else(empty_entry_changes);
-            let post_fee_changes = result
-                .post_fee_changes
-                .clone()
-                .unwrap_or_else(empty_entry_changes);
-            let tx_result_meta = TransactionResultMetaV1 {
-                ext: ExtensionPoint::V0,
-                result: tx_result.clone(),
-                fee_processing: fee_changes,
-                tx_apply_processing: tx_meta,
-                post_tx_apply_fee_processing: post_fee_changes,
-            };
-
-            results.push(result);
-            tx_results.push(tx_result);
-            tx_result_metas.push(tx_result_meta);
+            delta.merge(cluster_delta)?;
+            if total_fees != 0 {
+                delta.record_fee_pool_delta(total_fees);
+            }
+            cluster_results.push(cr);
         }
+        return Ok(cluster_results);
+    }
 
-        // Flush deferred RO TTL bumps within this cluster.
-        executor.state_mut().flush_deferred_ro_ttl_bumps();
+    // Multi-cluster: spawn one blocking task per cluster on Tokio's thread pool.
+    // Clone shared data for 'static closures (all clones are cheap / Arc-based).
+    let snapshot = snapshot.clone();
+    let soroban_config = soroban_config.clone();
+    let module_cache = module_cache.cloned();
+    let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
+        std::sync::Arc::new(clusters.to_vec());
 
-        // Collect hot archive restored keys.
-        let mut restored_keys: Vec<LedgerKey> = Vec::new();
-        for r in &results {
-            restored_keys.extend(r.hot_archive_restored_keys.iter().cloned());
-        }
+    let thread_results: Vec<Result<(ClusterResult, LedgerDelta, i64)>> =
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut tasks = Vec::with_capacity(clusters.len());
+                for idx in 0..clusters.len() {
+                    let snapshot = snapshot.clone();
+                    let config = soroban_config.clone();
+                    let cache = module_cache.clone();
+                    let ha = hot_archive.clone();
+                    let clusters = clusters.clone();
+                    let cluster_offset = offsets[idx];
 
-        let total_fees = executor.total_fees();
-        let final_id_pool = executor.id_pool();
+                    tasks.push(tokio::task::spawn_blocking(move || {
+                        execute_single_cluster(
+                            &snapshot,
+                            &clusters[idx],
+                            cluster_offset,
+                            ledger_seq,
+                            close_time,
+                            base_fee,
+                            base_reserve,
+                            protocol_version,
+                            network_id,
+                            &config,
+                            soroban_base_prng_seed,
+                            classic_events,
+                            cache.as_ref(),
+                            ha.as_ref(),
+                            id_pool,
+                        )
+                    }));
+                }
 
-        // Apply this cluster's state changes to the main delta.
-        executor.apply_to_delta(snapshot, delta)?;
+                // Collect all results (preserving cluster order).
+                let mut results = Vec::with_capacity(tasks.len());
+                for task in tasks {
+                    results.push(task.await.expect("cluster task panicked"));
+                }
+                results
+            })
+        });
+
+    // Merge results in cluster order (deterministic).
+    let mut cluster_results = Vec::with_capacity(thread_results.len());
+    for result in thread_results {
+        let (cr, cluster_delta, total_fees) = result?;
+        delta.merge(cluster_delta)?;
         if total_fees != 0 {
             delta.record_fee_pool_delta(total_fees);
         }
-
-        cluster_results.push(ClusterResult {
-            results,
-            tx_results,
-            tx_result_metas,
-            id_pool: final_id_pool,
-            hot_archive_restored_keys: restored_keys,
-        });
+        cluster_results.push(cr);
     }
 
     Ok(cluster_results)
 }
+
+// Compile-time assertions that key types are Send, required for spawn_blocking.
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _checks() {
+        _assert_send::<ClusterResult>();
+        _assert_send::<LedgerDelta>();
+    }
+};
 
 /// Compute the state size window update entry for a ledger close.
 ///
