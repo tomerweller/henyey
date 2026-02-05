@@ -1534,7 +1534,10 @@ impl TransactionExecutor {
             .chain(footprint.read_write.iter())
         {
             // Skip entries already in state (e.g., created by previous TX in this ledger)
-            if self.state.get_entry(key).is_none() {
+            // Also skip entries that were deleted by a previous TX in this ledger - they
+            // should NOT be reloaded from the bucket list. In C++ stellar-core, deleted
+            // entries are tracked in mThreadEntryMap as nullopt, providing the same behavior.
+            if self.state.get_entry(key).is_none() && !self.state.is_entry_deleted(key) {
                 all_keys.push(key.clone());
             }
             // Add TTL key for contract data/code entries
@@ -1546,7 +1549,8 @@ impl TransactionExecutor {
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                     key_hash: key_hash.clone(),
                 });
-                if self.state.get_entry(&ttl_key).is_none() {
+                // Also check if TTL was deleted (along with its parent entry)
+                if self.state.get_entry(&ttl_key).is_none() && !self.state.is_entry_deleted(&ttl_key) {
                     all_keys.push(ttl_key);
                 }
             }

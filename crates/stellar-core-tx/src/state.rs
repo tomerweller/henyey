@@ -552,6 +552,15 @@ pub struct LedgerStateManager {
     created_claimable_balances: HashSet<[u8; 32]>,
     /// Track liquidity pools created in this transaction (for rollback).
     created_liquidity_pools: HashSet<[u8; 32]>,
+    /// Track contract data entries deleted in this ledger.
+    /// Used to prevent reloading deleted entries from bucket list during footprint loading.
+    /// In C++ stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt,
+    /// which prevents subsequent transactions from seeing them.
+    deleted_contract_data: HashSet<ContractDataKey>,
+    /// Track contract code entries deleted in this ledger.
+    deleted_contract_code: HashSet<[u8; 32]>,
+    /// Track TTL entries deleted in this ledger.
+    deleted_ttl: HashSet<[u8; 32]>,
     /// Snapshot of id_pool for rollback. When an ID is generated during a transaction
     /// that later fails, the id_pool must be restored to its pre-transaction value.
     id_pool_snapshot: Option<u64>,
@@ -642,6 +651,9 @@ impl LedgerStateManager {
             created_ttl: HashSet::new(),
             created_claimable_balances: HashSet::new(),
             created_liquidity_pools: HashSet::new(),
+            deleted_contract_data: HashSet::new(),
+            deleted_contract_code: HashSet::new(),
+            deleted_ttl: HashSet::new(),
             id_pool_snapshot: None,
             delta_snapshot: None,
             offer_index: OfferIndex::new(),
@@ -2895,10 +2907,12 @@ impl LedgerStateManager {
             self.delta.record_delete(ledger_key.clone(), pre);
         }
 
-        // Remove from state
+        // Remove from state and track deletion
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.contract_data.remove(&lookup_key);
         self.remove_last_modified_key(&ledger_key);
+        // Track this deletion to prevent reloading from bucket list
+        self.deleted_contract_data.insert(lookup_key);
     }
 
     // ==================== Contract Code Operations ====================
@@ -3031,10 +3045,12 @@ impl LedgerStateManager {
             self.delta.record_delete(ledger_key.clone(), pre);
         }
 
-        // Remove from state
+        // Remove from state and track deletion
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.contract_code.remove(&key);
         self.remove_last_modified_key(&ledger_key);
+        // Track this deletion to prevent reloading from bucket list
+        self.deleted_contract_code.insert(key);
     }
 
     // ==================== TTL Entry Operations ====================
@@ -3498,10 +3514,12 @@ impl LedgerStateManager {
             self.delta.record_delete(ledger_key.clone(), pre);
         }
 
-        // Remove from state
+        // Remove from state and track deletion
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.ttl_entries.remove(&key);
         self.remove_last_modified_key(&ledger_key);
+        // Track this deletion to prevent reloading from bucket list
+        self.deleted_ttl.insert(key);
     }
 
     /// Check if a TTL entry is live (not expired).
@@ -3839,6 +3857,24 @@ impl LedgerStateManager {
                 .get_liquidity_pool(&k.liquidity_pool_id)
                 .map(|e| self.liquidity_pool_to_ledger_entry(e)),
             _ => None,
+        }
+    }
+
+    /// Check if an entry was deleted during this ledger (for Soroban entries).
+    ///
+    /// This is used to prevent reloading deleted entries from the bucket list.
+    /// In C++ stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt,
+    /// which prevents subsequent transactions from seeing them. This method provides
+    /// equivalent functionality.
+    pub fn is_entry_deleted(&self, key: &LedgerKey) -> bool {
+        match key {
+            LedgerKey::ContractData(k) => {
+                let lookup_key = ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                self.deleted_contract_data.contains(&lookup_key)
+            }
+            LedgerKey::ContractCode(k) => self.deleted_contract_code.contains(&k.hash.0),
+            LedgerKey::Ttl(k) => self.deleted_ttl.contains(&k.key_hash.0),
+            _ => false,
         }
     }
 
@@ -6607,5 +6643,154 @@ mod tests {
         // Rollback — id_pool should be restored
         manager.rollback_to_savepoint(sp);
         assert_eq!(manager.id_pool, initial_id);
+    }
+
+    // ==================== Deleted Entry Tracking Tests ====================
+    // These tests verify that deleted entries are tracked to prevent reloading
+    // from the bucket list. This is essential for correct within-cluster
+    // visibility in parallel Soroban execution.
+
+    fn create_test_contract_address(seed: u8) -> ScAddress {
+        ScAddress::Contract(Hash([seed; 32]).into())
+    }
+
+    fn create_test_contract_data_entry(seed: u8) -> ContractDataEntry {
+        ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: create_test_contract_address(seed),
+            key: ScVal::U32(seed as u32),
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::U64(1000),
+        }
+    }
+
+    fn create_test_contract_code_entry(seed: u8) -> ContractCodeEntry {
+        ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: Hash([seed; 32]),
+            code: vec![0, 1, 2, 3].try_into().unwrap(),
+        }
+    }
+
+    fn create_test_ttl_entry(seed: u8) -> TtlEntry {
+        TtlEntry {
+            key_hash: Hash([seed; 32]),
+            live_until_ledger_seq: 1000000,
+        }
+    }
+
+    #[test]
+    fn test_deleted_contract_data_tracking() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let cd = create_test_contract_data_entry(1);
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: cd.contract.clone(),
+            key: cd.key.clone(),
+            durability: cd.durability,
+        });
+
+        // Initially not deleted
+        assert!(!manager.is_entry_deleted(&key));
+
+        // Create and verify exists
+        manager.create_contract_data(cd.clone());
+        assert!(manager.get_contract_data(&cd.contract, &cd.key, cd.durability).is_some());
+        assert!(!manager.is_entry_deleted(&key));
+
+        // Delete and verify tracking
+        manager.delete_contract_data(&cd.contract, &cd.key, cd.durability);
+        assert!(manager.get_contract_data(&cd.contract, &cd.key, cd.durability).is_none());
+        assert!(manager.is_entry_deleted(&key));
+    }
+
+    #[test]
+    fn test_deleted_contract_code_tracking() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let cc = create_test_contract_code_entry(2);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: cc.hash.clone(),
+        });
+
+        // Initially not deleted
+        assert!(!manager.is_entry_deleted(&key));
+
+        // Create and verify exists
+        manager.create_contract_code(cc.clone());
+        assert!(manager.get_contract_code(&cc.hash).is_some());
+        assert!(!manager.is_entry_deleted(&key));
+
+        // Delete and verify tracking
+        manager.delete_contract_code(&cc.hash);
+        assert!(manager.get_contract_code(&cc.hash).is_none());
+        assert!(manager.is_entry_deleted(&key));
+    }
+
+    #[test]
+    fn test_deleted_ttl_tracking() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let ttl = create_test_ttl_entry(3);
+        let key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: ttl.key_hash.clone(),
+        });
+
+        // Initially not deleted
+        assert!(!manager.is_entry_deleted(&key));
+
+        // Create and verify exists
+        manager.create_ttl(ttl.clone());
+        assert!(manager.get_ttl(&ttl.key_hash).is_some());
+        assert!(!manager.is_entry_deleted(&key));
+
+        // Delete and verify tracking
+        manager.delete_ttl(&ttl.key_hash);
+        assert!(manager.get_ttl(&ttl.key_hash).is_none());
+        assert!(manager.is_entry_deleted(&key));
+    }
+
+    #[test]
+    fn test_non_soroban_entries_not_tracked_as_deleted() {
+        let manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Non-Soroban entry types should always return false for is_entry_deleted
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: create_test_account_id(1),
+        });
+        assert!(!manager.is_entry_deleted(&account_key));
+
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: create_test_account_id(1),
+            offer_id: 123,
+        });
+        assert!(!manager.is_entry_deleted(&offer_key));
+    }
+
+    #[test]
+    fn test_deleted_entry_tracking_regression_842789() {
+        // Regression test for ledger 842789 TX 5 mismatch.
+        // When TX 4 deletes an entry, TX 5 should NOT reload it from bucket list.
+        // This test verifies that deleted entries are properly tracked.
+        let mut manager = LedgerStateManager::new(5_000_000, 842789);
+
+        // Simulate TX 4 creating and then deleting a contract data entry
+        let cd = create_test_contract_data_entry(4);
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: cd.contract.clone(),
+            key: cd.key.clone(),
+            durability: cd.durability,
+        });
+
+        // TX 4: Create entry
+        manager.create_contract_data(cd.clone());
+        assert!(manager.get_entry(&key).is_some());
+
+        // TX 4: Delete entry
+        manager.delete_contract_data(&cd.contract, &cd.key, cd.durability);
+
+        // TX 5: Should see entry as deleted, not reload from bucket list
+        assert!(manager.get_entry(&key).is_none());
+        assert!(manager.is_entry_deleted(&key));
+
+        // This is the key check: is_entry_deleted prevents footprint loading
+        // from reloading the entry from bucket list
     }
 }

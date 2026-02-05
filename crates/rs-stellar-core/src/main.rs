@@ -2010,7 +2010,58 @@ async fn cmd_verify_execution(
                     if show_diff && !tx_result_matches {
                         println!("    TX count: ours={} CDP={}",
                             result.tx_results.len(), cdp_tx_results.len());
-                        // Could add more detailed diff here
+                        // Detailed TX-by-TX comparison
+                        for (i, (our_tx, cdp_tx)) in result.tx_results.iter().zip(cdp_tx_results.iter()).enumerate() {
+                            use stellar_xdr::curr::TransactionResultResult;
+                            let our_result = &our_tx.result.result;
+                            let cdp_result = &cdp_tx.result.result;
+
+                            // Check if results differ
+                            let our_result_code = match our_result {
+                                TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
+                                TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
+                                TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
+                                TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
+                                _ => format!("{:?}", our_result),
+                            };
+                            let cdp_result_code = match cdp_result {
+                                TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
+                                TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
+                                TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
+                                TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
+                                _ => format!("{:?}", cdp_result),
+                            };
+
+                            // Compare fees
+                            let fee_match = our_tx.result.fee_charged == cdp_tx.result.fee_charged;
+                            let result_match = our_result_code == cdp_result_code;
+
+                            if !fee_match || !result_match {
+                                println!("      TX {}: MISMATCH", i);
+                                println!("        Result: ours={} CDP={}", our_result_code, cdp_result_code);
+                                println!("        Fee: ours={} CDP={}", our_tx.result.fee_charged, cdp_tx.result.fee_charged);
+
+                                // If both failed but with different op results, show details
+                                if let (TransactionResultResult::TxFailed(our_ops), TransactionResultResult::TxFailed(cdp_ops)) = (our_result, cdp_result) {
+                                    for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
+                                        println!("          Op {}: ours={:?}", j, our_op);
+                                        println!("          Op {}: CDP={:?}", j, cdp_op);
+                                    }
+                                }
+                                // Show inner operation results for txSuccess too if they differ
+                                if let (TransactionResultResult::TxSuccess(our_ops), TransactionResultResult::TxSuccess(cdp_ops)) = (our_result, cdp_result) {
+                                    for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
+                                        let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                        let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                        if our_op_xdr != cdp_op_xdr {
+                                            println!("          Op {} differs:", j);
+                                            println!("            Ours: {:?}", our_op);
+                                            println!("            CDP:  {:?}", cdp_op);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if stop_on_error {

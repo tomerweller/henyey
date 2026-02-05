@@ -563,9 +563,11 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         &self,
         key: &LedgerKey,
     ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostErrorP25> {
-        // For ContractData and ContractCode, check TTL first.
-        // If TTL has expired, the entry is considered to be in the hot archive
-        // and not accessible. This mimics C++ stellar-core behavior.
+        // For ContractData and ContractCode, check TTL from bucket list snapshot.
+        // This matches C++ stellar-core behavior for parallel Soroban execution:
+        // - Entries with valid TTL (live_until >= current_ledger): pass to host
+        // - Entries with expired TTL (live_until < current_ledger): archived, not accessible
+        // - Entries without TTL in bucket list snapshot: created within ledger, not visible
         let live_until = get_entry_ttl(self.state, key, self.current_ledger);
 
         let entry = match key {
@@ -587,34 +589,38 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                     ext: LedgerEntryExt::V0,
                 }),
             LedgerKey::ContractData(cd_key) => {
-                // Check if entry has expired TTL - if so, it's archived and not accessible
-                if let Some(ttl) = live_until {
-                    if ttl < self.current_ledger {
-                        return Ok(None);
+                // Check TTL first - same logic as ContractCode
+                match live_until {
+                    Some(ttl) if ttl >= self.current_ledger => {
+                        // TTL exists and is live
+                        self.state
+                            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                            .map(|cd| LedgerEntry {
+                                last_modified_ledger_seq: self.current_ledger,
+                                data: LedgerEntryData::ContractData(cd.clone()),
+                                ext: LedgerEntryExt::V0,
+                            })
                     }
+                    Some(_) => None, // TTL expired - archived
+                    None => None,    // No TTL in snapshot - created within ledger or doesn't exist
                 }
-                self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                    .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractData(cd.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
             }
             LedgerKey::ContractCode(cc_key) => {
-                // Check if entry has expired TTL - if so, it's archived and not accessible
-                if let Some(ttl) = live_until {
-                    if ttl < self.current_ledger {
-                        return Ok(None);
+                // Same logic as ContractData
+                match live_until {
+                    Some(ttl) if ttl >= self.current_ledger => {
+                        // TTL exists and is live
+                        self.state
+                            .get_contract_code(&cc_key.hash)
+                            .map(|code| LedgerEntry {
+                                last_modified_ledger_seq: self.current_ledger,
+                                data: LedgerEntryData::ContractCode(code.clone()),
+                                ext: LedgerEntryExt::V0,
+                            })
                     }
+                    Some(_) => None, // TTL expired - archived
+                    None => None,    // No TTL in snapshot - created within ledger or doesn't exist
                 }
-                self.state
-                    .get_contract_code(&cc_key.hash)
-                    .map(|code| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractCode(code.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
             }
             LedgerKey::Ttl(ttl_key) => {
                 self.state
@@ -878,14 +884,12 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             // Compute key hash for TTL lookup
             let key_hash = compute_key_hash(key);
-            // Use CURRENT TTL for rent fee calculation. This matches C++ stellar-core
-            // behavior where the Soroban host computes rent fees based on the current state.
-            // If an earlier transaction already extended the TTL, we should see the new value
-            // and not pay rent for it again.
-            let ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
-            if let Some(live_until) = ttl {
+            // First try the bucket list snapshot TTL (for entries that existed at ledger start).
+            // This matches C++ behavior where mInMemorySorobanState provides ledger-start TTLs.
+            let snapshot_ttl = state.get_ttl_at_ledger_start(&key_hash);
+            if let Some(live_until) = snapshot_ttl {
                 if live_until < current_ledger {
-                    tracing::warn!(
+                    tracing::debug!(
                         current_ledger,
                         live_until,
                         key_type = if matches!(key, LedgerKey::ContractCode(_)) {
@@ -893,13 +897,30 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
                         } else {
                             "ContractData"
                         },
-                        "Soroban entry TTL is EXPIRED"
+                        "Soroban entry TTL is EXPIRED (from bucket list snapshot)"
                     );
                 }
+                return snapshot_ttl;
             }
-            // Note: TTL entries may be absent for newly created entries that haven't been
-            // checkpointed to the bucket list yet. This is expected and not an error.
-            ttl
+            // Entry not in bucket list snapshot - may have been created by earlier TX in this ledger.
+            // In C++ parallel execution, transactions in the same cluster share mThreadEntryMap,
+            // which contains TTLs created by earlier transactions. We need to fall back to the
+            // current state TTL to provide equivalent within-cluster visibility.
+            // (For different clusters, C++ uses separate mThreadEntryMaps, but we don't implement
+            // cluster isolation, so all TXs share state - this is correct for sequential execution.)
+            let current_ttl = state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq);
+            if current_ttl.is_some() {
+                tracing::debug!(
+                    key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                        "ContractCode"
+                    } else {
+                        "ContractData"
+                    },
+                    live_until = current_ttl,
+                    "Soroban entry has TTL from current state (created within ledger)"
+                );
+            }
+            current_ttl
         }
         _ => None,
     }
