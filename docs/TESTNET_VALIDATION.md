@@ -539,7 +539,7 @@ if current_bl_ledger < self.close_data.ledger_seq - 1 {
 
 This caused `advance_to_ledger()` to apply hundreds of thousands of empty batches (from ledger 1 to N-1), completely corrupting the bucket list structure. The corruption manifested ~60 ledgers later when merge timing caused hash mismatches.
 
-**Fix:** Added `set_ledger_seq()` method to both `BucketList` and `HotArchiveBucketList`, and call it after bucket list initialization in `initialize_from_buckets()` to set the correct ledger sequence.
+**Fix:** Added `set_ledger_seq()` method to both `BucketList` and `HotArchiveBucketList`, and call it after bucket list initialization in `initialize()` to set the correct ledger sequence.
 
 **Files changed:**
 - `crates/stellar-core-bucket/src/bucket_list.rs` - Added `set_ledger_seq()` method

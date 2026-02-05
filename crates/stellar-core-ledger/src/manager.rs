@@ -242,7 +242,7 @@ struct LedgerState {
 
     /// Whether the ledger manager has been initialized.
     ///
-    /// The manager must be initialized (via `initialize_from_buckets` or
+    /// The manager must be initialized (via `initialize` or
     /// by loading from database) before ledger close operations can begin.
     initialized: bool,
 }
@@ -265,8 +265,8 @@ struct LedgerState {
 ///
 /// Before use, the manager must be initialized via one of:
 ///
-/// - [`initialize_from_buckets`](Self::initialize_from_buckets): For catchup from history archives
-/// - [`reset_for_catchup`](Self::reset_for_catchup): To clear state before re-initialization
+/// - [`initialize`](Self::initialize): For catchup from history archives
+/// - [`reset`](Self::reset): To clear state before re-initialization
 ///
 /// # Ledger Close Flow
 ///
@@ -339,7 +339,7 @@ impl LedgerManager {
     /// Create a new ledger manager.
     ///
     /// The ledger starts uninitialized and must be initialized via
-    /// `initialize_from_buckets` before ledger close operations can begin.
+    /// `initialize` before ledger close operations can begin.
     pub fn new(network_passphrase: String, config: LedgerManagerConfig) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
 
@@ -451,7 +451,7 @@ impl LedgerManager {
     /// * `hot_archive_bucket_list` - The hot archive bucket list
     /// * `header` - The ledger header to initialize with
     /// * `header_hash` - The authoritative hash of the header from the history archive
-    pub fn initialize_from_buckets(
+    pub fn initialize(
         &self,
         bucket_list: BucketList,
         hot_archive_bucket_list: HotArchiveBucketList,
@@ -550,10 +550,10 @@ impl LedgerManager {
     /// Reset the ledger manager state for re-initialization.
     ///
     /// This clears all caches, bucket lists, and state to allow a fresh
-    /// `initialize_from_buckets` call. Used when catchup needs to reset
+    /// `initialize` call. Used when catchup needs to reset
     /// state while the ledger manager was already initialized (e.g., after
     /// falling behind in live mode).
-    pub fn reset_for_catchup(&self) {
+    pub fn reset(&self) {
         debug!("Resetting ledger manager for catchup");
 
         // Clear bucket lists

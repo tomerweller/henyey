@@ -79,7 +79,7 @@ use stellar_core_ledger::{LedgerManager, LedgerManagerConfig, LedgerCloseData, T
 
 // Create and initialize the ledger manager
 let manager = LedgerManager::new(network_passphrase, LedgerManagerConfig::default());
-manager.initialize_from_buckets(bucket_list, hot_archive_bucket_list, header, header_hash)?;
+manager.initialize(bucket_list, hot_archive_bucket_list, header, header_hash)?;
 
 // Close a ledger with externalized data
 let close_data = LedgerCloseData::new(

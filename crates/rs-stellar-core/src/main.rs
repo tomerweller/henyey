@@ -1859,7 +1859,7 @@ async fn cmd_verify_execution(
     let init_header_entry = init_header_entry
         .ok_or_else(|| anyhow::anyhow!("No header found for checkpoint {}", init_checkpoint))?;
     let init_header_hash = Hash256::from(init_header_entry.hash.0);
-    ledger_manager.initialize_from_buckets(
+    ledger_manager.initialize(
         bucket_list,
         hot_archive_bucket_list,
         init_header_entry.header.clone(),

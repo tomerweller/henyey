@@ -53,7 +53,7 @@ fn test_ledger_close_with_empty_tx_set() {
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");
     ledger
-        .initialize_from_buckets(bucket_list, hot_archive, header, header_hash)
+        .initialize(bucket_list, hot_archive, header, header_hash)
         .expect("init");
 
     let close_data = LedgerCloseData::new(

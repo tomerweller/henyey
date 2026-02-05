@@ -1952,10 +1952,10 @@ impl App {
         // This validates that the bucket list hash matches the ledger header.
         // Pass the pre-computed header hash from the history archive - this is authoritative.
         if self.ledger_manager.is_initialized() {
-            self.ledger_manager.reset_for_catchup();
+            self.ledger_manager.reset();
         }
         self.ledger_manager
-            .initialize_from_buckets(
+            .initialize(
                 output.bucket_list,
                 output.hot_archive_bucket_list,
                 output.header,
