@@ -38,6 +38,8 @@
 - No fuzz testing is required for this project.
 - No baseline transaction meta testing is required.
 - Perform testing on testnet, not mainnet.
+- **Bug investigation workflow**: When investigating a bug, always start by writing a narrow unit test that reproduces the bug and fails. Then fix the code until the test passes. Do not skip the failing-test-first step.
+- **Unit test coverage**: When writing new code, ensure it is thoroughly covered by unit tests. Every public function and significant code path should have corresponding tests.
 
 ## Commit & Pull Request Guidelines
 
