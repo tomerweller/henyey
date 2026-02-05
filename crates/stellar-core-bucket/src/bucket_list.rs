@@ -1749,12 +1749,20 @@ impl BucketList {
     ///
     /// This matches C++ stellar-core's logic in restartMerges() for handling
     /// FutureBuckets with hasHashes() && !isLive().
+    ///
+    /// # Arguments
+    ///
+    /// * `restart_structure_based` - If true, fall back to structure-based merge restart
+    ///   for levels with no stored HAS hashes (state 0). This should be true for full
+    ///   startup mode but false for offline verification mode. C++ stellar-core only
+    ///   calls restartMerges in full startup mode, not for standalone offline commands.
     pub fn restart_merges_from_has<F>(
         &mut self,
         ledger: u32,
         protocol_version: u32,
         next_states: &[HasNextState],
         mut load_bucket: F,
+        restart_structure_based: bool,
     ) -> Result<()>
     where
         F: FnMut(&Hash256) -> Result<Bucket>,
@@ -1856,7 +1864,16 @@ impl BucketList {
         //
         // This matches C++ stellar-core behavior: when next.isClear() for a level,
         // restartMerges() uses the previous level's snap to start a merge if needed.
-        self.restart_merges(ledger, protocol_version)
+        //
+        // Note: C++ only does structure-based restarts in full startup mode, not for
+        // standalone offline commands. The caller controls this via restart_structure_based.
+        if restart_structure_based {
+            self.restart_merges(ledger, protocol_version)
+        } else {
+            // Update ledger sequence even when not restarting merges
+            self.ledger_seq = ledger;
+            Ok(())
+        }
     }
 
     /// Restart any pending merges after restoring from a History Archive State (HAS).

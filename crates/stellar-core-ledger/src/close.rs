@@ -453,12 +453,10 @@ fn sorted_for_apply_parallel(
         for cluster in stage.iter_mut() {
             cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
         }
-        stage.sort_by(|a, b| {
-            if a.is_empty() || b.is_empty() {
-                return a.len().cmp(&b.len());
-            }
-            apply_sort_cmp(&a[0], &b[0], &set_hash)
-        });
+        // C++ does NOT sort clusters within a stage. Clusters are independent,
+        // so their execution order doesn't matter, and the original XDR order
+        // is preserved. Sorting clusters would change the transaction result
+        // ordering and produce a different result hash.
     }
 
     stage_vec.sort_by(|a, b| {
@@ -1051,12 +1049,7 @@ mod tests {
             for cluster in stage.iter_mut() {
                 cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
             }
-            stage.sort_by(|a, b| {
-                if a.is_empty() || b.is_empty() {
-                    return a.len().cmp(&b.len());
-                }
-                apply_sort_cmp(&a[0], &b[0], &set_hash)
-            });
+            // C++ does NOT sort clusters within a stage - preserve XDR order.
         }
         stage_vec.sort_by(|a, b| {
             if a.is_empty() || b.is_empty() {
@@ -1204,10 +1197,13 @@ mod tests {
 
         let set_hash = Hash256::hash_xdr(&gen_set).unwrap_or(Hash256::ZERO);
         let classic_expected = expected_apply_order(vec![classic_a, classic_b], set_hash, false);
+        // Must match XDR cluster order: stage_one = [cluster_b(soroban_c),
+        // cluster_a(soroban_b, soroban_a)], stage_two = [cluster_c(soroban_d)],
+        // execution_stages = [stage_two, stage_one].
         let soroban_expected = expected_parallel_order(
             vec![
-                vec![vec![soroban_a, soroban_b], vec![soroban_c]],
                 vec![vec![soroban_d]],
+                vec![vec![soroban_c], vec![soroban_a, soroban_b]],
             ],
             set_hash,
         );
@@ -1224,5 +1220,88 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    /// Regression test: clusters within a parallel stage must preserve their
+    /// original XDR order. C++ does NOT sort clusters within a stage because
+    /// clusters are independent and their execution order doesn't affect
+    /// correctness. Sorting clusters would change the transaction result
+    /// ordering and produce a different result hash than C++.
+    #[test]
+    fn parallel_clusters_preserve_xdr_order_within_stage() {
+        // Find seeds where sorting clusters would produce a different order
+        // than the original XDR order. We need cluster_first's first tx to
+        // sort AFTER cluster_second's first tx, so that if clusters were
+        // sorted, the order would reverse.
+        let mut found = None;
+        'search: for seed_a in 1u8..=50 {
+            for seed_b in 51u8..=100 {
+                let tx_a = make_tx(seed_a, 1);
+                let tx_b = make_tx(seed_b, 1);
+
+                let cluster_first =
+                    DependentTxCluster(vec![tx_a.clone()].try_into().unwrap());
+                let cluster_second =
+                    DependentTxCluster(vec![tx_b.clone()].try_into().unwrap());
+
+                let stage = ParallelTxExecutionStage(
+                    vec![cluster_first, cluster_second].try_into().unwrap(),
+                );
+                let parallel = ParallelTxsComponent {
+                    base_fee: None,
+                    execution_stages: vec![stage].try_into().unwrap(),
+                };
+                let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+                    previous_ledger_hash: Hash::from(Hash256::ZERO),
+                    phases: vec![
+                        TransactionPhase::V0(vec![].try_into().unwrap()),
+                        TransactionPhase::V1(parallel),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                });
+                let set_hash = Hash256::hash_xdr(&gen_set).unwrap_or(Hash256::ZERO);
+
+                // Check if sorting would reverse the cluster order
+                let cmp = apply_sort_cmp(&tx_a, &tx_b, &set_hash);
+                if cmp == std::cmp::Ordering::Greater {
+                    // tx_a sorts after tx_b, so if clusters were sorted,
+                    // cluster_second would come first (reversing XDR order)
+                    found = Some((gen_set, set_hash, tx_a, tx_b));
+                    break 'search;
+                }
+            }
+        }
+
+        let (gen_set, set_hash, tx_a, tx_b) =
+            found.expect("should find seeds where cluster sorting differs from XDR order");
+
+        let variant = TransactionSetVariant::Generalized(gen_set);
+        let actual: Vec<Hash256> = variant
+            .transactions_with_base_fee()
+            .into_iter()
+            .map(|(tx, _)| tx_hash(&tx))
+            .collect();
+
+        // Clusters must preserve XDR order: tx_a first, tx_b second
+        assert_eq!(actual.len(), 2);
+        assert_eq!(
+            actual[0],
+            tx_hash(&tx_a),
+            "First cluster's tx should appear first (XDR order preserved)"
+        );
+        assert_eq!(
+            actual[1],
+            tx_hash(&tx_b),
+            "Second cluster's tx should appear second (XDR order preserved)"
+        );
+
+        // Verify that sorting WOULD have reversed the order (test is meaningful)
+        let wrong_order = apply_sort_cmp(&tx_a, &tx_b, &set_hash);
+        assert_eq!(
+            wrong_order,
+            std::cmp::Ordering::Greater,
+            "Test requires that sorting would reverse cluster order"
+        );
     }
 }

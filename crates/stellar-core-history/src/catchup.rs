@@ -369,6 +369,7 @@ impl CatchupManager {
                 protocol_version,
                 &live_next_states,
                 load_bucket_for_merge,
+                true, // restart_structure_based = true for full catchup mode
             )
             .map_err(|e| {
                 HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
@@ -404,6 +405,7 @@ impl CatchupManager {
                     protocol_version,
                     &hot_next_states,
                     load_hot_bucket_for_merge,
+                    true, // restart_structure_based = true for full catchup mode
                 )
                 .map_err(|e| {
                     HistoryError::CatchupFailed(format!(
@@ -631,6 +633,7 @@ impl CatchupManager {
                         protocol_version,
                         &live_next_states,
                         load_bucket_for_merge,
+                        true, // restart_structure_based = true for full catchup mode
                     )
                     .map_err(|e| {
                         HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
@@ -666,6 +669,7 @@ impl CatchupManager {
                             protocol_version,
                             &hot_next_states,
                             load_hot_bucket_for_merge,
+                            true, // restart_structure_based = true for full catchup mode
                         )
                         .map_err(|e| {
                             HistoryError::CatchupFailed(format!(
@@ -898,6 +902,7 @@ impl CatchupManager {
                 protocol_version,
                 &live_next_states,
                 load_bucket_for_merge,
+                true, // restart_structure_based = true for full catchup mode
             )
             .map_err(|e| {
                 HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
@@ -933,6 +938,7 @@ impl CatchupManager {
                     protocol_version,
                     &hot_next_states,
                     load_hot_bucket_for_merge,
+                    true, // restart_structure_based = true for full catchup mode
                 )
                 .map_err(|e| {
                     HistoryError::CatchupFailed(format!(

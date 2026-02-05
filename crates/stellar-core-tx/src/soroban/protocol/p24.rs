@@ -143,13 +143,16 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 }
 
 /// Get the TTL for a ledger entry.
+///
+/// Uses `get_ttl_at_ledger_start()` to return the TTL value from the bucket
+/// list snapshot at ledger start. This matches C++ stellar-core behavior for
+/// parallel Soroban execution (V1 phases): transactions in different clusters
+/// should NOT see each other's TTL changes.
 fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             let key_hash = compute_key_hash(key);
-            let ttl = state
-                .get_ttl(&key_hash)
-                .map(|ttl| ttl.live_until_ledger_seq);
+            let ttl = state.get_ttl_at_ledger_start(&key_hash);
             if let Some(live_until) = ttl {
                 if live_until < current_ledger {
                     tracing::warn!(

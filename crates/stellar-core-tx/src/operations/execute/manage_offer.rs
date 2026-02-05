@@ -178,13 +178,17 @@ fn execute_manage_offer(
     };
     let reserve_subentry = old_offer.is_none() && sponsor.is_none();
 
-    // For native selling asset, check account has sufficient balance
-    if matches!(selling, Asset::Native) {
+    // For native selling asset with existing offers, check account has sufficient balance.
+    // For new offers, skip this check: C++ checks LowReserve (via
+    // createEntryWithPossibleSponsorship) BEFORE Underfunded (via
+    // computeOfferExchangeParameters). The later has_selling_capacity check
+    // handles the Underfunded case for new offers after the LowReserve check.
+    if old_offer.is_some() && matches!(selling, Asset::Native) {
         let account = state.get_account(source).unwrap();
         let min_balance = state.minimum_balance_for_account(
             account,
             context.protocol_version,
-            if reserve_subentry { 1 } else { 0 },
+            0,
         )?;
         if account.balance < min_balance {
             return Ok(make_sell_offer_result(
@@ -2112,6 +2116,64 @@ mod tests {
             let buy_offer = manage_buy_offer_amount(buy_price, buy_amount);
             let sell_offer = manage_sell_offer_amount(sell_price, sell_amount, 2);
             assert_eq!(buy_offer, sell_offer);
+        }
+    }
+
+    /// Regression test: new offer selling native with insufficient balance must
+    /// return LowReserve, not Underfunded. C++ checks LowReserve first (via
+    /// createEntryWithPossibleSponsorship in doApply) before Underfunded (via
+    /// computeOfferExchangeParameters). The early Underfunded check only applies
+    /// to existing offers.
+    #[test]
+    fn test_manage_sell_offer_new_native_low_reserve_before_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(200);
+        let issuer_id = create_test_account_id(201);
+
+        // Account has exactly min_balance: can't afford the subentry reserve
+        // for a new offer AND also has insufficient native balance to sell.
+        // C++ returns LowReserve (not Underfunded) because the reserve check
+        // happens first.
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
+        state.create_account(create_test_account(source_id.clone(), min_balance));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        // Create buying trustline (we're selling native, buying USD)
+        let asset = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: asset,
+            amount: 10_000, // selling native
+            price: Price { n: 1, d: 1 },
+            offer_id: 0, // new offer
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::LowReserve),
+                    "New offer selling native should return LowReserve (not Underfunded) \
+                     when account can't afford reserve for new subentry. Got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result type: {:?}", other),
         }
     }
 

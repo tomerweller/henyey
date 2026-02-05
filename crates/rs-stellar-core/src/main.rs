@@ -1831,11 +1831,21 @@ async fn cmd_verify_execution(
         .map(|h| h.header.ledger_version)
         .unwrap_or(25);
 
+    // Enable structure-based merge restarts to match C++ online mode behavior.
+    //
+    // Although C++ standalone offline commands skip restartMerges, we are comparing
+    // our results against CDP headers produced by C++ in ONLINE mode. The C++ node
+    // that produced those headers had full structure-based merge restarts enabled.
+    //
+    // In C++ online mode, restartMerges uses mLevels[i-1].getSnap() (the old snap
+    // from HAS) to start merges. Without structure-based restarts, add_batch would
+    // use snap() which returns the snapped curr (different input!).
     bucket_list.restart_merges_from_has(
         init_checkpoint,
         init_protocol_version,
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
+        true, // restart_structure_based = true to match C++ online mode
     )?;
 
     if let Some(ref ha_next_states) = hot_archive_next_states {
@@ -1844,6 +1854,7 @@ async fn cmd_verify_execution(
             init_protocol_version,
             ha_next_states,
             |hash| bucket_manager.load_hot_archive_bucket(hash),
+            true, // restart_structure_based = true to match C++ online mode
         )?;
     }
 
@@ -1995,6 +2006,23 @@ async fn cmd_verify_execution(
                     if !header_matches {
                         println!("    Header hash: ours={} expected={}",
                             result.header_hash.to_hex(), expected_header_hash.to_hex());
+                        // Show bucket list hash comparison when header diverges
+                        let our_bl_hash = Hash256::from(result.header.bucket_list_hash.0);
+                        let expected_bl_hash = Hash256::from(cdp_header.bucket_list_hash.0);
+                        if our_bl_hash != expected_bl_hash {
+                            println!("    Bucket list hash: ours={} expected={}",
+                                our_bl_hash.to_hex(), expected_bl_hash.to_hex());
+                        }
+                        // Show all other header fields that differ
+                        if result.tx_result_hash() == expected_tx_result_hash {
+                            // TX results match - the divergence is in bucket list or other header fields
+                            if result.header.total_coins != cdp_header.total_coins {
+                                println!("    total_coins: ours={} expected={}", result.header.total_coins, cdp_header.total_coins);
+                            }
+                            if result.header.fee_pool != cdp_header.fee_pool {
+                                println!("    fee_pool: ours={} expected={}", result.header.fee_pool, cdp_header.fee_pool);
+                            }
+                        }
                     }
                     if !tx_result_matches {
                         println!("    TX result hash: ours={} expected={}",
@@ -2004,42 +2032,48 @@ async fn cmd_verify_execution(
                     if show_diff && !tx_result_matches {
                         println!("    TX count: ours={} CDP={}",
                             result.tx_results.len(), cdp_tx_results.len());
-                        // Detailed TX-by-TX comparison
+                        // Detailed TX-by-TX comparison using full XDR
+                        let mut diff_count = 0;
                         for (i, (our_tx, cdp_tx)) in result.tx_results.iter().zip(cdp_tx_results.iter()).enumerate() {
-                            use stellar_xdr::curr::TransactionResultResult;
-                            let our_result = &our_tx.result.result;
-                            let cdp_result = &cdp_tx.result.result;
+                            let our_xdr = our_tx.result.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                            let cdp_xdr = cdp_tx.result.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
 
-                            // Check if results differ
-                            let our_result_code = match our_result {
-                                TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
-                                TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
-                                TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
-                                TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
-                                _ => format!("{:?}", our_result),
-                            };
-                            let cdp_result_code = match cdp_result {
-                                TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
-                                TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
-                                TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
-                                TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
-                                _ => format!("{:?}", cdp_result),
-                            };
+                            if our_xdr != cdp_xdr {
+                                diff_count += 1;
+                                use stellar_xdr::curr::TransactionResultResult;
+                                let our_result = &our_tx.result.result;
+                                let cdp_result = &cdp_tx.result.result;
 
-                            // Compare fees
-                            let fee_match = our_tx.result.fee_charged == cdp_tx.result.fee_charged;
-                            let result_match = our_result_code == cdp_result_code;
+                                let our_result_code = match our_result {
+                                    TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
+                                    TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
+                                    TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
+                                    TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
+                                    _ => format!("{:?}", our_result),
+                                };
+                                let cdp_result_code = match cdp_result {
+                                    TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
+                                    TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
+                                    TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
+                                    TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
+                                    _ => format!("{:?}", cdp_result),
+                                };
 
-                            if !fee_match || !result_match {
-                                println!("      TX {}: MISMATCH", i);
+                                println!("      TX {}: MISMATCH (XDR differs)", i);
                                 println!("        Result: ours={} CDP={}", our_result_code, cdp_result_code);
                                 println!("        Fee: ours={} CDP={}", our_tx.result.fee_charged, cdp_tx.result.fee_charged);
+                                println!("        TX hash: {}", hex::encode(&our_tx.transaction_hash.0));
 
                                 // If both failed but with different op results, show details
                                 if let (TransactionResultResult::TxFailed(our_ops), TransactionResultResult::TxFailed(cdp_ops)) = (our_result, cdp_result) {
                                     for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
-                                        println!("          Op {}: ours={:?}", j, our_op);
-                                        println!("          Op {}: CDP={:?}", j, cdp_op);
+                                        let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                        let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                        if our_op_xdr != cdp_op_xdr {
+                                            println!("          Op {} differs:", j);
+                                            println!("            Ours: {:?}", our_op);
+                                            println!("            CDP:  {:?}", cdp_op);
+                                        }
                                     }
                                 }
                                 // Show inner operation results for txSuccess too if they differ
@@ -2054,8 +2088,78 @@ async fn cmd_verify_execution(
                                         }
                                     }
                                 }
+
+                                // Limit output to first 10 diffs
+                                if diff_count >= 10 {
+                                    println!("      ... (showing first 10 of potentially more diffs)");
+                                    break;
+                                }
                             }
                         }
+                        if diff_count > 0 {
+                            println!("    Total TX diffs: {} out of {}", diff_count, result.tx_results.len().min(cdp_tx_results.len()));
+                        }
+                    }
+
+                    // Compare eviction data when header mismatches but TX results match
+                    if !header_matches && tx_result_matches {
+                        // Extract eviction data from CDP meta
+                        let cdp_evicted_keys = stellar_core_history::cdp::extract_evicted_keys(&lcm);
+                        let tx_metas = stellar_core_history::cdp::extract_transaction_metas(&lcm);
+                        let cdp_restored_keys = stellar_core_history::cdp::extract_restored_keys(&tx_metas);
+
+                        // Count CDP entry changes
+                        let mut cdp_creates = 0u32;
+                        let mut cdp_updates = 0u32;
+                        let mut cdp_deletes = 0u32;
+                        for tx_meta in &tx_metas {
+                            fn count_changes(changes: &[stellar_xdr::curr::LedgerEntryChange], creates: &mut u32, updates: &mut u32, deletes: &mut u32) {
+                                for change in changes {
+                                    match change {
+                                        stellar_xdr::curr::LedgerEntryChange::Created(_) => *creates += 1,
+                                        stellar_xdr::curr::LedgerEntryChange::Updated(_) => *updates += 1,
+                                        stellar_xdr::curr::LedgerEntryChange::Removed(_) => *deletes += 1,
+                                        stellar_xdr::curr::LedgerEntryChange::Restored(_) => *updates += 1,
+                                        stellar_xdr::curr::LedgerEntryChange::State(_) => {},
+                                    }
+                                }
+                            }
+                            match tx_meta {
+                                stellar_xdr::curr::TransactionMeta::V3(v3) => {
+                                    count_changes(&v3.tx_changes_before, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    for op in v3.operations.iter() {
+                                        count_changes(&op.changes, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    }
+                                    count_changes(&v3.tx_changes_after, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                }
+                                stellar_xdr::curr::TransactionMeta::V4(v4) => {
+                                    count_changes(&v4.tx_changes_before, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    for op in v4.operations.iter() {
+                                        count_changes(&op.changes, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    }
+                                    count_changes(&v4.tx_changes_after, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Extract upgrade meta entry counts
+                        let cdp_upgrade_metas = stellar_core_history::cdp::extract_upgrade_metas(&lcm);
+                        let mut upgrade_creates = 0u32;
+                        let mut upgrade_updates = 0u32;
+                        for um in &cdp_upgrade_metas {
+                            for change in um.changes.iter() {
+                                match change {
+                                    stellar_xdr::curr::LedgerEntryChange::Created(_) => upgrade_creates += 1,
+                                    stellar_xdr::curr::LedgerEntryChange::Updated(_) => upgrade_updates += 1,
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        println!("    CDP meta: creates={}, updates={}, deletes={}, evicted={}, restored={}, upgrade_creates={}, upgrade_updates={}",
+                            cdp_creates, cdp_updates, cdp_deletes, cdp_evicted_keys.len(), cdp_restored_keys.len(),
+                            upgrade_creates, upgrade_updates);
                     }
 
                     if stop_on_error {
