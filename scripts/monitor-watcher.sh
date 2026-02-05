@@ -6,10 +6,10 @@ set -euo pipefail
 
 # Configuration
 INTERVAL_MINUTES=${1:-30}  # Default: check every 30 minutes
-LOG_DIR="/home/tomer/rs-stellar-core/logs"
+LOG_DIR="$HOME/data/watcher-monitor"
 MONITOR_LOG="$LOG_DIR/monitor.log"
-PROJECT_DIR="/home/tomer/rs-stellar-core"
-WATCHER_LOG="/tmp/rs-stellar-core.log"
+PROJECT_DIR="/home/tomer/rs-stellar-core-2"
+WATCHER_LOG="$HOME/data/watcher/testnet-watcher.log"
 PROMPT_FILE="$PROJECT_DIR/scripts/watcher-check-prompt.md"
 MODEL="github-copilot/claude-opus-4.5"
 
