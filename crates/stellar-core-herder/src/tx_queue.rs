@@ -152,6 +152,16 @@ pub struct TxQueueConfig {
     /// from their mempool. This is configured via
     /// `EXCLUDE_TRANSACTIONS_CONTAINING_OPERATION_TYPE` in C++.
     pub filtered_operation_types: HashSet<OperationType>,
+    /// Maximum ledger-wide Soroban instructions (from ContractComputeV0).
+    /// Used for parallel phase building. Default 0 disables parallel building.
+    pub ledger_max_instructions: i64,
+    /// Maximum dependent TX clusters per stage (from ContractParallelComputeV0).
+    /// Used for parallel phase building. Default 0 disables parallel building.
+    pub ledger_max_dependent_tx_clusters: u32,
+    /// Minimum number of stages to try when building the parallel Soroban phase.
+    pub soroban_phase_min_stage_count: u32,
+    /// Maximum number of stages to try when building the parallel Soroban phase.
+    pub soroban_phase_max_stage_count: u32,
 }
 
 impl Default for TxQueueConfig {
@@ -173,6 +183,10 @@ impl Default for TxQueueConfig {
             max_queue_ops: None,
             max_queue_classic_bytes: None,
             filtered_operation_types: HashSet::new(),
+            ledger_max_instructions: 0,
+            ledger_max_dependent_tx_clusters: 0,
+            soroban_phase_min_stage_count: 1,
+            soroban_phase_max_stage_count: 4,
         }
     }
 }
@@ -1657,11 +1671,26 @@ impl TransactionQueue {
             Some(base_fee)
         };
 
+        let use_parallel_builder = !soroban_txs.is_empty()
+            && self.config.ledger_max_instructions > 0
+            && self.config.ledger_max_dependent_tx_clusters > 0
+            && self.config.soroban_phase_max_stage_count > 0;
+
         let soroban_phase = if soroban_txs.is_empty() {
             TransactionPhase::V1(ParallelTxsComponent {
                 base_fee: soroban_base_fee,
                 execution_stages: VecM::default(),
             })
+        } else if use_parallel_builder {
+            let stages = crate::parallel_tx_set_builder::build_parallel_soroban_phase(
+                &soroban_txs,
+                self.config.network_id,
+                self.config.ledger_max_instructions,
+                self.config.ledger_max_dependent_tx_clusters,
+                self.config.soroban_phase_min_stage_count,
+                self.config.soroban_phase_max_stage_count,
+            );
+            crate::parallel_tx_set_builder::stages_to_xdr_phase(stages, soroban_base_fee)
         } else {
             let cluster = DependentTxCluster(soroban_txs.try_into().unwrap_or_default());
             let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());

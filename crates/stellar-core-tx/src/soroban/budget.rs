@@ -38,6 +38,44 @@ pub struct SorobanConfig {
     pub max_contract_data_entry_size_bytes: u32,
 }
 
+impl Clone for SorobanConfig {
+    fn clone(&self) -> Self {
+        Self {
+            cpu_cost_params: self.cpu_cost_params.clone(),
+            mem_cost_params: self.mem_cost_params.clone(),
+            tx_max_instructions: self.tx_max_instructions,
+            tx_max_memory_bytes: self.tx_max_memory_bytes,
+            min_temp_entry_ttl: self.min_temp_entry_ttl,
+            min_persistent_entry_ttl: self.min_persistent_entry_ttl,
+            max_entry_ttl: self.max_entry_ttl,
+            fee_config: FeeConfiguration {
+                fee_per_instruction_increment: self.fee_config.fee_per_instruction_increment,
+                fee_per_disk_read_entry: self.fee_config.fee_per_disk_read_entry,
+                fee_per_write_entry: self.fee_config.fee_per_write_entry,
+                fee_per_disk_read_1kb: self.fee_config.fee_per_disk_read_1kb,
+                fee_per_write_1kb: self.fee_config.fee_per_write_1kb,
+                fee_per_historical_1kb: self.fee_config.fee_per_historical_1kb,
+                fee_per_contract_event_1kb: self.fee_config.fee_per_contract_event_1kb,
+                fee_per_transaction_size_1kb: self.fee_config.fee_per_transaction_size_1kb,
+            },
+            rent_fee_config: RentFeeConfiguration {
+                fee_per_write_1kb: self.rent_fee_config.fee_per_write_1kb,
+                fee_per_rent_1kb: self.rent_fee_config.fee_per_rent_1kb,
+                fee_per_write_entry: self.rent_fee_config.fee_per_write_entry,
+                persistent_rent_rate_denominator: self
+                    .rent_fee_config
+                    .persistent_rent_rate_denominator,
+                temporary_rent_rate_denominator: self
+                    .rent_fee_config
+                    .temporary_rent_rate_denominator,
+            },
+            tx_max_contract_events_size_bytes: self.tx_max_contract_events_size_bytes,
+            max_contract_size_bytes: self.max_contract_size_bytes,
+            max_contract_data_entry_size_bytes: self.max_contract_data_entry_size_bytes,
+        }
+    }
+}
+
 impl Default for SorobanConfig {
     fn default() -> Self {
         // Default values matching protocol 21 testnet/mainnet

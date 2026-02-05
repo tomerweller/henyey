@@ -5625,6 +5625,294 @@ pub fn execute_transaction_set_with_fee_mode(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Parallel Soroban Phase Execution
+// ---------------------------------------------------------------------------
+
+/// Result of executing one cluster of Soroban transactions.
+struct ClusterResult {
+    results: Vec<TransactionExecutionResult>,
+    tx_results: Vec<TransactionResultPair>,
+    tx_result_metas: Vec<TransactionResultMetaV1>,
+    id_pool: u64,
+    hot_archive_restored_keys: Vec<LedgerKey>,
+}
+
+/// Execute a full Soroban parallel phase (all stages sequentially,
+/// clusters within each stage in parallel).
+///
+/// The classic phase must be executed separately before calling this function.
+///
+/// # Returns
+///
+/// Same tuple as `execute_transaction_set`: (results, tx_result_pairs,
+/// tx_result_metas, id_pool, hot_archive_restored_keys).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn execute_soroban_parallel_phase(
+    snapshot: &SnapshotHandle,
+    phase: &crate::close::SorobanPhaseStructure,
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    delta: &mut LedgerDelta,
+    soroban_config: SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+) -> Result<(
+    Vec<TransactionExecutionResult>,
+    Vec<TransactionResultPair>,
+    Vec<TransactionResultMetaV1>,
+    u64,
+    Vec<LedgerKey>,
+)> {
+    let mut all_results: Vec<TransactionExecutionResult> = Vec::new();
+    let mut all_tx_results: Vec<TransactionResultPair> = Vec::new();
+    let mut all_tx_result_metas: Vec<TransactionResultMetaV1> = Vec::new();
+    let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
+    let mut id_pool = snapshot.header().id_pool;
+    // Global TX offset tracks the canonical position for PRNG seed computation.
+    let mut global_tx_offset: usize = 0;
+
+    for (stage_idx, stage) in phase.stages.iter().enumerate() {
+        if stage.is_empty() {
+            continue;
+        }
+
+        // Execute each cluster with its own executor, then merge results.
+        // Clusters within a stage are independent (no footprint conflicts)
+        // so they can be executed with isolated state.
+        let cluster_results = execute_stage_clusters(
+            snapshot,
+            stage,
+            global_tx_offset,
+            ledger_seq,
+            close_time,
+            base_fee,
+            base_reserve,
+            protocol_version,
+            network_id,
+            &soroban_config,
+            soroban_base_prng_seed,
+            classic_events,
+            module_cache,
+            hot_archive.clone(),
+            id_pool,
+            delta,
+        )?;
+
+        // Merge cluster results. Use max id_pool across clusters.
+        for cr in &cluster_results {
+            if cr.id_pool > id_pool {
+                id_pool = cr.id_pool;
+            }
+            all_results.extend(cr.results.iter().cloned());
+            all_tx_results.extend(cr.tx_results.iter().cloned());
+            all_tx_result_metas.extend(cr.tx_result_metas.iter().cloned());
+            all_hot_archive_restored_keys
+                .extend(cr.hot_archive_restored_keys.iter().cloned());
+        }
+
+        // Advance global TX offset for next stage.
+        let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
+        global_tx_offset += stage_tx_count;
+
+        tracing::debug!(
+            ledger_seq = ledger_seq,
+            stage_idx = stage_idx,
+            clusters = stage.len(),
+            stage_tx_count = stage_tx_count,
+            "Completed parallel stage"
+        );
+    }
+
+    // Apply fee refunds after ALL transactions (matching C++ processPostTxSetApply).
+    // We need a temporary executor to handle refunds through its state manager,
+    // since refunds modify account balances in the delta.
+    let mut refund_executor = TransactionExecutor::new(
+        ledger_seq,
+        close_time,
+        base_reserve,
+        protocol_version,
+        network_id,
+        id_pool,
+        soroban_config,
+        classic_events,
+    );
+
+    let flat_txs: Vec<&TransactionEnvelope> = phase
+        .stages
+        .iter()
+        .flat_map(|s| s.iter())
+        .flat_map(|c| c.iter())
+        .map(|(tx, _)| tx)
+        .collect();
+
+    let mut total_refunds = 0i64;
+    for (idx, result) in all_results.iter().enumerate() {
+        let refund = result.fee_refund;
+        if refund > 0 && idx < flat_txs.len() {
+            let frame = TransactionFrame::with_network(flat_txs[idx].clone(), network_id);
+            let fee_source_id =
+                stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
+
+            refund_executor.state.apply_refund_to_delta(&fee_source_id, refund);
+            refund_executor.state.delta_mut().add_fee(-refund);
+            total_refunds += refund;
+        }
+    }
+    if total_refunds > 0 {
+        tracing::info!(
+            ledger_seq = ledger_seq,
+            total_refunds = total_refunds,
+            "P23+ parallel Soroban fee refunds applied"
+        );
+    }
+
+    Ok((
+        all_results,
+        all_tx_results,
+        all_tx_result_metas,
+        id_pool,
+        all_hot_archive_restored_keys,
+    ))
+}
+
+/// Execute all clusters within a stage.
+///
+/// Each cluster gets its own `TransactionExecutor` with isolated state.
+/// The executor's state changes are applied to the main delta via `apply_to_delta`.
+/// Soroban TXs don't use the orderbook so `load_orderbook_offers` is skipped.
+#[allow(clippy::too_many_arguments)]
+fn execute_stage_clusters(
+    snapshot: &SnapshotHandle,
+    clusters: &[Vec<(TransactionEnvelope, Option<u32>)>],
+    global_tx_offset: usize,
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    soroban_config: &SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    id_pool: u64,
+    delta: &mut LedgerDelta,
+) -> Result<Vec<ClusterResult>> {
+    // Compute per-cluster global offsets.
+    let mut offsets = Vec::with_capacity(clusters.len());
+    let mut offset = global_tx_offset;
+    for cluster in clusters {
+        offsets.push(offset);
+        offset += cluster.len();
+    }
+
+    let mut cluster_results = Vec::with_capacity(clusters.len());
+    for (cluster_idx, cluster) in clusters.iter().enumerate() {
+        let mut executor = TransactionExecutor::new(
+            ledger_seq,
+            close_time,
+            base_reserve,
+            protocol_version,
+            network_id,
+            id_pool,
+            soroban_config.clone(),
+            classic_events,
+        );
+        if let Some(cache) = module_cache {
+            executor.set_module_cache(cache.clone());
+        }
+        if let Some(ref ha) = hot_archive {
+            executor.set_hot_archive(ha.clone());
+        }
+
+        let mut results = Vec::with_capacity(cluster.len());
+        let mut tx_results = Vec::with_capacity(cluster.len());
+        let mut tx_result_metas = Vec::with_capacity(cluster.len());
+
+        for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
+            executor.state.snapshot_delta();
+
+            let tx_fee = tx_base_fee.unwrap_or(base_fee);
+            let global_idx = offsets[cluster_idx] + local_idx;
+            let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_idx as u32);
+            let result = executor.execute_transaction_with_fee_mode(
+                snapshot,
+                tx,
+                tx_fee,
+                Some(tx_prng_seed),
+                true,
+            )?;
+            let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+            let tx_result = build_tx_result_pair(
+                &frame,
+                &executor.network_id,
+                &result,
+                tx_fee as i64,
+                protocol_version,
+            )?;
+            let tx_meta = result
+                .tx_meta
+                .clone()
+                .unwrap_or_else(empty_transaction_meta);
+            let fee_changes = result
+                .fee_changes
+                .clone()
+                .unwrap_or_else(empty_entry_changes);
+            let post_fee_changes = result
+                .post_fee_changes
+                .clone()
+                .unwrap_or_else(empty_entry_changes);
+            let tx_result_meta = TransactionResultMetaV1 {
+                ext: ExtensionPoint::V0,
+                result: tx_result.clone(),
+                fee_processing: fee_changes,
+                tx_apply_processing: tx_meta,
+                post_tx_apply_fee_processing: post_fee_changes,
+            };
+
+            results.push(result);
+            tx_results.push(tx_result);
+            tx_result_metas.push(tx_result_meta);
+        }
+
+        // Flush deferred RO TTL bumps within this cluster.
+        executor.state_mut().flush_deferred_ro_ttl_bumps();
+
+        // Collect hot archive restored keys.
+        let mut restored_keys: Vec<LedgerKey> = Vec::new();
+        for r in &results {
+            restored_keys.extend(r.hot_archive_restored_keys.iter().cloned());
+        }
+
+        let total_fees = executor.total_fees();
+        let final_id_pool = executor.id_pool();
+
+        // Apply this cluster's state changes to the main delta.
+        executor.apply_to_delta(snapshot, delta)?;
+        if total_fees != 0 {
+            delta.record_fee_pool_delta(total_fees);
+        }
+
+        cluster_results.push(ClusterResult {
+            results,
+            tx_results,
+            tx_result_metas,
+            id_pool: final_id_pool,
+            hot_archive_restored_keys: restored_keys,
+        });
+    }
+
+    Ok(cluster_results)
+}
+
 /// Compute the state size window update entry for a ledger close.
 ///
 /// This implements the C++ `maybeSnapshotSorobanStateSize` logic, which updates the

@@ -31,8 +31,8 @@ use crate::{
     },
     delta::{EntryChange, LedgerDelta},
     execution::{
-        execute_transaction_set, load_soroban_network_info, SorobanNetworkInfo,
-        TransactionExecutionResult,
+        execute_soroban_parallel_phase, execute_transaction_set, load_soroban_network_info,
+        SorobanNetworkInfo, TransactionExecutionResult,
     },
     header::{compute_header_hash, create_next_header},
     snapshot::{LedgerSnapshot, SnapshotHandle},
@@ -1544,6 +1544,10 @@ impl<'a> LedgerCloseContext<'a> {
     /// This executes all transactions in order, recording state changes
     /// to the delta and collecting results.
     fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
+        use stellar_core_common::protocol::{
+            protocol_version_starts_from, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+        };
+
         let transactions = self.close_data.tx_set.transactions_with_base_fee();
 
         if transactions.is_empty() {
@@ -1570,29 +1574,124 @@ impl<'a> LedgerCloseContext<'a> {
         // We pass the Arc directly - the execution layer will check if it contains Some.
         let hot_archive = Some(self.manager.hot_archive_bucket_list.clone());
 
+        // Check if we have a structured parallel Soroban phase that benefits
+        // from parallel execution (multiple stages or multiple clusters).
+        let phase_structure = self.close_data.tx_set.soroban_phase_structure();
+        let has_parallel = phase_structure.as_ref().map_or(false, |p| {
+            p.stages.len() > 1
+                || p.stages.first().map_or(false, |s| s.len() > 1)
+        });
+
         let (results, tx_results, mut tx_result_metas, id_pool, hot_archive_restored_keys) =
-            execute_transaction_set(
-                &self.snapshot,
-                &transactions,
-                self.close_data.ledger_seq,
-                self.close_data.close_time,
-                self.prev_header.base_fee,
-                self.prev_header.base_reserve,
-                self.prev_header.ledger_version,
-                self.manager.network_id,
-                &mut self.delta,
-                soroban_config,
-                soroban_base_prng_seed.0,
-                classic_events,
-                module_cache,
-                hot_archive,
-            )?;
+            if has_parallel
+                && protocol_version_starts_from(
+                    self.prev_header.ledger_version,
+                    PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+                )
+            {
+                let phase = phase_structure.unwrap();
+
+                // Execute classic phase first (sequential, unchanged).
+                let classic_txs = self.close_data.tx_set.classic_phase_transactions();
+                let (
+                    mut results,
+                    mut tx_results,
+                    mut tx_result_metas,
+                    mut id_pool,
+                    mut hot_archive_restored_keys,
+                ) = if classic_txs.is_empty() {
+                    (Vec::new(), Vec::new(), Vec::new(), self.snapshot.header().id_pool, Vec::new())
+                } else {
+                    execute_transaction_set(
+                        &self.snapshot,
+                        &classic_txs,
+                        self.close_data.ledger_seq,
+                        self.close_data.close_time,
+                        self.prev_header.base_fee,
+                        self.prev_header.base_reserve,
+                        self.prev_header.ledger_version,
+                        self.manager.network_id,
+                        &mut self.delta,
+                        soroban_config.clone(),
+                        soroban_base_prng_seed.0,
+                        classic_events,
+                        module_cache,
+                        hot_archive.clone(),
+                    )?
+                };
+
+                // Execute Soroban parallel phase.
+                let (
+                    soroban_results,
+                    soroban_tx_results,
+                    soroban_tx_result_metas,
+                    soroban_id_pool,
+                    soroban_restored_keys,
+                ) = execute_soroban_parallel_phase(
+                    &self.snapshot,
+                    &phase,
+                    self.close_data.ledger_seq,
+                    self.close_data.close_time,
+                    self.prev_header.base_fee,
+                    self.prev_header.base_reserve,
+                    self.prev_header.ledger_version,
+                    self.manager.network_id,
+                    &mut self.delta,
+                    soroban_config,
+                    soroban_base_prng_seed.0,
+                    classic_events,
+                    module_cache,
+                    hot_archive,
+                )?;
+
+                // Combine results: classic first, then Soroban.
+                results.extend(soroban_results);
+                tx_results.extend(soroban_tx_results);
+                tx_result_metas.extend(soroban_tx_result_metas);
+                id_pool = id_pool.max(soroban_id_pool);
+                hot_archive_restored_keys.extend(soroban_restored_keys);
+
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    classic_tx_count = classic_txs.len(),
+                    soroban_stages = phase.stages.len(),
+                    soroban_clusters = phase.stages.iter().map(|s| s.len()).sum::<usize>(),
+                    "Executed parallel Soroban phase"
+                );
+
+                (results, tx_results, tx_result_metas, id_pool, hot_archive_restored_keys)
+            } else {
+                // Existing sequential path (unchanged).
+                execute_transaction_set(
+                    &self.snapshot,
+                    &transactions,
+                    self.close_data.ledger_seq,
+                    self.close_data.close_time,
+                    self.prev_header.base_fee,
+                    self.prev_header.base_reserve,
+                    self.prev_header.ledger_version,
+                    self.manager.network_id,
+                    &mut self.delta,
+                    soroban_config,
+                    soroban_base_prng_seed.0,
+                    classic_events,
+                    module_cache,
+                    hot_archive,
+                )?
+            };
+
+        // Prepend fee events for classic event emission.
         if classic_events.events_enabled(self.prev_header.ledger_version) {
-            for (idx, ((envelope, _), meta)) in transactions
+            // Reconstruct the full transaction list for fee event correlation.
+            let all_txs = self.close_data.tx_set.transactions_with_base_fee();
+            for (idx, ((envelope, _), meta)) in all_txs
                 .iter()
                 .zip(tx_result_metas.iter_mut())
                 .enumerate()
             {
+                if idx >= tx_results.len() {
+                    break;
+                }
                 let fee_charged = tx_results[idx].result.fee_charged;
                 let frame =
                     TransactionFrame::with_network(envelope.clone(), self.manager.network_id);
@@ -1607,6 +1706,7 @@ impl<'a> LedgerCloseContext<'a> {
                 );
             }
         }
+
         self.id_pool = id_pool;
         self.tx_results = tx_results;
         self.tx_result_metas = tx_result_metas;

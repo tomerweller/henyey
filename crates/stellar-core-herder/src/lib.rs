@@ -123,6 +123,7 @@ mod surge_pricing;
 pub mod sync_recovery;
 pub mod timer_manager;
 pub mod tx_broadcast;
+pub mod parallel_tx_set_builder;
 mod tx_queue;
 mod tx_queue_limiter;
 pub mod upgrades;

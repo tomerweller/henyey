@@ -341,6 +341,75 @@ impl TransactionSetVariant {
             }
         }
     }
+
+    /// Get the classic phase transactions with base fee (for sequential execution).
+    ///
+    /// Returns only the V0 (classic) phase transactions, sorted for apply.
+    /// Returns an empty vec for Classic transaction sets.
+    pub fn classic_phase_transactions(&self) -> Vec<(TransactionEnvelope, Option<u32>)> {
+        let set_hash = self.hash();
+        match self {
+            TransactionSetVariant::Classic(set) => {
+                let txs: Vec<(TransactionEnvelope, Option<u32>)> =
+                    set.txs.iter().cloned().map(|tx| (tx, None)).collect();
+                sorted_for_apply_sequential(txs, set_hash)
+            }
+            TransactionSetVariant::Generalized(set) => {
+                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let mut txs = Vec::new();
+                for phase in set_v1.phases.iter() {
+                    if let stellar_xdr::curr::TransactionPhase::V0(components) = phase {
+                        let mut phase_txs = Vec::new();
+                        for comp in components.iter() {
+                            match comp {
+                                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                                    let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                    phase_txs.extend(c.txs.iter().cloned().map(|tx| (tx, base_fee)));
+                                }
+                            }
+                        }
+                        txs.extend(sorted_for_apply_sequential(phase_txs, set_hash));
+                    }
+                }
+                txs
+            }
+        }
+    }
+
+    /// Extract the structured Soroban parallel phase, if present.
+    ///
+    /// Returns `Some(SorobanPhaseStructure)` when the transaction set contains a
+    /// V1 (parallel) Soroban phase with non-empty execution stages. The
+    /// transactions within each cluster are sorted using the canonical parallel
+    /// apply ordering (XOR-based sort by tx hash).
+    pub fn soroban_phase_structure(&self) -> Option<SorobanPhaseStructure> {
+        let set_hash = self.hash();
+        match self {
+            TransactionSetVariant::Classic(_) => None,
+            TransactionSetVariant::Generalized(set) => {
+                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                for phase in set_v1.phases.iter() {
+                    if let stellar_xdr::curr::TransactionPhase::V1(parallel) = phase {
+                        let base_fee =
+                            parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+
+                        let stages = sorted_stages_for_parallel(
+                            parallel.execution_stages.as_slice(),
+                            set_hash,
+                            base_fee,
+                        );
+
+                        if stages.is_empty() {
+                            return None;
+                        }
+
+                        return Some(SorobanPhaseStructure { base_fee, stages });
+                    }
+                }
+                None
+            }
+        }
+    }
 }
 
 fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
@@ -439,6 +508,53 @@ fn sorted_for_apply_sequential(
     result
 }
 
+/// Sort stages/clusters for parallel apply, preserving the nested structure.
+///
+/// Returns stages > clusters > sorted (tx, base_fee) triples using the same
+/// canonical ordering as `sorted_for_apply_parallel`.
+fn sorted_stages_for_parallel(
+    stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
+    set_hash: Hash256,
+    base_fee: Option<u32>,
+) -> Vec<Vec<Vec<TxWithFee>>> {
+    let mut stage_vec: Vec<Vec<Vec<TransactionEnvelope>>> = stages
+        .iter()
+        .map(|stage| stage.0.iter().map(|cluster| cluster.0.to_vec()).collect())
+        .collect();
+
+    for stage in stage_vec.iter_mut() {
+        for cluster in stage.iter_mut() {
+            cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
+        }
+        stage.sort_by(|a, b| {
+            if a.is_empty() || b.is_empty() {
+                return a.len().cmp(&b.len());
+            }
+            apply_sort_cmp(&a[0], &b[0], &set_hash)
+        });
+    }
+
+    stage_vec.sort_by(|a, b| {
+        if a.is_empty() || b.is_empty() {
+            return a.len().cmp(&b.len());
+        }
+        if a[0].is_empty() || b[0].is_empty() {
+            return a[0].len().cmp(&b[0].len());
+        }
+        apply_sort_cmp(&a[0][0], &b[0][0], &set_hash)
+    });
+
+    stage_vec
+        .into_iter()
+        .map(|stage| {
+            stage
+                .into_iter()
+                .map(|cluster| cluster.into_iter().map(|tx| (tx, base_fee)).collect())
+                .collect()
+        })
+        .collect()
+}
+
 fn sorted_for_apply_parallel(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: Hash256,
@@ -478,6 +594,23 @@ fn sorted_for_apply_parallel(
         }
     }
     result
+}
+
+/// A transaction paired with an optional per-component base fee override.
+pub type TxWithFee = (TransactionEnvelope, Option<u32>);
+
+/// Structured Soroban parallel phase preserving stage/cluster nesting.
+///
+/// When a generalized transaction set contains a V1 (parallel) Soroban phase,
+/// this structure preserves the stages > clusters > sorted TXs hierarchy
+/// needed for parallel execution.
+#[derive(Debug, Clone)]
+pub struct SorobanPhaseStructure {
+    /// Per-component base fee override (from ParallelTxsComponent).
+    pub base_fee: Option<u32>,
+    /// Stages of clusters of sorted transactions with base fee.
+    /// stages[i][j] = cluster j of stage i, containing sorted (tx, base_fee) pairs.
+    pub stages: Vec<Vec<Vec<TxWithFee>>>,
 }
 
 /// Result of successfully closing a ledger.
