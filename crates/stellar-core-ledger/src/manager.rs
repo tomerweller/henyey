@@ -448,17 +448,15 @@ impl LedgerManager {
     /// # Arguments
     ///
     /// * `bucket_list` - The live bucket list
-    /// * `hot_archive_bucket_list` - The hot archive bucket list (protocol 23+)
+    /// * `hot_archive_bucket_list` - The hot archive bucket list
     /// * `header` - The ledger header to initialize with
-    /// * `header_hash` - The pre-computed hash of the header from the history archive.
-    ///   This is the authoritative hash that the network used. If `None`, the hash
-    ///   will be computed from the header (not recommended for catchup scenarios).
+    /// * `header_hash` - The authoritative hash of the header from the history archive
     pub fn initialize_from_buckets(
         &self,
         bucket_list: BucketList,
-        hot_archive_bucket_list: Option<HotArchiveBucketList>,
+        hot_archive_bucket_list: HotArchiveBucketList,
         header: LedgerHeader,
-        header_hash: Option<Hash256>,
+        header_hash: Hash256,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
@@ -469,20 +467,14 @@ impl LedgerManager {
 
         // Compute combined bucket list hash for verification
         let live_hash = bucket_list.hash();
-        let computed_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
-            // Protocol 23+: combine both hashes
-            let hot_hash = hot_archive.hash();
-            let mut hasher = Sha256::new();
-            hasher.update(live_hash.as_bytes());
-            hasher.update(hot_hash.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            Hash256::from_bytes(bytes)
-        } else {
-            // Pre-protocol 23: just live hash
-            live_hash
-        };
+        let hot_hash = hot_archive_bucket_list.hash();
+        let mut hasher = Sha256::new();
+        hasher.update(live_hash.as_bytes());
+        hasher.update(hot_hash.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        let computed_hash = Hash256::from_bytes(bytes);
 
         let expected_hash = Hash256::from(header.bucket_list_hash.0);
 
@@ -492,7 +484,7 @@ impl LedgerManager {
             expected = %expected_hash.to_hex(),
             computed = %computed_hash.to_hex(),
             live_hash = %live_hash.to_hex(),
-            hot_archive = hot_archive_bucket_list.is_some(),
+            hot_archive_hash = %hot_hash.to_hex(),
             "Verifying bucket list hash"
         );
         for level_idx in 0..bucket_list.levels().len() {
@@ -506,12 +498,6 @@ impl LedgerManager {
                 );
             }
         }
-        if let Some(ref hot_archive) = hot_archive_bucket_list {
-            tracing::debug!(
-                hot_archive_hash = %hot_archive.hash().to_hex(),
-                "Hot archive bucket list hash"
-            );
-        }
 
         if self.config.validate_bucket_hash && computed_hash != expected_hash {
             return Err(LedgerError::HashMismatch {
@@ -520,29 +506,9 @@ impl LedgerManager {
             });
         }
 
-        // Use the provided header hash if available, otherwise compute it.
-        // The provided hash should come from the history archive and is authoritative.
-        let header_hash = match header_hash {
-            Some(hash) => {
-                tracing::debug!(
-                    ledger_seq = header.ledger_seq,
-                    provided_hash = %hash.to_hex(),
-                    "Using pre-computed header hash from history archive"
-                );
-                hash
-            }
-            None => {
-                tracing::debug!(
-                    ledger_seq = header.ledger_seq,
-                    "Computing header hash (no pre-computed hash provided)"
-                );
-                compute_header_hash(&header)?
-            }
-        };
-
         // Update state
         *self.bucket_list.write() = bucket_list;
-        *self.hot_archive_bucket_list.write() = hot_archive_bucket_list;
+        *self.hot_archive_bucket_list.write() = Some(hot_archive_bucket_list);
 
         // Set the ledger sequence on bucket lists after restoring from history archive.
         // restore_from_hashes() sets ledger_seq to 0, but we need it set to the actual

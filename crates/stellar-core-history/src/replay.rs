@@ -359,29 +359,22 @@ const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 
 fn combined_bucket_list_hash(
     live_bucket_list: &stellar_core_bucket::BucketList,
-    hot_archive_bucket_list: Option<&stellar_core_bucket::HotArchiveBucketList>,
-    protocol_version: u32,
+    hot_archive_bucket_list: &stellar_core_bucket::HotArchiveBucketList,
 ) -> Hash256 {
-    if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
-        if let Some(hot_archive) = hot_archive_bucket_list {
-            let live_hash = live_bucket_list.hash();
-            let hot_hash = hot_archive.hash();
-            tracing::info!(
-                live_hash = %live_hash,
-                hot_archive_hash = %hot_hash,
-                "Computing combined bucket list hash"
-            );
-            let mut hasher = Sha256::new();
-            hasher.update(live_hash.as_bytes());
-            hasher.update(hot_hash.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            return Hash256::from_bytes(bytes);
-        }
-    }
-
-    live_bucket_list.hash()
+    let live_hash = live_bucket_list.hash();
+    let hot_hash = hot_archive_bucket_list.hash();
+    tracing::info!(
+        live_hash = %live_hash,
+        hot_archive_hash = %hot_hash,
+        "Computing combined bucket list hash"
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(live_hash.as_bytes());
+    hasher.update(hot_hash.as_bytes());
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    Hash256::from_bytes(bytes)
 }
 
 /// Replays a single ledger from history data.
@@ -483,7 +476,7 @@ pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
     bucket_list: &mut stellar_core_bucket::BucketList,
-    mut hot_archive_bucket_list: Option<&mut stellar_core_bucket::HotArchiveBucketList>,
+    hot_archive_bucket_list: &mut stellar_core_bucket::HotArchiveBucketList,
     network_id: &NetworkId,
     config: &ReplayConfig,
     expected_tx_results: Option<&[TransactionResultPair]>,
@@ -506,9 +499,8 @@ pub fn replay_ledger_with_execution(
     snapshot.set_id_pool(prev_id_pool);
     let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
     // Also include hot archive bucket list for archived entries and their TTLs
-    let hot_archive_ref = hot_archive_bucket_list
-        .as_ref()
-        .map(|ha| std::sync::Arc::new(std::sync::RwLock::new((*ha).clone())));
+    let hot_archive_ref =
+        std::sync::Arc::new(std::sync::RwLock::new(hot_archive_bucket_list.clone()));
     let lookup_fn = std::sync::Arc::new(move |key: &LedgerKey| {
         // First try the live bucket list
         if let Some(entry) = bucket_list_ref
@@ -519,16 +511,12 @@ pub fn replay_ledger_with_execution(
         {
             return Ok(Some(entry));
         }
-        // If not found and we have a hot archive, search there for archived entries and TTLs
-        if let Some(ref hot_archive) = hot_archive_ref {
-            // HotArchiveBucketList::get returns Result<Option<LedgerEntry>>
-            return hot_archive
-                .read()
-                .map_err(|_| LedgerError::Snapshot("hot archive lock poisoned".to_string()))?
-                .get(key)
-                .map_err(LedgerError::Bucket);
-        }
-        Ok(None)
+        // If not found, search hot archive for archived entries and TTLs
+        hot_archive_ref
+            .read()
+            .map_err(|_| LedgerError::Snapshot("hot archive lock poisoned".to_string()))?
+            .get(key)
+            .map_err(LedgerError::Bucket)
     });
     let snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
 
@@ -727,7 +715,6 @@ pub fn replay_ledger_with_execution(
 
     if config.run_eviction
         && header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-        && hot_archive_bucket_list.is_some()
     {
         let iter = updated_eviction_iterator.unwrap_or_else(|| {
             EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
@@ -813,8 +800,8 @@ pub fn replay_ledger_with_execution(
     // IMPORTANT: Must always call add_batch for protocol 23+ even with empty entries,
     // because the hot archive bucket list needs to run spill logic at the same
     // ledger boundaries as the live bucket list.
-    if let Some(hot_archive) = hot_archive_bucket_list.as_deref_mut() {
-        let pre_hash = hot_archive.hash();
+    {
+        let pre_hash = hot_archive_bucket_list.hash();
         tracing::info!(
             ledger_seq = header.ledger_seq,
             pre_hash = %pre_hash,
@@ -823,7 +810,7 @@ pub fn replay_ledger_with_execution(
         );
         // HotArchiveBucketList::add_batch takes (ledger_seq, protocol_version, archived_entries, restored_keys)
         // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
-        hot_archive
+        hot_archive_bucket_list
             .add_batch(
                 header.ledger_seq,
                 header.ledger_version,
@@ -831,17 +818,12 @@ pub fn replay_ledger_with_execution(
                 hot_archive_restored_keys.clone(),
             )
             .map_err(HistoryError::Bucket)?;
-        let post_hash = hot_archive.hash();
+        let post_hash = hot_archive_bucket_list.hash();
         tracing::info!(
             ledger_seq = header.ledger_seq,
             post_hash = %post_hash,
             hash_changed = (pre_hash != post_hash),
             "Hot archive add_batch - AFTER"
-        );
-    } else {
-        tracing::warn!(
-            ledger_seq = header.ledger_seq,
-            "Hot archive bucket list is None - skipping add_batch"
         );
     }
 
@@ -932,8 +914,7 @@ pub fn replay_ledger_with_execution(
             );
             let actual = combined_bucket_list_hash(
                 bucket_list,
-                hot_archive_bucket_list.as_deref(),
-                header.ledger_version,
+                hot_archive_bucket_list,
             );
             if actual != expected {
                 // Log detailed bucket list state for debugging
@@ -1397,7 +1378,7 @@ impl ReplayedLedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_core_bucket::BucketList;
+    use stellar_core_bucket::{BucketList, HotArchiveBucketList};
     use stellar_core_common::NetworkId;
     use stellar_xdr::curr::{
         GeneralizedTransactionSet, Hash, StellarValue, TimePoint, TransactionResultSet,
@@ -1571,29 +1552,35 @@ mod tests {
     fn test_replay_ledger_with_execution_bucket_hash_mismatch() {
         // Use checkpoint ledger (seq % 64 == 63) so bucket list verification runs
         let mut header = make_test_header(127);
+        // Use protocol version 25 (P24+) for correct combined hash semantics
+        header.ledger_version = 25;
         header.bucket_list_hash = Hash([1u8; 32]);
 
         let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
         let mut bucket_list = BucketList::new();
+        let mut hot_archive = HotArchiveBucketList::new();
 
         let config = ReplayConfig {
             verify_results: false,
             verify_bucket_list: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
-            run_eviction: false,
+            run_eviction: true, // Required for P23+ verification
             eviction_settings: StateArchivalSettings::default(),
         };
+
+        // Pass an eviction_iterator for P23+ verification (eviction_running check)
+        let eviction_iterator = Some(stellar_core_bucket::EvictionIterator::new(0));
 
         let result = replay_ledger_with_execution(
             &header,
             &tx_set,
             &mut bucket_list,
-            None,
+            &mut hot_archive,
             &NetworkId::testnet(),
             &config,
             None,
-            None,
+            eviction_iterator,
             None, // module_cache
             None, // soroban_state_size
             0,    // prev_id_pool
@@ -1609,6 +1596,7 @@ mod tests {
         header.scp_value.tx_set_hash = Hash([2u8; 32]);
 
         let mut bucket_list = BucketList::new();
+        let mut hot_archive = HotArchiveBucketList::new();
         let config = ReplayConfig {
             verify_results: true,
             verify_bucket_list: false,
@@ -1622,7 +1610,7 @@ mod tests {
             &header,
             &tx_set,
             &mut bucket_list,
-            None,
+            &mut hot_archive,
             &NetworkId::testnet(),
             &config,
             None,
@@ -1645,6 +1633,7 @@ mod tests {
         header.tx_set_result_hash = Hash([3u8; 32]);
 
         let mut bucket_list = BucketList::new();
+        let mut hot_archive = HotArchiveBucketList::new();
         let config = ReplayConfig {
             verify_results: true,
             verify_bucket_list: false,
@@ -1658,7 +1647,7 @@ mod tests {
             &header,
             &tx_set,
             &mut bucket_list,
-            None,
+            &mut hot_archive,
             &NetworkId::testnet(),
             &config,
             None,

@@ -1959,7 +1959,7 @@ impl App {
                 output.bucket_list,
                 output.hot_archive_bucket_list,
                 output.header,
-                Some(output.header_hash),
+                output.header_hash,
             )
             .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
 

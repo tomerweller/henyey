@@ -374,7 +374,7 @@ impl CatchupManager {
                 HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
             })?;
 
-        if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+        {
             use stellar_core_bucket::HotArchiveBucket;
             let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
             let load_hot_bucket_for_merge =
@@ -398,7 +398,7 @@ impl CatchupManager {
                         )))
                     }
                 };
-            hot_archive
+            hot_archive_bucket_list
                 .restart_merges_from_has(
                     checkpoint_seq,
                     protocol_version,
@@ -460,7 +460,7 @@ impl CatchupManager {
             let final_state = self
                 .replay_ledgers(
                     &mut bucket_list,
-                    hot_archive_bucket_list.as_mut(),
+                    &mut hot_archive_bucket_list,
                     &ledger_data,
                     network_id,
                     checkpoint_id_pool,
@@ -476,7 +476,7 @@ impl CatchupManager {
                     let header = create_header_from_replay_state(
                         &final_state,
                         &bucket_list,
-                        hot_archive_bucket_list.as_ref(),
+                        &hot_archive_bucket_list,
                     );
                     // Fall back to the replay-computed hash
                     (header, final_state.ledger_hash)
@@ -636,7 +636,7 @@ impl CatchupManager {
                         HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
                     })?;
 
-                if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+                {
                     use stellar_core_bucket::HotArchiveBucket;
                     let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
                     let load_hot_bucket_for_merge =
@@ -660,7 +660,7 @@ impl CatchupManager {
                                 )))
                             }
                         };
-                    hot_archive
+                    hot_archive_bucket_list
                         .restart_merges_from_has(
                             bucket_apply_at,
                             protocol_version,
@@ -738,7 +738,7 @@ impl CatchupManager {
             let final_state = self
                 .replay_ledgers(
                     &mut bucket_list,
-                    hot_archive_bucket_list.as_mut(),
+                    &mut hot_archive_bucket_list,
                     &ledger_data,
                     network_id,
                     checkpoint_id_pool,
@@ -753,7 +753,7 @@ impl CatchupManager {
                     let header = create_header_from_replay_state(
                         &final_state,
                         &bucket_list,
-                        hot_archive_bucket_list.as_ref(),
+                        &hot_archive_bucket_list,
                     );
                     (header, final_state.ledger_hash)
                 }
@@ -903,7 +903,7 @@ impl CatchupManager {
                 HistoryError::CatchupFailed(format!("Failed to restart bucket merges: {}", e))
             })?;
 
-        if let Some(ref mut hot_archive) = hot_archive_bucket_list {
+        {
             use stellar_core_bucket::HotArchiveBucket;
             let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
             let load_hot_bucket_for_merge =
@@ -927,7 +927,7 @@ impl CatchupManager {
                         )))
                     }
                 };
-            hot_archive
+            hot_archive_bucket_list
                 .restart_merges_from_has(
                     checkpoint_seq,
                     protocol_version,
@@ -1004,7 +1004,7 @@ impl CatchupManager {
             let final_state = self
                 .replay_ledgers(
                     &mut bucket_list,
-                    hot_archive_bucket_list.as_mut(),
+                    &mut hot_archive_bucket_list,
                     &ledger_data,
                     network_id,
                     checkpoint_header.id_pool, // Use checkpoint's id_pool for correct offer IDs
@@ -1020,7 +1020,7 @@ impl CatchupManager {
                     let header = create_header_from_replay_state(
                         &final_state,
                         &bucket_list,
-                        hot_archive_bucket_list.as_ref(),
+                        &hot_archive_bucket_list,
                     );
                     // Fall back to the replay-computed hash
                     (header, final_state.ledger_hash)
@@ -1233,7 +1233,7 @@ impl CatchupManager {
         buckets: &[(Hash256, Vec<u8>)],
     ) -> Result<(
         BucketList,
-        Option<HotArchiveBucketList>,
+        HotArchiveBucketList,
         Vec<HasNextState>,
         Vec<HasNextState>,
     )> {
@@ -1608,9 +1608,9 @@ impl CatchupManager {
                 );
             }
 
-            Some(hot_bucket_list)
+            hot_bucket_list
         } else {
-            None
+            HotArchiveBucketList::new()
         };
 
         Ok((
@@ -1837,52 +1837,39 @@ impl CatchupManager {
         &self,
         header: &LedgerHeader,
         bucket_list: &BucketList,
-        hot_archive_bucket_list: &Option<HotArchiveBucketList>,
+        hot_archive_bucket_list: &HotArchiveBucketList,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
         let live_hash = bucket_list.hash();
+        let hot_hash = hot_archive_bucket_list.hash();
         let expected_hash = Hash256::from(header.bucket_list_hash.0);
 
-        let computed_hash = if let Some(ref hot_archive) = hot_archive_bucket_list {
-            // Protocol 23+: combine live and hot archive bucket list hashes
-            let hot_hash = hot_archive.hash();
+        info!(
+            ledger_seq = header.ledger_seq,
+            live_hash = %live_hash.to_hex(),
+            hot_hash = %hot_hash.to_hex(),
+            expected_combined = %expected_hash.to_hex(),
+            "Catchup verify_final_state: computing combined bucket list hash"
+        );
 
+        // Log per-level hashes for hot archive
+        for (level_idx, level) in hot_archive_bucket_list.levels().iter().enumerate().take(5) {
             info!(
-                ledger_seq = header.ledger_seq,
-                live_hash = %live_hash.to_hex(),
-                hot_hash = %hot_hash.to_hex(),
-                expected_combined = %expected_hash.to_hex(),
-                "Catchup verify_final_state: computing combined bucket list hash"
+                level = level_idx,
+                curr_hash = %level.curr.hash().to_hex(),
+                snap_hash = %level.snap.hash().to_hex(),
+                "Hot archive level hash after catchup"
             );
+        }
 
-            // Log per-level hashes for hot archive
-            for (level_idx, level) in hot_archive.levels().iter().enumerate().take(5) {
-                info!(
-                    level = level_idx,
-                    curr_hash = %level.curr.hash().to_hex(),
-                    snap_hash = %level.snap.hash().to_hex(),
-                    "Hot archive level hash after catchup"
-                );
-            }
-
-            let mut hasher = Sha256::new();
-            hasher.update(live_hash.as_bytes());
-            hasher.update(hot_hash.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            Hash256::from_bytes(bytes)
-        } else {
-            // Pre-protocol 23: just the live bucket list hash
-            info!(
-                ledger_seq = header.ledger_seq,
-                live_hash = %live_hash.to_hex(),
-                expected = %expected_hash.to_hex(),
-                "Catchup verify_final_state: no hot archive"
-            );
-            live_hash
-        };
+        let mut hasher = Sha256::new();
+        hasher.update(live_hash.as_bytes());
+        hasher.update(hot_hash.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        let computed_hash = Hash256::from_bytes(bytes);
 
         info!(
             ledger_seq = header.ledger_seq,
@@ -2116,7 +2103,7 @@ impl CatchupManager {
     async fn replay_ledgers(
         &mut self,
         bucket_list: &mut BucketList,
-        mut hot_archive_bucket_list: Option<&mut HotArchiveBucketList>,
+        hot_archive_bucket_list: &mut HotArchiveBucketList,
         ledger_data: &[LedgerData],
         network_id: NetworkId,
         checkpoint_id_pool: u64,
@@ -2175,7 +2162,7 @@ impl CatchupManager {
                 &data.header,
                 &data.tx_set,
                 bucket_list,
-                hot_archive_bucket_list.as_deref_mut(),
+                hot_archive_bucket_list,
                 &network_id,
                 &self.replay_config,
                 Some(&data.tx_results),
@@ -2219,34 +2206,22 @@ impl CatchupManager {
         // Checkpoint verification is reliable because we restore from archive.
         let is_checkpoint = final_header.ledger_seq % 64 == 63;
         if self.replay_config.verify_bucket_list && is_checkpoint {
-            // For protocol 23+, the header's bucket_list_hash is the combined hash
-            // of the live bucket list and hot archive bucket list: SHA256(live || hot)
-            let bucket_list_hash = if final_header.ledger_version >= 23 {
-                if let Some(ref hot_archive) = hot_archive_bucket_list {
-                    use sha2::{Digest, Sha256};
-                    let live_hash = bucket_list.hash();
-                    let hot_hash = hot_archive.hash();
-                    tracing::info!(
-                        ledger_seq = final_header.ledger_seq,
-                        live_hash = %live_hash,
-                        hot_archive_hash = %hot_hash,
-                        "Computing combined bucket list hash for verification"
-                    );
-                    let mut hasher = Sha256::new();
-                    hasher.update(live_hash.as_bytes());
-                    hasher.update(hot_hash.as_bytes());
-                    let result = hasher.finalize();
-                    let mut bytes = [0u8; 32];
-                    bytes.copy_from_slice(&result);
-                    Hash256::from_bytes(bytes)
-                } else {
-                    // Hot archive not available, use live hash only
-                    bucket_list.hash()
-                }
-            } else {
-                // Pre-protocol 23: just live hash
-                bucket_list.hash()
-            };
+            use sha2::{Digest, Sha256};
+            let live_hash = bucket_list.hash();
+            let hot_hash = hot_archive_bucket_list.hash();
+            tracing::info!(
+                ledger_seq = final_header.ledger_seq,
+                live_hash = %live_hash,
+                hot_archive_hash = %hot_hash,
+                "Computing combined bucket list hash for verification"
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(live_hash.as_bytes());
+            hasher.update(hot_hash.as_bytes());
+            let result = hasher.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&result);
+            let bucket_list_hash = Hash256::from_bytes(bytes);
             replay::verify_replay_consistency(&final_header, &bucket_list_hash)?;
         }
 
@@ -2410,24 +2385,20 @@ impl Default for CatchupManagerBuilder {
 fn create_header_from_replay_state(
     replay_state: &ReplayedLedgerState,
     bucket_list: &BucketList,
-    hot_archive_bucket_list: Option<&HotArchiveBucketList>,
+    hot_archive_bucket_list: &HotArchiveBucketList,
 ) -> LedgerHeader {
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::{
         Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
     };
 
-    let bucket_list_hash = if let Some(hot_archive) = hot_archive_bucket_list {
-        let mut hasher = Sha256::new();
-        hasher.update(bucket_list.hash().as_bytes());
-        hasher.update(hot_archive.hash().as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Hash256::from_bytes(bytes)
-    } else {
-        bucket_list.hash()
-    };
+    let mut hasher = Sha256::new();
+    hasher.update(bucket_list.hash().as_bytes());
+    hasher.update(hot_archive_bucket_list.hash().as_bytes());
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    let bucket_list_hash = Hash256::from_bytes(bytes);
 
     LedgerHeader {
         ledger_version: replay_state.protocol_version,

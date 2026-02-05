@@ -1,7 +1,7 @@
-use stellar_core_bucket::BucketList;
+use stellar_core_bucket::{BucketList, HotArchiveBucketList};
 use stellar_core_common::Hash256;
 use stellar_core_ledger::{
-    LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
+    compute_header_hash, LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
 };
 use stellar_xdr::curr::{
     Hash, LedgerCloseMeta, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint,
@@ -49,9 +49,11 @@ fn test_ledger_close_with_empty_tx_set() {
     let ledger = LedgerManager::new("Test Network".to_string(), config);
 
     let bucket_list = BucketList::new();
+    let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
+    let header_hash = compute_header_hash(&header).expect("hash");
     ledger
-        .initialize_from_buckets(bucket_list, None, header, None)
+        .initialize_from_buckets(bucket_list, hot_archive, header, header_hash)
         .expect("init");
 
     let close_data = LedgerCloseData::new(

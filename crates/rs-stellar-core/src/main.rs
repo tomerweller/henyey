@@ -1813,18 +1813,14 @@ async fn cmd_verify_execution(
     )?;
     bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
 
-    let mut hot_archive_bucket_list: Option<HotArchiveBucketList> =
-        if let (Some(ref hashes), Some(ref next_states)) =
-            (&hot_archive_hashes, &hot_archive_next_states)
-        {
-            Some(HotArchiveBucketList::restore_from_has(
-                hashes,
-                next_states,
-                |hash| bucket_manager.load_hot_archive_bucket(hash),
-            )?)
-        } else {
-            None
-        };
+    let mut hot_archive_bucket_list = match (&hot_archive_hashes, &hot_archive_next_states) {
+        (Some(ref hashes), Some(ref next_states)) => HotArchiveBucketList::restore_from_has(
+            hashes,
+            next_states,
+            |hash| bucket_manager.load_hot_archive_bucket(hash),
+        )?,
+        _ => HotArchiveBucketList::new(),
+    };
 
     // Get init header and restart merges
     let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
@@ -1842,15 +1838,13 @@ async fn cmd_verify_execution(
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
     )?;
 
-    if let Some(ref mut hot) = hot_archive_bucket_list {
-        if let Some(ref ha_next_states) = hot_archive_next_states {
-            hot.restart_merges_from_has(
-                init_checkpoint,
-                init_protocol_version,
-                ha_next_states,
-                |hash| bucket_manager.load_hot_archive_bucket(hash),
-            )?;
-        }
+    if let Some(ref ha_next_states) = hot_archive_next_states {
+        hot_archive_bucket_list.restart_merges_from_has(
+            init_checkpoint,
+            init_protocol_version,
+            ha_next_states,
+            |hash| bucket_manager.load_hot_archive_bucket(hash),
+        )?;
     }
 
     // Create and initialize LedgerManager
@@ -1862,11 +1856,13 @@ async fn cmd_verify_execution(
         },
     );
 
-    let init_header_hash = init_header_entry.map(|h| Hash256::from(h.hash.0));
+    let init_header_entry = init_header_entry
+        .ok_or_else(|| anyhow::anyhow!("No header found for checkpoint {}", init_checkpoint))?;
+    let init_header_hash = Hash256::from(init_header_entry.hash.0);
     ledger_manager.initialize_from_buckets(
         bucket_list,
         hot_archive_bucket_list,
-        init_header_entry.map(|h| h.header.clone()).unwrap_or_default(),
+        init_header_entry.header.clone(),
         init_header_hash,
     )?;
 
@@ -1881,9 +1877,7 @@ async fn cmd_verify_execution(
     let mut meta_mismatches = 0u32;
 
     // Track previous ledger hash for close_ledger
-    let mut prev_ledger_hash = init_header_entry
-        .map(|h| Hash256::from(h.hash.0))
-        .unwrap_or(Hash256::ZERO);
+    let mut prev_ledger_hash = init_header_hash;
 
     // Main verification loop
     let verification_start = std::time::Instant::now();

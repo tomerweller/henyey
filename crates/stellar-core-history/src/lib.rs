@@ -401,11 +401,11 @@ pub struct CatchupOutput {
     /// contract data, etc.) that can be accessed by transactions.
     pub bucket_list: stellar_core_bucket::BucketList,
 
-    /// The hot archive bucket list state (protocol 23+ only).
+    /// The hot archive bucket list state.
     ///
     /// Contains recently evicted persistent entries that can be restored
-    /// via the `RestoreFootprint` operation.
-    pub hot_archive_bucket_list: Option<stellar_core_bucket::HotArchiveBucketList>,
+    /// via the `RestoreFootprint` operation. Empty for pre-Protocol 23 ledgers.
+    pub hot_archive_bucket_list: stellar_core_bucket::HotArchiveBucketList,
 
     /// The ledger header at the target ledger.
     ///
@@ -423,27 +423,21 @@ pub struct CatchupOutput {
 impl CatchupOutput {
     /// Compute the combined bucket list hash for verification.
     ///
-    /// For protocol 23+, this is SHA256(live_hash || hot_archive_hash).
-    /// For earlier protocols, this is just the live bucket list hash.
+    /// This is SHA256(live_hash || hot_archive_hash). For empty hot archives,
+    /// the hash is the SHA256 of all zeros.
     pub fn combined_bucket_list_hash(&self) -> stellar_core_common::Hash256 {
         use sha2::{Digest, Sha256};
 
         let live_hash = self.bucket_list.hash();
+        let hot_hash = self.hot_archive_bucket_list.hash();
 
-        if let Some(ref hot_archive) = self.hot_archive_bucket_list {
-            // Protocol 23+: combine both hashes
-            let hot_hash = hot_archive.hash();
-            let mut hasher = Sha256::new();
-            hasher.update(live_hash.as_bytes());
-            hasher.update(hot_hash.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            stellar_core_common::Hash256::from_bytes(bytes)
-        } else {
-            // Pre-protocol 23: just live hash
-            live_hash
-        }
+        let mut hasher = Sha256::new();
+        hasher.update(live_hash.as_bytes());
+        hasher.update(hot_hash.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        stellar_core_common::Hash256::from_bytes(bytes)
     }
 }
 

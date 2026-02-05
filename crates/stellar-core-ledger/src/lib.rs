@@ -53,7 +53,7 @@
 //! let manager = LedgerManager::new(network_passphrase, LedgerManagerConfig::default());
 //!
 //! // Initialize from buckets (during catchup)
-//! manager.initialize_from_buckets(bucket_list, None, header, Some(header_hash))?;
+//! manager.initialize_from_buckets(bucket_list, hot_archive_bucket_list, header, header_hash)?;
 //!
 //! // Close a ledger
 //! let close_data = LedgerCloseData::new(seq, tx_set, close_time, prev_hash);
