@@ -27,7 +27,8 @@
 
 use crate::{
     close::{
-        LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
+        LedgerCloseData, LedgerCloseResult, LedgerCloseStats, LedgerReplayData,
+        TransactionSetVariant, UpgradeContext,
     },
     delta::{EntryChange, LedgerDelta},
     execution::{
@@ -1573,31 +1574,22 @@ impl LedgerManager {
 
     /// Apply a pre-computed ledger close to the manager's internal state.
     ///
-    /// This is used by offline tools (verify-execution) that execute transactions
-    /// externally but want to use LedgerManager for state management. It performs
-    /// the same state updates as `LedgerCloseContext::commit()`:
+    /// This is used by offline tools (replay-bucket-list) that have pre-computed
+    /// state changes from history archives. It performs the same state updates
+    /// as the internal `commit()` without re-executing transactions:
     ///
-    /// 1. Bucket list add_batch (live)
-    /// 2. Hot archive add_batch (if protocol 23+)
+    /// 1. Hot archive add_batch (if protocol 23+)
+    /// 2. Bucket list add_batch (live)
     /// 3. Soroban state update (init/live/dead)
     /// 4. Module cache update (new contract code)
     /// 5. In-memory offers update (insert/update/delete)
     /// 6. Internal header update
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_ledger_close(
-        &self,
-        ledger_seq: u32,
-        protocol_version: u32,
-        init_entries: &[LedgerEntry],
-        live_entries: &[LedgerEntry],
-        dead_entries: &[LedgerKey],
-        archived_entries: Vec<LedgerEntry>,
-        restored_keys: Vec<LedgerKey>,
-        new_header: LedgerHeader,
-        new_header_hash: Hash256,
-    ) -> Result<()> {
+    pub fn apply_ledger_close(&self, data: LedgerReplayData) -> Result<()> {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
         let close_start = std::time::Instant::now();
+
+        let ledger_seq = data.ledger_seq;
+        let protocol_version = data.protocol_version;
 
         // 1. Hot archive add_batch (FIRST - matches C++ order: addHotArchiveBatch before addLiveBatch)
         let t0 = std::time::Instant::now();
@@ -1605,8 +1597,8 @@ impl LedgerManager {
             hot_archive.add_batch(
                 ledger_seq,
                 protocol_version,
-                archived_entries,
-                restored_keys,
+                data.archived_entries,
+                data.restored_keys,
             )?;
         }
         let ha_add_batch_us = t0.elapsed().as_micros() as u64;
@@ -1617,9 +1609,9 @@ impl LedgerManager {
             ledger_seq,
             protocol_version,
             BucketListType::Live,
-            init_entries.to_vec(),
-            live_entries.to_vec(),
-            dead_entries.to_vec(),
+            data.init_entries.clone(),
+            data.live_entries.clone(),
+            data.dead_entries.clone(),
         )?;
         let bl_add_batch_us = t0.elapsed().as_micros() as u64;
 
@@ -1632,9 +1624,9 @@ impl LedgerManager {
                 .write()
                 .update_state(
                     ledger_seq,
-                    init_entries,
-                    live_entries,
-                    dead_entries,
+                    &data.init_entries,
+                    &data.live_entries,
+                    &data.dead_entries,
                     protocol_version,
                     rent_config.as_ref(),
                 )
@@ -1649,7 +1641,7 @@ impl LedgerManager {
         {
             let module_cache_guard = self.module_cache.read();
             if let Some(ref cache) = *module_cache_guard {
-                for entry in init_entries.iter().chain(live_entries.iter()) {
+                for entry in data.init_entries.iter().chain(data.live_entries.iter()) {
                     if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
                         cache.add_contract(contract_code.code.as_slice(), protocol_version);
                     }
@@ -1660,11 +1652,11 @@ impl LedgerManager {
 
         // 5. In-memory offers update
         let t0 = std::time::Instant::now();
-        self.update_offers_from_entries(init_entries, live_entries, dead_entries)?;
+        self.update_offers_from_entries(&data.init_entries, &data.live_entries, &data.dead_entries)?;
         let offers_update_us = t0.elapsed().as_micros() as u64;
 
         // 6. Update header
-        self.set_state(new_header, new_header_hash);
+        self.set_state(data.header, data.header_hash);
 
         let total_us = close_start.elapsed().as_micros() as u64;
         tracing::info!(
@@ -1675,9 +1667,9 @@ impl LedgerManager {
             soroban_update_us,
             module_cache_us,
             offers_update_us,
-            init_count = init_entries.len(),
-            live_count = live_entries.len(),
-            dead_count = dead_entries.len(),
+            init_count = data.init_entries.len(),
+            live_count = data.live_entries.len(),
+            dead_count = data.dead_entries.len(),
             "apply_ledger_close timing"
         );
 

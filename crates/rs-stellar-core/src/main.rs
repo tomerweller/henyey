@@ -2580,7 +2580,7 @@ async fn cmd_verify_execution(
     };
     use stellar_core_history::{checkpoint, HistoryArchive};
     use stellar_core_ledger::execution::{load_soroban_config, TransactionExecutor};
-    use stellar_core_ledger::{LedgerManager, LedgerManagerConfig};
+    use stellar_core_ledger::{LedgerManager, LedgerManagerConfig, LedgerReplayData};
     use stellar_core_tx::ClassicEventConfig;
     use stellar_xdr::curr::{LedgerEntry, LedgerKey};
 
@@ -4537,17 +4537,17 @@ async fn cmd_verify_execution(
                 // Apply all state updates via LedgerManager:
                 // bucket list, hot archive, soroban state, module cache, SQL offers, entry cache
                 let apply_start = std::time::Instant::now();
-                ledger_manager.apply_ledger_close(
-                    seq,
-                    cdp_header.ledger_version,
-                    &all_init,
-                    &all_live,
-                    &all_dead,
+                ledger_manager.apply_ledger_close(LedgerReplayData {
+                    ledger_seq: seq,
+                    protocol_version: cdp_header.ledger_version,
+                    init_entries: all_init,
+                    live_entries: all_live,
+                    dead_entries: all_dead,
                     archived_entries,
-                    our_hot_archive_restored_keys.iter().cloned().collect(),
-                    cdp_header.clone(),
-                    Hash256::from(header_entry.hash.0),
-                ).map_err(|e| anyhow::anyhow!("apply_ledger_close failed: {}", e))?;
+                    restored_keys: our_hot_archive_restored_keys.iter().cloned().collect(),
+                    header: cdp_header.clone(),
+                    header_hash: Hash256::from(header_entry.hash.0),
+                }).map_err(|e| anyhow::anyhow!("apply_ledger_close failed: {}", e))?;
                 apply_close_us = apply_start.elapsed().as_micros() as u64;
             }
             timing.bucket_update_us = bucket_update_start.elapsed().as_micros() as u64;

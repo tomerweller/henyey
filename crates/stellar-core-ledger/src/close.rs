@@ -23,9 +23,9 @@ use std::collections::HashMap;
 use stellar_core_common::Hash256;
 use stellar_core_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
-    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade,
-    Limits, ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
-    TransactionResultSet, TransactionSet, WriteXdr,
+    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerEntry, LedgerHeader,
+    LedgerKey, LedgerUpgrade, Limits, ScpHistoryEntry, StellarValueExt, TransactionEnvelope,
+    TransactionResultPair, TransactionResultSet, TransactionSet, WriteXdr,
 };
 
 use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
@@ -154,6 +154,62 @@ impl LedgerCloseData {
     pub fn has_upgrades(&self) -> bool {
         !self.upgrades.is_empty()
     }
+}
+
+/// Pre-computed ledger state changes for replay mode.
+///
+/// This struct bundles all the data needed to apply a ledger close without
+/// re-executing transactions. It is used by offline tools (like `replay-bucket-list`)
+/// that read pre-computed state changes from history archives.
+///
+/// # Usage
+///
+/// ```ignore
+/// let replay_data = LedgerReplayData {
+///     ledger_seq: 12345,
+///     protocol_version: 21,
+///     init_entries: vec![...],  // New entries
+///     live_entries: vec![...],  // Updated entries
+///     dead_entries: vec![...],  // Deleted entry keys
+///     archived_entries: vec![], // Entries archived to hot archive (Protocol 23+)
+///     restored_keys: vec![],    // Keys restored from hot archive (Protocol 23+)
+///     header: new_header,
+///     header_hash: computed_hash,
+/// };
+/// manager.apply_ledger_close(replay_data)?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct LedgerReplayData {
+    /// The sequence number of the ledger being replayed.
+    pub ledger_seq: u32,
+
+    /// The protocol version for this ledger.
+    pub protocol_version: u32,
+
+    /// Newly created ledger entries (INIT).
+    pub init_entries: Vec<LedgerEntry>,
+
+    /// Updated ledger entries (LIVE).
+    pub live_entries: Vec<LedgerEntry>,
+
+    /// Keys of deleted ledger entries (DEAD).
+    pub dead_entries: Vec<LedgerKey>,
+
+    /// Entries archived to hot archive (Protocol 23+).
+    ///
+    /// These are entries that expired and were moved to the hot archive bucket list.
+    pub archived_entries: Vec<LedgerEntry>,
+
+    /// Keys restored from hot archive (Protocol 23+).
+    ///
+    /// These are entries that were restored via `RestoreFootprint` or similar operations.
+    pub restored_keys: Vec<LedgerKey>,
+
+    /// The new ledger header after this close.
+    pub header: LedgerHeader,
+
+    /// Hash of the new ledger header.
+    pub header_hash: Hash256,
 }
 
 /// Transaction set format variant.
