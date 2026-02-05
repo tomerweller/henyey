@@ -477,6 +477,7 @@ pub fn replay_ledger(
 /// * `expected_tx_results` - Optional expected results for comparison
 /// * `eviction_iterator` - Current eviction scan position (Protocol 23+)
 /// * `module_cache` - Optional persistent module cache for Soroban WASM reuse
+/// * `prev_id_pool` - The ID pool value from the previous ledger (for correct offer ID assignment)
 #[allow(clippy::too_many_arguments)]
 pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
@@ -489,6 +490,7 @@ pub fn replay_ledger_with_execution(
     eviction_iterator: Option<EvictionIterator>,
     module_cache: Option<&PersistentModuleCache>,
     soroban_state_size: Option<u64>,
+    prev_id_pool: u64,
 ) -> Result<LedgerReplayResult> {
     if config.verify_results {
         verify::verify_tx_set(header, tx_set)?;
@@ -498,7 +500,10 @@ pub fn replay_ledger_with_execution(
     // This ensures merge results are cached and won't be lost during clone.
     bucket_list.resolve_all_pending_merges();
 
-    let snapshot = LedgerSnapshot::empty(header.ledger_seq);
+    // Create snapshot with the correct id_pool from the previous ledger.
+    // This is critical for correct offer ID assignment during transaction execution.
+    let mut snapshot = LedgerSnapshot::empty(header.ledger_seq);
+    snapshot.set_id_pool(prev_id_pool);
     let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
     // Also include hot archive bucket list for archived entries and their TTLs
     let hot_archive_ref = hot_archive_bucket_list
@@ -625,6 +630,9 @@ pub fn replay_ledger_with_execution(
     //
     // IMPORTANT: We must check only the LIVE bucket list, not the hot archive.
     // Entries that exist only in hot archive should still be INITENTRY in the live list.
+    //
+    // NOTE: To match verify-execution behavior, we ONLY check ContractCode and ContractData
+    // entries. Other entry types should remain as INIT even if they exist in the bucket list.
     let mut init_entries: Vec<LedgerEntry> = Vec::new();
     let mut moved_to_live_count = 0u32;
     for entry in delta_init_entries {
@@ -635,8 +643,22 @@ pub fn replay_ledger_with_execution(
                 continue;
             }
         };
+
+        // Only check bucket list for ContractCode and ContractData (matching verify-exec)
+        let should_check_bucket_list = matches!(
+            &entry.data,
+            stellar_xdr::curr::LedgerEntryData::ContractCode(_)
+                | stellar_xdr::curr::LedgerEntryData::ContractData(_)
+        );
+
         // Check if entry exists in the LIVE bucket list (not hot archive)
-        if let Ok(Some(_prev)) = bucket_list.get(&key) {
+        let already_in_bucket_list = if should_check_bucket_list {
+            bucket_list.get(&key).ok().flatten().is_some()
+        } else {
+            false
+        };
+
+        if already_in_bucket_list {
             // Entry already exists in live bucket list - treat as update (LIVEENTRY)
             tracing::debug!(
                 ledger_seq = header.ledger_seq,
@@ -824,11 +846,45 @@ pub fn replay_ledger_with_execution(
     }
 
     // Apply changes to live bucket list SECOND (after hot archive update).
+    // Debug: compute hash of entries for comparison with verify-execution
+    let init_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for e in &init_entries {
+            if let Ok(xdr) = e.to_xdr(stellar_xdr::curr::Limits::none()) {
+                hasher.update(&xdr);
+            }
+        }
+        hex::encode(hasher.finalize())
+    };
+    let live_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for e in &all_live_entries {
+            if let Ok(xdr) = e.to_xdr(stellar_xdr::curr::Limits::none()) {
+                hasher.update(&xdr);
+            }
+        }
+        hex::encode(hasher.finalize())
+    };
+    let dead_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for k in &all_dead_entries {
+            if let Ok(xdr) = k.to_xdr(stellar_xdr::curr::Limits::none()) {
+                hasher.update(&xdr);
+            }
+        }
+        hex::encode(hasher.finalize())
+    };
     tracing::info!(
         ledger_seq = header.ledger_seq,
         init_count = init_entries.len(),
         live_count = all_live_entries.len(),
         dead_count = all_dead_entries.len(),
+        init_hash = %&init_hash[..16],
+        live_hash = %&live_hash[..16],
+        dead_hash = %&dead_hash[..16],
         "Replay add_batch entry counts - FINAL"
     );
     bucket_list
@@ -841,6 +897,14 @@ pub fn replay_ledger_with_execution(
             all_dead_entries,
         )
         .map_err(HistoryError::Bucket)?;
+
+    // Debug: log bucket list hash after add_batch for comparison with verify-execution
+    let post_add_batch_hash = bucket_list.hash();
+    tracing::info!(
+        ledger_seq = header.ledger_seq,
+        live_bucket_hash = %post_add_batch_hash.to_hex(),
+        "Bucket list hash after add_batch"
+    );
 
     if config.verify_bucket_list {
         // Bucket list verification during replay is only reliable at checkpoints.
@@ -1532,6 +1596,7 @@ mod tests {
             None,
             None, // module_cache
             None, // soroban_state_size
+            0,    // prev_id_pool
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
@@ -1564,6 +1629,7 @@ mod tests {
             None,
             None, // module_cache
             None, // soroban_state_size
+            0,    // prev_id_pool
         );
 
         assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
@@ -1599,6 +1665,7 @@ mod tests {
             None,
             None, // module_cache
             None, // soroban_state_size
+            0,    // prev_id_pool
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));

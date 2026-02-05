@@ -177,6 +177,14 @@ impl LedgerSnapshot {
         Ok(self.entries.contains_key(&key_bytes))
     }
 
+    /// Set the ID pool value in the header.
+    ///
+    /// This is used during replay to set the correct starting ID pool
+    /// from the previous ledger, so that new offers get the correct IDs.
+    pub fn set_id_pool(&mut self, id_pool: u64) {
+        self.header.id_pool = id_pool;
+    }
+
     /// Get the number of cached entries.
     pub fn num_entries(&self) -> usize {
         self.entries.len()
@@ -602,5 +610,31 @@ mod tests {
         let account = snapshot.get_account(&account_id).unwrap();
         assert!(account.is_some());
         assert_eq!(account.unwrap().balance, 1000000000);
+    }
+
+    /// Regression test for catchup replay id_pool fix.
+    ///
+    /// During catchup replay, the executor needs the previous ledger's id_pool
+    /// to correctly assign offer IDs when transactions create new offers.
+    /// Without this fix, LedgerSnapshot::empty() would always have id_pool=0,
+    /// causing new offers to get IDs starting from 1 instead of the correct
+    /// sequential value from the checkpoint.
+    #[test]
+    fn test_set_id_pool_for_replay() {
+        // Create an empty snapshot (as used in replay)
+        let mut snapshot = LedgerSnapshot::empty(100);
+
+        // Verify default id_pool is 0
+        assert_eq!(snapshot.header().id_pool, 0);
+
+        // Set id_pool to a value from a checkpoint (e.g., 20680)
+        let checkpoint_id_pool = 20680;
+        snapshot.set_id_pool(checkpoint_id_pool);
+
+        // Verify id_pool was updated correctly
+        assert_eq!(snapshot.header().id_pool, checkpoint_id_pool);
+
+        // This ensures that when the executor creates new offers during replay,
+        // they will get IDs starting from 20681, 20682, etc. instead of 1, 2, etc.
     }
 }

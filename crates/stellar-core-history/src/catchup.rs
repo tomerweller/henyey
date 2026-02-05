@@ -451,13 +451,19 @@ impl CatchupManager {
                 self.download_checkpoint_header(checkpoint_seq).await?;
             (checkpoint_header, header_hash, 0)
         } else {
-            // Replay ledgers to reach target
+            // Replay ledgers to reach target.
+            // First download the checkpoint header to get the starting id_pool.
+            let (checkpoint_header, _) =
+                self.download_checkpoint_header(checkpoint_seq).await?;
+            let checkpoint_id_pool = checkpoint_header.id_pool;
+
             let final_state = self
                 .replay_ledgers(
                     &mut bucket_list,
                     hot_archive_bucket_list.as_mut(),
                     &ledger_data,
                     network_id,
+                    checkpoint_id_pool,
                 )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
@@ -721,6 +727,11 @@ impl CatchupManager {
             self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
             self.verify_downloaded_data(&ledger_data)?;
 
+            // Get the starting id_pool from the checkpoint before replaying
+            let (checkpoint_header, _) =
+                self.download_checkpoint_header(download_from_checkpoint).await?;
+            let checkpoint_id_pool = checkpoint_header.id_pool;
+
             // Replay ledgers
             self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
 
@@ -730,6 +741,7 @@ impl CatchupManager {
                     hot_archive_bucket_list.as_mut(),
                     &ledger_data,
                     network_id,
+                    checkpoint_id_pool,
                 )
                 .await?;
 
@@ -995,6 +1007,7 @@ impl CatchupManager {
                     hot_archive_bucket_list.as_mut(),
                     &ledger_data,
                     network_id,
+                    checkpoint_header.id_pool, // Use checkpoint's id_pool for correct offer IDs
                 )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
@@ -2094,12 +2107,19 @@ impl CatchupManager {
     }
 
     /// Replay ledgers and update the bucket list.
+    ///
+    /// # Arguments
+    ///
+    /// * `checkpoint_id_pool` - The ID pool value from the checkpoint header.
+    ///   This is the starting `id_pool` for the first ledger being replayed.
+    ///   Required for correct offer ID assignment during transaction execution.
     async fn replay_ledgers(
         &mut self,
         bucket_list: &mut BucketList,
         mut hot_archive_bucket_list: Option<&mut HotArchiveBucketList>,
         ledger_data: &[LedgerData],
         network_id: NetworkId,
+        checkpoint_id_pool: u64,
     ) -> Result<ReplayedLedgerState> {
         use stellar_core_bucket::EvictionIterator;
 
@@ -2112,6 +2132,10 @@ impl CatchupManager {
         let total = ledger_data.len();
         let mut last_result: Option<LedgerReplayResult> = None;
         let mut last_header: Option<LedgerHeader> = None;
+
+        // Track the ID pool for correct offer ID assignment.
+        // Start with the checkpoint's id_pool and update from each ledger header.
+        let mut prev_id_pool = checkpoint_id_pool;
 
         // Load eviction iterator from checkpoint state instead of starting fresh.
         // The EvictionIterator ConfigSettingEntry tracks where the eviction scan was
@@ -2158,6 +2182,7 @@ impl CatchupManager {
                 eviction_iterator,
                 None, // TODO: Initialize module cache for catchup performance
                 soroban_state_size, // Soroban state size for window updates
+                prev_id_pool, // ID pool from previous ledger for correct offer ID assignment
             )?;
             // Update Soroban state size tracking based on accurate delta from replay.
             // The replay result computes this delta from the full change records,
@@ -2169,6 +2194,9 @@ impl CatchupManager {
 
             // Update eviction iterator for next ledger
             eviction_iterator = result.eviction_iterator;
+
+            // Update prev_id_pool for the next ledger
+            prev_id_pool = data.header.id_pool;
 
             debug!(
                 "Replayed ledger {}/{}: {} txs, {} ops",
