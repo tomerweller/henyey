@@ -202,9 +202,6 @@ impl Clone for LedgerSnapshot {
 /// Callback type for lazy entry lookup (e.g., from bucket list).
 pub type EntryLookupFn = Arc<dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync>;
 
-/// Callback type for historical header lookup (e.g., from database).
-pub type LedgerHeaderLookupFn = Arc<dyn Fn(u32) -> Result<Option<LedgerHeader>> + Send + Sync>;
-
 /// Callback type for full entry enumeration (e.g., bucket list scan).
 pub type EntriesLookupFn = Arc<dyn Fn() -> Result<Vec<LedgerEntry>> + Send + Sync>;
 
@@ -225,10 +222,9 @@ pub type OffersByAccountAssetFn =
 ///
 /// # Lookup Functions
 ///
-/// Three optional lookup functions can be configured:
+/// Two optional lookup functions can be configured:
 ///
 /// - **Entry lookup**: Fetches individual entries (e.g., from bucket list)
-/// - **Header lookup**: Fetches historical headers (e.g., from database)
 /// - **Entries scan**: Returns all live entries (e.g., for full state analysis)
 ///
 /// # Example
@@ -245,8 +241,6 @@ pub struct SnapshotHandle {
     inner: Arc<LedgerSnapshot>,
     /// Optional fallback for entry lookups not in cache.
     lookup_fn: Option<EntryLookupFn>,
-    /// Optional lookup for historical ledger headers.
-    header_lookup_fn: Option<LedgerHeaderLookupFn>,
     /// Optional enumeration of all live entries.
     entries_fn: Option<EntriesLookupFn>,
     /// Optional batch lookup for multiple entries in a single pass.
@@ -261,7 +255,6 @@ impl SnapshotHandle {
         Self {
             inner: Arc::new(snapshot),
             lookup_fn: None,
-            header_lookup_fn: None,
             entries_fn: None,
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
@@ -273,40 +266,21 @@ impl SnapshotHandle {
         Self {
             inner: Arc::new(snapshot),
             lookup_fn: Some(lookup_fn),
-            header_lookup_fn: None,
             entries_fn: None,
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
         }
     }
 
-    /// Create a new handle with lookup functions for entries and headers.
-    pub fn with_lookups(
-        snapshot: LedgerSnapshot,
-        lookup_fn: EntryLookupFn,
-        header_lookup_fn: LedgerHeaderLookupFn,
-    ) -> Self {
-        Self {
-            inner: Arc::new(snapshot),
-            lookup_fn: Some(lookup_fn),
-            header_lookup_fn: Some(header_lookup_fn),
-            entries_fn: None,
-            batch_lookup_fn: None,
-            offers_by_account_asset_fn: None,
-        }
-    }
-
-    /// Create a new handle with lookup functions for entries, headers, and full scans.
+    /// Create a new handle with lookup functions for entries and full scans.
     pub fn with_lookups_and_entries(
         snapshot: LedgerSnapshot,
         lookup_fn: EntryLookupFn,
-        header_lookup_fn: LedgerHeaderLookupFn,
         entries_fn: EntriesLookupFn,
     ) -> Self {
         Self {
             inner: Arc::new(snapshot),
             lookup_fn: Some(lookup_fn),
-            header_lookup_fn: Some(header_lookup_fn),
             entries_fn: Some(entries_fn),
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
@@ -316,11 +290,6 @@ impl SnapshotHandle {
     /// Set the lookup function.
     pub fn set_lookup(&mut self, lookup_fn: EntryLookupFn) {
         self.lookup_fn = Some(lookup_fn);
-    }
-
-    /// Set the ledger header lookup function.
-    pub fn set_header_lookup(&mut self, lookup_fn: LedgerHeaderLookupFn) {
-        self.header_lookup_fn = Some(lookup_fn);
     }
 
     /// Set the full-entry lookup function.
@@ -420,19 +389,6 @@ impl SnapshotHandle {
     /// Get the header.
     pub fn header(&self) -> &LedgerHeader {
         &self.inner.header
-    }
-
-    /// Look up a ledger header by sequence number.
-    pub fn get_ledger_header(&self, seq: u32) -> Result<Option<LedgerHeader>> {
-        if seq == self.inner.ledger_seq {
-            return Ok(Some(self.inner.header.clone()));
-        }
-
-        if let Some(ref lookup_fn) = self.header_lookup_fn {
-            return lookup_fn(seq);
-        }
-
-        Ok(None)
     }
 
     /// Look up an entry.

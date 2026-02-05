@@ -78,7 +78,7 @@ This crate provides the core ledger state management for the Stellar network. It
 use stellar_core_ledger::{LedgerManager, LedgerManagerConfig, LedgerCloseData, TransactionSetVariant};
 
 // Create and initialize the ledger manager
-let manager = LedgerManager::new(db, network_passphrase, LedgerManagerConfig::default());
+let manager = LedgerManager::new(network_passphrase, LedgerManagerConfig::default());
 manager.initialize_from_buckets(bucket_list, None, header)?;
 
 // Close a ledger with externalized data

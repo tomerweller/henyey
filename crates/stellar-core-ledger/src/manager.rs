@@ -46,7 +46,6 @@ use stellar_core_bucket::{
     BucketEntry, BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
 };
 use stellar_core_common::{Hash256, NetworkId};
-use stellar_core_db::Database;
 use stellar_core_tx::soroban::PersistentModuleCache;
 use stellar_core_tx::state::AssetKey;
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
@@ -208,13 +207,13 @@ fn load_state_archival_settings_from_snapshot(
 /// Configuration options for the [`LedgerManager`].
 ///
 /// This struct controls various aspects of ledger processing behavior,
-/// including validation, persistence, and event emission.
+/// including validation and event emission.
 ///
 /// # Defaults
 ///
-/// The default configuration enables all validation and persistence,
-/// which is appropriate for production use. For testing, you may want
-/// to disable certain validations for faster execution.
+/// The default configuration enables all validation, which is appropriate
+/// for production use. For testing, you may want to disable certain
+/// validations for faster execution.
 #[derive(Debug, Clone)]
 pub struct LedgerManagerConfig {
     /// Whether to validate bucket list hashes against header values.
@@ -223,12 +222,6 @@ pub struct LedgerManagerConfig {
     /// expected hash in the ledger header. Disable for replay-only scenarios
     /// where hash verification is not needed.
     pub validate_bucket_hash: bool,
-
-    /// Whether to persist ledger state to the database.
-    ///
-    /// When enabled, ledger headers and other metadata are written to
-    /// the database after each close. Disable for in-memory-only operation.
-    pub persist_to_db: bool,
 
     /// Whether to emit classic (non-Soroban) contract events.
     ///
@@ -247,7 +240,6 @@ impl Default for LedgerManagerConfig {
     fn default() -> Self {
         Self {
             validate_bucket_hash: true,
-            persist_to_db: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
         }
@@ -284,7 +276,6 @@ struct LedgerState {
 ///
 /// - **Bucket List**: The Merkle tree of all ledger entries, providing
 ///   cryptographic integrity for the state
-/// - **Database**: Persistent storage for ledger headers and metadata
 /// - **Snapshots**: Point-in-time views for concurrent access
 ///
 /// # Initialization
@@ -304,9 +295,6 @@ struct LedgerState {
 /// All public methods are safe to call from multiple threads. Internal state
 /// is protected by RwLocks to allow concurrent reads during ledger processing.
 pub struct LedgerManager {
-    /// Database handle for persistent storage.
-    db: Database,
-
     /// Live bucket list containing all current ledger entries.
     ///
     /// Wrapped in Arc for efficient sharing with snapshots.
@@ -368,12 +356,11 @@ impl LedgerManager {
     /// Create a new ledger manager.
     ///
     /// The ledger starts uninitialized and must be initialized via
-    /// `initialize_from_buckets` or by loading from the database.
-    pub fn new(db: Database, network_passphrase: String, config: LedgerManagerConfig) -> Self {
+    /// `initialize_from_buckets` before ledger close operations can begin.
+    pub fn new(network_passphrase: String, config: LedgerManagerConfig) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
 
         Self {
-            db,
             bucket_list: Arc::new(RwLock::new(BucketList::default())),
             hot_archive_bucket_list: Arc::new(RwLock::new(None)),
             network_passphrase,
@@ -1388,11 +1375,6 @@ impl LedgerManager {
                 Ok(result)
             });
 
-        // Create a lookup function that queries the ledger header table
-        let db = self.db.clone();
-        let header_lookup_fn: crate::snapshot::LedgerHeaderLookupFn =
-            Arc::new(move |seq: u32| db.get_ledger_header(seq).map_err(LedgerError::from));
-
         // Create entries function that reads from the in-memory offer store.
         // This avoids expensive SQL queries or bucket list scans during orderbook operations.
         // The in-memory store is populated at initialization and maintained incrementally.
@@ -1463,12 +1445,7 @@ impl LedgerManager {
             },
         );
 
-        let mut handle = SnapshotHandle::with_lookups_and_entries(
-            snapshot,
-            lookup_fn,
-            header_lookup_fn,
-            entries_fn,
-        );
+        let mut handle = SnapshotHandle::with_lookups_and_entries(snapshot, lookup_fn, entries_fn);
         handle.set_batch_lookup(batch_lookup_fn);
         handle.set_offers_by_account_asset(offers_by_account_asset_fn);
         Ok(handle)
@@ -1731,11 +1708,6 @@ impl LedgerManager {
         }
 
         Ok(())
-    }
-
-    /// Get the database handle.
-    pub fn database(&self) -> &Database {
-        &self.db
     }
 
     /// Get Soroban network configuration information.
@@ -2864,7 +2836,6 @@ mod tests {
     fn test_ledger_manager_config_default() {
         let config = LedgerManagerConfig::default();
         assert!(config.validate_bucket_hash);
-        assert!(config.persist_to_db);
     }
 
     #[test]

@@ -59,10 +59,6 @@ pub enum LedgerError {
     #[error("invalid header chain: {0}")]
     InvalidHeaderChain(String),
 
-    /// Error from the database layer.
-    #[error("database error: {0}")]
-    Database(#[from] stellar_core_db::DbError),
-
     /// Error from bucket list operations.
     #[error("bucket error: {0}")]
     Bucket(#[from] stellar_core_bucket::BucketError),

@@ -10,7 +10,6 @@ rust-version.workspace = true
 stellar-xdr.workspace = true
 stellar-core-common.workspace = true
 stellar-core-crypto.workspace = true
-stellar-core-db.workspace = true
 stellar-core-bucket.workspace = true
 stellar-core-tx.workspace = true
 soroban-env-host-p25.workspace = true

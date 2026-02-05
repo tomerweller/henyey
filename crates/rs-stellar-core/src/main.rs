@@ -2939,14 +2939,11 @@ async fn cmd_verify_execution(
         println!();
     }
 
-    // Create LedgerManager with in-memory database
-    let db = stellar_core_db::Database::open_in_memory()?;
+    // Create LedgerManager
     let ledger_manager = LedgerManager::new(
-        db,
         config.network.passphrase.clone(),
         LedgerManagerConfig {
             validate_bucket_hash: true,
-            persist_to_db: false,
             ..Default::default()
         },
     );
@@ -3177,23 +3174,9 @@ async fn cmd_verify_execution(
             let set_state_us = t0.elapsed().as_micros() as u64;
 
             let t0 = std::time::Instant::now();
-            let mut snapshot_handle = ledger_manager.create_snapshot()
+            let snapshot_handle = ledger_manager.create_snapshot()
                 .map_err(|e| anyhow::anyhow!("Failed to create snapshot: {}", e))?;
             let create_snapshot_us = t0.elapsed().as_micros() as u64;
-
-            // Override header lookup with local checkpoint headers (not in DB)
-            let header_map: std::collections::HashMap<u32, stellar_xdr::curr::LedgerHeader> =
-                headers
-                    .iter()
-                    .map(|entry| (entry.header.ledger_seq, entry.header.clone()))
-                    .collect();
-            let header_map = std::sync::Arc::new(header_map);
-            let header_lookup: std::sync::Arc<
-                dyn Fn(u32) -> stellar_core_ledger::Result<Option<stellar_xdr::curr::LedgerHeader>>
-                    + Send
-                    + Sync,
-            > = std::sync::Arc::new(move |seq| Ok(header_map.get(&seq).cloned()));
-            snapshot_handle.set_header_lookup(header_lookup);
 
             // Load Soroban config from ledger state
             let t0 = std::time::Instant::now();

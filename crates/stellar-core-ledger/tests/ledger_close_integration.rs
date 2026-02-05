@@ -1,6 +1,5 @@
 use stellar_core_bucket::BucketList;
 use stellar_core_common::Hash256;
-use stellar_core_db::Database;
 use stellar_core_ledger::{
     LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
 };
@@ -41,14 +40,13 @@ fn make_genesis_header() -> LedgerHeader {
 
 #[test]
 fn test_ledger_close_with_empty_tx_set() {
-    let db = Database::open_in_memory().expect("db");
     let _bucket_dir = tempfile::tempdir().expect("bucket dir");
 
     let config = LedgerManagerConfig {
         validate_bucket_hash: false,
         ..Default::default()
     };
-    let ledger = LedgerManager::new(db, "Test Network".to_string(), config);
+    let ledger = LedgerManager::new("Test Network".to_string(), config);
 
     let bucket_list = BucketList::new();
     let header = make_genesis_header();

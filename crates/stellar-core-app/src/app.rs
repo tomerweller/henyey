@@ -748,11 +748,9 @@ impl App {
 
         // Initialize ledger manager
         let ledger_manager = Arc::new(LedgerManager::new(
-            db.clone(),
             config.network.passphrase.clone(),
             LedgerManagerConfig {
                 validate_bucket_hash: true,
-                persist_to_db: true,
                 emit_classic_events: config.events.emit_classic_events,
                 backfill_stellar_asset_events: config.events.backfill_stellar_asset_events,
             },
