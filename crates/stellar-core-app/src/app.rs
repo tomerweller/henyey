@@ -1306,57 +1306,21 @@ impl App {
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(config))` - The ConfigUpgradeSet as a JSON-serializable value
-    /// * `Ok(None)` - The upgrade set was not found in the ledger
-    /// * `Err` - An error occurred while reading from the ledger
+    /// * `Some(json)` - The ConfigUpgradeSet as a JSON-serializable value
+    /// * `None` - The upgrade set was not found or is invalid
     pub fn get_config_upgrade_set(
         &self,
         key: &stellar_xdr::curr::ConfigUpgradeSetKey,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
-        use stellar_xdr::curr::{
-            ConfigUpgradeSet, LedgerEntryData, ReadXdr, ScVal, TtlEntry,
-        };
+    ) -> Option<serde_json::Value> {
+        let frame = self.ledger_manager.get_config_upgrade_set(key)?;
+        let upgrade_set = frame.to_xdr();
 
-        // Build the ledger key for the config upgrade set
-        let ledger_key = stellar_core_ledger::config_upgrade::ConfigUpgradeSetFrame::get_ledger_key(key);
-
-        // Look up the entry in the ledger
-        let entry = self.ledger_manager.load_entry(&ledger_key)?;
-
-        let Some(entry) = entry else {
-            return Ok(None);
-        };
-
-        // Extract the ConfigUpgradeSet from the entry
-        match &entry.data {
-            LedgerEntryData::Ttl(TtlEntry {
-                key_hash: _,
-                live_until_ledger_seq: _,
-            }) => {
-                // This shouldn't happen - we looked up the wrong entry type
-                Ok(None)
-            }
-            LedgerEntryData::ContractData(contract_data) => {
-                // Extract the bytes from the ScVal
-                match &contract_data.val {
-                    ScVal::Bytes(bytes) => {
-                        let upgrade_set =
-                            ConfigUpgradeSet::from_xdr(bytes.as_slice(), stellar_xdr::curr::Limits::none())?;
-
-                        // Convert to JSON-serializable format
-                        let json = serde_json::json!({
-                            "updated_entry": upgrade_set.updated_entry.iter().map(|entry| {
-                                format!("{:?}", entry)
-                            }).collect::<Vec<_>>()
-                        });
-
-                        Ok(Some(json))
-                    }
-                    _ => Ok(None),
-                }
-            }
-            _ => Ok(None),
-        }
+        // Convert to JSON-serializable format
+        Some(serde_json::json!({
+            "updated_entry": upgrade_set.updated_entry.iter().map(|entry| {
+                format!("{:?}", entry)
+            }).collect::<Vec<_>>()
+        }))
     }
 
     pub fn scp_slot_snapshots(&self, limit: usize) -> Vec<ScpSlotSnapshot> {

@@ -455,26 +455,6 @@ impl LedgerManager {
             .collect()
     }
 
-    /// Load a ledger entry by key.
-    pub fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        Ok(self.bucket_list.read().get(key)?)
-    }
-
-    /// Load an account by ID.
-    pub fn load_account(&self, id: &AccountId) -> Result<Option<AccountEntry>> {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: id.clone(),
-        });
-
-        if let Some(entry) = self.load_entry(&key)? {
-            if let LedgerEntryData::Account(account) = entry.data {
-                return Ok(Some(account));
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Initialize the ledger from bucket list state.
     ///
     /// This is used during catchup from history archives.
@@ -1531,6 +1511,28 @@ impl LedgerManager {
         }
         let snapshot = self.create_snapshot().ok()?;
         load_soroban_network_info(&snapshot)
+    }
+
+    /// Look up a pending ConfigUpgradeSet by its key.
+    ///
+    /// This retrieves a ConfigUpgradeSet that has been uploaded to the network
+    /// but not yet applied. Validators use this to validate scheduled upgrades.
+    ///
+    /// Returns `None` if:
+    /// - The ledger is not initialized
+    /// - The CONTRACT_DATA entry doesn't exist
+    /// - The entry's TTL has expired
+    /// - The entry is not TEMPORARY durability
+    /// - The XDR cannot be decoded
+    pub fn get_config_upgrade_set(
+        &self,
+        key: &stellar_xdr::curr::ConfigUpgradeSetKey,
+    ) -> Option<std::sync::Arc<crate::config_upgrade::ConfigUpgradeSetFrame>> {
+        if !self.is_initialized() {
+            return None;
+        }
+        let snapshot = self.create_snapshot().ok()?;
+        crate::config_upgrade::ConfigUpgradeSetFrame::make_from_key(&snapshot, key)
     }
 }
 

@@ -2027,17 +2027,11 @@ async fn dumpproposedsettings_handler(
 
     // Load ConfigUpgradeSet from ledger
     match state.app.get_config_upgrade_set(&key) {
-        Ok(Some(settings)) => (StatusCode::OK, Json(serde_json::json!(settings))),
-        Ok(None) => (
+        Some(settings) => (StatusCode::OK, Json(serde_json::json!(settings))),
+        None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "configUpgradeSet is missing or invalid"
-            })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": e.to_string()
             })),
         ),
     }
