@@ -908,7 +908,9 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
             // current state TTL to provide equivalent within-cluster visibility.
             // (For different clusters, C++ uses separate mThreadEntryMaps, but we don't implement
             // cluster isolation, so all TXs share state - this is correct for sequential execution.)
-            let current_ttl = state.get_ttl(&key_hash).map(|ttl| ttl.live_until_ledger_seq);
+            let current_ttl = state
+                .get_ttl(&key_hash)
+                .map(|ttl| ttl.live_until_ledger_seq);
             if current_ttl.is_some() {
                 tracing::debug!(
                     key_type = if matches!(key, LedgerKey::ContractCode(_)) {
@@ -1402,11 +1404,8 @@ pub fn execute_host_function_with_cache(
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<&dyn super::HotArchiveLookup>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
-    eprintln!("[TIMING] execute_host_function_with_cache: entry, protocol={}, has_module_cache={}, ro_keys={}, rw_keys={}",
-        context.protocol_version, module_cache.is_some(), soroban_data.resources.footprint.read_only.len(), soroban_data.resources.footprint.read_write.len());
     if context.protocol_version >= 25 {
         let p25_cache = module_cache.and_then(|c| c.as_p25());
-        eprintln!("[TIMING] Dispatching to P25 path, has_p25_cache={}", p25_cache.is_some());
         return execute_host_function_p25(
             host_function,
             auth_entries,
@@ -1420,7 +1419,10 @@ pub fn execute_host_function_with_cache(
         );
     }
     let p24_cache = module_cache.and_then(|c| c.as_p24());
-    tracing::info!(has_p24_cache = p24_cache.is_some(), "Dispatching to P24 path");
+    tracing::info!(
+        has_p24_cache = p24_cache.is_some(),
+        "Dispatching to P24 path"
+    );
     execute_host_function_p24(
         host_function,
         auth_entries,
@@ -2218,7 +2220,6 @@ fn execute_host_function_p25(
         Ok(())
     };
 
-    let footprint_start = std::time::Instant::now();
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
             add_entry(key, entry.as_ref(), live_until)?;
@@ -2316,17 +2317,10 @@ fn execute_host_function_p25(
         }
     }
 
-    let footprint_elapsed = footprint_start.elapsed();
-    eprintln!("[TIMING] P25: Prepared entries for e2e_invoke: ledger_entries={}, ttl_entries={}, restored={}, footprint_ms={}",
-        encoded_ledger_entries.len(), encoded_ttl_entries.len(), actual_restored_indices.len(), footprint_elapsed.as_millis());
-
     // Use existing module cache if provided, otherwise build one from the footprint.
-    let cache_start = std::time::Instant::now();
     let module_cache = if let Some(cache) = existing_cache {
-        eprintln!("[TIMING] P25: Using existing persistent module cache");
         Some(cache.clone())
     } else {
-        eprintln!("[TIMING] P25: FALLBACK - building per-TX module cache from footprint");
         build_module_cache_for_footprint_p25(
             state,
             &soroban_data.resources.footprint,
@@ -2334,10 +2328,7 @@ fn execute_host_function_p25(
             context.sequence,
         )
     };
-    let cache_elapsed = cache_start.elapsed();
-    eprintln!("[TIMING] P25: Module cache ready: cache_ms={}, has_cache={}", cache_elapsed.as_millis(), module_cache.is_some());
 
-    let invoke_start = std::time::Instant::now();
     let mut diagnostic_events: Vec<soroban_env_host25::xdr::DiagnosticEvent> = Vec::new();
 
     let result = match e2e_invoke::invoke_host_function(
@@ -2356,18 +2347,16 @@ fn execute_host_function_p25(
         None,
         module_cache,
     ) {
-        Ok(r) => {
-            let invoke_elapsed = invoke_start.elapsed();
-            eprintln!("[TIMING] P25: e2e_invoke completed successfully: invoke_ms={}, cpu_consumed={}, mem_consumed={}",
-                invoke_elapsed.as_millis(), budget.get_cpu_insns_consumed().unwrap_or(0), budget.get_mem_bytes_consumed().unwrap_or(0));
-            r
-        }
+        Ok(r) => r,
         Err(e) => {
-            let invoke_elapsed = invoke_start.elapsed();
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
             let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
-            eprintln!("[TIMING] P25: e2e_invoke FAILED: invoke_ms={}, cpu_consumed={}, mem_consumed={}, error={}",
-                invoke_elapsed.as_millis(), cpu_insns_consumed, mem_bytes_consumed, e);
+            tracing::warn!(
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
+                error = %e,
+                "P25: e2e_invoke failed"
+            );
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host25::xdr::WriteXdr as _;
                 if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {

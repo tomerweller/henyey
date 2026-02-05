@@ -1550,7 +1550,9 @@ impl TransactionExecutor {
                     key_hash: key_hash.clone(),
                 });
                 // Also check if TTL was deleted (along with its parent entry)
-                if self.state.get_entry(&ttl_key).is_none() && !self.state.is_entry_deleted(&ttl_key) {
+                if self.state.get_entry(&ttl_key).is_none()
+                    && !self.state.is_entry_deleted(&ttl_key)
+                {
                     all_keys.push(ttl_key);
                 }
             }
@@ -3043,8 +3045,6 @@ impl TransactionExecutor {
                         self.state.rollback_to_savepoint(op_savepoint);
                         self.state.end_op_snapshot();
                         all_success = false;
-                        eprintln!("[ERROR] execute_single_operation failed: op_index={}, op_type={:?}, error={:?}",
-                            op_index, OperationType::from_body(&op.body), e);
                         debug!(
                             error = %e,
                             op_index = op_index,
@@ -3626,7 +3626,11 @@ impl TransactionExecutor {
     }
 
     /// Apply all state changes to the delta.
-    pub fn apply_to_delta(&self, _snapshot: &SnapshotHandle, delta: &mut LedgerDelta) -> Result<()> {
+    pub fn apply_to_delta(
+        &self,
+        _snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+    ) -> Result<()> {
         let state_delta = self.state.delta();
 
         // Apply created entries
