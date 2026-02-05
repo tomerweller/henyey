@@ -10,7 +10,7 @@
 //!
 //! - **State Management**: Maintaining the current ledger header
 //! - **Bucket List Integration**: Updating the Merkle tree of ledger entries
-//! - **Transaction Execution**: Coordinating transaction processing via [`LedgerCloseContext`]
+//! - **Transaction Execution**: Coordinating transaction processing via [`close_ledger`](LedgerManager::close_ledger)
 //! - **Snapshots**: Providing consistent point-in-time views for queries
 //!
 //! # Thread Safety
@@ -295,9 +295,8 @@ struct LedgerState {
 ///
 /// # Ledger Close Flow
 ///
-/// 1. Call [`begin_close`](Self::begin_close) with the externalized data
-/// 2. Use the returned [`LedgerCloseContext`] to apply transactions
-/// 3. Call [`commit`](LedgerCloseContext::commit) to finalize the ledger
+/// Call [`close_ledger`](Self::close_ledger) with the externalized data to
+/// execute transactions and finalize the ledger in a single call.
 ///
 /// # Thread Safety
 ///
@@ -1127,14 +1126,11 @@ impl LedgerManager {
         ctx.commit()
     }
 
-    /// Begin closing a new ledger.
+    /// Begin closing a new ledger (internal).
     ///
     /// Returns a LedgerCloseContext for applying transactions and
-    /// committing the ledger.
-    ///
-    /// Note: For most use cases, prefer [`close_ledger`](Self::close_ledger) which
-    /// handles the full close process in a single call.
-    pub fn begin_close(&self, close_data: LedgerCloseData) -> Result<LedgerCloseContext<'_>> {
+    /// committing the ledger. This is called by `close_ledger`.
+    fn begin_close(&self, close_data: LedgerCloseData) -> Result<LedgerCloseContext<'_>> {
         let state = self.state.read();
         if !state.initialized {
             return Err(LedgerError::NotInitialized);
@@ -1763,38 +1759,11 @@ impl LedgerManager {
     }
 }
 
-/// Context for closing a single ledger.
+/// Internal context for closing a single ledger.
 ///
-/// This struct is returned by [`LedgerManager::begin_close`] and provides
-/// the interface for processing transactions and finalizing the ledger.
-///
-/// # Lifecycle
-///
-/// 1. **Created**: Obtained from `LedgerManager::begin_close()`
-/// 2. **Transaction Processing**: Call [`apply_transactions`](Self::apply_transactions)
-///    to execute the transaction set
-/// 3. **Finalization**: Either [`commit`](Self::commit) to finalize or
-///    [`abort`](Self::abort) to discard changes
-///
-/// # State Isolation
-///
-/// The context holds a snapshot of the ledger state at the time of creation.
-/// All reads during transaction processing see this consistent snapshot,
-/// while writes are accumulated in a [`LedgerDelta`] until commit.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut ctx = manager.begin_close(close_data)?;
-///
-/// // Apply all transactions from the set
-/// let results = ctx.apply_transactions()?;
-///
-/// // Check results and commit
-/// let close_result = ctx.commit()?;
-/// println!("Closed ledger {}", close_result.ledger_seq());
-/// ```
-pub struct LedgerCloseContext<'a> {
+/// This struct is used internally by [`LedgerManager::close_ledger`] to
+/// process transactions and finalize the ledger.
+struct LedgerCloseContext<'a> {
     manager: &'a LedgerManager,
     close_data: LedgerCloseData,
     prev_header: LedgerHeader,
@@ -1811,39 +1780,40 @@ pub struct LedgerCloseContext<'a> {
     hot_archive_restored_keys: Vec<LedgerKey>,
 }
 
+#[allow(dead_code)]
 impl<'a> LedgerCloseContext<'a> {
     /// Get the ledger sequence being closed.
-    pub fn ledger_seq(&self) -> u32 {
+    fn ledger_seq(&self) -> u32 {
         self.close_data.ledger_seq
     }
 
     /// Get the close time.
-    pub fn close_time(&self) -> u64 {
+    fn close_time(&self) -> u64 {
         self.close_data.close_time
     }
 
     /// Get the snapshot for reading state.
-    pub fn snapshot(&self) -> &SnapshotHandle {
+    fn snapshot(&self) -> &SnapshotHandle {
         &self.snapshot
     }
 
     /// Get the delta for recording changes.
-    pub fn delta(&self) -> &LedgerDelta {
+    fn delta(&self) -> &LedgerDelta {
         &self.delta
     }
 
     /// Get a mutable reference to the delta.
-    pub fn delta_mut(&mut self) -> &mut LedgerDelta {
+    fn delta_mut(&mut self) -> &mut LedgerDelta {
         &mut self.delta
     }
 
     /// Get the stats.
-    pub fn stats(&self) -> &LedgerCloseStats {
+    fn stats(&self) -> &LedgerCloseStats {
         &self.stats
     }
 
     /// Load an entry from the snapshot.
-    pub fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+    fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // First check if we have a pending change
         if let Some(change) = self.delta.get_change(key)? {
             return Ok(change.current_entry().cloned());
@@ -1854,7 +1824,7 @@ impl<'a> LedgerCloseContext<'a> {
     }
 
     /// Load an account from the snapshot.
-    pub fn load_account(&self, id: &AccountId) -> Result<Option<AccountEntry>> {
+    fn load_account(&self, id: &AccountId) -> Result<Option<AccountEntry>> {
         let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: id.clone(),
         });
@@ -1869,22 +1839,22 @@ impl<'a> LedgerCloseContext<'a> {
     }
 
     /// Record creation of a new entry.
-    pub fn record_create(&mut self, entry: LedgerEntry) -> Result<()> {
+    fn record_create(&mut self, entry: LedgerEntry) -> Result<()> {
         self.delta.record_create(entry)
     }
 
     /// Record update of an existing entry.
-    pub fn record_update(&mut self, previous: LedgerEntry, current: LedgerEntry) -> Result<()> {
+    fn record_update(&mut self, previous: LedgerEntry, current: LedgerEntry) -> Result<()> {
         self.delta.record_update(previous, current)
     }
 
     /// Record deletion of an entry.
-    pub fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
+    fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
         self.delta.record_delete(entry)
     }
 
     /// Add an upgrade to apply.
-    pub fn add_upgrade(&mut self, upgrade: stellar_xdr::curr::LedgerUpgrade) {
+    fn add_upgrade(&mut self, upgrade: stellar_xdr::curr::LedgerUpgrade) {
         self.upgrade_ctx.add_upgrade(upgrade);
     }
 
@@ -1892,7 +1862,7 @@ impl<'a> LedgerCloseContext<'a> {
     ///
     /// This executes all transactions in order, recording state changes
     /// to the delta and collecting results.
-    pub fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
+    fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
         let transactions = self.close_data.tx_set.transactions_with_base_fee();
 
         if transactions.is_empty() {
@@ -1975,7 +1945,7 @@ impl<'a> LedgerCloseContext<'a> {
     }
 
     /// Commit the ledger close and produce the new header.
-    pub fn commit(mut self) -> Result<LedgerCloseResult> {
+    fn commit(mut self) -> Result<LedgerCloseResult> {
         let start = std::time::Instant::now();
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
@@ -2788,7 +2758,7 @@ impl<'a> LedgerCloseContext<'a> {
     }
 
     /// Abort the ledger close without committing.
-    pub fn abort(self) {
+    fn abort(self) {
         debug!(
             ledger_seq = self.close_data.ledger_seq,
             "Ledger close aborted"

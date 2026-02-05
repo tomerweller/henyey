@@ -775,16 +775,12 @@ impl UpgradeContext {
 ///
 /// # Usage
 ///
-/// Statistics are accumulated during transaction processing and can be
-/// accessed via `LedgerCloseContext::stats`.
+/// Statistics are accumulated during transaction processing and returned
+/// as part of [`LedgerCloseResult`].
 ///
 /// ```ignore
-/// let ctx = manager.begin_close(close_data)?;
-/// ctx.apply_transactions()?;
-/// let result = ctx.commit()?;
-///
-/// // Stats are available in the context before commit
-/// println!("Processed {} transactions", ctx.stats().tx_count);
+/// let result = manager.close_ledger(close_data)?;
+/// println!("Closed ledger {}", result.ledger_seq());
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct LedgerCloseStats {
