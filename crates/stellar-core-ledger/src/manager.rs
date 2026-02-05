@@ -27,8 +27,7 @@
 
 use crate::{
     close::{
-        LedgerCloseData, LedgerCloseResult, LedgerCloseStats, LedgerReplayData,
-        TransactionSetVariant, UpgradeContext,
+        LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
     },
     delta::{EntryChange, LedgerDelta},
     execution::{
@@ -88,22 +87,6 @@ fn index_offer_insert(
         .entry((seller, buying_key))
         .or_default()
         .insert(offer.offer_id);
-}
-
-/// Remove an offer from the (account, asset) secondary index.
-fn index_offer_remove(
-    index: &mut OfferAccountAssetIndex,
-    offer: &stellar_xdr::curr::OfferEntry,
-) {
-    let seller = account_id_bytes(&offer.seller_id);
-    let selling_key = AssetKey::from_asset(&offer.selling);
-    let buying_key = AssetKey::from_asset(&offer.buying);
-    if let Some(set) = index.get_mut(&(seller, selling_key)) {
-        set.remove(&offer.offer_id);
-    }
-    if let Some(set) = index.get_mut(&(seller, buying_key)) {
-        set.remove(&offer.offer_id);
-    }
 }
 
 /// Prepend a fee event to transaction metadata.
@@ -446,17 +429,6 @@ impl LedgerManager {
             .values()
             .map(|s| s.len())
             .sum()
-    }
-
-    /// Update the ledger header and hash for offline replay scenarios.
-    ///
-    /// This updates the internal state so that `create_snapshot()` uses the
-    /// correct header. Used by verify-execution and other offline tools.
-    pub fn set_state(&self, header: LedgerHeader, header_hash: Hash256) {
-        let mut state = self.state.write();
-        state.header = header;
-        state.header_hash = header_hash;
-        state.initialized = true;
     }
 
     /// Get the SCP timing configuration from the current ledger state.
@@ -1544,167 +1516,6 @@ impl LedgerManager {
             let mut state = self.state.write();
             state.header = new_header;
             state.header_hash = new_header_hash;
-        }
-
-        Ok(())
-    }
-
-    /// Apply a pre-computed ledger close to the manager's internal state.
-    ///
-    /// This is used by offline tools (replay-bucket-list) that have pre-computed
-    /// state changes from history archives. It performs the same state updates
-    /// as the internal `commit()` without re-executing transactions:
-    ///
-    /// 1. Hot archive add_batch (if protocol 23+)
-    /// 2. Bucket list add_batch (live)
-    /// 3. Soroban state update (init/live/dead)
-    /// 4. Module cache update (new contract code)
-    /// 5. In-memory offers update (insert/update/delete)
-    /// 6. Internal header update
-    pub fn apply_ledger_close(&self, data: LedgerReplayData) -> Result<()> {
-        use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
-        let close_start = std::time::Instant::now();
-
-        let ledger_seq = data.ledger_seq;
-        let protocol_version = data.protocol_version;
-
-        // 1. Hot archive add_batch (FIRST - matches C++ order: addHotArchiveBatch before addLiveBatch)
-        let t0 = std::time::Instant::now();
-        if let Some(ref mut hot_archive) = *self.hot_archive_bucket_list.write() {
-            hot_archive.add_batch(
-                ledger_seq,
-                protocol_version,
-                data.archived_entries,
-                data.restored_keys,
-            )?;
-        }
-        let ha_add_batch_us = t0.elapsed().as_micros() as u64;
-
-        // 2. Live bucket list add_batch (SECOND)
-        let t0 = std::time::Instant::now();
-        self.bucket_list.write().add_batch(
-            ledger_seq,
-            protocol_version,
-            BucketListType::Live,
-            data.init_entries.clone(),
-            data.live_entries.clone(),
-            data.dead_entries.clone(),
-        )?;
-        let bl_add_batch_us = t0.elapsed().as_micros() as u64;
-
-        // 3. Soroban state update
-        // Load rent config BEFORE acquiring soroban_state write lock to avoid deadlock.
-        let t0 = std::time::Instant::now();
-        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-            let rent_config = self.load_soroban_rent_config(&self.bucket_list.read());
-            self.soroban_state
-                .write()
-                .update_state(
-                    ledger_seq,
-                    &data.init_entries,
-                    &data.live_entries,
-                    &data.dead_entries,
-                    protocol_version,
-                    rent_config.as_ref(),
-                )
-                .map_err(|e| {
-                    LedgerError::Internal(format!("soroban state update failed: {}", e))
-                })?;
-        }
-        let soroban_update_us = t0.elapsed().as_micros() as u64;
-
-        // 4. Module cache update (new contract code)
-        let t0 = std::time::Instant::now();
-        {
-            let module_cache_guard = self.module_cache.read();
-            if let Some(ref cache) = *module_cache_guard {
-                for entry in data.init_entries.iter().chain(data.live_entries.iter()) {
-                    if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
-                        cache.add_contract(contract_code.code.as_slice(), protocol_version);
-                    }
-                }
-            }
-        }
-        let module_cache_us = t0.elapsed().as_micros() as u64;
-
-        // 5. In-memory offers update
-        let t0 = std::time::Instant::now();
-        self.update_offers_from_entries(&data.init_entries, &data.live_entries, &data.dead_entries)?;
-        let offers_update_us = t0.elapsed().as_micros() as u64;
-
-        // 6. Update header
-        self.set_state(data.header, data.header_hash);
-
-        let total_us = close_start.elapsed().as_micros() as u64;
-        tracing::info!(
-            ledger_seq,
-            total_us,
-            bl_add_batch_us,
-            ha_add_batch_us,
-            soroban_update_us,
-            module_cache_us,
-            offers_update_us,
-            init_count = data.init_entries.len(),
-            live_count = data.live_entries.len(),
-            dead_count = data.dead_entries.len(),
-            "apply_ledger_close timing"
-        );
-
-        Ok(())
-    }
-
-    /// Update in-memory offer store and secondary index from init/live/dead entry vectors.
-    fn update_offers_from_entries(
-        &self,
-        init_entries: &[LedgerEntry],
-        live_entries: &[LedgerEntry],
-        dead_entries: &[LedgerKey],
-    ) -> Result<()> {
-        if !*self.offers_initialized.read() {
-            return Ok(());
-        }
-
-        let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
-        let mut offer_deletes: Vec<i64> = Vec::new();
-
-        for entry in init_entries.iter().chain(live_entries.iter()) {
-            if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                offer_upserts.push(entry.clone());
-            }
-        }
-
-        for key in dead_entries {
-            if let LedgerKey::Offer(offer_key) = key {
-                offer_deletes.push(offer_key.offer_id);
-            }
-        }
-
-        if !offer_upserts.is_empty() || !offer_deletes.is_empty() {
-            // Update in-memory offer store and secondary index
-            let mut store = self.offer_store.write();
-            let mut idx = self.offer_account_asset_index.write();
-            for entry in &offer_upserts {
-                if let LedgerEntryData::Offer(ref offer) = entry.data {
-                    // Remove old index entries if the offer already existed
-                    if let Some(old_entry) = store.get(&offer.offer_id) {
-                        if let LedgerEntryData::Offer(ref old_offer) = old_entry.data {
-                            index_offer_remove(&mut idx, old_offer);
-                        }
-                    }
-                    // Add new index entries
-                    index_offer_insert(&mut idx, offer);
-                    store.insert(offer.offer_id, entry.clone());
-                }
-            }
-            for offer_id in &offer_deletes {
-                // Remove index entries before removing from store
-                if let Some(old_entry) = store.get(offer_id) {
-                    if let LedgerEntryData::Offer(ref old_offer) = old_entry.data {
-                        index_offer_remove(&mut idx, old_offer);
-                    }
-                }
-                store.remove(offer_id);
-            }
         }
 
         Ok(())

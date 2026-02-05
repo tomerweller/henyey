@@ -962,6 +962,69 @@ pub fn extract_transaction_results(
     }
 }
 
+/// Extract the transaction set from LedgerCloseMeta.
+///
+/// Returns either a Classic TransactionSet (V0) or Generalized set (V1/V2).
+/// This is useful for passing to `close_ledger` when replaying from CDP.
+pub fn extract_transaction_set(
+    meta: &LedgerCloseMeta,
+) -> stellar_core_ledger::TransactionSetVariant {
+    use stellar_core_ledger::TransactionSetVariant;
+    match meta {
+        LedgerCloseMeta::V0(v0) => TransactionSetVariant::Classic(v0.tx_set.clone()),
+        LedgerCloseMeta::V1(v1) => TransactionSetVariant::Generalized(v1.tx_set.clone()),
+        LedgerCloseMeta::V2(v2) => TransactionSetVariant::Generalized(v2.tx_set.clone()),
+    }
+}
+
+/// Create `LedgerCloseData` from `LedgerCloseMeta` for replay.
+///
+/// This extracts all the information needed to call `close_ledger`:
+/// - Transaction set
+/// - Close time
+/// - Previous ledger hash
+/// - Protocol upgrades
+/// - StellarValue extension (Basic or Signed)
+///
+/// # Arguments
+/// * `meta` - The LedgerCloseMeta from CDP
+/// * `prev_ledger_hash` - Hash of the previous ledger (from history archive headers)
+///
+/// # Example
+/// ```ignore
+/// let close_data = extract_ledger_close_data(&cdp_meta, prev_hash);
+/// let result = ledger_manager.close_ledger(close_data)?;
+/// ```
+pub fn extract_ledger_close_data(
+    meta: &LedgerCloseMeta,
+    prev_ledger_hash: stellar_core_common::Hash256,
+) -> stellar_core_ledger::LedgerCloseData {
+    use stellar_core_ledger::LedgerCloseData;
+    use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+
+    let header = extract_ledger_header(meta);
+    let tx_set = extract_transaction_set(meta);
+
+    // Decode upgrades from raw bytes
+    let upgrades: Vec<LedgerUpgrade> = header
+        .scp_value
+        .upgrades
+        .iter()
+        .filter_map(|upgrade_bytes| {
+            LedgerUpgrade::from_xdr(upgrade_bytes.0.as_slice(), Limits::none()).ok()
+        })
+        .collect();
+
+    LedgerCloseData::new(
+        header.ledger_seq,
+        tx_set,
+        header.scp_value.close_time.0,
+        prev_ledger_hash,
+    )
+    .with_upgrades(upgrades)
+    .with_stellar_value_ext(header.scp_value.ext.clone())
+}
+
 /// Extract evicted ledger keys from LedgerCloseMeta (V2 only).
 /// These are entries that were evicted from the live bucket list.
 pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::LedgerKey> {
