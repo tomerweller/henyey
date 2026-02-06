@@ -999,4 +999,366 @@ mod tests {
         let pools_for_usd = map.get_pools_for_asset(&asset_b);
         assert_eq!(pools_for_usd.len(), 1);
     }
+
+    // ============ P2-4: In-Memory Index Offer Positioning ============
+    //
+    // Upstream: BucketIndexTests.cpp "in-memory index construction"
+    // Tests that offer entries at different positions in the bucket
+    // are correctly indexed.
+
+    fn make_offer_entry(seed: u8, offer_id: i64) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Offer(OfferEntry {
+                seller_id: make_account_id(seed),
+                offer_id,
+                selling: Asset::Native,
+                buying: Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4(*b"USD\0"),
+                    issuer: make_account_id(0),
+                }),
+                amount: 1000,
+                price: Price { n: 1, d: 1 },
+                flags: 0,
+                ext: OfferEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_index_with_no_offers() {
+        // Index construction should work correctly with no offers
+        let entries: Vec<(BucketEntry, u64)> = (0..20u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        assert_eq!(index.len(), 20);
+        // No offer type range should exist
+        assert!(index.type_range(LedgerEntryType::Offer).is_none());
+        assert!(index.type_range(LedgerEntryType::Account).is_some());
+    }
+
+    #[test]
+    fn test_index_with_offers_at_end() {
+        // Offers positioned after account entries (sorted by type discriminant)
+        let mut entries: Vec<(BucketEntry, u64)> = Vec::new();
+
+        // Account entries first
+        for i in 0..10u8 {
+            entries.push((BucketEntry::Live(make_account_entry(i)), i as u64 * 100));
+        }
+        // Offer entries after
+        for i in 0..5u8 {
+            entries.push((
+                BucketEntry::Live(make_offer_entry(i, i as i64 + 1)),
+                (10 + i) as u64 * 100,
+            ));
+        }
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        assert_eq!(index.len(), 15);
+        assert!(index.type_range(LedgerEntryType::Account).is_some());
+        assert!(index.type_range(LedgerEntryType::Offer).is_some());
+
+        // Verify offer lookup works
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: make_account_id(2),
+            offer_id: 3,
+        });
+        assert!(index.get_offset(&offer_key).is_some());
+    }
+
+    #[test]
+    fn test_index_with_offers_between_types() {
+        // Mix of account, offer, and contract data entries
+        let mut entries: Vec<(BucketEntry, u64)> = Vec::new();
+
+        // Accounts (type discriminant comes first)
+        for i in 0..5u8 {
+            entries.push((BucketEntry::Live(make_account_entry(i)), i as u64 * 100));
+        }
+        // Offers (between accounts and contract data)
+        for i in 0..5u8 {
+            entries.push((
+                BucketEntry::Live(make_offer_entry(i, i as i64 + 1)),
+                (5 + i) as u64 * 100,
+            ));
+        }
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        assert_eq!(index.len(), 10);
+
+        // Both lookups should work
+        let acct_key = make_account_key(3);
+        assert!(index.get_offset(&acct_key).is_some());
+
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: make_account_id(3),
+            offer_id: 4,
+        });
+        assert!(index.get_offset(&offer_key).is_some());
+    }
+
+    // ============ P2-5: ContractData Key with Same ScVal ============
+    //
+    // Upstream: BucketIndexTests.cpp "ContractData key with same ScVal"
+    // Tests that contract data entries with identical ScVal keys but
+    // different contracts or durabilities are correctly distinguished.
+
+    fn make_contract_data_entry(
+        contract_seed: u8,
+        key_val: i32,
+        durability: ContractDataDurability,
+    ) -> LedgerEntry {
+        use stellar_xdr::curr::*;
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([contract_seed; 32]))),
+                key: ScVal::I32(key_val),
+                durability,
+                val: ScVal::I64(100),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_contract_data_key(
+        contract_seed: u8,
+        key_val: i32,
+        durability: ContractDataDurability,
+    ) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([contract_seed; 32]))),
+            key: ScVal::I32(key_val),
+            durability,
+        })
+    }
+
+    #[test]
+    fn test_contract_data_same_scval_different_contracts() {
+        // Same ScVal key, different contract addresses
+        let entries: Vec<(BucketEntry, u64)> = vec![
+            (
+                BucketEntry::Live(make_contract_data_entry(
+                    1,
+                    42,
+                    ContractDataDurability::Persistent,
+                )),
+                0,
+            ),
+            (
+                BucketEntry::Live(make_contract_data_entry(
+                    2,
+                    42,
+                    ContractDataDurability::Persistent,
+                )),
+                100,
+            ),
+        ];
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        assert_eq!(index.len(), 2);
+
+        // Both should be independently findable
+        let key1 = make_contract_data_key(1, 42, ContractDataDurability::Persistent);
+        let key2 = make_contract_data_key(2, 42, ContractDataDurability::Persistent);
+        assert!(index.get_offset(&key1).is_some());
+        assert!(index.get_offset(&key2).is_some());
+        assert_ne!(index.get_offset(&key1), index.get_offset(&key2));
+    }
+
+    #[test]
+    fn test_contract_data_same_scval_different_durability() {
+        // Same contract and ScVal key, but different durability
+        let entries: Vec<(BucketEntry, u64)> = vec![
+            (
+                BucketEntry::Live(make_contract_data_entry(
+                    1,
+                    42,
+                    ContractDataDurability::Persistent,
+                )),
+                0,
+            ),
+            (
+                BucketEntry::Live(make_contract_data_entry(
+                    1,
+                    42,
+                    ContractDataDurability::Temporary,
+                )),
+                100,
+            ),
+        ];
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        assert_eq!(index.len(), 2);
+
+        let key_persistent = make_contract_data_key(1, 42, ContractDataDurability::Persistent);
+        let key_temporary = make_contract_data_key(1, 42, ContractDataDurability::Temporary);
+        assert!(index.get_offset(&key_persistent).is_some());
+        assert!(index.get_offset(&key_temporary).is_some());
+        assert_ne!(
+            index.get_offset(&key_persistent),
+            index.get_offset(&key_temporary)
+        );
+    }
+
+    // ============ P2-6: Account Lookup by ID ============
+    //
+    // Upstream: BucketIndexTests.cpp "loadAccountsByAccountID"
+    // Tests that account entries can be looked up by account ID.
+
+    #[test]
+    fn test_account_lookup_by_id() {
+        let entries: Vec<(BucketEntry, u64)> = (0..50u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        // Look up specific accounts
+        for i in [0u8, 10, 25, 49] {
+            let key = make_account_key(i);
+            let offset = index.get_offset(&key);
+            assert!(offset.is_some(), "Account {} should be in index", i);
+            assert_eq!(offset.unwrap(), i as u64 * 100);
+        }
+
+        // Non-existent accounts
+        for i in [50u8, 100, 255] {
+            let key = make_account_key(i);
+            assert!(
+                index.get_offset(&key).is_none(),
+                "Account {} should not be in index",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_account_lookup_with_bloom_filter() {
+        let entries: Vec<(BucketEntry, u64)> = (0..100u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        // may_contain should return true for existing keys
+        for i in [0u8, 50, 99] {
+            let key = make_account_key(i);
+            assert!(
+                index.may_contain(&key),
+                "Bloom filter should confirm account {}",
+                i
+            );
+        }
+
+        // may_contain may return true for non-existing keys (false positives OK)
+        // but the actual offset should be None
+        let key = make_account_key(200);
+        // We can't assert may_contain is false (bloom filters have false positives)
+        // but we can assert get_offset is None
+        assert!(index.get_offset(&key).is_none());
+    }
+
+    // ============ P2-7: Soroban Cache Population ============
+    //
+    // Upstream: BucketIndexTests.cpp "soroban cache population"
+    // Tests that contract code/data entries are correctly counted in
+    // the index entry counters.
+
+    fn make_contract_code_entry(seed: u8) -> LedgerEntry {
+        use stellar_xdr::curr::*;
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: Hash([seed; 32]),
+                code: vec![0u8; 100].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_soroban_entry_counters() {
+        let mut entries: Vec<(BucketEntry, u64)> = Vec::new();
+
+        // Add contract code entries
+        for i in 0..5u8 {
+            entries.push((BucketEntry::Live(make_contract_code_entry(i)), i as u64 * 100));
+        }
+
+        // Add persistent contract data entries
+        for i in 0..3u8 {
+            entries.push((
+                BucketEntry::Live(make_contract_data_entry(
+                    i,
+                    i as i32,
+                    ContractDataDurability::Persistent,
+                )),
+                (5 + i) as u64 * 100,
+            ));
+        }
+
+        // Add temporary contract data entries
+        for i in 0..2u8 {
+            entries.push((
+                BucketEntry::Live(make_contract_data_entry(
+                    10 + i,
+                    i as i32,
+                    ContractDataDurability::Temporary,
+                )),
+                (8 + i) as u64 * 100,
+            ));
+        }
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        let counters = index.counters();
+        assert_eq!(
+            counters.count_for_type(LedgerEntryType::ContractCode),
+            5,
+            "Should have 5 contract code entries"
+        );
+        assert_eq!(
+            counters.count_for_type(LedgerEntryType::ContractData),
+            5,
+            "Should have 5 contract data entries (3 persistent + 2 temporary)"
+        );
+        assert_eq!(
+            counters.persistent_soroban_entries, 8,
+            "Should have 8 persistent Soroban entries (5 code + 3 persistent data)"
+        );
+        assert_eq!(
+            counters.temporary_soroban_entries, 2,
+            "Should have 2 temporary Soroban entries"
+        );
+    }
+
+    #[test]
+    fn test_soroban_dead_entry_counters() {
+        let entries: Vec<(BucketEntry, u64)> = vec![
+            (BucketEntry::Live(make_contract_code_entry(1)), 0),
+            (BucketEntry::Live(make_contract_code_entry(2)), 100),
+            (
+                BucketEntry::Dead(LedgerKey::ContractCode(LedgerKeyContractCode {
+                    hash: Hash([3u8; 32]),
+                })),
+                200,
+            ),
+        ];
+
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+
+        let counters = index.counters();
+        assert_eq!(counters.total_live(), 2);
+        assert_eq!(counters.total_dead(), 1);
+    }
 }

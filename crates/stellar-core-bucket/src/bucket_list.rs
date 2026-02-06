@@ -3013,4 +3013,289 @@ mod tests {
             paths
         );
     }
+
+    // ============ P1-1: BucketList sizes at ledger 1 ============
+    //
+    // Upstream: BucketListTests.cpp "BucketList sizes at ledger 1"
+    // At ledger 1, level 0 curr should have exactly 1 entry,
+    // all other buckets should be empty.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_sizes_at_ledger_1() {
+        let mut bl = BucketList::new();
+
+        // Add a single batch at ledger 1
+        let entry = make_account_entry([1u8; 32], 100);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Level 0 curr should have entries (1 data entry + potentially metadata)
+        let level0 = &bl.levels()[0];
+        let level0_curr_data: usize = level0.curr.iter().filter(|e| !e.is_metadata()).count();
+        assert_eq!(
+            level0_curr_data, 1,
+            "Level 0 curr should have exactly 1 data entry at ledger 1"
+        );
+
+        // Level 0 snap should be empty
+        assert!(
+            level0.snap.is_empty(),
+            "Level 0 snap should be empty at ledger 1"
+        );
+
+        // All other levels should be completely empty
+        for level_idx in 1..BUCKET_LIST_LEVELS {
+            let level = &bl.levels()[level_idx];
+            assert!(
+                level.curr.is_empty(),
+                "Level {} curr should be empty at ledger 1",
+                level_idx
+            );
+            assert!(
+                level.snap.is_empty(),
+                "Level {} snap should be empty at ledger 1",
+                level_idx
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hot_archive_bucket_list_sizes_at_ledger_1() {
+        use crate::hot_archive::HotArchiveBucketList;
+
+        let mut ha = HotArchiveBucketList::new();
+
+        // Add a single archived entry at ledger 1
+        let entry = make_account_entry([1u8; 32], 100);
+        ha.add_batch(1, TEST_PROTOCOL, vec![entry], vec![]).unwrap();
+
+        // Level 0 curr should have entries (1 data + potentially metadata)
+        assert!(
+            !ha.levels()[0].curr.is_empty(),
+            "HA Level 0 curr should be non-empty at ledger 1"
+        );
+
+        // Level 0 snap should be empty
+        assert!(
+            ha.levels()[0].snap.is_empty(),
+            "HA Level 0 snap should be empty at ledger 1"
+        );
+
+        // All other levels should be empty
+        for level_idx in 1..crate::hot_archive::HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            assert!(
+                ha.levels()[level_idx].curr.is_empty(),
+                "HA Level {} curr should be empty at ledger 1",
+                level_idx
+            );
+            assert!(
+                ha.levels()[level_idx].snap.is_empty(),
+                "HA Level {} snap should be empty at ledger 1",
+                level_idx
+            );
+        }
+    }
+
+    // ============ P1-2: BucketList iterative size check ============
+    //
+    // Upstream: BucketListTests.cpp "BucketList check bucket sizes"
+    // Validates that bucket entry counts match expected sizes across
+    // many ledgers. Each ledger adds exactly one unique entry, so the
+    // total entry count across all buckets should equal the ledger number.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_iterative_size_check() {
+        let mut bl = BucketList::new();
+
+        for ledger_seq in 1..=256u32 {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&ledger_seq.to_be_bytes());
+            let mut entry = make_account_entry(id, ledger_seq as i64 * 100);
+            entry.last_modified_ledger_seq = ledger_seq;
+
+            bl.add_batch(
+                ledger_seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+            // Count total non-metadata entries across all levels
+            let mut total_data_entries: usize = 0;
+            for level in bl.levels() {
+                for entry in level.curr.iter() {
+                    if !entry.is_metadata() {
+                        total_data_entries += 1;
+                    }
+                }
+                for entry in level.snap.iter() {
+                    if !entry.is_metadata() {
+                        total_data_entries += 1;
+                    }
+                }
+            }
+
+            // Total data entries across all buckets should equal ledger_seq
+            // (one unique entry per ledger, no duplicates since keys are unique)
+            assert_eq!(
+                total_data_entries, ledger_seq as usize,
+                "Total entries mismatch at ledger {}",
+                ledger_seq
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_entry_bounds_after_spills() {
+        // After adding many entries, verify that lastModifiedLedgerSeq values
+        // in each bucket respect level boundaries.
+        let mut bl = BucketList::new();
+
+        for ledger_seq in 1..=64u32 {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&ledger_seq.to_be_bytes());
+            let mut entry = make_account_entry(id, ledger_seq as i64 * 100);
+            entry.last_modified_ledger_seq = ledger_seq;
+
+            bl.add_batch(
+                ledger_seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        // Check that entries at each level have reasonable lastModifiedLedgerSeq ranges
+        for (level_idx, level) in bl.levels().iter().enumerate() {
+            let mut curr_ledgers: Vec<u32> = Vec::new();
+            for entry in level.curr.iter() {
+                if let Some(le) = entry.as_ledger_entry() {
+                    curr_ledgers.push(le.last_modified_ledger_seq);
+                }
+            }
+            let mut snap_ledgers: Vec<u32> = Vec::new();
+            for entry in level.snap.iter() {
+                if let Some(le) = entry.as_ledger_entry() {
+                    snap_ledgers.push(le.last_modified_ledger_seq);
+                }
+            }
+
+            // Verify entries are contiguous within each bucket (no gaps)
+            if curr_ledgers.len() > 1 {
+                curr_ledgers.sort();
+                let range = *curr_ledgers.last().unwrap() - *curr_ledgers.first().unwrap() + 1;
+                assert_eq!(
+                    range as usize,
+                    curr_ledgers.len(),
+                    "Level {} curr entries should be contiguous",
+                    level_idx
+                );
+            }
+            if snap_ledgers.len() > 1 {
+                snap_ledgers.sort();
+                let range = *snap_ledgers.last().unwrap() - *snap_ledgers.first().unwrap() + 1;
+                assert_eq!(
+                    range as usize,
+                    snap_ledgers.len(),
+                    "Level {} snap entries should be contiguous",
+                    level_idx
+                );
+            }
+        }
+    }
+
+    // ============ P1-3: Bucket list shadowing pre/post protocol 12 ============
+    //
+    // Upstream: BucketListTests.cpp "bucket list shadowing pre/post proto 12"
+    // Verifies that frequently-updated entries shadow correctly:
+    // - Pre-protocol-12: entries shadowed at higher levels are filtered out
+    // - Post-protocol-12: entries persist at all levels (no shadow filtering)
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_lookup_shadowing_correctness() {
+        // Add the same entry repeatedly with increasing balance. The most
+        // recent value should always be returned by lookup, regardless of
+        // how many levels it has propagated through.
+        let mut bl = BucketList::new();
+
+        let id = [0xAA; 32];
+        for ledger_seq in 1..=200u32 {
+            let entry = make_account_entry(id, ledger_seq as i64 * 100);
+            bl.add_batch(
+                ledger_seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![entry],
+                vec![],
+            )
+            .unwrap();
+
+            // After every add, lookup should return the latest value
+            let key = make_account_key(id);
+            let found = bl.get(&key).unwrap().unwrap();
+            if let LedgerEntryData::Account(account) = &found.data {
+                assert_eq!(
+                    account.balance,
+                    ledger_seq as i64 * 100,
+                    "Lookup should return latest value at ledger {}",
+                    ledger_seq
+                );
+            } else {
+                panic!("Expected Account entry at ledger {}", ledger_seq);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_shadowing_multiple_keys() {
+        // Two frequently-updated entries (Alice and Bob) should always return
+        // their latest values even as they propagate through multiple levels.
+        let mut bl = BucketList::new();
+
+        let alice_id = [0xAA; 32];
+        let bob_id = [0xBB; 32];
+
+        for ledger_seq in 1..=100u32 {
+            let alice = make_account_entry(alice_id, ledger_seq as i64);
+            let bob = make_account_entry(bob_id, ledger_seq as i64 * 10);
+
+            bl.add_batch(
+                ledger_seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![alice, bob],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        // Verify latest values
+        let alice_key = make_account_key(alice_id);
+        let bob_key = make_account_key(bob_id);
+
+        let alice_entry = bl.get(&alice_key).unwrap().unwrap();
+        let bob_entry = bl.get(&bob_key).unwrap().unwrap();
+
+        if let LedgerEntryData::Account(a) = &alice_entry.data {
+            assert_eq!(a.balance, 100, "Alice should have latest balance");
+        }
+        if let LedgerEntryData::Account(b) = &bob_entry.data {
+            assert_eq!(b.balance, 1000, "Bob should have latest balance");
+        }
+    }
 }

@@ -1895,4 +1895,446 @@ mod tests {
             panic!("Expected metadata entries");
         }
     }
+
+    // ============ P0-1: Shadow + Protocol Version Merge Behavior ============
+    //
+    // Upstream: BucketTests.cpp "merges proceed old-style despite newer shadows"
+    // Tests that shadow filtering only applies pre-protocol-12 and that
+    // protocol version constraints are respected.
+
+    #[test]
+    fn test_shadow_filtering_pre_protocol_12() {
+        // Pre-protocol-12: shadowed LIVE entries should be filtered out
+        let shadow_entry = make_account_entry([1u8; 32], 500);
+        let shadow_bucket =
+            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+
+        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries).unwrap();
+
+        // Protocol 11 (pre-shadow-removal): entry [1] is in the shadow bucket,
+        // so it should be filtered out of the merge result
+        let merged = merge_buckets_with_options_and_shadows(
+            &old_bucket,
+            &new_bucket,
+            true, // keep_dead_entries
+            FIRST_PROTOCOL_SHADOWS_REMOVED - 1,
+            true, // normalize_init_entries
+            &[shadow_bucket],
+        )
+        .unwrap();
+
+        // Entry [1] should be filtered (shadowed), only entry [2] remains
+        let key1 = make_account_key([1u8; 32]);
+        let key2 = make_account_key([2u8; 32]);
+        assert!(
+            merged.get(&key1).unwrap().is_none(),
+            "Shadowed entry should be filtered pre-protocol-12"
+        );
+        assert!(
+            merged.get(&key2).unwrap().is_some(),
+            "Non-shadowed entry should remain"
+        );
+    }
+
+    #[test]
+    fn test_shadow_filtering_disabled_post_protocol_12() {
+        // Post-protocol-12: shadow filtering is disabled
+        let shadow_entry = make_account_entry([1u8; 32], 500);
+        let shadow_bucket =
+            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+
+        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries).unwrap();
+
+        // Protocol 12 (shadow removal): shadow filtering should NOT apply
+        let merged = merge_buckets_with_options_and_shadows(
+            &old_bucket,
+            &new_bucket,
+            true,
+            FIRST_PROTOCOL_SHADOWS_REMOVED, // exactly protocol 12
+            true,
+            &[shadow_bucket],
+        )
+        .unwrap();
+
+        // Both entries should remain (no shadow filtering)
+        let key1 = make_account_key([1u8; 32]);
+        let key2 = make_account_key([2u8; 32]);
+        assert!(
+            merged.get(&key1).unwrap().is_some(),
+            "Entry should NOT be filtered post-protocol-12"
+        );
+        assert!(merged.get(&key2).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_shadow_empty_shadows_is_noop() {
+        // Empty shadow list should be a no-op regardless of protocol version
+        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries).unwrap();
+
+        let merged = merge_buckets_with_options_and_shadows(
+            &old_bucket,
+            &new_bucket,
+            true,
+            FIRST_PROTOCOL_SHADOWS_REMOVED - 1,
+            true,
+            &[], // no shadows
+        )
+        .unwrap();
+
+        assert_eq!(merged.len(), 2, "No shadow filtering with empty shadows");
+    }
+
+    // ============ P0-2: Init Entry + Shadow Interaction ============
+    //
+    // Upstream: BucketTests.cpp "merging bucket entries with initentry with shadows"
+    // Tests that INIT and DEAD entries are preserved even when shadowed
+    // (keep_shadowed_lifecycle_entries = true for protocol >= 11).
+
+    #[test]
+    fn test_shadow_preserves_init_entries_in_init_era() {
+        // In protocol 11+ (INITENTRY era), INIT entries should NOT be filtered by shadows
+        let shadow_entry = make_account_entry([1u8; 32], 500);
+        let shadow_bucket =
+            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+
+        let old_entries = vec![
+            BucketEntry::Init(make_account_entry([1u8; 32], 100)), // shadowed, but INIT
+            BucketEntry::Init(make_account_entry([2u8; 32], 200)), // not shadowed
+        ];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(vec![]).unwrap();
+
+        // Protocol 11 supports INITENTRY - shadow filtering should preserve INIT/DEAD
+        let merged = merge_buckets_with_options_and_shadows(
+            &old_bucket,
+            &new_bucket,
+            true,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY, // protocol 11
+            false, // don't normalize init entries
+            &[shadow_bucket],
+        )
+        .unwrap();
+
+        // Both INIT entries should be preserved (not filtered by shadows)
+        let key1 = make_account_key([1u8; 32]);
+        let key2 = make_account_key([2u8; 32]);
+
+        let entry1 = merged.get(&key1).unwrap();
+        assert!(entry1.is_some(), "INIT entry should NOT be filtered by shadow in INITENTRY era");
+        assert!(entry1.unwrap().is_init(), "Should remain INIT");
+
+        let entry2 = merged.get(&key2).unwrap();
+        assert!(entry2.is_some());
+        assert!(entry2.unwrap().is_init());
+    }
+
+    #[test]
+    fn test_shadow_preserves_dead_entries_in_init_era() {
+        // In protocol 11+, DEAD entries should also NOT be filtered by shadows
+        let shadow_entry = make_account_entry([1u8; 32], 500);
+        let shadow_bucket =
+            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+
+        let old_entries = vec![
+            BucketEntry::Dead(make_account_key([1u8; 32])), // shadowed, but DEAD
+        ];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(vec![]).unwrap();
+
+        let merged = merge_buckets_with_options_and_shadows(
+            &old_bucket,
+            &new_bucket,
+            true,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            false,
+            &[shadow_bucket],
+        )
+        .unwrap();
+
+        let key1 = make_account_key([1u8; 32]);
+        let entry = merged.get(&key1).unwrap();
+        assert!(
+            entry.is_some(),
+            "DEAD entry should NOT be filtered by shadow in INITENTRY era"
+        );
+        assert!(entry.unwrap().is_dead());
+    }
+
+    #[test]
+    fn test_shadow_filters_live_but_not_lifecycle_entries() {
+        // In protocol 11 (pre-shadow-removal): LIVE entries are filtered by
+        // shadows but INIT and DEAD entries are preserved.
+        let shadow_bucket = Bucket::from_entries(vec![
+            BucketEntry::Live(make_account_entry([1u8; 32], 500)),
+            BucketEntry::Live(make_account_entry([2u8; 32], 600)),
+            BucketEntry::Live(make_account_entry([3u8; 32], 700)),
+        ])
+        .unwrap();
+
+        let old_entries = vec![
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)), // LIVE, shadowed → filtered
+            BucketEntry::Init(make_account_entry([2u8; 32], 200)), // INIT, shadowed → kept
+            BucketEntry::Dead(make_account_key([3u8; 32])),        // DEAD, shadowed → kept
+        ];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(vec![]).unwrap();
+
+        let merged = merge_buckets_with_options_and_shadows(
+            &old_bucket,
+            &new_bucket,
+            true,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY, // 11
+            false,
+            &[shadow_bucket],
+        )
+        .unwrap();
+
+        let key1 = make_account_key([1u8; 32]);
+        let key2 = make_account_key([2u8; 32]);
+        let key3 = make_account_key([3u8; 32]);
+
+        // LIVE entry [1] should be filtered (shadowed)
+        assert!(
+            merged.get(&key1).unwrap().is_none(),
+            "LIVE entry should be filtered by shadow"
+        );
+        // INIT entry [2] should be preserved (lifecycle entry)
+        assert!(
+            merged.get(&key2).unwrap().is_some(),
+            "INIT entry should be preserved despite shadow"
+        );
+        // DEAD entry [3] should be preserved (lifecycle entry)
+        assert!(
+            merged.get(&key3).unwrap().is_some(),
+            "DEAD entry should be preserved despite shadow"
+        );
+    }
+
+    #[test]
+    fn test_shadow_does_not_revive_dead_entries() {
+        // Upstream: "shadowing does not revive dead entries"
+        // Multi-level scenario: DEAD + INIT annihilation should still work
+        // even with shadows present.
+
+        // Level 5 (oldest): INIT entry for key [1]
+        let b5 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry(
+            [1u8; 32],
+            100,
+        ))])
+        .unwrap();
+
+        // Level 4: DEAD entry for key [1]
+        let b4 = Bucket::from_entries(vec![BucketEntry::Dead(make_account_key([1u8; 32]))])
+            .unwrap();
+
+        // Shadow bucket contains the same key (from a higher level)
+        let shadow = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry(
+            [1u8; 32],
+            999,
+        ))])
+        .unwrap();
+
+        // Merge b4 (newer) with b5 (older) = INIT + DEAD should annihilate
+        // regardless of shadow presence
+        let merged = merge_buckets_with_options_and_shadows(
+            &b5,
+            &b4,
+            true,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            false,
+            &[shadow],
+        )
+        .unwrap();
+
+        // INIT + DEAD should annihilate — shadow should NOT revive the entry
+        let key1 = make_account_key([1u8; 32]);
+        assert!(
+            merged.get(&key1).unwrap().is_none(),
+            "Shadow should NOT revive dead entries; INIT+DEAD still annihilates"
+        );
+    }
+
+    #[test]
+    fn test_shadow_does_not_eliminate_init_entries() {
+        // Upstream: shadows don't eliminate INIT entries
+        // Even when an INIT entry is "shadowed" by a higher-level entry,
+        // it must be kept for correct annihilation behavior at deeper levels.
+
+        let shadow = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry(
+            [1u8; 32],
+            999,
+        ))])
+        .unwrap();
+
+        // Create two buckets both with INIT for key [1]
+        let b1 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry(
+            [1u8; 32],
+            100,
+        ))])
+        .unwrap();
+        let b2 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry(
+            [2u8; 32],
+            200,
+        ))])
+        .unwrap();
+
+        let merged = merge_buckets_with_options_and_shadows(
+            &b1,
+            &b2,
+            true,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            false,
+            &[shadow],
+        )
+        .unwrap();
+
+        let key1 = make_account_key([1u8; 32]);
+        let entry = merged.get(&key1).unwrap();
+        assert!(
+            entry.is_some(),
+            "Shadow should NOT eliminate INIT entries"
+        );
+        assert!(
+            entry.unwrap().is_init(),
+            "INIT entry must remain as INIT"
+        );
+    }
+
+    // ============ P0-3: Output Iterator Version Rejection ============
+    //
+    // Upstream: BucketTests.cpp "bucket output iterator rejects wrong-version entries"
+    // Tests that pre-protocol-11 merges do not produce INITENTRY or METAENTRY.
+
+    #[test]
+    fn test_pre_protocol_11_merge_produces_no_metadata() {
+        // Pre-protocol-11 merges should NOT produce metadata entries
+        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries).unwrap();
+
+        let merged = merge_buckets_with_options(
+            &old_bucket,
+            &new_bucket,
+            true,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY - 1, // protocol 10
+            true,
+        )
+        .unwrap();
+
+        // No metadata in output
+        let has_metadata = merged.iter().any(|e| e.is_metadata());
+        assert!(
+            !has_metadata,
+            "Pre-protocol-11 merge should NOT produce METAENTRY"
+        );
+    }
+
+    #[test]
+    fn test_pre_protocol_11_merge_normalizes_init_to_live() {
+        // When crossing level boundaries (normalize_init=true), INIT entries from
+        // the new (incoming) bucket should be normalized to LIVE.
+        // This matches C++ BucketOutputIterator behavior.
+        let old_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
+        let new_entries = vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))];
+
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries).unwrap();
+
+        let merged = merge_buckets_with_options(
+            &old_bucket,
+            &new_bucket,
+            true,
+            25, // current protocol
+            true, // normalize_init = true (spill merge)
+        )
+        .unwrap();
+
+        // The INIT entry from new_bucket should be normalized to LIVE
+        let key1 = make_account_key([1u8; 32]);
+        let entry = merged.get(&key1).unwrap().unwrap();
+        assert!(
+            entry.is_live(),
+            "INIT from new bucket should be normalized to LIVE during spill merge"
+        );
+    }
+
+    #[test]
+    fn test_protocol_11_merge_produces_metadata() {
+        // Protocol 11+: merges SHOULD produce metadata when inputs have metadata.
+        // Note: build_output_metadata uses max(old, new) for version, so inputs
+        // must have metadata entries for the output to include them.
+
+        let old_meta = BucketMetadata {
+            ledger_version: 11,
+            ext: BucketMetadataExt::V0,
+        };
+        let old_with_meta = Bucket::from_entries(vec![
+            BucketEntry::Metadata(old_meta),
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+        ])
+        .unwrap();
+        let new_with_meta = Bucket::from_entries(vec![
+            BucketEntry::Metadata(BucketMetadata {
+                ledger_version: 11,
+                ext: BucketMetadataExt::V0,
+            }),
+            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+        ])
+        .unwrap();
+
+        let merged = merge_buckets_with_options(
+            &old_with_meta,
+            &new_with_meta,
+            true,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            false,
+        )
+        .unwrap();
+
+        let has_metadata = merged.iter().any(|e| e.is_metadata());
+        assert!(
+            has_metadata,
+            "Protocol-11+ merge should produce METAENTRY when inputs have metadata"
+        );
+    }
+
+    #[test]
+    fn test_in_memory_merge_pre_protocol_11_no_metadata() {
+        // In-memory merge with pre-protocol-11 should NOT produce metadata
+        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
+
+        let old_bucket = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
+        let new_bucket = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
+
+        let merged = merge_in_memory(
+            &old_bucket,
+            &new_bucket,
+            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY - 1,
+        )
+        .unwrap();
+
+        let has_metadata = merged.iter().any(|e| e.is_metadata());
+        assert!(
+            !has_metadata,
+            "In-memory merge with pre-protocol-11 should NOT produce metadata"
+        );
+    }
 }

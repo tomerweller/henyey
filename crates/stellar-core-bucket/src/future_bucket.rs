@@ -721,4 +721,356 @@ mod tests {
         let hashes = fb.get_hashes();
         assert_eq!(hashes.len(), 1);
     }
+
+    // ============ P3-1: Merge Reattach to Running Merge ============
+    //
+    // Upstream: BucketManagerTests.cpp "bucketmanager reattach to running merge"
+    // Tests that an in-progress merge can be serialized (snapshot),
+    // deserialized, and restarted via make_live(), producing identical results.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reattach_to_running_merge() {
+        // Create two buckets with distinct entries
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let entry3 = make_account_entry([3u8; 32], 300);
+
+        let bucket1 =
+            Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap());
+        let bucket2 = Arc::new(
+            Bucket::from_entries(vec![
+                BucketEntry::Live(entry2),
+                BucketEntry::Live(entry3),
+            ])
+            .unwrap(),
+        );
+
+        let b1_hash = bucket1.hash();
+        let b2_hash = bucket2.hash();
+
+        // Start a merge (enters LiveInputs state)
+        let mut fb = FutureBucket::start_merge(
+            bucket1.clone(),
+            bucket2.clone(),
+            25,
+            true,
+            false,
+        );
+        assert_eq!(fb.state(), FutureBucketState::LiveInputs);
+
+        // Resolve the original merge to get the expected result
+        let original_result = fb.resolve().await.unwrap();
+        let original_hash = original_result.hash();
+        let original_len = original_result.len();
+
+        // Now simulate a restart: serialize the in-progress state
+        // We manually create a HashInputs snapshot (as if we captured it mid-merge)
+        let snapshot = FutureBucketSnapshot {
+            state: FutureBucketState::HashInputs,
+            curr: Some(b1_hash.to_hex()),
+            snap: Some(b2_hash.to_hex()),
+            output: None,
+        };
+
+        // Deserialize from snapshot
+        let mut fb2 = FutureBucket::from_snapshot(snapshot).unwrap();
+        assert_eq!(fb2.state(), FutureBucketState::HashInputs);
+        assert!(!fb2.is_live());
+
+        // Make live - this restarts the merge by loading buckets
+        let b1_clone = bucket1.clone();
+        let b2_clone = bucket2.clone();
+        fb2.make_live(
+            |hash| {
+                if *hash == b1_hash {
+                    Ok((*b1_clone).clone())
+                } else if *hash == b2_hash {
+                    Ok((*b2_clone).clone())
+                } else {
+                    Err(BucketError::Merge("bucket not found".to_string()))
+                }
+            },
+            25,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(fb2.state(), FutureBucketState::LiveInputs);
+        assert!(fb2.is_live());
+        assert!(fb2.is_merging());
+
+        // Resolve the restarted merge
+        let reattached_result = fb2.resolve().await.unwrap();
+        assert_eq!(fb2.state(), FutureBucketState::LiveOutput);
+
+        // Results should be identical
+        assert_eq!(reattached_result.hash(), original_hash);
+        assert_eq!(reattached_result.len(), original_len);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reattach_to_finished_merge() {
+        // Start and complete a merge
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+
+        let bucket1 =
+            Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap());
+        let bucket2 =
+            Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap());
+
+        let mut fb = FutureBucket::start_merge(
+            bucket1.clone(),
+            bucket2.clone(),
+            25,
+            true,
+            false,
+        );
+        let result = fb.resolve().await.unwrap();
+        let result_hash = result.hash();
+
+        // Serialize - should be HashOutput (merge is done)
+        let snapshot = fb.to_snapshot();
+        assert_eq!(snapshot.state, FutureBucketState::HashOutput);
+        assert!(snapshot.output.is_some());
+
+        // Deserialize
+        let mut fb2 = FutureBucket::from_snapshot(snapshot).unwrap();
+        assert_eq!(fb2.state(), FutureBucketState::HashOutput);
+
+        // Make live by loading the output bucket
+        let result_clone = result.clone();
+        fb2.make_live(
+            |hash| {
+                if *hash == result_hash {
+                    Ok((*result_clone).clone())
+                } else {
+                    Err(BucketError::Merge("bucket not found".to_string()))
+                }
+            },
+            25,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(fb2.state(), FutureBucketState::LiveOutput);
+        assert!(fb2.output().is_some());
+        assert_eq!(fb2.output().unwrap().hash(), result_hash);
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_all_states() {
+        // Clear state
+        let fb = FutureBucket::clear();
+        let snap = fb.to_snapshot();
+        let fb2 = FutureBucket::from_snapshot(snap).unwrap();
+        assert!(fb2.is_clear());
+
+        // HashOutput state
+        let entry = make_account_entry([1u8; 32], 100);
+        let bucket = Bucket::from_entries(vec![BucketEntry::Live(entry)]).unwrap();
+        let bucket = Arc::new(bucket);
+        let fb = FutureBucket::from_output(bucket);
+        let snap = fb.to_snapshot();
+        assert_eq!(snap.state, FutureBucketState::HashOutput);
+        let fb2 = FutureBucket::from_snapshot(snap).unwrap();
+        assert_eq!(fb2.state(), FutureBucketState::HashOutput);
+
+        // LiveInputs state -> serializes as HashInputs
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let b1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap());
+        let b2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap());
+        let fb = FutureBucket {
+            state: FutureBucketState::LiveInputs,
+            input_curr: Some(b1.clone()),
+            input_snap: Some(b2.clone()),
+            output: None,
+            merge_handle: None,
+            input_curr_hash: Some(b1.hash()),
+            input_snap_hash: Some(b2.hash()),
+            output_hash: None,
+            protocol_version: 25,
+            keep_tombstones: true,
+            normalize_init: false,
+        };
+        let snap = fb.to_snapshot();
+        assert_eq!(snap.state, FutureBucketState::HashInputs);
+        assert!(snap.curr.is_some());
+        assert!(snap.snap.is_some());
+        let fb2 = FutureBucket::from_snapshot(snap).unwrap();
+        assert_eq!(fb2.state(), FutureBucketState::HashInputs);
+    }
+
+    // ============ P3-2: Bucket Persistence Across Restart ============
+    //
+    // Upstream: BucketManagerTests.cpp "bucket persistence over app restart"
+    // Tests that bucket data persists through a simulated restart cycle:
+    // create buckets, serialize merge state, clear in-memory state,
+    // reload and verify results match.
+
+    #[test]
+    fn test_persistence_across_simulated_restart() {
+        // Create buckets and merge them
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let entry3 = make_account_entry([3u8; 32], 300);
+
+        let bucket1 =
+            Bucket::from_entries(vec![BucketEntry::Live(entry1.clone())]).unwrap();
+        let bucket2 = Bucket::from_entries(vec![
+            BucketEntry::Live(entry2.clone()),
+            BucketEntry::Live(entry3.clone()),
+        ])
+        .unwrap();
+
+        let b1_hash = bucket1.hash();
+        let b2_hash = bucket2.hash();
+
+        // Merge synchronously
+        let mut fb = FutureBucket {
+            state: FutureBucketState::LiveInputs,
+            input_curr: Some(Arc::new(bucket1)),
+            input_snap: Some(Arc::new(bucket2)),
+            output: None,
+            merge_handle: None,
+            input_curr_hash: Some(b1_hash),
+            input_snap_hash: Some(b2_hash),
+            output_hash: None,
+            protocol_version: 25,
+            keep_tombstones: true,
+            normalize_init: false,
+        };
+
+        let merged = fb.resolve_blocking().unwrap();
+        let merged_hash = merged.hash();
+        let merged_len = merged.len();
+
+        // Serialize the completed merge state
+        let snapshot = fb.to_snapshot();
+        assert_eq!(snapshot.state, FutureBucketState::HashOutput);
+
+        // Simulate full restart: drop everything, recreate from snapshot
+        drop(fb);
+        drop(merged);
+
+        let mut restored = FutureBucket::from_snapshot(snapshot).unwrap();
+        assert_eq!(restored.state(), FutureBucketState::HashOutput);
+
+        // Recreate the output bucket (simulating disk reload)
+        let entry1_new = make_account_entry([1u8; 32], 100);
+        let entry2_new = make_account_entry([2u8; 32], 200);
+        let entry3_new = make_account_entry([3u8; 32], 300);
+
+        let b1_new = Bucket::from_entries(vec![BucketEntry::Live(entry1_new)]).unwrap();
+        let b2_new = Bucket::from_entries(vec![
+            BucketEntry::Live(entry2_new),
+            BucketEntry::Live(entry3_new),
+        ])
+        .unwrap();
+
+        // Re-merge to get the output bucket
+        let re_merged = crate::merge::merge_buckets_with_options(
+            &b1_new,
+            &b2_new,
+            true,
+            25,
+            false,
+        )
+        .unwrap();
+
+        // Verify re-merged has same hash as original
+        assert_eq!(re_merged.hash(), merged_hash);
+        assert_eq!(re_merged.len(), merged_len);
+
+        // Make live using the re-merged bucket
+        restored
+            .make_live(
+                |hash| {
+                    if *hash == merged_hash {
+                        Ok(re_merged.clone())
+                    } else {
+                        Err(BucketError::Merge("bucket not found".to_string()))
+                    }
+                },
+                25,
+                true,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(restored.state(), FutureBucketState::LiveOutput);
+        assert_eq!(restored.output().unwrap().hash(), merged_hash);
+        assert_eq!(restored.output().unwrap().len(), merged_len);
+    }
+
+    #[test]
+    fn test_persistence_with_incomplete_merge() {
+        // Simulate serializing a merge that was still in progress
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+
+        let bucket1 =
+            Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap();
+        let bucket2 =
+            Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap();
+
+        let b1_hash = bucket1.hash();
+        let b2_hash = bucket2.hash();
+
+        // Create a snapshot as if we captured it mid-merge
+        let snapshot = FutureBucketSnapshot {
+            state: FutureBucketState::HashInputs,
+            curr: Some(b1_hash.to_hex()),
+            snap: Some(b2_hash.to_hex()),
+            output: None,
+        };
+
+        // Deserialize - we get HashInputs, not LiveInputs
+        let restored = FutureBucket::from_snapshot(snapshot).unwrap();
+        assert_eq!(restored.state(), FutureBucketState::HashInputs);
+        assert!(!restored.is_live());
+        assert!(!restored.is_merging());
+
+        // Verify hashes are preserved
+        let hashes = restored.get_hashes();
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(&b1_hash));
+        assert!(hashes.contains(&b2_hash));
+
+        // Can re-merge with resolve_blocking after make_live
+        // (tested in test_reattach_to_running_merge)
+    }
+
+    #[test]
+    fn test_snapshot_hash_preservation() {
+        // Test that snapshot preserves exact hash hex strings through roundtrip
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let bucket1 = Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap();
+        let bucket2 = Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap();
+        let hash1 = bucket1.hash();
+        let hash2 = bucket2.hash();
+
+        // HashOutput snapshot preserves output hash
+        let fb = FutureBucket::from_output(Arc::new(bucket1));
+        let snap = fb.to_snapshot();
+        let restored = FutureBucket::from_snapshot(snap).unwrap();
+        assert_eq!(restored.output_hash(), Some(&hash1));
+
+        // HashInputs snapshot preserves input hashes
+        let snap = FutureBucketSnapshot {
+            state: FutureBucketState::HashInputs,
+            curr: Some(hash1.to_hex()),
+            snap: Some(hash2.to_hex()),
+            output: None,
+        };
+        let restored = FutureBucket::from_snapshot(snap).unwrap();
+        let hashes = restored.get_hashes();
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(&hash1));
+        assert!(hashes.contains(&hash2));
+    }
 }
