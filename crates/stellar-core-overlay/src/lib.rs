@@ -271,12 +271,38 @@ impl OverlayConfig {
     }
 
     /// Create mainnet configuration with known mainnet peers.
+    ///
+    /// Includes all Tier 1 validators from the Stellar network for better
+    /// peer diversity and resilience against individual nodes being overloaded.
     pub fn mainnet() -> Self {
         Self {
             known_peers: vec![
+                // SDF
                 PeerAddress::new("core-live-a.stellar.org", 11625),
                 PeerAddress::new("core-live-b.stellar.org", 11625),
                 PeerAddress::new("core-live-c.stellar.org", 11625),
+                // LOBSTR
+                PeerAddress::new("v1.stellar.lobstr.co", 11625),
+                PeerAddress::new("v2.stellar.lobstr.co", 11625),
+                PeerAddress::new("v3.stellar.lobstr.co", 11625),
+                PeerAddress::new("v4.stellar.lobstr.co", 11625),
+                PeerAddress::new("v5.stellar.lobstr.co", 11625),
+                // SatoshiPay
+                PeerAddress::new("stellar-de-fra.satoshipay.io", 11625),
+                PeerAddress::new("stellar-sg-sin.satoshipay.io", 11625),
+                PeerAddress::new("stellar-us-iowa.satoshipay.io", 11625),
+                // Blockdaemon
+                PeerAddress::new("stellar-full-validator1.bdnodes.net", 11625),
+                PeerAddress::new("stellar-full-validator2.bdnodes.net", 11625),
+                PeerAddress::new("stellar-full-validator3.bdnodes.net", 11625),
+                // Franklin Templeton
+                PeerAddress::new("stellar1.franklintempleton.com", 11625),
+                PeerAddress::new("stellar2.franklintempleton.com", 11625),
+                PeerAddress::new("stellar3.franklintempleton.com", 11625),
+                // PublicNode
+                PeerAddress::new("bootes.publicnode.org", 11625),
+                PeerAddress::new("lyra.publicnode.org", 11625),
+                PeerAddress::new("hercules.publicnode.org", 11625),
             ],
             network_passphrase: "Public Global Stellar Network ; September 2015".to_string(),
             listen_enabled: false,
