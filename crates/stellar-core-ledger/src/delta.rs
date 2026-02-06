@@ -662,4 +662,76 @@ mod tests {
         let changes: Vec<_> = delta.changes().collect();
         assert!(changes[0].is_created());
     }
+
+    #[test]
+    fn test_delete_then_create() {
+        // Scenario: TX1 deletes an entry that existed before the ledger,
+        // TX2 recreates it. Net effect should be Updated (existed before,
+        // still exists after with new value).
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account(1);
+        let mut recreated = original.clone();
+        if let LedgerEntryData::Account(ref mut acc) = recreated.data {
+            acc.balance = 5000000000;
+        }
+
+        delta.record_delete(original.clone()).unwrap();
+        delta.record_create(recreated.clone()).unwrap();
+
+        assert_eq!(delta.num_changes(), 1);
+        let changes: Vec<_> = delta.changes().collect();
+        assert!(changes[0].is_updated());
+
+        // Current value should be the recreated entry
+        let current = changes[0].current_entry().unwrap();
+        if let LedgerEntryData::Account(ref acc) = current.data {
+            assert_eq!(acc.balance, 5000000000);
+        } else {
+            panic!("expected account entry");
+        }
+
+        // Previous value should be the original
+        let previous = changes[0].previous_entry().unwrap();
+        if let LedgerEntryData::Account(ref acc) = previous.data {
+            assert_eq!(acc.balance, 1000000000);
+        } else {
+            panic!("expected account entry");
+        }
+
+        // Should appear in live_entries (not init or dead)
+        assert_eq!(delta.live_entries().len(), 1);
+        assert_eq!(delta.init_entries().len(), 0);
+        assert_eq!(delta.dead_entries().len(), 0);
+    }
+
+    #[test]
+    fn test_delete_then_update() {
+        // Scenario: TX1 deletes an entry, TX2 updates it (e.g., fee refund
+        // restores the account). Net effect should be Updated.
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account(1);
+        let mut updated_entry = original.clone();
+        if let LedgerEntryData::Account(ref mut acc) = updated_entry.data {
+            acc.balance = 3000000000;
+        }
+
+        delta.record_delete(original.clone()).unwrap();
+        delta.record_update(original.clone(), updated_entry.clone()).unwrap();
+
+        assert_eq!(delta.num_changes(), 1);
+        let changes: Vec<_> = delta.changes().collect();
+        assert!(changes[0].is_updated());
+
+        let current = changes[0].current_entry().unwrap();
+        if let LedgerEntryData::Account(ref acc) = current.data {
+            assert_eq!(acc.balance, 3000000000);
+        } else {
+            panic!("expected account entry");
+        }
+
+        // Should appear in live_entries (not init or dead)
+        assert_eq!(delta.live_entries().len(), 1);
+        assert_eq!(delta.init_entries().len(), 0);
+        assert_eq!(delta.dead_entries().len(), 0);
+    }
 }
