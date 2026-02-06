@@ -114,6 +114,19 @@ pub enum LedgerError {
     #[error("invalid entry: {0}")]
     InvalidEntry(String),
 
+    /// The ledger protocol version exceeds the maximum supported version.
+    ///
+    /// This occurs when the current ledger header has a protocol version
+    /// higher than `CURRENT_LEDGER_PROTOCOL_VERSION`. The node must be
+    /// upgraded to process this ledger.
+    #[error("unsupported protocol version: {version} (max supported: {max_supported})")]
+    UnsupportedProtocolVersion {
+        /// The protocol version in the ledger header.
+        version: u32,
+        /// The maximum supported protocol version.
+        max_supported: u32,
+    },
+
     /// Invalid ledger sequence for state update.
     ///
     /// Ledger sequences must progress by exactly one for state updates.

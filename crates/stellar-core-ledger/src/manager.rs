@@ -392,6 +392,15 @@ impl LedgerManager {
         self.state.read().header_hash
     }
 
+    /// Override the stored ledger header version for testing.
+    ///
+    /// This simulates a network upgrade beyond supported versions.
+    #[doc(hidden)]
+    pub fn set_header_version_for_test(&self, version: u32) {
+        let mut state = self.state.write();
+        state.header.ledger_version = version;
+    }
+
     /// Get bucket list level hashes (curr, snap) for persistence.
     pub fn bucket_list_levels(&self) -> Vec<(Hash256, Hash256)> {
         let bucket_list = self.bucket_list.read();
@@ -992,6 +1001,17 @@ impl LedgerManager {
         let state = self.state.read();
         if !state.initialized {
             return Err(LedgerError::NotInitialized);
+        }
+
+        // Validate protocol version is supported
+        if state.header.ledger_version
+            > stellar_core_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
+        {
+            return Err(LedgerError::UnsupportedProtocolVersion {
+                version: state.header.ledger_version,
+                max_supported:
+                    stellar_core_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
+            });
         }
 
         // Validate sequence
@@ -2654,8 +2674,96 @@ mod tests {
     #[test]
     fn test_genesis_header() {
         let header = create_genesis_header();
+        // Validate ALL genesis header fields (parity: LedgerHeaderTests.cpp:26 "genesisledger")
+        assert_eq!(header.ledger_version, 0);
+        assert_eq!(header.previous_ledger_hash, Hash([0u8; 32]));
+        assert_eq!(header.scp_value.tx_set_hash, Hash([0u8; 32]));
+        assert_eq!(header.scp_value.close_time.0, 0);
+        assert_eq!(header.scp_value.upgrades.len(), 0);
+        assert_eq!(header.tx_set_result_hash, Hash([0u8; 32]));
+        assert_eq!(header.bucket_list_hash, Hash([0u8; 32]));
         assert_eq!(header.ledger_seq, 0);
+        assert_eq!(header.total_coins, 0);
+        assert_eq!(header.fee_pool, 0);
+        assert_eq!(header.inflation_seq, 0);
+        assert_eq!(header.id_pool, 0);
         assert_eq!(header.base_fee, 100);
+        assert_eq!(header.base_reserve, 5_000_000);
+        assert_eq!(header.max_tx_set_size, 1000);
+        assert_eq!(header.skip_list.len(), 4);
+        for skip in &header.skip_list {
+            assert_eq!(*skip, Hash([0u8; 32]));
+        }
+    }
+
+    /// Parity: LedgerTests.cpp:15 "cannot close ledger with unsupported ledger version"
+    /// Tests that begin_close rejects headers with protocol version > CURRENT.
+    /// The full integration test is in tests/ledger_close_integration.rs.
+    #[test]
+    fn test_cannot_close_with_unsupported_protocol_version() {
+        use stellar_core_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        // Initialize with a header at the current protocol version
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let bucket_list = stellar_core_bucket::BucketList::new();
+        let hot_archive_bucket_list = stellar_core_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        manager
+            .initialize(bucket_list, hot_archive_bucket_list, header.clone(), header_hash)
+            .expect("initialization should succeed");
+
+        // begin_close at CURRENT version should pass the version check
+        let close_data = LedgerCloseData::new(
+            2,
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: header_hash.into(),
+                txs: VecM::default(),
+            }),
+            1,
+            header_hash,
+        );
+        let result = manager.begin_close(close_data);
+        // Should pass version check (may fail for other reasons but NOT version)
+        if let Err(ref e) = result {
+            assert!(
+                !matches!(e, LedgerError::UnsupportedProtocolVersion { .. }),
+                "should not reject current protocol version"
+            );
+        }
+
+        // Set version to CURRENT + 1 and verify rejection
+        manager.set_header_version_for_test(CURRENT_LEDGER_PROTOCOL_VERSION + 1);
+
+        let close_data2 = LedgerCloseData::new(
+            2,
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: header_hash.into(),
+                txs: VecM::default(),
+            }),
+            1,
+            header_hash,
+        );
+        let result2 = manager.begin_close(close_data2);
+        match result2 {
+            Err(LedgerError::UnsupportedProtocolVersion { version, max_supported }) => {
+                assert_eq!(version, CURRENT_LEDGER_PROTOCOL_VERSION + 1);
+                assert_eq!(max_supported, CURRENT_LEDGER_PROTOCOL_VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedProtocolVersion, got: {}", e),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 
     #[test]

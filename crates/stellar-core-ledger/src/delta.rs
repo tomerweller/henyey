@@ -343,7 +343,20 @@ impl LedgerDelta {
     /// - If it was created, remove from delta entirely (create + delete = no-op)
     /// - If it was updated, record as deleted with original previous
     /// - If it was already deleted, skip (idempotent delete)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry is a `ConfigSetting`. Config settings are
+    /// network-wide parameters that cannot be deleted, only updated via upgrades.
+    /// Parity: LedgerTxnTests.cpp:853 "fails for configuration"
     pub fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
+        // ConfigSetting entries cannot be erased (parity: C++ LedgerTxn::erase)
+        if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::ConfigSetting(_)) {
+            return Err(LedgerError::InvalidEntry(
+                "cannot delete ConfigSetting entries".to_string(),
+            ));
+        }
+
         let key = entry_to_key(&entry)?;
         let key_bytes = key_to_bytes(&key)?;
 
@@ -704,6 +717,356 @@ mod tests {
         assert_eq!(delta.dead_entries().len(), 0);
     }
 
+    // =========================================================================
+    // P2-1: Delta round-trip stress test
+    // Parity: LedgerTxnTests.cpp:464 "LedgerTxn round trip"
+    // =========================================================================
+
+    fn create_test_account_with_balance(seed: u8, balance: i64) -> LedgerEntry {
+        let mut entry = create_test_account(seed);
+        if let LedgerEntryData::Account(ref mut acc) = entry.data {
+            acc.balance = balance;
+        }
+        entry
+    }
+
+    /// Stress test: multiple rounds of create/modify/erase operations.
+    #[test]
+    fn test_delta_round_trip_stress() {
+        let mut delta = LedgerDelta::new(1);
+
+        // Round 1: Create 10 entries
+        for i in 0..10u8 {
+            let entry = create_test_account(i);
+            delta.record_create(entry).unwrap();
+        }
+        assert_eq!(delta.num_changes(), 10);
+        assert_eq!(delta.init_entries().len(), 10);
+
+        // Round 2: Update all 10 entries
+        for i in 0..10u8 {
+            let old = create_test_account(i);
+            let mut new = old.clone();
+            if let LedgerEntryData::Account(ref mut acc) = new.data {
+                acc.balance = 2_000_000_000;
+            }
+            delta.record_update(old, new).unwrap();
+        }
+        // Created then updated = Created with final value
+        assert_eq!(delta.num_changes(), 10);
+        assert_eq!(delta.init_entries().len(), 10);
+        assert_eq!(delta.live_entries().len(), 0);
+
+        // Verify all entries have updated balance
+        for entry in delta.init_entries() {
+            if let LedgerEntryData::Account(ref acc) = entry.data {
+                assert_eq!(acc.balance, 2_000_000_000);
+            }
+        }
+
+        // Round 3: Delete half the entries
+        for i in 0..5u8 {
+            let entry = create_test_account(i);
+            delta.record_delete(entry).unwrap();
+        }
+        // Created then deleted = removed from delta
+        assert_eq!(delta.num_changes(), 5);
+        assert_eq!(delta.init_entries().len(), 5);
+        assert_eq!(delta.dead_entries().len(), 0);
+
+        // Round 4: Recreate the deleted entries with new values
+        for i in 0..5u8 {
+            let mut entry = create_test_account(i);
+            if let LedgerEntryData::Account(ref mut acc) = entry.data {
+                acc.balance = 3_000_000_000;
+            }
+            delta.record_create(entry).unwrap();
+        }
+        // These are fresh creates since the entries were removed from delta
+        assert_eq!(delta.num_changes(), 10);
+        assert_eq!(delta.init_entries().len(), 10);
+    }
+
+    /// Stress test: interleaved operations on the same entries.
+    #[test]
+    fn test_delta_interleaved_operations() {
+        let mut delta = LedgerDelta::new(1);
+
+        // Create entry
+        let e1 = create_test_account(1);
+        delta.record_create(e1.clone()).unwrap();
+
+        // Update it
+        let e1_v2 = create_test_account_with_balance(1, 2_000_000_000);
+        delta.record_update(e1.clone(), e1_v2.clone()).unwrap();
+
+        // Update it again
+        let e1_v3 = create_test_account_with_balance(1, 3_000_000_000);
+        delta.record_update(e1_v2.clone(), e1_v3.clone()).unwrap();
+
+        // Net: created with value v3
+        assert_eq!(delta.num_changes(), 1);
+        let changes: Vec<_> = delta.changes().collect();
+        assert!(changes[0].is_created());
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 3_000_000_000);
+        }
+
+        // Delete it
+        delta.record_delete(e1_v3.clone()).unwrap();
+        // Created then deleted = empty delta
+        assert!(delta.is_empty());
+    }
+
+    // =========================================================================
+    // P2-2: Create entry when key exists
+    // Parity: LedgerTxnTests.cpp:692 "LedgerTxn create"
+    // =========================================================================
+
+    /// Creating when key already exists as Created should overwrite.
+    #[test]
+    fn test_create_on_existing_created_overwrites() {
+        let mut delta = LedgerDelta::new(1);
+        let entry1 = create_test_account(1);
+        delta.record_create(entry1).unwrap();
+
+        // Create same key again with different value
+        let entry2 = create_test_account_with_balance(1, 9_999);
+        delta.record_create(entry2).unwrap();
+
+        assert_eq!(delta.num_changes(), 1);
+        let changes: Vec<_> = delta.changes().collect();
+        assert!(changes[0].is_created());
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 9_999);
+        }
+    }
+
+    /// Creating when key exists as Updated should update current value.
+    #[test]
+    fn test_create_on_existing_updated_keeps_original_previous() {
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account(1);
+        let updated = create_test_account_with_balance(1, 2_000);
+        delta.record_update(original.clone(), updated).unwrap();
+
+        // Now "create" on same key
+        let recreated = create_test_account_with_balance(1, 3_000);
+        delta.record_create(recreated).unwrap();
+
+        // Should still be Updated with original previous
+        assert_eq!(delta.num_changes(), 1);
+        let changes: Vec<_> = delta.changes().collect();
+        assert!(changes[0].is_updated());
+        if let LedgerEntryData::Account(ref acc) = changes[0].previous_entry().unwrap().data {
+            assert_eq!(acc.balance, 1_000_000_000); // original
+        }
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 3_000);
+        }
+    }
+
+    // =========================================================================
+    // Delta merge tests
+    // Parity: LedgerTxnTests.cpp commit/merge semantics
+    // =========================================================================
+
+    /// Merge two independent deltas.
+    #[test]
+    fn test_merge_independent_deltas() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        delta1.record_create(create_test_account(1)).unwrap();
+        delta2.record_create(create_test_account(2)).unwrap();
+
+        delta1.merge(delta2).unwrap();
+        assert_eq!(delta1.num_changes(), 2);
+        assert_eq!(delta1.init_entries().len(), 2);
+    }
+
+    /// Merge delta with Deleted + Created = Updated.
+    #[test]
+    fn test_merge_deleted_then_created_becomes_updated() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let original = create_test_account(1);
+        delta1.record_delete(original.clone()).unwrap();
+
+        let recreated = create_test_account_with_balance(1, 5_000);
+        delta2.record_create(recreated.clone()).unwrap();
+
+        delta1.merge(delta2).unwrap();
+        assert_eq!(delta1.num_changes(), 1);
+        let changes: Vec<_> = delta1.changes().collect();
+        assert!(changes[0].is_updated());
+    }
+
+    /// Merge delta with Created + Deleted = no-op.
+    #[test]
+    fn test_merge_created_then_deleted_becomes_noop() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let entry = create_test_account(1);
+        delta1.record_create(entry.clone()).unwrap();
+        delta2.record_delete(entry).unwrap();
+
+        delta1.merge(delta2).unwrap();
+        assert!(delta1.is_empty());
+    }
+
+    /// Merge delta: Updated + Updated = Updated (original previous, final current).
+    #[test]
+    fn test_merge_updated_then_updated_keeps_original_previous() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let v0 = create_test_account(1);
+        let v1 = create_test_account_with_balance(1, 2_000);
+        let v2 = create_test_account_with_balance(1, 3_000);
+
+        delta1.record_update(v0.clone(), v1.clone()).unwrap();
+        delta2.record_update(v1.clone(), v2.clone()).unwrap();
+
+        delta1.merge(delta2).unwrap();
+        assert_eq!(delta1.num_changes(), 1);
+        let changes: Vec<_> = delta1.changes().collect();
+        assert!(changes[0].is_updated());
+        // Previous should be v0 (original)
+        if let LedgerEntryData::Account(ref acc) = changes[0].previous_entry().unwrap().data {
+            assert_eq!(acc.balance, 1_000_000_000); // v0
+        }
+        // Current should be v2 (final)
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 3_000); // v2
+        }
+    }
+
+    /// Merge fee pool and total coins deltas.
+    #[test]
+    fn test_merge_fee_pool_and_total_coins() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        delta1.record_fee_pool_delta(100);
+        delta1.record_total_coins_delta(50);
+
+        delta2.record_fee_pool_delta(200);
+        delta2.record_total_coins_delta(-30);
+
+        delta1.merge(delta2).unwrap();
+        assert_eq!(delta1.fee_pool_delta(), 300);
+        assert_eq!(delta1.total_coins_delta(), 20);
+    }
+
+    /// Merge error: create on existing non-deleted entry.
+    #[test]
+    fn test_merge_create_on_existing_created_fails() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let entry = create_test_account(1);
+        delta1.record_create(entry.clone()).unwrap();
+        delta2.record_create(entry).unwrap();
+
+        assert!(delta1.merge(delta2).is_err());
+    }
+
+    /// Merge error: delete on already-deleted entry.
+    #[test]
+    fn test_merge_delete_on_deleted_fails() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let entry = create_test_account(1);
+        delta1.record_delete(entry.clone()).unwrap();
+        delta2.record_delete(entry).unwrap();
+
+        assert!(delta1.merge(delta2).is_err());
+    }
+
+    // =========================================================================
+    // Delta ordering test
+    // =========================================================================
+
+    /// Changes are returned in insertion order (deterministic).
+    #[test]
+    fn test_delta_deterministic_ordering() {
+        let mut delta = LedgerDelta::new(1);
+
+        // Insert in specific order
+        for i in (0..10u8).rev() {
+            delta.record_create(create_test_account(i)).unwrap();
+        }
+
+        // Verify changes come back in insertion order (9, 8, 7, ..., 0)
+        let keys: Vec<u8> = delta
+            .changes()
+            .map(|c| {
+                if let LedgerEntryData::Account(ref acc) = c.current_entry().unwrap().data {
+                    match &acc.account_id.0 {
+                        PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => bytes[0],
+                    }
+                } else {
+                    panic!("expected account");
+                }
+            })
+            .collect();
+        assert_eq!(keys, vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    }
+
+    /// Clear resets all state.
+    #[test]
+    fn test_delta_clear() {
+        let mut delta = LedgerDelta::new(1);
+        delta.record_create(create_test_account(1)).unwrap();
+        delta.record_fee_pool_delta(100);
+        delta.record_total_coins_delta(50);
+
+        delta.clear();
+        assert!(delta.is_empty());
+        assert_eq!(delta.fee_pool_delta(), 0);
+        assert_eq!(delta.total_coins_delta(), 0);
+    }
+
+    // =========================================================================
+    // Idempotent delete test
+    // =========================================================================
+
+    /// Double delete on same entry is idempotent.
+    #[test]
+    fn test_double_delete_idempotent() {
+        let mut delta = LedgerDelta::new(1);
+        let entry = create_test_account(1);
+
+        delta.record_delete(entry.clone()).unwrap();
+        delta.record_delete(entry).unwrap(); // should be no-op
+
+        assert_eq!(delta.num_changes(), 1);
+        assert_eq!(delta.dead_entries().len(), 1);
+    }
+
+    /// Update then delete preserves original previous.
+    #[test]
+    fn test_update_then_delete_preserves_original() {
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account(1);
+        let updated = create_test_account_with_balance(1, 5_000);
+
+        delta.record_update(original.clone(), updated.clone()).unwrap();
+        delta.record_delete(updated).unwrap();
+
+        assert_eq!(delta.num_changes(), 1);
+        let changes: Vec<_> = delta.changes().collect();
+        assert!(changes[0].is_deleted());
+        // Previous should be the original, not the updated value
+        if let LedgerEntryData::Account(ref acc) = changes[0].previous_entry().unwrap().data {
+            assert_eq!(acc.balance, 1_000_000_000); // original
+        }
+    }
+
     #[test]
     fn test_delete_then_update() {
         // Scenario: TX1 deletes an entry, TX2 updates it (e.g., fee refund
@@ -733,5 +1096,143 @@ mod tests {
         assert_eq!(delta.live_entries().len(), 1);
         assert_eq!(delta.init_entries().len(), 0);
         assert_eq!(delta.dead_entries().len(), 0);
+    }
+
+    // =========================================================================
+    // P2-3: ConfigSetting deletion prevention
+    // Parity: LedgerTxnTests.cpp:853 "fails for configuration"
+    // =========================================================================
+
+    fn create_config_setting_entry() -> LedgerEntry {
+        use stellar_xdr::curr::ConfigSettingEntry;
+
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractMaxSizeBytes(16384)),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Parity: LedgerTxnTests.cpp:853 "fails for configuration"
+    /// ConfigSetting entries cannot be erased.
+    #[test]
+    fn test_cannot_delete_config_setting() {
+        let mut delta = LedgerDelta::new(1);
+        let config = create_config_setting_entry();
+
+        let result = delta.record_delete(config);
+        assert!(result.is_err(), "should reject deletion of ConfigSetting");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot delete ConfigSetting"),
+            "error should mention ConfigSetting, got: {}",
+            err
+        );
+
+        // Delta should be empty - no change was recorded
+        assert_eq!(delta.num_changes(), 0);
+    }
+
+    /// ConfigSetting entries can be created and updated (just not deleted).
+    #[test]
+    fn test_config_setting_create_and_update_allowed() {
+        let mut delta = LedgerDelta::new(1);
+        let config = create_config_setting_entry();
+
+        // Create is allowed
+        delta.record_create(config.clone()).unwrap();
+        assert_eq!(delta.num_changes(), 1);
+
+        // Update is allowed
+        let mut updated = config.clone();
+        if let LedgerEntryData::ConfigSetting(ref mut setting) = updated.data {
+            *setting = stellar_xdr::curr::ConfigSettingEntry::ContractMaxSizeBytes(32768);
+        }
+        delta.record_update(config, updated).unwrap();
+        assert_eq!(delta.num_changes(), 1);
+        assert!(delta.changes().next().unwrap().is_created()); // create+update = created
+    }
+
+    // =========================================================================
+    // P2-4: Load entry when erased
+    // Parity: LedgerTxnTests.cpp:1509 "when key exists in grandparent, erased in parent"
+    //
+    // Tests that after deleting an entry, get_change shows it as deleted,
+    // and that created-then-deleted entries vanish entirely.
+    // =========================================================================
+
+    /// After deleting an entry, get_change returns Deleted with the original.
+    #[test]
+    fn test_deleted_entry_shows_as_deleted_in_delta() {
+        let mut delta = LedgerDelta::new(1);
+        let entry = create_test_account(1);
+        let key = entry_to_key(&entry).unwrap();
+
+        delta.record_delete(entry.clone()).unwrap();
+
+        // get_change should return Deleted
+        let change = delta.get_change(&key).unwrap();
+        assert!(change.is_some(), "deleted entry should be findable");
+        assert!(change.unwrap().is_deleted());
+
+        // dead_entries should contain the key
+        let dead = delta.dead_entries();
+        assert_eq!(dead.len(), 1);
+    }
+
+    /// Created then deleted = completely vanishes from delta (no-op).
+    /// Parity: LedgerTxnTests.cpp "when key exists in grandparent, erased in parent"
+    /// In C++, erasing an entry erased by a parent throws. In Rust, created+deleted = removed.
+    #[test]
+    fn test_created_then_deleted_vanishes() {
+        let mut delta = LedgerDelta::new(1);
+        let entry = create_test_account(1);
+        let key = entry_to_key(&entry).unwrap();
+
+        delta.record_create(entry.clone()).unwrap();
+        assert_eq!(delta.num_changes(), 1);
+
+        delta.record_delete(entry).unwrap();
+        assert_eq!(delta.num_changes(), 0, "create+delete should cancel out");
+
+        // Entry should not be findable
+        let change = delta.get_change(&key).unwrap();
+        assert!(change.is_none(), "entry should have been removed from delta");
+
+        // No entries in any category
+        assert!(delta.init_entries().is_empty());
+        assert!(delta.live_entries().is_empty());
+        assert!(delta.dead_entries().is_empty());
+    }
+
+    /// Entry deleted in delta cannot be loaded from delta (returns Deleted).
+    /// The snapshot/state layer interprets Deleted as "entry does not exist".
+    #[test]
+    fn test_deleted_entry_previous_preserved() {
+        let mut delta = LedgerDelta::new(1);
+        let entry = create_test_account(1);
+        let key = entry_to_key(&entry).unwrap();
+
+        // Set a specific balance so we can verify previous is preserved
+        let mut custom = entry.clone();
+        if let LedgerEntryData::Account(ref mut acc) = custom.data {
+            acc.balance = 42_000_000;
+        }
+
+        delta.record_delete(custom.clone()).unwrap();
+
+        let change = delta.get_change(&key).unwrap().unwrap();
+        assert!(change.is_deleted());
+
+        // Previous entry should be the exact entry we deleted
+        let prev = change.previous_entry().unwrap();
+        if let LedgerEntryData::Account(ref acc) = prev.data {
+            assert_eq!(acc.balance, 42_000_000);
+        } else {
+            panic!("expected account entry");
+        }
+
+        // Current entry should be None for deleted entries
+        assert!(change.current_entry().is_none());
     }
 }

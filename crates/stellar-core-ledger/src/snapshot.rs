@@ -612,6 +612,102 @@ mod tests {
         assert_eq!(account.unwrap().balance, 1000000000);
     }
 
+    /// Parity: LedgerTxnTests.cpp:1616 "LedgerTxn loadWithoutRecord"
+    /// Reading from a snapshot should not produce any side effects (no delta impact).
+    /// Snapshots are immutable point-in-time views.
+    #[test]
+    fn test_snapshot_read_is_side_effect_free() {
+        let (key1, entry1) = create_test_account(1);
+        let (key2, entry2) = create_test_account(2);
+
+        let snapshot = SnapshotBuilder::new(5)
+            .add_entry(key1.clone(), entry1.clone())
+            .unwrap()
+            .add_entry(key2.clone(), entry2.clone())
+            .unwrap()
+            .build_with_default_header();
+
+        // Read entries multiple times
+        for _ in 0..3 {
+            let e1 = snapshot.get_entry(&key1).unwrap();
+            assert!(e1.is_some());
+            let e2 = snapshot.get_entry(&key2).unwrap();
+            assert!(e2.is_some());
+        }
+
+        // Reading a non-existent entry is fine
+        let (missing_key, _) = create_test_account(99);
+        let missing = snapshot.get_entry(&missing_key).unwrap();
+        assert!(missing.is_none());
+
+        // Snapshot state hasn't changed: sequence, header, entries all same
+        assert_eq!(snapshot.ledger_seq(), 5);
+        let e1_again = snapshot.get_entry(&key1).unwrap().unwrap();
+        assert_eq!(e1_again.data, entry1.data);
+    }
+
+    /// Parity: LedgerTxnTests.cpp:1509 "when key does not exist"
+    /// Loading an entry that was never added to the snapshot returns None.
+    #[test]
+    fn test_snapshot_entry_not_found() {
+        let (key1, entry1) = create_test_account(1);
+        let (missing_key, _) = create_test_account(99);
+
+        let snapshot = SnapshotBuilder::new(5)
+            .add_entry(key1.clone(), entry1)
+            .unwrap()
+            .build_with_default_header();
+
+        // Existing entry: found
+        assert!(snapshot.get_entry(&key1).unwrap().is_some());
+
+        // Missing entry: returns None (not error)
+        assert!(snapshot.get_entry(&missing_key).unwrap().is_none());
+
+        // Missing account: returns None
+        if let LedgerKey::Account(ref ak) = missing_key {
+            assert!(snapshot.get_account(&ak.account_id).unwrap().is_none());
+        }
+    }
+
+    /// Parity: LedgerTxnTests.cpp:1562 "when key exists in grandparent, erased in parent"
+    /// If an entry is removed from the snapshot (e.g., during rebuild), it cannot be loaded.
+    /// This tests that snapshot entries are independent - removing one doesn't affect others.
+    #[test]
+    fn test_snapshot_selective_entries() {
+        let (key1, entry1) = create_test_account(1);
+        let (key2, entry2) = create_test_account(2);
+        let (key3, _entry3) = create_test_account(3);
+
+        // Build snapshot with only key1 and key2 (key3 was "erased")
+        let snapshot = SnapshotBuilder::new(5)
+            .add_entry(key1.clone(), entry1)
+            .unwrap()
+            .add_entry(key2.clone(), entry2)
+            .unwrap()
+            .build_with_default_header();
+
+        // key1 and key2 are found
+        assert!(snapshot.get_entry(&key1).unwrap().is_some());
+        assert!(snapshot.get_entry(&key2).unwrap().is_some());
+
+        // key3 was never added (simulating deletion) - not found
+        assert!(snapshot.get_entry(&key3).unwrap().is_none());
+    }
+
+    /// Snapshot provides an immutable header view.
+    #[test]
+    fn test_snapshot_header_immutability() {
+        let snapshot = SnapshotBuilder::new(42).build_with_default_header();
+
+        let h1 = snapshot.header().clone();
+        let h2 = snapshot.header().clone();
+
+        // Header should be identical on every read
+        assert_eq!(h1.ledger_seq, h2.ledger_seq);
+        assert_eq!(h1.ledger_seq, 42);
+    }
+
     /// Regression test for catchup replay id_pool fix.
     ///
     /// During catchup replay, the executor needs the previous ledger's id_pool
