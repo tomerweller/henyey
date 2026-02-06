@@ -332,6 +332,15 @@ pub struct LedgerManager {
     soroban_state: Arc<crate::soroban_state::SharedSorobanState>,
 }
 
+// Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
+#[allow(dead_code)]
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn _check() {
+        assert_send_sync::<LedgerManager>();
+    }
+};
+
 impl LedgerManager {
     /// Create a new ledger manager.
     ///
@@ -964,8 +973,13 @@ impl LedgerManager {
     /// let result = manager.close_ledger(close_data)?;
     /// println!("Closed ledger {}", result.ledger_seq());
     /// ```
-    pub fn close_ledger(&self, close_data: LedgerCloseData) -> Result<LedgerCloseResult> {
+    pub fn close_ledger(
+        &self,
+        close_data: LedgerCloseData,
+        runtime_handle: Option<tokio::runtime::Handle>,
+    ) -> Result<LedgerCloseResult> {
         let mut ctx = self.begin_close(close_data)?;
+        ctx.runtime_handle = runtime_handle;
         ctx.apply_transactions()?;
         ctx.commit()
     }
@@ -1151,6 +1165,7 @@ impl LedgerManager {
             tx_results: Vec::new(),
             tx_result_metas: Vec::new(),
             hot_archive_restored_keys: Vec::new(),
+            runtime_handle: None,
         })
     }
 
@@ -1459,6 +1474,8 @@ struct LedgerCloseContext<'a> {
     /// Keys of entries restored from hot archive during transaction execution.
     /// Passed to HotArchiveBucketList::add_batch to remove restored entries from archive.
     hot_archive_restored_keys: Vec<LedgerKey>,
+    /// Tokio runtime handle for spawning parallel work from non-worker threads.
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 #[allow(dead_code)]
@@ -1642,6 +1659,7 @@ impl<'a> LedgerCloseContext<'a> {
                     classic_events,
                     module_cache,
                     hot_archive,
+                    self.runtime_handle.clone(),
                 )?;
 
                 // Combine results: classic first, then Soroban.

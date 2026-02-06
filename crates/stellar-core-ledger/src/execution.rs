@@ -5671,6 +5671,7 @@ pub fn execute_soroban_parallel_phase(
     classic_events: ClassicEventConfig,
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    runtime_handle: Option<tokio::runtime::Handle>,
 ) -> Result<(
     Vec<TransactionExecutionResult>,
     Vec<TransactionResultPair>,
@@ -5711,6 +5712,7 @@ pub fn execute_soroban_parallel_phase(
             hot_archive.clone(),
             id_pool,
             delta,
+            runtime_handle.clone(),
         )?;
 
         // Merge cluster results. Use max id_pool across clusters.
@@ -5935,6 +5937,7 @@ fn execute_stage_clusters(
     hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
     id_pool: u64,
     delta: &mut LedgerDelta,
+    runtime_handle: Option<tokio::runtime::Handle>,
 ) -> Result<Vec<ClusterResult>> {
     // Compute per-cluster global offsets.
     let mut offsets = Vec::with_capacity(clusters.len());
@@ -5982,47 +5985,58 @@ fn execute_stage_clusters(
     let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
         std::sync::Arc::new(clusters.to_vec());
 
+    // Build the async future that spawns per-cluster tasks and collects results.
+    let spawn_and_collect = async {
+        let mut tasks = Vec::with_capacity(clusters.len());
+        for idx in 0..clusters.len() {
+            let snapshot = snapshot.clone();
+            let config = soroban_config.clone();
+            let cache = module_cache.clone();
+            let ha = hot_archive.clone();
+            let clusters = clusters.clone();
+            let cluster_offset = offsets[idx];
+
+            tasks.push(tokio::task::spawn_blocking(move || {
+                execute_single_cluster(
+                    &snapshot,
+                    &clusters[idx],
+                    cluster_offset,
+                    ledger_seq,
+                    close_time,
+                    base_fee,
+                    base_reserve,
+                    protocol_version,
+                    network_id,
+                    &config,
+                    soroban_base_prng_seed,
+                    classic_events,
+                    cache.as_ref(),
+                    ha.as_ref(),
+                    id_pool,
+                )
+            }));
+        }
+
+        // Collect all results (preserving cluster order).
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await.expect("cluster task panicked"));
+        }
+        results
+    };
+
+    // When called from a spawn_blocking thread (runtime_handle is Some),
+    // use Handle::block_on directly. When called from a tokio worker thread
+    // (runtime_handle is None), use block_in_place to safely enter a blocking
+    // context before calling block_on.
     let thread_results: Vec<Result<(ClusterResult, LedgerDelta, i64)>> =
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut tasks = Vec::with_capacity(clusters.len());
-                for idx in 0..clusters.len() {
-                    let snapshot = snapshot.clone();
-                    let config = soroban_config.clone();
-                    let cache = module_cache.clone();
-                    let ha = hot_archive.clone();
-                    let clusters = clusters.clone();
-                    let cluster_offset = offsets[idx];
-
-                    tasks.push(tokio::task::spawn_blocking(move || {
-                        execute_single_cluster(
-                            &snapshot,
-                            &clusters[idx],
-                            cluster_offset,
-                            ledger_seq,
-                            close_time,
-                            base_fee,
-                            base_reserve,
-                            protocol_version,
-                            network_id,
-                            &config,
-                            soroban_base_prng_seed,
-                            classic_events,
-                            cache.as_ref(),
-                            ha.as_ref(),
-                            id_pool,
-                        )
-                    }));
-                }
-
-                // Collect all results (preserving cluster order).
-                let mut results = Vec::with_capacity(tasks.len());
-                for task in tasks {
-                    results.push(task.await.expect("cluster task panicked"));
-                }
-                results
+        if let Some(handle) = runtime_handle {
+            handle.block_on(spawn_and_collect)
+        } else {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(spawn_and_collect)
             })
-        });
+        };
 
     // Merge results in cluster order (deterministic).
     let mut cluster_results = Vec::with_capacity(thread_results.len());

@@ -3982,6 +3982,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
             ClassicEventConfig::default(),
             None,
             None,
+            None,
         )
         .expect("execute parallel phase");
 
@@ -4060,6 +4061,7 @@ async fn test_parallel_soroban_matches_sequential() {
             &mut parallel_delta,
             args.7, args.8, args.9,
             None, None,
+            None,
         )
         .expect("parallel");
 
@@ -4081,6 +4083,7 @@ async fn test_parallel_soroban_matches_sequential() {
             &mut sequential_delta,
             args.7, args.8, args.9,
             None, None,
+            None,
         )
         .expect("sequential");
 
@@ -4157,6 +4160,7 @@ async fn test_parallel_soroban_deterministic() {
                 [0u8; 32],
                 ClassicEventConfig::default(),
                 None, None,
+                None,
             )
             .expect("execute");
 
@@ -4179,4 +4183,173 @@ async fn test_parallel_soroban_deterministic() {
         prev_fee_delta = Some(delta.fee_pool_delta());
         prev_num_changes = Some(delta.num_changes());
     }
+}
+
+/// Test that `execute_soroban_parallel_phase` works correctly when called from
+/// a `spawn_blocking` thread with an explicit runtime handle. This is the
+/// production code path used by the parallel ledger close.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parallel_soroban_from_spawn_blocking() {
+    use stellar_core_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
+        SnapshotHandle,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
+        builder = builder.add_entry(key, entry).expect("add entry");
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    // 1 stage, 2 clusters → triggers multi-cluster parallel path.
+    let phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![
+            vec![(tx1.clone(), None)],
+            vec![(tx2.clone(), None)],
+        ]],
+    };
+
+    let handle = tokio::runtime::Handle::current();
+
+    // Execute on a spawn_blocking thread with Some(handle).
+    // This exercises the Handle::block_on path (not block_in_place).
+    let result = tokio::task::spawn_blocking(move || {
+        let mut delta = LedgerDelta::new(1);
+        let (results, tx_results, tx_result_metas, _id_pool, _restored) =
+            execute_soroban_parallel_phase(
+                &snapshot,
+                &phase,
+                1,
+                1_000,
+                100,
+                5_000_000,
+                25,
+                network_id,
+                &mut delta,
+                SorobanConfig::default(),
+                [0u8; 32],
+                ClassicEventConfig::default(),
+                None,
+                None,
+                Some(handle),
+            )
+            .expect("execute parallel phase from spawn_blocking");
+
+        (results, tx_results, tx_result_metas, delta)
+    })
+    .await
+    .expect("spawn_blocking task");
+
+    let (results, tx_results, tx_result_metas, delta) = result;
+    assert_eq!(results.len(), 2, "expected 2 execution results");
+    assert_eq!(tx_results.len(), 2, "expected 2 TX result pairs");
+    assert_eq!(tx_result_metas.len(), 2, "expected 2 TX result metas");
+    assert!(results[0].success, "TX1 should succeed");
+    assert!(results[1].success, "TX2 should succeed");
+    assert!(delta.num_changes() > 0, "delta should have changes");
+    assert!(delta.fee_pool_delta() > 0, "fees should be collected");
+}
+
+/// Test that results from spawn_blocking path match the block_in_place path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parallel_soroban_spawn_blocking_matches_worker() {
+    use stellar_core_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
+        SnapshotHandle,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
+        builder = builder.add_entry(key, entry).expect("add entry");
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    let phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![
+            vec![(tx1.clone(), None)],
+            vec![(tx2.clone(), None)],
+        ]],
+    };
+
+    // Run with None (block_in_place path, on worker thread).
+    let mut delta_worker = LedgerDelta::new(1);
+    let (results_worker, tx_results_worker, _, _, _) = execute_soroban_parallel_phase(
+        &snapshot,
+        &phase,
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+        &mut delta_worker,
+        SorobanConfig::default(),
+        [0u8; 32],
+        ClassicEventConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .expect("worker path");
+
+    // Run with Some(handle) (Handle::block_on path, on spawn_blocking thread).
+    let handle = tokio::runtime::Handle::current();
+    let snapshot2 = SnapshotHandle::new({
+        let mut b = SnapshotBuilder::new(1);
+        let (_, e1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+        let (_, e2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+        for (key, entry) in e1.into_iter().chain(e2.into_iter()) {
+            b = b.add_entry(key, entry).expect("add entry");
+        }
+        b.build_with_default_header()
+    });
+    let phase2 = phase.clone();
+
+    let (results_blocking, tx_results_blocking, delta_blocking) =
+        tokio::task::spawn_blocking(move || {
+            let mut delta = LedgerDelta::new(1);
+            let (results, tx_results, _, _, _) = execute_soroban_parallel_phase(
+                &snapshot2,
+                &phase2,
+                1,
+                1_000,
+                100,
+                5_000_000,
+                25,
+                network_id,
+                &mut delta,
+                SorobanConfig::default(),
+                [0u8; 32],
+                ClassicEventConfig::default(),
+                None,
+                None,
+                Some(handle),
+            )
+            .expect("spawn_blocking path");
+            (results, tx_results, delta)
+        })
+        .await
+        .expect("spawn_blocking task");
+
+    // Both paths should produce identical results.
+    assert_eq!(results_worker.len(), results_blocking.len());
+    for (w, b) in results_worker.iter().zip(results_blocking.iter()) {
+        assert_eq!(w.success, b.success);
+        assert_eq!(w.fee_charged, b.fee_charged);
+    }
+    assert_eq!(tx_results_worker.len(), tx_results_blocking.len());
+    assert_eq!(delta_worker.fee_pool_delta(), delta_blocking.fee_pool_delta());
+    assert_eq!(delta_worker.num_changes(), delta_blocking.num_changes());
 }

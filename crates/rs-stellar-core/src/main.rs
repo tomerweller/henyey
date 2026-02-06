@@ -1943,7 +1943,7 @@ async fn cmd_verify_execution(
             let close_data = extract_ledger_close_data(&lcm, prev_ledger_hash);
 
             // Execute via close_ledger
-            let result = match ledger_manager.close_ledger(close_data) {
+            let result = match ledger_manager.close_ledger(close_data, None) {
                 Ok(r) => r,
                 Err(e) => {
                     println!("  Ledger {}: close_ledger failed: {}", seq, e);

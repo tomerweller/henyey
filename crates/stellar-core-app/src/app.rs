@@ -71,7 +71,8 @@ use stellar_core_historywork::{
     build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
 };
 use stellar_core_ledger::{
-    LedgerCloseData, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo, TransactionSetVariant,
+    LedgerCloseData, LedgerCloseResult, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo,
+    TransactionSetVariant,
 };
 use stellar_core_overlay::{
     ConnectionDirection, LocalNode, OverlayConfig as OverlayManagerConfig, OverlayManager,
@@ -227,6 +228,23 @@ pub struct SurveyReport {
     pub survey_in_progress: bool,
     pub backlog: Vec<String>,
     pub bad_response_nodes: Vec<String>,
+}
+
+/// State for a ledger close running on a background thread.
+///
+/// Created by [`App::try_start_ledger_close`] and consumed by
+/// [`App::handle_close_complete`] once the blocking close finishes.
+struct PendingLedgerClose {
+    /// Join handle for the `spawn_blocking` task.
+    handle: tokio::task::JoinHandle<std::result::Result<LedgerCloseResult, String>>,
+    /// Sequence number being closed.
+    ledger_seq: u32,
+    /// The transaction set used for closing.
+    tx_set: stellar_core_herder::TransactionSet,
+    /// Variant of the tx set (classic or generalized).
+    tx_set_variant: TransactionSetVariant,
+    /// Close time for the ledger.
+    close_time: u64,
 }
 
 /// The main application struct coordinating all Stellar Core subsystems.
@@ -2453,9 +2471,27 @@ impl App {
         // Add a short heartbeat interval for debugging
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
 
+        // In-progress background ledger close. Polled in the select loop.
+        let mut pending_close: Option<PendingLedgerClose> = None;
+
         loop {
             tokio::select! {
                 // NOTE: Removed biased; to ensure timers get fair polling
+
+                // Await pending ledger close completion
+                join_result = async {
+                    match pending_close.as_mut() {
+                        Some(p) => (&mut p.handle).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let pending = pending_close.take().unwrap();
+                    let success = self.handle_close_complete(pending, join_result).await;
+                    // Chain next close if successful.
+                    if success {
+                        pending_close = self.try_start_ledger_close().await;
+                    }
+                }
 
                 // Process overlay messages
                 msg = overlay_rx.recv() => {
@@ -2545,6 +2581,11 @@ impl App {
 
                     // Check for externalized slots to process
                     self.process_externalized_slots().await;
+
+                    // Start a background ledger close if one isn't already running.
+                    if pending_close.is_none() {
+                        pending_close = self.try_start_ledger_close().await;
+                    }
 
                     // Request any pending tx sets we need
                     self.request_pending_tx_sets().await;
@@ -3711,144 +3752,336 @@ impl App {
         true
     }
 
+    /// Apply buffered ledgers (yields to tokio via `spawn_blocking`).
+    ///
+    /// Used by callers outside the main select loop (catchup completion, tx set
+    /// handlers). If a background close is already in progress (`is_applying_ledger`),
+    /// returns immediately — the select loop completion handler will chain the next close.
     async fn try_apply_buffered_ledgers(&self) {
+        // If a background close is already running, let the select loop handle chaining.
+        if self.is_applying_ledger() {
+            return;
+        }
+
         loop {
-            let current_ledger = match self.get_current_ledger().await {
-                Ok(seq) => seq,
-                Err(_) => return,
+            let mut pending = match self.try_start_ledger_close().await {
+                Some(p) => p,
+                None => return,
             };
-
-            let next_seq = current_ledger.saturating_add(1);
-
-            let close_info = {
-                let mut buffer = self.syncing_ledgers.write().await;
-                Self::trim_syncing_ledgers(&mut buffer, current_ledger);
-                match buffer.get(&next_seq) {
-                    Some(info) if info.tx_set.is_some() => info.clone(),
-                    Some(info) => {
-                        // We have the slot externalized but no tx_set - it's pending
-                        tracing::debug!(
-                            next_seq,
-                            tx_set_hash = %info.tx_set_hash,
-                            "Waiting for tx_set for next slot"
-                        );
-                        return;
-                    }
-                    None => {
-                        // Slot not in buffer - check if it's externalized
-                        let is_externalized = self.herder.get_externalized(next_seq as u64).is_some();
-                        if is_externalized {
-                            // Externalized but not in buffer - shouldn't happen normally
-                            tracing::warn!(
-                                next_seq,
-                                current_ledger,
-                                "Next slot externalized but not in syncing_ledgers buffer"
-                            );
-                        } else {
-                            // Not externalized - we're missing the EXTERNALIZE message
-                            let latest = self.herder.latest_externalized_slot().unwrap_or(0);
-                            if latest > next_seq as u64 {
-                                tracing::debug!(
-                                    next_seq,
-                                    latest_externalized = latest,
-                                    "Missing EXTERNALIZE for next slot (gap detected)"
-                                );
-                            }
-                        }
-                        return;
-                    }
-                }
-            };
-
-            let tx_set = close_info.tx_set.clone().expect("tx set present");
-            // Log our current header hash vs what network expects
-            let our_header_hash = self.ledger_manager.current_header_hash();
-            tracing::info!(
-                ledger_seq = next_seq,
-                our_header_hash = %our_header_hash.to_hex(),
-                network_prev_hash = %tx_set.previous_ledger_hash.to_hex(),
-                matches = our_header_hash == tx_set.previous_ledger_hash,
-                "Pre-close hash comparison"
-            );
-            if tx_set.hash != close_info.tx_set_hash {
-                tracing::error!(
-                    ledger_seq = next_seq,
-                    expected = %close_info.tx_set_hash.to_hex(),
-                    found = %tx_set.hash.to_hex(),
-                    "Buffered tx set hash mismatch"
-                );
-                let mut buffer = self.syncing_ledgers.write().await;
-                if let Some(entry) = buffer.get_mut(&next_seq) {
-                    entry.tx_set = None;
-                }
+            let join_result = (&mut pending.handle).await;
+            let success = self.handle_close_complete(pending, join_result).await;
+            if !success {
                 return;
             }
-            tracing::info!(
-                ledger_seq = next_seq,
-                tx_count = tx_set.transactions.len(),
-                close_time = close_info.close_time,
-                prev_ledger_hash = %tx_set.previous_ledger_hash.to_hex(),
-                "Applying buffered ledger"
-            );
+        }
+    }
 
-            match HerderCallback::close_ledger(
-                self,
-                next_seq,
-                tx_set,
-                close_info.close_time,
-                close_info.upgrades.clone(),
-                close_info.stellar_value_ext.clone(),
-            )
-            .await
-            {
-                Ok(hash) => {
-                    tracing::info!(
-                        ledger_seq = next_seq,
-                        hash = %hash.to_hex(),
-                        "Applied buffered ledger"
+    /// Start a background ledger close if the next buffered ledger is ready.
+    ///
+    /// Returns `Some(PendingLedgerClose)` if a close was spawned, `None` if
+    /// nothing to close or a close is already in progress.
+    async fn try_start_ledger_close(&self) -> Option<PendingLedgerClose> {
+        if self.is_applying_ledger() {
+            return None;
+        }
+
+        let current_ledger = self.get_current_ledger().await.ok()?;
+        let next_seq = current_ledger.saturating_add(1);
+
+        let close_info = {
+            let mut buffer = self.syncing_ledgers.write().await;
+            Self::trim_syncing_ledgers(&mut buffer, current_ledger);
+            match buffer.get(&next_seq) {
+                Some(info) if info.tx_set.is_some() => info.clone(),
+                Some(info) => {
+                    tracing::debug!(
+                        next_seq,
+                        tx_set_hash = %info.tx_set_hash,
+                        "Waiting for tx_set for next slot"
                     );
-                    {
-                        let mut buffer = self.syncing_ledgers.write().await;
-                        buffer.remove(&next_seq);
-                    }
-                    *self.current_ledger.write().await = next_seq;
-                    *self.last_processed_slot.write().await = next_seq as u64;
-                    self.clear_tx_advert_history(next_seq).await;
+                    return None;
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    let is_hash_mismatch = error_str.contains("hash mismatch");
-                    tracing::error!(
-                        ledger_seq = next_seq,
-                        error = %e,
-                        is_hash_mismatch,
-                        "Failed to apply buffered ledger"
-                    );
-                    if is_hash_mismatch {
-                        // Hash mismatch means we're out of sync with the network.
-                        // All buffered ledgers are invalid since they're based on the wrong chain.
-                        // Clear everything and let catchup rebuild state correctly.
-                        let mut buffer = self.syncing_ledgers.write().await;
-                        let cleared_count = buffer.len();
-                        buffer.clear();
+                None => {
+                    let is_externalized =
+                        self.herder.get_externalized(next_seq as u64).is_some();
+                    if is_externalized {
                         tracing::warn!(
-                            ledger_seq = next_seq,
-                            cleared_count,
-                            "Hash mismatch detected - cleared all buffered ledgers, will trigger catchup"
+                            next_seq,
+                            current_ledger,
+                            "Next slot externalized but not in syncing_ledgers buffer"
                         );
                     } else {
-                        // For other errors, just remove this entry to prevent infinite retry
-                        let mut buffer = self.syncing_ledgers.write().await;
-                        buffer.remove(&next_seq);
-                        tracing::info!(
+                        let latest =
+                            self.herder.latest_externalized_slot().unwrap_or(0);
+                        if latest > next_seq as u64 {
+                            tracing::debug!(
+                                next_seq,
+                                latest_externalized = latest,
+                                "Missing EXTERNALIZE for next slot (gap detected)"
+                            );
+                        }
+                    }
+                    return None;
+                }
+            }
+        };
+
+        let tx_set = close_info.tx_set.clone().expect("tx set present");
+        let our_header_hash = self.ledger_manager.current_header_hash();
+        tracing::info!(
+            ledger_seq = next_seq,
+            our_header_hash = %our_header_hash.to_hex(),
+            network_prev_hash = %tx_set.previous_ledger_hash.to_hex(),
+            matches = our_header_hash == tx_set.previous_ledger_hash,
+            "Pre-close hash comparison"
+        );
+        if tx_set.hash != close_info.tx_set_hash {
+            tracing::error!(
+                ledger_seq = next_seq,
+                expected = %close_info.tx_set_hash.to_hex(),
+                found = %tx_set.hash.to_hex(),
+                "Buffered tx set hash mismatch"
+            );
+            let mut buffer = self.syncing_ledgers.write().await;
+            if let Some(entry) = buffer.get_mut(&next_seq) {
+                entry.tx_set = None;
+            }
+            return None;
+        }
+
+        tracing::info!(
+            ledger_seq = next_seq,
+            tx_count = tx_set.transactions.len(),
+            close_time = close_info.close_time,
+            prev_ledger_hash = %tx_set.previous_ledger_hash.to_hex(),
+            "Starting background ledger close"
+        );
+
+        // Build LedgerCloseData (same as HerderCallback::close_ledger).
+        let prev_hash = tx_set.previous_ledger_hash;
+        let tx_set_variant = if let Some(gen_tx_set) = tx_set.generalized_tx_set.clone() {
+            TransactionSetVariant::Generalized(gen_tx_set)
+        } else {
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash::from(prev_hash),
+                txs: match tx_set.transactions.clone().try_into() {
+                    Ok(txs) => txs,
+                    Err(_) => {
+                        tracing::error!(
                             ledger_seq = next_seq,
-                            "Removed failed buffered ledger entry"
+                            "Failed to create tx set for background close"
+                        );
+                        return None;
+                    }
+                },
+            })
+        };
+
+        let decoded_upgrades = decode_upgrades(close_info.upgrades.clone());
+        let close_time = close_info.close_time;
+
+        let mut close_data =
+            LedgerCloseData::new(next_seq, tx_set_variant.clone(), close_time, prev_hash)
+                .with_stellar_value_ext(close_info.stellar_value_ext);
+        if !decoded_upgrades.is_empty() {
+            close_data = close_data.with_upgrades(decoded_upgrades);
+        }
+        if let Some(entry) = self.build_scp_history_entry(next_seq) {
+            close_data = close_data.with_scp_history(vec![entry]);
+        }
+
+        // Remove from buffer before spawning (optimistic).
+        {
+            let mut buffer = self.syncing_ledgers.write().await;
+            buffer.remove(&next_seq);
+        }
+
+        // Spawn blocking close.
+        let lm = self.ledger_manager.clone();
+        let runtime_handle = tokio::runtime::Handle::current();
+        self.set_applying_ledger(true);
+
+        let join_handle = tokio::task::spawn_blocking(move || {
+            lm.close_ledger(close_data, Some(runtime_handle))
+                .map_err(|e| e.to_string())
+        });
+
+        Some(PendingLedgerClose {
+            handle: join_handle,
+            ledger_seq: next_seq,
+            tx_set,
+            tx_set_variant,
+            close_time,
+        })
+    }
+
+    /// Handle completion of a background ledger close.
+    ///
+    /// Performs all post-close work: meta emission, DB persistence, herder
+    /// notification, and state updates. Returns `true` on success.
+    async fn handle_close_complete(
+        &self,
+        pending: PendingLedgerClose,
+        join_result: Result<
+            std::result::Result<LedgerCloseResult, String>,
+            tokio::task::JoinError,
+        >,
+    ) -> bool {
+        self.set_applying_ledger(false);
+
+        let result = match join_result {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                let is_hash_mismatch = e.contains("hash mismatch");
+                tracing::error!(
+                    ledger_seq = pending.ledger_seq,
+                    error = %e,
+                    is_hash_mismatch,
+                    "Background ledger close failed"
+                );
+                if is_hash_mismatch {
+                    let mut buffer = self.syncing_ledgers.write().await;
+                    let cleared_count = buffer.len();
+                    buffer.clear();
+                    tracing::warn!(
+                        ledger_seq = pending.ledger_seq,
+                        cleared_count,
+                        "Hash mismatch detected - cleared all buffered ledgers, will trigger catchup"
+                    );
+                }
+                return false;
+            }
+            Err(e) => {
+                tracing::error!(
+                    ledger_seq = pending.ledger_seq,
+                    error = %e,
+                    "Ledger close task panicked"
+                );
+                return false;
+            }
+        };
+
+        // Emit LedgerCloseMeta to stream.
+        if let Some(ref meta) = result.meta {
+            let mut guard = self.meta_stream.lock().unwrap();
+            if let Some(ref mut stream) = *guard {
+                if let Err(e) = stream.maybe_rotate_debug_stream(pending.ledger_seq) {
+                    tracing::warn!(
+                        error = %e,
+                        ledger_seq = pending.ledger_seq,
+                        "Failed to rotate debug meta stream"
+                    );
+                }
+                match stream.emit_meta(meta) {
+                    Ok(()) => {}
+                    Err(MetaStreamError::MainStreamWrite(e)) => {
+                        tracing::error!(
+                            error = %e,
+                            ledger_seq = pending.ledger_seq,
+                            "Fatal: metadata output stream write failed"
+                        );
+                        std::process::abort();
+                    }
+                    Err(MetaStreamError::DebugStreamWrite(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            ledger_seq = pending.ledger_seq,
+                            "Debug metadata stream write failed"
                         );
                     }
-                    return;
                 }
             }
         }
+
+        // Persist ledger close data.
+        let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
+        if let Err(err) = self.persist_ledger_close(
+            &result.header,
+            &pending.tx_set_variant,
+            &result.tx_results,
+            tx_metas.as_deref(),
+        ) {
+            tracing::warn!(error = %err, "Failed to persist ledger close data");
+        }
+
+        // Separate successful and failed transactions for queue management.
+        let mut applied_hashes = Vec::new();
+        let mut failed_hashes = Vec::new();
+        for (tx, tx_result) in pending
+            .tx_set
+            .transactions
+            .iter()
+            .zip(result.tx_results.iter())
+        {
+            if let Some(hash) = self.tx_hash(tx) {
+                use stellar_xdr::curr::TransactionResultResult;
+                let is_success = matches!(
+                    tx_result.result.result,
+                    TransactionResultResult::TxSuccess(_)
+                        | TransactionResultResult::TxFeeBumpInnerSuccess(_)
+                );
+                if is_success {
+                    applied_hashes.push(hash);
+                } else {
+                    failed_hashes.push(hash);
+                }
+            }
+        }
+
+        self.herder
+            .ledger_closed(pending.ledger_seq as u64, &applied_hashes);
+
+        if !failed_hashes.is_empty() {
+            tracing::debug!(
+                failed_count = failed_hashes.len(),
+                "Banning failed transactions"
+            );
+            self.herder.tx_queue().ban(&failed_hashes);
+        }
+
+        // Record externalized close time for drift tracking.
+        if let Ok(mut tracker) = self.drift_tracker.lock() {
+            if let Some(warning) =
+                tracker.record_externalized_close_time(pending.ledger_seq, pending.close_time)
+            {
+                tracing::warn!("{}", warning);
+            }
+        }
+
+        self.herder.tx_queue().update_validation_context(
+            pending.ledger_seq,
+            result.header.scp_value.close_time.0,
+            result.header.ledger_version,
+            result.header.base_fee,
+        );
+
+        let shift_result = self.herder.tx_queue().shift();
+        if shift_result.unbanned_count > 0 || shift_result.evicted_due_to_age > 0 {
+            tracing::debug!(
+                unbanned = shift_result.unbanned_count,
+                evicted = shift_result.evicted_due_to_age,
+                "Shifted transaction ban queue"
+            );
+        }
+
+        // Update current ledger tracking.
+        *self.current_ledger.write().await = pending.ledger_seq;
+        *self.last_processed_slot.write().await = pending.ledger_seq as u64;
+        self.clear_tx_advert_history(pending.ledger_seq).await;
+
+        // Signal heartbeat to sync recovery.
+        self.sync_recovery_heartbeat();
+
+        self.tx_set_all_peers_exhausted
+            .store(false, Ordering::SeqCst);
+
+        tracing::info!(
+            ledger_seq = result.ledger_seq(),
+            hash = %result.header_hash.to_hex(),
+            "Ledger closed successfully"
+        );
+
+        true
     }
 
     // NOTE: trigger_catchup_due_to_missing_txset was removed.
@@ -7387,134 +7620,52 @@ impl HerderCallback for App {
         };
 
         // Create close data
+        let decoded_upgrades = decode_upgrades(upgrades);
         let mut close_data =
             LedgerCloseData::new(ledger_seq, tx_set_variant.clone(), close_time, prev_hash)
-                .with_stellar_value_ext(stellar_value_ext);
-        let decoded_upgrades = decode_upgrades(upgrades);
+                .with_stellar_value_ext(stellar_value_ext.clone());
         if !decoded_upgrades.is_empty() {
-            close_data = close_data.with_upgrades(decoded_upgrades);
+            close_data = close_data.with_upgrades(decoded_upgrades.clone());
         }
         if let Some(entry) = self.build_scp_history_entry(ledger_seq) {
             close_data = close_data.with_scp_history(vec![entry]);
         }
 
-        // Close the ledger (execute transactions and commit)
-        let result = self.ledger_manager.close_ledger(close_data).map_err(|e| {
-            stellar_core_herder::HerderError::Internal(format!("Failed to close ledger: {}", e))
-        })?;
+        // Close the ledger on a blocking thread (yields the tokio worker).
+        let lm = self.ledger_manager.clone();
+        let runtime_handle = tokio::runtime::Handle::current();
+        self.set_applying_ledger(true);
 
-        // Emit LedgerCloseMeta to stream — after state commit, before DB persist.
-        // This matches C++ ordering: emitNextMeta() before database commit.
-        if let Some(ref meta) = result.meta {
-            let mut guard = self.meta_stream.lock().unwrap();
-            if let Some(ref mut stream) = *guard {
-                if let Err(e) = stream.maybe_rotate_debug_stream(ledger_seq) {
-                    tracing::warn!(error = %e, ledger_seq, "Failed to rotate debug meta stream");
-                }
-                match stream.emit_meta(meta) {
-                    Ok(()) => {}
-                    Err(MetaStreamError::MainStreamWrite(e)) => {
-                        tracing::error!(error = %e, ledger_seq, "Fatal: metadata output stream write failed");
-                        std::process::abort();
-                    }
-                    Err(MetaStreamError::DebugStreamWrite(e)) => {
-                        tracing::warn!(error = %e, ledger_seq, "Debug metadata stream write failed");
-                    }
-                }
-            }
-        }
+        let join_handle = tokio::task::spawn_blocking(move || {
+            lm.close_ledger(close_data, Some(runtime_handle))
+                .map_err(|e| e.to_string())
+        });
 
-        let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
-        tracing::debug!(ledger_seq, "Persisting ledger close data");
-        if let Err(err) = self.persist_ledger_close(
-            &result.header,
-            &tx_set_variant,
-            &result.tx_results,
-            tx_metas.as_deref(),
-        ) {
-            tracing::warn!(error = %err, "Failed to persist ledger close data");
-        }
-        tracing::debug!(ledger_seq, "Ledger close data persisted");
-
-        // Separate successful and failed transactions for queue management.
-        // Results are in the same order as tx_set.transactions.
-        let mut applied_hashes = Vec::new();
-        let mut failed_hashes = Vec::new();
-        for (tx, tx_result) in tx_set.transactions.iter().zip(result.tx_results.iter()) {
-            if let Some(hash) = self.tx_hash(tx) {
-                // Check if transaction succeeded by examining the result discriminant
-                use stellar_xdr::curr::TransactionResultResult;
-                let is_success = matches!(
-                    tx_result.result.result,
-                    TransactionResultResult::TxSuccess(_)
-                        | TransactionResultResult::TxFeeBumpInnerSuccess(_)
-                );
-                if is_success {
-                    applied_hashes.push(hash);
-                } else {
-                    failed_hashes.push(hash);
-                }
-            }
-        }
-
-        self.herder
-            .ledger_closed(ledger_seq as u64, &applied_hashes);
-
-        // Ban failed transactions to prevent immediate resubmission.
-        if !failed_hashes.is_empty() {
-            tracing::debug!(
-                failed_count = failed_hashes.len(),
-                "Banning failed transactions"
-            );
-            self.herder.tx_queue().ban(&failed_hashes);
-        }
-
-        // Record externalized close time for drift tracking and log warning if clock drift is high.
-        if let Ok(mut tracker) = self.drift_tracker.lock() {
-            if let Some(warning) = tracker.record_externalized_close_time(ledger_seq, close_time) {
-                tracing::warn!("{}", warning);
-            }
-        }
-
-        self.herder.tx_queue().update_validation_context(
+        let mut pending = PendingLedgerClose {
+            handle: join_handle,
             ledger_seq,
-            result.header.scp_value.close_time.0,
-            result.header.ledger_version,
-            result.header.base_fee,
-        );
+            tx_set,
+            tx_set_variant,
+            close_time,
+        };
 
-        // Shift the transaction ban queue - ages out old bans after each ledger close.
-        let shift_result = self.herder.tx_queue().shift();
-        if shift_result.unbanned_count > 0 || shift_result.evicted_due_to_age > 0 {
-            tracing::debug!(
-                unbanned = shift_result.unbanned_count,
-                evicted = shift_result.evicted_due_to_age,
-                "Shifted transaction ban queue"
-            );
+        let join_result = (&mut pending.handle).await;
+
+        // Extract header hash before passing ownership to handle_close_complete.
+        let header_hash = match &join_result {
+            Ok(Ok(result)) => Some(result.header_hash),
+            _ => None,
+        };
+
+        let success = self.handle_close_complete(pending, join_result).await;
+
+        if success {
+            Ok(header_hash.unwrap())
+        } else {
+            Err(stellar_core_herder::HerderError::Internal(
+                format!("Failed to close ledger {}", ledger_seq),
+            ))
         }
-
-        // Update current ledger tracking
-        tracing::debug!(ledger_seq, "Updating current ledger tracking");
-        *self.current_ledger.write().await = ledger_seq;
-        tracing::debug!(ledger_seq, "Clearing tx advert history");
-        self.clear_tx_advert_history(ledger_seq).await;
-
-        // Signal heartbeat to sync recovery - ledger close is progress
-        tracing::debug!(ledger_seq, "Signaling sync recovery heartbeat");
-        self.sync_recovery_heartbeat();
-
-        // Reset the tx set exhausted flag - we're making progress
-        self.tx_set_all_peers_exhausted
-            .store(false, Ordering::SeqCst);
-
-        tracing::info!(
-            ledger_seq = result.ledger_seq(),
-            hash = %result.header_hash.to_hex(),
-            "Ledger closed successfully"
-        );
-
-        tracing::debug!(ledger_seq, "Ledger close function returning");
-        Ok(result.header_hash)
     }
 
     async fn validate_tx_set(&self, _tx_set_hash: &stellar_core_common::Hash256) -> bool {
@@ -8136,5 +8287,213 @@ mod tests {
         let shift_result = app.herder.tx_queue().shift();
         assert_eq!(shift_result.unbanned_count, 0);
         assert_eq!(shift_result.evicted_due_to_age, 0);
+    }
+
+    #[tokio::test]
+    async fn test_try_start_ledger_close_returns_none_when_no_buffered() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // No buffered ledgers → should return None.
+        let pending = app.try_start_ledger_close().await;
+        assert!(pending.is_none(), "should return None with no buffered ledgers");
+    }
+
+    #[tokio::test]
+    async fn test_try_start_ledger_close_skips_when_already_applying() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Simulate a ledger close already in progress.
+        app.set_applying_ledger(true);
+
+        let pending = app.try_start_ledger_close().await;
+        assert!(
+            pending.is_none(),
+            "should return None when is_applying_ledger is true"
+        );
+
+        // Cleanup.
+        app.set_applying_ledger(false);
+    }
+
+    #[tokio::test]
+    async fn test_try_apply_buffered_skips_when_already_applying() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Simulate a ledger close already in progress.
+        app.set_applying_ledger(true);
+
+        // Should return immediately without doing anything.
+        app.try_apply_buffered_ledgers().await;
+
+        // Flag should still be true (not cleared by the no-op call).
+        assert!(app.is_applying_ledger.load(Ordering::Relaxed));
+
+        // Cleanup.
+        app.set_applying_ledger(false);
+    }
+
+    #[tokio::test]
+    async fn test_handle_close_complete_clears_applying_flag_on_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        // Simulate a failed close result.
+        let pending = PendingLedgerClose {
+            handle: tokio::task::spawn_blocking(|| {
+                Err("simulated error".to_string())
+            }),
+            ledger_seq: 1,
+            tx_set: stellar_core_herder::TransactionSet {
+                hash: stellar_core_common::Hash256::ZERO,
+                previous_ledger_hash: stellar_core_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(
+                stellar_xdr::curr::TransactionSet {
+                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    txs: stellar_xdr::curr::VecM::default(),
+                },
+            ),
+            close_time: 1,
+        };
+
+        let mut pending = pending;
+        let join_result = (&mut pending.handle).await;
+        let success = app.handle_close_complete(pending, join_result).await;
+
+        assert!(!success, "should return false on error");
+        assert!(
+            !app.is_applying_ledger.load(Ordering::Relaxed),
+            "is_applying_ledger should be cleared on error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_close_complete_clears_applying_flag_on_panic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        // Simulate a panicked task.
+        let pending = PendingLedgerClose {
+            handle: tokio::task::spawn_blocking(|| {
+                panic!("simulated panic");
+            }),
+            ledger_seq: 1,
+            tx_set: stellar_core_herder::TransactionSet {
+                hash: stellar_core_common::Hash256::ZERO,
+                previous_ledger_hash: stellar_core_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(
+                stellar_xdr::curr::TransactionSet {
+                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    txs: stellar_xdr::curr::VecM::default(),
+                },
+            ),
+            close_time: 1,
+        };
+
+        let mut pending = pending;
+        let join_result = (&mut pending.handle).await;
+        let success = app.handle_close_complete(pending, join_result).await;
+
+        assert!(!success, "should return false on panic");
+        assert!(
+            !app.is_applying_ledger.load(Ordering::Relaxed),
+            "is_applying_ledger should be cleared on panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_close_complete_clears_buffer_on_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        // Add a fake entry to syncing_ledgers to verify it gets cleared.
+        {
+            let mut buffer = app.syncing_ledgers.write().await;
+            buffer.insert(
+                2,
+                stellar_core_herder::LedgerCloseInfo {
+                    slot: 2,
+                    tx_set_hash: stellar_core_common::Hash256::ZERO,
+                    tx_set: None,
+                    close_time: 1,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // Simulate a hash mismatch error.
+        let pending = PendingLedgerClose {
+            handle: tokio::task::spawn_blocking(|| {
+                Err("previous ledger hash mismatch".to_string())
+            }),
+            ledger_seq: 1,
+            tx_set: stellar_core_herder::TransactionSet {
+                hash: stellar_core_common::Hash256::ZERO,
+                previous_ledger_hash: stellar_core_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(
+                stellar_xdr::curr::TransactionSet {
+                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    txs: stellar_xdr::curr::VecM::default(),
+                },
+            ),
+            close_time: 1,
+        };
+
+        let mut pending = pending;
+        let join_result = (&mut pending.handle).await;
+        let success = app.handle_close_complete(pending, join_result).await;
+
+        assert!(!success);
+        // Buffer should have been cleared due to hash mismatch.
+        let buffer = app.syncing_ledgers.read().await;
+        assert!(
+            buffer.is_empty(),
+            "syncing_ledgers should be cleared on hash mismatch"
+        );
     }
 }
