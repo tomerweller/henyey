@@ -3633,23 +3633,28 @@ impl TransactionExecutor {
     ) -> Result<()> {
         let state_delta = self.state.delta();
 
-        // Apply created entries
-        for entry in state_delta.created_entries() {
-            delta.record_create(entry.clone())?;
-        }
-
-        // Apply updated entries with their pre-states
-        let update_states = state_delta.update_states();
-        for (i, entry) in state_delta.updated_entries().iter().enumerate() {
-            let prev = &update_states[i];
-            delta.record_update(prev.clone(), entry.clone())?;
-        }
-
-        // Apply deleted entries with their pre-states
-        let delete_states = state_delta.delete_states();
-        for (i, _key) in state_delta.deleted_keys().iter().enumerate() {
-            let prev = &delete_states[i];
-            delta.record_delete(prev.clone())?;
+        // Apply changes in chronological order using change_order.
+        // This is critical for correctness when the same key is affected by
+        // multiple transactions (e.g., TX1 deletes an entry, TX2 recreates it).
+        // Processing by category (all creates, then all updates, then all deletes)
+        // would process the create before the delete, causing them to cancel out
+        // instead of producing the correct Updated result.
+        for change_ref in state_delta.change_order() {
+            match change_ref {
+                stellar_core_tx::ChangeRef::Created(idx) => {
+                    let entry = &state_delta.created_entries()[*idx];
+                    delta.record_create(entry.clone())?;
+                }
+                stellar_core_tx::ChangeRef::Updated(idx) => {
+                    let prev = &state_delta.update_states()[*idx];
+                    let entry = &state_delta.updated_entries()[*idx];
+                    delta.record_update(prev.clone(), entry.clone())?;
+                }
+                stellar_core_tx::ChangeRef::Deleted(idx) => {
+                    let prev = &state_delta.delete_states()[*idx];
+                    delta.record_delete(prev.clone())?;
+                }
+            }
         }
 
         Ok(())

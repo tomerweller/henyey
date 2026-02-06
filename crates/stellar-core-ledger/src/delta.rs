@@ -274,10 +274,16 @@ impl LedgerDelta {
                         },
                     );
                 }
-                EntryChange::Deleted { .. } => {
-                    return Err(LedgerError::Internal(
-                        "cannot create an entry that was deleted in the same delta".to_string(),
-                    ));
+                EntryChange::Deleted { previous } => {
+                    // Deleted then created = update (entry existed before the ledger,
+                    // was deleted, then recreated - net effect is an update).
+                    self.changes.insert(
+                        key_bytes,
+                        EntryChange::Updated {
+                            previous: previous.clone(),
+                            current: Box::new(entry),
+                        },
+                    );
                 }
             }
         } else {
@@ -310,10 +316,16 @@ impl LedgerDelta {
                         },
                     );
                 }
-                EntryChange::Deleted { .. } => {
-                    return Err(LedgerError::Internal(
-                        "cannot update a deleted entry".to_string(),
-                    ));
+                EntryChange::Deleted { previous: orig } => {
+                    // Deleted then updated = entry was deleted then came back
+                    // (e.g., via fee refund restore). Keep original previous.
+                    self.changes.insert(
+                        key_bytes,
+                        EntryChange::Updated {
+                            previous: orig.clone(),
+                            current: Box::new(current),
+                        },
+                    );
                 }
             }
         } else {
