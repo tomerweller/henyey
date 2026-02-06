@@ -260,8 +260,8 @@ pub mod known_validators {
     /// Note: For production mainnet use, you should configure a more
     /// diverse set of validators from multiple organizations.
     pub const MAINNET_SDF_VALIDATORS: &[&str] = &[
-        "GCGB2S2KGYARPVIA37HBER46GJSTA276NAJMGRY7DXVQ6JR7RMQMJ", // sdf1
-        "GCM6QMP3DLBER46NSEBVR6T6RNXOQCWPZ4ZQWOXJH3OPCY4DJXXOH", // sdf2
+        "GCGB2S2KGYARPVIA37HYZXVRM2YZUEXA6S33ZU5BUDC6THSB62LZSTYH", // sdf1
+        "GCM6QMP3DLRPTAZW2UZPCPX2LF3SXWXKPMP3GKFZBDSF3QZGV2G5QSTK", // sdf2
         "GABMKJM6I25XI4K7U6XWMULOUQIQ27BCTMLS6BYYSOWKTBUXVRJSXHYQ", // sdf3
     ];
 
