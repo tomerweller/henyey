@@ -171,15 +171,13 @@ mod tests {
         let result = make_inflation_result(InflationResultCode::Success, vec![payout]);
 
         match result {
-            OperationResult::OpInner(OperationResultTr::Inflation(r)) => {
-                match r {
-                    InflationResult::Success(payouts) => {
-                        assert_eq!(payouts.len(), 1);
-                        assert_eq!(payouts[0].amount, 1000000);
-                    }
-                    _ => panic!("Expected Success"),
+            OperationResult::OpInner(OperationResultTr::Inflation(r)) => match r {
+                InflationResult::Success(payouts) => {
+                    assert_eq!(payouts.len(), 1);
+                    assert_eq!(payouts[0].amount, 1000000);
                 }
-            }
+                _ => panic!("Expected Success"),
+            },
             _ => panic!("Unexpected result type"),
         }
     }

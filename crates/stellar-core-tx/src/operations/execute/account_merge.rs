@@ -516,10 +516,7 @@ mod tests {
             )) => {
                 assert_eq!(amount, 100_000_000);
             }
-            other => panic!(
-                "Expected Success with signers allowed, got {:?}",
-                other
-            ),
+            other => panic!("Expected Success with signers allowed, got {:?}", other),
         }
 
         // Source should be deleted

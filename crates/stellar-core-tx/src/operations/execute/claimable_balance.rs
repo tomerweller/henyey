@@ -202,8 +202,7 @@ pub fn execute_create_claimable_balance(
                 .unwrap_or(false)
         };
         if clawback_enabled {
-            claimable_flags |=
-                ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32;
+            claimable_flags |= ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32;
         }
     }
 
@@ -1430,7 +1429,13 @@ mod tests {
         };
 
         let create_result = execute_create_claimable_balance(
-            &create_op, &creator_id, &creator_id, 123, 0, &mut state, &context,
+            &create_op,
+            &creator_id,
+            &creator_id,
+            123,
+            0,
+            &mut state,
+            &context,
         )
         .unwrap();
 
@@ -1497,7 +1502,13 @@ mod tests {
         };
 
         let create_result = execute_create_claimable_balance(
-            &create_op, &creator_id, &creator_id, 123, 0, &mut state, &context,
+            &create_op,
+            &creator_id,
+            &creator_id,
+            123,
+            0,
+            &mut state,
+            &context,
         )
         .unwrap();
 
@@ -1638,7 +1649,13 @@ mod tests {
         };
 
         let create_result = execute_create_claimable_balance(
-            &create_op, &creator_id, &creator_id, 123, 0, &mut state, &context,
+            &create_op,
+            &creator_id,
+            &creator_id,
+            123,
+            0,
+            &mut state,
+            &context,
         )
         .unwrap();
 

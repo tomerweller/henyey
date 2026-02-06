@@ -72,10 +72,7 @@ fn account_id_bytes(account_id: &AccountId) -> [u8; 32] {
 /// Insert an offer into the (account, asset) secondary index.
 ///
 /// Each offer gets two entries: (seller, selling_asset) and (seller, buying_asset).
-fn index_offer_insert(
-    index: &mut OfferAccountAssetIndex,
-    offer: &stellar_xdr::curr::OfferEntry,
-) {
+fn index_offer_insert(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::curr::OfferEntry) {
     let seller = account_id_bytes(&offer.seller_id);
     let selling_key = AssetKey::from_asset(&offer.selling);
     let buying_key = AssetKey::from_asset(&offer.buying);
@@ -428,33 +425,40 @@ impl LedgerManager {
         header: LedgerHeader,
         header_hash: Hash256,
     ) -> Result<()> {
-        use sha2::{Digest, Sha256};
-
         let mut state = self.state.write();
         if state.initialized {
             return Err(LedgerError::AlreadyInitialized);
         }
 
-        // Compute combined bucket list hash for verification
+        // Compute bucket list hash for verification.
+        // For protocol >= 23, the hash is SHA256(live_hash || hot_archive_hash).
+        // For earlier protocols, the hash is just the live bucket list hash.
         let live_hash = bucket_list.hash();
-        let hot_hash = hot_archive_bucket_list.hash();
-        let mut hasher = Sha256::new();
-        hasher.update(live_hash.as_bytes());
-        hasher.update(hot_hash.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        let computed_hash = Hash256::from_bytes(bytes);
+        let computed_hash =
+            if header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                use sha2::{Digest, Sha256};
+                let hot_hash = hot_archive_bucket_list.hash();
+                let mut hasher = Sha256::new();
+                hasher.update(live_hash.as_bytes());
+                hasher.update(hot_hash.as_bytes());
+                let result = hasher.finalize();
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&result);
+                Hash256::from_bytes(bytes)
+            } else {
+                live_hash
+            };
 
         let expected_hash = Hash256::from(header.bucket_list_hash.0);
 
         // Debug: log the bucket level hashes
         tracing::debug!(
             header_ledger_seq = header.ledger_seq,
+            protocol_version = header.ledger_version,
             expected = %expected_hash.to_hex(),
             computed = %computed_hash.to_hex(),
             live_hash = %live_hash.to_hex(),
-            hot_archive_hash = %hot_hash.to_hex(),
+            hot_archive_hash = %hot_archive_bucket_list.hash().to_hex(),
             "Verifying bucket list hash"
         );
         for level_idx in 0..bucket_list.levels().len() {
@@ -828,7 +832,11 @@ impl LedgerManager {
         *self.offer_account_asset_index.write() = account_asset_idx;
 
         let offer_elapsed = cache_init_start.elapsed();
-        info!(offer_count, elapsed_ms = offer_elapsed.as_millis() as u64, "Cache init: Offer scan complete");
+        info!(
+            offer_count,
+            elapsed_ms = offer_elapsed.as_millis() as u64,
+            "Cache init: Offer scan complete"
+        );
 
         // --- Scan 2: ContractCode -> module cache + soroban state ---
         let mut contracts_added = 0u64;
@@ -858,10 +866,13 @@ impl LedgerManager {
                 true
             });
             let now = cache_init_start.elapsed();
-            info!(code_count, contracts_added,
+            info!(
+                code_count,
+                contracts_added,
                 scan_ms = (now - last_scan_elapsed).as_millis() as u64,
                 elapsed_ms = now.as_millis() as u64,
-                "Cache init: ContractCode scan complete");
+                "Cache init: ContractCode scan complete"
+            );
             last_scan_elapsed = now;
         }
 
@@ -880,10 +891,12 @@ impl LedgerManager {
                 true
             });
             let now = cache_init_start.elapsed();
-            info!(data_count,
+            info!(
+                data_count,
                 scan_ms = (now - last_scan_elapsed).as_millis() as u64,
                 elapsed_ms = now.as_millis() as u64,
-                "Cache init: ContractData scan complete");
+                "Cache init: ContractData scan complete"
+            );
             last_scan_elapsed = now;
         }
 
@@ -911,10 +924,12 @@ impl LedgerManager {
                 true
             });
             let now = cache_init_start.elapsed();
-            info!(ttl_count,
+            info!(
+                ttl_count,
                 scan_ms = (now - last_scan_elapsed).as_millis() as u64,
                 elapsed_ms = now.as_millis() as u64,
-                "Cache init: TTL scan complete");
+                "Cache init: TTL scan complete"
+            );
         }
 
         // --- Scan 5: ConfigSetting -> soroban state ---
@@ -935,7 +950,11 @@ impl LedgerManager {
                 }
                 true
             });
-            info!(config_count, elapsed_ms = cache_init_start.elapsed().as_millis() as u64, "Cache init: ConfigSetting scan complete");
+            info!(
+                config_count,
+                elapsed_ms = cache_init_start.elapsed().as_millis() as u64,
+                "Cache init: ConfigSetting scan complete"
+            );
         }
 
         // Drop bucket list lock before acquiring write locks
@@ -1357,23 +1376,32 @@ impl LedgerManager {
             let bucket_list = self.bucket_list.read();
             let live_hash = bucket_list.hash();
 
-            // Compute combined hash including hot archive
-            let computed = {
-                let hot_archive_guard = self.hot_archive_bucket_list.read();
-                if let Some(ref hot_archive) = *hot_archive_guard {
-                    use sha2::{Digest, Sha256};
-                    let hot_hash = hot_archive.hash();
-                    let mut hasher = Sha256::new();
-                    hasher.update(live_hash.as_bytes());
-                    hasher.update(hot_hash.as_bytes());
-                    let result = hasher.finalize();
-                    let mut bytes = [0u8; 32];
-                    bytes.copy_from_slice(&result);
-                    Hash256::from_bytes(bytes)
+            // Compute bucket list hash based on protocol version.
+            // For protocol >= 23, the hash is SHA256(live_hash || hot_archive_hash).
+            // For earlier protocols, the hash is just the live bucket list hash.
+            let computed =
+                if new_header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                    let hot_archive_guard = self.hot_archive_bucket_list.read();
+                    if let Some(ref hot_archive) = *hot_archive_guard {
+                        use sha2::{Digest, Sha256};
+                        let hot_hash = hot_archive.hash();
+                        let mut hasher = Sha256::new();
+                        hasher.update(live_hash.as_bytes());
+                        hasher.update(hot_hash.as_bytes());
+                        let result = hasher.finalize();
+                        let mut bytes = [0u8; 32];
+                        bytes.copy_from_slice(&result);
+                        Hash256::from_bytes(bytes)
+                    } else {
+                        tracing::warn!(
+                            "Protocol >= 23 but no hot archive bucket list present, \
+                         using live hash only - this WILL cause hash mismatch!"
+                        );
+                        live_hash
+                    }
                 } else {
                     live_hash
-                }
-            };
+                };
 
             let expected = Hash256::from(new_header.bucket_list_hash.0);
             if computed != expected {
@@ -1615,8 +1643,7 @@ impl<'a> LedgerCloseContext<'a> {
         // from parallel execution (multiple stages or multiple clusters).
         let phase_structure = self.close_data.tx_set.soroban_phase_structure();
         let has_parallel = phase_structure.as_ref().map_or(false, |p| {
-            p.stages.len() > 1
-                || p.stages.first().map_or(false, |s| s.len() > 1)
+            p.stages.len() > 1 || p.stages.first().map_or(false, |s| s.len() > 1)
         });
 
         let (results, tx_results, mut tx_result_metas, id_pool, hot_archive_restored_keys) =
@@ -1637,7 +1664,13 @@ impl<'a> LedgerCloseContext<'a> {
                     mut id_pool,
                     mut hot_archive_restored_keys,
                 ) = if classic_txs.is_empty() {
-                    (Vec::new(), Vec::new(), Vec::new(), self.snapshot.header().id_pool, Vec::new())
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        self.snapshot.header().id_pool,
+                        Vec::new(),
+                    )
                 } else {
                     execute_transaction_set(
                         &self.snapshot,
@@ -1697,7 +1730,13 @@ impl<'a> LedgerCloseContext<'a> {
                     "Executed parallel Soroban phase"
                 );
 
-                (results, tx_results, tx_result_metas, id_pool, hot_archive_restored_keys)
+                (
+                    results,
+                    tx_results,
+                    tx_result_metas,
+                    id_pool,
+                    hot_archive_restored_keys,
+                )
             } else {
                 // Existing sequential path (unchanged).
                 execute_transaction_set(
@@ -1722,10 +1761,8 @@ impl<'a> LedgerCloseContext<'a> {
         if classic_events.events_enabled(self.prev_header.ledger_version) {
             // Reconstruct the full transaction list for fee event correlation.
             let all_txs = self.close_data.tx_set.transactions_with_base_fee();
-            for (idx, ((envelope, _), meta)) in all_txs
-                .iter()
-                .zip(tx_result_metas.iter_mut())
-                .enumerate()
+            for (idx, ((envelope, _), meta)) in
+                all_txs.iter().zip(tx_result_metas.iter_mut()).enumerate()
             {
                 if idx >= tx_results.len() {
                     break;
@@ -2303,12 +2340,6 @@ impl<'a> LedgerCloseContext<'a> {
 
             let live_hash = bucket_list.hash();
 
-            tracing::info!(
-                ledger_seq = self.close_data.ledger_seq,
-                post_add_batch_hash = %live_hash.to_hex(),
-                "BUCKET_OUTPUT: Live bucket list hash after add_batch"
-            );
-
             // For Protocol 23+, update hot archive and combine bucket list hashes
             if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
                 let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
@@ -2382,12 +2413,6 @@ impl<'a> LedgerCloseContext<'a> {
                     use sha2::{Digest, Sha256};
                     let hot_hash = hot_archive.hash();
 
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        post_hot_hash = %hot_hash.to_hex(),
-                        "BUCKET_OUTPUT: Hot archive bucket list hash after add_batch"
-                    );
-
                     let mut hasher = Sha256::new();
                     hasher.update(live_hash.as_bytes());
                     hasher.update(hot_hash.as_bytes());
@@ -2395,14 +2420,6 @@ impl<'a> LedgerCloseContext<'a> {
                     let mut bytes = [0u8; 32];
                     bytes.copy_from_slice(&result);
                     let combined_hash = Hash256::from_bytes(bytes);
-
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        live_hash = %live_hash.to_hex(),
-                        hot_hash = %hot_hash.to_hex(),
-                        combined_hash = %combined_hash.to_hex(),
-                        "BUCKET_OUTPUT: Combined bucket list hash"
-                    );
                     combined_hash
                 } else {
                     // No hot archive bucket list available, use live hash only

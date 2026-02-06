@@ -257,10 +257,10 @@ mod tests {
         let price = Price { n: 2, d: 1 };
         let result = exchange_v10(
             price,
-            100,  // max_wheat_send
-            50,   // max_wheat_receive (limited to 50 wheat)
-            100,  // max_sheep_send
-            100,  // max_sheep_receive
+            100, // max_wheat_send
+            50,  // max_wheat_receive (limited to 50 wheat)
+            100, // max_sheep_send
+            100, // max_sheep_receive
             RoundingType::Normal,
         )
         .unwrap();
@@ -366,15 +366,7 @@ mod tests {
     fn test_exchange_v10_large_amounts() {
         let price = Price { n: 1, d: 1 };
         let large = 1_000_000_000_000i64;
-        let result = exchange_v10(
-            price,
-            large,
-            large,
-            large,
-            large,
-            RoundingType::Normal,
-        )
-        .unwrap();
+        let result = exchange_v10(price, large, large, large, large, RoundingType::Normal).unwrap();
 
         assert!(result.num_wheat_received > 0);
         assert!(result.num_sheep_send > 0);
@@ -386,10 +378,10 @@ mod tests {
         let price = Price { n: 1, d: 1 };
         let result = exchange_v10(
             price,
-            1000,  // wheat_send
-            10,    // wheat_receive (very limited)
-            1000,  // sheep_send
-            1000,  // sheep_receive
+            1000, // wheat_send
+            10,   // wheat_receive (very limited)
+            1000, // sheep_send
+            1000, // sheep_receive
             RoundingType::Normal,
         )
         .unwrap();
@@ -402,15 +394,7 @@ mod tests {
     #[test]
     fn test_exchange_v10_fractional_price() {
         let price = Price { n: 3, d: 7 };
-        let result = exchange_v10(
-            price,
-            100,
-            100,
-            100,
-            100,
-            RoundingType::Normal,
-        )
-        .unwrap();
+        let result = exchange_v10(price, 100, 100, 100, 100, RoundingType::Normal).unwrap();
 
         // At 3/7 price, wheat is cheaper than sheep
         assert!(result.num_wheat_received > 0);
@@ -464,15 +448,7 @@ mod tests {
     #[test]
     fn test_exchange_v10_all_zero() {
         let price = Price { n: 1, d: 1 };
-        let result = exchange_v10(
-            price,
-            0,
-            0,
-            0,
-            0,
-            RoundingType::Normal,
-        )
-        .unwrap();
+        let result = exchange_v10(price, 0, 0, 0, 0, RoundingType::Normal).unwrap();
 
         assert_eq!(result.num_wheat_received, 0);
         assert_eq!(result.num_sheep_send, 0);
@@ -483,6 +459,9 @@ mod tests {
     fn test_rounding_type_enum() {
         assert_eq!(RoundingType::Normal, RoundingType::Normal);
         assert_ne!(RoundingType::Normal, RoundingType::PathPaymentStrictSend);
-        assert_ne!(RoundingType::PathPaymentStrictSend, RoundingType::PathPaymentStrictReceive);
+        assert_ne!(
+            RoundingType::PathPaymentStrictSend,
+            RoundingType::PathPaymentStrictReceive
+        );
     }
 }

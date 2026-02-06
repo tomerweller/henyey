@@ -2437,10 +2437,17 @@ fn create_header_from_replay_state(
 /// uses the same rent-adjusted size calculation as LedgerManager to include
 /// compiled module memory cost.
 ///
+/// Cost parameters are loaded from the bucket list's ConfigSettingEntry to ensure
+/// correct compiled module memory cost calculation (matching C++ behavior).
+///
 /// Note: This is expensive for large bucket lists but only needs to run once per catchup.
 fn compute_initial_soroban_state_size(bucket_list: &BucketList, protocol_version: u32) -> u64 {
-    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
+    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
     use stellar_xdr::curr::WriteXdr;
+
+    // Load cost params from bucket list for accurate contract code size calculation
+    let cost_params = load_cost_params_from_bucket_list(bucket_list);
+    let cost_params_ref = cost_params.as_ref().map(|(cpu, mem)| (cpu, mem));
 
     let mut total_size: u64 = 0;
 
@@ -2457,7 +2464,12 @@ fn compute_initial_soroban_state_size(bucket_list: &BucketList, protocol_version
                 // Contract code uses rent-adjusted size (includes compiled module memory)
                 if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
                     let xdr_size = xdr_bytes.len() as u32;
-                    let rent_size = entry_size_for_rent_by_protocol(protocol_version, &entry, xdr_size);
+                    let rent_size = entry_size_for_rent_by_protocol_with_cost_params(
+                        protocol_version,
+                        &entry,
+                        xdr_size,
+                        cost_params_ref,
+                    );
                     total_size += rent_size as u64;
                 }
             }
@@ -2466,6 +2478,51 @@ fn compute_initial_soroban_state_size(bucket_list: &BucketList, protocol_version
     }
 
     total_size
+}
+
+/// Load CPU and memory cost parameters from the bucket list's ConfigSettingEntries.
+///
+/// Returns `Some((cpu_params, mem_params))` if both are found, or `None` if either
+/// is missing (e.g., for pre-Soroban checkpoints).
+fn load_cost_params_from_bucket_list(
+    bucket_list: &BucketList,
+) -> Option<(
+    stellar_xdr::curr::ContractCostParams,
+    stellar_xdr::curr::ContractCostParams,
+)> {
+    use stellar_xdr::curr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting,
+    };
+
+    let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
+    });
+    let cpu_params = bucket_list.get(&cpu_key).ok()?.and_then(|e| {
+        if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+        ) = e.data
+        {
+            Some(params)
+        } else {
+            None
+        }
+    })?;
+
+    let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
+    });
+    let mem_params = bucket_list.get(&mem_key).ok()?.and_then(|e| {
+        if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+        ) = e.data
+        {
+            Some(params)
+        } else {
+            None
+        }
+    })?;
+
+    Some((cpu_params, mem_params))
 }
 
 /// Load the EvictionIterator from the bucket list's ConfigSettingEntry.

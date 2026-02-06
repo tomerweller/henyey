@@ -50,7 +50,7 @@ use soroban_env_host_p25::e2e_invoke::entry_size_for_rent as entry_size_for_rent
 use soroban_env_host_p25::xdr as soroban_xdr_p25;
 use soroban_xdr_p25::ReadXdr;
 use stellar_core_common::Hash256;
-use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
+use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use stellar_xdr::curr::{
     ConfigSettingId, ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey,
     LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, Limits,
@@ -805,7 +805,13 @@ impl InMemorySorobanState {
             .map(|v| v.len() as u32)
             .unwrap_or(0);
         if protocol_version < 25 {
-            return entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size);
+            let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
+            return entry_size_for_rent_by_protocol_with_cost_params(
+                protocol_version,
+                entry,
+                xdr_size,
+                cost_params,
+            );
         }
         let budget = build_rent_budget(rent_config);
         // Convert to P25 XDR type (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)

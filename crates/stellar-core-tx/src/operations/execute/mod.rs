@@ -166,8 +166,31 @@ pub fn entry_size_for_rent_by_protocol(
     entry: &stellar_xdr::curr::LedgerEntry,
     entry_xdr_size: u32,
 ) -> u32 {
+    entry_size_for_rent_by_protocol_with_cost_params(protocol_version, entry, entry_xdr_size, None)
+}
+
+/// Like `entry_size_for_rent_by_protocol`, but accepts optional on-chain cost
+/// parameters (cpu_cost_params, mem_cost_params) so that the budget used for
+/// computing WASM module memory cost matches the network configuration.
+///
+/// When `cost_params` is `None`, falls back to `Budget::default()` which uses
+/// hard-coded cost model parameters. For deterministic parity with C++
+/// stellar-core, callers should pass the actual on-chain cost params whenever
+/// available.
+pub fn entry_size_for_rent_by_protocol_with_cost_params(
+    protocol_version: u32,
+    entry: &stellar_xdr::curr::LedgerEntry,
+    entry_xdr_size: u32,
+    cost_params: Option<(
+        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::curr::ContractCostParams,
+    )>,
+) -> u32 {
     if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
-        let budget = soroban_env_host24::budget::Budget::default();
+        let budget = match cost_params {
+            Some((cpu, mem)) => build_budget_p24(cpu, mem),
+            None => soroban_env_host24::budget::Budget::default(),
+        };
         let entry = convert_ledger_entry_to_p24(entry);
         entry
             .and_then(|entry| {
@@ -176,7 +199,10 @@ pub fn entry_size_for_rent_by_protocol(
             })
             .unwrap_or(entry_xdr_size)
     } else {
-        let budget = soroban_env_host25::budget::Budget::default();
+        let budget = match cost_params {
+            Some((cpu, mem)) => build_budget_p25(cpu, mem),
+            None => soroban_env_host25::budget::Budget::default(),
+        };
         convert_ledger_entry_to_p25(entry)
             .and_then(|entry| {
                 soroban_env_host25::e2e_invoke::entry_size_for_rent(&budget, &entry, entry_xdr_size)
@@ -184,6 +210,62 @@ pub fn entry_size_for_rent_by_protocol(
             })
             .unwrap_or(entry_xdr_size)
     }
+}
+
+/// Build a P24 Budget from on-chain cost parameters.
+fn build_budget_p24(
+    cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
+    mem_cost_params: &stellar_xdr::curr::ContractCostParams,
+) -> soroban_env_host24::budget::Budget {
+    let cpu = convert_cost_params_to_p24(cpu_cost_params);
+    let mem = convert_cost_params_to_p24(mem_cost_params);
+    match (cpu, mem) {
+        (Some(cpu), Some(mem)) => {
+            // Use limits of 0 — we only need the cost model, not actual metering
+            soroban_env_host24::budget::Budget::try_from_configs(0, 0, cpu, mem)
+                .unwrap_or_else(|_| soroban_env_host24::budget::Budget::default())
+        }
+        _ => soroban_env_host24::budget::Budget::default(),
+    }
+}
+
+/// Build a P25 Budget from on-chain cost parameters.
+fn build_budget_p25(
+    cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
+    mem_cost_params: &stellar_xdr::curr::ContractCostParams,
+) -> soroban_env_host25::budget::Budget {
+    let cpu = convert_cost_params_to_p25(cpu_cost_params);
+    let mem = convert_cost_params_to_p25(mem_cost_params);
+    match (cpu, mem) {
+        (Some(cpu), Some(mem)) => {
+            soroban_env_host25::budget::Budget::try_from_configs(0, 0, cpu, mem)
+                .unwrap_or_else(|_| soroban_env_host25::budget::Budget::default())
+        }
+        _ => soroban_env_host25::budget::Budget::default(),
+    }
+}
+
+fn convert_cost_params_to_p24(
+    params: &stellar_xdr::curr::ContractCostParams,
+) -> Option<soroban_env_host24::xdr::ContractCostParams> {
+    let bytes = params.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
+    soroban_env_host24::xdr::ContractCostParams::from_xdr(
+        &bytes,
+        soroban_env_host24::xdr::Limits::none(),
+    )
+    .ok()
+}
+
+fn convert_cost_params_to_p25(
+    params: &stellar_xdr::curr::ContractCostParams,
+) -> Option<soroban_env_host25::xdr::ContractCostParams> {
+    use soroban_env_host25::xdr::ReadXdr as _;
+    let bytes = params.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
+    soroban_env_host25::xdr::ContractCostParams::from_xdr(
+        &bytes,
+        soroban_env_host25::xdr::Limits::none(),
+    )
+    .ok()
 }
 
 fn convert_ledger_entry_to_p25(
@@ -207,6 +289,10 @@ fn rent_snapshot_for_keys(
     keys: &[stellar_xdr::curr::LedgerKey],
     state: &LedgerStateManager,
     protocol_version: u32,
+    cost_params: Option<(
+        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::curr::ContractCostParams,
+    )>,
 ) -> Vec<RentSnapshot> {
     let mut snapshots = Vec::new();
     for key in keys {
@@ -216,8 +302,12 @@ fn rent_snapshot_for_keys(
         let entry_xdr = entry
             .to_xdr(stellar_xdr::curr::Limits::none())
             .unwrap_or_default();
-        let entry_size =
-            entry_size_for_rent_by_protocol(protocol_version, &entry, entry_xdr.len() as u32);
+        let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
+            protocol_version,
+            &entry,
+            entry_xdr.len() as u32,
+            cost_params,
+        );
         let key_hash = ledger_key_hash(key);
         let old_live_until = state
             .get_ttl(&key_hash)
@@ -246,6 +336,10 @@ fn rent_changes_from_snapshots(
     snapshots: &[RentSnapshot],
     state: &LedgerStateManager,
     protocol_version: u32,
+    cost_params: Option<(
+        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::curr::ContractCostParams,
+    )>,
 ) -> Vec<RentChange> {
     let mut changes = Vec::new();
     for snapshot in snapshots {
@@ -256,8 +350,12 @@ fn rent_changes_from_snapshots(
         let entry_xdr = entry
             .to_xdr(stellar_xdr::curr::Limits::none())
             .unwrap_or_default();
-        let new_size_bytes =
-            entry_size_for_rent_by_protocol(protocol_version, &entry, entry_xdr.len() as u32);
+        let new_size_bytes = entry_size_for_rent_by_protocol_with_cost_params(
+            protocol_version,
+            &entry,
+            entry_xdr.len() as u32,
+            cost_params,
+        );
         let key_hash = ledger_key_hash(&snapshot.key);
         let new_live_until = state
             .get_ttl(&key_hash)
@@ -467,7 +565,12 @@ pub fn execute_operation_with_soroban(
                     let mut keys = Vec::new();
                     keys.extend(data.resources.footprint.read_only.iter().cloned());
                     keys.extend(data.resources.footprint.read_write.iter().cloned());
-                    rent_snapshot_for_keys(&keys, state, context.protocol_version)
+                    rent_snapshot_for_keys(
+                        &keys,
+                        state,
+                        context.protocol_version,
+                        soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                    )
                 })
                 .unwrap_or_default();
             let result = extend_footprint_ttl::execute_extend_footprint_ttl(
@@ -484,8 +587,12 @@ pub fn execute_operation_with_soroban(
                     ExtendFootprintTtlResult::Success
                 ))
             ) {
-                let rent_changes =
-                    rent_changes_from_snapshots(&snapshots, state, context.protocol_version);
+                let rent_changes = rent_changes_from_snapshots(
+                    &snapshots,
+                    state,
+                    context.protocol_version,
+                    soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                );
                 let rent_fee = compute_rent_fee_by_protocol(
                     context.protocol_version,
                     &rent_changes,
@@ -535,10 +642,11 @@ pub fn execute_operation_with_soroban(
                             let entry_xdr = entry
                                 .to_xdr(stellar_xdr::curr::Limits::none())
                                 .unwrap_or_default();
-                            let entry_size = entry_size_for_rent_by_protocol(
+                            let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
                                 context.protocol_version,
                                 &entry,
                                 entry_xdr.len() as u32,
+                                soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
                             );
                             let (is_persistent, is_code_entry) = match key {
                                 stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
@@ -617,8 +725,12 @@ pub fn execute_operation_with_soroban(
                     RestoreFootprintResult::Success
                 ))
             ) {
-                let rent_changes =
-                    rent_changes_from_snapshots(&snapshots, state, context.protocol_version);
+                let rent_changes = rent_changes_from_snapshots(
+                    &snapshots,
+                    state,
+                    context.protocol_version,
+                    soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                );
                 let rent_fee = compute_rent_fee_by_protocol(
                     context.protocol_version,
                     &rent_changes,
@@ -775,9 +887,8 @@ mod tests {
 
     #[test]
     fn test_operation_execution_result_with_soroban_meta() {
-        let op_result = OperationResult::OpInner(OperationResultTr::Inflation(
-            InflationResult::NotTime,
-        ));
+        let op_result =
+            OperationResult::OpInner(OperationResultTr::Inflation(InflationResult::NotTime));
         let meta = SorobanOperationMeta {
             events: vec![],
             diagnostic_events: vec![],
@@ -871,10 +982,7 @@ mod tests {
         });
         let entry = LedgerEntry {
             last_modified_ledger_seq: 50,
-            data: LedgerEntryData::Account(create_test_account(
-                create_test_account_id(),
-                500_000,
-            )),
+            data: LedgerEntryData::Account(create_test_account(create_test_account_id(), 500_000)),
             ext: LedgerEntryExt::V0,
         };
 
@@ -927,7 +1035,9 @@ mod tests {
 
         let op = Operation {
             source_account: None,
-            body: OperationBody::BumpSequence(BumpSequenceOp { bump_to: SequenceNumber(10) }),
+            body: OperationBody::BumpSequence(BumpSequenceOp {
+                bump_to: SequenceNumber(10),
+            }),
         };
 
         let result = execute_operation(&op, &source, &mut state, &context).expect("execute op");
@@ -1042,7 +1152,9 @@ mod tests {
         // Operation with explicit source different from tx source
         let op = Operation {
             source_account: Some(MuxedAccount::Ed25519(Uint256([9u8; 32]))),
-            body: OperationBody::BumpSequence(BumpSequenceOp { bump_to: SequenceNumber(10) }),
+            body: OperationBody::BumpSequence(BumpSequenceOp {
+                bump_to: SequenceNumber(10),
+            }),
         };
 
         let result = execute_operation(&op, &tx_source, &mut state, &context).expect("execute op");

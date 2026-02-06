@@ -185,11 +185,8 @@ fn execute_manage_offer(
     // handles the Underfunded case for new offers after the LowReserve check.
     if old_offer.is_some() && matches!(selling, Asset::Native) {
         let account = state.get_account(source).unwrap();
-        let min_balance = state.minimum_balance_for_account(
-            account,
-            context.protocol_version,
-            0,
-        )?;
+        let min_balance =
+            state.minimum_balance_for_account(account, context.protocol_version, 0)?;
         if account.balance < min_balance {
             return Ok(make_sell_offer_result(
                 ManageSellOfferResultCode::Underfunded,
@@ -199,7 +196,6 @@ fn execute_manage_offer(
     }
 
     if old_offer.is_none() {
-
         if let Some(sponsor) = &sponsor {
             let sponsor_account = state
                 .get_account(sponsor)

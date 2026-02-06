@@ -961,8 +961,7 @@ mod tests {
             set_flags: TrustLineFlags::AuthorizedFlag as u32,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(
@@ -1050,8 +1049,7 @@ mod tests {
             set_flags: TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(

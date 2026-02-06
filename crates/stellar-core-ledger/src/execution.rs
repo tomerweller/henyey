@@ -6182,8 +6182,43 @@ pub fn compute_soroban_state_size_from_bucket_list(
     bucket_list: &stellar_core_bucket::BucketList,
     protocol_version: u32,
 ) -> u64 {
-    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
-    use stellar_xdr::curr::{LedgerEntryData, Limits, WriteXdr};
+    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
+    use stellar_xdr::curr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting,
+        Limits, WriteXdr,
+    };
+
+    // Load cost params from bucket list for accurate contract code size calculation
+    let cost_params = {
+        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
+        });
+        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
+        });
+        let cpu = bucket_list.get(&cpu_key).ok().flatten().and_then(|e| {
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+            ) = e.data
+            {
+                Some(params)
+            } else {
+                None
+            }
+        });
+        let mem = bucket_list.get(&mem_key).ok().flatten().and_then(|e| {
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+            ) = e.data
+            {
+                Some(params)
+            } else {
+                None
+            }
+        });
+        cpu.zip(mem)
+    };
+    let cost_params_ref = cost_params.as_ref().map(|(cpu, mem)| (cpu, mem));
 
     let mut total_size: u64 = 0;
 
@@ -6206,8 +6241,12 @@ pub fn compute_soroban_state_size_from_bucket_list(
                 // the compiled module memory cost for Protocol 23+
                 if let Ok(xdr_bytes) = entry.to_xdr(Limits::none()) {
                     let xdr_size = xdr_bytes.len() as u32;
-                    let rent_size =
-                        entry_size_for_rent_by_protocol(protocol_version, &entry, xdr_size);
+                    let rent_size = entry_size_for_rent_by_protocol_with_cost_params(
+                        protocol_version,
+                        &entry,
+                        xdr_size,
+                        cost_params_ref,
+                    );
                     total_size += rent_size as u64;
                 }
             }

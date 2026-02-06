@@ -85,8 +85,20 @@ fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchiv
 ///
 /// Returns the entry size in bytes for ContractData/ContractCode entries,
 /// or 0 for other entry types. ContractCode uses rent-adjusted size.
-fn soroban_entry_size(entry: &LedgerEntry, protocol_version: u32) -> i64 {
-    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol;
+///
+/// `cost_params` should be `Some((cpu_cost_params, mem_cost_params))` from the
+/// on-chain ConfigSettingEntry to ensure correct compiled module memory cost
+/// calculation. If `None`, falls back to `Budget::default()` which may produce
+/// incorrect sizes.
+fn soroban_entry_size(
+    entry: &LedgerEntry,
+    protocol_version: u32,
+    cost_params: Option<(
+        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::curr::ContractCostParams,
+    )>,
+) -> i64 {
+    use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
     use stellar_xdr::curr::WriteXdr;
 
     match &entry.data {
@@ -103,7 +115,12 @@ fn soroban_entry_size(entry: &LedgerEntry, protocol_version: u32) -> i64 {
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .map(|xdr_bytes| {
                     let xdr_size = xdr_bytes.len() as u32;
-                    entry_size_for_rent_by_protocol(protocol_version, entry, xdr_size) as i64
+                    entry_size_for_rent_by_protocol_with_cost_params(
+                        protocol_version,
+                        entry,
+                        xdr_size,
+                        cost_params,
+                    ) as i64
                 })
                 .unwrap_or(0)
         }
@@ -117,21 +134,29 @@ fn soroban_entry_size(entry: &LedgerEntry, protocol_version: u32) -> i64 {
 /// - INIT (created): +size of new Soroban entries
 /// - LIVE (updated): +(new_size - old_size) for modified Soroban entries
 /// - DEAD (deleted): -size of removed Soroban entries
-fn compute_soroban_state_size_delta(changes: &[EntryChange], protocol_version: u32) -> i64 {
+fn compute_soroban_state_size_delta(
+    changes: &[EntryChange],
+    protocol_version: u32,
+    cost_params: Option<(
+        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::curr::ContractCostParams,
+    )>,
+) -> i64 {
     let mut delta: i64 = 0;
 
     for change in changes {
         match change {
             EntryChange::Created(entry) => {
-                delta += soroban_entry_size(entry, protocol_version);
+                delta += soroban_entry_size(entry, protocol_version, cost_params);
             }
             EntryChange::Updated { previous, current } => {
-                let old_size = soroban_entry_size(previous, protocol_version);
-                let new_size = soroban_entry_size(current.as_ref(), protocol_version);
+                let old_size = soroban_entry_size(previous, protocol_version, cost_params);
+                let new_size =
+                    soroban_entry_size(current.as_ref(), protocol_version, cost_params);
                 delta += new_size - old_size;
             }
             EntryChange::Deleted { previous } => {
-                delta -= soroban_entry_size(previous, protocol_version);
+                delta -= soroban_entry_size(previous, protocol_version, cost_params);
             }
         }
     }
@@ -360,21 +385,30 @@ const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 fn combined_bucket_list_hash(
     live_bucket_list: &stellar_core_bucket::BucketList,
     hot_archive_bucket_list: &stellar_core_bucket::HotArchiveBucketList,
+    protocol_version: u32,
 ) -> Hash256 {
     let live_hash = live_bucket_list.hash();
-    let hot_hash = hot_archive_bucket_list.hash();
-    tracing::info!(
-        live_hash = %live_hash,
-        hot_archive_hash = %hot_hash,
-        "Computing combined bucket list hash"
-    );
-    let mut hasher = Sha256::new();
-    hasher.update(live_hash.as_bytes());
-    hasher.update(hot_hash.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    Hash256::from_bytes(bytes)
+    if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+        let hot_hash = hot_archive_bucket_list.hash();
+        tracing::info!(
+            live_hash = %live_hash,
+            hot_archive_hash = %hot_hash,
+            "Computing combined bucket list hash (protocol >= 23)"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(live_hash.as_bytes());
+        hasher.update(hot_hash.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        Hash256::from_bytes(bytes)
+    } else {
+        tracing::info!(
+            live_hash = %live_hash,
+            "Using live bucket list hash only (protocol < 23)"
+        );
+        live_hash
+    }
 }
 
 /// Replays a single ledger from history data.
@@ -434,7 +468,7 @@ pub fn replay_ledger(
     // For accurate tracking, use execution-based replay.
     let mut soroban_state_size_delta: i64 = 0;
     for entry in &init_entries {
-        soroban_state_size_delta += soroban_entry_size(entry, header.ledger_version);
+        soroban_state_size_delta += soroban_entry_size(entry, header.ledger_version, None);
     }
 
     Ok(LedgerReplayResult {
@@ -524,6 +558,9 @@ pub fn replay_ledger_with_execution(
     let transactions = tx_set.transactions_with_base_fee();
     // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
     let soroban_config = load_soroban_config(&snapshot, header.ledger_version);
+    // Save cost params before soroban_config is moved into execute_transaction_set
+    let cpu_cost_params = soroban_config.cpu_cost_params.clone();
+    let mem_cost_params = soroban_config.mem_cost_params.clone();
     let eviction_settings =
         load_state_archival_settings(&snapshot).unwrap_or(config.eviction_settings);
     // Use transaction set hash as base PRNG seed for Soroban execution
@@ -915,6 +952,7 @@ pub fn replay_ledger_with_execution(
             let actual = combined_bucket_list_hash(
                 bucket_list,
                 hot_archive_bucket_list,
+                header.ledger_version,
             );
             if actual != expected {
                 // Log detailed bucket list state for debugging
@@ -968,7 +1006,9 @@ pub fn replay_ledger_with_execution(
     // Compute accurate soroban state size delta from the full change records.
     // This uses the before/after state to accurately track size changes from
     // created, updated, and deleted entries.
-    let soroban_state_size_delta = compute_soroban_state_size_delta(&changes, header.ledger_version);
+    let cost_params = Some((&cpu_cost_params, &mem_cost_params));
+    let soroban_state_size_delta =
+        compute_soroban_state_size_delta(&changes, header.ledger_version, cost_params);
 
     Ok(LedgerReplayResult {
         sequence: header.ledger_seq,
@@ -1848,13 +1888,14 @@ mod tests {
             EntryChange::Created(entry2.clone()),
         ];
 
-        let delta = compute_soroban_state_size_delta(&changes, 25);
+        let delta = compute_soroban_state_size_delta(&changes, 25, None);
 
         // Delta should be positive (sum of both entry sizes)
         assert!(delta > 0, "Delta should be positive for created entries");
 
         // Verify it equals the sum of individual entry sizes
-        let expected = soroban_entry_size(&entry1, 25) + soroban_entry_size(&entry2, 25);
+        let expected =
+            soroban_entry_size(&entry1, 25, None) + soroban_entry_size(&entry2, 25, None);
         assert_eq!(delta, expected);
     }
 
@@ -1869,11 +1910,11 @@ mod tests {
             current: Box::new(new_entry.clone()),
         }];
 
-        let delta = compute_soroban_state_size_delta(&changes, 25);
+        let delta = compute_soroban_state_size_delta(&changes, 25, None);
 
         // Delta should be positive (new > old)
-        let old_size = soroban_entry_size(&old_entry, 25);
-        let new_size = soroban_entry_size(&new_entry, 25);
+        let old_size = soroban_entry_size(&old_entry, 25, None);
+        let new_size = soroban_entry_size(&new_entry, 25, None);
         assert_eq!(delta, new_size - old_size);
         assert!(delta > 0, "Delta should be positive when entry grows");
     }
@@ -1889,11 +1930,11 @@ mod tests {
             current: Box::new(new_entry.clone()),
         }];
 
-        let delta = compute_soroban_state_size_delta(&changes, 25);
+        let delta = compute_soroban_state_size_delta(&changes, 25, None);
 
         // Delta should be negative (new < old)
-        let old_size = soroban_entry_size(&old_entry, 25);
-        let new_size = soroban_entry_size(&new_entry, 25);
+        let old_size = soroban_entry_size(&old_entry, 25, None);
+        let new_size = soroban_entry_size(&new_entry, 25, None);
         assert_eq!(delta, new_size - old_size);
         assert!(delta < 0, "Delta should be negative when entry shrinks");
     }
@@ -1907,10 +1948,10 @@ mod tests {
             previous: entry.clone(),
         }];
 
-        let delta = compute_soroban_state_size_delta(&changes, 25);
+        let delta = compute_soroban_state_size_delta(&changes, 25, None);
 
         // Delta should be negative (size subtracted)
-        let expected = -soroban_entry_size(&entry, 25);
+        let expected = -soroban_entry_size(&entry, 25, None);
         assert_eq!(delta, expected);
         assert!(delta < 0, "Delta should be negative for deleted entries");
     }
@@ -1926,14 +1967,14 @@ mod tests {
             EntryChange::Created(contract_entry.clone()),
         ];
 
-        let delta = compute_soroban_state_size_delta(&changes, 25);
+        let delta = compute_soroban_state_size_delta(&changes, 25, None);
 
         // Should only count the ContractData entry, not Account
-        let expected = soroban_entry_size(&contract_entry, 25);
+        let expected = soroban_entry_size(&contract_entry, 25, None);
         assert_eq!(delta, expected);
 
         // Account entry size should be 0
-        assert_eq!(soroban_entry_size(&account_entry, 25), 0);
+        assert_eq!(soroban_entry_size(&account_entry, 25, None), 0);
     }
 
     #[test]
@@ -1955,12 +1996,13 @@ mod tests {
             },
         ];
 
-        let delta = compute_soroban_state_size_delta(&changes, 25);
+        let delta = compute_soroban_state_size_delta(&changes, 25, None);
 
         // Expected: +created + (new_updated - old_updated) - deleted
-        let expected = soroban_entry_size(&created, 25)
-            + (soroban_entry_size(&new_updated, 25) - soroban_entry_size(&old_updated, 25))
-            - soroban_entry_size(&deleted, 25);
+        let expected = soroban_entry_size(&created, 25, None)
+            + (soroban_entry_size(&new_updated, 25, None)
+                - soroban_entry_size(&old_updated, 25, None))
+            - soroban_entry_size(&deleted, 25, None);
 
         assert_eq!(delta, expected);
     }
@@ -1969,7 +2011,7 @@ mod tests {
     fn test_soroban_state_size_delta_empty_changes() {
         // Test that empty changes produce zero delta
         let changes: Vec<EntryChange> = vec![];
-        let delta = compute_soroban_state_size_delta(&changes, 25);
+        let delta = compute_soroban_state_size_delta(&changes, 25, None);
         assert_eq!(delta, 0);
     }
 }

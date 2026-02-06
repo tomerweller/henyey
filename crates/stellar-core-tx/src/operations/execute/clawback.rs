@@ -710,7 +710,10 @@ mod tests {
 
         // Verify trustline balance was reduced
         let trustline = state.get_trustline(&holder_id, &asset).unwrap();
-        assert_eq!(trustline.balance, 700, "Expected balance to be reduced to 700");
+        assert_eq!(
+            trustline.balance, 700,
+            "Expected balance to be reduced to 700"
+        );
     }
 
     /// Test Clawback with trustline not authorized returns NotClawbackEnabled.

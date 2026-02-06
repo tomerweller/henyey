@@ -159,9 +159,7 @@ pub fn execute_set_options(
     // This matches C++ stellar-core's SetOptionsOpFrame::doApply() which calls
     // loadAccountWithoutRecord() and returns SET_OPTIONS_INVALID_INFLATION if not found.
     if let Some(ref inflation_dest) = op.inflation_dest {
-        if inflation_dest != source
-            && state.get_account(inflation_dest).is_none()
-        {
+        if inflation_dest != source && state.get_account(inflation_dest).is_none() {
             return Ok(make_result(SetOptionsResultCode::InvalidInflation));
         }
     }
@@ -1069,7 +1067,11 @@ mod tests {
 
         // Verify the signer weight was updated
         let account = state.get_account(&source_id).unwrap();
-        let signer = account.signers.iter().find(|s| s.key == signer_key).unwrap();
+        let signer = account
+            .signers
+            .iter()
+            .find(|s| s.key == signer_key)
+            .unwrap();
         assert_eq!(signer.weight, 5);
     }
 
@@ -1362,9 +1364,6 @@ mod tests {
 
         // Verify master weight is 0
         let account = state.get_account(&source_id).unwrap();
-        assert_eq!(
-            account.thresholds.0[0], 0,
-            "Master weight should be 0"
-        );
+        assert_eq!(account.thresholds.0[0], 0, "Master weight should be 0");
     }
 }
