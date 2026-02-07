@@ -5758,19 +5758,8 @@ pub fn execute_soroban_parallel_phase(
     }
 
     // Apply fee refunds after ALL transactions (matching C++ processPostTxSetApply).
-    // We need a temporary executor to handle refunds through its state manager,
-    // since refunds modify account balances in the delta.
-    let mut refund_executor = TransactionExecutor::new(
-        ledger_seq,
-        close_time,
-        base_reserve,
-        protocol_version,
-        network_id,
-        id_pool,
-        soroban_config,
-        classic_events,
-    );
-
+    // Account entries are already in the main delta from cluster merges, so we modify
+    // them directly rather than using a separate executor.
     let flat_txs: Vec<&TransactionEnvelope> = phase
         .stages
         .iter()
@@ -5787,12 +5776,12 @@ pub fn execute_soroban_parallel_phase(
             let fee_source_id =
                 stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
 
-            refund_executor.state.apply_refund_to_delta(&fee_source_id, refund);
-            refund_executor.state.delta_mut().add_fee(-refund);
+            delta.apply_refund_to_account(&fee_source_id, refund)?;
             total_refunds += refund;
         }
     }
     if total_refunds > 0 {
+        delta.record_fee_pool_delta(-total_refunds);
         tracing::info!(
             ledger_seq = ledger_seq,
             total_refunds = total_refunds,

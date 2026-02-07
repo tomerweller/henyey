@@ -29,7 +29,9 @@
 
 use crate::{LedgerError, Result};
 use std::collections::HashMap;
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, WriteXdr};
+use stellar_xdr::curr::{
+    AccountId, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyAccount, Limits, WriteXdr,
+};
 
 /// Represents a single change to a ledger entry.
 ///
@@ -399,6 +401,37 @@ impl LedgerDelta {
     /// Record a total coins change (e.g., from inflation).
     pub fn record_total_coins_delta(&mut self, delta: i64) {
         self.total_coins_delta += delta;
+    }
+
+    /// Apply a fee refund to an account entry already in the delta.
+    ///
+    /// This is used by parallel Soroban execution where cluster deltas have been merged
+    /// into the main delta, and fee refunds need to be applied post-execution.
+    /// Modifies the account's balance in-place within the existing change entry.
+    pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) -> Result<()> {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let key_bytes = key_to_bytes(&key)?;
+
+        if let Some(change) = self.changes.get_mut(&key_bytes) {
+            match change {
+                EntryChange::Created(ref mut entry) => {
+                    if let LedgerEntryData::Account(ref mut acc) = entry.data {
+                        acc.balance += refund;
+                    }
+                }
+                EntryChange::Updated {
+                    ref mut current, ..
+                } => {
+                    if let LedgerEntryData::Account(ref mut acc) = current.data {
+                        acc.balance += refund;
+                    }
+                }
+                EntryChange::Deleted { .. } => {}
+            }
+        }
+        Ok(())
     }
 
     /// Get the fee pool delta.
@@ -1234,5 +1267,75 @@ mod tests {
 
         // Current entry should be None for deleted entries
         assert!(change.current_entry().is_none());
+    }
+
+    /// Applying a fee refund to an updated account modifies its balance.
+    #[test]
+    fn test_apply_refund_to_updated_account() {
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account(1); // balance = 1_000_000_000
+        let updated = create_test_account_with_balance(1, 900_000_000); // fee deducted
+
+        delta
+            .record_update(original.clone(), updated.clone())
+            .unwrap();
+
+        // Apply a refund of 50_000_000
+        let account_id = if let LedgerEntryData::Account(ref acc) = original.data {
+            acc.account_id.clone()
+        } else {
+            panic!("expected account");
+        };
+        delta.apply_refund_to_account(&account_id, 50_000_000).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 950_000_000); // 900M + 50M refund
+        } else {
+            panic!("expected account entry");
+        }
+        // Previous should be unchanged
+        if let LedgerEntryData::Account(ref acc) = changes[0].previous_entry().unwrap().data {
+            assert_eq!(acc.balance, 1_000_000_000);
+        }
+    }
+
+    /// Applying a fee refund to a created account modifies its balance.
+    #[test]
+    fn test_apply_refund_to_created_account() {
+        let mut delta = LedgerDelta::new(1);
+        let entry = create_test_account_with_balance(1, 500_000_000);
+
+        delta.record_create(entry.clone()).unwrap();
+
+        let account_id = if let LedgerEntryData::Account(ref acc) = entry.data {
+            acc.account_id.clone()
+        } else {
+            panic!("expected account");
+        };
+        delta.apply_refund_to_account(&account_id, 25_000_000).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 525_000_000);
+        } else {
+            panic!("expected account entry");
+        }
+    }
+
+    /// Applying a refund to a nonexistent account is a no-op.
+    #[test]
+    fn test_apply_refund_to_missing_account() {
+        let mut delta = LedgerDelta::new(1);
+        let entry = create_test_account(1);
+        let account_id = if let LedgerEntryData::Account(ref acc) = entry.data {
+            acc.account_id.clone()
+        } else {
+            panic!("expected account");
+        };
+        // No entries in delta - refund is a no-op
+        delta.apply_refund_to_account(&account_id, 100).unwrap();
+        assert!(delta.is_empty());
     }
 }
