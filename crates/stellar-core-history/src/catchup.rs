@@ -70,6 +70,20 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info, warn};
 
+/// Read the current process RSS (Resident Set Size) in MB from `/proc/self/status`.
+/// Returns `None` on non-Linux platforms or if the file can't be read.
+fn rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            // Format is "VmRSS:    123456 kB"
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
 /// Current status of a catchup operation.
 ///
 /// This enum represents the discrete phases of the catchup process,
@@ -1135,6 +1149,9 @@ impl CatchupManager {
         use std::sync::Mutex;
         use stellar_core_bucket::Bucket;
 
+        if let Some(mb) = rss_mb() {
+            info!("apply_buckets START — RSS {} MB", mb);
+        }
         info!(
             "Applying buckets to build state at ledger {} (disk-backed mode)",
             has.current_ledger
@@ -1176,11 +1193,12 @@ impl CatchupManager {
             let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
 
             // Check if bucket already exists on disk as an XDR file.
-            // Use streaming I/O to build the index without loading the entire file
-            // into memory. This is critical for mainnet where buckets can be many GB.
+            // Use lazy initialization to defer index building and mmap creation
+            // until the first lookup. During catchup we only need hashes for
+            // verification — lookups aren't needed until live operation begins.
             if bucket_path.exists() {
-                debug!("Loading existing bucket {} from disk (streaming)", hash);
-                let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
+                debug!("Loading existing bucket {} from disk (lazy)", hash);
+                let bucket = Bucket::from_xdr_file_lazy(&bucket_path)?;
                 let mut cache = bucket_cache.lock().unwrap();
                 cache.insert(*hash, bucket.clone());
                 return Ok(bucket);
@@ -1271,7 +1289,7 @@ impl CatchupManager {
             // Drop the in-memory XDR data before building the index to free memory
             drop(xdr_data);
 
-            let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
+            let bucket = Bucket::from_xdr_file_lazy(&bucket_path)?;
 
             // Verify hash matches
             if bucket.hash() != *hash {
@@ -1333,6 +1351,9 @@ impl CatchupManager {
             "Live bucket list restored: {} total entries",
             bucket_list.stats().total_entries
         );
+        if let Some(mb) = rss_mb() {
+            info!("apply_buckets AFTER live bucket list restore — RSS {} MB", mb);
+        }
 
         // Build hot archive next states (even if no hot archive buckets, for return value)
         let hot_next_states: Vec<HasNextState> = has
@@ -1484,9 +1505,10 @@ impl CatchupManager {
                         })?;
                     }
 
-                    // Load hot archive bucket from disk using streaming I/O
-                    // to avoid holding entire file in memory during index building
-                    let bucket = HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)?;
+                    // Load hot archive bucket from disk lazily — only computes hash + entry count.
+                    // The BTreeMap index is deferred until the first get() call,
+                    // which saves memory during catchup.
+                    let bucket = HotArchiveBucket::from_xdr_file_lazy(&bucket_path)?;
 
                     // Cache for reuse (same hash can appear at multiple levels)
                     {
@@ -1513,6 +1535,9 @@ impl CatchupManager {
                 "Hot archive bucket list restored: {} total entries",
                 hot_bucket_list.stats().total_entries
             );
+            if let Some(mb) = rss_mb() {
+                info!("apply_buckets AFTER hot archive restore — RSS {} MB", mb);
+            }
 
             // Log the restored bucket list state
             for (level_idx, level) in hot_bucket_list.levels().iter().enumerate().take(5) {
@@ -1528,6 +1553,10 @@ impl CatchupManager {
         } else {
             HotArchiveBucketList::new()
         };
+
+        if let Some(mb) = rss_mb() {
+            info!("apply_buckets END — RSS {} MB", mb);
+        }
 
         Ok((
             bucket_list,

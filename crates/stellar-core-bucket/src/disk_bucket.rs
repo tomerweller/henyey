@@ -35,7 +35,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use memmap2::Mmap;
 
@@ -82,20 +82,29 @@ pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 /// Lookups use memory-mapped I/O for lock-free, zero-syscall reads.
 /// This is critical for performance on mainnet where thousands of
 /// lookups per ledger are needed.
+///
+/// # Lazy Initialization
+///
+/// The index and mmap can be lazily initialized. During catchup, we only
+/// need Pass 1 (count + hash) since lookups aren't needed until live
+/// operation begins. Pass 2 (index building) and mmap creation are deferred
+/// until the first `get()` call. This dramatically reduces memory usage
+/// during catchup — from O(index_size × num_buckets) to essentially zero.
 #[derive(Clone)]
 pub struct DiskBucket {
     /// The SHA-256 hash of this bucket's contents (for verification).
     hash: Hash256,
     /// Path to the bucket file on disk (uncompressed XDR).
     file_path: PathBuf,
-    /// Index for key lookups.
-    index: Box<LiveBucketIndex>,
     /// Total number of entries in this bucket.
     entry_count: usize,
-    /// Memory-mapped file for lock-free reads.
-    /// Using mmap eliminates seek+read syscalls and the Mutex,
-    /// and lets the OS page cache manage data optimally.
-    mmap: Arc<Mmap>,
+    /// Bloom filter seed used for index construction (needed for lazy init).
+    bloom_seed: HashSeed,
+    /// Index for key lookups, lazily initialized on first get().
+    /// Using OnceLock for thread-safe lazy initialization without external locking.
+    index: OnceLock<Box<LiveBucketIndex>>,
+    /// Memory-mapped file for lock-free reads, lazily initialized on first get().
+    mmap: OnceLock<Arc<Mmap>>,
 }
 
 /// Iterator that reads `(BucketEntry, offset)` pairs one at a time from an
@@ -180,6 +189,38 @@ impl DiskBucket {
         Ok(Arc::new(mmap))
     }
 
+    /// Ensure the index is initialized, building it lazily if needed.
+    fn ensure_index(&self) -> &LiveBucketIndex {
+        self.index.get_or_init(|| {
+            tracing::info!(
+                hash = %self.hash.to_hex(),
+                entry_count = self.entry_count,
+                file = ?self.file_path,
+                "Lazily building disk bucket index on first access"
+            );
+            let file_len = std::fs::metadata(&self.file_path)
+                .expect("bucket file must exist for index build")
+                .len();
+            let iter = StreamingXdrEntryIterator::new(&self.file_path, file_len)
+                .expect("failed to open bucket file for index build");
+            let live_index = LiveBucketIndex::from_entries(iter, self.bloom_seed, self.entry_count);
+
+            tracing::debug!(
+                hash = %self.hash.to_hex(),
+                index_type = if live_index.is_in_memory() { "InMemory" } else { "DiskIndex" },
+                "Lazy index construction complete"
+            );
+
+            Box::new(live_index)
+        })
+    }
+
+    /// Ensure the mmap is initialized, creating it lazily if needed.
+    fn ensure_mmap(&self) -> &Arc<Mmap> {
+        self.mmap
+            .get_or_init(|| Self::create_mmap(&self.file_path).expect("failed to mmap bucket file"))
+    }
+
     /// Create a disk bucket from an XDR file.
     ///
     /// This streams the file to build the index without keeping entries in memory.
@@ -219,38 +260,7 @@ impl DiskBucket {
         let file_len = std::fs::metadata(path)?.len();
 
         // Pass 1: count entries and compute hash (O(1) memory, no entry storage)
-        let (entry_count, hash) = {
-            let file = File::open(path)?;
-            let mut reader = BufReader::new(file);
-            let mut hasher = Sha256::new();
-            let mut position = 0u64;
-            let mut count = 0usize;
-
-            while position + 4 <= file_len {
-                let mut mark_buf = [0u8; 4];
-                reader.read_exact(&mut mark_buf)?;
-                position += 4;
-
-                let record_mark = u32::from_be_bytes(mark_buf);
-                let record_len = (record_mark & 0x7FFFFFFF) as usize;
-
-                if position + record_len as u64 > file_len {
-                    break;
-                }
-
-                let mut record_data = vec![0u8; record_len];
-                reader.read_exact(&mut record_data)?;
-                position += record_len as u64;
-
-                hasher.update(mark_buf);
-                hasher.update(&record_data);
-
-                count += 1;
-            }
-
-            let hash_bytes: [u8; 32] = hasher.finalize().into();
-            (count, Hash256::from_bytes(hash_bytes))
-        };
+        let (entry_count, hash) = Self::count_and_hash(path, file_len)?;
 
         // Pass 2: build index by streaming entries one at a time (O(index_size) memory)
         // The iterator reads and parses one entry at a time from disk.
@@ -268,13 +278,96 @@ impl DiskBucket {
             "Built disk bucket index via streaming"
         );
 
+        let index = OnceLock::new();
+        index
+            .set(Box::new(live_index))
+            .unwrap_or_else(|_| unreachable!());
+        let mmap = OnceLock::new();
+        mmap.set(Self::create_mmap(path)?)
+            .unwrap_or_else(|_| unreachable!());
+
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
-            index: Box::new(live_index),
             entry_count,
-            mmap: Self::create_mmap(path)?,
+            bloom_seed,
+            index,
+            mmap,
         })
+    }
+
+    /// Create a disk bucket with **lazy** index and mmap construction.
+    ///
+    /// This performs only Pass 1 (count entries + compute hash), deferring
+    /// the expensive Pass 2 (index building) and mmap creation until the first
+    /// `get()` call. This is ideal during catchup where we need to build the
+    /// bucket list structure but don't need lookups until live operation begins.
+    ///
+    /// Memory savings: for mainnet with ~60M entries across ~30 buckets, this
+    /// avoids allocating ~200+ MB of bloom filters, page indexes, and mmap
+    /// virtual address space until they're actually needed.
+    pub fn from_file_lazy(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_file_lazy_with_seed(path, DEFAULT_BLOOM_SEED)
+    }
+
+    /// Create a disk bucket with lazy index/mmap, using a custom bloom filter seed.
+    pub fn from_file_lazy_with_seed(path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
+        let path = path.as_ref();
+        let file_len = std::fs::metadata(path)?.len();
+
+        // Pass 1 only: count entries and compute hash
+        let (entry_count, hash) = Self::count_and_hash(path, file_len)?;
+
+        tracing::debug!(
+            entry_count,
+            file_size = file_len,
+            hash = %hash.to_hex(),
+            "Created lazy disk bucket (index deferred)"
+        );
+
+        Ok(Self {
+            hash,
+            file_path: path.to_path_buf(),
+            entry_count,
+            bloom_seed,
+            index: OnceLock::new(),
+            mmap: OnceLock::new(),
+        })
+    }
+
+    /// Pass 1: count entries and compute SHA-256 hash by streaming through the file.
+    /// Uses O(1) memory — only a small read buffer and hasher state.
+    fn count_and_hash(path: &Path, file_len: u64) -> Result<(usize, Hash256)> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut hasher = Sha256::new();
+        let mut position = 0u64;
+        let mut count = 0usize;
+
+        while position + 4 <= file_len {
+            let mut mark_buf = [0u8; 4];
+            reader.read_exact(&mut mark_buf)?;
+            position += 4;
+
+            let record_mark = u32::from_be_bytes(mark_buf);
+            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+
+            if position + record_len as u64 > file_len {
+                break;
+            }
+
+            let mut record_data = vec![0u8; record_len];
+            reader.read_exact(&mut record_data)?;
+            position += record_len as u64;
+
+            hasher.update(mark_buf);
+            hasher.update(&record_data);
+
+            count += 1;
+        }
+
+        let hash_bytes: [u8; 32] = hasher.finalize().into();
+        Ok((count, Hash256::from_bytes(hash_bytes)))
     }
 
     /// Create a disk bucket from a pre-built index, skipping file scanning.
@@ -293,15 +386,25 @@ impl DiskBucket {
         path: impl AsRef<Path>,
         hash: Hash256,
         entry_count: usize,
-        index: LiveBucketIndex,
+        prebuilt_index: LiveBucketIndex,
     ) -> Result<Self> {
         let path = path.as_ref();
+
+        let index = OnceLock::new();
+        index
+            .set(Box::new(prebuilt_index))
+            .unwrap_or_else(|_| unreachable!());
+        let mmap = OnceLock::new();
+        mmap.set(Self::create_mmap(path)?)
+            .unwrap_or_else(|_| unreachable!());
+
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
-            index: Box::new(index),
             entry_count,
-            mmap: Self::create_mmap(path)?,
+            bloom_seed: DEFAULT_BLOOM_SEED,
+            index,
+            mmap,
         })
     }
 
@@ -353,8 +456,9 @@ impl DiskBucket {
     }
 
     /// Returns a reference to the live bucket index.
+    /// Lazily initializes the index if it hasn't been built yet.
     pub fn live_index(&self) -> &LiveBucketIndex {
-        &self.index
+        self.ensure_index()
     }
 
     /// Returns true if this bucket has a bloom filter for fast negative lookups.
@@ -364,25 +468,29 @@ impl DiskBucket {
 
     /// Returns the size of the bloom filter in bytes, or 0 if no filter exists.
     pub fn bloom_filter_size_bytes(&self) -> usize {
-        self.index.bloom_filter_size_bytes()
+        self.ensure_index().bloom_filter_size_bytes()
     }
 
     /// Returns the hash seed used for the bloom filter.
     pub fn bloom_seed(&self) -> HashSeed {
-        self.index.bloom_seed()
+        self.bloom_seed
     }
 
     /// Look up an entry by key.
     ///
     /// This reads from disk using the index. The bloom filter is checked first
     /// to quickly reject keys that are definitely not present (avoiding disk I/O).
+    ///
+    /// On first call, this lazily initializes the index (Pass 2) and mmap.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<BucketEntry>> {
+        let index = self.ensure_index();
+
         // Check bloom filter (built into the index)
-        if !self.index.may_contain(key) {
+        if !index.may_contain(key) {
             return Ok(None);
         }
 
-        match &*self.index {
+        match index {
             LiveBucketIndex::InMemory(idx) => {
                 // Exact offset lookup
                 if let Some(offset) = idx.get_offset(key) {
@@ -415,11 +523,13 @@ impl DiskBucket {
         key: &LedgerKey,
         key_bytes: &[u8],
     ) -> Result<Option<BucketEntry>> {
-        if !self.index.may_contain_bytes(key_bytes) {
+        let index = self.ensure_index();
+
+        if !index.may_contain_bytes(key_bytes) {
             return Ok(None);
         }
 
-        match &*self.index {
+        match index {
             LiveBucketIndex::InMemory(idx) => {
                 if let Some(offset) = idx.get_offset_by_key_bytes(key_bytes) {
                     let entry = self.read_entry_at(offset)?;
@@ -447,7 +557,7 @@ impl DiskBucket {
     /// No syscalls, no locks — direct memory access through the mmap.
     fn read_entry_at(&self, offset: u64) -> Result<BucketEntry> {
         let offset = offset as usize;
-        let data = &*self.mmap;
+        let data = &**self.ensure_mmap();
 
         if offset + 4 > data.len() {
             return Err(BucketError::Io(std::io::Error::new(
@@ -498,7 +608,7 @@ impl DiskBucket {
         key: &LedgerKey,
         page_size: u64,
     ) -> Result<Option<BucketEntry>> {
-        let data = &*self.mmap;
+        let data = &**self.ensure_mmap();
         let mut position = page_offset as usize;
         let mut entries_scanned = 0u64;
 

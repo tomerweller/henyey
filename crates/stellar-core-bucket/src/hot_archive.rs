@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry, LedgerEntry,
     LedgerKey, Limits, ReadXdr, WriteXdr,
@@ -63,7 +64,9 @@ enum HotArchiveStorage {
         /// Path to the uncompressed `.bucket.xdr` file.
         path: PathBuf,
         /// Index mapping key XDR bytes → file offset of the record mark.
-        index: BTreeMap<Vec<u8>, u64>,
+        /// Wrapped in OnceLock for lazy initialization — during catchup we only
+        /// need hash + entry_count, the index is built on first lookup.
+        index: OnceLock<BTreeMap<Vec<u8>, u64>>,
         /// Number of entries in the bucket (including metadata).
         entry_count: usize,
     },
@@ -79,6 +82,65 @@ pub struct HotArchiveBucket {
 }
 
 impl HotArchiveBucket {
+    /// Build the BTreeMap index for a disk-backed bucket by streaming through the file.
+    ///
+    /// This is extracted as a static method so it can be called from `OnceLock::get_or_init()`.
+    fn build_index(path: &Path) -> BTreeMap<Vec<u8>, u64> {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "failed to open hot archive bucket for index building");
+                return BTreeMap::new();
+            }
+        };
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut reader = BufReader::new(file);
+        let mut index = BTreeMap::new();
+        let mut position: u64 = 0;
+
+        while position + 4 <= file_len {
+            let record_offset = position;
+
+            let mut mark_bytes = [0u8; 4];
+            if reader.read_exact(&mut mark_bytes).is_err() {
+                break;
+            }
+            let record_mark = u32::from_be_bytes(mark_bytes);
+            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+
+            if position + 4 + record_len as u64 > file_len {
+                break;
+            }
+
+            let mut data = vec![0u8; record_len];
+            if reader.read_exact(&mut data).is_err() {
+                break;
+            }
+
+            if let Ok(entry) = HotArchiveBucketEntry::from_xdr(&data, Limits::none()) {
+                if let Ok(key) = hot_archive_entry_to_key(&entry) {
+                    index.insert(key, record_offset);
+                }
+            }
+
+            position += 4 + record_len as u64;
+        }
+
+        index
+    }
+
+    /// Ensure the disk-backed index is built, building it lazily if needed.
+    ///
+    /// Returns a reference to the index. For non-DiskBacked storage, panics.
+    fn ensure_index(&self) -> &BTreeMap<Vec<u8>, u64> {
+        match &self.storage {
+            HotArchiveStorage::DiskBacked { path, index, .. } => {
+                index.get_or_init(|| Self::build_index(path))
+            }
+            _ => panic!("ensure_index called on non-DiskBacked storage"),
+        }
+    }
+
     /// Create an empty hot archive bucket.
     pub fn empty() -> Self {
         Self {
@@ -203,8 +265,9 @@ impl HotArchiveBucket {
                 }
                 0
             }
-            HotArchiveStorage::DiskBacked { index, path, .. } => {
+            HotArchiveStorage::DiskBacked { path, .. } => {
                 // Try to read metadata entry (stored at offset for empty key)
+                let index = self.ensure_index();
                 if let Some(&offset) = index.get(&Vec::new()) {
                     if let Ok(HotArchiveBucketEntry::Metaentry(meta)) =
                         Self::read_entry_at_offset(path, offset)
@@ -224,7 +287,8 @@ impl HotArchiveBucket {
         })?;
         match &self.storage {
             HotArchiveStorage::InMemory { entries, .. } => Ok(entries.get(&key_bytes).cloned()),
-            HotArchiveStorage::DiskBacked { index, path, .. } => {
+            HotArchiveStorage::DiskBacked { path, .. } => {
+                let index = self.ensure_index();
                 if let Some(&offset) = index.get(&key_bytes) {
                     let entry = Self::read_entry_at_offset(path, offset)?;
                     Ok(Some(entry))
@@ -511,14 +575,14 @@ impl HotArchiveBucket {
     /// Create a disk-backed hot archive bucket from an existing uncompressed XDR file.
     ///
     /// Streams through the file to build an index without loading all entries into memory.
-    /// Hash is computed during the streaming pass.
+    /// Hash is computed during the streaming pass. The index is built eagerly.
     pub fn from_xdr_file_disk_backed(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
         let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
 
-        let mut index = BTreeMap::new();
+        let mut built_index = BTreeMap::new();
         let mut hasher = Sha256::new();
         let mut entry_count = 0;
         let mut position: u64 = 0;
@@ -556,9 +620,73 @@ impl HotArchiveBucket {
             })?;
 
             let key = hot_archive_entry_to_key(&entry)?;
-            index.insert(key, record_offset);
+            built_index.insert(key, record_offset);
             entry_count += 1;
 
+            position += 4 + record_len as u64;
+        }
+
+        let result = hasher.finalize();
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(&result);
+        let hash = if entry_count == 0 {
+            Hash256::from_bytes([0u8; 32])
+        } else {
+            Hash256::from_bytes(hash_bytes)
+        };
+
+        let index = OnceLock::new();
+        let _ = index.set(built_index);
+
+        Ok(Self {
+            storage: HotArchiveStorage::DiskBacked {
+                path,
+                index,
+                entry_count,
+            },
+            hash,
+        })
+    }
+
+    /// Create a disk-backed hot archive bucket lazily from an existing uncompressed XDR file.
+    ///
+    /// Only performs Pass 1: counts entries and computes the SHA-256 hash.
+    /// The BTreeMap index (needed for lookups) is deferred until the first `get()` call.
+    /// This saves memory during catchup when we load ~22 hot archive buckets but don't
+    /// need lookups until live operation begins.
+    pub fn from_xdr_file_lazy(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = std::fs::File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+
+        let mut hasher = Sha256::new();
+        let mut entry_count = 0;
+        let mut position: u64 = 0;
+
+        while position + 4 <= file_len {
+            // Read record mark
+            let mut mark_bytes = [0u8; 4];
+            reader.read_exact(&mut mark_bytes)?;
+            let record_mark = u32::from_be_bytes(mark_bytes);
+            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+
+            if position + 4 + record_len as u64 > file_len {
+                return Err(BucketError::Serialization(format!(
+                    "Record length {} exceeds remaining data at offset {}",
+                    record_len, position
+                )));
+            }
+
+            // Read entry data (need to hash it, but skip parsing/indexing)
+            let mut data = vec![0u8; record_len];
+            reader.read_exact(&mut data)?;
+
+            // Hash: include record mark + data
+            hasher.update(mark_bytes);
+            hasher.update(&data);
+
+            entry_count += 1;
             position += 4 + record_len as u64;
         }
 
@@ -574,7 +702,7 @@ impl HotArchiveBucket {
         Ok(Self {
             storage: HotArchiveStorage::DiskBacked {
                 path,
-                index,
+                index: OnceLock::new(), // Deferred — built on first get()
                 entry_count,
             },
             hash,

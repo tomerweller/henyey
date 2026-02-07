@@ -404,6 +404,28 @@ impl Bucket {
         })
     }
 
+    /// Create a DiskBacked bucket with **lazy** index and mmap construction.
+    ///
+    /// This performs only Pass 1 (count entries + compute hash), deferring
+    /// Pass 2 (index building) and mmap creation until the first lookup.
+    /// This is ideal for catchup where we need bucket hashes for verification
+    /// but don't need lookups until live operation begins.
+    ///
+    /// Memory savings: avoids allocating bloom filters, page indexes, and mmap
+    /// virtual address space for all buckets simultaneously during catchup.
+    pub fn from_xdr_file_lazy(path: impl AsRef<Path>) -> Result<Self> {
+        let disk_bucket = DiskBucket::from_file_lazy(path)?;
+        let hash = disk_bucket.hash();
+
+        Ok(Self {
+            hash,
+            storage: BucketStorage::DiskBacked {
+                disk_bucket: Arc::new(disk_bucket),
+            },
+            level_zero_state: LevelZeroState::None,
+        })
+    }
+
     /// Create a DiskBacked bucket from a pre-built index, skipping file scanning.
     ///
     /// This is used when loading a persisted index from disk, avoiding the
