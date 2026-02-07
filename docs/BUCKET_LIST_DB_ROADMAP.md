@@ -251,7 +251,7 @@ buckets/
 
 ## Phase 5: Uncompressed XDR On-Disk Format
 
-**Status: Not started**
+**Status: Complete**
 
 **Why:** Foundation for all subsequent phases. The current `.bucket.gz` (gzip compressed)
 format is not seekable — random-access reads are impossible without full decompression.
@@ -284,7 +284,7 @@ This is already the internal format. Changing on-disk storage doesn't affect has
 
 ## Phase 6: Streaming Iteration & Merge
 
-**Status: Not started**
+**Status: Complete**
 
 **Why:** Two critical memory bottlenecks exist:
 
@@ -344,7 +344,7 @@ mergeInternal(bm, maxProtocolVersion, keepDeadEntries, out, shadows, fileMergeIn
 
 ## Phase 7: DiskBacked Buckets by Default
 
-**Status: Not started**
+**Status: Complete**
 
 **Why:** `BucketManager::load_bucket()` calls `Bucket::load_from_file()` which decompresses
 `.gz` and loads **all entries** into `Vec<BucketEntry>`. This is the direct cause of the
@@ -519,16 +519,16 @@ Phase 3 (Point Lookups)              ✅ ------+ (parallel)
 Phase 4 (Index Persistence)          ✅
     |
     v
-Phase 5 (Uncompressed XDR Format)    ← Next
+Phase 5 (Uncompressed XDR Format)    ✅
     |
     v
-Phase 6 (Streaming Iteration/Merge)  ← Needs seekable files
+Phase 6 (Streaming Iteration/Merge)  ✅
     |
     v
-Phase 7 (DiskBacked by Default)      ← Needs streaming merge for subsequent ops
+Phase 7 (DiskBacked by Default)      ✅
     |
     v
-Phase 8 (Connect Index to DiskBucket) ← Needs DiskBacked buckets
+Phase 8 (Connect Index to DiskBucket) ← Next
     |
     +------> Phase 9 (Arc<Bucket>)    ← Can parallelize with Phase 8
     |
@@ -536,7 +536,7 @@ Phase 8 (Connect Index to DiskBucket) ← Needs DiskBacked buckets
 Phase 10 (HotArchive DiskBacked)     ← Reuses Phase 5-7 patterns
 ```
 
-**Minimum viable for mainnet (fixes OOM):** Phases 5-7
+**Minimum viable for mainnet (fixes OOM):** Phases 5-7 ✅
 **Full C++ parity:** All 10 phases
 
 ---
@@ -547,12 +547,16 @@ Phase 10 (HotArchive DiskBacked)     ← Reuses Phase 5-7 patterns
 
 | Component | Estimate |
 |-----------|----------|
-| Deduplication `HashSet<LedgerKey>` (transient) | ~8.6 GB |
+| Deduplication `HashSet<LedgerKey>` (transient, per-type) | ~240 MB |
 | Bucket indexes | ~200-400 MB |
 | Module cache (WASM compilation) | ~500 MB |
 | SQLite (offers + overhead) | ~200 MB |
 | Operating overhead (allocator, stack, etc.) | ~2 GB |
-| **Peak total** | **~12-13 GB** |
+| **Peak total** | **~3-4 GB** |
+
+*Note: The dedup HashSet was reduced from ~8.6 GB to ~240 MB by switching from
+`live_entries_iter()` (all 60M keys) to per-type scanning (ContractData +
+ContractCode, ~1.68M keys). See `docs/CATCHUP_MEMORY_ANALYSIS.md` for details.*
 
 ### Steady-State Operation
 
@@ -565,7 +569,7 @@ Phase 10 (HotArchive DiskBacked)     ← Reuses Phase 5-7 patterns
 | Operating overhead | ~1.5 GB |
 | **Steady-state total** | **~2.5-3 GB** |
 
-The deduplication HashSet is freed after catchup completes, so steady-state memory is
+The per-type deduplication HashSets are freed after catchup completes, so steady-state memory is
 substantially lower than peak.
 
 ---
@@ -595,7 +599,7 @@ to the live bucket list. This should be monitored during extended mainnet observ
 - Point lookups with cache misses (verify disk fallback returns correct entries)
 
 ### Performance Tests
-- Memory profiling during catchup (target: < 13 GB peak)
+- Memory profiling during catchup (target: < 4 GB peak)
 - Steady-state memory after 1,000+ ledger closes (target: < 4 GB)
 - Iteration speed benchmark
 - Point lookup latency (cache hit vs miss)
@@ -632,7 +636,7 @@ See [Phase Dependencies (Complete Picture)](#phase-dependencies-complete-picture
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | **SQL offer query latency** | Medium | High — DEX matching is latency-sensitive | SQLite with the `bestofferindex` composite index should handle order book queries efficiently. Benchmark with mainnet-scale offer counts (~12M) early. If latency is unacceptable, consider an in-memory order book index backed by SQL as source of truth. |
-| **Memory estimation off** | Medium | High — could exceed 16 GB target | Profile with real mainnet bucket archives. The transient dedup HashSet (~8.6 GB) is the largest single allocation; if it's too large, a bloom filter pre-screen could be added as a second tier to reduce the set size. |
+| **Memory estimation off** | Medium | High — could exceed 16 GB target | Profile with real mainnet bucket archives. Per-type scanning reduced the transient dedup HashSet from ~8.6 GB to ~240 MB. If further reduction is needed, a bloom filter pre-screen could be added. |
 | **Index format changes** | Low | Medium — breaks existing persisted indexes | Version field in the index header allows backward-compatible updates. Fallback to rebuild ensures no data loss. |
 | **Regression in ledger close** | Low | Critical — consensus failure | Comprehensive comparison tests: run Rust and C++ side-by-side on the same ledger sequence and verify identical hashes for 1,000+ consecutive ledgers. |
 | **Lock contention on BucketList** | Low (mitigated) | Medium — slower lookups under load | Addressed: `create_snapshot()` now captures a `BucketListSnapshot` so point lookups during TX execution use an immutable snapshot with no lock acquisition. |
@@ -642,7 +646,7 @@ See [Phase Dependencies (Complete Picture)](#phase-dependencies-complete-picture
 
 ## Success Metrics
 
-1. **Memory (peak)**: RSS < 16 GB during catchup with mainnet bucket archives
+1. **Memory (peak)**: RSS < 4 GB during catchup with mainnet bucket archives
 2. **Memory (steady-state)**: RSS < 4 GB during normal ledger close operation
 3. **Correctness**: Ledger hashes match C++ for 1,000+ consecutive ledgers on testnet
 4. **Performance**: Ledger close time within 10% of current
@@ -662,4 +666,4 @@ See [Phase Dependencies (Complete Picture)](#phase-dependencies-complete-picture
 
 ---
 
-*Last updated: January 2026*
+*Last updated: February 2026*
