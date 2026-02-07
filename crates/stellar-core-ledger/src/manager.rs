@@ -1430,6 +1430,155 @@ impl<'a> LedgerCloseContext<'a> {
         }
     }
 
+    /// Apply version upgrade side effects for protocol 25.
+    ///
+    /// Parity: NetworkConfig.cpp:1450-1457 `createCostTypesForV25`
+    /// Resizes the CPU and memory cost param entries to include BN254 curve
+    /// cost types and populates their values.
+    fn create_cost_types_for_v25(&mut self) -> Result<()> {
+        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams, ExtensionPoint};
+
+        // BN254 cost type indices (from ContractCostType enum)
+        const BN254_ENCODE_FP: usize = 70;
+        const BN254_DECODE_FP: usize = 71;
+        const BN254_G1_CHECK_POINT_ON_CURVE: usize = 72;
+        const BN254_G2_CHECK_POINT_ON_CURVE: usize = 73;
+        const BN254_G2_CHECK_POINT_IN_SUBGROUP: usize = 74;
+        const BN254_G1_PROJECTIVE_TO_AFFINE: usize = 75;
+        const BN254_G1_ADD: usize = 76;
+        const BN254_G1_MUL: usize = 77;
+        const BN254_PAIRING: usize = 78;
+        const BN254_FR_FROM_U256: usize = 79;
+        const BN254_FR_TO_U256: usize = 80;
+        const BN254_FR_ADD_SUB: usize = 81;
+        const BN254_FR_MUL: usize = 82;
+        const BN254_FR_POW: usize = 83;
+        const BN254_FR_INV: usize = 84;
+        const NEW_SIZE: usize = BN254_FR_INV + 1; // 85
+
+        let make_entry =
+            |const_term: i64, linear_term: i64| ContractCostParamEntry {
+                ext: ExtensionPoint::V0,
+                const_term,
+                linear_term,
+            };
+
+        // --- Update CPU cost params ---
+        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
+        });
+        let cpu_entry = self.load_entry(&cpu_key)?.ok_or_else(|| {
+            LedgerError::Internal(
+                "ContractCostParamsCpuInstructions entry not found".to_string(),
+            )
+        })?;
+        let mut cpu_params = if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+        ) = &cpu_entry.data
+        {
+            params.0.to_vec()
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for CPU cost params".to_string(),
+            ));
+        };
+
+        // Resize to fit BN254 types
+        cpu_params.resize(NEW_SIZE, make_entry(0, 0));
+
+        // Set BN254 CPU cost values (from NetworkConfig.cpp:556-629)
+        cpu_params[BN254_ENCODE_FP] = make_entry(344, 0);
+        cpu_params[BN254_DECODE_FP] = make_entry(476, 0);
+        cpu_params[BN254_G1_CHECK_POINT_ON_CURVE] = make_entry(904, 0);
+        cpu_params[BN254_G2_CHECK_POINT_ON_CURVE] = make_entry(2811, 0);
+        cpu_params[BN254_G2_CHECK_POINT_IN_SUBGROUP] = make_entry(2937755, 0);
+        cpu_params[BN254_G1_PROJECTIVE_TO_AFFINE] = make_entry(61, 0);
+        cpu_params[BN254_G1_ADD] = make_entry(3623, 0);
+        cpu_params[BN254_G1_MUL] = make_entry(1150435, 0);
+        cpu_params[BN254_PAIRING] = make_entry(5263916, 392472814);
+        cpu_params[BN254_FR_FROM_U256] = make_entry(2052, 0);
+        cpu_params[BN254_FR_TO_U256] = make_entry(1133, 0);
+        cpu_params[BN254_FR_ADD_SUB] = make_entry(74, 0);
+        cpu_params[BN254_FR_MUL] = make_entry(332, 0);
+        cpu_params[BN254_FR_POW] = make_entry(755, 68930);
+        cpu_params[BN254_FR_INV] = make_entry(33151, 0);
+
+        let new_cpu_entry = LedgerEntry {
+            last_modified_ledger_seq: self.close_data.ledger_seq,
+            data: LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
+                    cpu_params.try_into().map_err(|_| {
+                        LedgerError::Internal("Failed to convert CPU cost params".to_string())
+                    })?,
+                )),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+        self.delta.record_update(cpu_entry, new_cpu_entry)?;
+
+        // --- Update memory cost params ---
+        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
+        });
+        let mem_entry = self.load_entry(&mem_key)?.ok_or_else(|| {
+            LedgerError::Internal(
+                "ContractCostParamsMemoryBytes entry not found".to_string(),
+            )
+        })?;
+        let mut mem_params = if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+        ) = &mem_entry.data
+        {
+            params.0.to_vec()
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for memory cost params".to_string(),
+            ));
+        };
+
+        // Resize to fit BN254 types
+        mem_params.resize(NEW_SIZE, make_entry(0, 0));
+
+        // Set BN254 memory cost values (from NetworkConfig.cpp:993-1067)
+        // Most are 0,0 except Bn254Pairing and Bn254FrToU256
+        mem_params[BN254_ENCODE_FP] = make_entry(0, 0);
+        mem_params[BN254_DECODE_FP] = make_entry(0, 0);
+        mem_params[BN254_G1_CHECK_POINT_ON_CURVE] = make_entry(0, 0);
+        mem_params[BN254_G2_CHECK_POINT_ON_CURVE] = make_entry(0, 0);
+        mem_params[BN254_G2_CHECK_POINT_IN_SUBGROUP] = make_entry(0, 0);
+        mem_params[BN254_G1_PROJECTIVE_TO_AFFINE] = make_entry(0, 0);
+        mem_params[BN254_G1_ADD] = make_entry(0, 0);
+        mem_params[BN254_G1_MUL] = make_entry(0, 0);
+        mem_params[BN254_PAIRING] = make_entry(1821, 6232546);
+        mem_params[BN254_FR_FROM_U256] = make_entry(0, 0);
+        mem_params[BN254_FR_TO_U256] = make_entry(312, 0);
+        mem_params[BN254_FR_ADD_SUB] = make_entry(0, 0);
+        mem_params[BN254_FR_MUL] = make_entry(0, 0);
+        mem_params[BN254_FR_POW] = make_entry(0, 0);
+        mem_params[BN254_FR_INV] = make_entry(0, 0);
+
+        let new_mem_entry = LedgerEntry {
+            last_modified_ledger_seq: self.close_data.ledger_seq,
+            data: LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
+                    mem_params.try_into().map_err(|_| {
+                        LedgerError::Internal("Failed to convert memory cost params".to_string())
+                    })?,
+                )),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+        self.delta.record_update(mem_entry, new_mem_entry)?;
+
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            new_size = NEW_SIZE,
+            "Applied createCostTypesForV25: resized cost params with BN254 entries"
+        );
+
+        Ok(())
+    }
+
     /// Load Soroban rent config from the delta (for upgraded values) falling back to snapshot.
     ///
     /// This is used during config upgrades where the new cost params are in the delta
@@ -1733,12 +1882,27 @@ impl<'a> LedgerCloseContext<'a> {
         let mut upgraded_header = self.prev_header.clone();
         self.upgrade_ctx.apply_to_header(&mut upgraded_header);
         let protocol_version = upgraded_header.ledger_version;
+        let prev_version = self.prev_header.ledger_version;
         tracing::info!(
             ledger_seq = self.close_data.ledger_seq,
-            prev_protocol_version = self.prev_header.ledger_version,
+            prev_protocol_version = prev_version,
             upgraded_protocol_version = protocol_version,
             "Protocol version for commit"
         );
+
+        // Parity: Upgrades.cpp:1229-1242 applyVersionUpgrade
+        // Version upgrades may create/modify config setting entries in the
+        // ledger (e.g. new cost types for V25, state size window for V23+).
+        // These must be applied to the delta before bucket list extraction.
+        let mut version_upgrade_memory_cost_changed = false;
+        if prev_version != protocol_version {
+            // Parity: Upgrades.cpp:1229-1233
+            // needUpgradeToVersion(V_25, prev, new) → createCostTypesForV25
+            if prev_version < 25 && protocol_version >= 25 {
+                self.create_cost_types_for_v25()?;
+                version_upgrade_memory_cost_changed = true;
+            }
+        }
 
         // Apply config upgrades to the delta BEFORE extracting entries for the bucket list.
         // In C++ stellar-core, config upgrades are applied to the LedgerTxn before
@@ -1763,10 +1927,15 @@ impl<'a> LedgerCloseContext<'a> {
             );
         }
 
-        // Parity: Upgrades.cpp:1449-1453 handleUpgradeAffectingSorobanInMemoryStateSize
-        // When ContractCostParamsMemoryBytes is upgraded, recompute contract code
-        // sizes in-memory and overwrite all window entries with the new total size.
-        if config_memory_cost_params_changed
+        // Parity: Upgrades.cpp:1238-1242 and 1449-1453
+        // handleUpgradeAffectingSorobanInMemoryStateSize is called:
+        // 1. After version upgrade to V23+ (recompute with potentially new cost params)
+        // 2. After config upgrade that changes ContractCostParamsMemoryBytes
+        // It recomputes contract code sizes in-memory and overwrites all window entries.
+        let version_upgrade_triggers_state_size = prev_version != protocol_version
+            && protocol_version >= 23;
+        if (config_memory_cost_params_changed || version_upgrade_memory_cost_changed
+            || version_upgrade_triggers_state_size)
             && protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
             // Load rent config from delta (new upgraded values) falling back to snapshot.
