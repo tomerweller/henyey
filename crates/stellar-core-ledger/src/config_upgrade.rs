@@ -20,6 +20,9 @@
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use stellar_core_common::protocol::{
+    protocol_version_starts_from, ProtocolVersion, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+};
 use stellar_core_common::Hash256;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
@@ -45,70 +48,75 @@ pub enum ConfigUpgradeValidity {
 
 /// Minimum values for Soroban network configuration.
 ///
-/// These match the C++ MinimumSorobanNetworkConfig values.
+/// These match the C++ MinimumSorobanNetworkConfig values from NetworkConfig.h.
+/// These are intentionally low floor values that allow the network flexibility
+/// to configure settings via upgrades. They are NOT the initial/production
+/// values.
 pub mod min_config {
     /// Minimum max contract size.
-    pub const MAX_CONTRACT_SIZE: u32 = 64 * 1024; // 64KB
+    pub const MAX_CONTRACT_SIZE: u32 = 2_000;
     /// Minimum max contract data key size.
-    pub const MAX_CONTRACT_DATA_KEY_SIZE_BYTES: u32 = 250;
+    pub const MAX_CONTRACT_DATA_KEY_SIZE_BYTES: u32 = 200;
     /// Minimum max contract data entry size.
-    pub const MAX_CONTRACT_DATA_ENTRY_SIZE_BYTES: u32 = 64 * 1024; // 64KB
+    pub const MAX_CONTRACT_DATA_ENTRY_SIZE_BYTES: u32 = 2_000;
     /// Minimum tx max size bytes.
-    pub const TX_MAX_SIZE_BYTES: u32 = 71680; // 70KB
+    pub const TX_MAX_SIZE_BYTES: u32 = 10_000;
     /// Minimum tx max instructions.
-    pub const TX_MAX_INSTRUCTIONS: u32 = 25_000_000;
+    pub const TX_MAX_INSTRUCTIONS: u32 = 2_500_000;
     /// Minimum memory limit.
-    pub const MEMORY_LIMIT: u32 = 40 * 1024 * 1024; // 40MB
+    pub const MEMORY_LIMIT: u32 = 2_000_000;
     /// Minimum tx max read ledger entries.
-    pub const TX_MAX_READ_LEDGER_ENTRIES: u32 = 40;
+    pub const TX_MAX_READ_LEDGER_ENTRIES: u32 = 3;
     /// Minimum tx max read bytes.
-    pub const TX_MAX_READ_BYTES: u32 = 200 * 1024; // 200KB
+    pub const TX_MAX_READ_BYTES: u32 = 3_200;
     /// Minimum tx max write ledger entries.
-    pub const TX_MAX_WRITE_LEDGER_ENTRIES: u32 = 25;
+    pub const TX_MAX_WRITE_LEDGER_ENTRIES: u32 = 2;
     /// Minimum tx max write bytes.
-    pub const TX_MAX_WRITE_BYTES: u32 = 66560; // 65KB
+    pub const TX_MAX_WRITE_BYTES: u32 = 3_200;
     /// Minimum tx max contract events size.
-    pub const TX_MAX_CONTRACT_EVENTS_SIZE_BYTES: u32 = 8 * 1024; // 8KB
+    pub const TX_MAX_CONTRACT_EVENTS_SIZE_BYTES: u32 = 200;
     /// Minimum maximum entry TTL.
-    pub const MAXIMUM_ENTRY_LIFETIME: u32 = 31536000; // ~1 year in ledgers
+    pub const MAXIMUM_ENTRY_LIFETIME: u32 = 1_054_080;
     /// Minimum temporary entry TTL.
     pub const MINIMUM_TEMP_ENTRY_LIFETIME: u32 = 16;
     /// Minimum persistent entry TTL.
-    pub const MINIMUM_PERSISTENT_ENTRY_LIFETIME: u32 = 120960; // ~7 days
+    pub const MINIMUM_PERSISTENT_ENTRY_LIFETIME: u32 = 10;
     /// Minimum max entries to archive.
-    pub const MAX_ENTRIES_TO_ARCHIVE: u32 = 100;
+    pub const MAX_ENTRIES_TO_ARCHIVE: u32 = 0;
     /// Minimum bucket list size window sample size.
-    pub const BUCKETLIST_SIZE_WINDOW_SAMPLE_SIZE: u32 = 30;
+    pub const BUCKETLIST_SIZE_WINDOW_SAMPLE_SIZE: u32 = 1;
     /// Minimum eviction scan size.
-    pub const EVICTION_SCAN_SIZE: u32 = 1000;
+    pub const EVICTION_SCAN_SIZE: u32 = 0;
     /// Minimum starting eviction level.
-    pub const STARTING_EVICTION_LEVEL: u32 = 7;
+    pub const STARTING_EVICTION_LEVEL: u32 = 1;
     /// Minimum bucket list window sample period.
     pub const BUCKETLIST_WINDOW_SAMPLE_PERIOD: u32 = 1;
     /// Minimum ledger target close time.
-    pub const LEDGER_TARGET_CLOSE_TIME_MILLISECONDS: u32 = 1000;
+    pub const LEDGER_TARGET_CLOSE_TIME_MILLISECONDS: u32 = 4_000;
     /// Minimum nomination timeout initial.
-    pub const NOMINATION_TIMEOUT_INITIAL_MILLISECONDS: u32 = 500;
+    pub const NOMINATION_TIMEOUT_INITIAL_MILLISECONDS: u32 = 750;
     /// Minimum nomination timeout increment.
-    pub const NOMINATION_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 100;
+    pub const NOMINATION_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 750;
     /// Minimum ballot timeout initial.
-    pub const BALLOT_TIMEOUT_INITIAL_MILLISECONDS: u32 = 500;
+    pub const BALLOT_TIMEOUT_INITIAL_MILLISECONDS: u32 = 750;
     /// Minimum ballot timeout increment.
-    pub const BALLOT_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 500;
+    pub const BALLOT_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 750;
 }
 
 /// Maximum values for Soroban network configuration.
+///
+/// These match the C++ MaximumSorobanNetworkConfig values from NetworkConfig.h.
 pub mod max_config {
     /// Maximum ledger target close time.
-    pub const LEDGER_TARGET_CLOSE_TIME_MILLISECONDS: u32 = 10000;
+    pub const LEDGER_TARGET_CLOSE_TIME_MILLISECONDS: u32 = 5_000;
     /// Maximum nomination timeout initial.
-    pub const NOMINATION_TIMEOUT_INITIAL_MILLISECONDS: u32 = 10000;
+    pub const NOMINATION_TIMEOUT_INITIAL_MILLISECONDS: u32 = 2_500;
     /// Maximum nomination timeout increment.
-    pub const NOMINATION_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 5000;
+    pub const NOMINATION_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 2_000;
     /// Maximum ballot timeout initial.
-    pub const BALLOT_TIMEOUT_INITIAL_MILLISECONDS: u32 = 10000;
+    pub const BALLOT_TIMEOUT_INITIAL_MILLISECONDS: u32 = 2_500;
     /// Maximum ballot timeout increment.
-    pub const BALLOT_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 10000;
+    pub const BALLOT_TIMEOUT_INCREMENT_MILLISECONDS: u32 = 2_000;
 }
 
 /// A frame for a ConfigUpgradeSet stored in the ledger.
@@ -456,7 +464,11 @@ impl ConfigUpgradeSetFrame {
     }
 
     /// Validate a config setting entry against constraints.
-    fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, _ledger_version: u32) -> bool {
+    ///
+    /// Matches C++ `SorobanNetworkConfig::isValidConfigSettingEntry` from
+    /// NetworkConfig.cpp.
+    #[allow(clippy::absurd_extreme_comparisons)]
+    fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, ledger_version: u32) -> bool {
         match entry {
             ConfigSettingEntry::ContractMaxSizeBytes(v) => *v >= min_config::MAX_CONTRACT_SIZE,
             ConfigSettingEntry::ContractCostParamsCpuInstructions(_) => {
@@ -500,6 +512,8 @@ impl ConfigUpgradeSetFrame {
                     && cost.fee_disk_read1_kb >= 0
                     && cost.soroban_state_target_size_bytes > 0
                     && cost.rent_fee1_kb_soroban_state_size_high >= 0
+                // Note: C++ also checks sorobanStateRentFeeGrowthFactor >= 0,
+                // but the field is u32 in Rust so it's always >= 0.
             }
             ConfigSettingEntry::ContractEventsV0(events) => {
                 events.tx_max_contract_events_size_bytes
@@ -528,15 +542,20 @@ impl ConfigUpgradeSetFrame {
             ConfigSettingEntry::LiveSorobanStateSizeWindow(_) => true,
             ConfigSettingEntry::EvictionIterator(_) => true,
             ConfigSettingEntry::ContractParallelComputeV0(parallel) => {
-                parallel.ledger_max_dependent_tx_clusters > 0
+                protocol_version_starts_from(
+                    ledger_version,
+                    PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+                ) && parallel.ledger_max_dependent_tx_clusters > 0
                     && parallel.ledger_max_dependent_tx_clusters < 128
             }
             ConfigSettingEntry::ContractLedgerCostExtV0(ext) => {
-                ext.tx_max_footprint_entries >= min_config::TX_MAX_READ_LEDGER_ENTRIES
+                protocol_version_starts_from(ledger_version, ProtocolVersion::V23)
+                    && ext.tx_max_footprint_entries >= min_config::TX_MAX_READ_LEDGER_ENTRIES
                     && ext.fee_write1_kb >= 0
             }
             ConfigSettingEntry::ScpTiming(timing) => {
-                timing.ledger_target_close_time_milliseconds
+                protocol_version_starts_from(ledger_version, ProtocolVersion::V23)
+                    && timing.ledger_target_close_time_milliseconds
                         >= min_config::LEDGER_TARGET_CLOSE_TIME_MILLISECONDS
                     && timing.ledger_target_close_time_milliseconds
                         <= max_config::LEDGER_TARGET_CLOSE_TIME_MILLISECONDS
@@ -624,5 +643,149 @@ mod tests {
             &upgrade_set,
             &key
         ));
+    }
+
+    /// Regression test: config upgrade validation must accept values at the
+    /// C++ MinimumSorobanNetworkConfig floor, not the higher initial/production
+    /// values. Testnet ledger 427 has a ContractLedgerCostV0 upgrade with values
+    /// below the (incorrect) old Rust minimums but above the real C++ minimums.
+    #[test]
+    fn test_contract_ledger_cost_v0_accepts_cpp_minimum_values() {
+        use stellar_xdr::curr::ConfigSettingContractLedgerCostV0;
+
+        // Values at the C++ minimum floor - must be accepted
+        let cost_at_minimum =
+            ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
+                tx_max_disk_read_entries: 3, // C++ min: 3
+                ledger_max_disk_read_entries: 3,
+                tx_max_disk_read_bytes: 3200, // C++ min: 3200
+                ledger_max_disk_read_bytes: 3200,
+                tx_max_write_ledger_entries: 2, // C++ min: 2
+                ledger_max_write_ledger_entries: 2,
+                tx_max_write_bytes: 3200, // C++ min: 3200
+                ledger_max_write_bytes: 3200,
+                fee_disk_read_ledger_entry: 0,
+                fee_write_ledger_entry: 0,
+                fee_disk_read1_kb: 0,
+                soroban_state_target_size_bytes: 1,
+                rent_fee1_kb_soroban_state_size_low: 0,
+                rent_fee1_kb_soroban_state_size_high: 0,
+                soroban_state_rent_fee_growth_factor: 0,
+            });
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&cost_at_minimum, 25),
+            "ContractLedgerCostV0 at C++ minimum values must be accepted"
+        );
+
+        // Values below the C++ minimum - must be rejected
+        let cost_below_minimum =
+            ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
+                tx_max_disk_read_entries: 2, // Below C++ min of 3
+                ledger_max_disk_read_entries: 2,
+                tx_max_disk_read_bytes: 3200,
+                ledger_max_disk_read_bytes: 3200,
+                tx_max_write_ledger_entries: 2,
+                ledger_max_write_ledger_entries: 2,
+                tx_max_write_bytes: 3200,
+                ledger_max_write_bytes: 3200,
+                fee_disk_read_ledger_entry: 0,
+                fee_write_ledger_entry: 0,
+                fee_disk_read1_kb: 0,
+                soroban_state_target_size_bytes: 1,
+                rent_fee1_kb_soroban_state_size_low: 0,
+                rent_fee1_kb_soroban_state_size_high: 0,
+                soroban_state_rent_fee_growth_factor: 0,
+            });
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&cost_below_minimum, 25),
+            "ContractLedgerCostV0 below C++ minimum values must be rejected"
+        );
+    }
+
+    /// Regression test: all config setting types must use the correct C++
+    /// MinimumSorobanNetworkConfig floor values, not the higher initial values.
+    #[test]
+    fn test_all_config_settings_accept_cpp_minimum_values() {
+        use stellar_xdr::curr::{
+            ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+            ConfigSettingContractEventsV0, StateArchivalSettings,
+        };
+
+        // ContractMaxSizeBytes at C++ min of 2000
+        let entry = ConfigSettingEntry::ContractMaxSizeBytes(2000);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "ContractMaxSizeBytes=2000 must be accepted (C++ min)"
+        );
+        let entry = ConfigSettingEntry::ContractMaxSizeBytes(1999);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "ContractMaxSizeBytes=1999 must be rejected"
+        );
+
+        // ContractDataKeySizeBytes at C++ min of 200
+        let entry = ConfigSettingEntry::ContractDataKeySizeBytes(200);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "ContractDataKeySizeBytes=200 must be accepted (C++ min)"
+        );
+
+        // ContractDataEntrySizeBytes at C++ min of 2000
+        let entry = ConfigSettingEntry::ContractDataEntrySizeBytes(2000);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "ContractDataEntrySizeBytes=2000 must be accepted (C++ min)"
+        );
+
+        // ContractBandwidthV0 at C++ min
+        let entry = ConfigSettingEntry::ContractBandwidthV0(ConfigSettingContractBandwidthV0 {
+            fee_tx_size1_kb: 0,
+            tx_max_size_bytes: 10_000, // C++ min
+            ledger_max_txs_size_bytes: 10_000,
+        });
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "ContractBandwidthV0 at C++ min must be accepted"
+        );
+
+        // ContractComputeV0 at C++ min
+        let entry = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            fee_rate_per_instructions_increment: 0,
+            tx_max_instructions: 2_500_000, // C++ min
+            ledger_max_instructions: 2_500_000,
+            tx_memory_limit: 2_000_000, // C++ min
+        });
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "ContractComputeV0 at C++ min must be accepted"
+        );
+
+        // ContractEventsV0 at C++ min
+        let entry = ConfigSettingEntry::ContractEventsV0(ConfigSettingContractEventsV0 {
+            tx_max_contract_events_size_bytes: 200, // C++ min
+            fee_contract_events1_kb: 0,
+        });
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "ContractEventsV0 at C++ min must be accepted"
+        );
+
+        // StateArchival at C++ min
+        let entry = ConfigSettingEntry::StateArchival(StateArchivalSettings {
+            max_entry_ttl: 1_054_080, // C++ min
+            min_temporary_ttl: 16,    // C++ min
+            min_persistent_ttl: 10,   // C++ min
+            persistent_rent_rate_denominator: 1,
+            temp_rent_rate_denominator: 1,
+            max_entries_to_archive: 0,                     // C++ min
+            live_soroban_state_size_window_sample_size: 1, // C++ min
+            eviction_scan_size: 0,                         // C++ min (was 1000)
+            starting_eviction_scan_level: 1,               // C++ min (was 7)
+            live_soroban_state_size_window_sample_period: 1,
+        });
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "StateArchival at C++ min must be accepted"
+        );
     }
 }

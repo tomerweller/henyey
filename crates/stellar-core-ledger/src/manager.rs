@@ -1028,8 +1028,7 @@ impl LedgerManager {
         {
             return Err(LedgerError::UnsupportedProtocolVersion {
                 version: state.header.ledger_version,
-                max_supported:
-                    stellar_core_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
+                max_supported: stellar_core_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
             });
         }
 
@@ -1826,6 +1825,20 @@ impl<'a> LedgerCloseContext<'a> {
         self.upgrade_ctx.apply_to_header(&mut upgraded_header);
         let protocol_version = upgraded_header.ledger_version;
 
+        // Apply config upgrades to the delta BEFORE extracting entries for the bucket list.
+        // In C++ stellar-core, config upgrades are applied to the LedgerTxn before
+        // getAllEntries() and addBatch(), so the upgraded ConfigSetting entries are included
+        // in the bucket list update. We must do the same here.
+        let mut config_state_archival_changed = false;
+        let mut config_memory_limit_changed = false;
+        if self.upgrade_ctx.has_config_upgrades() {
+            let (archival, memory) = self
+                .upgrade_ctx
+                .apply_config_upgrades(&self.snapshot, &mut self.delta)?;
+            config_state_archival_changed = archival;
+            config_memory_limit_changed = memory;
+        }
+
         // Load state archival settings BEFORE acquiring bucket list lock to avoid deadlock.
         // The snapshot's lookup_fn tries to acquire a read lock on bucket_list, which would
         // deadlock if we're already holding the write lock.
@@ -2479,25 +2492,19 @@ impl<'a> LedgerCloseContext<'a> {
         // Apply upgrades to header fields (e.g., ledger_version, base_fee)
         self.upgrade_ctx.apply_to_header(&mut new_header);
 
-        // Apply config upgrades (Soroban settings stored in CONTRACT_DATA)
-        if self.upgrade_ctx.has_config_upgrades() {
-            let (state_archival_changed, memory_limit_changed) = self
-                .upgrade_ctx
-                .apply_config_upgrades(&self.snapshot, &mut self.delta)?;
-
-            if state_archival_changed {
-                tracing::info!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    "State archival settings changed via config upgrade"
-                );
-            }
-
-            if memory_limit_changed {
-                tracing::info!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    "Memory limit settings changed via config upgrade"
-                );
-            }
+        // Log config upgrade effects (upgrades were already applied to the delta
+        // before bucket list add_batch, matching C++ ordering)
+        if config_state_archival_changed {
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                "State archival settings changed via config upgrade"
+            );
+        }
+        if config_memory_limit_changed {
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                "Memory limit settings changed via config upgrade"
+            );
         }
 
         // Also set the raw upgrades in scp_value.upgrades for correct header hash
@@ -2738,7 +2745,12 @@ mod tests {
         let header_hash = crate::compute_header_hash(&header).expect("hash");
 
         manager
-            .initialize(bucket_list, hot_archive_bucket_list, header.clone(), header_hash)
+            .initialize(
+                bucket_list,
+                hot_archive_bucket_list,
+                header.clone(),
+                header_hash,
+            )
             .expect("initialization should succeed");
 
         // begin_close at CURRENT version should pass the version check
@@ -2774,7 +2786,10 @@ mod tests {
         );
         let result2 = manager.begin_close(close_data2);
         match result2 {
-            Err(LedgerError::UnsupportedProtocolVersion { version, max_supported }) => {
+            Err(LedgerError::UnsupportedProtocolVersion {
+                version,
+                max_supported,
+            }) => {
                 assert_eq!(version, CURRENT_LEDGER_PROTOCOL_VERSION + 1);
                 assert_eq!(max_supported, CURRENT_LEDGER_PROTOCOL_VERSION);
             }
