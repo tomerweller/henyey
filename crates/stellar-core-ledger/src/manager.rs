@@ -158,31 +158,6 @@ fn load_eviction_iterator_from_bucket_list(bucket_list: &BucketList) -> Option<E
     }
 }
 
-/// Load StateArchivalSettings from the snapshot's ConfigSettingEntry.
-fn load_state_archival_settings_from_snapshot(
-    snapshot: &SnapshotHandle,
-) -> Option<StateArchivalSettings> {
-    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::StateArchival,
-    });
-
-    match snapshot.get_entry(&key) {
-        Ok(Some(entry)) => {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) =
-                entry.data
-            {
-                Some(StateArchivalSettings {
-                    eviction_scan_size: settings.eviction_scan_size as u64,
-                    starting_eviction_scan_level: settings.starting_eviction_scan_level,
-                    max_entries_to_archive: settings.max_entries_to_archive,
-                })
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
 
 /// Configuration options for the [`LedgerManager`].
 ///
@@ -1583,6 +1558,92 @@ impl<'a> LedgerCloseContext<'a> {
         Ok(None)
     }
 
+    /// Load StateArchivalSettings from the delta (for upgraded values) falling back to snapshot.
+    ///
+    /// Parity: In C++, the eviction scan runs after config upgrades are applied to the
+    /// LedgerTxn, so it sees the upgraded StateArchival settings. We must do the same
+    /// by checking the delta first (which contains the upgrade), then falling back to
+    /// the snapshot.
+    fn load_state_archival_settings(&self) -> Option<StateArchivalSettings> {
+        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::StateArchival,
+        });
+        let entry = self.load_entry(&key).ok()??;
+        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) =
+            entry.data
+        {
+            Some(StateArchivalSettings {
+                eviction_scan_size: settings.eviction_scan_size as u64,
+                starting_eviction_scan_level: settings.starting_eviction_scan_level,
+                max_entries_to_archive: settings.max_entries_to_archive,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Load Soroban rent config from the delta (for upgraded values) falling back to snapshot.
+    ///
+    /// This is used during config upgrades where the new cost params are in the delta
+    /// but haven't been applied to the bucket list yet.
+    /// Parity: C++ loads from LedgerTxn which reflects the just-applied upgrades.
+    fn load_rent_config_from_delta_or_snapshot(
+        &self,
+    ) -> Option<crate::soroban_state::SorobanRentConfig> {
+        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
+        });
+        let cpu_params = self.load_entry(&cpu_key).ok()?.and_then(|e| {
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+            ) = e.data
+            {
+                Some(params)
+            } else {
+                None
+            }
+        })?;
+
+        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
+        });
+        let mem_params = self.load_entry(&mem_key).ok()?.and_then(|e| {
+            if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+            ) = e.data
+            {
+                Some(params)
+            } else {
+                None
+            }
+        })?;
+
+        let compute_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractComputeV0,
+        });
+        let (tx_max_instructions, tx_max_memory_bytes) =
+            self.load_entry(&compute_key).ok()?.and_then(|e| {
+                if let LedgerEntryData::ConfigSetting(
+                    ConfigSettingEntry::ContractComputeV0(compute),
+                ) = e.data
+                {
+                    Some((
+                        compute.tx_max_instructions as u64,
+                        compute.tx_memory_limit as u64,
+                    ))
+                } else {
+                    None
+                }
+            })?;
+
+        Some(crate::soroban_state::SorobanRentConfig {
+            cpu_cost_params: cpu_params,
+            mem_cost_params: mem_params,
+            tx_max_instructions,
+            tx_max_memory_bytes,
+        })
+    }
+
     /// Record creation of a new entry.
     fn record_create(&mut self, entry: LedgerEntry) -> Result<()> {
         self.delta.record_create(entry)
@@ -1824,24 +1885,169 @@ impl<'a> LedgerCloseContext<'a> {
         let mut upgraded_header = self.prev_header.clone();
         self.upgrade_ctx.apply_to_header(&mut upgraded_header);
         let protocol_version = upgraded_header.ledger_version;
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            prev_protocol_version = self.prev_header.ledger_version,
+            upgraded_protocol_version = protocol_version,
+            "Protocol version for commit"
+        );
 
         // Apply config upgrades to the delta BEFORE extracting entries for the bucket list.
         // In C++ stellar-core, config upgrades are applied to the LedgerTxn before
         // getAllEntries() and addBatch(), so the upgraded ConfigSetting entries are included
         // in the bucket list update. We must do the same here.
         let mut config_state_archival_changed = false;
-        let mut config_memory_limit_changed = false;
+        let mut config_memory_cost_params_changed = false;
+        let delta_count_before_upgrades = self.delta.num_changes();
         if self.upgrade_ctx.has_config_upgrades() {
-            let (archival, memory) = self
+            let (archival, memory_cost) = self
                 .upgrade_ctx
                 .apply_config_upgrades(&self.snapshot, &mut self.delta)?;
             config_state_archival_changed = archival;
-            config_memory_limit_changed = memory;
+            config_memory_cost_params_changed = memory_cost;
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                delta_before = delta_count_before_upgrades,
+                delta_after = self.delta.num_changes(),
+                archival_changed = config_state_archival_changed,
+                memory_cost_changed = config_memory_cost_params_changed,
+                "Delta entry count after config upgrades"
+            );
         }
+
+        // Parity: Upgrades.cpp:1449-1453 handleUpgradeAffectingSorobanInMemoryStateSize
+        // When ContractCostParamsMemoryBytes is upgraded, recompute contract code
+        // sizes in-memory and overwrite all window entries with the new total size.
+        if config_memory_cost_params_changed
+            && protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION
+        {
+            // Load rent config from delta (new upgraded values) falling back to snapshot.
+            // C++ loads from LedgerTxn which reflects the just-applied upgrades.
+            let rent_config =
+                self.load_rent_config_from_delta_or_snapshot();
+
+            // Recompute contract code sizes with new cost params
+            {
+                let mut soroban_state = self.manager.soroban_state.write();
+                let code_size_before = soroban_state.contract_code_state_size();
+                let data_size_before = soroban_state.contract_data_state_size();
+                let code_count = soroban_state.contract_code_count();
+                let data_count = soroban_state.contract_data_count();
+                soroban_state
+                    .recompute_contract_code_sizes(protocol_version, rent_config.as_ref());
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    code_size_before = code_size_before,
+                    code_size_after = soroban_state.contract_code_state_size(),
+                    data_size = data_size_before,
+                    code_count = code_count,
+                    data_count = data_count,
+                    total_size = soroban_state.total_size(),
+                    has_rent_config = rent_config.is_some(),
+                    "Recomputed contract code sizes"
+                );
+            }
+
+            // Update all window entries with the new total size
+            // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
+            if stellar_core_common::protocol::protocol_version_starts_from(
+                protocol_version,
+                stellar_core_common::protocol::ProtocolVersion::V23,
+            ) {
+                let new_size = self.manager.soroban_state.read().total_size();
+                let window_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
+                    stellar_xdr::curr::LedgerKeyConfigSetting {
+                        config_setting_id:
+                            stellar_xdr::curr::ConfigSettingId::LiveSorobanStateSizeWindow,
+                    },
+                );
+
+                // Read the window from the delta first (it may have been resized
+                // by the config upgrade), falling back to the snapshot.
+                // Parity: C++ reads from LedgerTxn which includes prior modifications.
+                let (window_vec_base, previous_entry) = {
+                    let delta_change = self.delta.get_change(&window_key)?;
+                    if let Some(change) = delta_change {
+                        if let Some(current) = change.current_entry() {
+                            if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
+                                stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(w),
+                            ) = &current.data
+                            {
+                                // Use delta's current version (includes resize)
+                                // For the "previous" in record_update, use the snapshot version
+                                let snapshot_entry =
+                                    self.snapshot.get_entry(&window_key).ok().flatten();
+                                (
+                                    Some(w.iter().copied().collect::<Vec<u64>>()),
+                                    snapshot_entry,
+                                )
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    } else if let Some(entry) =
+                        self.snapshot.get_entry(&window_key).ok().flatten()
+                    {
+                        if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
+                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(w),
+                        ) = &entry.data
+                        {
+                            (
+                                Some(w.iter().copied().collect::<Vec<u64>>()),
+                                Some(entry),
+                            )
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                };
+
+                if let (Some(mut window_vec), Some(prev)) = (window_vec_base, previous_entry) {
+                    for size in &mut window_vec {
+                        *size = new_size;
+                    }
+                    let new_window: stellar_xdr::curr::VecM<u64> =
+                        window_vec.try_into().map_err(|_| {
+                            LedgerError::Internal("Failed to convert window vec".to_string())
+                        })?;
+                    let new_window_entry = stellar_xdr::curr::LedgerEntry {
+                        last_modified_ledger_seq: self.close_data.ledger_seq,
+                        data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(
+                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                                new_window,
+                            ),
+                        ),
+                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                    };
+                    self.delta.record_update(prev.clone(), new_window_entry)?;
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        new_size = new_size,
+                        delta_count = self.delta.num_changes(),
+                        "Updated all state size window entries due to memory cost params upgrade"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            delta_count_final = self.delta.num_changes(),
+            init_count = self.delta.init_entries().len(),
+            live_count = self.delta.live_entries().len(),
+            dead_count = self.delta.dead_entries().len(),
+            "Delta entry counts before bucket list update"
+        );
 
         // Load state archival settings BEFORE acquiring bucket list lock to avoid deadlock.
         // The snapshot's lookup_fn tries to acquire a read lock on bucket_list, which would
         // deadlock if we're already holding the write lock.
+        // Parity: In C++, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
+        // so it reads the post-upgrade StateArchival settings. We use load_state_archival_settings()
+        // which checks the delta first (containing any upgrade changes) before the snapshot.
         let eviction_settings = if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
         {
             tracing::debug!(
@@ -1849,7 +2055,7 @@ impl<'a> LedgerCloseContext<'a> {
                 "Loading state archival settings"
             );
             let settings =
-                load_state_archival_settings_from_snapshot(&self.snapshot).unwrap_or_default();
+                self.load_state_archival_settings().unwrap_or_default();
             tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 "Loaded state archival settings"
@@ -2328,6 +2534,77 @@ impl<'a> LedgerCloseContext<'a> {
                 Hash256::from_bytes(bytes)
             };
 
+            // Temporary: dump per-entry details for upgrade ledgers
+            if self.upgrade_ctx.has_config_upgrades() {
+                use sha2::{Digest as _, Sha256};
+                for (i, entry) in live_entries.iter().enumerate() {
+                    let key_str = match &entry.data {
+                        LedgerEntryData::ConfigSetting(cs) => {
+                            format!("ConfigSetting({:?})", cs.discriminant())
+                        }
+                        LedgerEntryData::Account(a) => {
+                            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
+                            format!("Account({:02x}{:02x}..{:02x}{:02x})", pk.0[0], pk.0[1], pk.0[30], pk.0[31])
+                        }
+                        other => format!("{:?}", std::mem::discriminant(other)),
+                    };
+                    let xdr_bytes = entry.to_xdr(Limits::none()).unwrap_or_default();
+                    let xdr_size = xdr_bytes.len();
+                    let xdr_hash = {
+                        let mut h = Sha256::new();
+                        h.update(&xdr_bytes);
+                        let r = h.finalize();
+                        let mut b = [0u8; 32];
+                        b.copy_from_slice(&r);
+                        Hash256::from_bytes(b)
+                    };
+                    // For Account entries, also dump full hex for comparison
+                    let hex_preview = if matches!(&entry.data, LedgerEntryData::Account(_)) {
+                        format!(" xdr_hex={}", xdr_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+                    } else {
+                        String::new()
+                    };
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        idx = i,
+                        key = %key_str,
+                        last_modified = entry.last_modified_ledger_seq,
+                        xdr_size = xdr_size,
+                        xdr_hash = %xdr_hash.to_hex(),
+                        xdr_hex = %hex_preview,
+                        "BUCKET_ENTRY"
+                    );
+                }
+                // Also log init entries
+                for (i, entry) in init_entries.iter().enumerate() {
+                    let key_str = match &entry.data {
+                        LedgerEntryData::ConfigSetting(cs) => {
+                            format!("ConfigSetting({:?})", cs.discriminant())
+                        }
+                        other => format!("{:?}", std::mem::discriminant(other)),
+                    };
+                    let xdr_bytes = entry.to_xdr(Limits::none()).unwrap_or_default();
+                    let xdr_size = xdr_bytes.len();
+                    let xdr_hash = {
+                        let mut h = Sha256::new();
+                        h.update(&xdr_bytes);
+                        let r = h.finalize();
+                        let mut b = [0u8; 32];
+                        b.copy_from_slice(&r);
+                        Hash256::from_bytes(b)
+                    };
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        idx = i,
+                        key = %key_str,
+                        last_modified = entry.last_modified_ledger_seq,
+                        xdr_size = xdr_size,
+                        xdr_hash = %xdr_hash.to_hex(),
+                        "BUCKET_INIT_ENTRY"
+                    );
+                }
+            }
+
             // Log the inputs to add_batch - this is critical for debugging mismatches
             tracing::info!(
                 ledger_seq = self.close_data.ledger_seq,
@@ -2500,10 +2777,10 @@ impl<'a> LedgerCloseContext<'a> {
                 "State archival settings changed via config upgrade"
             );
         }
-        if config_memory_limit_changed {
+        if config_memory_cost_params_changed {
             tracing::info!(
                 ledger_seq = self.close_data.ledger_seq,
-                "Memory limit settings changed via config upgrade"
+                "Memory cost params changed via config upgrade"
             );
         }
 

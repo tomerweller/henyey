@@ -5555,7 +5555,10 @@ pub fn execute_transaction_set_with_fee_mode(
         info!(
             success = result.success,
             fee = result.fee_charged,
+            fee_refund = result.fee_refund,
             ops = result.operation_results.len(),
+            ledger_seq = ledger_seq,
+            tx_index = tx_index,
             "Executed transaction"
         );
 
@@ -5582,7 +5585,7 @@ pub fn execute_transaction_set_with_fee_mode(
                 executor.state.delta_mut().add_fee(-refund);
                 total_refunds += refund;
 
-                tracing::info!(
+                tracing::debug!(
                     ledger_seq = ledger_seq,
                     tx_index = idx,
                     refund = refund,
@@ -5592,7 +5595,7 @@ pub fn execute_transaction_set_with_fee_mode(
             }
         }
         if total_refunds > 0 {
-            tracing::info!(
+            tracing::debug!(
                 ledger_seq = ledger_seq,
                 total_refunds = total_refunds,
                 tx_count = transactions.len(),
