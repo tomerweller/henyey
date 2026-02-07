@@ -818,7 +818,7 @@ impl UpgradeContext {
         delta: &mut LedgerDelta,
     ) -> Result<(bool, bool), LedgerError> {
         let mut state_archival_changed = false;
-        let mut memory_limit_changed = false;
+        let mut memory_cost_params_changed = false;
 
         for key in self.config_upgrade_keys() {
             // Load the upgrade set from the ledger
@@ -852,10 +852,10 @@ impl UpgradeContext {
                 }
             }
 
-            // Apply the upgrade
-            let (archival, memory) = frame.apply_to(snapshot, delta)?;
+            // Apply the upgrade (includes window resize if sample size changed)
+            let (archival, memory_cost) = frame.apply_to(snapshot, delta)?;
             state_archival_changed |= archival;
-            memory_limit_changed |= memory;
+            memory_cost_params_changed |= memory_cost;
 
             tracing::info!(
                 contract_id = ?key.contract_id,
@@ -863,7 +863,7 @@ impl UpgradeContext {
             );
         }
 
-        Ok((state_archival_changed, memory_limit_changed))
+        Ok((state_archival_changed, memory_cost_params_changed))
     }
 
     /// Apply upgrades to a header, returning the modified values.

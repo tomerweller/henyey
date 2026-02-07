@@ -992,22 +992,46 @@ impl InMemorySorobanState {
     /// Recompute all contract code sizes.
     ///
     /// Called after a protocol upgrade or config change that affects
-    /// compiled module sizing.
-    pub fn recompute_contract_code_sizes(&mut self, _protocol_version: u32) {
+    /// compiled module sizing (e.g. ContractCostParamsMemoryBytes upgrade).
+    ///
+    /// Parity: InMemorySorobanState.cpp:562 recomputeContractCodeSize
+    pub fn recompute_contract_code_sizes(
+        &mut self,
+        protocol_version: u32,
+        rent_config: Option<&SorobanRentConfig>,
+    ) {
         let mut total_size: i64 = 0;
 
+        // Build the budget once outside the loop for efficiency
+        let budget = build_rent_budget(rent_config);
+
         for entry in self.contract_code_entries.values_mut() {
-            let new_size = entry
+            let xdr_size = entry
                 .ledger_entry
                 .to_xdr(Limits::none())
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
 
-            // Apply protocol-specific sizing
-            let adjusted_size = new_size * 2; // Placeholder for compiled module overhead
+            // Use the same logic as calculate_code_size
+            let new_size = if protocol_version >= 25 {
+                convert_ledger_entry_to_p25(&entry.ledger_entry)
+                    .and_then(|p25_entry| {
+                        entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).ok()
+                    })
+                    .unwrap_or(xdr_size)
+            } else {
+                let cost_params =
+                    rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
+                entry_size_for_rent_by_protocol_with_cost_params(
+                    protocol_version,
+                    &entry.ledger_entry,
+                    xdr_size,
+                    cost_params,
+                )
+            };
 
-            entry.size_bytes = adjusted_size;
-            total_size += adjusted_size as i64;
+            entry.size_bytes = new_size;
+            total_size += new_size as i64;
         }
 
         self.contract_code_state_size = total_size;

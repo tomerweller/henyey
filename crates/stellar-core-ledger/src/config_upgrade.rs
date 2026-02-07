@@ -338,22 +338,28 @@ impl ConfigUpgradeSetFrame {
 
     /// Apply the configuration upgrades to the ledger.
     ///
-    /// Updates all CONFIG_SETTING entries in the upgrade set.
+    /// Updates all CONFIG_SETTING entries in the upgrade set. Also handles
+    /// secondary effects that C++ stellar-core performs during config upgrade:
+    /// - Resizing the LiveSorobanStateSizeWindow when sample size changes
+    ///   (parity: Upgrades.cpp:1443 `maybeUpdateSorobanStateSizeWindowSize`)
     ///
     /// Returns a tuple of:
     /// - `state_archival_changed`: Whether StateArchival settings were modified
-    /// - `memory_limit_changed`: Whether memory limit settings were modified
+    /// - `memory_cost_params_changed`: Whether ContractCostParamsMemoryBytes was upgraded
     ///
     /// These flags are used by the caller to trigger special handling:
     /// - StateArchival changes may affect the state size window
-    /// - Memory limit changes require Soroban host reconfiguration
+    /// - Memory cost params changes require recomputing in-memory state sizes
+    ///   and overwriting all window entries
+    ///   (parity: Upgrades.cpp:1449 `handleUpgradeAffectingSorobanInMemoryStateSize`)
     pub fn apply_to(
         &self,
         snapshot: &SnapshotHandle,
         delta: &mut LedgerDelta,
     ) -> Result<(bool, bool), LedgerError> {
         let mut state_archival_changed = false;
-        let mut memory_limit_changed = false;
+        let mut memory_cost_params_changed = false;
+        let mut window_sample_size_changed = false;
 
         for new_entry in self.config_upgrade_set.updated_entry.iter() {
             let setting_id = new_entry.discriminant();
@@ -384,6 +390,31 @@ impl ConfigUpgradeSetFrame {
                 }
             };
 
+            // Track special changes BEFORE recording the update
+            // Parity: Upgrades.cpp:1426-1437
+            if matches!(setting_id, ConfigSettingId::StateArchival) {
+                state_archival_changed = true;
+                // Check if liveSorobanStateSizeWindowSampleSize changed
+                if let (
+                    LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(old)),
+                    ConfigSettingEntry::StateArchival(new),
+                ) = (&previous.data, new_entry)
+                {
+                    if old.live_soroban_state_size_window_sample_size
+                        != new.live_soroban_state_size_window_sample_size
+                    {
+                        window_sample_size_changed = true;
+                    }
+                }
+            }
+
+            if matches!(
+                setting_id,
+                ConfigSettingId::ContractCostParamsMemoryBytes
+            ) {
+                memory_cost_params_changed = true;
+            }
+
             // Create the new entry
             let new_ledger_entry = LedgerEntry {
                 last_modified_ledger_seq: delta.ledger_seq(),
@@ -394,31 +425,117 @@ impl ConfigUpgradeSetFrame {
             // Record the update
             delta.record_update(previous.clone(), new_ledger_entry)?;
 
-            // Track special changes
-            if matches!(setting_id, ConfigSettingId::StateArchival) {
-                state_archival_changed = true;
-            }
-
-            if matches!(setting_id, ConfigSettingId::ContractComputeV0) {
-                // Check if memory limit changed
-                if let (
-                    LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(old)),
-                    ConfigSettingEntry::ContractComputeV0(new),
-                ) = (&previous.data, new_entry)
-                {
-                    if old.tx_memory_limit != new.tx_memory_limit {
-                        memory_limit_changed = true;
-                    }
-                }
-            }
-
             info!(
                 setting_id = ?setting_id,
                 "Applied config upgrade"
             );
         }
 
-        Ok((state_archival_changed, memory_limit_changed))
+        // Parity: Upgrades.cpp:1443-1446
+        // If the state size window sample size changed, resize the window.
+        // This must happen AFTER all config settings are applied but BEFORE
+        // entries are extracted for the bucket list.
+        if window_sample_size_changed {
+            self.maybe_update_state_size_window(snapshot, delta)?;
+        }
+
+        Ok((state_archival_changed, memory_cost_params_changed))
+    }
+
+    /// Resize the LiveSorobanStateSizeWindow when liveSorobanStateSizeWindowSampleSize
+    /// changes via a config upgrade.
+    ///
+    /// Parity: NetworkConfig.cpp:2080 `maybeUpdateSorobanStateSizeWindowSize`
+    fn maybe_update_state_size_window(
+        &self,
+        snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+    ) -> Result<(), LedgerError> {
+        // Get the new sample size from the upgrade set
+        let new_sample_size = self
+            .config_upgrade_set
+            .updated_entry
+            .iter()
+            .find_map(|entry| {
+                if let ConfigSettingEntry::StateArchival(archival) = entry {
+                    Some(archival.live_soroban_state_size_window_sample_size as usize)
+                } else {
+                    None
+                }
+            });
+
+        let new_sample_size = match new_sample_size {
+            Some(size) => size,
+            None => return Ok(()),
+        };
+
+        // Load the current window from the snapshot
+        let window_key = LedgerKey::ConfigSetting(
+            stellar_xdr::curr::LedgerKeyConfigSetting {
+                config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+            },
+        );
+        let window_entry = snapshot
+            .get_entry(&window_key)
+            .map_err(|e| {
+                LedgerError::Internal(format!(
+                    "Failed to load LiveSorobanStateSizeWindow: {}",
+                    e
+                ))
+            })?;
+
+        let window_entry = match window_entry {
+            Some(entry) => entry,
+            None => return Ok(()),
+        };
+
+        let window = match &window_entry.data {
+            LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::LiveSorobanStateSizeWindow(w),
+            ) => w,
+            _ => return Ok(()),
+        };
+
+        let mut window_vec: Vec<u64> = window.iter().copied().collect();
+        let curr_size = window_vec.len();
+
+        if new_sample_size == curr_size {
+            return Ok(());
+        }
+
+        if new_sample_size < curr_size {
+            // Shrink: remove oldest entries from front
+            window_vec.drain(0..(curr_size - new_sample_size));
+        } else {
+            // Grow: backfill with oldest value at front
+            let oldest = window_vec.first().copied().unwrap_or(0);
+            let insert_count = new_sample_size - curr_size;
+            for _ in 0..insert_count {
+                window_vec.insert(0, oldest);
+            }
+        }
+
+        info!(
+            old_size = curr_size,
+            new_size = new_sample_size,
+            "Resized LiveSorobanStateSizeWindow due to config upgrade"
+        );
+
+        let new_window: stellar_xdr::curr::VecM<u64> = window_vec
+            .try_into()
+            .map_err(|_| LedgerError::Internal("Failed to convert window vec".to_string()))?;
+
+        let new_window_entry = LedgerEntry {
+            last_modified_ledger_seq: delta.ledger_seq(),
+            data: LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::LiveSorobanStateSizeWindow(new_window),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+
+        delta.record_update(window_entry.clone(), new_window_entry)?;
+
+        Ok(())
     }
 
     // --- Validation helpers ---
