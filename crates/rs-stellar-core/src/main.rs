@@ -2160,6 +2160,127 @@ async fn cmd_verify_execution(
                         println!("    CDP meta: creates={}, updates={}, deletes={}, evicted={}, restored={}, upgrade_creates={}, upgrade_updates={}",
                             cdp_creates, cdp_updates, cdp_deletes, cdp_evicted_keys.len(), cdp_restored_keys.len(),
                             upgrade_creates, upgrade_updates);
+
+                        // Dump expected upgrade entries from CDP meta for comparison
+                        if !cdp_upgrade_metas.is_empty() {
+                            use sha2::{Digest, Sha256};
+                            println!("    CDP upgrade entries (expected):");
+                            for (ui, um) in cdp_upgrade_metas.iter().enumerate() {
+                                for change in um.changes.iter() {
+                                    match change {
+                                        stellar_xdr::curr::LedgerEntryChange::Updated(entry) => {
+                                            let key_str = match &entry.data {
+                                                stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                                                    format!("ConfigSetting({:?})", cs.discriminant())
+                                                }
+                                                other => format!("{:?}", std::mem::discriminant(other)),
+                                            };
+                                            let xdr_bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let xdr_size = xdr_bytes.len();
+                                            let hash = {
+                                                let mut h = Sha256::new();
+                                                h.update(&xdr_bytes);
+                                                let r = h.finalize();
+                                                format!("{:x}", r)
+                                            };
+                                            println!("      upgrade[{}] Updated: key={}, last_modified={}, xdr_size={}, xdr_hash={}",
+                                                ui, key_str, entry.last_modified_ledger_seq, xdr_size, hash);
+                                        }
+                                        stellar_xdr::curr::LedgerEntryChange::Created(entry) => {
+                                            let key_str = match &entry.data {
+                                                stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                                                    format!("ConfigSetting({:?})", cs.discriminant())
+                                                }
+                                                other => format!("{:?}", std::mem::discriminant(other)),
+                                            };
+                                            let xdr_bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let xdr_size = xdr_bytes.len();
+                                            let hash = {
+                                                let mut h = Sha256::new();
+                                                h.update(&xdr_bytes);
+                                                let r = h.finalize();
+                                                format!("{:x}", r)
+                                            };
+                                            println!("      upgrade[{}] Created: key={}, last_modified={}, xdr_size={}, xdr_hash={}",
+                                                ui, key_str, entry.last_modified_ledger_seq, xdr_size, hash);
+                                        }
+                                        stellar_xdr::curr::LedgerEntryChange::State(entry) => {
+                                            let key_str = match &entry.data {
+                                                stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                                                    format!("ConfigSetting({:?})", cs.discriminant())
+                                                }
+                                                other => format!("{:?}", std::mem::discriminant(other)),
+                                            };
+                                            println!("      upgrade[{}] State(before): key={}", ui, key_str);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+
+                        // Also dump expected final TX entries from CDP meta
+                        {
+                            use sha2::{Digest, Sha256};
+                            // Coalesce: keep last Updated entry per key
+                            let mut final_entries: std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry> = std::collections::HashMap::new();
+                            for tx_meta in &tx_metas {
+                                let changes: Vec<&stellar_xdr::curr::LedgerEntryChange> = match tx_meta {
+                                    stellar_xdr::curr::TransactionMeta::V3(v3) => {
+                                        let mut c: Vec<_> = v3.tx_changes_before.iter().collect();
+                                        for op in v3.operations.iter() {
+                                            c.extend(op.changes.iter());
+                                        }
+                                        c.extend(v3.tx_changes_after.iter());
+                                        c
+                                    }
+                                    stellar_xdr::curr::TransactionMeta::V4(v4) => {
+                                        let mut c: Vec<_> = v4.tx_changes_before.iter().collect();
+                                        for op in v4.operations.iter() {
+                                            c.extend(op.changes.iter());
+                                        }
+                                        c.extend(v4.tx_changes_after.iter());
+                                        c
+                                    }
+                                    _ => vec![],
+                                };
+                                for change in changes {
+                                    if let stellar_xdr::curr::LedgerEntryChange::Updated(entry)
+                                    | stellar_xdr::curr::LedgerEntryChange::Created(entry)
+                                    | stellar_xdr::curr::LedgerEntryChange::Restored(entry) = change {
+                                        if let Ok(key) = stellar_core_ledger::entry_to_key(entry) {
+                                            if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
+                                                final_entries.insert(kb, entry.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            println!("    CDP TX final entries (coalesced, {} unique keys):", final_entries.len());
+                            for (_, entry) in final_entries.iter() {
+                                let key_str = match &entry.data {
+                                    stellar_xdr::curr::LedgerEntryData::Account(a) => {
+                                        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
+                                        format!("Account({}..{})", hex::encode(&pk.0[..4]), hex::encode(&pk.0[28..32]))
+                                    }
+                                    stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                                        format!("ConfigSetting({:?})", cs.discriminant())
+                                    }
+                                    other => format!("{:?}", std::mem::discriminant(other)),
+                                };
+                                let xdr_bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                let xdr_size = xdr_bytes.len();
+                                let hash = {
+                                    let mut h = Sha256::new();
+                                    h.update(&xdr_bytes);
+                                    let r = h.finalize();
+                                    format!("{:x}", r)
+                                };
+                                let hex_preview = hex::encode(&xdr_bytes[..xdr_bytes.len().min(200)]);
+                                println!("      key={}, last_modified={}, xdr_size={}, xdr_hash={}\n        xdr_hex={}",
+                                    key_str, entry.last_modified_ledger_seq, xdr_size, hash, hex_preview);
+                            }
+                        }
                     }
 
                     if stop_on_error {
