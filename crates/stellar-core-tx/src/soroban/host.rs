@@ -882,12 +882,14 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
 fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-            // Compute key hash for TTL lookup
             let key_hash = compute_key_hash(key);
-            // First try the bucket list snapshot TTL (for entries that existed at ledger start).
-            // This matches C++ behavior where mInMemorySorobanState provides ledger-start TTLs.
-            let snapshot_ttl = state.get_ttl_at_ledger_start(&key_hash);
-            if let Some(live_until) = snapshot_ttl {
+            // Use current state TTL which includes updates from earlier TXs in this ledger.
+            // This matches C++ sequential execution where LedgerTxn reflects all prior
+            // changes, including TTL bumps from earlier transactions.
+            let ttl = state
+                .get_ttl(&key_hash)
+                .map(|ttl| ttl.live_until_ledger_seq);
+            if let Some(live_until) = ttl {
                 if live_until < current_ledger {
                     tracing::debug!(
                         current_ledger,
@@ -897,32 +899,11 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
                         } else {
                             "ContractData"
                         },
-                        "Soroban entry TTL is EXPIRED (from bucket list snapshot)"
+                        "Soroban entry TTL is EXPIRED"
                     );
                 }
-                return snapshot_ttl;
             }
-            // Entry not in bucket list snapshot - may have been created by earlier TX in this ledger.
-            // In C++ parallel execution, transactions in the same cluster share mThreadEntryMap,
-            // which contains TTLs created by earlier transactions. We need to fall back to the
-            // current state TTL to provide equivalent within-cluster visibility.
-            // (For different clusters, C++ uses separate mThreadEntryMaps, but we don't implement
-            // cluster isolation, so all TXs share state - this is correct for sequential execution.)
-            let current_ttl = state
-                .get_ttl(&key_hash)
-                .map(|ttl| ttl.live_until_ledger_seq);
-            if current_ttl.is_some() {
-                tracing::debug!(
-                    key_type = if matches!(key, LedgerKey::ContractCode(_)) {
-                        "ContractCode"
-                    } else {
-                        "ContractData"
-                    },
-                    live_until = current_ttl,
-                    "Soroban entry has TTL from current state (created within ledger)"
-                );
-            }
-            current_ttl
+            ttl
         }
         _ => None,
     }
