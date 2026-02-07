@@ -52,8 +52,8 @@ use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
     EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet, Hash, LedgerCloseMeta,
     LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerEntryType, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
-    LedgerKey, LedgerKeyConfigSetting, TransactionEventStage, TransactionMeta, TransactionPhase,
+    LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
+    LedgerKeyConfigSetting, TransactionEventStage, TransactionMeta, TransactionPhase,
     TransactionResultMetaV1, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
     UpgradeEntryMeta, VecM,
 };
@@ -1115,55 +1115,18 @@ impl LedgerManager {
         // Create entries function that reads from the in-memory offer store.
         // This avoids expensive SQL queries or bucket list scans during orderbook operations.
         // The in-memory store is populated at initialization and maintained incrementally.
+        // Offers are always initialized before the first ledger close, so no fallback is needed.
         let offer_store = self.offer_store.clone();
-        let offers_initialized = self.offers_initialized.clone();
-        let bucket_list_entries = self.bucket_list.clone();
         let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
-            // If offers are initialized, read from the in-memory store.
-            if *offers_initialized.read() {
-                let store = offer_store.read();
-                return Ok(store.values().cloned().collect());
-            }
-            // Fall back to bucket list scan if offers not initialized.
-            // Use per-type scan to only build dedup set over Offer keys (~240K)
-            // instead of all 60M keys (~8.6 GB) via live_entries_iter().
-            let bucket_list = bucket_list_entries.read();
-            let mut entries = Vec::new();
-            bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
-                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                    entries.push(entry.clone());
-                }
-                true
-            });
-            Ok(entries)
+            let store = offer_store.read();
+            Ok(store.values().cloned().collect())
         });
 
         // Create index-based lookup for offers by (account, asset).
         let offer_store_idx = self.offer_store.clone();
         let offer_index = self.offer_account_asset_index.clone();
-        let offers_init_idx = self.offers_initialized.clone();
-        let bucket_list_idx = self.bucket_list.clone();
         let offers_by_account_asset_fn: crate::snapshot::OffersByAccountAssetFn = Arc::new(
             move |account_id: &AccountId, asset: &stellar_xdr::curr::Asset| {
-                if !*offers_init_idx.read() {
-                    // Fall back to bucket list scan with per-type dedup
-                    let bucket_list = bucket_list_idx.read();
-                    let mut entries = Vec::new();
-                    bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
-                        if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                            if let LedgerEntryData::Offer(ref offer) = entry.data {
-                                if offer.seller_id == *account_id
-                                    && (offer.buying == *asset || offer.selling == *asset)
-                                {
-                                    entries.push(entry.clone());
-                                }
-                            }
-                        }
-                        true
-                    });
-                    return Ok(entries);
-                }
-
                 let idx = offer_index.read();
                 let store = offer_store_idx.read();
                 let seller = account_id_bytes(account_id);
