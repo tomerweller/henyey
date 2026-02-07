@@ -248,6 +248,25 @@ fn print_startup_info(app: &App, options: &RunOptions) {
 
 /// Run the main application loop.
 async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()> {
+    // Attempt to restore node state from persisted DB + on-disk bucket files.
+    // This avoids a full catchup when the node restarts with intact state.
+    if !options.force_catchup {
+        match app.load_last_known_ledger() {
+            Ok(true) => {
+                let (seq, _hash, _close_time, _protocol) = app.ledger_info();
+                tracing::info!(lcl_seq = seq, "Restored state from disk, skipping full catchup");
+                app.set_state(AppState::Synced).await;
+                app.set_current_ledger(seq).await;
+            }
+            Ok(false) => {
+                tracing::debug!("No persisted state available, will check catchup");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to restore from disk, will check catchup");
+            }
+        }
+    }
+
     // Check if we need to catch up
     let needs_catchup = check_needs_catchup(&app, &options).await?;
 

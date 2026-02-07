@@ -54,10 +54,13 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock;
 
 use stellar_core_bucket::BucketManager;
+use stellar_core_bucket::{BucketList, HasNextState, HotArchiveBucketList};
 use stellar_core_common::{Hash256, NetworkId};
 use stellar_core_db::{
     BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
 };
+use stellar_core_db::queries::StateQueries;
+use stellar_core_db::schema::state_keys;
 use stellar_core_herder::{
     drift_tracker::CloseTimeDriftTracker,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
@@ -65,7 +68,9 @@ use stellar_core_herder::{
 };
 use stellar_core_history::{
     is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupMode,
-    CatchupOutput, CheckpointData, HistoryArchive, GENESIS_LEDGER_SEQ, CHECKPOINT_FREQUENCY,
+    CatchupOutput, CheckpointData, HistoryArchive, HistoryArchiveState,
+    GENESIS_LEDGER_SEQ, CHECKPOINT_FREQUENCY,
+    build_history_archive_state,
 };
 use stellar_core_historywork::{
     build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
@@ -1031,7 +1036,7 @@ impl App {
     }
 
     /// Set the application state.
-    async fn set_state(&self, state: AppState) {
+    pub(crate) async fn set_state(&self, state: AppState) {
         let mut current = self.state.write().await;
         if *current != state {
             if matches!(*current, AppState::Synced | AppState::Validating)
@@ -1042,6 +1047,11 @@ impl App {
             tracing::info!(from = %*current, to = %state, "State transition");
             *current = state;
         }
+    }
+
+    /// Set the tracked current ledger sequence.
+    pub(crate) async fn set_current_ledger(&self, seq: u32) {
+        *self.current_ledger.write().await = seq;
     }
 
     /// Get the database.
@@ -1461,6 +1471,21 @@ impl App {
             ext: TransactionHistoryResultEntryExt::default(),
         };
 
+        // Build HAS from current bucket list state for restart recovery.
+        // This captures pending merge outputs so a restarted node can
+        // reconstruct the bucket list without re-downloading from archives.
+        let has_json = {
+            let bucket_list = self.ledger_manager.bucket_list();
+            let has = build_history_archive_state(
+                header.ledger_seq,
+                &bucket_list,
+                Some(self.config.network.passphrase.clone()),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
+            has.to_json()
+                .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?
+        };
+
         self.db.transaction(|conn| {
             conn.store_ledger_header(header, &header_xdr)?;
             conn.store_tx_history_entry(header.ledger_seq, &tx_history_entry)?;
@@ -1504,10 +1529,164 @@ impl App {
             for (hash, qset) in &scp_quorum_sets {
                 conn.store_scp_quorum_set(hash, header.ledger_seq, qset)?;
             }
+
+            // Persist HAS and LCL for restart recovery
+            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+            conn.set_last_closed_ledger(header.ledger_seq)?;
+
             Ok(())
         })?;
 
         Ok(())
+    }
+
+    /// Attempt to restore node state from persisted DB and on-disk bucket files.
+    ///
+    /// This is the Rust equivalent of C++ stellar-core's `loadLastKnownLedger`.
+    /// On success, the ledger manager is initialized with the bucket list
+    /// reconstructed from disk, avoiding a full catchup from history archives.
+    ///
+    /// Returns `true` if state was successfully restored, `false` if no persisted
+    /// state is available (fresh node or corrupt state).
+    pub fn load_last_known_ledger(&self) -> anyhow::Result<bool> {
+        // Step 1: Read LCL sequence from DB
+        let lcl_seq = self.db.with_connection(|conn| {
+            conn.get_last_closed_ledger()
+        })?;
+        let Some(lcl_seq) = lcl_seq else {
+            tracing::debug!("No last closed ledger in DB, cannot restore from disk");
+            return Ok(false);
+        };
+        if lcl_seq == 0 {
+            tracing::debug!("LCL is 0, cannot restore from disk");
+            return Ok(false);
+        }
+
+        // Step 2: Read HAS JSON from DB
+        let has_json = self.db.with_connection(|conn| {
+            conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)
+        })?;
+        let Some(has_json) = has_json else {
+            tracing::warn!(lcl_seq, "LCL found but no HAS in DB, cannot restore");
+            return Ok(false);
+        };
+        let has = HistoryArchiveState::from_json(&has_json)
+            .map_err(|e| anyhow::anyhow!("Failed to parse persisted HAS: {}", e))?;
+
+        // Step 3: Verify consistency between LCL and HAS
+        if has.current_ledger != lcl_seq {
+            tracing::warn!(
+                lcl_seq,
+                has_ledger = has.current_ledger,
+                "LCL and HAS disagree on current ledger, cannot restore"
+            );
+            return Ok(false);
+        }
+
+        tracing::info!(
+            lcl_seq,
+            bucket_levels = has.current_buckets.len(),
+            "Found persisted state, attempting restore from disk"
+        );
+
+        // Step 4: Load ledger header from DB
+        let header = self.db.get_ledger_header(lcl_seq)?
+            .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
+
+        // Compute header hash (we don't store it separately)
+        let header_hash = compute_header_hash(&header)
+            .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;
+
+        // Step 5: Verify all bucket files exist on disk
+        let all_hashes = has.unique_bucket_hashes();
+        let missing = self.bucket_manager.verify_buckets_exist(&all_hashes);
+        if !missing.is_empty() {
+            tracing::warn!(
+                missing_count = missing.len(),
+                first_missing = %missing[0].to_hex(),
+                "Missing bucket files on disk, cannot restore"
+            );
+            return Ok(false);
+        }
+
+        // Step 6: Reconstruct live BucketList from persisted HAS
+        let live_hash_pairs = has.bucket_hash_pairs();
+        let live_next_states: Vec<HasNextState> = has
+            .live_next_states()
+            .into_iter()
+            .map(|s| HasNextState {
+                state: s.state,
+                output: s.output,
+                input_curr: s.input_curr,
+                input_snap: s.input_snap,
+            })
+            .collect();
+
+        let bucket_manager = self.bucket_manager.clone();
+        let load_bucket = |hash: &stellar_core_common::Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::Bucket> {
+            let arc = bucket_manager.load_bucket(hash)?;
+            // Unwrap the Arc — restore_from_has stores it in its own Arc
+            Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
+        };
+
+        let mut bucket_list = BucketList::restore_from_has(
+            &live_hash_pairs,
+            &live_next_states,
+            load_bucket,
+        ).map_err(|e| anyhow::anyhow!("Failed to restore live bucket list from disk: {}", e))?;
+
+        // Set bucket directory for future merges
+        let bucket_dir = self.config.database.path
+            .parent()
+            .unwrap_or(&self.config.database.path)
+            .join("buckets");
+        bucket_list.set_bucket_dir(bucket_dir);
+        bucket_list.set_ledger_seq(lcl_seq);
+
+        // Step 7: Reconstruct hot archive BucketList (or create empty)
+        let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
+            let hot_next_states: Vec<HasNextState> = has
+                .hot_archive_next_states()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| HasNextState {
+                    state: s.state,
+                    output: s.output,
+                    input_curr: s.input_curr,
+                    input_snap: s.input_snap,
+                })
+                .collect();
+
+            let bucket_manager = self.bucket_manager.clone();
+            let load_hot = |hash: &stellar_core_common::Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::HotArchiveBucket> {
+                bucket_manager.load_hot_archive_bucket(hash)
+            };
+
+            HotArchiveBucketList::restore_from_has(
+                &hot_hash_pairs,
+                &hot_next_states,
+                load_hot,
+            ).map_err(|e| anyhow::anyhow!("Failed to restore hot archive from disk: {}", e))?
+        } else {
+            HotArchiveBucketList::default()
+        };
+
+        // Step 8: Initialize LedgerManager
+        if self.ledger_manager.is_initialized() {
+            self.ledger_manager.reset();
+        }
+        self.ledger_manager
+            .initialize(bucket_list, hot_archive, header.clone(), header_hash)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager from disk: {}", e))?;
+
+        tracing::info!(
+            lcl_seq,
+            header_hash = %header_hash.to_hex(),
+            protocol_version = header.ledger_version,
+            "Successfully restored node state from disk"
+        );
+
+        Ok(true)
     }
 
     pub async fn survey_report(&self) -> SurveyReport {

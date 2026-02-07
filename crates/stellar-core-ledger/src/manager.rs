@@ -395,6 +395,14 @@ impl LedgerManager {
             .collect()
     }
 
+    /// Get a read guard to the live bucket list.
+    ///
+    /// This is used during HAS serialization to capture the full bucket list
+    /// state including pending merges.
+    pub fn bucket_list(&self) -> parking_lot::RwLockReadGuard<'_, BucketList> {
+        self.bucket_list.read()
+    }
+
     /// Initialize the ledger from bucket list state.
     ///
     /// This is used during catchup from history archives.

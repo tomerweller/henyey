@@ -117,25 +117,41 @@ pub struct PublishManager {
 }
 
 /// Build a history archive state from a bucket list snapshot.
+///
+/// Captures the full bucket list state including any pending merge outputs.
+/// Pending merges are recorded as state=1 (output hash known) in the HAS,
+/// matching C++ stellar-core behavior for restart recovery.
 pub fn build_history_archive_state(
-    checkpoint_ledger: u32,
+    ledger_seq: u32,
     bucket_list: &BucketList,
     network_passphrase: Option<String>,
 ) -> Result<HistoryArchiveState> {
     let current_buckets: Vec<HASBucketLevel> = bucket_list
         .levels()
         .iter()
-        .map(|level| HASBucketLevel {
-            curr: level.curr.hash().to_hex(),
-            snap: level.snap.hash().to_hex(),
-            next: HASBucketNext::default(),
+        .map(|level| {
+            let next = match level.pending_merge_output_hash() {
+                Some(hash) => HASBucketNext {
+                    state: 1, // FB_HASH_OUTPUT
+                    output: Some(hash.to_hex()),
+                    curr: None,
+                    snap: None,
+                    shadow: None,
+                },
+                None => HASBucketNext::default(),
+            };
+            HASBucketLevel {
+                curr: level.curr.hash().to_hex(),
+                snap: level.snap.hash().to_hex(),
+                next,
+            }
         })
         .collect();
 
     Ok(HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core".to_string()),
-        current_ledger: checkpoint_ledger,
+        current_ledger: ledger_seq,
         network_passphrase,
         current_buckets,
         hot_archive_buckets: None,

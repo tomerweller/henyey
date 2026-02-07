@@ -142,6 +142,7 @@ pub use paths::{
     final_to_dirty_path, is_dirty_path,
 };
 pub use publish_queue::{PublishQueue, PublishQueueStats};
+pub use publish::build_history_archive_state;
 pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
 pub use replay::{LedgerReplayResult, ReplayConfig, ReplayedLedgerState};
 pub use verify::{compute_header_hash, verify_bucket_hash, verify_header_chain};

@@ -455,6 +455,26 @@ impl BucketLevel {
         self.next.is_some()
     }
 
+    /// Get the hash of the pending merge output, if any.
+    ///
+    /// Returns the resolved output hash for use in HAS serialization.
+    /// For InMemory merges, returns the bucket hash directly.
+    /// For Async merges, returns the cached result hash if resolved.
+    /// Returns `None` if there is no pending merge or the async merge hasn't resolved.
+    pub fn pending_merge_output_hash(&self) -> Option<Hash256> {
+        match &self.next {
+            Some(pending) => {
+                let h = pending.hash();
+                if h.is_zero() {
+                    None // Unresolved async merge
+                } else {
+                    Some(h)
+                }
+            }
+            None => None,
+        }
+    }
+
     /// Resolve any pending async merge without committing it.
     ///
     /// This ensures that if this level has an async merge in progress,
