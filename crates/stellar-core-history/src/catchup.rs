@@ -340,28 +340,12 @@ impl CatchupManager {
         // input hashes from the HAS). This matches how verify-execution initializes its bucket list.
         let protocol_version = 25u32;
 
-        // Create a bucket loader for restart_merges_from_has (handles state 2 input loading)
+        // Create a bucket loader for restart_merges_from_has (handles state 2 input loading).
+        // Uses disk-backed loading (streaming I/O) to avoid loading entire bucket files into
+        // memory. This is critical for mainnet where higher-level buckets can be tens of GB.
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        let load_bucket_for_merge = |hash: &Hash256| -> stellar_core_bucket::Result<Bucket> {
-            if hash.is_zero() {
-                return Ok(Bucket::empty());
-            }
-            let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-            if bucket_path.exists() {
-                let data = std::fs::read(&bucket_path).map_err(|e| {
-                    stellar_core_bucket::BucketError::NotFound(format!(
-                        "failed to read bucket from disk: {}",
-                        e
-                    ))
-                })?;
-                Bucket::from_xdr_bytes(&data)
-            } else {
-                Err(stellar_core_bucket::BucketError::NotFound(format!(
-                    "bucket {} not found on disk",
-                    hash
-                )))
-            }
-        };
+        let load_bucket_for_merge =
+            load_disk_backed_bucket_closure(bucket_dir.clone());
 
         bucket_list
             .restart_merges_from_has(
@@ -376,29 +360,8 @@ impl CatchupManager {
             })?;
 
         {
-            use stellar_core_bucket::HotArchiveBucket;
-            let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
             let load_hot_bucket_for_merge =
-                |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
-                    if hash.is_zero() {
-                        return Ok(HotArchiveBucket::empty());
-                    }
-                    let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-                    if bucket_path.exists() {
-                        let data = std::fs::read(&bucket_path).map_err(|e| {
-                            stellar_core_bucket::BucketError::NotFound(format!(
-                                "failed to read bucket from disk: {}",
-                                e
-                            ))
-                        })?;
-                        HotArchiveBucket::from_xdr_bytes(&data)
-                    } else {
-                        Err(stellar_core_bucket::BucketError::NotFound(format!(
-                            "hot archive bucket {} not found on disk",
-                            hash
-                        )))
-                    }
-                };
+                load_disk_backed_hot_archive_bucket_closure(bucket_dir.clone());
             hot_archive_bucket_list
                 .restart_merges_from_has(
                     checkpoint_seq,
@@ -603,29 +566,12 @@ impl CatchupManager {
                 let mut bucket_list = bl;
                 let mut hot_archive_bucket_list = hot_bl;
 
-                // Restart merges
+                // Restart merges using disk-backed bucket loading to avoid
+                // loading entire bucket files into memory.
                 let protocol_version = 25u32;
                 let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-                let load_bucket_for_merge = |hash: &Hash256| -> stellar_core_bucket::Result<Bucket> {
-                    if hash.is_zero() {
-                        return Ok(Bucket::empty());
-                    }
-                    let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-                    if bucket_path.exists() {
-                        let data = std::fs::read(&bucket_path).map_err(|e| {
-                            stellar_core_bucket::BucketError::NotFound(format!(
-                                "failed to read bucket from disk: {}",
-                                e
-                            ))
-                        })?;
-                        Bucket::from_xdr_bytes(&data)
-                    } else {
-                        Err(stellar_core_bucket::BucketError::NotFound(format!(
-                            "bucket {} not found on disk",
-                            hash
-                        )))
-                    }
-                };
+                let load_bucket_for_merge =
+                    load_disk_backed_bucket_closure(bucket_dir.clone());
 
                 bucket_list
                     .restart_merges_from_has(
@@ -640,29 +586,8 @@ impl CatchupManager {
                     })?;
 
                 {
-                    use stellar_core_bucket::HotArchiveBucket;
-                    let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
                     let load_hot_bucket_for_merge =
-                        |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
-                            if hash.is_zero() {
-                                return Ok(HotArchiveBucket::empty());
-                            }
-                            let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-                            if bucket_path.exists() {
-                                let data = std::fs::read(&bucket_path).map_err(|e| {
-                                    stellar_core_bucket::BucketError::NotFound(format!(
-                                        "failed to read bucket from disk: {}",
-                                        e
-                                    ))
-                                })?;
-                                HotArchiveBucket::from_xdr_bytes(&data)
-                            } else {
-                                Err(stellar_core_bucket::BucketError::NotFound(format!(
-                                    "hot archive bucket {} not found on disk",
-                                    hash
-                                )))
-                            }
-                        };
+                        load_disk_backed_hot_archive_bucket_closure(bucket_dir.clone());
                     hot_archive_bucket_list
                         .restart_merges_from_has(
                             bucket_apply_at,
@@ -873,28 +798,12 @@ impl CatchupManager {
         // input hashes from the HAS). This matches how verify-execution initializes its bucket list.
         let protocol_version = 25u32;
 
-        // Create a bucket loader for restart_merges_from_has (handles state 2 input loading)
+        // Create a bucket loader for restart_merges_from_has (handles state 2 input loading).
+        // Uses disk-backed loading (streaming I/O) to avoid loading entire bucket files into
+        // memory. This is critical for mainnet where higher-level buckets can be tens of GB.
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        let load_bucket_for_merge = |hash: &Hash256| -> stellar_core_bucket::Result<Bucket> {
-            if hash.is_zero() {
-                return Ok(Bucket::empty());
-            }
-            let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-            if bucket_path.exists() {
-                let data = std::fs::read(&bucket_path).map_err(|e| {
-                    stellar_core_bucket::BucketError::NotFound(format!(
-                        "failed to read bucket from disk: {}",
-                        e
-                    ))
-                })?;
-                Bucket::from_xdr_bytes(&data)
-            } else {
-                Err(stellar_core_bucket::BucketError::NotFound(format!(
-                    "bucket {} not found on disk",
-                    hash
-                )))
-            }
-        };
+        let load_bucket_for_merge =
+            load_disk_backed_bucket_closure(bucket_dir.clone());
 
         bucket_list
             .restart_merges_from_has(
@@ -909,29 +818,8 @@ impl CatchupManager {
             })?;
 
         {
-            use stellar_core_bucket::HotArchiveBucket;
-            let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
             let load_hot_bucket_for_merge =
-                |hash: &Hash256| -> stellar_core_bucket::Result<HotArchiveBucket> {
-                    if hash.is_zero() {
-                        return Ok(HotArchiveBucket::empty());
-                    }
-                    let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-                    if bucket_path.exists() {
-                        let data = std::fs::read(&bucket_path).map_err(|e| {
-                            stellar_core_bucket::BucketError::NotFound(format!(
-                                "failed to read bucket from disk: {}",
-                                e
-                            ))
-                        })?;
-                        HotArchiveBucket::from_xdr_bytes(&data)
-                    } else {
-                        Err(stellar_core_bucket::BucketError::NotFound(format!(
-                            "hot archive bucket {} not found on disk",
-                            hash
-                        )))
-                    }
-                };
+                load_disk_backed_hot_archive_bucket_closure(bucket_dir.clone());
             hot_archive_bucket_list
                 .restart_merges_from_has(
                     checkpoint_seq,
@@ -1287,13 +1175,12 @@ impl CatchupManager {
             // Construct path for this bucket
             let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
 
-            // Check if bucket already exists on disk
+            // Check if bucket already exists on disk as an XDR file.
+            // Use streaming I/O to build the index without loading the entire file
+            // into memory. This is critical for mainnet where buckets can be many GB.
             if bucket_path.exists() {
-                debug!("Loading existing bucket {} from disk", hash);
-                let bucket = Bucket::from_xdr_bytes_disk_backed(
-                    &std::fs::read(&bucket_path)?,
-                    &bucket_path,
-                )?;
+                debug!("Loading existing bucket {} from disk (streaming)", hash);
+                let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
                 let mut cache = bucket_cache.lock().unwrap();
                 cache.insert(*hash, bucket.clone());
                 return Ok(bucket);
@@ -1372,10 +1259,19 @@ impl CatchupManager {
                 xdr_data.len()
             );
 
-            // Create the bucket using disk-backed storage.
-            // This saves the XDR to disk and builds a compact index.
-            // Entries are NOT loaded into memory - they're read from disk on-demand.
-            let bucket = Bucket::from_xdr_bytes_disk_backed(&xdr_data, &bucket_path)?;
+            // Save XDR data to disk first, then build the disk-backed bucket by
+            // streaming through the file. This avoids holding the full file in memory
+            // while also building the index — critical for multi-GB buckets on mainnet.
+            std::fs::write(&bucket_path, &xdr_data).map_err(|e| {
+                stellar_core_bucket::BucketError::NotFound(format!(
+                    "failed to write bucket to disk: {}",
+                    e
+                ))
+            })?;
+            // Drop the in-memory XDR data before building the index to free memory
+            drop(xdr_data);
+
+            let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
 
             // Verify hash matches
             if bucket.hash() != *hash {
@@ -1496,19 +1392,21 @@ impl CatchupManager {
                     // Check if we have the XDR data in the pre-downloaded cache
                     let bucket_path = bucket_dir_clone.join(format!("{}.bucket", hash.to_hex()));
 
-                    let xdr_data = if let Some(data) = {
+                    let xdr_data: Option<Vec<u8>> = if let Some(data) = {
                         let mut preloaded = preloaded_buckets.lock().unwrap();
                         preloaded.remove(hash)
                     } {
-                        data
-                    } else if bucket_path.exists() {
-                        // Already saved to disk, read it back
-                        std::fs::read(&bucket_path).map_err(|e| {
+                        // Save preloaded data to disk, then load via streaming
+                        std::fs::write(&bucket_path, &data).map_err(|e| {
                             stellar_core_bucket::BucketError::NotFound(format!(
-                                "failed to read bucket from disk: {}",
+                                "failed to write hot archive bucket to disk: {}",
                                 e
                             ))
-                        })?
+                        })?;
+                        None
+                    } else if bucket_path.exists() {
+                        // Already on disk, load via streaming
+                        None
                     } else {
                         // Download if needed (shouldn't happen if download_buckets was called)
                         warn!(
@@ -1535,7 +1433,7 @@ impl CatchupManager {
 
                         // Handle async download from sync context properly
                         // (matching the pattern used for live buckets)
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        let downloaded = if let Ok(handle) = tokio::runtime::Handle::try_current() {
                             if matches!(
                                 handle.runtime_flavor(),
                                 tokio::runtime::RuntimeFlavor::MultiThread
@@ -1572,11 +1470,23 @@ impl CatchupManager {
                                     ))
                                 })?;
                             rt.block_on(download)?
-                        }
+                        };
+                        Some(downloaded)
                     };
 
-                    // Parse as HotArchiveBucket (uses HotArchiveBucketEntry XDR)
-                    let bucket = HotArchiveBucket::from_xdr_bytes(&xdr_data)?;
+                    // If we downloaded data, save it to disk first
+                    if let Some(downloaded_data) = xdr_data {
+                        std::fs::write(&bucket_path, &downloaded_data).map_err(|e| {
+                            stellar_core_bucket::BucketError::NotFound(format!(
+                                "failed to write hot archive bucket to disk: {}",
+                                e
+                            ))
+                        })?;
+                    }
+
+                    // Load hot archive bucket from disk using streaming I/O
+                    // to avoid holding entire file in memory during index building
+                    let bucket = HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)?;
 
                     // Cache for reuse (same hash can appear at multiple levels)
                     {
@@ -2573,6 +2483,60 @@ fn load_eviction_iterator_from_bucket_list(
         Err(e) => {
             warn!(error = %e, "Failed to query EvictionIterator from bucket list");
             None
+        }
+    }
+}
+
+/// Create a closure that loads live buckets from disk using streaming I/O.
+///
+/// This uses `Bucket::from_xdr_file_disk_backed()` which streams through the file
+/// in two passes (hash computation + index building) without loading the entire file
+/// into memory. Memory usage is O(index_size) instead of O(file_size).
+///
+/// This is critical for mainnet where higher-level buckets can be tens of GB.
+/// Loading a 30GB bucket file fully into memory would require 30GB+ RAM, while
+/// the streaming approach uses only ~150MB for the index.
+fn load_disk_backed_bucket_closure(
+    bucket_dir: std::path::PathBuf,
+) -> impl FnMut(&Hash256) -> stellar_core_bucket::Result<Bucket> {
+    move |hash: &Hash256| {
+        if hash.is_zero() {
+            return Ok(Bucket::empty());
+        }
+        let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+        if bucket_path.exists() {
+            Bucket::from_xdr_file_disk_backed(&bucket_path)
+        } else {
+            Err(stellar_core_bucket::BucketError::NotFound(format!(
+                "bucket {} not found on disk at {}",
+                hash,
+                bucket_path.display()
+            )))
+        }
+    }
+}
+
+/// Create a closure that loads hot archive buckets from disk using streaming I/O.
+///
+/// Same memory optimization as `load_disk_backed_bucket_closure` but for hot archive
+/// buckets which use `HotArchiveBucketEntry` format instead of `BucketEntry`.
+fn load_disk_backed_hot_archive_bucket_closure(
+    bucket_dir: std::path::PathBuf,
+) -> impl FnMut(&Hash256) -> stellar_core_bucket::Result<stellar_core_bucket::HotArchiveBucket> {
+    use stellar_core_bucket::HotArchiveBucket;
+    move |hash: &Hash256| {
+        if hash.is_zero() {
+            return Ok(HotArchiveBucket::empty());
+        }
+        let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+        if bucket_path.exists() {
+            HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)
+        } else {
+            Err(stellar_core_bucket::BucketError::NotFound(format!(
+                "hot archive bucket {} not found on disk at {}",
+                hash,
+                bucket_path.display()
+            )))
         }
     }
 }
