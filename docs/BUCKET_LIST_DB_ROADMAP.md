@@ -31,9 +31,9 @@ Significant foundational work is already in place:
 | 2 | SQL-Backed Offers | **Complete** |
 | 3 | BucketListDB Point Lookups | **Complete** |
 | 4 | Index Persistence | **Complete** |
-| 5 | Uncompressed XDR On-Disk Format | Not started |
-| 6 | Streaming Iteration & Merge | Not started |
-| 7 | DiskBacked Buckets by Default | Not started |
+| 5 | Uncompressed XDR On-Disk Format | **Complete** |
+| 6 | Streaming Iteration & Merge | **Complete** |
+| 7 | DiskBacked Buckets by Default | **Complete** |
 | 8 | Connect Index System to DiskBucket | Not started |
 | 9 | Arc\<Bucket\> Shared Ownership | Not started |
 | 10 | HotArchive DiskBacked Support | Not started |

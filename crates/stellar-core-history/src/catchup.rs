@@ -2350,10 +2350,19 @@ fn create_header_from_replay_state(
 /// Cost parameters are loaded from the bucket list's ConfigSettingEntry to ensure
 /// correct compiled module memory cost calculation (matching C++ behavior).
 ///
-/// Note: This is expensive for large bucket lists but only needs to run once per catchup.
+/// # Memory Efficiency
+///
+/// Uses `scan_for_entries_of_types` instead of `live_entries_iter()` to only
+/// build a dedup `HashSet<LedgerKey>` over ContractData + ContractCode keys
+/// (~1.68M keys, ~240 MB) instead of all keys (~60M, ~8.6 GB). This matches
+/// the C++ approach in `InMemorySorobanState::initializeStateFromSnapshot()`
+/// which uses per-type `scanForEntriesOfType` calls.
+///
+/// Note: This only needs to run once per catchup.
 fn compute_initial_soroban_state_size(bucket_list: &BucketList, protocol_version: u32) -> u64 {
+    use stellar_core_bucket::BucketEntry;
     use stellar_core_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
-    use stellar_xdr::curr::WriteXdr;
+    use stellar_xdr::curr::{LedgerEntryType, WriteXdr};
 
     // Load cost params from bucket list for accurate contract code size calculation
     let cost_params = load_cost_params_from_bucket_list(bucket_list);
@@ -2361,31 +2370,38 @@ fn compute_initial_soroban_state_size(bucket_list: &BucketList, protocol_version
 
     let mut total_size: u64 = 0;
 
-    // Iterate through all live entries in the bucket list using streaming iterator
-    for entry in bucket_list.live_entries_iter().flatten() {
-        match &entry.data {
-            LedgerEntryData::ContractData(_) => {
-                // Contract data uses XDR size
-                if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
-                    total_size += xdr_bytes.len() as u64;
+    // Scan only ContractData and ContractCode entries, avoiding a dedup set
+    // over all 60M keys. The dedup set only tracks ~1.68M Soroban keys.
+    bucket_list.scan_for_entries_of_types(
+        &[LedgerEntryType::ContractData, LedgerEntryType::ContractCode],
+        |be| {
+            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                match &entry.data {
+                    LedgerEntryData::ContractData(_) => {
+                        // Contract data uses XDR size
+                        if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
+                            total_size += xdr_bytes.len() as u64;
+                        }
+                    }
+                    LedgerEntryData::ContractCode(_) => {
+                        // Contract code uses rent-adjusted size (includes compiled module memory)
+                        if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
+                            let xdr_size = xdr_bytes.len() as u32;
+                            let rent_size = entry_size_for_rent_by_protocol_with_cost_params(
+                                protocol_version,
+                                entry,
+                                xdr_size,
+                                cost_params_ref,
+                            );
+                            total_size += rent_size as u64;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            LedgerEntryData::ContractCode(_) => {
-                // Contract code uses rent-adjusted size (includes compiled module memory)
-                if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
-                    let xdr_size = xdr_bytes.len() as u32;
-                    let rent_size = entry_size_for_rent_by_protocol_with_cost_params(
-                        protocol_version,
-                        &entry,
-                        xdr_size,
-                        cost_params_ref,
-                    );
-                    total_size += rent_size as u64;
-                }
-            }
-            _ => {}
-        }
-    }
+            true // continue scanning
+        },
+    );
 
     total_size
 }
