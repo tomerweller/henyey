@@ -279,13 +279,50 @@ impl BucketManager {
         // Load from .bucket.xdr based on file size
         let file_size = std::fs::metadata(&xdr_path)?.len();
         let bucket = if file_size > Self::DISK_BACKED_THRESHOLD {
-            // Large file: use DiskBacked with streaming index build (O(index_size) memory)
+            // Large file: use DiskBacked
             tracing::debug!(
                 hash = %hash,
                 file_size,
                 "Loading bucket as DiskBacked (file exceeds threshold)"
             );
-            Bucket::from_xdr_file_disk_backed(&xdr_path)?
+
+            // Try loading a persisted index first (skips both file-scanning passes)
+            if let Some(disk_index) = self.try_load_index_for_bucket(
+                hash,
+                crate::index::DEFAULT_PAGE_SIZE,
+            )? {
+                let entry_count = disk_index.counters().total() as usize;
+                let live_index = crate::index::LiveBucketIndex::Disk(disk_index);
+                tracing::debug!(
+                    hash = %hash,
+                    entry_count,
+                    "Loaded bucket with persisted index (skipped streaming build)"
+                );
+                Bucket::from_xdr_file_disk_backed_prebuilt(
+                    &xdr_path,
+                    *hash,
+                    entry_count,
+                    live_index,
+                )?
+            } else {
+                // No persisted index: do full streaming build (2-pass)
+                let bucket = Bucket::from_xdr_file_disk_backed(&xdr_path)?;
+
+                // Save index for next time (only for DiskIndex, not InMemoryIndex)
+                if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) =
+                    bucket.live_index()
+                {
+                    if let Err(e) = self.save_index_for_bucket(hash, disk_idx) {
+                        tracing::warn!(
+                            hash = %hash,
+                            error = %e,
+                            "Failed to persist bucket index"
+                        );
+                    }
+                }
+
+                bucket
+            }
         } else {
             // Small file: load entirely into memory for fast access
             Bucket::load_from_xdr_file(&xdr_path)?
@@ -432,6 +469,18 @@ impl BucketManager {
 
         // Load as DiskBacked (builds index, O(index_size) memory)
         let bucket = Bucket::from_xdr_file_disk_backed(&final_path)?;
+
+        // Persist the index for next time (only for DiskIndex, not InMemoryIndex)
+        if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) = bucket.live_index() {
+            if let Err(e) = self.save_index_for_bucket(&hash, disk_idx) {
+                tracing::warn!(
+                    hash = %hash,
+                    error = %e,
+                    "Failed to persist merged bucket index"
+                );
+            }
+        }
+
         let bucket = Arc::new(bucket);
         self.add_to_cache(hash, Arc::clone(&bucket));
 

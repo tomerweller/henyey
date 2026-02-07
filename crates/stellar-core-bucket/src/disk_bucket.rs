@@ -10,24 +10,21 @@
 //! Instead of loading all entries into memory, the disk bucket:
 //!
 //! 1. **Stores** the raw XDR bucket file on disk (uncompressed)
-//! 2. **Builds** an index mapping the first 8 bytes of each key's SHA-256 hash
-//!    to the file offset and length of the entry
-//! 3. **Reads** entries on-demand from disk when accessed
+//! 2. **Builds** a `LiveBucketIndex` by streaming entries from the file
+//! 3. **Reads** entries on-demand from disk when accessed via mmap
 //!
-//! # Memory Efficiency
+//! # Index Types
 //!
-//! Memory usage is reduced from O(entries) to O(unique_keys * 16 bytes):
-//! - 8 bytes for the key hash prefix
-//! - 8 bytes for the offset and length (IndexEntry)
+//! The index is automatically selected based on bucket size:
 //!
-//! For a bucket with 1 million entries, this is roughly 16 MB for the index
-//! instead of potentially several GB for all entry data.
+//! - **Small buckets** (< 10K entries): `InMemoryIndex` with per-key offsets
+//! - **Large buckets** (>= 10K entries): `DiskIndex` with page-based ranges
+//!   and bloom filter (~148 MB for 60M keys vs ~960 MB with a flat index)
 //!
 //! # Trade-offs
 //!
-//! - **Slower lookups**: Each lookup requires disk I/O
+//! - **Slower lookups**: Each lookup requires disk I/O (mitigated by mmap)
 //! - **No in-memory slice access**: Must use iteration instead
-//! - **Hash collision risk**: The 8-byte key hash may collide (rare, handled by verification)
 //!
 //! # Usage
 //!
@@ -35,7 +32,6 @@
 //! transparent to most bucket operations. Check [`Bucket::is_disk_backed`] to
 //! determine the storage mode.
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -48,7 +44,7 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr};
 
 use stellar_core_common::Hash256;
 
-use crate::bloom_filter::{BucketBloomFilter, HashSeed};
+use crate::bloom_filter::HashSeed;
 use crate::entry::BucketEntry;
 use crate::index::LiveBucketIndex;
 use crate::{BucketError, Result};
@@ -61,63 +57,25 @@ const BLOOM_FILTER_MIN_ENTRIES: usize = 2;
 /// This is used when no custom seed is provided.
 pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 
-/// Entry in the bucket index: file offset.
-///
-/// This is a compact 8-byte structure that stores the
-/// location of an entry in the bucket file.
-#[derive(Debug, Clone, Copy)]
-struct IndexEntry {
-    /// Byte offset in the bucket file where this entry's record mark starts.
-    offset: u64,
-}
-
-/// The index type used by a `DiskBucket` for key lookups.
-///
-/// Supports both the legacy flat index (8-byte key hash → offset) and the
-/// new `LiveBucketIndex` (page-based for large buckets, per-key for small).
-#[derive(Clone)]
-enum DiskBucketIndex {
-    /// Legacy flat index: maps 8-byte key hash prefix → file offset.
-    ///
-    /// This stores one entry per key using an 8-byte hash prefix.
-    /// Simple but uses ~16 bytes/key, which is ~960 MB for 60M keys.
-    Legacy {
-        index: Arc<BTreeMap<u64, IndexEntry>>,
-        bloom_filter: Option<Arc<BucketBloomFilter>>,
-        bloom_seed: HashSeed,
-    },
-    /// Advanced index using `LiveBucketIndex` from `index.rs`.
-    ///
-    /// For small buckets (< 10K entries): per-key `InMemoryIndex`
-    /// For large buckets (≥ 10K entries): page-based `DiskIndex`
-    ///   - ~60K page entries for 60M keys (~10 MB)
-    ///   - Bloom filter for fast negative lookups (~138 MB for 60M keys)
-    Advanced(Box<LiveBucketIndex>),
-}
-
 /// A disk-backed bucket that stores entries on disk with an in-memory index.
 ///
 /// This implementation is designed for memory efficiency when processing
 /// large buckets during catchup. Instead of loading all entries into memory,
 /// it maintains a compact index and reads entries on-demand.
 ///
-/// # Index Types
+/// # Index Type
 ///
-/// The bucket supports two index modes:
+/// Uses `LiveBucketIndex` which automatically selects the appropriate strategy:
 ///
-/// - **Legacy flat index**: Maps 8-byte key hash prefixes to file offsets.
-///   Simple but uses ~16 bytes/key (~960 MB for 60M keys).
-///
-/// - **Advanced index** (`LiveBucketIndex`): For large buckets, uses a page-based
-///   `DiskIndex` with bloom filter, reducing memory from ~960 MB to ~148 MB
-///   for 60M keys. For small buckets, uses a per-key `InMemoryIndex`.
-///
-/// The streaming constructor (`from_file_streaming`) uses the advanced index.
+/// - **Small buckets** (< 10K entries): `InMemoryIndex` with per-key offsets
+/// - **Large buckets** (≥ 10K entries): `DiskIndex` with page-based ranges
+///   and bloom filter, reducing memory from ~960 MB to ~148 MB for 60M keys
 ///
 /// # Bloom Filter
 ///
-/// Both index modes include bloom filters for fast negative lookups,
-/// allowing `get()` to quickly reject keys not in the bucket.
+/// The index includes bloom filters for fast negative lookups,
+/// allowing `get()` to quickly reject keys that are definitely
+/// not present (avoiding disk I/O).
 ///
 /// # File Access Pattern
 ///
@@ -131,7 +89,7 @@ pub struct DiskBucket {
     /// Path to the bucket file on disk (uncompressed XDR).
     file_path: PathBuf,
     /// Index for key lookups.
-    disk_index: DiskBucketIndex,
+    index: Box<LiveBucketIndex>,
     /// Total number of entries in this bucket.
     entry_count: usize,
     /// Memory-mapped file for lock-free reads.
@@ -224,57 +182,16 @@ impl DiskBucket {
 
     /// Create a disk bucket from an XDR file.
     ///
-    /// This parses the file to build the index but doesn't keep entries in memory.
-    /// For large files, prefer `from_file_streaming` which uses O(1) memory.
+    /// This streams the file to build the index without keeping entries in memory.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_file_with_seed(path, DEFAULT_BLOOM_SEED)
+        Self::from_file_streaming_with_seed(path, DEFAULT_BLOOM_SEED)
     }
 
     /// Create a disk bucket from an XDR file with a custom bloom filter seed.
     ///
-    /// This parses the file to build the index but doesn't keep entries in memory.
-    /// Note: This loads the entire file into memory for hash computation and index
-    /// building. For large files, prefer `from_file_streaming`.
+    /// This streams the file to build the index without keeping entries in memory.
     pub fn from_file_with_seed(path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
-        let path = path.as_ref();
-        let file = File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
-
-        // Read entire file for hash computation
-        let mut bytes = Vec::with_capacity(file_len as usize);
-        reader.read_to_end(&mut bytes)?;
-
-        // Compute hash
-        let hash = Hash256::hash(&bytes);
-
-        // Build index by scanning the file
-        let (index, key_hashes, entry_count) = Self::build_index(&bytes, &bloom_seed)?;
-
-        // Build bloom filter if we have enough entries
-        let bloom_filter = if key_hashes.len() >= BLOOM_FILTER_MIN_ENTRIES {
-            match BucketBloomFilter::from_hashes(&key_hashes, &bloom_seed) {
-                Ok(filter) => Some(Arc::new(filter)),
-                Err(e) => {
-                    tracing::warn!("Failed to build bloom filter for bucket: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        Ok(Self {
-            hash,
-            file_path: path.to_path_buf(),
-            disk_index: DiskBucketIndex::Legacy {
-                index: Arc::new(index),
-                bloom_filter,
-                bloom_seed,
-            },
-            entry_count,
-            mmap: Self::create_mmap(path)?,
-        })
+        Self::from_file_streaming_with_seed(path, bloom_seed)
     }
 
     /// Create a disk bucket from an uncompressed XDR file using streaming I/O.
@@ -343,14 +260,46 @@ impl DiskBucket {
         tracing::debug!(
             entry_count,
             file_size = file_len,
-            index_type = if live_index.is_in_memory() { "InMemory" } else { "DiskIndex" },
+            index_type = if live_index.is_in_memory() {
+                "InMemory"
+            } else {
+                "DiskIndex"
+            },
             "Built disk bucket index via streaming"
         );
 
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
-            disk_index: DiskBucketIndex::Advanced(Box::new(live_index)),
+            index: Box::new(live_index),
+            entry_count,
+            mmap: Self::create_mmap(path)?,
+        })
+    }
+
+    /// Create a disk bucket from a pre-built index, skipping file scanning.
+    ///
+    /// This is used when loading a persisted index from disk, avoiding the
+    /// expensive 2-pass streaming build. The caller is responsible for ensuring
+    /// that the index matches the bucket file contents.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the uncompressed XDR bucket file
+    /// * `hash` - The known SHA-256 hash of the bucket contents
+    /// * `entry_count` - Total number of entries in the bucket
+    /// * `index` - Pre-built LiveBucketIndex (from persistence or prior build)
+    pub fn from_prebuilt(
+        path: impl AsRef<Path>,
+        hash: Hash256,
+        entry_count: usize,
+        index: LiveBucketIndex,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        Ok(Self {
+            hash,
+            file_path: path.to_path_buf(),
+            index: Box::new(index),
             entry_count,
             mmap: Self::create_mmap(path)?,
         })
@@ -362,6 +311,8 @@ impl DiskBucket {
     }
 
     /// Create a disk bucket from raw XDR bytes with a custom bloom filter seed.
+    ///
+    /// Writes the bytes to disk, then builds the index by streaming.
     pub fn from_xdr_bytes_with_seed(
         bytes: &[u8],
         save_path: impl AsRef<Path>,
@@ -371,164 +322,14 @@ impl DiskBucket {
 
         let save_path = save_path.as_ref();
 
-        // Compute hash
-        let hash = Hash256::hash(bytes);
-
-        // Build index
-        let (index, key_hashes, entry_count) = Self::build_index(bytes, &bloom_seed)?;
-
-        // Build bloom filter if we have enough entries
-        let bloom_filter = if key_hashes.len() >= BLOOM_FILTER_MIN_ENTRIES {
-            match BucketBloomFilter::from_hashes(&key_hashes, &bloom_seed) {
-                Ok(filter) => Some(Arc::new(filter)),
-                Err(e) => {
-                    tracing::warn!("Failed to build bloom filter for bucket: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Save to disk
+        // Save to disk first
         let mut file = File::create(save_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
 
-        Ok(Self {
-            hash,
-            file_path: save_path.to_path_buf(),
-            disk_index: DiskBucketIndex::Legacy {
-                index: Arc::new(index),
-                bloom_filter,
-                bloom_seed,
-            },
-            entry_count,
-            mmap: Self::create_mmap(save_path)?,
-        })
-    }
-
-    /// Build an index from XDR bytes.
-    ///
-    /// Returns (index, bloom_key_hashes, entry_count).
-    fn build_index(
-        bytes: &[u8],
-        bloom_seed: &HashSeed,
-    ) -> Result<(BTreeMap<u64, IndexEntry>, Vec<u64>, usize)> {
-        use tracing::debug;
-
-        if bytes.is_empty() {
-            return Ok((BTreeMap::new(), Vec::new(), 0));
-        }
-
-        let mut index = BTreeMap::new();
-        let mut bloom_key_hashes = Vec::new();
-        let mut offset: u64 = 0;
-        let mut entry_count = 0;
-
-        // Check if the file uses XDR record marking
-        let uses_record_marks = bytes.len() >= 4 && (bytes[0] & 0x80) != 0;
-
-        if uses_record_marks {
-            debug!("Building index for bucket with XDR record marking format");
-
-            while (offset as usize) + 4 <= bytes.len() {
-                let record_start = offset;
-
-                // Read 4-byte record mark
-                let record_mark = u32::from_be_bytes([
-                    bytes[offset as usize],
-                    bytes[offset as usize + 1],
-                    bytes[offset as usize + 2],
-                    bytes[offset as usize + 3],
-                ]);
-                offset += 4;
-
-                let record_len = (record_mark & 0x7FFFFFFF) as usize;
-
-                if (offset as usize) + record_len > bytes.len() {
-                    break;
-                }
-
-                // Parse just enough to get the key
-                let record_data = &bytes[offset as usize..(offset as usize) + record_len];
-                if let Ok(xdr_entry) =
-                    stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none())
-                {
-                    if let Some(key) = Self::extract_key(&xdr_entry) {
-                        // Use first 8 bytes of key hash as index key
-                        let key_hash = Self::hash_key(&key);
-                        index.insert(
-                            key_hash,
-                            IndexEntry {
-                                offset: record_start,
-                            },
-                        );
-                        // Also compute bloom filter hash
-                        bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, bloom_seed));
-                    }
-                    entry_count += 1;
-                }
-
-                offset += record_len as u64;
-            }
-        } else {
-            // Raw XDR format - need to parse sequentially
-            debug!("Building index for bucket with raw XDR format");
-
-            use stellar_xdr::curr::Limited;
-            let cursor = std::io::Cursor::new(bytes);
-            let mut limited = Limited::new(cursor, Limits::none());
-
-            while limited.inner.position() < bytes.len() as u64 {
-                let entry_start = limited.inner.position();
-
-                match stellar_xdr::curr::BucketEntry::read_xdr(&mut limited) {
-                    Ok(xdr_entry) => {
-                        if let Some(key) = Self::extract_key(&xdr_entry) {
-                            let key_hash = Self::hash_key(&key);
-                            index.insert(
-                                key_hash,
-                                IndexEntry {
-                                    offset: entry_start,
-                                },
-                            );
-                            // Also compute bloom filter hash
-                            bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, bloom_seed));
-                        }
-                        entry_count += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        debug!(
-            "Built index with {} entries, {} keys for bloom filter",
-            entry_count,
-            bloom_key_hashes.len()
-        );
-        Ok((index, bloom_key_hashes, entry_count))
-    }
-
-    /// Extract the key from a bucket entry.
-    fn extract_key(entry: &stellar_xdr::curr::BucketEntry) -> Option<LedgerKey> {
-        use crate::entry::ledger_entry_to_key;
-        use stellar_xdr::curr::BucketEntry as XdrBucketEntry;
-
-        match entry {
-            XdrBucketEntry::Liveentry(e) | XdrBucketEntry::Initentry(e) => ledger_entry_to_key(e),
-            XdrBucketEntry::Deadentry(k) => Some(k.clone()),
-            XdrBucketEntry::Metaentry(_) => None,
-        }
-    }
-
-    /// Compute a compact hash of a key for index lookup.
-    fn hash_key(key: &LedgerKey) -> u64 {
-        use stellar_xdr::curr::WriteXdr;
-        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-        let hash = Sha256::digest(&key_bytes);
-        u64::from_be_bytes(hash[0..8].try_into().unwrap())
+        // Build index by streaming the saved file
+        Self::from_file_streaming_with_seed(save_path, bloom_seed)
     }
 
     /// Get the hash of this bucket.
@@ -551,98 +352,55 @@ impl DiskBucket {
         &self.file_path
     }
 
+    /// Returns a reference to the live bucket index.
+    pub fn live_index(&self) -> &LiveBucketIndex {
+        &self.index
+    }
+
     /// Returns true if this bucket has a bloom filter for fast negative lookups.
     pub fn has_bloom_filter(&self) -> bool {
-        match &self.disk_index {
-            DiskBucketIndex::Legacy { bloom_filter, .. } => bloom_filter.is_some(),
-            // Advanced indexes always build bloom filters for buckets with >= 2 entries
-            DiskBucketIndex::Advanced(_) => self.entry_count >= BLOOM_FILTER_MIN_ENTRIES,
-        }
+        self.entry_count >= BLOOM_FILTER_MIN_ENTRIES
     }
 
     /// Returns the size of the bloom filter in bytes, or 0 if no filter exists.
     pub fn bloom_filter_size_bytes(&self) -> usize {
-        match &self.disk_index {
-            DiskBucketIndex::Legacy { bloom_filter, .. } => {
-                bloom_filter.as_ref().map_or(0, |f| f.size_bytes())
-            }
-            DiskBucketIndex::Advanced(_) => 0, // Not easily accessible through facade
-        }
+        self.index.bloom_filter_size_bytes()
     }
 
     /// Returns the hash seed used for the bloom filter.
     pub fn bloom_seed(&self) -> HashSeed {
-        match &self.disk_index {
-            DiskBucketIndex::Legacy { bloom_seed, .. } => *bloom_seed,
-            DiskBucketIndex::Advanced(_) => DEFAULT_BLOOM_SEED,
-        }
+        self.index.bloom_seed()
     }
 
     /// Look up an entry by key.
     ///
-    /// This reads from disk using the index. If a bloom filter is available,
-    /// it first checks the filter to quickly reject keys that are definitely
-    /// not present (avoiding disk I/O).
+    /// This reads from disk using the index. The bloom filter is checked first
+    /// to quickly reject keys that are definitely not present (avoiding disk I/O).
     pub fn get(&self, key: &LedgerKey) -> Result<Option<BucketEntry>> {
-        match &self.disk_index {
-            DiskBucketIndex::Legacy {
-                index,
-                bloom_filter,
-                bloom_seed,
-            } => {
-                // Check bloom filter first for fast negative lookup
-                if let Some(ref filter) = bloom_filter {
-                    if !filter.may_contain(key, bloom_seed) {
-                        return Ok(None);
+        // Check bloom filter (built into the index)
+        if !self.index.may_contain(key) {
+            return Ok(None);
+        }
+
+        match &*self.index {
+            LiveBucketIndex::InMemory(idx) => {
+                // Exact offset lookup
+                if let Some(offset) = idx.get_offset(key) {
+                    let entry = self.read_entry_at(offset)?;
+                    if let Some(entry_key) = entry.key() {
+                        if &entry_key == key {
+                            return Ok(Some(entry));
+                        }
                     }
                 }
-
-                let key_hash = Self::hash_key(key);
-
-                let index_entry = match index.get(&key_hash) {
-                    Some(e) => e,
-                    None => return Ok(None),
-                };
-
-                // Read the entry from disk
-                let entry = self.read_entry_at(index_entry.offset)?;
-
-                // Verify this is the right entry (hash collisions are possible)
-                if let Some(entry_key) = entry.key() {
-                    if &entry_key == key {
-                        return Ok(Some(entry));
-                    }
-                }
-
                 Ok(None)
             }
-            DiskBucketIndex::Advanced(live_index) => {
-                // Check bloom filter (built into the index)
-                if !live_index.may_contain(key) {
-                    return Ok(None);
-                }
-
-                match &**live_index {
-                    LiveBucketIndex::InMemory(idx) => {
-                        // Exact offset lookup
-                        if let Some(offset) = idx.get_offset(key) {
-                            let entry = self.read_entry_at(offset)?;
-                            if let Some(entry_key) = entry.key() {
-                                if &entry_key == key {
-                                    return Ok(Some(entry));
-                                }
-                            }
-                        }
-                        Ok(None)
-                    }
-                    LiveBucketIndex::Disk(disk_idx) => {
-                        // Page-based lookup: find candidate page, scan within it
-                        if let Some(page_offset) = disk_idx.find_page_for_key(key) {
-                            self.scan_page_for_key(page_offset, key, disk_idx.page_size())
-                        } else {
-                            Ok(None)
-                        }
-                    }
+            LiveBucketIndex::Disk(disk_idx) => {
+                // Page-based lookup: find candidate page, scan within it
+                if let Some(page_offset) = disk_idx.find_page_for_key(key) {
+                    self.scan_page_for_key(page_offset, key, disk_idx.page_size())
+                } else {
+                    Ok(None)
                 }
             }
         }
@@ -651,73 +409,35 @@ impl DiskBucket {
     /// Look up an entry using pre-serialized key bytes to avoid redundant serialization.
     ///
     /// The `key` is needed for final verification (hash collisions), while `key_bytes`
-    /// is used for bloom filter checks, hash computation, and index lookups.
+    /// is used for bloom filter checks and index lookups.
     pub fn get_by_key_bytes(
         &self,
         key: &LedgerKey,
         key_bytes: &[u8],
     ) -> Result<Option<BucketEntry>> {
-        match &self.disk_index {
-            DiskBucketIndex::Legacy {
-                index,
-                bloom_filter,
-                bloom_seed,
-            } => {
-                if let Some(ref filter) = bloom_filter {
-                    let hash = crate::bloom_filter::BucketBloomFilter::hash_bytes(
-                        key_bytes, bloom_seed,
-                    );
-                    if !filter.may_contain_hash(hash) {
-                        return Ok(None);
+        if !self.index.may_contain_bytes(key_bytes) {
+            return Ok(None);
+        }
+
+        match &*self.index {
+            LiveBucketIndex::InMemory(idx) => {
+                if let Some(offset) = idx.get_offset_by_key_bytes(key_bytes) {
+                    let entry = self.read_entry_at(offset)?;
+                    if let Some(entry_key) = entry.key() {
+                        if &entry_key == key {
+                            return Ok(Some(entry));
+                        }
                     }
                 }
-
-                let key_hash = {
-                    let hash = Sha256::digest(key_bytes);
-                    u64::from_be_bytes(hash[0..8].try_into().unwrap())
-                };
-
-                let index_entry = match index.get(&key_hash) {
-                    Some(e) => e,
-                    None => return Ok(None),
-                };
-
-                let entry = self.read_entry_at(index_entry.offset)?;
-
-                if let Some(entry_key) = entry.key() {
-                    if &entry_key == key {
-                        return Ok(Some(entry));
-                    }
-                }
-
                 Ok(None)
             }
-            DiskBucketIndex::Advanced(live_index) => {
-                if !live_index.may_contain_bytes(key_bytes) {
-                    return Ok(None);
-                }
-
-                match &**live_index {
-                    LiveBucketIndex::InMemory(idx) => {
-                        if let Some(offset) = idx.get_offset_by_key_bytes(key_bytes) {
-                            let entry = self.read_entry_at(offset)?;
-                            if let Some(entry_key) = entry.key() {
-                                if &entry_key == key {
-                                    return Ok(Some(entry));
-                                }
-                            }
-                        }
-                        Ok(None)
-                    }
-                    LiveBucketIndex::Disk(disk_idx) => {
-                        // Disk-based index uses key comparison for page search,
-                        // fall back to regular method
-                        if let Some(page_offset) = disk_idx.find_page_for_key(key) {
-                            self.scan_page_for_key(page_offset, key, disk_idx.page_size())
-                        } else {
-                            Ok(None)
-                        }
-                    }
+            LiveBucketIndex::Disk(disk_idx) => {
+                // Disk-based index uses key comparison for page search,
+                // fall back to regular method
+                if let Some(page_offset) = disk_idx.find_page_for_key(key) {
+                    self.scan_page_for_key(page_offset, key, disk_idx.page_size())
+                } else {
+                    Ok(None)
                 }
             }
         }
@@ -745,10 +465,9 @@ impl DiskBucket {
         } else {
             // No record mark — try reading as raw XDR from offset
             let xdr_entry =
-                stellar_xdr::curr::BucketEntry::from_xdr(&data[offset..], Limits::none())
-                    .map_err(|e| {
-                        BucketError::Serialization(format!("Failed to parse entry: {}", e))
-                    })?;
+                stellar_xdr::curr::BucketEntry::from_xdr(&data[offset..], Limits::none()).map_err(
+                    |e| BucketError::Serialization(format!("Failed to parse entry: {}", e)),
+                )?;
             return BucketEntry::from_xdr_entry(xdr_entry);
         };
 
@@ -869,10 +588,7 @@ impl DiskBucket {
     ///
     /// Each item is `(BucketEntry, record_size)` where `record_size` includes
     /// the 4-byte record mark.
-    pub fn iter_from_offset_with_sizes(
-        &self,
-        start_offset: u64,
-    ) -> Result<DiskBucketOffsetIter> {
+    pub fn iter_from_offset_with_sizes(&self, start_offset: u64) -> Result<DiskBucketOffsetIter> {
         let file = File::open(&self.file_path)?;
         let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
@@ -980,10 +696,7 @@ impl Iterator for DiskBucketIter {
             match stellar_xdr::curr::BucketEntry::read_xdr(&mut limited) {
                 Ok(xdr_entry) => {
                     // Update our position tracking
-                    self.position = self
-                        .reader
-                        .stream_position()
-                        .unwrap_or(self.file_len);
+                    self.position = self.reader.stream_position().unwrap_or(self.file_len);
                     Some(BucketEntry::from_xdr_entry(xdr_entry))
                 }
                 Err(_) => None,

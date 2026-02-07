@@ -400,10 +400,8 @@ impl InMemoryIndex {
     /// Checks if pre-serialized key bytes may exist (bloom filter check).
     pub fn may_contain_bytes(&self, key_bytes: &[u8]) -> bool {
         if let Some(ref filter) = self.bloom_filter {
-            let hash = crate::bloom_filter::BucketBloomFilter::hash_bytes(
-                key_bytes,
-                &self.bloom_seed,
-            );
+            let hash =
+                crate::bloom_filter::BucketBloomFilter::hash_bytes(key_bytes, &self.bloom_seed);
             filter.may_contain_hash(hash)
         } else {
             true
@@ -430,6 +428,16 @@ impl InMemoryIndex {
     /// Returns the type range for a specific entry type.
     pub fn type_range(&self, entry_type: LedgerEntryType) -> Option<&TypeRange> {
         self.type_ranges.get(&entry_type)
+    }
+
+    /// Returns the bloom filter seed.
+    pub fn bloom_seed(&self) -> HashSeed {
+        self.bloom_seed
+    }
+
+    /// Returns the size of the bloom filter in bytes, or 0 if no filter exists.
+    pub fn bloom_filter_size_bytes(&self) -> usize {
+        self.bloom_filter.as_ref().map_or(0, |f| f.size_bytes())
     }
 
     /// Returns the number of indexed keys.
@@ -622,10 +630,8 @@ impl DiskIndex {
     /// Checks if pre-serialized key bytes may exist (bloom filter check).
     pub fn may_contain_bytes(&self, key_bytes: &[u8]) -> bool {
         if let Some(ref filter) = self.bloom_filter {
-            let hash = crate::bloom_filter::BucketBloomFilter::hash_bytes(
-                key_bytes,
-                &self.bloom_seed,
-            );
+            let hash =
+                crate::bloom_filter::BucketBloomFilter::hash_bytes(key_bytes, &self.bloom_seed);
             filter.may_contain_hash(hash)
         } else {
             true
@@ -717,6 +723,11 @@ impl DiskIndex {
     /// Used for serialization/persistence.
     pub fn bloom_filter(&self) -> Option<&BucketBloomFilter> {
         self.bloom_filter.as_deref()
+    }
+
+    /// Returns the size of the bloom filter in bytes, or 0 if no filter exists.
+    pub fn bloom_filter_size_bytes(&self) -> usize {
+        self.bloom_filter.as_ref().map_or(0, |f| f.size_bytes())
     }
 }
 
@@ -827,6 +838,22 @@ impl LiveBucketIndex {
                 })
             })
             .collect()
+    }
+
+    /// Returns the bloom filter seed.
+    pub fn bloom_seed(&self) -> HashSeed {
+        match self {
+            LiveBucketIndex::InMemory(idx) => idx.bloom_seed(),
+            LiveBucketIndex::Disk(idx) => idx.bloom_seed(),
+        }
+    }
+
+    /// Returns the size of the bloom filter in bytes, or 0 if no filter exists.
+    pub fn bloom_filter_size_bytes(&self) -> usize {
+        match self {
+            LiveBucketIndex::InMemory(idx) => idx.bloom_filter_size_bytes(),
+            LiveBucketIndex::Disk(idx) => idx.bloom_filter_size_bytes(),
+        }
     }
 }
 
@@ -1292,7 +1319,10 @@ mod tests {
 
         // Add contract code entries
         for i in 0..5u8 {
-            entries.push((BucketEntry::Live(make_contract_code_entry(i)), i as u64 * 100));
+            entries.push((
+                BucketEntry::Live(make_contract_code_entry(i)),
+                i as u64 * 100,
+            ));
         }
 
         // Add persistent contract data entries

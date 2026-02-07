@@ -404,6 +404,27 @@ impl Bucket {
         })
     }
 
+    /// Create a DiskBacked bucket from a pre-built index, skipping file scanning.
+    ///
+    /// This is used when loading a persisted index from disk, avoiding the
+    /// expensive 2-pass streaming build. The caller provides the pre-built
+    /// `LiveBucketIndex`, the known hash, and entry count.
+    pub fn from_xdr_file_disk_backed_prebuilt(
+        path: impl AsRef<Path>,
+        hash: Hash256,
+        entry_count: usize,
+        index: crate::index::LiveBucketIndex,
+    ) -> Result<Self> {
+        let disk_bucket = DiskBucket::from_prebuilt(path, hash, entry_count, index)?;
+        Ok(Self {
+            hash,
+            storage: BucketStorage::DiskBacked {
+                disk_bucket: Arc::new(disk_bucket),
+            },
+            level_zero_state: LevelZeroState::None,
+        })
+    }
+
     /// Internal method to create a bucket with optional key index building.
     fn from_xdr_bytes_internal(bytes: &[u8], build_index: bool) -> Result<Self> {
         let entries = Self::parse_entries(bytes)?;
@@ -714,6 +735,17 @@ impl Bucket {
     /// Check if this bucket uses disk-backed storage.
     pub fn is_disk_backed(&self) -> bool {
         matches!(&self.storage, BucketStorage::DiskBacked { .. })
+    }
+
+    /// Get the live bucket index for disk-backed buckets.
+    ///
+    /// Returns `Some(&LiveBucketIndex)` for disk-backed buckets, `None` for in-memory.
+    /// This is used to extract the index for persistence (saving to `.index` files).
+    pub fn live_index(&self) -> Option<&crate::index::LiveBucketIndex> {
+        match &self.storage {
+            BucketStorage::DiskBacked { disk_bucket } => Some(disk_bucket.live_index()),
+            BucketStorage::InMemory { .. } => None,
+        }
     }
 
     /// Get the backing file path for disk-backed buckets.
