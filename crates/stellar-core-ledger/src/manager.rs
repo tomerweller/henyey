@@ -52,8 +52,8 @@ use stellar_xdr::curr::{
     AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
     EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet, Hash, LedgerCloseMeta,
     LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
-    LedgerKeyConfigSetting, TransactionEventStage, TransactionMeta, TransactionPhase,
+    LedgerEntryType, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
+    LedgerKey, LedgerKeyConfigSetting, TransactionEventStage, TransactionMeta, TransactionPhase,
     TransactionResultMetaV1, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
     UpgradeEntryMeta, VecM,
 };
@@ -170,7 +170,6 @@ fn load_eviction_iterator_from_bucket_list(bucket_list: &BucketList) -> Option<E
         _ => None,
     }
 }
-
 
 /// Configuration options for the [`LedgerManager`].
 ///
@@ -535,165 +534,6 @@ impl LedgerManager {
         state.initialized = false;
 
         debug!("Ledger manager reset complete");
-    }
-
-    /// Initialize the persistent module cache from CONTRACT_CODE entries in the bucket list.
-    ///
-    /// This scans the bucket list for all contract code entries and pre-compiles them
-    /// for reuse across transactions. This is only done for protocol versions that
-    /// support Soroban (20+).
-    ///
-    /// Note: This function is kept for potential future use in selective reinitialization.
-    /// Normal initialization uses `initialize_all_caches()` for better memory efficiency.
-    #[allow(dead_code)]
-    fn initialize_module_cache(&self, protocol_version: u32) -> Result<()> {
-        use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
-
-        if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
-            // Soroban not supported at this protocol version
-            *self.module_cache.write() = None;
-            return Ok(());
-        }
-
-        // Create a new module cache for this protocol version
-        let cache = match PersistentModuleCache::new_for_protocol(protocol_version) {
-            Some(c) => c,
-            None => {
-                *self.module_cache.write() = None;
-                return Ok(());
-            }
-        };
-
-        // Scan bucket list for CONTRACT_CODE entries and pre-compile them
-        let bucket_list = self.bucket_list.read();
-
-        let mut contracts_added = 0;
-        for entry_result in bucket_list.live_entries_iter() {
-            let entry = entry_result.map_err(|e| {
-                LedgerError::Internal(format!(
-                    "Failed to iterate live entries for module cache: {}",
-                    e
-                ))
-            })?;
-            if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
-                if cache.add_contract(contract_code.code.as_slice(), protocol_version) {
-                    contracts_added += 1;
-                }
-            }
-        }
-
-        info!(
-            contracts_added,
-            protocol_version, "Initialized module cache from bucket list"
-        );
-
-        *self.module_cache.write() = Some(cache);
-        Ok(())
-    }
-
-    /// Initialize the in-memory Soroban state from CONTRACT_DATA, CONTRACT_CODE, and TTL entries.
-    ///
-    /// This scans the bucket list once during initialization to populate the state cache.
-    /// After initialization, the state is maintained incrementally during ledger close.
-    ///
-    /// Note: This function is kept for potential future use in selective reinitialization.
-    /// Normal initialization uses `initialize_all_caches()` for better memory efficiency.
-    #[allow(dead_code)]
-    fn initialize_soroban_state(&self, protocol_version: u32, ledger_seq: u32) -> Result<()> {
-        use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
-
-        if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
-            // Soroban not supported at this protocol version
-            return Ok(());
-        }
-
-        let bucket_list = self.bucket_list.read();
-
-        // Load rent config for accurate code size calculation
-        let rent_config = self.load_soroban_rent_config(&bucket_list);
-
-        let mut soroban_state = self.soroban_state.write();
-        soroban_state.clear();
-
-        // Stream through entries and collect CONTRACT_DATA, CONTRACT_CODE, TTL, and ConfigSetting entries
-        let mut data_count = 0u64;
-        let mut code_count = 0u64;
-        let mut ttl_count = 0u64;
-        let mut config_count = 0u64;
-
-        for entry_result in bucket_list.live_entries_iter() {
-            let entry = entry_result.map_err(|e| {
-                LedgerError::Internal(format!(
-                    "Failed to iterate live entries for soroban state: {}",
-                    e
-                ))
-            })?;
-            match &entry.data {
-                LedgerEntryData::ContractData(_) => {
-                    if let Err(e) = soroban_state.create_contract_data(entry.clone()) {
-                        tracing::warn!(error = %e, "Failed to add contract data to soroban state");
-                    } else {
-                        data_count += 1;
-                    }
-                }
-                LedgerEntryData::ContractCode(_) => {
-                    if let Err(e) = soroban_state.create_contract_code(
-                        entry.clone(),
-                        protocol_version,
-                        rent_config.as_ref(),
-                    ) {
-                        tracing::warn!(error = %e, "Failed to add contract code to soroban state");
-                    } else {
-                        code_count += 1;
-                    }
-                }
-                LedgerEntryData::Ttl(ttl) => {
-                    let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
-                        key_hash: ttl.key_hash.clone(),
-                    };
-                    let ttl_data = crate::soroban_state::TtlData::new(
-                        ttl.live_until_ledger_seq,
-                        entry.last_modified_ledger_seq,
-                    );
-                    if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
-                        tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
-                    } else {
-                        ttl_count += 1;
-                    }
-                }
-                LedgerEntryData::ConfigSetting(_) => {
-                    // ConfigSetting entries are cached for fast Soroban config loading
-                    if let Err(e) = soroban_state.process_entry_create(
-                        &entry,
-                        protocol_version,
-                        rent_config.as_ref(),
-                    ) {
-                        tracing::warn!(error = %e, "Failed to add config setting to soroban state");
-                    } else {
-                        config_count += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let total_size = soroban_state.total_size();
-        let stats = soroban_state.stats();
-
-        info!(
-            ledger_seq,
-            data_count,
-            code_count,
-            ttl_count,
-            config_count,
-            total_size,
-            contract_data_size = stats.contract_data_size,
-            contract_code_size = stats.contract_code_size,
-            pending_ttl_count = stats.pending_ttl_count,
-            "Initialized in-memory Soroban state from bucket list"
-        );
-
-        Ok(())
     }
 
     /// Load Soroban rent config from bucket list for code size calculation.
@@ -1285,16 +1125,16 @@ impl LedgerManager {
                 return Ok(store.values().cloned().collect());
             }
             // Fall back to bucket list scan if offers not initialized.
-            // Use streaming iterator to avoid excessive memory usage.
+            // Use per-type scan to only build dedup set over Offer keys (~240K)
+            // instead of all 60M keys (~8.6 GB) via live_entries_iter().
             let bucket_list = bucket_list_entries.read();
             let mut entries = Vec::new();
-            for entry_result in bucket_list.live_entries_iter() {
-                let entry = entry_result.map_err(LedgerError::Bucket)?;
-                // Only collect offers for the offer cache fallback
-                if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                    entries.push(entry);
+            bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
+                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                    entries.push(entry.clone());
                 }
-            }
+                true
+            });
             Ok(entries)
         });
 
@@ -1306,19 +1146,21 @@ impl LedgerManager {
         let offers_by_account_asset_fn: crate::snapshot::OffersByAccountAssetFn = Arc::new(
             move |account_id: &AccountId, asset: &stellar_xdr::curr::Asset| {
                 if !*offers_init_idx.read() {
-                    // Fall back to bucket list scan
+                    // Fall back to bucket list scan with per-type dedup
                     let bucket_list = bucket_list_idx.read();
                     let mut entries = Vec::new();
-                    for entry_result in bucket_list.live_entries_iter() {
-                        let entry = entry_result.map_err(LedgerError::Bucket)?;
-                        if let LedgerEntryData::Offer(ref offer) = entry.data {
-                            if offer.seller_id == *account_id
-                                && (offer.buying == *asset || offer.selling == *asset)
-                            {
-                                entries.push(entry);
+                    bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
+                        if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                            if let LedgerEntryData::Offer(ref offer) = entry.data {
+                                if offer.seller_id == *account_id
+                                    && (offer.buying == *asset || offer.selling == *asset)
+                                {
+                                    entries.push(entry.clone());
+                                }
                             }
                         }
-                    }
+                        true
+                    });
                     return Ok(entries);
                 }
 
@@ -1648,9 +1490,9 @@ impl<'a> LedgerCloseContext<'a> {
         });
         let (tx_max_instructions, tx_max_memory_bytes) =
             self.load_entry(&compute_key).ok()?.and_then(|e| {
-                if let LedgerEntryData::ConfigSetting(
-                    ConfigSettingEntry::ContractComputeV0(compute),
-                ) = e.data
+                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(
+                    compute,
+                )) = e.data
                 {
                     Some((
                         compute.tx_max_instructions as u64,
@@ -1948,8 +1790,7 @@ impl<'a> LedgerCloseContext<'a> {
         {
             // Load rent config from delta (new upgraded values) falling back to snapshot.
             // C++ loads from LedgerTxn which reflects the just-applied upgrades.
-            let rent_config =
-                self.load_rent_config_from_delta_or_snapshot();
+            let rent_config = self.load_rent_config_from_delta_or_snapshot();
 
             // Recompute contract code sizes with new cost params
             {
@@ -1958,8 +1799,7 @@ impl<'a> LedgerCloseContext<'a> {
                 let data_size_before = soroban_state.contract_data_state_size();
                 let code_count = soroban_state.contract_code_count();
                 let data_count = soroban_state.contract_data_count();
-                soroban_state
-                    .recompute_contract_code_sizes(protocol_version, rent_config.as_ref());
+                soroban_state.recompute_contract_code_sizes(protocol_version, rent_config.as_ref());
                 tracing::info!(
                     ledger_seq = self.close_data.ledger_seq,
                     code_size_before = code_size_before,
@@ -1995,7 +1835,9 @@ impl<'a> LedgerCloseContext<'a> {
                     if let Some(change) = delta_change {
                         if let Some(current) = change.current_entry() {
                             if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                                stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(w),
+                                stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                                    w,
+                                ),
                             ) = &current.data
                             {
                                 // Use delta's current version (includes resize)
@@ -2012,17 +1854,13 @@ impl<'a> LedgerCloseContext<'a> {
                         } else {
                             (None, None)
                         }
-                    } else if let Some(entry) =
-                        self.snapshot.get_entry(&window_key).ok().flatten()
+                    } else if let Some(entry) = self.snapshot.get_entry(&window_key).ok().flatten()
                     {
                         if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
                             stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(w),
                         ) = &entry.data
                         {
-                            (
-                                Some(w.iter().copied().collect::<Vec<u64>>()),
-                                Some(entry),
-                            )
+                            (Some(w.iter().copied().collect::<Vec<u64>>()), Some(entry))
                         } else {
                             (None, None)
                         }
@@ -2079,8 +1917,7 @@ impl<'a> LedgerCloseContext<'a> {
                 ledger_seq = self.close_data.ledger_seq,
                 "Loading state archival settings"
             );
-            let settings =
-                self.load_state_archival_settings().unwrap_or_default();
+            let settings = self.load_state_archival_settings().unwrap_or_default();
             tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 "Loaded state archival settings"
@@ -2568,8 +2405,12 @@ impl<'a> LedgerCloseContext<'a> {
                             format!("ConfigSetting({:?})", cs.discriminant())
                         }
                         LedgerEntryData::Account(a) => {
-                            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
-                            format!("Account({:02x}{:02x}..{:02x}{:02x})", pk.0[0], pk.0[1], pk.0[30], pk.0[31])
+                            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) =
+                                a.account_id.0;
+                            format!(
+                                "Account({:02x}{:02x}..{:02x}{:02x})",
+                                pk.0[0], pk.0[1], pk.0[30], pk.0[31]
+                            )
                         }
                         other => format!("{:?}", std::mem::discriminant(other)),
                     };
@@ -2585,7 +2426,13 @@ impl<'a> LedgerCloseContext<'a> {
                     };
                     // For Account entries, also dump full hex for comparison
                     let hex_preview = if matches!(&entry.data, LedgerEntryData::Account(_)) {
-                        format!(" xdr_hex={}", xdr_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+                        format!(
+                            " xdr_hex={}",
+                            xdr_bytes
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<String>()
+                        )
                     } else {
                         String::new()
                     };

@@ -88,26 +88,21 @@ peak depends on download/write speed overlap. Worst case: 2-3 large buckets in f
 
 **Savings:** Variable (~1-6 GB in worst case)
 
-### ISSUE 4: Offer fallback closures use `live_entries_iter()`
+### ~~ISSUE 4: Offer fallback closures use `live_entries_iter()`~~ (FIXED)
 
-**File:** `crates/stellar-core-ledger/src/manager.rs:1291, 1312`
+**File:** `crates/stellar-core-ledger/src/manager.rs`
 
-Two fallback closures in `create_snapshot()` use `live_entries_iter()` when offers are not
-initialized. These are rarely triggered (offers are normally initialized), but if they fire,
-each creates an 8.6 GB dedup set just to find offers.
-
-**Fix:** Replace with `scan_for_entries_of_type(Offer, ...)`.
+Two fallback closures in `create_snapshot()` used `live_entries_iter()` when offers were not
+initialized. Replaced with `scan_for_entries_of_type(Offer, ...)`.
 
 **Savings:** ~8.6 GB -> ~200 MB (when fallback fires)
 
-### ISSUE 5: Dead code using `live_entries_iter()`
+### ~~ISSUE 5: Dead code using `live_entries_iter()`~~ (FIXED)
 
-**Files:**
-- `manager.rs:571` — `initialize_module_cache()` (dead code, `#[allow(dead_code)]`)
-- `manager.rs:624` — `initialize_soroban_state()` (dead code, `#[allow(dead_code)]`)
-- `execution.rs:6187` — `compute_soroban_state_size_from_bucket_list()` (dead code, never called)
-
-**Fix:** Remove dead code or convert to per-type scanning if resurrected.
+Removed dead functions that used `live_entries_iter()`:
+- `initialize_module_cache()` (manager.rs)
+- `initialize_soroban_state()` (manager.rs)
+- `compute_soroban_state_size_from_bucket_list()` (execution.rs)
 
 ---
 

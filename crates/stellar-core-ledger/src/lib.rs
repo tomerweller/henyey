@@ -89,8 +89,7 @@ pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 pub use delta::{entry_to_key, EntryChange, LedgerDelta};
 pub use error::LedgerError;
 pub use execution::{
-    compute_soroban_state_size_from_bucket_list, compute_state_size_window_entry,
-    execute_soroban_parallel_phase, SorobanNetworkInfo,
+    compute_state_size_window_entry, execute_soroban_parallel_phase, SorobanNetworkInfo,
 };
 pub use header::{
     calculate_skip_values, close_time, compute_header_hash, compute_skip_list, create_next_header,
