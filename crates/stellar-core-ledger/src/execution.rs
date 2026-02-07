@@ -5709,6 +5709,17 @@ pub fn execute_soroban_parallel_phase(
             continue;
         }
 
+        // Collect current entries from the delta so clusters in this stage can
+        // see changes from prior Soroban stages.  For stage 0 there are no
+        // prior Soroban stages, so we pass an empty slice.  This matches C++
+        // GlobalParallelApplyLedgerState / collectClusterFootprintEntriesFromGlobal
+        // which accumulates per-stage Soroban changes.
+        let prior_stage_entries = if stage_idx == 0 {
+            Vec::new()
+        } else {
+            delta.current_entries()
+        };
+
         // Execute each cluster with its own executor, then merge results.
         // Clusters within a stage are independent (no footprint conflicts)
         // so they can be executed with isolated state.
@@ -5730,6 +5741,7 @@ pub fn execute_soroban_parallel_phase(
             id_pool,
             delta,
             runtime_handle.clone(),
+            &prior_stage_entries,
         )?;
 
         // Merge cluster results. Use max id_pool across clusters.
@@ -5819,6 +5831,7 @@ fn execute_single_cluster(
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<&std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
     id_pool: u64,
+    prior_stage_entries: &[LedgerEntry],
 ) -> Result<(ClusterResult, LedgerDelta, i64)> {
     let mut executor = TransactionExecutor::new(
         ledger_seq,
@@ -5835,6 +5848,13 @@ fn execute_single_cluster(
     }
     if let Some(ha) = hot_archive {
         executor.set_hot_archive(ha.clone());
+    }
+
+    // Pre-load entries from prior stages so this cluster's executor sees
+    // restorations and modifications made by earlier stages.  This matches
+    // C++ `collectClusterFootprintEntriesFromGlobal`.
+    for entry in prior_stage_entries {
+        executor.state.load_entry(entry.clone());
     }
 
     let mut results = Vec::with_capacity(cluster.len());
@@ -5944,6 +5964,7 @@ fn execute_stage_clusters(
     id_pool: u64,
     delta: &mut LedgerDelta,
     runtime_handle: Option<tokio::runtime::Handle>,
+    prior_stage_entries: &[LedgerEntry],
 ) -> Result<Vec<ClusterResult>> {
     // Compute per-cluster global offsets.
     let mut offsets = Vec::with_capacity(clusters.len());
@@ -5952,6 +5973,13 @@ fn execute_stage_clusters(
         offsets.push(offset);
         offset += cluster.len();
     }
+
+    tracing::debug!(
+        ledger_seq = ledger_seq,
+        num_clusters = clusters.len(),
+        prior_entries = prior_stage_entries.len(),
+        "execute_stage_clusters: starting"
+    );
 
     // Single-cluster fast path: execute inline, no thread overhead.
     if clusters.len() <= 1 {
@@ -5973,6 +6001,7 @@ fn execute_stage_clusters(
                 module_cache,
                 hot_archive.as_ref(),
                 id_pool,
+                prior_stage_entries,
             )?;
             delta.merge(cluster_delta)?;
             if total_fees != 0 {
@@ -5990,6 +6019,8 @@ fn execute_stage_clusters(
     let module_cache = module_cache.cloned();
     let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
         std::sync::Arc::new(clusters.to_vec());
+    let prior_entries: std::sync::Arc<Vec<LedgerEntry>> =
+        std::sync::Arc::new(prior_stage_entries.to_vec());
 
     // Build the async future that spawns per-cluster tasks and collects results.
     let spawn_and_collect = async {
@@ -6000,6 +6031,7 @@ fn execute_stage_clusters(
             let cache = module_cache.clone();
             let ha = hot_archive.clone();
             let clusters = clusters.clone();
+            let prior_entries = prior_entries.clone();
             let cluster_offset = offsets[idx];
 
             tasks.push(tokio::task::spawn_blocking(move || {
@@ -6019,6 +6051,7 @@ fn execute_stage_clusters(
                     cache.as_ref(),
                     ha.as_ref(),
                     id_pool,
+                    &prior_entries,
                 )
             }));
         }

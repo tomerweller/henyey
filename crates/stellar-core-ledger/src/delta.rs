@@ -475,6 +475,16 @@ impl LedgerDelta {
             .collect()
     }
 
+    /// Get all current entry values (created + updated).
+    ///
+    /// Used to propagate prior-stage entries to subsequent stages in parallel
+    /// Soroban execution, matching C++ `collectClusterFootprintEntriesFromGlobal`.
+    pub fn current_entries(&self) -> Vec<LedgerEntry> {
+        self.changes()
+            .filter_map(|change| change.current_entry().cloned())
+            .collect()
+    }
+
     /// Get all dead entries (deleted keys) for bucket list update.
     pub fn dead_entries(&self) -> Vec<LedgerKey> {
         self.changes()
@@ -509,9 +519,18 @@ impl LedgerDelta {
                                         },
                                     );
                                 }
-                                _ => {
+                                EntryChange::Created(_) => {
+                                    // Created + Created: a later stage re-creates the
+                                    // same entry that an earlier stage already restored
+                                    // from the hot archive.  Keep the later value.
+                                    self.changes.insert(
+                                        key_bytes,
+                                        EntryChange::Created(entry.clone()),
+                                    );
+                                }
+                                EntryChange::Updated { .. } => {
                                     return Err(LedgerError::Internal(
-                                        "invalid merge: create on existing entry".to_string(),
+                                        "invalid merge: create on updated entry".to_string(),
                                     ));
                                 }
                             }
@@ -994,15 +1013,40 @@ mod tests {
         assert_eq!(delta1.total_coins_delta(), 20);
     }
 
-    /// Merge error: create on existing non-deleted entry.
+    /// Merge Created + Created keeps the later value.
+    ///
+    /// This occurs when multiple Soroban stages restore the same entry from
+    /// the hot archive.  Stage 0's cluster creates the entry; stage 1's cluster
+    /// re-creates it.  The merge should succeed, keeping the later value.
     #[test]
-    fn test_merge_create_on_existing_created_fails() {
+    fn test_merge_created_then_created_keeps_later_value() {
         let mut delta1 = LedgerDelta::new(1);
         let mut delta2 = LedgerDelta::new(1);
 
-        let entry = create_test_account(1);
-        delta1.record_create(entry.clone()).unwrap();
-        delta2.record_create(entry).unwrap();
+        let entry_v1 = create_test_account_with_balance(1, 1_000);
+        let entry_v2 = create_test_account_with_balance(1, 2_000);
+        delta1.record_create(entry_v1).unwrap();
+        delta2.record_create(entry_v2).unwrap();
+
+        delta1.merge(delta2).unwrap();
+        assert_eq!(delta1.num_changes(), 1);
+        let changes: Vec<_> = delta1.changes().collect();
+        assert!(changes[0].is_created());
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 2_000); // later value wins
+        }
+    }
+
+    /// Merge error: create on existing updated entry.
+    #[test]
+    fn test_merge_create_on_existing_updated_fails() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let original = create_test_account(1);
+        let updated = create_test_account_with_balance(1, 2_000);
+        delta1.record_update(original, updated).unwrap();
+        delta2.record_create(create_test_account(1)).unwrap();
 
         assert!(delta1.merge(delta2).is_err());
     }
@@ -1337,5 +1381,35 @@ mod tests {
         // No entries in delta - refund is a no-op
         delta.apply_refund_to_account(&account_id, 100).unwrap();
         assert!(delta.is_empty());
+    }
+
+    // =========================================================================
+    // current_entries() tests
+    // =========================================================================
+
+    /// current_entries returns created and updated entries but not deleted.
+    #[test]
+    fn test_current_entries_includes_created_and_updated() {
+        let mut delta = LedgerDelta::new(1);
+
+        let created = create_test_account(1);
+        delta.record_create(created.clone()).unwrap();
+
+        let prev = create_test_account(2);
+        let updated = create_test_account_with_balance(2, 5_000);
+        delta.record_update(prev, updated.clone()).unwrap();
+
+        let deleted = create_test_account(3);
+        delta.record_delete(deleted).unwrap();
+
+        let entries = delta.current_entries();
+        assert_eq!(entries.len(), 2); // created + updated, not deleted
+    }
+
+    /// current_entries on empty delta returns empty.
+    #[test]
+    fn test_current_entries_empty_delta() {
+        let delta = LedgerDelta::new(1);
+        assert!(delta.current_entries().is_empty());
     }
 }
