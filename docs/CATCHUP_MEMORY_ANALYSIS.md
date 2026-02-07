@@ -57,21 +57,25 @@ Memory: ~240 MB.
 
 **Savings:** ~8.6 GB -> ~240 MB (**~8.4 GB saved**)
 
-### ISSUE 2: DiskBucket flat index — 960 MB
+### ISSUE 2: DiskBucket index memory — ~200-400 MB
 
 **File:** `crates/stellar-core-bucket/src/disk_bucket.rs`
 
-The current `DiskBucket` uses a Legacy flat index (`BTreeMap<u64, IndexEntry>`) with 16 bytes
-per key. For 60M mainnet keys across ~42 buckets: ~960 MB.
+The legacy flat `DiskBucketIndex` (`BTreeMap` per-key) was removed in favor of `LiveBucketIndex`
+which supports both `InMemoryIndex` (full key→offset map for small buckets) and `DiskIndex`
+(page-based range index + bloom filter for large buckets). The `LiveBucketIndex` is wired
+into `DiskBucket` and index persistence is available (gated by `persist_index` flag).
+
+Current memory usage depends on bucket size distribution:
+- Small buckets (< 10K entries): `InMemoryIndex` with full key map
+- Large buckets (≥ 10K entries): `DiskIndex` with pages (~60K total) + bloom filter
 
 C++ uses page-based `DiskIndex` (~10 MB) + bloom filter (~138 MB) = ~148 MB.
 
-The Rust `LiveBucketIndex` infrastructure already exists in `index.rs` with both `InMemoryIndex`
-and `DiskIndex` modes, but it is NOT connected to `DiskBucket` yet (Phase 8 in the roadmap).
+**Remaining work:** Phase 8 — Wire persisted index loading into `DiskBucket` to avoid
+full bucket scans on startup.
 
-**Fix:** Phase 8 — Connect `LiveBucketIndex` to `DiskBucket`.
-
-**Savings:** ~960 MB -> ~148 MB (**~812 MB saved**)
+**Savings:** ~960 MB (old flat index) → ~200-400 MB (current) → ~148 MB (Phase 8)
 
 ### ISSUE 3: Bucket download buffers
 
@@ -113,7 +117,7 @@ Removed dead functions that used `live_entries_iter()`:
 | Component | Current | After Issue 1 Fix | After All Fixes |
 |-----------|---------|-------------------|-----------------|
 | Dedup HashSet (soroban state) | ~8.6 GB | ~240 MB | ~240 MB |
-| DiskBucket indexes (flat) | ~960 MB | ~960 MB | ~148 MB (Phase 8) |
+| DiskBucket indexes (LiveBucketIndex) | ~200-400 MB | ~200-400 MB | ~148 MB (Phase 8) |
 | Module cache (WASM) | ~500 MB | ~500 MB | ~500 MB |
 | SQLite (offers + overhead) | ~200 MB | ~200 MB | ~200 MB |
 | Operating overhead | ~2 GB | ~2 GB | ~2 GB |
@@ -124,7 +128,7 @@ Removed dead functions that used `live_entries_iter()`:
 | Component | Estimate |
 |-----------|----------|
 | Bucket indexes | ~200-400 MB (Phase 8: ~148 MB) |
-| RandomEvictionCache | ~100 MB (configurable) |
+| RandomEvictionCache (integrated into BucketList::get) | ~100 MB (configurable) |
 | Module cache | ~500 MB |
 | SQLite | ~200 MB |
 | Operating overhead | ~1.5 GB |
@@ -137,10 +141,10 @@ Removed dead functions that used `live_entries_iter()`:
 | Priority | Issue | Savings | Effort | Dependency |
 |----------|-------|---------|--------|------------|
 | 1 | Dedup HashSet in `compute_initial_soroban_state_size` | ~8.4 GB | Small — swap `live_entries_iter()` for `scan_for_entries_of_types()` | None |
-| 2 | Phase 8: Connect `LiveBucketIndex` to `DiskBucket` | ~812 MB | Medium — plumbing exists, needs wiring | None |
+| 2 | Phase 8: Wire persisted index loading into `DiskBucket` | ~50-250 MB | Medium — persistence exists, needs startup wiring | None |
 | 3 | Streaming bucket downloads | Variable | Medium — requires streaming HTTP response to disk | None |
-| 4 | Offer fallback closures | ~8.4 GB (rare) | Small — same pattern as Issue 1 | None |
-| 5 | Dead code cleanup | N/A | Trivial | None |
+| 4 | ~~Offer fallback closures~~ | ~~~8.4 GB~~ | ~~Small~~ | FIXED |
+| 5 | ~~Dead code cleanup~~ | N/A | ~~Trivial~~ | FIXED |
 
 ---
 

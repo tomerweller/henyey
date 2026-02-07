@@ -58,6 +58,7 @@ use crate::entry::{
     get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
     ledger_entry_to_key, BucketEntry,
 };
+use crate::cache::RandomEvictionCache;
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
 };
@@ -769,6 +770,11 @@ pub struct BucketList {
     /// When set, merges at level 1+ write to disk instead of collecting in memory,
     /// reducing peak memory from O(data_size) to O(index_size).
     bucket_dir: Option<std::path::PathBuf>,
+    /// Optional entry cache for frequently-accessed keys (currently Account entries).
+    /// When active, `get()` checks the cache before scanning levels, and populates
+    /// it on miss. Cache entries are invalidated when new data is added via `add_batch()`.
+    /// Shared via `Arc` so clones of BucketList share the same cache.
+    cache: Arc<RandomEvictionCache>,
 }
 
 /// Get the LedgerEntryType from LedgerEntryData.
@@ -848,6 +854,7 @@ impl BucketList {
             levels,
             ledger_seq: 0,
             bucket_dir: None,
+            cache: Arc::new(RandomEvictionCache::new()),
         }
     }
 
@@ -928,6 +935,21 @@ impl BucketList {
         })
     }
 
+    /// Get a reference to the entry cache.
+    pub fn cache(&self) -> &Arc<RandomEvictionCache> {
+        &self.cache
+    }
+
+    /// Activate the cache if the bucket list is large enough.
+    ///
+    /// This should be called after restoring a bucket list from a history archive,
+    /// passing the total number of live entries. The cache self-activates when
+    /// the entry count exceeds `MIN_BUCKET_LIST_SIZE_FOR_CACHE` (1M entries).
+    pub fn maybe_activate_cache(&self, bucket_list_entry_count: u64) {
+        self.cache
+            .maybe_initialize(bucket_list_entry_count as usize);
+    }
+
     /// Look up an entry by its key.
     ///
     /// Searches from the newest (level 0) to oldest levels.
@@ -938,6 +960,27 @@ impl BucketList {
 
     /// Look up an entry by its key with optional debug tracing.
     pub fn get_with_debug(&self, key: &LedgerKey, debug: bool) -> Result<Option<LedgerEntry>> {
+        // Check cache first for eligible key types (currently Account only).
+        // The cache is only consulted when active (entry count >= threshold).
+        if self.cache.is_active() && RandomEvictionCache::is_cached_type(key) {
+            if let Some(cached) = self.cache.get(key) {
+                if debug {
+                    tracing::info!("Cache hit for entry");
+                }
+                return match cached.as_ref() {
+                    BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
+                    BucketEntry::Dead(_) => Ok(None),
+                    BucketEntry::Metadata(_) => {
+                        // Metadata should never be cached; fall through to level scan
+                        Ok(None)
+                    }
+                };
+            }
+            if debug {
+                tracing::info!("Cache miss for entry, scanning levels");
+            }
+        }
+
         // Search from newest to oldest (curr then snap). Pending merges (next)
         // are not part of the bucket list state yet.
         for (level_idx, level) in self.levels.iter().enumerate() {
@@ -950,6 +993,10 @@ impl BucketList {
                         entry_type = ?std::mem::discriminant(&entry),
                         "Found entry in bucket list"
                     );
+                }
+                // Populate cache on miss for eligible types
+                if self.cache.is_active() && RandomEvictionCache::is_cached_type(key) {
+                    self.cache.insert(key.clone(), entry.clone());
                 }
                 return match entry {
                     BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
@@ -967,6 +1014,10 @@ impl BucketList {
                         entry_type = ?std::mem::discriminant(&entry),
                         "Found entry in bucket list"
                     );
+                }
+                // Populate cache on miss for eligible types
+                if self.cache.is_active() && RandomEvictionCache::is_cached_type(key) {
+                    self.cache.insert(key.clone(), entry.clone());
                 }
                 return match entry {
                     BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
@@ -1266,6 +1317,30 @@ impl BucketList {
             })
             .collect();
         entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
+
+        // Update the cache for any entries being added to the bucket list.
+        // This ensures the cache stays consistent with the newest state.
+        // We insert Live/Init/Dead entries so that subsequent get() calls
+        // return the correct result without scanning levels.
+        if self.cache.is_active() {
+            for entry in &entries {
+                if let Some(key) = entry.key() {
+                    if RandomEvictionCache::is_cached_type(&key) {
+                        match entry {
+                            BucketEntry::Live(_) | BucketEntry::Init(_) => {
+                                self.cache.insert(key, entry.clone());
+                            }
+                            BucketEntry::Dead(_) => {
+                                // Remove dead entries from cache so the next get()
+                                // returns None without a stale Live hit.
+                                self.cache.remove(&key);
+                            }
+                            BucketEntry::Metadata(_) => {}
+                        }
+                    }
+                }
+            }
+        }
 
         // Create the new bucket with in-memory entries for level 0 optimization.
         // We use fresh_in_memory_only() which skips hash computation because:
@@ -1738,6 +1813,7 @@ impl BucketList {
             levels,
             ledger_seq: 0,
             bucket_dir: None,
+            cache: Arc::new(RandomEvictionCache::new()),
         })
     }
 

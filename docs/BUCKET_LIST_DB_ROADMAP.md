@@ -20,7 +20,8 @@ Significant foundational work is already in place:
 | Offer delta during ledger close | `stellar-core-ledger/src/manager.rs:1540-1576` | Complete — upserts/deletes from `EntryChange` |
 | `LiveBucketIndex` (InMemory + Disk) | `stellar-core-bucket/src/index.rs` | Complete — threshold at 10,000 entries, page size 1,024 |
 | `RandomEvictionCache` | `stellar-core-bucket/src/cache.rs` | Complete — 100 MB / 100k entry default, accounts only |
-| `BucketList::get()` point lookup | `stellar-core-bucket/src/bucket_list.rs:789` | Complete — searches levels 0-10 newest-first |
+| `BucketList::get()` point lookup | `stellar-core-bucket/src/bucket_list.rs` | Complete — searches levels 0-10 newest-first, cache-integrated |
+| Cache integration into BucketList | `stellar-core-bucket/src/bucket_list.rs` | Complete — cache checked before level scan, populated on miss, invalidated on add_batch |
 | Index persistence (save/load) | `stellar-core-bucket/src/index_persistence.rs` | Complete — bincode format, version 2; bloom filter + asset_pool_map persisted |
 
 ## Phase Summary
@@ -141,12 +142,21 @@ hierarchy) but the observable semantics are identical.
    - Only caches `Account` entries (hot path for TX validation)
    - Minimum bucket list size for cache activation: 1,000,000 entries
 
-3. **BucketList::get()** (`bucket_list.rs:789`)
-   - Searches levels 0-10 in order (newest first)
+3. **BucketList::get()** (`bucket_list.rs`)
+   - Checks `RandomEvictionCache` first for eligible key types (Account)
+   - On cache miss, searches levels 0-10 in order (newest first)
    - Checks `curr` then `snap` at each level
    - Returns first live match; dead entries return `None`
+   - Populates cache on miss for eligible key types
 
-4. **LedgerManager cache-miss fallback** (`manager.rs`)
+4. **Cache integration** (`bucket_list.rs`)
+   - `BucketList` holds an `Arc<RandomEvictionCache>` — shared across clones
+   - `get_with_debug()` checks cache before level scan, inserts on miss
+   - `add_batch()` invalidates/updates cache for entries being written
+   - `maybe_activate_cache(entry_count)` activates when bucket list has ≥1M entries
+   - Cache is inactive by default — zero overhead for small bucket lists
+
+5. **LedgerManager cache-miss fallback** (`manager.rs`)
    - `create_snapshot()` provides a `lookup_fn` closure that falls back to bucket list
      point lookups when the entry cache misses
    - `load_entry()` populates the entry cache on demand from bucket list lookups
@@ -407,41 +417,33 @@ enum variants), expand from ~21 GB on disk to 60+ GB in memory.
 
 **Status: Not started**
 
-**Why:** The `DiskBucket` flat index (`BTreeMap<u64, IndexEntry>`) stores one entry per
-key (16 bytes each). For 60M mainnet keys, that's ~960 MB of index. The existing `index.rs`
-`DiskIndex` uses pages (~1024 entries/page) reducing the index to ~60K entries (~10 MB)
-plus a bloom filter (~138 MB). The `index.rs` code is complete but not connected to `DiskBucket`.
+**Why:** `DiskBucket` currently uses `LiveBucketIndex` which was wired up in commit `9bd074a`
+(legacy flat `DiskBucketIndex` was removed). The `LiveBucketIndex` provides both `InMemoryIndex`
+(for small buckets) and `DiskIndex` (page-based range + bloom filter for large buckets).
+However, `DiskBucket` always builds a `LiveBucketIndex` from scratch when loaded; it should
+use persisted indexes when available to avoid full bucket scans on startup.
+
+**Note:** The `RandomEvictionCache` has been connected to `BucketList::get()` (not to
+individual `DiskBucket` instances) — cache check happens before the level-by-level scan,
+and cache is populated on miss. This is a simpler integration point than per-bucket caching.
 
 ### What Needs to Change
 
 **Files:** `stellar-core-bucket/src/disk_bucket.rs`, `src/index.rs`, `src/index_persistence.rs`
 
-1. **Refactor DiskBucket to use `index.rs` indexes:**
-   - Small buckets (< `INDEX_CUTOFF` entries): `InMemoryIndex` from `index.rs`
-     - `BTreeMap<Vec<u8>, u64>` mapping key bytes → file offset
-     - Bloom filter for fast negative lookups
-   - Large buckets (≥ `INDEX_CUTOFF`): `DiskIndex` from `index.rs`
-     - Page-based: `Vec<(RangeEntry, u64)>` with configurable page size (default 1024)
-     - `BinaryFuseFilter` for fast negative lookups
-     - Binary search to find candidate page → seek to page offset → scan within page
+1. **Wire `DiskBucket` to use persisted `LiveBucketIndex`:**
+   - On load: check for `.bucket.index` file → deserialize via `index_persistence.rs`
+   - On miss: rebuild index by streaming through `.xdr` file (current behavior)
+   - On build: save index to `.bucket.index` file for next load
 
-2. **Connect `RandomEvictionCache`** (`cache.rs`) **to DiskBucket:**
-   - Per-bucket bounded cache of recently-accessed ACCOUNT entries
-   - Size proportional to bucket's share of total ACCOUNT entry bytes
-   - Total cache memory configurable (default 256 MB)
-   - Matches C++ `RandomEvictionCache` behavior
+2. **Optimize `DiskBucket::get()` for large buckets:**
+   - Check bloom filter → if definitely not present, return None
+   - Binary search `pages` vector → find candidate page with matching range
+   - Seek to page offset in `.xdr` file, scan entries within page
 
-3. **Lookup path for large DiskBacked bucket:**
-   1. Check `RandomEvictionCache` → if hit, return immediately
-   2. Check bloom filter → if definitely not present, return None
-   3. Binary search `pages` vector → find candidate page with matching range
-   4. Seek to page offset in `.xdr` file, scan entries within page
-   5. If found and ACCOUNT type, add to `RandomEvictionCache`
-
-4. **Index persistence integration:**
+3. **Index persistence integration:**
    - `BucketManager` saves DiskIndex as `<hash>.bucket.index` on creation
-   - On load: check for `.index` file → deserialize; otherwise rebuild from `.xdr`
-   - Uses existing `index_persistence.rs` serialization
+   - Uses existing `index_persistence.rs` serialization (version 2, with bloom filter)
 
 ### Memory After Phase 8
 
