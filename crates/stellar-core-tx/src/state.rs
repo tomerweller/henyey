@@ -21,6 +21,11 @@ use crate::{Result, TxError};
 /// Callback type for lazily loading ledger entries from the bucket list.
 type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>>;
 type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>>;
+/// Callback type for loading all offers by (account, asset) from the
+/// authoritative offer store.  Used by `remove_offers_by_account_and_asset`
+/// to mirror C++ `loadOffersByAccountAndAsset` which queries the SQL database.
+type OffersByAccountAssetLoaderFn =
+    dyn Fn(&AccountId, &Asset) -> Result<Vec<LedgerEntry>> + Send + Sync;
 
 /// Soroban state extracted from LedgerStateManager for cheap cloning.
 ///
@@ -582,6 +587,13 @@ pub struct LedgerStateManager {
     /// through the bucket list. Used by `ensure_offer_entries_loaded` to batch
     /// account + trustline lookups for offer sellers.
     batch_entry_loader: Option<Arc<BatchEntryLoaderFn>>,
+    /// Optional callback to load all offers for a given (account, asset) pair
+    /// from the authoritative offer store.  C++ stellar-core uses SQL
+    /// `loadOffersByAccountAndAsset` which always returns every matching offer.
+    /// Without this loader the in-memory `account_asset_offers` index would
+    /// only contain offers that happened to be loaded during prior TX execution,
+    /// causing non-deterministic offer removal in `SetTrustLineFlags` / `AllowTrust`.
+    offers_by_account_asset_loader: Option<Arc<OffersByAccountAssetLoaderFn>>,
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +672,7 @@ impl LedgerStateManager {
             account_asset_offers: HashMap::new(),
             entry_loader: None,
             batch_entry_loader: None,
+            offers_by_account_asset_loader: None,
         }
     }
 
@@ -917,6 +930,19 @@ impl LedgerStateManager {
         self.batch_entry_loader = Some(loader);
     }
 
+    /// Set the loader that returns all offers for a given (account, asset) pair.
+    ///
+    /// This mirrors C++ `loadOffersByAccountAndAsset` and is used by
+    /// `remove_offers_by_account_and_asset` (called during authorization
+    /// revocation) to ensure ALL matching offers are found, not just those
+    /// that happened to be loaded during prior TX execution.
+    pub fn set_offers_by_account_asset_loader(
+        &mut self,
+        loader: Arc<OffersByAccountAssetLoaderFn>,
+    ) {
+        self.offers_by_account_asset_loader = Some(loader);
+    }
+
     /// Batch-load all entries needed to cross an offer (seller account + trustlines).
     ///
     /// This is significantly faster than separate `ensure_account_loaded` +
@@ -1116,6 +1142,7 @@ impl LedgerStateManager {
             self.entry_last_modified.clear();
         }
         self.entry_loader = None;
+        self.offers_by_account_asset_loader = None;
 
         // Clear all transaction-level state
         self.op_entry_snapshots.clear();
@@ -2339,6 +2366,28 @@ impl LedgerStateManager {
         self.offers.get(&(seller_key, offer_id))
     }
 
+    /// Get all offers for an account that buy or sell a specific asset.
+    ///
+    /// Uses the state's own `account_asset_offers` secondary index, which is
+    /// maintained as offers are loaded, created, modified, and deleted. This is
+    /// more reliable than the manager's index (which may be stale across ledgers).
+    pub fn get_offers_by_account_and_asset(
+        &self,
+        account_id: &AccountId,
+        asset: &Asset,
+    ) -> Vec<OfferEntry> {
+        let account_key = account_id_to_bytes(account_id);
+        let asset_key = AssetKey::from_asset(asset);
+        self.account_asset_offers
+            .get(&(account_key, asset_key))
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|&id| self.offers.get(&(account_key, id)).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Get a mutable reference to an offer.
     pub fn get_offer_mut(
         &mut self,
@@ -2566,11 +2615,60 @@ impl LedgerStateManager {
     /// This is used when revoking authorization on a trustline.
     /// Returns the list of OfferEntry that were removed (before deletion) so callers can
     /// handle liability release, subentry updates, and sponsorship adjustments.
+    ///
+    /// Mirrors C++ `removeOffersByAccountAndAsset` which calls
+    /// `loadOffersByAccountAndAsset` to query the SQL database for ALL
+    /// matching offers.  We first load all matching offers from the
+    /// authoritative offer store so the in-memory index is complete.
     pub fn remove_offers_by_account_and_asset(
         &mut self,
         account_id: &AccountId,
         asset: &Asset,
     ) -> Vec<OfferEntry> {
+        // Load all matching offers from the authoritative source so the
+        // in-memory index has every offer that exists, not just those that
+        // happened to be loaded during prior TX execution.
+        if let Some(loader) = self.offers_by_account_asset_loader.take() {
+            match loader(account_id, asset) {
+                Ok(entries) => {
+                    tracing::debug!(
+                        ledger_seq = self.ledger_seq,
+                        account = ?account_id,
+                        loader_entries = entries.len(),
+                        existing_offers = self.offers.len(),
+                        "remove_offers_by_account_and_asset: loader returned entries"
+                    );
+                    for entry in entries {
+                        if let LedgerEntryData::Offer(ref offer) = entry.data {
+                            let seller_key = account_id_to_bytes(&offer.seller_id);
+                            let key = (seller_key, offer.offer_id);
+                            // Only load offers not already tracked in state.
+                            if !self.offers.contains_key(&key) {
+                                tracing::info!(
+                                    ledger_seq = self.ledger_seq,
+                                    offer_id = offer.offer_id,
+                                    "remove_offers_by_account_and_asset: loading NEW offer from authoritative store"
+                                );
+                                self.load_entry(entry);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "remove_offers_by_account_and_asset: loader failed"
+                    );
+                }
+            }
+            self.offers_by_account_asset_loader = Some(loader);
+        } else {
+            tracing::debug!(
+                ledger_seq = self.ledger_seq,
+                "remove_offers_by_account_and_asset: NO loader available"
+            );
+        }
+
         let account_key = account_id_to_bytes(account_id);
         let asset_key = AssetKey::from_asset(asset);
 
@@ -6792,5 +6890,53 @@ mod tests {
 
         // This is the key check: is_entry_deleted prevents footprint loading
         // from reloading the entry from bucket list
+    }
+
+    /// Regression test: remove_offers_by_account_and_asset must use the
+    /// authoritative loader to discover offers not yet in the in-memory index.
+    ///
+    /// Mirrors C++ `loadOffersByAccountAndAsset` which queries the SQL database
+    /// for ALL matching offers regardless of whether they were previously accessed.
+    /// Without the loader, offers that exist in the bucket list but were never
+    /// loaded into the state manager would be silently skipped, causing
+    /// non-deterministic authorization revocation.
+    #[test]
+    fn test_remove_offers_by_account_and_asset_uses_loader() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let seller1 = create_test_account_id(1);
+
+        // Create offer1 directly (simulating it being loaded from bucket list
+        // during a prior TX).
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        manager.create_offer(offer1);
+        manager.commit();
+
+        // offer2 exists in the "authoritative store" but has NOT been loaded
+        // into the state manager's in-memory index.
+        let offer2 = create_test_offer_with_assets(1, 200, eur_asset(), usd_asset());
+
+        // Set up the loader to return offer2 (simulating the manager's
+        // complete offer store returning all offers for this account+asset).
+        let offer2_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Offer(offer2),
+            ext: LedgerEntryExt::V0,
+        };
+        let offer2_clone = offer2_entry.clone();
+        manager.set_offers_by_account_asset_loader(Arc::new(move |_account_id, _asset| {
+            Ok(vec![offer2_clone.clone()])
+        }));
+
+        // Before the fix, this would only find offer1 (the one already loaded).
+        // With the fix, it uses the loader to discover offer2 as well.
+        let removed = manager.remove_offers_by_account_and_asset(&seller1, &usd_asset());
+
+        // Both offers should be removed: offer1 (Native→USD) and offer2 (EUR→USD)
+        let removed_ids: HashSet<i64> = removed.iter().map(|o| o.offer_id).collect();
+        assert_eq!(
+            removed_ids,
+            HashSet::from([100, 200]),
+            "Both the pre-loaded offer and the loader-discovered offer should be removed"
+        );
     }
 }

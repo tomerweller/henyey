@@ -1447,23 +1447,27 @@ impl TransactionExecutor {
         Ok(())
     }
 
-    /// Load all offers by an account for a specific asset.
+    /// Load dependencies (trustlines, accounts) for all offers by an account for a specific asset.
     ///
     /// This is used when revoking trustline authorization - all offers for the
-    /// account/asset pair must be removed. The offers must first be loaded from
-    /// the snapshot so they can be deleted by the trustline flags operation.
+    /// account/asset pair must be removed. Their dependencies (seller accounts
+    /// and trustlines for selling/buying assets) must be loaded so that
+    /// `release_offer_liabilities` can update them.
+    ///
+    /// Uses the state's own `account_asset_offers` index (which is maintained
+    /// as offers are loaded/created/modified/deleted) rather than the manager's
+    /// `offer_account_asset_index` (which is only built at startup and can become
+    /// stale across ledgers).
     pub fn load_offers_by_account_and_asset(
         &mut self,
         snapshot: &SnapshotHandle,
         account_id: &AccountId,
         asset: &Asset,
     ) -> Result<()> {
-        let entries = snapshot.offers_by_account_and_asset(account_id, asset)?;
-        for entry in entries {
-            let LedgerEntryData::Offer(ref offer) = entry.data else {
-                continue;
-            };
-            // Check if already loaded
+        // Get matching offers from the state's own index, which is always up-to-date.
+        // All offers are loaded into state by load_orderbook_offers() before any TX executes.
+        let offers = self.state.get_offers_by_account_and_asset(account_id, asset);
+        for offer in &offers {
             let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
                 seller_id: offer.seller_id.clone(),
                 offer_id: offer.offer_id,
@@ -1474,18 +1478,13 @@ impl TransactionExecutor {
                 continue;
             }
 
-            // Always load dependencies (trustlines) for the offer, even if offer is already in state.
+            // Load dependencies (trustlines, accounts) for the offer.
             // This is critical because:
             // 1. Offers are cached in state across transactions
-            // 2. But state is cleared between transactions (except offers)
+            // 2. But non-offer state is cleared between transactions
             // 3. When revoking authorization, we need to release liabilities on trustlines
             // 4. Those trustlines must be loaded even if the offer was cached from a previous TX
             self.load_offer_dependencies(snapshot, offer)?;
-
-            // Only load the offer entry if not already in state
-            if self.state.get_entry(&offer_key).is_none() {
-                self.state.load_entry(entry);
-            }
         }
         Ok(())
     }
@@ -2703,6 +2702,21 @@ impl TransactionExecutor {
                     .load_entries(keys)
                     .map_err(|e| stellar_core_tx::TxError::Internal(e.to_string()))
             }));
+
+        // Set up authoritative offers-by-(account, asset) loader.
+        // C++ stellar-core uses SQL `loadOffersByAccountAndAsset` which always
+        // returns every matching offer.  Without this loader, the in-memory
+        // index only contains offers that happened to be loaded during prior TX
+        // execution, causing non-deterministic offer removal in SetTrustLineFlags.
+        let snapshot_for_offers = snapshot.clone();
+        self.state
+            .set_offers_by_account_asset_loader(std::sync::Arc::new(
+                move |account_id, asset| {
+                    snapshot_for_offers
+                        .offers_by_account_and_asset(account_id, asset)
+                        .map_err(|e| stellar_core_tx::TxError::Internal(e.to_string()))
+                },
+            ));
 
         // Execute operations
         let mut operation_results = Vec::new();

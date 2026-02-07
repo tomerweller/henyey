@@ -2012,6 +2012,12 @@ async fn cmd_verify_execution(
                         if our_bl_hash != expected_bl_hash {
                             println!("    Bucket list hash: ours={} expected={}",
                                 our_bl_hash.to_hex(), expected_bl_hash.to_hex());
+                            // Print per-level bucket hashes for debugging
+                            let level_info = ledger_manager.bucket_list_levels();
+                            for (i, (curr_hash, snap_hash)) in level_info.iter().enumerate() {
+                                println!("      Level {}: curr={} snap={}",
+                                    i, curr_hash.to_hex(), snap_hash.to_hex());
+                            }
                         }
                         // Show all other header fields that differ
                         if result.tx_result_hash() == expected_tx_result_hash {

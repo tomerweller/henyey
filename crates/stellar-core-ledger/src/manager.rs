@@ -86,6 +86,19 @@ fn index_offer_insert(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::c
         .insert(offer.offer_id);
 }
 
+/// Remove an offer from the (account, asset) secondary index.
+fn index_offer_remove(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::curr::OfferEntry) {
+    let seller = account_id_bytes(&offer.seller_id);
+    let selling_key = AssetKey::from_asset(&offer.selling);
+    let buying_key = AssetKey::from_asset(&offer.buying);
+    if let Some(set) = index.get_mut(&(seller, selling_key)) {
+        set.remove(&offer.offer_id);
+    }
+    if let Some(set) = index.get_mut(&(seller, buying_key)) {
+        set.remove(&offer.offer_id);
+    }
+}
+
 /// Prepend a fee event to transaction metadata.
 ///
 /// This adds a "NewFee" event at the beginning of the transaction's event list
@@ -1386,7 +1399,7 @@ impl LedgerManager {
             }
         }
 
-        // Update in-memory offer store with offer changes
+        // Update in-memory offer store and secondary index with offer changes
         if *self.offers_initialized.read() {
             let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
             let mut offer_deletes: Vec<i64> = Vec::new();
@@ -1404,26 +1417,38 @@ impl LedgerManager {
                             offer_upserts.push(entry.clone());
                         }
                     }
-                    EntryChange::Updated { current, .. } => {
+                    EntryChange::Updated { current, previous } => {
                         if matches!(current.data, LedgerEntryData::Offer(_)) {
                             offer_upserts.push(current.as_ref().clone());
                         }
+                        // For updates, remove old index entries (asset pair may have changed)
+                        if let LedgerEntryData::Offer(ref old_offer) = previous.data {
+                            let mut idx = self.offer_account_asset_index.write();
+                            index_offer_remove(&mut idx, old_offer);
+                        }
                     }
-                    EntryChange::Deleted { .. } => {
+                    EntryChange::Deleted { previous } => {
                         // Collect offer ID for deletion
                         if let LedgerKey::Offer(offer_key) = &key {
                             offer_deletes.push(offer_key.offer_id);
+                        }
+                        // Remove from secondary index
+                        if let LedgerEntryData::Offer(ref old_offer) = previous.data {
+                            let mut idx = self.offer_account_asset_index.write();
+                            index_offer_remove(&mut idx, old_offer);
                         }
                     }
                 }
             }
 
-            // Update in-memory offer store
+            // Update in-memory offer store and secondary index
             if !offer_upserts.is_empty() || !offer_deletes.is_empty() {
                 let mut store = self.offer_store.write();
+                let mut idx = self.offer_account_asset_index.write();
                 for entry in &offer_upserts {
                     if let LedgerEntryData::Offer(ref offer) = entry.data {
                         store.insert(offer.offer_id, entry.clone());
+                        index_offer_insert(&mut idx, offer);
                     }
                 }
                 for offer_id in &offer_deletes {
@@ -2534,7 +2559,7 @@ impl<'a> LedgerCloseContext<'a> {
                 Hash256::from_bytes(bytes)
             };
 
-            // Temporary: dump per-entry details for upgrade ledgers
+            // Temporary: dump per-entry details for debugging
             if self.upgrade_ctx.has_config_upgrades() {
                 use sha2::{Digest as _, Sha256};
                 for (i, entry) in live_entries.iter().enumerate() {
