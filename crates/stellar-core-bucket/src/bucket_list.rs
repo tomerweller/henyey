@@ -230,12 +230,36 @@ impl AsyncMergeHandle {
                     protocol_version,
                     normalize_init,
                 ) {
-                    Ok((_hash, entry_count)) => {
+                    Ok((hash, entry_count)) => {
                         if entry_count == 0 {
                             let _ = std::fs::remove_file(&temp_path);
                             Ok(Bucket::empty())
                         } else {
-                            Bucket::from_xdr_file_disk_backed(&temp_path)
+                            // Rename the temp file to its permanent canonical path
+                            // ({hash}.bucket.xdr) so that restart recovery can find
+                            // it by hash. Without this rename the file stays at
+                            // merge-tmp-{pid}-{N}.xdr and is invisible to
+                            // load_last_known_ledger().
+                            let permanent_path = dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                            if !permanent_path.exists() {
+                                match std::fs::rename(&temp_path, &permanent_path) {
+                                    Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            temp = %temp_path.display(),
+                                            dest = %permanent_path.display(),
+                                            "Failed to rename merge output to permanent path, using temp path"
+                                        );
+                                        Bucket::from_xdr_file_disk_backed(&temp_path)
+                                    }
+                                }
+                            } else {
+                                // Permanent file already exists (e.g. from catchup);
+                                // remove temp and load from the permanent path.
+                                let _ = std::fs::remove_file(&temp_path);
+                                Bucket::from_xdr_file_disk_backed(&permanent_path)
+                            }
                         }
                     }
                     Err(e) => {
@@ -1500,6 +1524,29 @@ impl BucketList {
         self.levels[0].prepare_first_level(protocol_version, new_bucket)?;
         self.levels[0].commit();
 
+        // Ensure all curr/snap buckets have a permanent file on disk so that
+        // restart recovery can locate them by hash.  Level 0 uses an in-memory
+        // merge whose result has no backing file; writing it here means the
+        // persisted HAS always references files that exist.
+        if let Some(ref dir) = self.bucket_dir {
+            for level in &self.levels {
+                for bucket in [&level.curr, &level.snap] {
+                    if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
+                        let permanent = dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
+                        if !permanent.exists() {
+                            if let Err(e) = bucket.save_to_xdr_file(&permanent) {
+                                tracing::warn!(
+                                    error = %e,
+                                    hash = %bucket.hash().to_hex(),
+                                    "Failed to persist in-memory bucket to disk"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1916,7 +1963,7 @@ impl BucketList {
                             // loading all entries into memory. Critical for mainnet
                             // where higher-level bucket merges can be tens of GB.
                             let temp_path = temp_merge_path(dir);
-                            let (_hash, entry_count) = merge_buckets_to_file(
+                            let (hash, entry_count) = merge_buckets_to_file(
                                 &input_curr,
                                 &input_snap,
                                 &temp_path,
@@ -1928,7 +1975,22 @@ impl BucketList {
                                 let _ = std::fs::remove_file(&temp_path);
                                 Bucket::empty()
                             } else {
-                                Bucket::from_xdr_file_disk_backed(&temp_path)?
+                                // Rename to permanent canonical path for restart recovery.
+                                let permanent_path = dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                                if !permanent_path.exists() {
+                                    if let Err(e) = std::fs::rename(&temp_path, &permanent_path) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Failed to rename restart merge output, using temp path"
+                                        );
+                                        Bucket::from_xdr_file_disk_backed(&temp_path)?
+                                    } else {
+                                        Bucket::from_xdr_file_disk_backed(&permanent_path)?
+                                    }
+                                } else {
+                                    let _ = std::fs::remove_file(&temp_path);
+                                    Bucket::from_xdr_file_disk_backed(&permanent_path)?
+                                }
                             }
                         } else {
                             merge_buckets_with_options_and_shadows(

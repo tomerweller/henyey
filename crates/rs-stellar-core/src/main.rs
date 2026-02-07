@@ -1163,6 +1163,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             let has = build_history_archive_state(
                 checkpoint,
                 &bucket_list,
+                None,
                 Some(config.network.passphrase.clone()),
             )?;
             let root_path = publish_dir.join(root_has_path());
@@ -1191,6 +1192,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             let has = build_history_archive_state(
                 checkpoint,
                 &bucket_list,
+                None,
                 Some(config.network.passphrase.clone()),
             )?;
             let root_path = path.join(root_has_path());

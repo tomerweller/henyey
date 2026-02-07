@@ -124,6 +124,7 @@ pub struct PublishManager {
 pub fn build_history_archive_state(
     ledger_seq: u32,
     bucket_list: &BucketList,
+    hot_archive_bucket_list: Option<&stellar_core_bucket::HotArchiveBucketList>,
     network_passphrase: Option<String>,
 ) -> Result<HistoryArchiveState> {
     let current_buckets: Vec<HASBucketLevel> = bucket_list
@@ -148,13 +149,24 @@ pub fn build_history_archive_state(
         })
         .collect();
 
+    let hot_archive_buckets = hot_archive_bucket_list.map(|habl| {
+        habl.levels()
+            .iter()
+            .map(|level| HASBucketLevel {
+                curr: level.curr.hash().to_hex(),
+                snap: level.snap.hash().to_hex(),
+                next: HASBucketNext::default(),
+            })
+            .collect()
+    });
+
     Ok(HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core".to_string()),
         current_ledger: ledger_seq,
         network_passphrase,
         current_buckets,
-        hot_archive_buckets: None,
+        hot_archive_buckets,
     })
 }
 
@@ -466,6 +478,7 @@ impl PublishManager {
         build_history_archive_state(
             checkpoint_ledger,
             bucket_list,
+            None,
             self.config.network_passphrase.clone(),
         )
     }

@@ -403,6 +403,16 @@ impl LedgerManager {
         self.bucket_list.read()
     }
 
+    /// Get a read lock on the hot archive bucket list.
+    ///
+    /// This is used during HAS serialization to capture the hot archive state
+    /// for restart recovery (protocol >= 23).
+    pub fn hot_archive_bucket_list(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, Option<HotArchiveBucketList>> {
+        self.hot_archive_bucket_list.read()
+    }
+
     /// Initialize the ledger from bucket list state.
     ///
     /// This is used during catchup from history archives.

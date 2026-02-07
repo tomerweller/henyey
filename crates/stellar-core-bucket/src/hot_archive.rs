@@ -480,6 +480,34 @@ impl HotArchiveBucket {
         }
     }
 
+    /// Save this bucket to an uncompressed XDR file.
+    ///
+    /// For InMemory buckets, serializes entries with record marks.
+    /// For DiskBacked buckets, copies the existing file.
+    /// The resulting file will hash to `self.hash()`.
+    pub fn save_to_xdr_file(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+
+        match &self.storage {
+            HotArchiveStorage::InMemory { .. } => {
+                let bytes = self.to_xdr_bytes()?;
+                let mut file = std::fs::File::create(&path)?;
+                use std::io::Write;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
+            HotArchiveStorage::DiskBacked {
+                path: source_path, ..
+            } => {
+                if source_path != &path {
+                    std::fs::copy(source_path, &path)?;
+                }
+            }
+        }
+
+        Ok(path)
+    }
+
     /// Create a disk-backed hot archive bucket from an existing uncompressed XDR file.
     ///
     /// Streams through the file to build an index without loading all entries into memory.
@@ -1097,10 +1125,8 @@ impl HotArchiveBucketList {
         }
 
         // Convert flat array to (curr, snap) pairs
-        let pairs: Vec<(Hash256, Hash256)> = hashes
-            .chunks(2)
-            .map(|chunk| (chunk[0], chunk[1]))
-            .collect();
+        let pairs: Vec<(Hash256, Hash256)> =
+            hashes.chunks(2).map(|chunk| (chunk[0], chunk[1])).collect();
 
         // Use default next states (all state=0, no pending merges)
         let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];

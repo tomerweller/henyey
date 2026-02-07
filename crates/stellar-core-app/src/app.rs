@@ -927,6 +927,7 @@ impl App {
 
         let mut current_seq = latest;
         let mut checked = 0u32;
+        let mut has_gap = false;
         while current_seq > 0 && checked < VERIFY_DEPTH {
             let current = db
                 .get_ledger_header(current_seq)?
@@ -938,6 +939,7 @@ impl App {
                     latest_seq = latest,
                     "Ledger header chain has a gap; skipping deeper integrity checks"
                 );
+                has_gap = true;
                 break;
             };
             let prev_hash = compute_header_hash(&prev)?;
@@ -946,15 +948,21 @@ impl App {
             checked += 1;
         }
 
-        let latest_header = db
-            .get_ledger_header(latest)?
-            .ok_or_else(|| anyhow::anyhow!("Missing latest ledger header at {}", latest))?;
-        verify_skip_list(&latest_header, |seq| {
-            db.get_ledger_header(seq)
-                .ok()
-                .flatten()
-                .and_then(|header| compute_header_hash(&header).ok())
-        })?;
+        // Skip list verification is only meaningful when we have a contiguous
+        // header chain.  After catchup with gaps the skip list may reference
+        // ledger sequences that were stored in a different catchup epoch,
+        // producing false mismatches.
+        if !has_gap {
+            let latest_header = db
+                .get_ledger_header(latest)?
+                .ok_or_else(|| anyhow::anyhow!("Missing latest ledger header at {}", latest))?;
+            verify_skip_list(&latest_header, |seq| {
+                db.get_ledger_header(seq)
+                    .ok()
+                    .flatten()
+                    .and_then(|header| compute_header_hash(&header).ok())
+            })?;
+        }
 
         Ok(())
     }
@@ -1476,9 +1484,39 @@ impl App {
         // reconstruct the bucket list without re-downloading from archives.
         let has_json = {
             let bucket_list = self.ledger_manager.bucket_list();
+            let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
+            let hot_archive_ref = hot_archive_guard.as_ref();
+
+            // Ensure hot archive buckets are persisted to disk for restart recovery.
+            // Hot archive merges are all in-memory, so after each close the curr/snap
+            // buckets may have no backing file.
+            if let Some(habl) = hot_archive_ref {
+                let bucket_dir = self.config.database.path
+                    .parent()
+                    .unwrap_or(&self.config.database.path)
+                    .join("buckets");
+                for level in habl.levels() {
+                    for bucket in [&level.curr, &level.snap] {
+                        if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
+                            let permanent = bucket_dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
+                            if !permanent.exists() {
+                                if let Err(e) = bucket.save_to_xdr_file(&permanent) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        hash = %bucket.hash().to_hex(),
+                                        "Failed to persist in-memory hot archive bucket to disk"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let has = build_history_archive_state(
                 header.ledger_seq,
                 &bucket_list,
+                hot_archive_ref,
                 Some(self.config.network.passphrase.clone()),
             )
             .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
@@ -1597,16 +1635,55 @@ impl App {
         let header_hash = compute_header_hash(&header)
             .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;
 
-        // Step 5: Verify all bucket files exist on disk
-        let all_hashes = has.unique_bucket_hashes();
-        let missing = self.bucket_manager.verify_buckets_exist(&all_hashes);
+        // Step 5: Verify essential bucket files exist on disk.
+        // We only require curr/snap hashes — pending merge outputs (next.output)
+        // are optional; if missing we'll discard the pending merge state.
+        let mut essential_hashes: Vec<Hash256> = has.bucket_hash_pairs()
+            .iter()
+            .flat_map(|(curr, snap)| [*curr, *snap])
+            .filter(|h| !h.is_zero())
+            .collect();
+        // Also include hot archive bucket hashes
+        if let Some(hot_pairs) = has.hot_archive_bucket_hash_pairs() {
+            for (curr, snap) in &hot_pairs {
+                if !curr.is_zero() {
+                    essential_hashes.push(*curr);
+                }
+                if !snap.is_zero() {
+                    essential_hashes.push(*snap);
+                }
+            }
+        }
+        let missing = self.bucket_manager.verify_buckets_exist(&essential_hashes);
         if !missing.is_empty() {
             tracing::warn!(
                 missing_count = missing.len(),
                 first_missing = %missing[0].to_hex(),
-                "Missing bucket files on disk, cannot restore"
+                "Missing essential bucket files on disk, cannot restore"
             );
             return Ok(false);
+        }
+
+        // Step 5b: Check which pending merge outputs are available.
+        // If a next.output hash is missing on disk, downgrade that level's
+        // merge state so restore_from_has doesn't try to load it.
+        let mut has = has;
+        for level in &mut has.current_buckets {
+            if level.next.state == 1 {
+                // state 1 = FB_HASH_OUTPUT (merge completed, output hash known)
+                if let Some(ref output_hex) = level.next.output {
+                    if let Ok(hash) = Hash256::from_hex(output_hex) {
+                        if !hash.is_zero() && !self.bucket_manager.bucket_exists(&hash) {
+                            tracing::info!(
+                                output = %hash.to_hex(),
+                                "Pending merge output not on disk, discarding merge state"
+                            );
+                            level.next.state = 0;
+                            level.next.output = None;
+                        }
+                    }
+                }
+            }
         }
 
         // Step 6: Reconstruct live BucketList from persisted HAS
