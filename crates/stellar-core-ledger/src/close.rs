@@ -526,12 +526,10 @@ fn sorted_stages_for_parallel(
         for cluster in stage.iter_mut() {
             cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
         }
-        stage.sort_by(|a, b| {
-            if a.is_empty() || b.is_empty() {
-                return a.len().cmp(&b.len());
-            }
-            apply_sort_cmp(&a[0], &b[0], &set_hash)
-        });
+        // C++ does NOT sort clusters within a stage. Clusters are independent,
+        // so their execution order doesn't matter, and the original XDR order
+        // is preserved. Sorting clusters would change the transaction result
+        // ordering and produce a different result hash.
     }
 
     stage_vec.sort_by(|a, b| {
