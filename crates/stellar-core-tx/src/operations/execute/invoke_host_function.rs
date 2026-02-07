@@ -194,6 +194,7 @@ fn execute_contract_invocation(
         &soroban_data.resources.footprint,
         &soroban_data.ext,
         context.sequence,
+        hot_archive,
     ) {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::EntryArchived,
@@ -1161,6 +1162,7 @@ fn footprint_has_unrestored_archived_entries(
     footprint: &stellar_xdr::curr::LedgerFootprint,
     ext: &stellar_xdr::curr::SorobanTransactionDataExt,
     current_ledger: u32,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
 ) -> bool {
     let mut archived_rw = std::collections::HashSet::new();
     if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resources_ext) = ext {
@@ -1172,13 +1174,13 @@ fn footprint_has_unrestored_archived_entries(
     if footprint
         .read_only
         .iter()
-        .any(|key| is_archived_contract_entry(state, key, current_ledger))
+        .any(|key| is_archived_contract_entry(state, key, current_ledger, hot_archive))
     {
         return true;
     }
 
     for (index, key) in footprint.read_write.iter().enumerate() {
-        if !is_archived_contract_entry(state, key, current_ledger) {
+        if !is_archived_contract_entry(state, key, current_ledger, hot_archive) {
             continue;
         }
         if !archived_rw.contains(&index) {
@@ -1189,46 +1191,60 @@ fn footprint_has_unrestored_archived_entries(
     false
 }
 
+/// Check if a footprint entry refers to an archived (evicted) contract entry.
+///
+/// Parity: InvokeHostFunctionOpFrame.cpp `addReads()` lines 378-445
+///
+/// The check follows the C++ logic:
+/// 1. Look up the TTL in the live state. If found and expired → archived.
+/// 2. If TTL not found in live state (entry was evicted), check the hot
+///    archive (P23+). If found there → archived.
 fn is_archived_contract_entry(
     state: &LedgerStateManager,
     key: &LedgerKey,
     current_ledger: u32,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
 ) -> bool {
-    // First, check if this is a temporary entry. Temporary entries with expired TTLs
-    // are treated as if they don't exist, not as archived (per C++ stellar-core).
-    // Only persistent entries (ContractCode or ContractData with durability=Persistent)
-    // can be "archived".
-    let is_temporary = matches!(
-        key,
-        LedgerKey::ContractData(cd) if cd.durability == stellar_xdr::curr::ContractDataDurability::Temporary
-    );
-    if is_temporary {
-        // Temporary entries can never be "archived" - they just disappear when expired
+    // Only persistent Soroban entries can be "archived".
+    // Temporary entries just disappear when expired.
+    let is_persistent_soroban = match key {
+        LedgerKey::ContractData(cd) => {
+            cd.durability == stellar_xdr::curr::ContractDataDurability::Persistent
+        }
+        LedgerKey::ContractCode(_) => true,
+        _ => false,
+    };
+    if !is_persistent_soroban {
         return false;
     }
 
-    match key {
-        LedgerKey::ContractData(cd) => {
-            if state
-                .get_contract_data(&cd.contract, &cd.key, cd.durability)
-                .is_none()
-            {
-                return false;
-            }
-        }
-        LedgerKey::ContractCode(cc) => {
-            if state.get_contract_code(&cc.hash).is_none() {
-                return false;
-            }
-        }
-        _ => return false,
+    // Check if the entry exists in live state with an expired TTL.
+    let entry_in_live = match key {
+        LedgerKey::ContractData(cd) => state
+            .get_contract_data(&cd.contract, &cd.key, cd.durability)
+            .is_some(),
+        LedgerKey::ContractCode(cc) => state.get_contract_code(&cc.hash).is_some(),
+        _ => false,
+    };
+
+    if entry_in_live {
+        // Entry is in live state — check its TTL
+        let key_hash = compute_key_hash(key);
+        return match state.get_ttl(&key_hash) {
+            Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
+            None => true, // No TTL → treat as archived
+        };
     }
 
-    let key_hash = compute_key_hash(key);
-    match state.get_ttl(&key_hash) {
-        Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
-        None => true,
+    // Entry not in live state — check hot archive (P23+ fallback).
+    // Parity: InvokeHostFunctionOpFrame.cpp:413-445
+    if let Some(archive) = hot_archive {
+        if archive.get(key).is_some() {
+            return true;
+        }
     }
+
+    false
 }
 
 /// Compute the hash of a contract code key for TTL lookup.
