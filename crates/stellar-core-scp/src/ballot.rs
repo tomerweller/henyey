@@ -1032,8 +1032,10 @@ impl BallotProtocol {
     ) -> bool {
         let mut did_work = self.set_prepared(ballot.clone(), driver, slot_index);
 
-        if self.commit.is_some() && self.high_ballot.is_some() {
-            let high = self.high_ballot.as_ref().unwrap();
+        if self.commit.is_some() {
+            let Some(high) = self.high_ballot.as_ref() else {
+                return did_work;
+            };
             let incompatible = self
                 .prepared
                 .as_ref()
