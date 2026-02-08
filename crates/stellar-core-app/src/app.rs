@@ -2320,6 +2320,12 @@ impl App {
             *cache = Some((output.result.ledger_seq, Instant::now()));
         }
 
+        // Record catchup completion time for cooldown. This prevents
+        // maybe_start_buffered_catchup() from immediately triggering a second
+        // catchup when the first externalized slot is slightly past the
+        // checkpoint boundary (normal after initial online catchup).
+        *self.last_catchup_completed_at.write().await = Some(Instant::now());
+
         Ok(CatchupResult {
             ledger_seq: output.result.ledger_seq,
             ledger_hash: output.result.ledger_hash,
@@ -4413,19 +4419,22 @@ impl App {
             return;
         }
 
-        // Calculate gap and determine catchup strategy
-        let gap = first_buffered.saturating_sub(current_ledger);
-        let large_gap = gap >= CHECKPOINT_FREQUENCY && first_buffered > current_ledger + 1;
+        // Calculate gap and determine catchup strategy.
+        //
+        // Upstream (C++) only triggers immediate catchup when the first buffered
+        // ledger sits at a checkpoint boundary AND there is at least one more
+        // buffered ledger after it. The gap *size* alone is not a trigger — a
+        // gap slightly larger than CHECKPOINT_FREQUENCY is expected right after
+        // the initial catchup because the network advances while catchup runs.
+        // Triggering on gap size alone caused unnecessary second catchup cycles
+        // (see: "Buffered gap exceeds checkpoint; starting catchup" log spam).
+        let _gap = first_buffered.saturating_sub(current_ledger);
 
-        // Check if we can trigger immediate catchup (upstream behavior)
-        let can_trigger_immediate = if large_gap {
-            // Large gap - trigger immediately to first_buffered - 1
-            true
-        } else if Self::is_first_ledger_in_checkpoint(first_buffered)
+        let can_trigger_immediate = if Self::is_first_ledger_in_checkpoint(first_buffered)
             && first_buffered < last_buffered
         {
-            // First buffered is checkpoint boundary AND we have multiple buffered ledgers
-            // This matches upstream: catchup to first_buffered - 1
+            // First buffered is checkpoint boundary AND we have multiple buffered ledgers.
+            // This matches upstream: catchup to first_buffered - 1.
             true
         } else {
             false
@@ -4619,15 +4628,6 @@ impl App {
                 0
             }
         };
-
-        if large_gap {
-            tracing::info!(
-                current_ledger,
-                first_buffered,
-                gap,
-                "Buffered gap exceeds checkpoint; starting catchup"
-            );
-        }
 
         if self.catchup_in_progress.swap(true, Ordering::SeqCst) {
             tracing::info!("Buffered catchup already in progress");
