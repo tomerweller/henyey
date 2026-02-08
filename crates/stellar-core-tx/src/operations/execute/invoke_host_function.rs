@@ -712,7 +712,22 @@ fn disk_read_bytes_exceeded(
                     .read_write
                     .get(*index as usize)
                 {
-                    if is_soroban_key(key) && meter_entry(key, &mut total_read_bytes) {
+                    if !is_soroban_key(key) {
+                        continue;
+                    }
+                    // Match C++ behavior: only meter archived entries that are
+                    // actually still archived. If a previous TX in this ledger
+                    // restored the entry, its TTL is now live, and C++ treats
+                    // it as an in-memory soroban entry (no disk read metering).
+                    let key_hash = compute_key_hash(key);
+                    let is_still_archived = match state.get_ttl(&key_hash) {
+                        Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
+                        None => true, // No TTL = not in live state = archived
+                    };
+                    if !is_still_archived {
+                        continue;
+                    }
+                    if meter_entry(key, &mut total_read_bytes) {
                         tracing::warn!(
                             total_read_bytes,
                             specified_read_bytes = limit,
@@ -1652,6 +1667,110 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    /// Regression test for ledger 800896: archived entry with live TTL should not be
+    /// metered for disk read bytes.
+    ///
+    /// When a previous TX in the same ledger restores an archived soroban entry, the
+    /// entry's TTL becomes live. Subsequent TXs that also reference the entry in their
+    /// `archived_soroban_entries` should NOT meter it for disk read bytes, because C++
+    /// stellar-core dynamically checks the TTL and treats restored entries as in-memory.
+    /// Without this fix, the disk_read_bytes_exceeded check would incorrectly count the
+    /// restored entry's bytes, causing spurious ResourceLimitExceeded failures.
+    #[test]
+    fn test_disk_read_bytes_skips_already_restored_archived_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context_p23();
+
+        // Create an archived soroban entry that has been "restored" (live TTL)
+        let contract_id = ScAddress::Contract(ContractId(Hash([5u8; 32])));
+        let contract_key = ScVal::U32(42);
+        let durability = ContractDataDurability::Persistent;
+
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::I32(999),
+        };
+        state.create_contract_data(cd_entry);
+
+        let cd_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+        let key_hash = compute_key_hash(&cd_key);
+
+        // Set TTL to LIVE (simulating a prior TX that restored this entry)
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence + 100, // Live!
+        });
+
+        // Also add a classic account entry (always metered)
+        let account_id = create_test_account_id(1);
+        state.create_account(create_test_account(account_id.clone(), 100_000_000));
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        // Set disk_read_bytes to just enough for the account entry (~92 bytes)
+        // but NOT enough for account + contract data entry (~164 bytes) together.
+        // If the restored entry is incorrectly metered, this would exceed the limit.
+        let footprint = LedgerFootprint {
+            read_only: vec![account_key].try_into().unwrap(),
+            read_write: vec![cd_key].try_into().unwrap(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100, // Enough for account (~92) but not account+contract (~164)
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        // The restored entry should NOT be metered, so disk_read_bytes_exceeded
+        // should return false (only the account entry is metered)
+        let exceeded = disk_read_bytes_exceeded(
+            &state,
+            &soroban_data,
+            context.protocol_version,
+            context.sequence,
+        );
+        assert!(
+            !exceeded,
+            "disk_read_bytes should NOT be exceeded: restored entry with live TTL should be skipped"
+        );
+
+        // Now verify that if the TTL is expired, the entry IS metered
+        let key_hash2 = compute_key_hash(&LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id,
+            key: contract_key,
+            durability: ContractDataDurability::Persistent,
+        }));
+        state
+            .get_ttl_mut(&key_hash2)
+            .unwrap()
+            .live_until_ledger_seq = context.sequence - 1; // Expired
+
+        let exceeded = disk_read_bytes_exceeded(
+            &state,
+            &soroban_data,
+            context.protocol_version,
+            context.sequence,
+        );
+        assert!(
+            exceeded,
+            "disk_read_bytes SHOULD be exceeded when archived entry has expired TTL"
+        );
     }
 
     #[test]
