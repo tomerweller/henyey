@@ -430,6 +430,14 @@ fn execute_manage_offer(
                     account.num_sub_entries -= 1;
                 }
             }
+        } else {
+            // New offer that was fully consumed during matching.
+            // In C++ (V14+), loadAccount is called before the exchange for
+            // createEntryWithPossibleSponsorship (numSubEntries++), and again
+            // after for removeEntryWithPossibleSponsorship (numSubEntries--).
+            // The net effect on fields is zero, but the account is recorded
+            // in the LedgerTxn and gets lastModified updated on commit.
+            state.record_account_access(source);
         }
         ManageOfferSuccessResultOffer::Deleted
     };
@@ -3008,5 +3016,180 @@ mod tests {
             }
             other => panic!("Expected success, got {:?}", other),
         }
+    }
+
+    /// Regression test for the "fully consumed new offer" bug.
+    ///
+    /// When a new ManageSellOffer (or ManageBuyOffer) is submitted and gets
+    /// fully consumed during matching against existing offers, C++ still
+    /// records the source account as accessed (via loadAccount before the
+    /// exchange). Our code must also call record_account_access so the
+    /// account appears in the delta with updated lastModified.
+    #[test]
+    fn test_new_offer_fully_consumed_records_source_account() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        // Create issuer for two non-native assets
+        let issuer_id = create_test_account_id(99);
+        state.create_account(create_test_account(issuer_id.clone(), 1_000_000_000));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: issuer_id.clone(),
+        });
+        let tl_asset_a = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EURX"),
+            issuer: issuer_id.clone(),
+        });
+        let tl_asset_b = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EURX"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Counterparty: has a sell offer selling USDC for EURX
+        let counter_id = create_test_account_id(1);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 3, 0, 0)
+            .unwrap();
+        state.create_account(create_test_account(counter_id.clone(), min_balance));
+
+        // Counterparty trustlines (with V1 ext for liabilities)
+        state.create_trustline(TrustLineEntry {
+            account_id: counter_id.clone(),
+            asset: tl_asset_a.clone(),
+            balance: 500_000_000, // 500 USDC
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 100_000_000, // Matches the offer amount
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+        state.create_trustline(TrustLineEntry {
+            account_id: counter_id.clone(),
+            asset: tl_asset_b.clone(),
+            balance: 0,
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 100_000_000, // Matches what the offer buys
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+
+        // Counterparty offer: selling 100 USDC for EURX at price 1:1
+        let counter_offer = OfferEntry {
+            seller_id: counter_id.clone(),
+            offer_id: 1000,
+            selling: asset_a.clone(),
+            buying: asset_b.clone(),
+            amount: 100_000_000, // 100 USDC
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        // Load the offer as pre-existing (not created in this ledger)
+        state.load_entry(LedgerEntry {
+            last_modified_ledger_seq: 840000,
+            data: LedgerEntryData::Offer(counter_offer),
+            ext: LedgerEntryExt::V0,
+        });
+
+        // Bump counterparty's num_sub_entries to account for the offer + 2 trustlines
+        if let Some(acct) = state.get_account_mut(&counter_id) {
+            acct.num_sub_entries = 3;
+        }
+
+        // Source account: will submit a new offer that gets fully consumed
+        let source_id = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), min_balance));
+
+        // Source trustlines
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset_a.clone(),
+            0,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset_b.clone(),
+            500_000_000, // 500 EURX
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Record source's initial num_sub_entries (2 trustlines)
+        if let Some(acct) = state.get_account_mut(&source_id) {
+            acct.num_sub_entries = 2;
+        }
+
+        // Clear any snapshots from setup
+        state.flush_modified_entries();
+        state.begin_op_snapshot();
+
+        // Source submits: sell 100 EURX for USDC at price 1:1
+        // This should match the counterparty's offer exactly and be fully consumed.
+        let op = ManageSellOfferOp {
+            selling: asset_b.clone(),
+            buying: asset_a.clone(),
+            amount: 100_000_000, // Same as counterparty's offer
+            price: Price { n: 1, d: 1 },
+            offer_id: 0, // New offer
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+
+        // Verify operation succeeded
+        match &result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(success),
+            )) => {
+                // Offer should be deleted (fully consumed)
+                assert!(
+                    matches!(success.offer, ManageOfferSuccessResultOffer::Deleted),
+                    "Expected offer to be fully consumed (Deleted), got {:?}",
+                    success.offer
+                );
+                // Should have claimed the counterparty's offer
+                assert_eq!(
+                    success.offers_claimed.len(),
+                    1,
+                    "Expected 1 offer claimed"
+                );
+            }
+            other => panic!("Expected success, got {:?}", other),
+        }
+
+        // Verify source account num_sub_entries is unchanged (no offer was created)
+        let source_acct = state.get_account(&source_id).unwrap();
+        assert_eq!(
+            source_acct.num_sub_entries, 2,
+            "num_sub_entries should be unchanged (offer was fully consumed)"
+        );
+
+        // Key assertion: the source account must appear in the op snapshot,
+        // meaning it was recorded as accessed. This matches C++ behavior where
+        // loadAccount is called before the exchange for new offers (V14+).
+        let op_snapshots = state.end_op_snapshot();
+        let source_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: source_id.clone(),
+        });
+        assert!(
+            op_snapshots.contains_key(&source_account_key),
+            "Source account must be recorded in op snapshot for fully consumed new offers"
+        );
     }
 }
