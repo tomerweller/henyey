@@ -1722,6 +1722,7 @@ impl<'a> LedgerCloseContext<'a> {
                 ) = execute_soroban_parallel_phase(
                     &self.snapshot,
                     &phase,
+                    classic_txs.len(),
                     self.close_data.ledger_seq,
                     self.close_data.close_time,
                     self.prev_header.base_fee,

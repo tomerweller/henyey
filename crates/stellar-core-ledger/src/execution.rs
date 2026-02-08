@@ -5695,6 +5695,7 @@ fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
 pub fn execute_soroban_parallel_phase(
     snapshot: &SnapshotHandle,
     phase: &crate::close::SorobanPhaseStructure,
+    classic_tx_count: usize,
     ledger_seq: u32,
     close_time: u64,
     base_fee: u32,
@@ -5721,7 +5722,9 @@ pub fn execute_soroban_parallel_phase(
     let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
     let mut id_pool = snapshot.header().id_pool;
     // Global TX offset tracks the canonical position for PRNG seed computation.
-    let mut global_tx_offset: usize = 0;
+    // In C++, the index counter is shared across all phases (classic + Soroban),
+    // so Soroban TXs start at classic_tx_count.
+    let mut global_tx_offset: usize = classic_tx_count;
 
     for (stage_idx, stage) in phase.stages.iter().enumerate() {
         if stage.is_empty() {
