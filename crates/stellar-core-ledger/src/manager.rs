@@ -1657,12 +1657,16 @@ impl<'a> LedgerCloseContext<'a> {
         // We pass the Arc directly - the execution layer will check if it contains Some.
         let hot_archive = Some(self.manager.hot_archive_bucket_list.clone());
 
-        // Check if we have a structured parallel Soroban phase that benefits
-        // from parallel execution (multiple stages or multiple clusters).
+        // Check if we have a structured Soroban phase (V1 TransactionPhase).
+        // In C++ stellar-core, the Soroban phase ALWAYS goes through
+        // applyParallelPhase() when it has V1 structure (isParallel()=true),
+        // regardless of cluster count. Refunds are applied in
+        // processPostTxSetApply() which only handles parallel phases.
+        // The sequential path (applySequentialPhase) does NOT apply refunds
+        // for P23+. So we must always use the parallel path when a Soroban
+        // phase structure exists, even for single-stage single-cluster sets.
         let phase_structure = self.close_data.tx_set.soroban_phase_structure();
-        let has_parallel = phase_structure.as_ref().map_or(false, |p| {
-            p.stages.len() > 1 || p.stages.first().map_or(false, |s| s.len() > 1)
-        });
+        let has_parallel = phase_structure.is_some();
 
         let (results, tx_results, mut tx_result_metas, id_pool, hot_archive_restored_keys) =
             if has_parallel
@@ -2149,49 +2153,20 @@ impl<'a> LedgerCloseContext<'a> {
                     // Use pre-loaded eviction settings (loaded before bucket list lock)
                     let eviction_settings = eviction_settings.unwrap_or_default();
 
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        "EVICTION: Loading eviction iterator from bucket list"
-                    );
                     let eviction_iterator = load_eviction_iterator_from_bucket_list(&bucket_list);
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        has_iterator = eviction_iterator.is_some(),
-                        iter_level = eviction_iterator.as_ref().map(|i| i.bucket_list_level),
-                        iter_is_curr = eviction_iterator.as_ref().map(|i| i.is_curr_bucket),
-                        iter_offset = eviction_iterator.as_ref().map(|i| i.bucket_file_offset),
-                        "EVICTION: Loaded eviction iterator from bucket list"
-                    );
 
                     let iter = eviction_iterator.unwrap_or_else(|| {
-                        tracing::info!(
+                        tracing::debug!(
                             ledger_seq = self.close_data.ledger_seq,
                             starting_level = eviction_settings.starting_eviction_scan_level,
-                            "EVICTION: Creating new EvictionIterator (no entry found)"
+                            "Creating new EvictionIterator (no entry found)"
                         );
                         EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
                     });
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        level = iter.bucket_list_level,
-                        is_curr = iter.is_curr_bucket,
-                        offset = iter.bucket_file_offset,
-                        "EVICTION: EvictionIterator ready"
-                    );
-
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        start_level = iter.bucket_list_level,
-                        start_is_curr = iter.is_curr_bucket,
-                        start_offset = iter.bucket_file_offset,
-                        scan_size = eviction_settings.eviction_scan_size,
-                        max_entries_to_archive = eviction_settings.max_entries_to_archive,
-                        "EVICTION: Starting eviction scan"
-                    );
 
                     // Run eviction scan
                     let eviction_start = std::time::Instant::now();
-                    let eviction_result = bucket_list
+                    let mut eviction_result = bucket_list
                         .scan_for_eviction_incremental(
                             iter,
                             self.close_data.ledger_seq,
@@ -2200,40 +2175,73 @@ impl<'a> LedgerCloseContext<'a> {
                         .map_err(LedgerError::Bucket)?;
                     let eviction_duration = eviction_start.elapsed();
 
-                    tracing::info!(
+                    tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
                         bytes_scanned = eviction_result.bytes_scanned,
                         archived_count = eviction_result.archived_entries.len(),
-                        evicted_count = eviction_result.evicted_keys.len(),
-                        end_level = eviction_result.end_iterator.bucket_list_level,
-                        end_is_curr = eviction_result.end_iterator.is_curr_bucket,
-                        end_offset = eviction_result.end_iterator.bucket_file_offset,
+                        evicted_count = eviction_result.evicted_keys.len() / 2,
                         duration_ms = eviction_duration.as_millis(),
-                        "EVICTION: Incremental eviction scan completed"
+                        "Eviction scan completed"
                     );
 
-                    // Log archived entries for debugging
-                    if !eviction_result.archived_entries.is_empty() {
-                        for (i, entry) in eviction_result.archived_entries.iter().enumerate() {
-                            let key_type = match &entry.data {
-                                LedgerEntryData::ContractData(cd) => {
-                                    format!("ContractData({:?})", cd.durability)
-                                }
-                                LedgerEntryData::ContractCode(_) => "ContractCode".to_string(),
-                                _ => format!("{:?}", std::mem::discriminant(&entry.data)),
-                            };
+                    // Filter eviction candidates: exclude entries whose TTL
+                    // was modified by transactions in this ledger.  C++ does this
+                    // via getAllTTLKeysWithoutSealing() + resolveBackgroundEvictionScan
+                    // which removes candidates whose TTL key is in the modified set.
+                    let modified_ttl_keys: std::collections::HashSet<LedgerKey> = init_entries
+                        .iter()
+                        .chain(live_entries.iter())
+                        .filter_map(|entry| {
+                            if let LedgerEntryData::Ttl(ttl) = &entry.data {
+                                Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                                    key_hash: ttl.key_hash.clone(),
+                                }))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    if !modified_ttl_keys.is_empty() {
+                        // Eviction produces pairs: [data_key, ttl_key, data_key, ttl_key, ...]
+                        // If the TTL key of a pair is in modified_ttl_keys, remove
+                        // the entire pair (both data key and TTL key).
+                        // Also track which data keys were filtered out so we can
+                        // filter the corresponding archived_entries.
+                        let mut filtered_keys = Vec::new();
+                        let mut filtered_data_keys: std::collections::HashSet<LedgerKey> =
+                            std::collections::HashSet::new();
+                        let mut i = 0;
+                        while i + 1 < eviction_result.evicted_keys.len() {
+                            let ttl_key = &eviction_result.evicted_keys[i + 1];
+                            if !modified_ttl_keys.contains(ttl_key) {
+                                filtered_keys.push(eviction_result.evicted_keys[i].clone());
+                                filtered_keys.push(eviction_result.evicted_keys[i + 1].clone());
+                            } else {
+                                filtered_data_keys
+                                    .insert(eviction_result.evicted_keys[i].clone());
+                            }
+                            i += 2;
+                        }
+                        if !filtered_data_keys.is_empty() {
                             tracing::info!(
                                 ledger_seq = self.close_data.ledger_seq,
-                                entry_index = i,
-                                key_type = %key_type,
-                                last_modified = entry.last_modified_ledger_seq,
-                                "EVICTION: Archived entry"
+                                filtered_count = filtered_data_keys.len(),
+                                "Filtered eviction candidates with TX-modified TTLs"
                             );
+                            // Filter archived_entries to match
+                            eviction_result.archived_entries.retain(|entry| {
+                                if let Ok(key) = crate::delta::entry_to_key(entry) {
+                                    !filtered_data_keys.contains(&key)
+                                } else {
+                                    true
+                                }
+                            });
                         }
+                        dead_entries.extend(filtered_keys);
+                    } else {
+                        dead_entries.extend(eviction_result.evicted_keys);
                     }
-
-                    // Add evicted keys to dead entries
-                    dead_entries.extend(eviction_result.evicted_keys);
                     archived_entries = eviction_result.archived_entries;
 
                     // Add EvictionIterator update to live entries
@@ -2249,6 +2257,7 @@ impl<'a> LedgerCloseContext<'a> {
                         )),
                         ext: LedgerEntryExt::V0,
                     };
+
                     live_entries.push(eviction_iter_entry);
 
                     tracing::debug!(
@@ -2463,144 +2472,12 @@ impl<'a> LedgerCloseContext<'a> {
                 );
             }
 
-            // Compute hashes of entries being added for debugging
-            // This allows us to compare with expected values when a mismatch occurs
-            let init_entries_hash = {
-                use sha2::{Digest, Sha256};
-                use stellar_xdr::curr::{Limits, WriteXdr};
-                let mut hasher = Sha256::new();
-                for entry in &init_entries {
-                    if let Ok(xdr) = entry.to_xdr(Limits::none()) {
-                        hasher.update(&xdr);
-                    }
-                }
-                let result = hasher.finalize();
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&result);
-                Hash256::from_bytes(bytes)
-            };
-            let live_entries_hash = {
-                use sha2::{Digest, Sha256};
-                use stellar_xdr::curr::{Limits, WriteXdr};
-                let mut hasher = Sha256::new();
-                for entry in &live_entries {
-                    if let Ok(xdr) = entry.to_xdr(Limits::none()) {
-                        hasher.update(&xdr);
-                    }
-                }
-                let result = hasher.finalize();
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&result);
-                Hash256::from_bytes(bytes)
-            };
-            let dead_entries_hash = {
-                use sha2::{Digest, Sha256};
-                use stellar_xdr::curr::{Limits, WriteXdr};
-                let mut hasher = Sha256::new();
-                for key in &dead_entries {
-                    if let Ok(xdr) = key.to_xdr(Limits::none()) {
-                        hasher.update(&xdr);
-                    }
-                }
-                let result = hasher.finalize();
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&result);
-                Hash256::from_bytes(bytes)
-            };
-
-            // Temporary: dump per-entry details for debugging
-            if self.upgrade_ctx.has_config_upgrades() {
-                use sha2::{Digest as _, Sha256};
-                for (i, entry) in live_entries.iter().enumerate() {
-                    let key_str = match &entry.data {
-                        LedgerEntryData::ConfigSetting(cs) => {
-                            format!("ConfigSetting({:?})", cs.discriminant())
-                        }
-                        LedgerEntryData::Account(a) => {
-                            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) =
-                                a.account_id.0;
-                            format!(
-                                "Account({:02x}{:02x}..{:02x}{:02x})",
-                                pk.0[0], pk.0[1], pk.0[30], pk.0[31]
-                            )
-                        }
-                        other => format!("{:?}", std::mem::discriminant(other)),
-                    };
-                    let xdr_bytes = entry.to_xdr(Limits::none()).unwrap_or_default();
-                    let xdr_size = xdr_bytes.len();
-                    let xdr_hash = {
-                        let mut h = Sha256::new();
-                        h.update(&xdr_bytes);
-                        let r = h.finalize();
-                        let mut b = [0u8; 32];
-                        b.copy_from_slice(&r);
-                        Hash256::from_bytes(b)
-                    };
-                    // For Account entries, also dump full hex for comparison
-                    let hex_preview = if matches!(&entry.data, LedgerEntryData::Account(_)) {
-                        format!(
-                            " xdr_hex={}",
-                            xdr_bytes
-                                .iter()
-                                .map(|b| format!("{:02x}", b))
-                                .collect::<String>()
-                        )
-                    } else {
-                        String::new()
-                    };
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        idx = i,
-                        key = %key_str,
-                        last_modified = entry.last_modified_ledger_seq,
-                        xdr_size = xdr_size,
-                        xdr_hash = %xdr_hash.to_hex(),
-                        xdr_hex = %hex_preview,
-                        "BUCKET_ENTRY"
-                    );
-                }
-                // Also log init entries
-                for (i, entry) in init_entries.iter().enumerate() {
-                    let key_str = match &entry.data {
-                        LedgerEntryData::ConfigSetting(cs) => {
-                            format!("ConfigSetting({:?})", cs.discriminant())
-                        }
-                        other => format!("{:?}", std::mem::discriminant(other)),
-                    };
-                    let xdr_bytes = entry.to_xdr(Limits::none()).unwrap_or_default();
-                    let xdr_size = xdr_bytes.len();
-                    let xdr_hash = {
-                        let mut h = Sha256::new();
-                        h.update(&xdr_bytes);
-                        let r = h.finalize();
-                        let mut b = [0u8; 32];
-                        b.copy_from_slice(&r);
-                        Hash256::from_bytes(b)
-                    };
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        idx = i,
-                        key = %key_str,
-                        last_modified = entry.last_modified_ledger_seq,
-                        xdr_size = xdr_size,
-                        xdr_hash = %xdr_hash.to_hex(),
-                        "BUCKET_INIT_ENTRY"
-                    );
-                }
-            }
-
-            // Log the inputs to add_batch - this is critical for debugging mismatches
-            tracing::info!(
+            tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 init_count = init_entries.len(),
                 live_count = live_entries.len(),
                 dead_count = dead_entries.len(),
-                init_entries_hash = %init_entries_hash.to_hex(),
-                live_entries_hash = %live_entries_hash.to_hex(),
-                dead_entries_hash = %dead_entries_hash.to_hex(),
-                pre_add_batch_hash = %bucket_list.hash().to_hex(),
-                bucket_list_ledger_seq = bucket_list.ledger_seq(),
-                "BUCKET_INPUT: Entries being added to live bucket list"
+                "Adding entries to live bucket list"
             );
 
             bucket_list.add_batch(
@@ -2634,49 +2511,6 @@ impl<'a> LedgerCloseContext<'a> {
                     // Add archived entries to hot archive bucket list
                     // Must call add_batch even with empty entries to maintain spill consistency
                     // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
-                    let pre_hot_hash = hot_archive.hash();
-
-                    // Compute hashes of hot archive inputs for debugging
-                    let archived_entries_hash = {
-                        use sha2::{Digest, Sha256};
-                        use stellar_xdr::curr::{Limits, WriteXdr};
-                        let mut hasher = Sha256::new();
-                        for entry in &archived_entries {
-                            if let Ok(xdr) = entry.to_xdr(Limits::none()) {
-                                hasher.update(&xdr);
-                            }
-                        }
-                        let result = hasher.finalize();
-                        let mut bytes = [0u8; 32];
-                        bytes.copy_from_slice(&result);
-                        Hash256::from_bytes(bytes)
-                    };
-                    let restored_keys_hash = {
-                        use sha2::{Digest, Sha256};
-                        use stellar_xdr::curr::{Limits, WriteXdr};
-                        let mut hasher = Sha256::new();
-                        for key in &self.hot_archive_restored_keys {
-                            if let Ok(xdr) = key.to_xdr(Limits::none()) {
-                                hasher.update(&xdr);
-                            }
-                        }
-                        let result = hasher.finalize();
-                        let mut bytes = [0u8; 32];
-                        bytes.copy_from_slice(&result);
-                        Hash256::from_bytes(bytes)
-                    };
-
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        archived_count = archived_entries.len(),
-                        restored_count = self.hot_archive_restored_keys.len(),
-                        archived_entries_hash = %archived_entries_hash.to_hex(),
-                        restored_keys_hash = %restored_keys_hash.to_hex(),
-                        pre_hot_hash = %pre_hot_hash.to_hex(),
-                        hot_archive_ledger_seq = hot_archive.ledger_seq(),
-                        "BUCKET_INPUT: Entries being added to hot archive bucket list"
-                    );
-
                     hot_archive.add_batch(
                         self.close_data.ledger_seq,
                         protocol_version,

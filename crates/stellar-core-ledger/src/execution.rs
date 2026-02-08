@@ -5663,6 +5663,25 @@ struct ClusterResult {
     hot_archive_restored_keys: Vec<LedgerKey>,
 }
 
+/// Extract the fee-paying source AccountId from a raw TransactionEnvelope.
+/// For fee bump transactions, this is the outer fee source.
+/// For regular transactions, this is the transaction source account.
+fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
+    let muxed = match env {
+        TransactionEnvelope::TxV0(e) => MuxedAccount::Ed25519(e.tx.source_account_ed25519.clone()),
+        TransactionEnvelope::Tx(e) => e.tx.source_account.clone(),
+        TransactionEnvelope::TxFeeBump(e) => e.tx.fee_source.clone(),
+    };
+    match muxed {
+        MuxedAccount::Ed25519(key) => {
+            AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key))
+        }
+        MuxedAccount::MuxedEd25519(m) => {
+            AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(m.ed25519))
+        }
+    }
+}
+
 /// Execute a full Soroban parallel phase (all stages sequentially,
 /// clusters within each stage in parallel).
 ///
@@ -5710,15 +5729,12 @@ pub fn execute_soroban_parallel_phase(
         }
 
         // Collect current entries from the delta so clusters in this stage can
-        // see changes from prior Soroban stages.  For stage 0 there are no
-        // prior Soroban stages, so we pass an empty slice.  This matches C++
-        // GlobalParallelApplyLedgerState / collectClusterFootprintEntriesFromGlobal
-        // which accumulates per-stage Soroban changes.
-        let prior_stage_entries = if stage_idx == 0 {
-            Vec::new()
-        } else {
-            delta.current_entries()
-        };
+        // see changes from prior stages AND classic TX changes.  In C++,
+        // GlobalParallelApplyLedgerState wraps the main LedgerTxn which already
+        // has classic TX changes committed, so even stage 0 clusters see classic
+        // modifications (e.g., fee deductions on shared accounts).  We always
+        // pass delta.current_entries() to match this behavior.
+        let prior_stage_entries = delta.current_entries();
 
         // Execute each cluster with its own executor, then merge results.
         // Clusters within a stage are independent (no footprint conflicts)
@@ -5780,25 +5796,20 @@ pub fn execute_soroban_parallel_phase(
         .map(|(tx, _)| tx)
         .collect();
 
+    // Apply Soroban fee refunds: C++ processPostTxSetApply() calls
+    // processRefund() which applies refund to both the account balance
+    // (via LedgerTxn) and the fee pool (feePool -= refund).
     let mut total_refunds = 0i64;
     for (idx, result) in all_results.iter().enumerate() {
         let refund = result.fee_refund;
         if refund > 0 && idx < flat_txs.len() {
-            let frame = TransactionFrame::with_network(flat_txs[idx].clone(), network_id);
-            let fee_source_id =
-                stellar_core_tx::muxed_to_account_id(&frame.fee_source_account());
-
-            delta.apply_refund_to_account(&fee_source_id, refund)?;
+            let source = fee_source_account_id(flat_txs[idx]);
+            delta.apply_refund_to_account(&source, refund)?;
             total_refunds += refund;
         }
     }
     if total_refunds > 0 {
         delta.record_fee_pool_delta(-total_refunds);
-        tracing::info!(
-            ledger_seq = ledger_seq,
-            total_refunds = total_refunds,
-            "P23+ parallel Soroban fee refunds applied"
-        );
     }
 
     Ok((
