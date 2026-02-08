@@ -1,11 +1,12 @@
 //! ChangeTrust operation execution.
 
 use stellar_xdr::curr::{
-    AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult, ChangeTrustResultCode,
-    LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry, LiquidityPoolEntryBody,
-    LiquidityPoolEntryConstantProduct, LiquidityPoolParameters, OperationResult, OperationResultTr,
-    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2,
-    TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
+    AccountEntry, AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult,
+    ChangeTrustResultCode, LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry,
+    LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolParameters,
+    OperationResult, OperationResultTr, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
+    TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
+    TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use crate::apply::account_id_to_key;
@@ -161,6 +162,7 @@ pub fn execute_change_trust(
         }
 
         // Check source can afford new sub-entry
+        // C++ uses getAvailableBalance which deducts selling liabilities
         let sponsor = state.active_sponsor_for(source);
         if let Some(sponsor) = &sponsor {
             let sponsor_account = state
@@ -173,7 +175,10 @@ pub fn execute_change_trust(
                 multiplier,
                 0,
             )?;
-            if sponsor_account.balance < new_min_balance {
+            let available = sponsor_account
+                .balance
+                .saturating_sub(account_liabilities(sponsor_account).selling);
+            if available < new_min_balance {
                 return Ok(make_result(ChangeTrustResultCode::LowReserve));
             }
         } else {
@@ -185,7 +190,10 @@ pub fn execute_change_trust(
                 context.protocol_version,
                 multiplier,
             )?;
-            if source_account.balance < new_min_balance {
+            let available = source_account
+                .balance
+                .saturating_sub(account_liabilities(source_account).selling);
+            if available < new_min_balance {
                 return Ok(make_result(ChangeTrustResultCode::LowReserve));
             }
         }
@@ -299,6 +307,16 @@ fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
             selling: 0,
         },
         TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
+}
+
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
     }
 }
 
@@ -1419,10 +1437,11 @@ mod tests {
     /// Test ChangeTrust with source account having native selling liabilities.
     ///
     /// Selling liabilities don't affect the reserve check for creating trustlines.
-    /// The reserve check is purely based on balance >= minimum_balance, not available balance.
-    /// This test verifies that selling liabilities don't block trustline creation.
+    /// C++ uses getAvailableBalance (balance - sellingLiabilities) for the reserve check.
+    /// This test verifies that selling liabilities are deducted when checking reserves,
+    /// but that the trustline creation succeeds when available balance is sufficient.
     ///
-    /// C++ Reference: ChangeTrustTests.cpp - selling liabilities don't affect entry creation
+    /// C++ Reference: SponsorshipUtils.cpp - canCreateEntryWithoutSponsorship uses getAvailableBalance
     #[test]
     fn test_change_trust_with_native_selling_liabilities() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -1436,12 +1455,14 @@ mod tests {
             .minimum_balance_with_counts(context.protocol_version, 1, 0, 0)
             .unwrap();
 
-        // Create source with selling liabilities - but balance is sufficient for reserve
-        let mut source = create_test_account(source_id.clone(), min_balance_with_tl + 100);
+        let selling_liabilities = 200i64;
+        // Create source with selling liabilities and enough balance so that
+        // available = balance - selling_liabilities >= min_balance_with_tl
+        let mut source = create_test_account(source_id.clone(), min_balance_with_tl + selling_liabilities + 100);
         source.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
             liabilities: Liabilities {
                 buying: 0,
-                selling: 200, // Selling liabilities don't affect reserve check
+                selling: selling_liabilities,
             },
             ext: AccountEntryExtensionV1Ext::V0,
         });
@@ -1458,13 +1479,13 @@ mod tests {
             limit: 1_000_000,
         };
 
-        // ChangeTrust should succeed - selling liabilities don't affect reserve check
+        // ChangeTrust should succeed - available balance covers the reserve
         let result = execute_change_trust(&op, &source_id, &mut state, &context);
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
                 assert!(
                     matches!(r, ChangeTrustResult::Success),
-                    "Expected Success (selling liabilities don't block entry creation), got {:?}",
+                    "Expected Success when available balance covers reserve, got {:?}",
                     r
                 );
             }
@@ -1639,6 +1660,101 @@ mod tests {
                 // Expected - 999 + 2 = 1001 > 1000 limit
             }
             other => panic!("expected OpTooManySubentries, got {:?}", other),
+        }
+    }
+
+    /// Regression test: ChangeTrust LowReserve check must deduct selling liabilities.
+    ///
+    /// Before the fix, the reserve check compared raw balance against min_balance,
+    /// ignoring selling liabilities. This allowed accounts with high selling liabilities
+    /// to create new trustlines even when their available balance (balance - liabilities)
+    /// was below the reserve requirement.
+    ///
+    /// Found at mainnet ledger 59501777: a ChangeTrust succeeded in our code but C++
+    /// correctly returned LowReserve because getAvailableBalance deducts selling liabilities.
+    #[test]
+    fn test_change_trust_low_reserve_with_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        // Compute reserve requirements:
+        // min_balance for 0 subentries = base_reserve * 2 = 10_000_000
+        // Adding a trustline needs 1 extra subentry, so new_min_balance = base_reserve * 3 = 15_000_000
+        let new_min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 1, 0, 0)
+            .unwrap();
+
+        let selling_liabilities = 1_000_000i64;
+        // Set balance so raw balance >= new_min_balance, but available < new_min_balance:
+        //   balance = new_min_balance + selling_liabilities - 1
+        //   available = balance - selling_liabilities = new_min_balance - 1 < new_min_balance
+        let balance = new_min_balance + selling_liabilities - 1;
+        assert!(balance >= new_min_balance, "raw balance must be >= new_min_balance");
+        assert!(
+            balance - selling_liabilities < new_min_balance,
+            "available balance must be < new_min_balance"
+        );
+
+        let mut source_account = create_test_account(source_id.clone(), balance);
+        source_account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: selling_liabilities,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(source_account);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::LowReserve),
+                    "Expected LowReserve when selling liabilities reduce available balance below reserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result type: {:?}", other),
+        }
+
+        // Verify that without selling liabilities, the same balance succeeds
+        let source_id2 = create_test_account_id(2);
+        let mut source_account2 = create_test_account(source_id2.clone(), balance);
+        source_account2.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(source_account2);
+
+        let op2 = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            limit: 1_000,
+        };
+
+        let result2 = execute_change_trust(&op2, &source_id2, &mut state, &context).unwrap();
+        match result2 {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(ChangeTrustResult::Success)) => {
+                // Expected: without liabilities, same balance is sufficient
+            }
+            other => panic!("Expected Success without selling liabilities, got {:?}", other),
         }
     }
 }

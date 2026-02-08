@@ -6,12 +6,12 @@
 use std::collections::HashSet;
 
 use stellar_xdr::curr::{
-    AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp, ClaimClaimableBalanceResult,
-    ClaimClaimableBalanceResultCode, ClaimPredicate, ClaimableBalanceEntry,
-    ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
+    AccountEntry, AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp,
+    ClaimClaimableBalanceResult, ClaimClaimableBalanceResultCode, ClaimPredicate,
+    ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
     ClaimableBalanceEntryExtensionV1Ext, ClaimableBalanceFlags, ClaimableBalanceId, Claimant,
     CreateClaimableBalanceOp, CreateClaimableBalanceResult, CreateClaimableBalanceResultCode, Hash,
-    HashIdPreimage, HashIdPreimageOperationId, LedgerKey, LedgerKeyClaimableBalance,
+    HashIdPreimage, HashIdPreimageOperationId, LedgerKey, LedgerKeyClaimableBalance, Liabilities,
     OperationResult, OperationResultTr, SequenceNumber,
 };
 
@@ -185,7 +185,10 @@ pub fn execute_create_claimable_balance(
         sponsorship_multiplier,
         0,
     )?;
-    if sponsor_account.balance < sponsor_min_balance {
+    let available = sponsor_account
+        .balance
+        .saturating_sub(account_liabilities(sponsor_account).selling);
+    if available < sponsor_min_balance {
         return Ok(make_create_result(
             CreateClaimableBalanceResultCode::LowReserve,
             None,
@@ -482,6 +485,16 @@ fn update_predicate_for_apply(predicate: &mut ClaimPredicate, close_time: u64) {
 }
 
 /// Create a CreateClaimableBalance result.
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
+}
+
 fn make_create_result(
     code: CreateClaimableBalanceResultCode,
     balance_id: Option<ClaimableBalanceId>,

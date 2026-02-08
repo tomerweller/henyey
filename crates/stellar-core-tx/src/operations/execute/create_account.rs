@@ -63,7 +63,10 @@ pub fn execute_create_account(
             num_sponsoring + account_multiplier,
             num_sponsored,
         )?;
-        if sponsor_account.balance < sponsor_min_balance {
+        let available = sponsor_account
+            .balance
+            .saturating_sub(account_liabilities(sponsor_account).selling);
+        if available < sponsor_min_balance {
             return Ok(make_result(CreateAccountResultCode::LowReserve));
         }
     }

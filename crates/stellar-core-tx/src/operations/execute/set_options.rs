@@ -5,7 +5,7 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
-    AccountEntryExtensionV2, AccountId, OperationResult, OperationResultTr, PublicKey,
+    AccountEntryExtensionV2, AccountId, Liabilities, OperationResult, OperationResultTr, PublicKey,
     SetOptionsOp, SetOptionsResult, SetOptionsResultCode, Signer, SignerKey,
     SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS_V17,
 };
@@ -147,7 +147,10 @@ pub fn execute_set_options(
             1,
             0,
         )?;
-        Some((sponsor_id, sponsor_account.balance, min_balance))
+        let available = sponsor_account
+            .balance
+            .saturating_sub(account_liabilities(sponsor_account).selling);
+        Some((sponsor_id, available, min_balance))
     } else {
         None
     };
@@ -315,7 +318,10 @@ pub fn execute_set_options(
                     ));
                 }
                 let new_min_balance = effective_entries * base_reserve;
-                if source_account_mut.balance < new_min_balance {
+                let available = source_account_mut
+                    .balance
+                    .saturating_sub(account_liabilities(source_account_mut).selling);
+                if available < new_min_balance {
                     return Ok(make_result(SetOptionsResultCode::LowReserve));
                 }
             }
@@ -420,6 +426,16 @@ fn sponsorship_counts_for_account_entry(account: &AccountEntry) -> (i64, i64) {
 }
 
 /// Create an OperationResult from a SetOptionsResultCode.
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
+}
+
 fn make_result(code: SetOptionsResultCode) -> OperationResult {
     let result = match code {
         SetOptionsResultCode::Success => SetOptionsResult::Success,

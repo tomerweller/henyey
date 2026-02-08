@@ -6,12 +6,12 @@
 //! - RevokeSponsorship
 
 use stellar_xdr::curr::{
-    AccountId, BeginSponsoringFutureReservesOp, BeginSponsoringFutureReservesResult,
-    BeginSponsoringFutureReservesResultCode, EndSponsoringFutureReservesResult,
-    EndSponsoringFutureReservesResultCode, LedgerEntryData, LedgerKey, LedgerKeyAccount,
-    LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer, LedgerKeyTrustLine, OperationResult,
-    OperationResultTr, RevokeSponsorshipOp, RevokeSponsorshipResult, RevokeSponsorshipResultCode,
-    SponsorshipDescriptor, TrustLineAsset,
+    AccountEntry, AccountId, BeginSponsoringFutureReservesOp,
+    BeginSponsoringFutureReservesResult, BeginSponsoringFutureReservesResultCode,
+    EndSponsoringFutureReservesResult, EndSponsoringFutureReservesResultCode, LedgerEntryData,
+    LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer,
+    LedgerKeyTrustLine, Liabilities, OperationResult, OperationResultTr, RevokeSponsorshipOp,
+    RevokeSponsorshipResult, RevokeSponsorshipResultCode, SponsorshipDescriptor, TrustLineAsset,
 };
 
 use crate::state::LedgerStateManager;
@@ -186,7 +186,10 @@ pub fn execute_revoke_sponsorship(
                     multiplier,
                     0,
                 )?;
-                if new_sponsor_account.balance < new_min_balance {
+                let available = new_sponsor_account
+                    .balance
+                    .saturating_sub(account_liabilities(new_sponsor_account).selling);
+                if available < new_min_balance {
                     return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
@@ -204,7 +207,10 @@ pub fn execute_revoke_sponsorship(
                         0,
                         -multiplier,
                     )?;
-                    if owner_account.balance < new_min_balance {
+                    let available = owner_account
+                        .balance
+                        .saturating_sub(account_liabilities(owner_account).selling);
+                    if available < new_min_balance {
                         return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                     }
                 }
@@ -231,7 +237,10 @@ pub fn execute_revoke_sponsorship(
                     multiplier,
                     0,
                 )?;
-                if new_sponsor_account.balance < new_min_balance {
+                let available = new_sponsor_account
+                    .balance
+                    .saturating_sub(account_liabilities(new_sponsor_account).selling);
+                if available < new_min_balance {
                     return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
@@ -298,7 +307,10 @@ pub fn execute_revoke_sponsorship(
                     1,
                     0,
                 )?;
-                if new_sponsor_account.balance < new_min_balance {
+                let available = new_sponsor_account
+                    .balance
+                    .saturating_sub(account_liabilities(new_sponsor_account).selling);
+                if available < new_min_balance {
                     return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
@@ -315,7 +327,10 @@ pub fn execute_revoke_sponsorship(
                         0,
                         -1,
                     )?;
-                    if owner_account.balance < new_min_balance {
+                    let available = owner_account
+                        .balance
+                        .saturating_sub(account_liabilities(owner_account).selling);
+                    if available < new_min_balance {
                         return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                     }
                 }
@@ -336,7 +351,10 @@ pub fn execute_revoke_sponsorship(
                     1,
                     0,
                 )?;
-                if new_sponsor_account.balance < new_min_balance {
+                let available = new_sponsor_account
+                    .balance
+                    .saturating_sub(account_liabilities(new_sponsor_account).selling);
+                if available < new_min_balance {
                     return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
@@ -351,6 +369,16 @@ pub fn execute_revoke_sponsorship(
 }
 
 /// Create a BeginSponsoringFutureReserves result.
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
+        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
+}
+
 fn make_begin_result(code: BeginSponsoringFutureReservesResultCode) -> OperationResult {
     let result = match code {
         BeginSponsoringFutureReservesResultCode::Success => {
