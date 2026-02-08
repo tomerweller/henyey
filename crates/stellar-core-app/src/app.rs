@@ -2320,14 +2320,32 @@ impl App {
             *cache = Some((output.result.ledger_seq, Instant::now()));
         }
 
-        // Record catchup completion time for cooldown. This prevents
-        // maybe_start_buffered_catchup() from immediately triggering a second
-        // catchup when the first externalized slot is slightly past the
-        // checkpoint boundary (normal after initial online catchup).
+        // Drain all sequential buffered ledgers before returning.
+        // This matches C++ stellar-core's behavior: CatchupWork creates
+        // ApplyBufferedLedgersWork which applies all sequential buffered
+        // ledgers before CatchupWork returns WORK_SUCCESS.
+        // Without this, we'd transition to Synced with a gap (the next
+        // sequential ledger is buffered but not applied), and the stuck
+        // timeout would trigger an unnecessary re-catchup.
+        let drained = self.drain_buffered_ledgers_sync().await;
+        if drained > 0 {
+            let new_ledger = self.get_current_ledger().await.unwrap_or(0);
+            tracing::info!(
+                drained,
+                new_ledger,
+                "Drained buffered ledgers as part of catchup completion"
+            );
+        }
+
+        // Record catchup completion time for cooldown AFTER draining buffered
+        // ledgers. This ensures the cooldown window starts after all post-catchup
+        // work is complete, preventing maybe_start_buffered_catchup() from
+        // triggering a second catchup while the node is still stabilizing.
         *self.last_catchup_completed_at.write().await = Some(Instant::now());
 
+        let final_ledger = self.get_current_ledger().await.unwrap_or(output.result.ledger_seq);
         Ok(CatchupResult {
-            ledger_seq: output.result.ledger_seq,
+            ledger_seq: final_ledger,
             ledger_hash: output.result.ledger_hash,
             buckets_applied: output.result.buckets_downloaded,
             ledgers_replayed: output.result.ledgers_applied,
@@ -4020,6 +4038,30 @@ impl App {
         true
     }
 
+    /// Drain all sequential buffered ledgers synchronously.
+    ///
+    /// Called at the end of catchup to match C++ stellar-core's
+    /// `ApplyBufferedLedgersWork`: CatchupWork does not return success
+    /// until all sequential buffered ledgers have been applied.
+    ///
+    /// Returns the number of ledgers drained.
+    async fn drain_buffered_ledgers_sync(&self) -> u32 {
+        let mut drained = 0u32;
+        loop {
+            let mut pending = match self.try_start_ledger_close().await {
+                Some(p) => p,
+                None => break,
+            };
+            let join_result = (&mut pending.handle).await;
+            let success = self.handle_close_complete(pending, join_result).await;
+            if !success {
+                break;
+            }
+            drained += 1;
+        }
+        drained
+    }
+
     /// Apply buffered ledgers (yields to tokio via `spawn_blocking`).
     ///
     /// Used by callers outside the main select loop (catchup completion, tx set
@@ -4358,10 +4400,12 @@ impl App {
     // catchup loops that occur when catchup targets checkpoints, leaving gaps.
 
     async fn maybe_start_buffered_catchup(&self) {
-        // Early cooldown check: if we recently skipped catchup due to no newer checkpoint,
-        // skip re-evaluating. This prevents log spam when multiple SCP messages arrive
-        // after catchup completion and before the next checkpoint is available.
-        const EVALUATION_COOLDOWN_SECS: u64 = 2;
+        // Early cooldown check: if we recently completed or skipped catchup,
+        // skip re-evaluating. This prevents log spam and avoids re-triggering
+        // catchup while the node is still stabilizing after a catchup cycle.
+        // 10 seconds gives enough time for SCP messages to arrive and fill
+        // small gaps after catchup + buffered ledger drain.
+        const EVALUATION_COOLDOWN_SECS: u64 = 10;
         let recently_skipped = self
             .last_catchup_completed_at
             .read()
@@ -4468,13 +4512,9 @@ impl App {
                             let elapsed = state.stuck_start.elapsed().as_secs();
                             let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
 
-                            // Use faster timeout when:
-                            // 1. All peers have explicitly said DontHave, OR
-                            // 2. We have pending tx set requests that have been waiting too long, OR
-                            // 3. Recovery attempts have failed to make progress (gap persists)
-                            //    This handles the case where peers don't have SCP envelopes for gap slots
-                            // BUT: if we just completed catchup, use normal timeout to avoid
-                            // catching up repeatedly to the same checkpoint.
+                            // These signals help determine the stuck timeout when NOT
+                            // recently caught up. When all peers report DontHave or
+                            // requests have been waiting too long, use a faster timeout.
                             let all_peers_exhausted =
                                 self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
                             let has_stale_requests = self
@@ -4482,84 +4522,104 @@ impl App {
                                 .has_stale_pending_tx_set(TX_SET_UNAVAILABLE_TIMEOUT_SECS);
                             let recovery_failed = state.recovery_attempts >= 2;
 
-                            // Cooldown: don't use fast timeout if we just completed catchup.
-                            // This prevents catching up to the same checkpoint repeatedly.
-                            // Use the archive cache TTL as the cooldown since that's the minimum
-                            // time needed for a new checkpoint to potentially be available.
+                            // Cooldown: don't trigger catchup if we recently completed
+                            // catchup. C++ stellar-core does NOT have a stuck timeout
+                            // that triggers catchup — it only triggers catchup when
+                            // checkpoint boundary conditions are met (handled above by
+                            // can_trigger_immediate). When recently caught up, only do
+                            // recovery (re-request SCP state) to fill gaps.
                             let recently_caught_up = self
                                 .last_catchup_completed_at
                                 .read()
                                 .await
                                 .is_some_and(|t| t.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS);
 
-                            let use_fast_timeout = !recently_caught_up
-                                && (all_peers_exhausted || has_stale_requests || recovery_failed);
-                            let effective_timeout = if use_fast_timeout {
-                                TX_SET_UNAVAILABLE_TIMEOUT_SECS
+                            // When recently caught up, never trigger catchup from stuck
+                            // timeout. Only do recovery. This matches C++ behavior where
+                            // gaps are filled by waiting for SCP, not by re-catching up.
+                            if recently_caught_up {
+                                if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
+                                    state.last_recovery_attempt = now;
+                                    state.recovery_attempts += 1;
+                                    tracing::info!(
+                                        current_ledger,
+                                        first_buffered,
+                                        elapsed_secs = elapsed,
+                                        recovery_attempts = state.recovery_attempts,
+                                        "Attempting out-of-sync recovery (post-catchup gap)"
+                                    );
+                                    ConsensusStuckAction::AttemptRecovery
+                                } else {
+                                    tracing::debug!(
+                                        current_ledger,
+                                        first_buffered,
+                                        elapsed_secs = elapsed,
+                                        "Waiting for SCP to fill post-catchup gap"
+                                    );
+                                    ConsensusStuckAction::Wait
+                                }
                             } else {
-                                CONSENSUS_STUCK_TIMEOUT_SECS
-                            };
+                                // Not recently caught up — use stuck timeout logic.
+                                let use_fast_timeout =
+                                    all_peers_exhausted || has_stale_requests || recovery_failed;
+                                let effective_timeout = if use_fast_timeout {
+                                    TX_SET_UNAVAILABLE_TIMEOUT_SECS
+                                } else {
+                                    CONSENSUS_STUCK_TIMEOUT_SECS
+                                };
 
-                            // If we've already triggered catchup for this stuck state and it
-                            // was skipped (no newer checkpoint), don't trigger again until the
-                            // archive cooldown expires. The recently_caught_up check combined
-                            // with catchup_triggered prevents repeated catchup attempts.
-                            if state.catchup_triggered && recently_caught_up {
-                                tracing::debug!(
-                                    current_ledger,
-                                    first_buffered,
-                                    elapsed_secs = elapsed,
-                                    "Catchup already triggered, waiting for archive cooldown"
-                                );
-                                ConsensusStuckAction::Wait
-                            } else if elapsed >= effective_timeout {
-                                tracing::warn!(
-                                    current_ledger,
-                                    first_buffered,
-                                    last_buffered,
-                                    required_first,
-                                    trigger,
-                                    elapsed_secs = elapsed,
-                                    recovery_attempts = state.recovery_attempts,
-                                    all_peers_exhausted,
-                                    has_stale_requests,
-                                    recovery_failed,
-                                    recently_caught_up,
-                                    effective_timeout,
-                                    catchup_triggered = state.catchup_triggered,
-                                    "Buffered catchup stuck timeout; triggering catchup"
-                                );
-                                // Mark that we've triggered catchup for this stuck state
-                                state.catchup_triggered = true;
-                                // Reset the exhausted flag since we're triggering catchup
-                                self.tx_set_all_peers_exhausted
-                                    .store(false, Ordering::SeqCst);
-                                // Also clear the warned set so we can warn again if it happens after catchup
-                                self.tx_set_exhausted_warned.write().await.clear();
-                                ConsensusStuckAction::TriggerCatchup
-                            } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
-                                state.last_recovery_attempt = now;
-                                state.recovery_attempts += 1;
-                                tracing::info!(
-                                    current_ledger,
-                                    first_buffered,
-                                    elapsed_secs = elapsed,
-                                    recovery_attempts = state.recovery_attempts,
-                                    timeout_secs = CONSENSUS_STUCK_TIMEOUT_SECS,
-                                    "Attempting out-of-sync recovery (buffered gap)"
-                                );
-                                ConsensusStuckAction::AttemptRecovery
-                            } else {
-                                tracing::debug!(
-                                    current_ledger,
-                                    first_buffered,
-                                    last_buffered,
-                                    required_first,
-                                    trigger,
-                                    elapsed_secs = elapsed,
-                                    "Waiting for buffered catchup trigger ledger"
-                                );
-                                ConsensusStuckAction::Wait
+                                if state.catchup_triggered {
+                                    tracing::debug!(
+                                        current_ledger,
+                                        first_buffered,
+                                        elapsed_secs = elapsed,
+                                        "Catchup already triggered, waiting for progress"
+                                    );
+                                    ConsensusStuckAction::Wait
+                                } else if elapsed >= effective_timeout {
+                                    tracing::warn!(
+                                        current_ledger,
+                                        first_buffered,
+                                        last_buffered,
+                                        required_first,
+                                        trigger,
+                                        elapsed_secs = elapsed,
+                                        recovery_attempts = state.recovery_attempts,
+                                        all_peers_exhausted,
+                                        has_stale_requests,
+                                        recovery_failed,
+                                        effective_timeout,
+                                        "Buffered catchup stuck timeout; triggering catchup"
+                                    );
+                                    state.catchup_triggered = true;
+                                    self.tx_set_all_peers_exhausted
+                                        .store(false, Ordering::SeqCst);
+                                    self.tx_set_exhausted_warned.write().await.clear();
+                                    ConsensusStuckAction::TriggerCatchup
+                                } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
+                                    state.last_recovery_attempt = now;
+                                    state.recovery_attempts += 1;
+                                    tracing::info!(
+                                        current_ledger,
+                                        first_buffered,
+                                        elapsed_secs = elapsed,
+                                        recovery_attempts = state.recovery_attempts,
+                                        timeout_secs = CONSENSUS_STUCK_TIMEOUT_SECS,
+                                        "Attempting out-of-sync recovery (buffered gap)"
+                                    );
+                                    ConsensusStuckAction::AttemptRecovery
+                                } else {
+                                    tracing::debug!(
+                                        current_ledger,
+                                        first_buffered,
+                                        last_buffered,
+                                        required_first,
+                                        trigger,
+                                        elapsed_secs = elapsed,
+                                        "Waiting for buffered catchup trigger ledger"
+                                    );
+                                    ConsensusStuckAction::Wait
+                                }
                             }
                         }
                         _ => {

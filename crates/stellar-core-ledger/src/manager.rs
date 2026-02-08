@@ -616,19 +616,23 @@ impl LedgerManager {
         })
     }
 
-    /// Initialize all caches from the bucket list using per-type scanning.
+    /// Initialize all caches from the bucket list using a single-pass scan.
     ///
-    /// Instead of iterating all ~60M entries with a single dedup HashSet (~8.6 GB
-    /// on mainnet), this performs separate scans per entry type. Each scan maintains
-    /// its own dedup set scoped to that type's keys, with peak memory ~240 MB
-    /// (for ContractData with ~1.68M keys). The dedup set is freed between scans.
+    /// Performs ONE pass over the entire bucket list, dispatching each entry
+    /// to the appropriate handler based on its type. This reads ~24 GB of
+    /// bucket data once, instead of 5x (~120 GB) with per-type scanning.
     ///
-    /// Scan order:
-    /// 1. Offers -> SQL bulk insert (dedup: ~912K keys, ~130 MB)
-    /// 2. ContractCode -> module cache + soroban state (dedup: ~874 keys, tiny)
-    /// 3. ContractData -> soroban state (dedup: ~1.68M keys, ~240 MB)
-    /// 4. TTL -> soroban state (dedup: ~1.68M keys, ~240 MB)
-    /// 5. ConfigSetting -> soroban state (dedup: ~17 keys, tiny)
+    /// A single `HashSet<LedgerKey>` is used for deduplication across all
+    /// entry types. Since `LedgerKey` is a discriminated union, keys of
+    /// different types never collide. Peak memory for the dedup set is
+    /// ~5.3M keys (~700 MB) on mainnet.
+    ///
+    /// Entry types processed:
+    /// - Offer -> in-memory offer store + secondary index
+    /// - ContractCode -> module cache + soroban state
+    /// - ContractData -> soroban state
+    /// - TTL -> soroban state
+    /// - ConfigSetting -> soroban state
     fn initialize_all_caches(&self, protocol_version: u32, ledger_seq: u32) -> Result<()> {
         use stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION;
         use stellar_xdr::curr::LedgerEntryType;
@@ -640,7 +644,8 @@ impl LedgerManager {
         let rent_config = self.load_soroban_rent_config(&bucket_list);
 
         // Create module cache if Soroban is supported
-        let module_cache = if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
+        let soroban_enabled = protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION;
+        let module_cache = if soroban_enabled {
             PersistentModuleCache::new_for_protocol(protocol_version)
         } else {
             None
@@ -650,109 +655,66 @@ impl LedgerManager {
         let mut soroban_state = self.soroban_state.write();
         soroban_state.clear();
 
-        // --- Scan 1: Offers -> in-memory store ---
-        info!("Cache init: scanning Offer entries...");
+        // Counters
         let mut offer_count = 0u64;
-        let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
-
-        bucket_list.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
-            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                if let LedgerEntryData::Offer(ref offer) = entry.data {
-                    mem_offers.insert(offer.offer_id, entry.clone());
-                    offer_count += 1;
-                }
-            }
-            true
-        });
-
-        // Build the (account, asset) secondary index from mem_offers
-        let mut account_asset_idx: OfferAccountAssetIndex = HashMap::new();
-        for entry in mem_offers.values() {
-            if let LedgerEntryData::Offer(ref offer) = entry.data {
-                index_offer_insert(&mut account_asset_idx, offer);
-            }
-        }
-
-        // Store in persistent in-memory offer store
-        *self.offer_store.write() = mem_offers;
-        *self.offer_account_asset_index.write() = account_asset_idx;
-
-        let offer_elapsed = cache_init_start.elapsed();
-        info!(
-            offer_count,
-            elapsed_ms = offer_elapsed.as_millis() as u64,
-            "Cache init: Offer scan complete"
-        );
-
-        // --- Scan 2: ContractCode -> module cache + soroban state ---
         let mut contracts_added = 0u64;
         let mut code_count = 0u64;
-        let mut last_scan_elapsed = offer_elapsed;
-        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-            info!("Cache init: scanning ContractCode entries...");
-            bucket_list.scan_for_entries_of_type(LedgerEntryType::ContractCode, |be| {
-                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                    if let LedgerEntryData::ContractCode(contract_code) = &entry.data {
+        let mut data_count = 0u64;
+        let mut ttl_count = 0u64;
+        let mut config_count = 0u64;
+
+        // Collect offers in memory for secondary index construction
+        let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
+
+        // Build list of entry types to scan
+        let mut scan_types = vec![LedgerEntryType::Offer];
+        if soroban_enabled {
+            scan_types.push(LedgerEntryType::ContractCode);
+            scan_types.push(LedgerEntryType::ContractData);
+            scan_types.push(LedgerEntryType::Ttl);
+            scan_types.push(LedgerEntryType::ConfigSetting);
+        }
+
+        info!(
+            types = scan_types.len(),
+            soroban_enabled, "Cache init: starting single-pass scan..."
+        );
+
+        // Single pass over the entire bucket list
+        bucket_list.scan_for_entries_of_types(&scan_types, |be| {
+            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+                match &entry.data {
+                    LedgerEntryData::Offer(ref offer) => {
+                        mem_offers.insert(offer.offer_id, entry.clone());
+                        offer_count += 1;
+                    }
+                    LedgerEntryData::ContractCode(contract_code) => {
                         if let Some(ref cache) = module_cache {
-                            if cache.add_contract(contract_code.code.as_slice(), protocol_version) {
+                            if cache.add_contract(
+                                contract_code.code.as_slice(),
+                                protocol_version,
+                            ) {
                                 contracts_added += 1;
                             }
                         }
+                        if let Err(e) = soroban_state.create_contract_code(
+                            entry.clone(),
+                            protocol_version,
+                            rent_config.as_ref(),
+                        ) {
+                            tracing::warn!(error = %e, "Failed to add contract code to soroban state");
+                        } else {
+                            code_count += 1;
+                        }
                     }
-                    if let Err(e) = soroban_state.create_contract_code(
-                        entry.clone(),
-                        protocol_version,
-                        rent_config.as_ref(),
-                    ) {
-                        tracing::warn!(error = %e, "Failed to add contract code to soroban state");
-                    } else {
-                        code_count += 1;
+                    LedgerEntryData::ContractData(_) => {
+                        if let Err(e) = soroban_state.create_contract_data(entry.clone()) {
+                            tracing::warn!(error = %e, "Failed to add contract data to soroban state");
+                        } else {
+                            data_count += 1;
+                        }
                     }
-                }
-                true
-            });
-            let now = cache_init_start.elapsed();
-            info!(
-                code_count,
-                contracts_added,
-                scan_ms = (now - last_scan_elapsed).as_millis() as u64,
-                elapsed_ms = now.as_millis() as u64,
-                "Cache init: ContractCode scan complete"
-            );
-            last_scan_elapsed = now;
-        }
-
-        // --- Scan 3: ContractData -> soroban state ---
-        let mut data_count = 0u64;
-        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-            info!("Cache init: scanning ContractData entries...");
-            bucket_list.scan_for_entries_of_type(LedgerEntryType::ContractData, |be| {
-                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                    if let Err(e) = soroban_state.create_contract_data(entry.clone()) {
-                        tracing::warn!(error = %e, "Failed to add contract data to soroban state");
-                    } else {
-                        data_count += 1;
-                    }
-                }
-                true
-            });
-            let now = cache_init_start.elapsed();
-            info!(
-                data_count,
-                scan_ms = (now - last_scan_elapsed).as_millis() as u64,
-                elapsed_ms = now.as_millis() as u64,
-                "Cache init: ContractData scan complete"
-            );
-            last_scan_elapsed = now;
-        }
-
-        // --- Scan 4: TTL -> soroban state ---
-        let mut ttl_count = 0u64;
-        if protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION {
-            info!("Cache init: scanning TTL entries...");
-            bucket_list.scan_for_entries_of_type(LedgerEntryType::Ttl, |be| {
-                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                    if let LedgerEntryData::Ttl(ttl) = &entry.data {
+                    LedgerEntryData::Ttl(ttl) => {
                         let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
                             key_hash: ttl.key_hash.clone(),
                         };
@@ -766,42 +728,46 @@ impl LedgerManager {
                             ttl_count += 1;
                         }
                     }
+                    LedgerEntryData::ConfigSetting(_) => {
+                        if let Err(e) = soroban_state.process_entry_create(
+                            entry,
+                            protocol_version,
+                            rent_config.as_ref(),
+                        ) {
+                            tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                        } else {
+                            config_count += 1;
+                        }
+                    }
+                    _ => {}
                 }
-                true
-            });
-            let now = cache_init_start.elapsed();
-            info!(
-                ttl_count,
-                scan_ms = (now - last_scan_elapsed).as_millis() as u64,
-                elapsed_ms = now.as_millis() as u64,
-                "Cache init: TTL scan complete"
-            );
+            }
+            true
+        });
+
+        let scan_elapsed = cache_init_start.elapsed();
+        info!(
+            offer_count,
+            code_count,
+            contracts_added,
+            data_count,
+            ttl_count,
+            config_count,
+            elapsed_ms = scan_elapsed.as_millis() as u64,
+            "Cache init: single-pass scan complete"
+        );
+
+        // Build the (account, asset) secondary index from mem_offers
+        let mut account_asset_idx: OfferAccountAssetIndex = HashMap::new();
+        for entry in mem_offers.values() {
+            if let LedgerEntryData::Offer(ref offer) = entry.data {
+                index_offer_insert(&mut account_asset_idx, offer);
+            }
         }
 
-        // --- Scan 5: ConfigSetting -> soroban state ---
-        let mut config_count = 0u64;
-        {
-            info!("Cache init: scanning ConfigSetting entries...");
-            bucket_list.scan_for_entries_of_type(LedgerEntryType::ConfigSetting, |be| {
-                if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                    if let Err(e) = soroban_state.process_entry_create(
-                        entry,
-                        protocol_version,
-                        rent_config.as_ref(),
-                    ) {
-                        tracing::warn!(error = %e, "Failed to add config setting to soroban state");
-                    } else {
-                        config_count += 1;
-                    }
-                }
-                true
-            });
-            info!(
-                config_count,
-                elapsed_ms = cache_init_start.elapsed().as_millis() as u64,
-                "Cache init: ConfigSetting scan complete"
-            );
-        }
+        // Store in persistent in-memory offer store
+        *self.offer_store.write() = mem_offers;
+        *self.offer_account_asset_index.write() = account_asset_idx;
 
         // Drop bucket list lock before acquiring write locks
         drop(bucket_list);
@@ -826,7 +792,7 @@ impl LedgerManager {
             total_soroban_size =
                 soroban_stats.contract_data_size + soroban_stats.contract_code_size,
             elapsed_ms = cache_init_start.elapsed().as_millis() as u64,
-            "Initialized caches from bucket list (per-type scanning)"
+            "Initialized caches from bucket list (single-pass scanning)"
         );
 
         Ok(())
@@ -1456,21 +1422,18 @@ impl<'a> LedgerCloseContext<'a> {
         const BN254_FR_INV: usize = 84;
         const NEW_SIZE: usize = BN254_FR_INV + 1; // 85
 
-        let make_entry =
-            |const_term: i64, linear_term: i64| ContractCostParamEntry {
-                ext: ExtensionPoint::V0,
-                const_term,
-                linear_term,
-            };
+        let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+            ext: ExtensionPoint::V0,
+            const_term,
+            linear_term,
+        };
 
         // --- Update CPU cost params ---
         let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
         });
         let cpu_entry = self.load_entry(&cpu_key)?.ok_or_else(|| {
-            LedgerError::Internal(
-                "ContractCostParamsCpuInstructions entry not found".to_string(),
-            )
+            LedgerError::Internal("ContractCostParamsCpuInstructions entry not found".to_string())
         })?;
         let mut cpu_params = if let LedgerEntryData::ConfigSetting(
             ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
@@ -1521,9 +1484,7 @@ impl<'a> LedgerCloseContext<'a> {
             config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
         });
         let mem_entry = self.load_entry(&mem_key)?.ok_or_else(|| {
-            LedgerError::Internal(
-                "ContractCostParamsMemoryBytes entry not found".to_string(),
-            )
+            LedgerError::Internal("ContractCostParamsMemoryBytes entry not found".to_string())
         })?;
         let mut mem_params = if let LedgerEntryData::ConfigSetting(
             ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
@@ -1932,9 +1893,10 @@ impl<'a> LedgerCloseContext<'a> {
         // 1. After version upgrade to V23+ (recompute with potentially new cost params)
         // 2. After config upgrade that changes ContractCostParamsMemoryBytes
         // It recomputes contract code sizes in-memory and overwrites all window entries.
-        let version_upgrade_triggers_state_size = prev_version != protocol_version
-            && protocol_version >= 23;
-        if (config_memory_cost_params_changed || version_upgrade_memory_cost_changed
+        let version_upgrade_triggers_state_size =
+            prev_version != protocol_version && protocol_version >= 23;
+        if (config_memory_cost_params_changed
+            || version_upgrade_memory_cost_changed
             || version_upgrade_triggers_state_size)
             && protocol_version >= stellar_core_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
