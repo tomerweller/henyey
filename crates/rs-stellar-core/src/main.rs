@@ -2097,6 +2097,28 @@ async fn cmd_verify_execution(
                                     }
                                 }
 
+                                // Show ops when one succeeds and other fails
+                                if let (TransactionResultResult::TxSuccess(our_ops), TransactionResultResult::TxFailed(cdp_ops)) = (our_result, cdp_result) {
+                                    println!("        Ours ops ({}):", our_ops.len());
+                                    for (j, op) in our_ops.iter().enumerate() {
+                                        println!("          Op {}: {:?}", j, op);
+                                    }
+                                    println!("        CDP ops ({}):", cdp_ops.len());
+                                    for (j, op) in cdp_ops.iter().enumerate() {
+                                        println!("          Op {}: {:?}", j, op);
+                                    }
+                                }
+                                if let (TransactionResultResult::TxFailed(our_ops), TransactionResultResult::TxSuccess(cdp_ops)) = (our_result, cdp_result) {
+                                    println!("        Ours ops ({}):", our_ops.len());
+                                    for (j, op) in our_ops.iter().enumerate() {
+                                        println!("          Op {}: {:?}", j, op);
+                                    }
+                                    println!("        CDP ops ({}):", cdp_ops.len());
+                                    for (j, op) in cdp_ops.iter().enumerate() {
+                                        println!("          Op {}: {:?}", j, op);
+                                    }
+                                }
+
                                 // Limit output to first 10 diffs
                                 if diff_count >= 10 {
                                     println!("      ... (showing first 10 of potentially more diffs)");
@@ -2253,41 +2275,109 @@ async fn cmd_verify_execution(
                                     _ => vec![],
                                 };
                                 for change in changes {
-                                    if let stellar_xdr::curr::LedgerEntryChange::Updated(entry)
-                                    | stellar_xdr::curr::LedgerEntryChange::Created(entry)
-                                    | stellar_xdr::curr::LedgerEntryChange::Restored(entry) = change {
-                                        if let Ok(key) = stellar_core_ledger::entry_to_key(entry) {
+                                    match change {
+                                        stellar_xdr::curr::LedgerEntryChange::Updated(entry)
+                                        | stellar_xdr::curr::LedgerEntryChange::Created(entry)
+                                        | stellar_xdr::curr::LedgerEntryChange::Restored(entry) => {
+                                            if let Ok(key) = stellar_core_ledger::entry_to_key(entry) {
+                                                if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
+                                                    final_entries.insert(kb, entry.clone());
+                                                }
+                                            }
+                                        }
+                                        stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
                                             if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-                                                final_entries.insert(kb, entry.clone());
+                                                final_entries.remove(&kb);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            println!("    CDP TX final entries (coalesced, {} unique keys)", final_entries.len());
+
+                            // Compare CDP entries with our bucket list state
+                            let bl = ledger_manager.bucket_list();
+                            let bl_snapshot = stellar_core_bucket::BucketListSnapshot::new(&bl, result.header.clone());
+                            drop(bl);
+                            let mut diffs = 0;
+                            let mut missing = 0;
+                            for (key_bytes, cdp_entry) in final_entries.iter() {
+                                use stellar_xdr::curr::ReadXdr;
+                                if let Ok(key) = stellar_xdr::curr::LedgerKey::from_xdr(key_bytes.as_slice(), stellar_xdr::curr::Limits::none()) {
+                                    let cdp_xdr = cdp_entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                    let cdp_hash = {
+                                        let mut h = Sha256::new();
+                                        h.update(&cdp_xdr);
+                                        format!("{:x}", h.finalize())
+                                    };
+                                    match bl_snapshot.get(&key) {
+                                        Some(our_entry) => {
+                                            let our_xdr = our_entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let our_hash = {
+                                                let mut h = Sha256::new();
+                                                h.update(&our_xdr);
+                                                format!("{:x}", h.finalize())
+                                            };
+                                            if our_hash != cdp_hash {
+                                                diffs += 1;
+                                                let key_str = format!("{:?}", std::mem::discriminant(&cdp_entry.data));
+                                                println!("    ENTRY DIFF #{}: key={:?}", diffs, key_str);
+                                                println!("      CDP:  lm={} hash={}", cdp_entry.last_modified_ledger_seq, cdp_hash);
+                                                println!("      Ours: lm={} hash={}", our_entry.last_modified_ledger_seq, our_hash);
+                                                println!("      CDP  xdr: {}", hex::encode(&cdp_xdr[..cdp_xdr.len().min(200)]));
+                                                println!("      Ours xdr: {}", hex::encode(&our_xdr[..our_xdr.len().min(200)]));
+                                                // For offers, show readable details
+                                                if let (stellar_xdr::curr::LedgerEntryData::Offer(cdp_o), stellar_xdr::curr::LedgerEntryData::Offer(our_o)) = (&cdp_entry.data, &our_entry.data) {
+                                                    println!("      CDP  offer: seller={:?} amount={} price={}/{}", hex::encode(&{let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_o.seller_id.0; pk.0}[..8]), cdp_o.amount, cdp_o.price.n, cdp_o.price.d);
+                                                    println!("      Ours offer: seller={:?} amount={} price={}/{}", hex::encode(&{let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = our_o.seller_id.0; pk.0}[..8]), our_o.amount, our_o.price.n, our_o.price.d);
+                                                }
+                                                if let (stellar_xdr::curr::LedgerEntryData::Account(cdp_a), stellar_xdr::curr::LedgerEntryData::Account(our_a)) = (&cdp_entry.data, &our_entry.data) {
+                                                    println!("      CDP  account: balance={} seq={}", cdp_a.balance, cdp_a.seq_num.0);
+                                                    println!("      Ours account: balance={} seq={}", our_a.balance, our_a.seq_num.0);
+                                                }
+                                                if let (stellar_xdr::curr::LedgerEntryData::Trustline(cdp_t), stellar_xdr::curr::LedgerEntryData::Trustline(our_t)) = (&cdp_entry.data, &our_entry.data) {
+                                                    println!("      CDP  trustline: balance={} asset={:?}", cdp_t.balance, cdp_t.asset);
+                                                    println!("      Ours trustline: balance={} asset={:?}", our_t.balance, our_t.asset);
+                                                }
+                                                if let (stellar_xdr::curr::LedgerEntryData::LiquidityPool(cdp_p), stellar_xdr::curr::LedgerEntryData::LiquidityPool(our_p)) = (&cdp_entry.data, &our_entry.data) {
+                                                    let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cdp_cp) = cdp_p.body;
+                                                    let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref our_cp) = our_p.body;
+                                                    println!("      CDP  pool: reserve_a={} reserve_b={}", cdp_cp.reserve_a, cdp_cp.reserve_b);
+                                                    println!("      Ours pool: reserve_a={} reserve_b={}", our_cp.reserve_a, our_cp.reserve_b);
+                                                }
+                                                if diffs >= 20 { break; }
+                                            }
+                                        }
+                                        None => {
+                                            missing += 1;
+                                            if missing <= 10 {
+                                                let key_str = match &cdp_entry.data {
+                                                    stellar_xdr::curr::LedgerEntryData::Account(a) => {
+                                                        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
+                                                        format!("Account({})", hex::encode(&pk.0[..8]))
+                                                    }
+                                                    stellar_xdr::curr::LedgerEntryData::Trustline(t) => {
+                                                        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = t.account_id.0;
+                                                        format!("Trustline(acct={}, asset={:?}, balance={})", hex::encode(&pk.0[..8]), t.asset, t.balance)
+                                                    }
+                                                    stellar_xdr::curr::LedgerEntryData::Offer(o) => {
+                                                        format!("Offer(id={}, amount={})", o.offer_id, o.amount)
+                                                    }
+                                                    stellar_xdr::curr::LedgerEntryData::LiquidityPool(p) => {
+                                                        let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cp) = p.body;
+                                                        format!("Pool(ra={}, rb={})", cp.reserve_a, cp.reserve_b)
+                                                    }
+                                                    other => format!("{:?}", std::mem::discriminant(other)),
+                                                };
+                                                println!("    MISSING in our state: {} cdp_lm={} hash={}", key_str, cdp_entry.last_modified_ledger_seq, cdp_hash);
+                                                println!("      cdp_xdr: {}", hex::encode(&cdp_xdr[..cdp_xdr.len().min(200)]));
                                             }
                                         }
                                     }
                                 }
                             }
-                            println!("    CDP TX final entries (coalesced, {} unique keys):", final_entries.len());
-                            for (_, entry) in final_entries.iter() {
-                                let key_str = match &entry.data {
-                                    stellar_xdr::curr::LedgerEntryData::Account(a) => {
-                                        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
-                                        format!("Account({}..{})", hex::encode(&pk.0[..4]), hex::encode(&pk.0[28..32]))
-                                    }
-                                    stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
-                                        format!("ConfigSetting({:?})", cs.discriminant())
-                                    }
-                                    other => format!("{:?}", std::mem::discriminant(other)),
-                                };
-                                let xdr_bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                let xdr_size = xdr_bytes.len();
-                                let hash = {
-                                    let mut h = Sha256::new();
-                                    h.update(&xdr_bytes);
-                                    let r = h.finalize();
-                                    format!("{:x}", r)
-                                };
-                                let hex_preview = hex::encode(&xdr_bytes[..xdr_bytes.len().min(200)]);
-                                println!("      key={}, last_modified={}, xdr_size={}, xdr_hash={}\n        xdr_hex={}",
-                                    key_str, entry.last_modified_ledger_seq, xdr_size, hash, hex_preview);
-                            }
+                            println!("    Entry comparison: {} diffs, {} missing (out of {} CDP entries)", diffs, missing, final_entries.len());
                         }
                     }
 
