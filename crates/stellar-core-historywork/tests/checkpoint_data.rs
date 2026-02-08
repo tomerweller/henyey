@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_core_history::archive_state::HistoryArchiveState;
@@ -14,6 +13,7 @@ async fn test_build_checkpoint_data_requires_has() {
 
 #[tokio::test]
 async fn test_build_checkpoint_data_clones_state() {
+    let tmp_dir = tempfile::tempdir().unwrap();
     let mut work = HistoryWorkState::default();
     work.has = Some(HistoryArchiveState {
         version: 2,
@@ -23,13 +23,13 @@ async fn test_build_checkpoint_data_clones_state() {
         current_buckets: Vec::new(),
         hot_archive_buckets: None,
     });
-    work.buckets = HashMap::new();
+    work.bucket_dir = Some(tmp_dir.path().to_path_buf());
 
     let state = Arc::new(Mutex::new(work));
     let checkpoint = build_checkpoint_data(&state).await.unwrap();
 
     assert_eq!(checkpoint.has.current_ledger, 64);
-    assert!(checkpoint.buckets.is_empty());
+    assert_eq!(checkpoint.bucket_dir, tmp_dir.path());
     assert!(checkpoint.headers.is_empty());
     assert!(checkpoint.transactions.is_empty());
     assert!(checkpoint.tx_results.is_empty());

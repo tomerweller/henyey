@@ -90,7 +90,7 @@ fn make_header(
 #[tokio::test]
 async fn test_history_work_chain() {
     let checkpoint = 63u32;
-    let bucket_data: Vec<u8> = Vec::new();
+    let bucket_data: Vec<u8> = vec![0u8; 8]; // non-empty so it doesn't get filtered as empty bucket
     let bucket_hash = Hash256::hash(&bucket_data);
 
     let tx_set = TransactionSet {
@@ -220,13 +220,19 @@ async fn test_history_work_chain() {
 
     let archive = Arc::new(HistoryArchive::new(&format!("http://{}/", addr)).expect("archive"));
     let state = Arc::new(tokio::sync::Mutex::new(HistoryWorkState::default()));
+    let bucket_download_dir = tempfile::tempdir().expect("bucket download dir");
 
     let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
         max_concurrency: 2,
         retry_delay: std::time::Duration::from_millis(10),
         event_tx: None,
     });
-    let builder = HistoryWorkBuilder::new(archive, checkpoint, Arc::clone(&state));
+    let builder = HistoryWorkBuilder::new(
+        archive,
+        checkpoint,
+        Arc::clone(&state),
+        bucket_download_dir.path().to_path_buf(),
+    );
     let ids = builder.register(&mut scheduler);
 
     let publish_dir = tempfile::tempdir().expect("publish dir");
@@ -237,7 +243,7 @@ async fn test_history_work_chain() {
 
     let guard = state.lock().await;
     assert!(guard.has.is_some());
-    assert_eq!(guard.buckets.len(), 1);
+    assert!(guard.bucket_dir.is_some(), "bucket_dir should be set after download");
     assert_eq!(guard.headers.len(), 1);
     assert_eq!(guard.transactions.len(), 1);
     assert_eq!(guard.tx_results.len(), 1);

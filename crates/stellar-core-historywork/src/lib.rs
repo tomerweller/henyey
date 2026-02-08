@@ -128,7 +128,7 @@ use stellar_xdr::curr::{
 /// # Fields
 ///
 /// - `has`: The History Archive State describing the checkpoint's bucket list
-/// - `buckets`: Raw bucket data keyed by hash, used to reconstruct ledger state
+/// - `bucket_dir`: Directory where bucket files are stored on disk
 /// - `headers`: Ledger headers for all ledgers in the checkpoint range
 /// - `transactions`: Transaction sets for each ledger
 /// - `tx_results`: Transaction results (meta) for each ledger
@@ -142,11 +142,11 @@ pub struct HistoryWorkState {
     /// state at the checkpoint boundary.
     pub has: Option<HistoryArchiveState>,
 
-    /// Downloaded bucket data, keyed by SHA-256 hash.
+    /// Directory where downloaded bucket files are stored on disk.
     ///
-    /// Buckets contain the actual ledger entries (accounts, trustlines, etc.)
-    /// organized in a multi-level structure for efficient incremental updates.
-    pub buckets: HashMap<Hash256, Vec<u8>>,
+    /// Buckets are saved as `<hex_hash>.bucket` files during download.
+    /// This avoids holding multi-GB bucket data in memory.
+    pub bucket_dir: Option<PathBuf>,
 
     /// Ledger header history entries for the checkpoint range.
     ///
@@ -334,10 +334,11 @@ impl Work for GetHistoryArchiveStateWork {
 ///
 /// # Output
 ///
-/// On success, populates `state.buckets` with a map of hash -> bucket data.
+/// On success, saves bucket files to disk in the configured bucket directory.
 pub struct DownloadBucketsWork {
     archive: Arc<HistoryArchive>,
     state: SharedHistoryState,
+    bucket_dir: PathBuf,
 }
 
 impl DownloadBucketsWork {
@@ -346,9 +347,10 @@ impl DownloadBucketsWork {
     /// # Arguments
     ///
     /// * `archive` - The history archive to fetch buckets from
-    /// * `state` - Shared state containing the HAS and where buckets will be stored
-    pub fn new(archive: Arc<HistoryArchive>, state: SharedHistoryState) -> Self {
-        Self { archive, state }
+    /// * `state` - Shared state containing the HAS
+    /// * `bucket_dir` - Directory where bucket files will be saved
+    pub fn new(archive: Arc<HistoryArchive>, state: SharedHistoryState, bucket_dir: PathBuf) -> Self {
+        Self { archive, state, bucket_dir }
     }
 }
 
@@ -376,48 +378,98 @@ impl Work for DownloadBucketsWork {
             return WorkOutcome::Failed("missing HAS".to_string());
         };
 
-        let hashes = has.unique_bucket_hashes();
+        let empty_bucket_hash = Hash256::hash(&[]);
+        let hashes: Vec<_> = has
+            .unique_bucket_hashes()
+            .into_iter()
+            .filter(|h| !h.is_zero() && *h != empty_bucket_hash)
+            .collect();
         let total = hashes.len();
         let archive = self.archive.clone();
+        let bucket_dir = self.bucket_dir.clone();
 
-        // Download buckets in parallel (16 concurrent downloads, matching C++ MAX_CONCURRENT_SUBPROCESSES)
-        let results: Vec<Result<(Hash256, Vec<u8>), String>> = stream::iter(hashes)
-            .map(|hash| {
-                let archive = archive.clone();
-                async move {
-                    match archive.get_bucket(&hash).await {
-                        Ok(data) => {
-                            if let Err(err) = verify::verify_bucket_hash(&data, &hash) {
-                                Err(format!("bucket {} hash mismatch: {}", hash, err))
-                            } else {
-                                Ok((hash, data))
-                            }
-                        }
-                        Err(err) => Err(format!("failed to download bucket {}: {}", hash, err)),
-                    }
-                }
+        // Ensure bucket directory exists
+        if let Err(e) = std::fs::create_dir_all(&bucket_dir) {
+            return WorkOutcome::Failed(format!("failed to create bucket dir: {}", e));
+        }
+
+        // Filter out buckets already on disk
+        let to_download: Vec<_> = hashes
+            .iter()
+            .filter(|hash| {
+                let path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                !path.exists()
             })
-            .buffer_unordered(16)
-            .collect()
-            .await;
+            .cloned()
+            .collect();
 
-        // Check for failures and collect successful downloads
-        let mut buckets = HashMap::new();
-        for result in results {
-            match result {
-                Ok((hash, data)) => {
-                    buckets.insert(hash, data);
-                }
-                Err(err) => {
+        if to_download.is_empty() {
+            tracing::info!("All {} buckets already cached on disk", total);
+        } else {
+            tracing::info!(
+                "Downloading {} buckets to disk ({} already cached)",
+                to_download.len(),
+                total - to_download.len()
+            );
+
+            let downloaded_count = std::sync::atomic::AtomicU32::new(0);
+            let total_to_download = to_download.len();
+
+            // Download buckets in parallel, saving directly to disk.
+            // Each bucket is verified, written to disk, and then dropped from memory
+            // to avoid holding multi-GB bucket data in RAM simultaneously.
+            let results: Vec<Result<(), String>> = stream::iter(to_download.into_iter())
+                .map(|hash| {
+                    let archive = archive.clone();
+                    let bucket_dir = bucket_dir.clone();
+                    let downloaded_count = &downloaded_count;
+
+                    async move {
+                        let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+
+                        // Try each archive until one succeeds
+                        match archive.get_bucket(&hash).await {
+                            Ok(data) => {
+                                // Verify hash before saving
+                                if let Err(err) = verify::verify_bucket_hash(&data, &hash) {
+                                    return Err(format!("bucket {} hash mismatch: {}", hash, err));
+                                }
+                                // Save to disk
+                                if let Err(e) = std::fs::write(&bucket_path, &data) {
+                                    return Err(format!(
+                                        "failed to save bucket {} to disk: {}",
+                                        hash, e
+                                    ));
+                                }
+                                let count = downloaded_count
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                if count % 5 == 0 || count == total_to_download as u32 {
+                                    tracing::info!("Downloaded {}/{} buckets", count, total_to_download);
+                                }
+                                // data is dropped here — not held in memory
+                                Ok(())
+                            }
+                            Err(err) => Err(format!("failed to download bucket {}: {}", hash, err)),
+                        }
+                    }
+                })
+                .buffer_unordered(16)
+                .collect()
+                .await;
+
+            // Check for failures
+            for result in results {
+                if let Err(err) = result {
                     return WorkOutcome::Failed(err);
                 }
             }
         }
 
-        tracing::info!("Downloaded {} buckets in parallel", total);
+        tracing::info!("All {} buckets available on disk", total);
 
         let mut guard = self.state.lock().await;
-        guard.buckets = buckets;
+        guard.bucket_dir = Some(bucket_dir);
         WorkOutcome::Success
     }
 }
@@ -1271,16 +1323,36 @@ impl Work for PublishBucketsWork {
             "publishing buckets",
         )
         .await;
-        let buckets = {
+        let (bucket_dir, has) = {
             let guard = self.state.lock().await;
-            guard.buckets.clone()
+            (guard.bucket_dir.clone(), guard.has.clone())
         };
 
-        if buckets.is_empty() {
-            return WorkOutcome::Failed("buckets not available".to_string());
-        }
+        let Some(bucket_dir) = bucket_dir else {
+            return WorkOutcome::Failed("bucket directory not available".to_string());
+        };
+        let Some(has) = has else {
+            return WorkOutcome::Failed("HAS not available for publish".to_string());
+        };
 
-        for (hash, data) in buckets {
+        let empty_bucket_hash = Hash256::hash(&[]);
+        let hashes: Vec<_> = has
+            .unique_bucket_hashes()
+            .into_iter()
+            .filter(|h| !h.is_zero() && *h != empty_bucket_hash)
+            .collect();
+
+        for hash in hashes {
+            let file_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+            let data = match std::fs::read(&file_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    return WorkOutcome::Failed(format!(
+                        "failed to read bucket {} from disk: {}",
+                        hash, e
+                    ));
+                }
+            };
             match gzip_bytes(&data) {
                 Ok(gz) => {
                     let path = bucket_path(&hash);
@@ -1495,6 +1567,7 @@ pub struct HistoryWorkBuilder {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
+    bucket_dir: PathBuf,
 }
 
 impl HistoryWorkBuilder {
@@ -1505,11 +1578,18 @@ impl HistoryWorkBuilder {
     /// * `archive` - The history archive to download from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state that will be populated by download work
-    pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    /// * `bucket_dir` - Directory where bucket files will be saved
+    pub fn new(
+        archive: Arc<HistoryArchive>,
+        checkpoint: u32,
+        state: SharedHistoryState,
+        bucket_dir: PathBuf,
+    ) -> Self {
         Self {
             archive,
             checkpoint,
             state,
+            bucket_dir,
         }
     }
 
@@ -1537,6 +1617,7 @@ impl HistoryWorkBuilder {
             Box::new(DownloadBucketsWork::new(
                 Arc::clone(&self.archive),
                 Arc::clone(&self.state),
+                self.bucket_dir.clone(),
             )),
             vec![has_id],
             3,
@@ -1700,17 +1781,17 @@ pub async fn get_has(state: &SharedHistoryState) -> Result<HistoryArchiveState> 
         .ok_or_else(|| anyhow::anyhow!("HAS not available"))
 }
 
-/// Retrieves downloaded buckets from shared state.
+/// Retrieves the bucket directory from shared state.
 ///
 /// # Errors
 ///
-/// Returns an error if buckets have not been downloaded yet.
-pub async fn get_buckets(state: &SharedHistoryState) -> Result<HashMap<Hash256, Vec<u8>>> {
+/// Returns an error if the bucket directory has not been set yet.
+pub async fn get_bucket_dir(state: &SharedHistoryState) -> Result<PathBuf> {
     let guard = state.lock().await;
-    if guard.buckets.is_empty() {
-        anyhow::bail!("buckets not available");
-    }
-    Ok(guard.buckets.clone())
+    guard
+        .bucket_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("bucket directory not available"))
 }
 
 /// Retrieves downloaded ledger headers from shared state.
@@ -2302,7 +2383,10 @@ pub async fn build_checkpoint_data(state: &SharedHistoryState) -> Result<Checkpo
 
     Ok(CheckpointData {
         has,
-        buckets: guard.buckets.clone(),
+        bucket_dir: guard
+            .bucket_dir
+            .clone()
+            .ok_or_else(|| anyhow!("bucket directory not set"))?,
         headers: guard.headers.clone(),
         transactions: guard.transactions.clone(),
         tx_results: guard.tx_results.clone(),

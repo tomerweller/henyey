@@ -2547,7 +2547,13 @@ impl App {
             retry_delay: Duration::from_millis(200),
             event_tx: None,
         });
-        let builder = HistoryWorkBuilder::new(archive, checkpoint_seq, Arc::clone(&state));
+        let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
+        let builder = HistoryWorkBuilder::new(
+            archive,
+            checkpoint_seq,
+            Arc::clone(&state),
+            bucket_dir,
+        );
         let ids = builder.register(&mut scheduler);
 
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);

@@ -174,8 +174,9 @@ pub struct CheckpointData {
     /// The History Archive State describing this checkpoint.
     pub has: HistoryArchiveState,
 
-    /// Downloaded bucket files keyed by their hash.
-    pub buckets: HashMap<Hash256, Vec<u8>>,
+    /// Directory where bucket files are stored on disk (keyed by hash).
+    /// Bucket files are named `<hex_hash>.bucket`.
+    pub bucket_dir: std::path::PathBuf,
 
     /// Ledger headers for the checkpoint range.
     pub headers: Vec<LedgerHeaderHistoryEntry>,
@@ -773,22 +774,45 @@ impl CatchupManager {
         verify::verify_has_structure(&data.has)?;
         verify::verify_has_checkpoint(&data.has, checkpoint_seq)?;
 
-        // Step 3: Verify buckets
+        // Step 3: Verify bucket files exist on disk
+        // Hash verification was already performed at download time by DownloadBucketsWork.
+        // The apply_buckets step will re-verify hashes when loading each bucket lazily.
         self.update_progress(
             CatchupStatus::DownloadingBuckets,
             2,
-            "Verifying bucket files",
+            "Verifying bucket files on disk",
         );
         let bucket_hashes = data.has.unique_bucket_hashes();
+        let empty_bucket_hash = Hash256::hash(&[]);
         self.progress.buckets_total = bucket_hashes.len() as u32;
-        let mut buckets = Vec::with_capacity(bucket_hashes.len());
         for (idx, hash) in bucket_hashes.iter().enumerate() {
-            let Some(bytes) = data.buckets.get(hash) else {
-                return Err(HistoryError::BucketNotFound(*hash));
-            };
-            verify::verify_bucket_hash(bytes, hash)?;
-            buckets.push((*hash, bytes.clone()));
+            if !hash.is_zero() && *hash != empty_bucket_hash {
+                let bucket_path = data.bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                if !bucket_path.exists() {
+                    return Err(HistoryError::BucketNotFound(*hash));
+                }
+            }
             self.progress.buckets_downloaded = (idx + 1) as u32;
+        }
+
+        // Copy bucket files to the bucket manager directory if they're in a different location
+        let bucket_mgr_dir = self.bucket_manager.bucket_dir().to_path_buf();
+        if data.bucket_dir != bucket_mgr_dir {
+            for hash in &bucket_hashes {
+                if hash.is_zero() || *hash == empty_bucket_hash {
+                    continue;
+                }
+                let src = data.bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                let dst = bucket_mgr_dir.join(format!("{}.bucket", hash.to_hex()));
+                if src.exists() && !dst.exists() {
+                    std::fs::copy(&src, &dst).map_err(|e| {
+                        HistoryError::CatchupFailed(format!(
+                            "failed to copy bucket {} to bucket manager dir: {}",
+                            hash, e
+                        ))
+                    })?;
+                }
+            }
         }
 
         // Step 4: Verify SCP history entries (if present)
@@ -797,14 +821,15 @@ impl CatchupManager {
             self.persist_scp_history_entries(&data.scp_history)?;
         }
 
-        // Step 4: Apply buckets to build initial state
+        // Step 5: Apply buckets to build initial state
+        // Buckets are loaded lazily from disk — no in-memory bucket data needed.
         self.update_progress(
             CatchupStatus::ApplyingBuckets,
             3,
             "Applying buckets to build initial state",
         );
         let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
-            self.apply_buckets(&data.has, &buckets).await?;
+            self.apply_buckets(&data.has, &[]).await?;
 
         // Restart any pending merges that should have been in progress at the checkpoint.
         // This is critical for correct bucket list hash computation after catchup.
