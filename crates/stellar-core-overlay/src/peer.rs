@@ -276,6 +276,7 @@ impl Peer {
     /// Perform the authentication handshake.
     async fn handshake(&mut self, timeout_secs: u64) -> Result<()> {
         self.state = PeerState::Handshaking;
+        let handshake_start = std::time::Instant::now();
         debug!("Starting handshake with {}", self.connection.remote_addr());
 
         // Send Hello
@@ -354,21 +355,26 @@ impl Peer {
         }
 
         self.state = PeerState::Authenticated;
+        let handshake_ms = handshake_start.elapsed().as_millis();
         info!(
-            "Authenticated with peer {} ({})",
-            self.info.peer_id, self.info.address
+            "Authenticated with peer {} ({}) handshake_ms={}",
+            self.info.peer_id, self.info.address, handshake_ms
         );
 
         // Send SEND_MORE_EXTENDED to enable flow control
-        // num_messages: how many messages we can buffer
-        // num_bytes: how many bytes we can buffer (0 to disable bytes-based flow control)
-        // Use generous capacity to avoid early disconnects
+        // Match C++ defaults: PEER_FLOOD_READING_CAPACITY=200, fcBytes=300000
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
-            num_messages: 500,     // We can handle many messages
-            num_bytes: 50_000_000, // 50 MB of data
+            num_messages: 200,
+            num_bytes: 300_000,
         });
         self.send(send_more).await?;
         debug!("Sent SEND_MORE_EXTENDED to {}", self.info.peer_id);
+
+        // Ask for SCP data _after_ the flow control message (matches C++ recvAuth behavior)
+        // Use ledger seq 0 to request the latest SCP state
+        let get_scp_state = StellarMessage::GetScpState(0);
+        self.send(get_scp_state).await?;
+        debug!("Sent GET_SCP_STATE to {}", self.info.peer_id);
 
         Ok(())
     }
@@ -438,7 +444,7 @@ impl Peer {
         }
 
         let msg_type = helpers::message_type_name(&message);
-        trace!("Sending {} to {}", msg_type, self.info.peer_id);
+        info!("SEND {} to {}", msg_type, self.info.peer_id);
 
         let size = message_len(&message);
         let auth_msg = self.auth.wrap_message(message)?;

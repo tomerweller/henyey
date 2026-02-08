@@ -34,7 +34,7 @@
 
 use crate::{
     codec::helpers,
-    connection::{ConnectionPool, Listener},
+    connection::{ConnectionDirection, ConnectionPool, Listener},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
     peer::{Peer, PeerInfo, PeerStatsSnapshot},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
@@ -644,12 +644,20 @@ impl OverlayManager {
         processed_quorum_sets: Arc<DashMap<stellar_core_common::Hash256, std::time::Instant>>,
     ) {
         // Flow control: track messages received and send SendMoreExtended frequently
-        // Peers disconnect if we don't send enough flow control messages
-        // CRITICAL: Must use SendMoreExtended since we initialized with it in handshake
-        const SEND_MORE_THRESHOLD: u32 = 5; // Send flow control after just 5 messages
+        // C++ sends FLOW_CONTROL_SEND_MORE_BATCH_SIZE=40 msgs / 100000 bytes after processing
+        // a batch, NOT the full initial capacity. Match this behavior.
+        const SEND_MORE_THRESHOLD: u32 = 40; // Send flow control after 40 messages (C++ default)
         let mut messages_since_send_more = 0u32;
         let mut last_send_more = std::time::Instant::now();
         const SEND_MORE_INTERVAL: Duration = Duration::from_secs(1); // Send every second
+
+        // Ping/keepalive: send GetScpQuorumSet every 5 seconds to keep the connection alive.
+        // C++ stellar-core has a 5-second recurrent timer that calls pingPeer(), which sends
+        // GetScpQuorumSet with a synthetic hash. Without this, the remote peer's idle timeout
+        // (30s for authenticated peers) will eventually fire since we stop writing after the
+        // initial handshake burst.
+        let mut last_ping = std::time::Instant::now();
+        const PING_INTERVAL: Duration = Duration::from_secs(5);
 
         loop {
             if !running.load(Ordering::Relaxed) {
@@ -660,18 +668,45 @@ impl OverlayManager {
             if last_send_more.elapsed() >= SEND_MORE_INTERVAL {
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
-                    // Send generous flow control matching our handshake values
-                    // Use SendMoreExtended to match the handshake (not SendMore)
-                    if let Err(e) = peer_lock.send_more_extended(500, 50_000_000).await {
+                    // Send batch flow control matching C++ FLOW_CONTROL_SEND_MORE_BATCH_SIZE
+                    if let Err(e) = peer_lock.send_more_extended(40, 100_000).await {
                         debug!("Failed to send periodic flow control to {}: {}", peer_id, e);
                     } else {
                         trace!(
-                            "Sent periodic flow control (SendMoreExtended 500/50MB) to {}",
+                            "Sent periodic flow control (SendMoreExtended 40/100KB) to {}",
                             peer_id
                         );
                     }
                 }
                 last_send_more = std::time::Instant::now();
+            }
+
+            // Ping/keepalive: send GetScpQuorumSet every 5 seconds (matches C++ RECURRENT_TIMER_PERIOD)
+            // C++ sends GetScpQuorumSet with a hash derived from current time as a ping.
+            // This resets the remote peer's mLastRead timer, preventing idle timeout disconnects.
+            if last_ping.elapsed() >= PING_INTERVAL {
+                let mut peer_lock = peer.lock().await;
+                if peer_lock.is_connected() {
+                    // Generate a synthetic hash from the current time (same approach as C++ pingIDfromTimePoint)
+                    let now_nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let ping_hash = {
+                        use sha2::Digest;
+                        let mut hasher = sha2::Sha256::new();
+                        hasher.update(now_nanos.to_le_bytes());
+                        let result = hasher.finalize();
+                        stellar_xdr::curr::Uint256(result.into())
+                    };
+                    let ping_msg = stellar_xdr::curr::StellarMessage::GetScpQuorumset(ping_hash);
+                    if let Err(e) = peer_lock.send(ping_msg).await {
+                        debug!("Failed to send ping to {}: {}", peer_id, e);
+                    } else {
+                        trace!("Sent ping (GetScpQuorumSet) to {}", peer_id);
+                    }
+                }
+                last_ping = std::time::Instant::now();
             }
 
             // Receive message with timeout to allow periodic flow control
@@ -684,9 +719,12 @@ impl OverlayManager {
                 // Use a short timeout so we can send periodic flow control messages
                 match tokio::time::timeout(Duration::from_secs(2), peer_lock.recv()).await {
                     Ok(Ok(Some(msg))) => msg,
-                    Ok(Ok(None)) => break,
+                    Ok(Ok(None)) => {
+                        info!("Peer {} connection closed cleanly by remote", peer_id);
+                        break;
+                    }
                     Ok(Err(e)) => {
-                        debug!("Peer {} error: {}", peer_id, e);
+                        info!("Peer {} recv error: {}", peer_id, e);
                         break;
                     }
                     Err(_) => {
@@ -698,7 +736,7 @@ impl OverlayManager {
 
             // Process message
             let msg_type = helpers::message_type_name(&message);
-            trace!("Processing {} from {}", msg_type, peer_id);
+            info!("Processing {} from {}", msg_type, peer_id);
 
             // Log ERROR messages
             if let stellar_xdr::curr::StellarMessage::ErrorMsg(ref err) = message {
@@ -842,12 +880,12 @@ impl OverlayManager {
             if messages_since_send_more >= SEND_MORE_THRESHOLD {
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
-                    // Send generous capacity matching handshake values
-                    if let Err(e) = peer_lock.send_more_extended(500, 50_000_000).await {
+                    // Send batch capacity matching C++ FLOW_CONTROL_SEND_MORE_BATCH_SIZE
+                    if let Err(e) = peer_lock.send_more_extended(40, 100_000).await {
                         debug!("Failed to send flow control to {}: {}", peer_id, e);
                     } else {
                         trace!(
-                            "Sent batch flow control (SendMoreExtended 500/50MB) to {}",
+                            "Sent batch flow control (SendMoreExtended 40/100KB) to {}",
                             peer_id
                         );
                     }
@@ -1054,8 +1092,8 @@ impl OverlayManager {
         flood_gate: Arc<FloodGate>,
         running: Arc<AtomicBool>,
         peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
-        advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
-        advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
+        _advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
+        _advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
         added_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
         dropped_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
@@ -1103,18 +1141,10 @@ impl OverlayManager {
                 .await;
         }
 
-        let outbound_snapshot = advertised_outbound_peers.read().clone();
-        let inbound_snapshot = advertised_inbound_peers.read().clone();
-        if let Some(message) =
-            Self::build_peers_message(&outbound_snapshot, &inbound_snapshot, Some(addr))
-        {
-            let mut peer_lock = peer.lock().await;
-            if peer_lock.is_ready() {
-                if let Err(e) = peer_lock.send(message).await {
-                    debug!("Failed to send peers to {}: {}", peer_id, e);
-                }
-            }
-        }
+        // NOTE: Do NOT send PEERS to outbound peers (peers we connected to).
+        // In C++, only the acceptor (REMOTE_CALLED_US) sends PEERS during recvAuth().
+        // If we send PEERS to a peer we initiated a connection to, the remote will
+        // drop us silently (Peer.cpp:1225-1230).
 
         let peer_id_clone = peer_id.clone();
         let peers_clone = Arc::clone(&peers);
@@ -1173,7 +1203,11 @@ impl OverlayManager {
 
                 for entry in peers.iter() {
                     if let Ok(mut peer) = entry.value().try_lock() {
-                        if peer.is_ready() {
+                        // Only send PEERS to inbound peers (peers that connected to us).
+                        // C++ drops connections from initiators that send PEERS (Peer.cpp:1225-1230).
+                        if peer.is_ready()
+                            && peer.direction() == ConnectionDirection::Inbound
+                        {
                             if let Err(e) = peer.send(message.clone()).await {
                                 debug!("Failed to send peers to {}: {}", entry.key(), e);
                             }
@@ -1482,8 +1516,8 @@ impl OverlayManager {
             .connect_timeout_secs
             .max(self.config.auth_timeout_secs);
         let peer_handles = Arc::clone(&self.peer_handles);
-        let advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
-        let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
+        let _advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
+        let _advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
         let peer_event_tx = self.config.peer_event_tx.clone();
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let tx_set_callback = self.tx_set_callback.read().clone();
@@ -1508,20 +1542,7 @@ impl OverlayManager {
                     peers.insert(peer_id.clone(), Arc::clone(&peer));
                     peer_info_cache.insert(peer_id.clone(), peer_info);
 
-                    let outbound_snapshot = advertised_outbound_peers.read().clone();
-                    let inbound_snapshot = advertised_inbound_peers.read().clone();
-                    if let Some(message) = OverlayManager::build_peers_message(
-                        &outbound_snapshot,
-                        &inbound_snapshot,
-                        Some(&addr),
-                    ) {
-                        let mut peer_lock = peer.lock().await;
-                        if peer_lock.is_ready() {
-                            if let Err(e) = peer_lock.send(message).await {
-                                debug!("Failed to send peers to {}: {}", peer_id, e);
-                            }
-                        }
-                    }
+                    // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
                     // Run peer loop
                     Self::run_peer_loop(peer_id.clone(), peer, message_tx, flood_gate, running, tx_set_callback, quorum_set_callback, processed_tx_sets, processed_quorum_sets)

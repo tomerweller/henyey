@@ -2,13 +2,82 @@
 name = "rs-stellar-core-mainnet"
 is_validator = false
 
-# Trust the SDF mainnet validators
+# Mainnet tier 1 validators organized by organization
+# 7 orgs, require 5-of-7 (72%) agreement at top level
+# Each org inner set requires 2-of-3 (67%) or 3-of-5 (60%) agreement
 [node.quorum_set]
-threshold_percent = 66
+threshold_percent = 72
+validators = []
+
+# SDF (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
 validators = [
     "GCGB2S2KGYARPVIA37HYZXVRM2YZUEXA6S33ZU5BUDC6THSB62LZSTYH",
     "GCM6QMP3DLRPTAZW2UZPCPX2LF3SXWXKPMP3GKFZBDSF3QZGV2G5QSTK",
     "GABMKJM6I25XI4K7U6XWMULOUQIQ27BCTMLS6BYYSOWKTBUXVRJSXHYQ",
+]
+inner_sets = []
+
+# LOBSTR (5 validators, 3-of-5)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 60
+validators = [
+    "GCFONE23AB7Y6C5YZOMKUKGETPIAJA4QOYLS5VNS4JHBGKRZCPYHDLW7",
+    "GCB2VSADESRV2DDTIVTFLBDI562K6KE3KMKILBHUHUWFXCUBHGQDI7VL",
+    "GD5QWEVV4GZZTQP46BRXV5CUMMMLP4JTGFD7FWYJJWRL54CELY6JGQ63",
+    "GA7TEPCBDQKI7JQLQ34ZURRMK44DVYCIGVXQQWNSWAEQR6KB4FMCBT7J",
+    "GA5STBMV6QDXFDGD62MEHLLHZTPDI77U3PFOD2SELU5RJDHQWBR5NNK7",
+]
+inner_sets = []
+
+# Blockdaemon (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GAAV2GCVFLNN522ORUYFV33E76VPC22E72S75AQ6MBR5V45Z5DWVPWEU",
+    "GAVXB7SBJRYHSG6KSQHY74N7JAFRL4PFVZCNWW2ARI6ZEKNBJSMSKW7C",
+    "GAYXZ4PZ7P6QOX7EBHPIZXNWY4KCOBYWJCA4WKWRKC7XIUS3UJPT6EZ4",
+]
+inner_sets = []
+
+# Franklin Templeton (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GARYGQ5F2IJEBCZJCBNPWNWVDOFK7IBOHLJKKSG2TMHDQKEEC6P4PE4V",
+    "GCMSM2VFZGRPTZKPH5OABHGH4F3AVS6XTNJXDGCZ3MKCOSUBH3FL6DOB",
+    "GA7DV63PBUUWNUFAF4GAZVXU2OZMYRATDLKTC7VTCG7AU4XUPN5VRX4A",
+]
+inner_sets = []
+
+# SatoshiPay (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GC5SXLNAM3C4NMGK2PXK4R34B5GNZ47FYQ24ZIBFDFOCU6D4KBN4POAE",
+    "GBJQUIXUO4XSNPAUT6ODLZUJRV2NPXYASKUBY4G5MYP3M47PCVI55MNT",
+    "GAK6Z5UVGUVSEK6PEOCAYJISTT5EJBB34PN3NOLEQG2SUKXRVV2F6HZY",
+]
+inner_sets = []
+
+# Whalestack (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GD6SZQV3WEJUH352NTVLKEV2JM2RH266VPEM7EH5QLLI7ZZAALMLNUVN",
+    "GAZ437J46SCFPZEDLVGDMKZPLFO77XJ4QVAURSJVRZK2T5S7XUFHXI2Z",
+    "GADLA6BJK6VK33EM2IDQM37L5KGVCY5MSHSHVJA4SCNGNUIEOTCR6J5T",
+]
+inner_sets = []
+
+# PublicNode (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GCVJ4Z6TI6Z2SOGENSPXDQ2U4RKH3CNQKYUHNSSPYFPNWTLGS6EBH7I2",
+    "GCIXVKNFPKWVMKJKVK2V4NK7D4TC6W3BUMXSIJ365QUAXWBRPPJXIR2Z",
+    "GBLJNN3AVZZPG2FYAYTYQKECNWTQYYUUY2KVFN2OUKZKBULXIXBZ4FCT",
 ]
 inner_sets = []
 
@@ -50,18 +119,36 @@ max_inbound_peers = 64
 max_outbound_peers = 8
 target_outbound_peers = 8
 known_peers = [
+    # SDF
     "core-live-a.stellar.org:11625",
     "core-live-b.stellar.org:11625",
     "core-live-c.stellar.org:11625",
+    # LOBSTR
     "v1.stellar.lobstr.co:11625",
     "v2.stellar.lobstr.co:11625",
     "v3.stellar.lobstr.co:11625",
-    "stellar-de-fra.satoshipay.io:11625",
-    "stellar-us-iowa.satoshipay.io:11625",
+    "v4.stellar.lobstr.co:11625",
+    "v5.stellar.lobstr.co:11625",
+    # Blockdaemon
     "stellar-full-validator1.bdnodes.net:11625",
     "stellar-full-validator2.bdnodes.net:11625",
+    "stellar-full-validator3.bdnodes.net:11625",
+    # Franklin Templeton
     "stellar1.franklintempleton.com:11625",
+    "stellar2.franklintempleton.com:11625",
+    "stellar3.franklintempleton.com:11625",
+    # SatoshiPay
+    "stellar-de-fra.satoshipay.io:11625",
+    "stellar-sg-sin.satoshipay.io:11625",
+    "stellar-us-iowa.satoshipay.io:11625",
+    # Whalestack
+    "germany.stellar.whalestack.com:11625",
+    "finland.stellar.whalestack.com:11625",
+    "hongkong.stellar.whalestack.com:11625",
+    # PublicNode
     "bootes.publicnode.org:11625",
+    "hercules.publicnode.org:11625",
+    "lyra.publicnode.org:11625",
 ]
 preferred_peers = []
 

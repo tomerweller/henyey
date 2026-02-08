@@ -64,12 +64,6 @@ use crate::Result;
 
 /// Maximum slot distance for accepting EXTERNALIZE messages.
 ///
-/// EXTERNALIZE messages from future slots can fast-forward our tracking slot,
-/// but we need to limit this to prevent malicious nodes from making us catch up
-/// to non-existent slots. This limit (1000 ledgers, ~83 minutes at 5s/ledger)
-/// is generous enough to handle network partitions while preventing attacks.
-const MAX_EXTERNALIZE_SLOT_DISTANCE: u64 = 1000;
-
 /// Maximum number of slots to accept behind the current tracking slot.
 ///
 /// This matches the C++ stellar-core MAX_SLOTS_TO_REMEMBER constant. Slots
@@ -740,19 +734,8 @@ impl Herder {
                     return EnvelopeState::Invalid;
                 }
 
-                // Security check 2: Reject slots that are unreasonably far in the future
-                // This prevents malicious nodes from making us catch up to non-existent slots.
-                let slot_distance = slot.saturating_sub(current_slot);
-                if slot_distance > MAX_EXTERNALIZE_SLOT_DISTANCE {
-                    warn!(
-                        slot,
-                        current_slot,
-                        slot_distance,
-                        max_distance = MAX_EXTERNALIZE_SLOT_DISTANCE,
-                        "Rejecting EXTERNALIZE for slot too far in future"
-                    );
-                    return EnvelopeState::Invalid;
-                }
+                // C++ stellar-core has no max distance check for EXTERNALIZE.
+                // The quorum check above is sufficient to prevent untrusted fast-forwards.
 
                 // CRITICAL: Don't externalize without the tx_set!
                 // Like C++ stellar-core, we must wait until the tx_set is available before
@@ -2118,12 +2101,8 @@ mod tests {
         assert!(!stats.is_validator);
     }
 
-    #[test]
-    fn test_max_externalize_slot_distance_constant() {
-        // Verify the constant is set to a reasonable value (1000 ledgers)
-        // This prevents accepting EXTERNALIZE messages for slots millions of ledgers ahead
-        assert_eq!(MAX_EXTERNALIZE_SLOT_DISTANCE, 1000);
-    }
+    // MAX_EXTERNALIZE_SLOT_DISTANCE was removed — C++ stellar-core has no such limit.
+    // When not tracking, C++ accepts EXTERNALIZE for any slot (maxLedgerSeq = uint32::max).
 
     /// Creates a signed EXTERNALIZE envelope for testing.
     fn make_signed_externalize_envelope(slot: u64, herder: &Herder) -> ScpEnvelope {
@@ -2188,8 +2167,10 @@ mod tests {
     }
 
     #[test]
-    fn test_externalize_rejected_when_slot_too_far_in_future() {
-        // Create a herder with a quorum set that includes our test node
+    fn test_externalize_accepted_for_far_future_slot() {
+        // C++ stellar-core has no MAX_EXTERNALIZE_SLOT_DISTANCE — when not tracking,
+        // it accepts EXTERNALIZE for any slot (maxLedgerSeq = uint32::max).
+        // This test verifies we match that behavior.
         let secret = SecretKey::from_seed(&[1u8; 32]);
         let public = secret.public_key();
         let test_node_id = node_id_from_public_key(&public);
@@ -2216,14 +2197,26 @@ mod tests {
         };
         herder.quorum_tracker.write().expand(&test_node_id, test_qs);
 
-        // Create an EXTERNALIZE envelope for a slot WAY in the future (beyond MAX_EXTERNALIZE_SLOT_DISTANCE)
-        let far_future_slot = 100 + MAX_EXTERNALIZE_SLOT_DISTANCE + 100; // 1200
+        // Create an EXTERNALIZE envelope for a slot far in the future (1200 ledgers ahead).
+        // This should now be ACCEPTED since we removed the distance check.
+        let far_future_slot = 100 + 1100; // 1200
         let envelope = make_signed_externalize_envelope(far_future_slot, &herder);
+
+        // Cache a dummy tx_set so the EXTERNALIZE handler can find it
+        let dummy_tx_set = TransactionSet {
+            hash: Hash256([0u8; 32]),
+            previous_ledger_hash: Hash256::ZERO,
+            transactions: vec![],
+            generalized_tx_set: None,
+        };
+        herder.cache_tx_set(dummy_tx_set);
 
         let result = herder.receive_scp_envelope(envelope);
 
-        // Should be rejected because slot is too far in the future
-        assert_eq!(result, EnvelopeState::Invalid);
+        // Should be accepted — no distance limit exists (matching C++ behavior)
+        assert_eq!(result, EnvelopeState::Valid);
+        // Tracking slot should have advanced
+        assert_eq!(herder.tracking_slot(), far_future_slot + 1);
     }
 
     #[test]

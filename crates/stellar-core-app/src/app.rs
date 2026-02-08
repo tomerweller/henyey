@@ -2225,17 +2225,47 @@ impl App {
         // Initialize ledger manager with catchup results.
         // This validates that the bucket list hash matches the ledger header.
         // Pass the pre-computed header hash from the history archive - this is authoritative.
+        //
+        // If caches are already warm from a prior catchup cycle, use the differential
+        // update path which only scans changed bucket levels (~2-5s) instead of
+        // rebuilding all caches from scratch (~120s on mainnet).
         if self.ledger_manager.is_initialized() {
-            self.ledger_manager.reset();
+            if self.ledger_manager.has_warm_caches() {
+                tracing::info!("Re-catchup with warm caches: using differential cache update");
+                self.ledger_manager.reset_for_recatchup();
+                self.ledger_manager
+                    .initialize_warm(
+                        output.bucket_list,
+                        output.hot_archive_bucket_list,
+                        output.header,
+                        output.header_hash,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to initialize ledger manager (warm): {}", e)
+                    })?;
+            } else {
+                self.ledger_manager.reset();
+                self.ledger_manager
+                    .initialize(
+                        output.bucket_list,
+                        output.hot_archive_bucket_list,
+                        output.header,
+                        output.header_hash,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to initialize ledger manager: {}", e)
+                    })?;
+            }
+        } else {
+            self.ledger_manager
+                .initialize(
+                    output.bucket_list,
+                    output.hot_archive_bucket_list,
+                    output.header,
+                    output.header_hash,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
         }
-        self.ledger_manager
-            .initialize(
-                output.bucket_list,
-                output.hot_archive_bucket_list,
-                output.header,
-                output.header_hash,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
 
         tracing::info!(
             ledger_seq = output.result.ledger_seq,
