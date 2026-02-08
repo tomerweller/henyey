@@ -2468,9 +2468,9 @@ impl<'a> LedgerCloseContext<'a> {
                         EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
                     });
 
-                    // Run eviction scan
+                    // Run eviction scan (scan phase only — collects candidates)
                     let eviction_start = std::time::Instant::now();
-                    let mut eviction_result = bucket_list
+                    let eviction_result = bucket_list
                         .scan_for_eviction_incremental(
                             iter,
                             self.close_data.ledger_seq,
@@ -2482,16 +2482,16 @@ impl<'a> LedgerCloseContext<'a> {
                     tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
                         bytes_scanned = eviction_result.bytes_scanned,
-                        archived_count = eviction_result.archived_entries.len(),
-                        evicted_count = eviction_result.evicted_keys.len() / 2,
+                        candidates = eviction_result.candidates.len(),
                         duration_ms = eviction_duration.as_millis(),
                         "Eviction scan completed"
                     );
 
-                    // Filter eviction candidates: exclude entries whose TTL
-                    // was modified by transactions in this ledger.  C++ does this
-                    // via getAllTTLKeysWithoutSealing() + resolveBackgroundEvictionScan
-                    // which removes candidates whose TTL key is in the modified set.
+                    // Resolution phase: apply TTL filtering + max_entries limit.
+                    // This matches C++ resolveBackgroundEvictionScan which:
+                    // 1. Filters out entries whose TTL was modified by TXs
+                    // 2. Evicts up to maxEntriesToArchive entries
+                    // 3. Sets iterator based on whether the limit was hit
                     let modified_ttl_keys: std::collections::HashSet<LedgerKey> = init_entries
                         .iter()
                         .chain(live_entries.iter())
@@ -2506,57 +2506,24 @@ impl<'a> LedgerCloseContext<'a> {
                         })
                         .collect();
 
-                    if !modified_ttl_keys.is_empty() {
-                        // Eviction produces pairs: [data_key, ttl_key, data_key, ttl_key, ...]
-                        // If the TTL key of a pair is in modified_ttl_keys, remove
-                        // the entire pair (both data key and TTL key).
-                        // Also track which data keys were filtered out so we can
-                        // filter the corresponding archived_entries.
-                        let mut filtered_keys = Vec::new();
-                        let mut filtered_data_keys: std::collections::HashSet<LedgerKey> =
-                            std::collections::HashSet::new();
-                        let mut i = 0;
-                        while i + 1 < eviction_result.evicted_keys.len() {
-                            let ttl_key = &eviction_result.evicted_keys[i + 1];
-                            if !modified_ttl_keys.contains(ttl_key) {
-                                filtered_keys.push(eviction_result.evicted_keys[i].clone());
-                                filtered_keys.push(eviction_result.evicted_keys[i + 1].clone());
-                            } else {
-                                filtered_data_keys
-                                    .insert(eviction_result.evicted_keys[i].clone());
-                            }
-                            i += 2;
-                        }
-                        if !filtered_data_keys.is_empty() {
-                            tracing::info!(
-                                ledger_seq = self.close_data.ledger_seq,
-                                filtered_count = filtered_data_keys.len(),
-                                "Filtered eviction candidates with TX-modified TTLs"
-                            );
-                            // Filter archived_entries to match
-                            eviction_result.archived_entries.retain(|entry| {
-                                if let Ok(key) = crate::delta::entry_to_key(entry) {
-                                    !filtered_data_keys.contains(&key)
-                                } else {
-                                    true
-                                }
-                            });
-                        }
-                        dead_entries.extend(filtered_keys);
-                    } else {
-                        dead_entries.extend(eviction_result.evicted_keys);
-                    }
-                    archived_entries = eviction_result.archived_entries;
+                    let bytes_scanned = eviction_result.bytes_scanned;
+                    let resolved = eviction_result.resolve(
+                        eviction_settings.max_entries_to_archive,
+                        &modified_ttl_keys,
+                    );
+
+                    dead_entries.extend(resolved.evicted_keys);
+                    archived_entries = resolved.archived_entries;
 
                     // Add EvictionIterator update to live entries
                     let eviction_iter_entry = LedgerEntry {
                         last_modified_ledger_seq: self.close_data.ledger_seq,
                         data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
                             XdrEvictionIterator {
-                                bucket_file_offset: eviction_result.end_iterator.bucket_file_offset
+                                bucket_file_offset: resolved.end_iterator.bucket_file_offset
                                     as u64,
-                                bucket_list_level: eviction_result.end_iterator.bucket_list_level,
-                                is_curr_bucket: eviction_result.end_iterator.is_curr_bucket,
+                                bucket_list_level: resolved.end_iterator.bucket_list_level,
+                                is_curr_bucket: resolved.end_iterator.is_curr_bucket,
                             },
                         )),
                         ext: LedgerEntryExt::V0,
@@ -2566,9 +2533,10 @@ impl<'a> LedgerCloseContext<'a> {
 
                     tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
-                        level = eviction_result.end_iterator.bucket_list_level,
-                        is_curr = eviction_result.end_iterator.is_curr_bucket,
-                        offset = eviction_result.end_iterator.bucket_file_offset,
+                        bytes_scanned = bytes_scanned,
+                        level = resolved.end_iterator.bucket_list_level,
+                        is_curr = resolved.end_iterator.is_curr_bucket,
+                        offset = resolved.end_iterator.bucket_file_offset,
                         "Added EvictionIterator entry to live entries"
                     );
                 }

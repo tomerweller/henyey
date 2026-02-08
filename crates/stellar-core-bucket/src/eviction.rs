@@ -177,33 +177,134 @@ impl EvictionIterator {
     }
 }
 
-/// Result of an eviction scan for a single ledger.
+/// A candidate entry for eviction, collected during the scan phase.
 ///
-/// Contains the entries to archive, keys to delete, and updated iterator
-/// position for the next scan. The caller is responsible for:
+/// C++ stellar-core uses a two-phase eviction approach:
+/// 1. **Scan phase**: Collects ALL eligible candidates within the byte budget
+/// 2. **Resolution phase**: Applies TTL filtering and max_entries limit
 ///
-/// 1. Adding `archived_entries` to the hot archive bucket list
-/// 2. Adding `evicted_keys` as dead entries to the live bucket list
-/// 3. Persisting `end_iterator` for the next ledger's scan
+/// Each candidate tracks the entry data, keys, and the bucket list position
+/// where it was found. The position is used for iterator adjustment when
+/// the max_entries_to_archive limit is hit.
+#[derive(Debug)]
+pub struct EvictionCandidate {
+    /// The data entry being evicted (newest version from bucket list).
+    pub entry: LedgerEntry,
+    /// The data entry's key.
+    pub data_key: LedgerKey,
+    /// The corresponding TTL key.
+    pub ttl_key: LedgerKey,
+    /// Whether this is a temporary entry (vs persistent).
+    pub is_temporary: bool,
+    /// The EvictionIterator position AFTER this entry (resume point).
+    pub position: EvictionIterator,
+}
+
+/// Result of the scan phase of eviction for a single ledger.
+///
+/// Contains eviction candidates and the scan region end position.
+/// Call `resolve()` to apply TTL filtering and max_entries limit,
+/// producing the final eviction results.
 #[derive(Debug, Default)]
 pub struct EvictionResult {
-    /// Persistent entries to archive to the hot archive bucket list.
-    ///
-    /// These are ContractCode or persistent ContractData entries that have
-    /// expired but can be restored later by paying for TTL extension.
-    pub archived_entries: Vec<LedgerEntry>,
-    /// Keys of all evicted entries to delete from the live bucket list.
-    ///
-    /// Includes both temporary entries (deleted permanently) and persistent
-    /// entries (moved to hot archive). These become dead entries in the
-    /// live bucket list.
-    pub evicted_keys: Vec<LedgerKey>,
-    /// Updated iterator position for the next scan.
+    /// Eviction candidates collected during the scan.
+    /// These need to be resolved (filtered + limited) before use.
+    pub candidates: Vec<EvictionCandidate>,
+    /// EvictionIterator at the end of the scan region.
+    /// This is where the next scan should start if no max_entries limit was hit.
     pub end_iterator: EvictionIterator,
     /// Total bytes of entry data scanned during this ledger.
     pub bytes_scanned: u64,
     /// Whether the scan completed its byte quota (vs hitting bucket end early).
     pub scan_complete: bool,
+}
+
+/// Result of resolving eviction candidates.
+///
+/// Produced by `EvictionResult::resolve()` after applying TTL filtering
+/// and the max_entries_to_archive limit.
+pub struct ResolvedEviction {
+    /// Persistent entries to archive to the hot archive bucket list.
+    pub archived_entries: Vec<LedgerEntry>,
+    /// Keys of all evicted entries to delete from the live bucket list.
+    /// Includes both data keys and TTL keys in pairs.
+    pub evicted_keys: Vec<LedgerKey>,
+    /// The resolved EvictionIterator for the next scan.
+    pub end_iterator: EvictionIterator,
+}
+
+impl EvictionResult {
+    /// Resolve eviction candidates by applying TTL filtering and max_entries limit.
+    ///
+    /// This matches C++ stellar-core's `resolveBackgroundEvictionScan`:
+    /// 1. Filter out entries whose TTL was modified by transactions in this ledger
+    /// 2. Evict up to `max_entries_to_archive` entries from the filtered set
+    /// 3. Set the iterator position:
+    ///    - If the entry limit was hit: resume from the last evicted entry's position
+    ///    - Otherwise (including max_entries=0): advance to end of scan region
+    pub fn resolve(
+        self,
+        max_entries_to_archive: u32,
+        modified_ttl_keys: &std::collections::HashSet<LedgerKey>,
+    ) -> ResolvedEviction {
+        let scan_end_iterator = self.end_iterator;
+
+        // Phase 1: Filter out entries with modified TTLs
+        let filtered: Vec<_> = self
+            .candidates
+            .into_iter()
+            .filter(|c| !modified_ttl_keys.contains(&c.ttl_key))
+            .collect();
+
+        // Phase 2: Apply max_entries limit and collect results
+        let mut archived_entries = Vec::new();
+        let mut evicted_keys = Vec::new();
+        let mut last_evicted_position = None;
+        let mut remaining = max_entries_to_archive;
+
+        for candidate in filtered {
+            if remaining == 0 {
+                break;
+            }
+
+            if candidate.is_temporary {
+                evicted_keys.push(candidate.data_key);
+                evicted_keys.push(candidate.ttl_key);
+            } else {
+                // Persistent entries go to hot archive AND are evicted from live
+                archived_entries.push(candidate.entry);
+                evicted_keys.push(candidate.data_key);
+                evicted_keys.push(candidate.ttl_key);
+            }
+
+            last_evicted_position = Some(candidate.position);
+            remaining -= 1;
+        }
+
+        // Phase 3: Set iterator position
+        // C++ logic from resolveBackgroundEvictionScan:
+        //   newEvictionIterator is initialized to endOfRegionIterator
+        //   Each eviction updates it to the evicted entry's position
+        //   After the loop: if (remainingEntriesToEvict != 0) { use endOfRegionIterator }
+        //
+        // This means:
+        // - If we exhausted the budget (remaining == 0 AND max > 0): use last evicted position
+        // - If we didn't exhaust the budget (remaining > 0): use end of scan region
+        // - If max_entries == 0: remaining starts at 0, loop never runs, use end of scan region
+        let end_iterator = if max_entries_to_archive > 0 && remaining == 0 {
+            // We hit the eviction limit — resume from last evicted position next time
+            last_evicted_position.unwrap_or(scan_end_iterator)
+        } else {
+            // Didn't hit limit (or max_entries=0) — advance to end of scan region
+            scan_end_iterator
+        };
+
+        ResolvedEviction {
+            archived_entries,
+            evicted_keys,
+            end_iterator,
+        }
+    }
 }
 
 /// Configuration settings for Soroban state archival.

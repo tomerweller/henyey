@@ -60,7 +60,8 @@ use crate::entry::{
 };
 use crate::cache::RandomEvictionCache;
 use crate::eviction::{
-    update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
+    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
+    StateArchivalSettings,
 };
 use crate::live_iterator::LiveEntriesIterator;
 use crate::manager::temp_merge_path;
@@ -2294,8 +2295,7 @@ impl BucketList {
         settings: &StateArchivalSettings,
     ) -> Result<EvictionResult> {
         let mut result = EvictionResult {
-            archived_entries: Vec::new(),
-            evicted_keys: Vec::new(),
+            candidates: Vec::new(),
             end_iterator: iter,
             bytes_scanned: 0,
             scan_complete: false,
@@ -2310,8 +2310,6 @@ impl BucketList {
 
         let start_iter = iter;
         let mut bytes_remaining = settings.eviction_scan_size;
-        // Track how many data entries we've evicted (not counting TTL entries)
-        let mut entries_remaining = settings.max_entries_to_archive;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
@@ -2331,25 +2329,18 @@ impl BucketList {
                 &self.levels[level].snap
             };
 
-            // Scan entries in this bucket starting from the offset
-            let (_entries_scanned, bytes_used, data_entries_evicted, finished_bucket) = self
+            // Scan entries in this bucket (byte-limited only, no entry count limit)
+            let (_entries_scanned, bytes_used, finished_bucket) = self
                 .scan_bucket_region(
                     bucket,
                     &mut iter,
                     bytes_remaining,
-                    entries_remaining,
                     current_ledger,
-                    &mut result.archived_entries,
-                    &mut result.evicted_keys,
+                    &mut result.candidates,
                     &mut seen_keys,
                 )?;
 
             result.bytes_scanned += bytes_used;
-            if entries_remaining > data_entries_evicted {
-                entries_remaining -= data_entries_evicted;
-            } else {
-                entries_remaining = 0;
-            }
 
             if bytes_remaining > bytes_used {
                 bytes_remaining -= bytes_used;
@@ -2357,8 +2348,8 @@ impl BucketList {
                 bytes_remaining = 0;
             }
 
-            // If we've hit either limit (bytes or entry count), we're done
-            if bytes_remaining == 0 || entries_remaining == 0 {
+            // If we've hit the byte limit, we're done
+            if bytes_remaining == 0 {
                 result.scan_complete = true;
                 break;
             }
@@ -2369,10 +2360,6 @@ impl BucketList {
 
                 // Check if we've completed a full cycle - only break when we return
                 // to the exact starting bucket (same level AND same is_curr).
-                // Note: The `wrapped` flag from advance_to_next_bucket just means we
-                // went from level 10 back to the starting level - it doesn't mean
-                // we've completed a full cycle since we still need to scan curr
-                // before reaching snap.
                 if iter.bucket_list_level == start_iter.bucket_list_level
                     && iter.is_curr_bucket == start_iter.is_curr_bucket
                 {
@@ -2387,9 +2374,14 @@ impl BucketList {
         Ok(result)
     }
 
-    /// Scan a region of a bucket for evictable entries.
+    /// Scan a region of a bucket for evictable entries (scan phase only).
     ///
-    /// Returns (entries_scanned, bytes_used, data_entries_evicted, finished_bucket).
+    /// Returns (entries_scanned, bytes_used, finished_bucket).
+    ///
+    /// This is the scan phase of the two-phase eviction approach. It collects
+    /// ALL eligible candidates within the byte budget. The `max_entries_to_archive`
+    /// limit is NOT applied here — it's applied in the resolution phase via
+    /// `EvictionResult::resolve()`.
     ///
     /// Uses byte-offset-aware iteration: for disk-backed buckets, seeks directly
     /// to the start offset (instead of reading and skipping millions of entries)
@@ -2401,21 +2393,18 @@ impl BucketList {
         bucket: &Bucket,
         iter: &mut EvictionIterator,
         max_bytes: u64,
-        max_entries: u32,
         current_ledger: u32,
-        archived_entries: &mut Vec<LedgerEntry>,
-        evicted_keys: &mut Vec<LedgerKey>,
+        candidates: &mut Vec<EvictionCandidate>,
         seen_keys: &mut HashSet<Vec<u8>>,
-    ) -> Result<(usize, u64, u32, bool)> {
+    ) -> Result<(usize, u64, bool)> {
         let mut entries_scanned = 0;
         let mut bytes_used = 0u64;
-        let mut data_entries_evicted = 0u32;
 
         // Skip buckets that predate Soroban; they cannot contain evictable entries.
         let bucket_protocol = bucket.protocol_version().unwrap_or(0);
         if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
             iter.bucket_file_offset = 0;
-            return Ok((entries_scanned, bytes_used, data_entries_evicted, true));
+            return Ok((entries_scanned, bytes_used, true));
         }
 
         // bucket_file_offset is a byte offset in the bucket file.
@@ -2439,14 +2428,14 @@ impl BucketList {
                     }
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                        return Ok((entries_scanned, bytes_used, false));
                     }
                     continue;
                 }
                 BucketEntry::Metadata(_) => {
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                        return Ok((entries_scanned, bytes_used, false));
                     }
                     continue;
                 }
@@ -2456,7 +2445,7 @@ impl BucketList {
             if !is_soroban_entry(live_entry) {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                    return Ok((entries_scanned, bytes_used, false));
                 }
                 continue;
             }
@@ -2465,7 +2454,7 @@ impl BucketList {
             let Some(key) = ledger_entry_to_key(live_entry) else {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                    return Ok((entries_scanned, bytes_used, false));
                 }
                 continue;
             };
@@ -2476,7 +2465,7 @@ impl BucketList {
                 Err(_) => {
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                        return Ok((entries_scanned, bytes_used, false));
                     }
                     continue;
                 }
@@ -2485,7 +2474,7 @@ impl BucketList {
             if !seen_keys.insert(key_bytes) {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                    return Ok((entries_scanned, bytes_used, false));
                 }
                 // Already processed from a newer level
                 continue;
@@ -2495,7 +2484,7 @@ impl BucketList {
             let Some(ttl_key) = get_ttl_key(&key) else {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                    return Ok((entries_scanned, bytes_used, false));
                 }
                 continue;
             };
@@ -2504,7 +2493,7 @@ impl BucketList {
             let Some(ttl_entry) = self.get(&ttl_key)? else {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                    return Ok((entries_scanned, bytes_used, false));
                 }
                 continue;
             };
@@ -2513,7 +2502,7 @@ impl BucketList {
             let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                    return Ok((entries_scanned, bytes_used, false));
                 }
                 continue;
             };
@@ -2521,48 +2510,48 @@ impl BucketList {
             if !is_expired {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                    return Ok((entries_scanned, bytes_used, false));
                 }
                 continue;
             }
 
-            // Entry is expired - categorize it
-            // When evicting an entry, we must remove BOTH the data entry AND its TTL entry
-            // Also check the max_entries limit (counts data entries only, not TTL)
-            if is_temporary_entry(live_entry) {
-                evicted_keys.push(key);
-                evicted_keys.push(ttl_key);
-                data_entries_evicted += 1;
-            } else if is_persistent_entry(live_entry) {
-                // Persistent entries go to hot archive AND are evicted from live.
-                // IMPORTANT: We must archive the NEWEST version of the entry from the
-                // bucket list, not the potentially stale version we scanned. The entry
-                // we scanned might be from an older bucket level, and a newer version
-                // may exist in a lower (newer) level. Protocol V24+ requires archiving
-                // the newest version to ensure deterministic hot archive contents.
-                // See: BucketSnapshot.cpp scanForEviction() lines 247-261
-                let entry_to_archive = if let Some(newest_entry) = self.get(&key)? {
+            // Entry is expired — collect as eviction candidate.
+            // For persistent entries, archive the NEWEST version from the bucket list
+            // (not the potentially stale version from the older bucket being scanned).
+            // See: BucketSnapshot.cpp scanForEviction() lines 247-261
+            let is_temp = is_temporary_entry(live_entry);
+            let entry_for_candidate = if !is_temp {
+                if let Some(newest_entry) = self.get(&key)? {
                     newest_entry
                 } else {
-                    // Entry was deleted in a newer bucket; shouldn't happen but be safe
                     live_entry.clone()
-                };
-                archived_entries.push(entry_to_archive);
-                evicted_keys.push(key);
-                evicted_keys.push(ttl_key);
-                data_entries_evicted += 1;
-            }
+                }
+            } else {
+                live_entry.clone()
+            };
 
-            // Check both limits: bytes scanned and entries evicted
-            if bytes_used >= max_bytes || data_entries_evicted >= max_entries {
+            candidates.push(EvictionCandidate {
+                entry: entry_for_candidate,
+                data_key: key,
+                ttl_key,
+                is_temporary: is_temp,
+                position: EvictionIterator {
+                    bucket_list_level: iter.bucket_list_level,
+                    is_curr_bucket: iter.is_curr_bucket,
+                    bucket_file_offset: start_offset + bytes_used,
+                },
+            });
+
+            // Only check bytes limit (max_entries is applied in resolution phase)
+            if bytes_used >= max_bytes {
                 iter.bucket_file_offset = start_offset + bytes_used;
-                return Ok((entries_scanned, bytes_used, data_entries_evicted, false));
+                return Ok((entries_scanned, bytes_used, false));
             }
         }
 
         // Finished the bucket
         iter.bucket_file_offset = start_offset + bytes_used;
-        Ok((entries_scanned, bytes_used, data_entries_evicted, true))
+        Ok((entries_scanned, bytes_used, true))
     }
 }
 

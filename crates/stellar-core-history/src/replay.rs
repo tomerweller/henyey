@@ -763,16 +763,23 @@ pub fn replay_ledger_with_execution(
         tracing::info!(
             ledger_seq = header.ledger_seq,
             bytes_scanned = eviction_result.bytes_scanned,
-            archived_count = eviction_result.archived_entries.len(),
-            evicted_count = eviction_result.evicted_keys.len(),
+            candidates = eviction_result.candidates.len(),
             end_level = eviction_result.end_iterator.bucket_list_level,
             end_is_curr = eviction_result.end_iterator.is_curr_bucket,
             "Incremental eviction scan results"
         );
 
-        evicted_keys = eviction_result.evicted_keys;
-        archived_entries = eviction_result.archived_entries;
-        updated_eviction_iterator = Some(eviction_result.end_iterator);
+        // Resolve: apply max_entries limit (no TTL filtering needed during replay
+        // since we don't have the modified TTL keys from transaction execution).
+        let empty_ttl_keys = std::collections::HashSet::new();
+        let resolved = eviction_result.resolve(
+            eviction_settings.max_entries_to_archive,
+            &empty_ttl_keys,
+        );
+
+        evicted_keys = resolved.evicted_keys;
+        archived_entries = resolved.archived_entries;
+        updated_eviction_iterator = Some(resolved.end_iterator);
         eviction_actually_ran = true;
     }
 

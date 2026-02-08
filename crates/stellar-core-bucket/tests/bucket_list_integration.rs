@@ -936,7 +936,7 @@ async fn test_eviction_scan_incremental() {
     // Note: The exact count depends on how many fit in the scan size
     // For this test we just verify the mechanism works
     assert!(
-        result.archived_entries.len() > 0 || result.evicted_keys.len() > 0 || result.scan_complete,
+        result.candidates.len() > 0 || result.scan_complete,
         "Incremental scan should either find entries or complete the scan"
     );
 

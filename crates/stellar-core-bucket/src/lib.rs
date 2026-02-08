@@ -154,7 +154,8 @@ pub use error::BucketError;
 
 pub use eviction::{
     bucket_update_period, level_half, level_should_spill, level_size,
-    update_starting_eviction_iterator, EvictionIterator, EvictionResult, StateArchivalSettings,
+    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
+    ResolvedEviction, StateArchivalSettings,
     DEFAULT_EVICTION_SCAN_SIZE, DEFAULT_MAX_ENTRIES_TO_ARCHIVE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
 };
 
