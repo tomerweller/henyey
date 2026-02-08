@@ -1237,11 +1237,23 @@ fn exchange_with_pool(
             let denominator = u128::from(MAX_BPS as u64) * u128::from(reserves_to_pool as u64)
                 + u128::from((MAX_BPS - fee_bps) as u64) * u128::from(*to_pool as u64);
 
-            let numerator = u128::from((MAX_BPS - fee_bps) as u64)
-                * u128::from(reserves_from_pool as u64)
-                * u128::from(*to_pool as u64);
+            // Use hugeDivide algorithm matching C++ stellar-core exactly:
+            // result = floor(A * B / C) where A = (MAX_BPS - fee_bps), B and C are u128
+            // C++ computes: A*Q + floor(A*R/C) where Q = B/C, R = B%C
+            // This avoids overflow that would occur computing A*B directly in u128.
+            let a = (MAX_BPS - fee_bps) as u128;
+            let b = u128::from(reserves_from_pool as u64) * u128::from(*to_pool as u64);
+            let c = denominator;
 
-            let value = numerator / denominator;
+            if c == 0 {
+                return Ok(false);
+            }
+
+            let q = b / c;
+            let r = b % c;
+
+            // result = A*Q + floor(A*R/C)
+            let value = a * q + (a * r) / c;
             if value > i64::MAX as u128 {
                 return Err(TxError::Internal("pool exchange overflow".into()));
             }
@@ -2247,5 +2259,60 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    #[test]
+    fn test_exchange_with_pool_strict_send_large_reserves_no_overflow() {
+        // Regression test: when reserves_from_pool * to_pool * (MAX_BPS - fee_bps)
+        // exceeds u128::MAX, the naive multiplication overflows silently in release
+        // mode. The hugeDivide decomposition avoids this.
+        //
+        // Found at mainnet ledger 59501889: PathPaymentStrictSend through pools
+        // with very large intermediate amounts (e.g., 7e16 stroops).
+        let reserves_to_pool: i64 = 500_000_000_000_000_000; // 5e17
+        let reserves_from_pool: i64 = 400_000_000_000_000_000; // 4e17
+        let send_amount: i64 = 70_000_000_000_000_000; // 7e16
+
+        // Verify that reserves_from * to_pool * 9970 would overflow u128
+        let a = 9970u128;
+        let _b = reserves_from_pool as u128 * send_amount as u128;
+        // a * b = 9970 * 4e17 * 7e16 = 9970 * 2.8e34 ≈ 2.79e38
+        // u128::MAX ≈ 3.4e38, so this is close to the boundary.
+        // With slightly larger reserves, it WILL overflow.
+        let reserves_from_large: i64 = 900_000_000_000_000_000; // 9e17
+        let b_large = reserves_from_large as u128 * send_amount as u128;
+        assert!(
+            a.checked_mul(b_large).is_none(),
+            "Should overflow u128 with large reserves: a*b = {} * {} would overflow",
+            a,
+            b_large
+        );
+
+        // The hugeDivide decomposition should still produce a correct result
+        let mut to_pool = 0i64;
+        let mut from_pool = 0i64;
+        let ok = exchange_with_pool(
+            reserves_to_pool,
+            send_amount,
+            &mut to_pool,
+            reserves_from_large,
+            i64::MAX,
+            &mut from_pool,
+            30, // 30 bps fee
+            RoundingType::PathPaymentStrictSend,
+        )
+        .unwrap();
+
+        assert!(ok, "Exchange should succeed");
+        assert_eq!(to_pool, send_amount);
+        assert!(from_pool > 0, "Should receive positive amount");
+
+        // Verify the result matches manual calculation using the decomposition
+        let denominator = 10_000u128 * reserves_to_pool as u128
+            + 9970u128 * send_amount as u128;
+        let q = b_large / denominator;
+        let r = b_large % denominator;
+        let expected = a * q + (a * r) / denominator;
+        assert_eq!(from_pool, expected as i64);
     }
 }
