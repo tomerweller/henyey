@@ -2253,27 +2253,10 @@ async fn cmd_verify_execution(
                         {
                             use sha2::{Digest, Sha256};
                             // Coalesce: keep last Updated entry per key
+                            // Include ALL change sources: fee_processing, tx_apply_processing, and post_tx_apply_fee_processing
                             let mut final_entries: std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry> = std::collections::HashMap::new();
-                            for tx_meta in &tx_metas {
-                                let changes: Vec<&stellar_xdr::curr::LedgerEntryChange> = match tx_meta {
-                                    stellar_xdr::curr::TransactionMeta::V3(v3) => {
-                                        let mut c: Vec<_> = v3.tx_changes_before.iter().collect();
-                                        for op in v3.operations.iter() {
-                                            c.extend(op.changes.iter());
-                                        }
-                                        c.extend(v3.tx_changes_after.iter());
-                                        c
-                                    }
-                                    stellar_xdr::curr::TransactionMeta::V4(v4) => {
-                                        let mut c: Vec<_> = v4.tx_changes_before.iter().collect();
-                                        for op in v4.operations.iter() {
-                                            c.extend(op.changes.iter());
-                                        }
-                                        c.extend(v4.tx_changes_after.iter());
-                                        c
-                                    }
-                                    _ => vec![],
-                                };
+                            // Helper to process a slice of changes into the coalesced map
+                            let coalesce_changes = |changes: &[stellar_xdr::curr::LedgerEntryChange], map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry>| {
                                 for change in changes {
                                     match change {
                                         stellar_xdr::curr::LedgerEntryChange::Updated(entry)
@@ -2281,16 +2264,59 @@ async fn cmd_verify_execution(
                                         | stellar_xdr::curr::LedgerEntryChange::Restored(entry) => {
                                             if let Ok(key) = stellar_core_ledger::entry_to_key(entry) {
                                                 if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-                                                    final_entries.insert(kb, entry.clone());
+                                                    map.insert(kb, entry.clone());
                                                 }
                                             }
                                         }
                                         stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
                                             if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-                                                final_entries.remove(&kb);
+                                                map.remove(&kb);
                                             }
                                         }
                                         _ => {}
+                                    }
+                                }
+                            };
+                            let coalesce_tx_meta = |meta: &stellar_xdr::curr::TransactionMeta, map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry>| {
+                                match meta {
+                                    stellar_xdr::curr::TransactionMeta::V3(v3) => {
+                                        coalesce_changes(&v3.tx_changes_before, map);
+                                        for op in v3.operations.iter() {
+                                            coalesce_changes(&op.changes, map);
+                                        }
+                                        coalesce_changes(&v3.tx_changes_after, map);
+                                    }
+                                    stellar_xdr::curr::TransactionMeta::V4(v4) => {
+                                        coalesce_changes(&v4.tx_changes_before, map);
+                                        for op in v4.operations.iter() {
+                                            coalesce_changes(&op.changes, map);
+                                        }
+                                        coalesce_changes(&v4.tx_changes_after, map);
+                                    }
+                                    _ => {}
+                                }
+                            };
+                            // Process ALL change sources from LCM tx_processing
+                            match &lcm {
+                                stellar_xdr::curr::LedgerCloseMeta::V0(v0) => {
+                                    for tp in v0.tx_processing.iter() {
+                                        coalesce_changes(&tp.fee_processing, &mut final_entries);
+                                        coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
+                                        // V0 TransactionResultMeta has no post_tx_apply_fee_processing
+                                    }
+                                }
+                                stellar_xdr::curr::LedgerCloseMeta::V1(v1) => {
+                                    for tp in v1.tx_processing.iter() {
+                                        coalesce_changes(&tp.fee_processing, &mut final_entries);
+                                        coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
+                                        // V1 TransactionResultMeta has no post_tx_apply_fee_processing
+                                    }
+                                }
+                                stellar_xdr::curr::LedgerCloseMeta::V2(v2) => {
+                                    for tp in v2.tx_processing.iter() {
+                                        coalesce_changes(&tp.fee_processing, &mut final_entries);
+                                        coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
+                                        coalesce_changes(&tp.post_tx_apply_fee_processing, &mut final_entries);
                                     }
                                 }
                             }
