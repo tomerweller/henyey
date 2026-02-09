@@ -1702,4 +1702,77 @@ mod tests {
         let claimant_trustline = state.get_trustline(&claimant_id, &asset).unwrap();
         assert_eq!(claimant_trustline.balance, 50_000);
     }
+
+    /// Regression test for mainnet ledger 59501891: two ClaimClaimableBalance
+    /// operations in the same TX claim the same balance ID. The first claim
+    /// should succeed and delete the entry; the second should return DoesNotExist.
+    /// Previously, the entry was incorrectly reloaded from the database after
+    /// being deleted, allowing double-claiming.
+    #[test]
+    fn test_claim_claimable_balance_double_claim_returns_does_not_exist() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let claimant_id = create_test_account_id(1);
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+        // Create a claimable balance
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([7u8; 32]));
+        let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        })];
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: claimants.try_into().unwrap(),
+            asset: Asset::Native,
+            amount: 10_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+
+        let op = ClaimClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+
+        // First claim should succeed
+        let result1 =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+        match &result1 {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClaimClaimableBalanceResult::Success),
+                    "First claim should succeed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // After deletion, the balance should not be in state
+        assert!(
+            state.get_claimable_balance(&balance_id).is_none(),
+            "Claimable balance should be deleted after claim"
+        );
+
+        // The entry should still be tracked (in snapshots) to prevent reload from DB
+        assert!(
+            state.is_claimable_balance_tracked(&balance_id),
+            "Deleted claimable balance should still be tracked in snapshots"
+        );
+
+        // Second claim should return DoesNotExist
+        let result2 =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+        match &result2 {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClaimClaimableBalanceResult::DoesNotExist),
+                    "Second claim of same balance should return DoesNotExist, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

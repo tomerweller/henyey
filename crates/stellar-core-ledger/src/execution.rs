@@ -1150,6 +1150,11 @@ impl TransactionExecutor {
             return Ok(true);
         }
 
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_trustline_tracked(account_id, asset) {
+            return Ok(false);
+        }
+
         let key = stellar_xdr::curr::LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
             account_id: account_id.clone(),
             asset: asset.clone(),
@@ -1187,6 +1192,13 @@ impl TransactionExecutor {
             return Ok(true);
         }
 
+        // If the entry was loaded during this TX and then deleted (e.g., claimed by
+        // a prior operation), don't reload from the snapshot. This matches C++ behavior
+        // where nested LedgerTxn inherits deletions from the parent.
+        if self.state.is_claimable_balance_tracked(balance_id) {
+            return Ok(false);
+        }
+
         let key = stellar_xdr::curr::LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: balance_id.clone(),
         });
@@ -1207,6 +1219,11 @@ impl TransactionExecutor {
         // Check if already in state from previous transaction in this ledger
         if self.state.get_data(account_id, data_name).is_some() {
             return Ok(true);
+        }
+
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_data_tracked(account_id, data_name) {
+            return Ok(false);
         }
 
         let name_bytes = stellar_xdr::curr::String64::try_from(data_name.as_bytes().to_vec())
@@ -1238,6 +1255,11 @@ impl TransactionExecutor {
             return Ok(true);
         }
 
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_data_tracked(account_id, &name_str) {
+            return Ok(false);
+        }
+
         let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
             account_id: account_id.clone(),
             data_name: data_name.clone(),
@@ -1258,6 +1280,11 @@ impl TransactionExecutor {
     ) -> Result<bool> {
         if self.state.get_offer(seller_id, offer_id).is_some() {
             return Ok(true);
+        }
+
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_offer_tracked(seller_id, offer_id) {
+            return Ok(false);
         }
 
         let key = stellar_xdr::curr::LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
@@ -1316,6 +1343,11 @@ impl TransactionExecutor {
         // Check if already loaded in state - don't overwrite with snapshot data
         if let Some(pool) = self.state.get_liquidity_pool(pool_id) {
             return Ok(Some(pool.clone()));
+        }
+
+        // If the pool was loaded during this TX and then deleted, don't reload.
+        if self.state.is_liquidity_pool_tracked(pool_id) {
+            return Ok(None);
         }
 
         let key = stellar_xdr::curr::LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {

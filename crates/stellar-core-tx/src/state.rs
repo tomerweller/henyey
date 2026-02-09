@@ -2133,6 +2133,13 @@ impl LedgerStateManager {
         self.trustlines.get(&(account_key, asset_key))
     }
 
+    /// Check if a trustline was already loaded during this transaction.
+    pub fn is_trustline_tracked(&self, account_id: &AccountId, asset: &TrustLineAsset) -> bool {
+        let account_key = account_id_to_bytes(account_id);
+        let asset_key = AssetKey::from_trustline_asset(asset);
+        self.trustline_snapshots.contains_key(&(account_key, asset_key))
+    }
+
     /// Get a mutable reference to a trustline by trustline asset.
     pub fn get_trustline_by_trustline_asset_mut(
         &mut self,
@@ -2364,6 +2371,12 @@ impl LedgerStateManager {
     pub fn get_offer(&self, seller_id: &AccountId, offer_id: i64) -> Option<&OfferEntry> {
         let seller_key = account_id_to_bytes(seller_id);
         self.offers.get(&(seller_key, offer_id))
+    }
+
+    /// Check if an offer was already loaded during this transaction.
+    pub fn is_offer_tracked(&self, seller_id: &AccountId, offer_id: i64) -> bool {
+        let seller_key = account_id_to_bytes(seller_id);
+        self.offer_snapshots.contains_key(&(seller_key, offer_id))
     }
 
     /// Get all offers for an account that buy or sell a specific asset.
@@ -2704,6 +2717,12 @@ impl LedgerStateManager {
     pub fn get_data(&self, account_id: &AccountId, name: &str) -> Option<&DataEntry> {
         let account_key = account_id_to_bytes(account_id);
         self.data_entries.get(&(account_key, name.to_string()))
+    }
+
+    /// Check if a data entry was already loaded during this transaction.
+    pub fn is_data_tracked(&self, account_id: &AccountId, name: &str) -> bool {
+        let account_key = account_id_to_bytes(account_id);
+        self.data_snapshots.contains_key(&(account_key, name.to_string()))
     }
 
     /// Get a mutable reference to a data entry.
@@ -3640,6 +3659,15 @@ impl LedgerStateManager {
         self.claimable_balances.get(&key)
     }
 
+    /// Check if a claimable balance was already loaded during this transaction.
+    /// Returns true if the entry exists in snapshots, meaning it was loaded
+    /// (even if subsequently deleted). Used to prevent reloading deleted entries
+    /// from the database during per-operation preloading.
+    pub fn is_claimable_balance_tracked(&self, balance_id: &ClaimableBalanceId) -> bool {
+        let key = claimable_balance_id_to_bytes(balance_id);
+        self.claimable_balance_snapshots.contains_key(&key)
+    }
+
     /// Get a mutable reference to a claimable balance entry.
     pub fn get_claimable_balance_mut(
         &mut self,
@@ -3772,6 +3800,12 @@ impl LedgerStateManager {
     pub fn get_liquidity_pool(&self, pool_id: &PoolId) -> Option<&LiquidityPoolEntry> {
         let key = pool_id_to_bytes(pool_id);
         self.liquidity_pools.get(&key)
+    }
+
+    /// Check if a liquidity pool was already loaded during this transaction.
+    pub fn is_liquidity_pool_tracked(&self, pool_id: &PoolId) -> bool {
+        let key = pool_id_to_bytes(pool_id);
+        self.liquidity_pool_snapshots.contains_key(&key)
     }
 
     /// Get a mutable reference to a liquidity pool.
