@@ -438,6 +438,13 @@ fn execute_manage_offer(
             // The net effect on fields is zero, but the account is recorded
             // in the LedgerTxn and gets lastModified updated on commit.
             state.record_account_access(source);
+            // If there was a pending sponsor, C++ also loads the sponsor
+            // account via createEntryWithPossibleSponsorship (numSponsoring++)
+            // and removeEntryWithPossibleSponsorship (numSponsoring--).
+            // Net effect is zero but the sponsor account gets lm stamped.
+            if let Some(ref sponsor) = sponsor {
+                state.record_account_access(sponsor);
+            }
         }
         ManageOfferSuccessResultOffer::Deleted
     };
@@ -3190,6 +3197,181 @@ mod tests {
         assert!(
             op_snapshots.contains_key(&source_account_key),
             "Source account must be recorded in op snapshot for fully consumed new offers"
+        );
+    }
+
+    /// Test that when a sponsored new offer is fully consumed during matching,
+    /// the sponsor account is recorded in the op snapshot (gets lm stamped).
+    ///
+    /// In C++ (V14+), createEntryWithPossibleSponsorship is called before the
+    /// exchange (numSponsoring++ on sponsor), and removeEntryWithPossibleSponsorship
+    /// is called after (numSponsoring-- on sponsor). The net effect on the sponsor
+    /// is zero, but the account is loaded with tracking and gets lastModified updated.
+    ///
+    /// Found at mainnet ledger 61153284.
+    #[test]
+    fn test_sponsored_new_offer_fully_consumed_records_sponsor_account() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        // Create issuer for two non-native assets
+        let issuer_id = create_test_account_id(99);
+        state.create_account(create_test_account(issuer_id.clone(), 1_000_000_000));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EURX"),
+            issuer: issuer_id.clone(),
+        });
+        let tl_asset_a = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: issuer_id.clone(),
+        });
+        let tl_asset_b = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EURX"),
+            issuer: issuer_id.clone(),
+        });
+
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 10, 0, 0)
+            .unwrap();
+
+        // Counterparty with existing offer on the book
+        let counter_id = create_test_account_id(1);
+        state.create_account(create_test_account(counter_id.clone(), min_balance));
+        state.create_trustline(TrustLineEntry {
+            account_id: counter_id.clone(),
+            asset: tl_asset_a.clone(),
+            balance: 500_000_000,
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 100_000_000,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+        state.create_trustline(TrustLineEntry {
+            account_id: counter_id.clone(),
+            asset: tl_asset_b.clone(),
+            balance: 0,
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 100_000_000,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+
+        let counter_offer = OfferEntry {
+            seller_id: counter_id.clone(),
+            offer_id: 1000,
+            selling: asset_a.clone(),
+            buying: asset_b.clone(),
+            amount: 100_000_000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        state.load_entry(LedgerEntry {
+            last_modified_ledger_seq: 840000,
+            data: LedgerEntryData::Offer(counter_offer),
+            ext: LedgerEntryExt::V0,
+        });
+
+        if let Some(acct) = state.get_account_mut(&counter_id) {
+            acct.num_sub_entries = 3;
+        }
+
+        // Source account: will submit a new offer that gets fully consumed
+        let source_id = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), min_balance));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset_a.clone(),
+            0,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset_b.clone(),
+            500_000_000,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+
+        if let Some(acct) = state.get_account_mut(&source_id) {
+            acct.num_sub_entries = 2;
+        }
+
+        // Sponsor account: will sponsor the source's offer
+        let sponsor_id = create_test_account_id(3);
+        state.create_account(create_test_account(sponsor_id.clone(), min_balance * 10));
+
+        // Set up sponsorship: sponsor_id sponsors source_id's entries
+        state.push_sponsorship(sponsor_id.clone(), source_id.clone());
+
+        // Clear any snapshots from setup
+        state.flush_modified_entries();
+        state.begin_op_snapshot();
+
+        // Source submits: sell 100 EURX for USDC at price 1:1
+        // This should match the counterparty's offer exactly and be fully consumed.
+        let op = ManageSellOfferOp {
+            selling: asset_b.clone(),
+            buying: asset_a.clone(),
+            amount: 100_000_000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0, // New offer
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+
+        // Verify operation succeeded with offer fully consumed
+        match &result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(success),
+            )) => {
+                assert!(
+                    matches!(success.offer, ManageOfferSuccessResultOffer::Deleted),
+                    "Expected offer to be fully consumed (Deleted), got {:?}",
+                    success.offer
+                );
+                assert_eq!(success.offers_claimed.len(), 1, "Expected 1 offer claimed");
+            }
+            other => panic!("Expected success, got {:?}", other),
+        }
+
+        let op_snapshots = state.end_op_snapshot();
+
+        // Key assertion: the SPONSOR account must appear in the op snapshot.
+        // In C++, createEntryWithPossibleSponsorship loads the sponsor (numSponsoring++),
+        // and removeEntryWithPossibleSponsorship loads it again (numSponsoring--).
+        // Net effect is zero but the sponsor gets lm stamped.
+        let sponsor_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: sponsor_id.clone(),
+        });
+        assert!(
+            op_snapshots.contains_key(&sponsor_account_key),
+            "Sponsor account must be recorded in op snapshot for fully consumed sponsored new offers"
+        );
+
+        // Source account should also be in op snapshot
+        let source_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: source_id.clone(),
+        });
+        assert!(
+            op_snapshots.contains_key(&source_account_key),
+            "Source account must be recorded in op snapshot"
         );
     }
 }

@@ -779,18 +779,6 @@ impl LedgerStateManager {
             return;
         }
         if let Some(entry) = self.get_entry(key) {
-            // Debug logging for account snapshots
-            if let LedgerKey::Account(k) = key {
-                if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
-                    let key_bytes = account_id_to_bytes(&k.account_id);
-                    tracing::debug!(
-                        account_prefix = ?&key_bytes[0..4],
-                        balance = acc.balance,
-                        last_modified = entry.last_modified_ledger_seq,
-                        "Capturing op snapshot for account"
-                    );
-                }
-            }
             self.op_entry_snapshots.insert(key.clone(), entry);
         }
     }
