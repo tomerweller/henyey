@@ -1160,6 +1160,14 @@ impl TransactionExecutor {
             asset: asset.clone(),
         });
 
+        // Check if deleted by a previous TX in this ledger. The delta persists across
+        // TXs, but is_trustline_tracked() only covers within-TX deletions (snapshots
+        // are cleared on commit). Without this check, entries deleted by prior TXs
+        // would be reloaded from the snapshot/bucket list.
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
         if let Some(entry) = snapshot.get_entry(&key)? {
             if let stellar_xdr::curr::LedgerEntryData::Trustline(ref tl) = entry.data {
                 tracing::debug!(
@@ -1202,6 +1210,12 @@ impl TransactionExecutor {
         let key = stellar_xdr::curr::LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: balance_id.clone(),
         });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
         if let Some(entry) = snapshot.get_entry(&key)? {
             self.state.load_entry(entry);
             return Ok(true);
@@ -1232,6 +1246,12 @@ impl TransactionExecutor {
             account_id: account_id.clone(),
             data_name: name_bytes,
         });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
         if let Some(entry) = snapshot.get_entry(&key)? {
             self.state.load_entry(entry);
             return Ok(true);
@@ -1264,6 +1284,12 @@ impl TransactionExecutor {
             account_id: account_id.clone(),
             data_name: data_name.clone(),
         });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
         if let Some(entry) = snapshot.get_entry(&key)? {
             self.state.load_entry(entry);
             return Ok(true);
@@ -1291,6 +1317,12 @@ impl TransactionExecutor {
             seller_id: seller_id.clone(),
             offer_id,
         });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
         if let Some(entry) = snapshot.get_entry(&key)? {
             self.state.load_entry(entry);
             return Ok(true);
@@ -1353,6 +1385,12 @@ impl TransactionExecutor {
         let key = stellar_xdr::curr::LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: pool_id.clone(),
         });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(None);
+        }
+
         if let Some(entry) = snapshot.get_entry(&key)? {
             let pool = match &entry.data {
                 LedgerEntryData::LiquidityPool(pool) => pool.clone(),
@@ -3091,11 +3129,12 @@ impl TransactionExecutor {
                         self.state.rollback_to_savepoint(op_savepoint);
                         self.state.end_op_snapshot();
                         all_success = false;
-                        debug!(
+                        tracing::debug!(
                             error = %e,
                             op_index = op_index,
                             op_type = ?OperationType::from_body(&op.body),
-                            "Operation execution failed"
+                            ledger_seq = self.ledger_seq,
+                            "Operation execution returned Err (mapped to OpNotSupported)"
                         );
                         operation_results.push(OperationResult::OpNotSupported);
                         op_changes.push(empty_entry_changes());

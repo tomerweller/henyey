@@ -2119,6 +2119,45 @@ async fn cmd_verify_execution(
                                     }
                                 }
 
+                                // Show fee bump inner result details
+                                if let (TransactionResultResult::TxFeeBumpInnerFailed(our_inner), TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner)) = (our_result, cdp_result) {
+                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
+                                    let our_inner_code = format!("{:?}", std::mem::discriminant(&our_inner.result.result));
+                                    let cdp_inner_code = format!("{:?}", std::mem::discriminant(&cdp_inner.result.result));
+                                    println!("        Inner result type: ours={} CDP={}", our_inner_code, cdp_inner_code);
+                                    if let (stellar_xdr::curr::InnerTransactionResultResult::TxFailed(our_ops), stellar_xdr::curr::InnerTransactionResultResult::TxFailed(cdp_ops)) = (&our_inner.result.result, &cdp_inner.result.result) {
+                                        for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
+                                            let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            if our_op_xdr != cdp_op_xdr {
+                                                println!("          Inner Op {} differs:", j);
+                                                println!("            Ours: {:?}", our_op);
+                                                println!("            CDP:  {:?}", cdp_op);
+                                            }
+                                        }
+                                        if our_ops.len() != cdp_ops.len() {
+                                            println!("          Inner op count: ours={} CDP={}", our_ops.len(), cdp_ops.len());
+                                        }
+                                    } else {
+                                        println!("        Inner result ours: {:?}", our_inner.result.result);
+                                        println!("        Inner result CDP:  {:?}", cdp_inner.result.result);
+                                    }
+                                }
+                                if let (TransactionResultResult::TxFeeBumpInnerSuccess(our_inner), TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner)) = (our_result, cdp_result) {
+                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
+                                    if let (stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(our_ops), stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(cdp_ops)) = (&our_inner.result.result, &cdp_inner.result.result) {
+                                        for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
+                                            let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            if our_op_xdr != cdp_op_xdr {
+                                                println!("          Inner Op {} differs:", j);
+                                                println!("            Ours: {:?}", our_op);
+                                                println!("            CDP:  {:?}", cdp_op);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Limit output to first 10 diffs
                                 if diff_count >= 10 {
                                     println!("      ... (showing first 10 of potentially more diffs)");

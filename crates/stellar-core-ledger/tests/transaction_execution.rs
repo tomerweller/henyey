@@ -13,6 +13,7 @@ use stellar_xdr::curr::{
     AllowTrustOp, AlphaNum4, Asset, AssetCode, AssetCode4, BytesM, ClaimAtom,
     ClaimClaimableBalanceOp, ClaimLiquidityAtom, ClaimOfferAtom, ClaimPredicate,
     ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId, Claimant, ClaimantV0,
+    ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult,
     ClawbackClaimableBalanceOp, ClawbackOp, ContractCodeEntry, ContractCodeEntryExt,
     ContractEventBody, ContractId, ContractIdPreimage, CreateAccountOp, CreateAccountResult,
     CreateClaimableBalanceOp, CreateClaimableBalanceResult, DecoratedSignature, Duration,
@@ -4352,4 +4353,212 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     assert_eq!(tx_results_worker.len(), tx_results_blocking.len());
     assert_eq!(delta_worker.fee_pool_delta(), delta_blocking.fee_pool_delta());
     assert_eq!(delta_worker.num_changes(), delta_blocking.num_changes());
+}
+
+/// Regression test for cross-TX entry reload bug (mainnet ledger 59503619).
+///
+/// When TX1 deletes a trustline via ChangeTrust(limit=0), and TX2 in the same ledger
+/// tries to access the same trustline, load_trustline must NOT reload it from the
+/// bucket list snapshot. The per-TX snapshots (is_trustline_tracked) are cleared on
+/// commit, so the delta's deleted_keys must be checked to prevent stale reloads.
+///
+/// Without the fix, TX2's preloader reloads the deleted trustline from the snapshot,
+/// ChangeTrust finds it, tries to delete it again, hits negative num_sub_entries,
+/// and returns an internal error mapped to OpNotSupported/TxNotSupported.
+#[test]
+fn test_cross_tx_deleted_trustline_not_reloaded() {
+    let source_secret = SecretKey::from_seed(&[50u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+    let issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])));
+
+    // Asset: VELO issued by issuer_id
+    let asset_code = AssetCode4(*b"VELO");
+    let tl_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: asset_code.clone(),
+        issuer: issuer_id.clone(),
+    });
+
+    // Source account has a trustline (num_sub_entries=1)
+    let source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: source_id.clone(),
+    });
+    let source_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: source_id.clone(),
+            balance: 100_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 1, // One trustline
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    // Issuer account
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
+
+    // Trustline entry with zero balance (ready to delete)
+    let (tl_key, tl_entry) = create_trustline_entry(
+        source_id.clone(),
+        tl_asset.clone(),
+        0,          // balance = 0 (required for deletion)
+        1_000_000,  // limit
+        1, // AUTHORIZED_FLAG
+    );
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(tl_key, tl_entry)
+        .expect("add trustline")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    // ===== TX1: Delete the trustline via ChangeTrust(limit=0) =====
+    let change_trust_op = Operation {
+        source_account: None,
+        body: OperationBody::ChangeTrust(ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: asset_code.clone(),
+                issuer: issuer_id.clone(),
+            }),
+            limit: 0,
+        }),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![change_trust_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    let decorated1 = sign_envelope(&envelope1, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope1 {
+        env.signatures = vec![decorated1].try_into().unwrap();
+    }
+
+    let result1 = executor
+        .execute_transaction(&snapshot, &envelope1, 100, None)
+        .expect("TX1 execute");
+
+    assert!(
+        result1.success,
+        "TX1 (delete trustline) should succeed. Result: {:?}",
+        result1.operation_results
+    );
+
+    // Verify the trustline was deleted
+    assert!(
+        executor
+            .state()
+            .get_trustline_by_trustline_asset(&source_id, &tl_asset)
+            .is_none(),
+        "Trustline should be gone after TX1"
+    );
+
+    // Verify num_sub_entries decremented to 0
+    let account = executor.state().get_account(&source_id).expect("source account");
+    assert_eq!(account.num_sub_entries, 0, "num_sub_entries should be 0 after trustline deletion");
+
+    // Snapshot delta before TX2 (simulates ledger execution flow between transactions)
+    executor.state_mut().snapshot_delta();
+
+    // ===== TX2: Try to delete the same trustline again =====
+    // This should fail with ChangeTrustResult::InvalidLimit because the trustline
+    // no longer exists. Without the fix, load_trustline would reload it from the
+    // snapshot, causing a negative subentry count error.
+    let change_trust_op2 = Operation {
+        source_account: None,
+        body: OperationBody::ChangeTrust(ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: asset_code.clone(),
+                issuer: issuer_id.clone(),
+            }),
+            limit: 0,
+        }),
+    };
+
+    let tx2 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(3),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![change_trust_op2].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope2 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx2,
+        signatures: VecM::default(),
+    });
+    let decorated2 = sign_envelope(&envelope2, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope2 {
+        env.signatures = vec![decorated2].try_into().unwrap();
+    }
+
+    let result2 = executor
+        .execute_transaction(&snapshot, &envelope2, 100, None)
+        .expect("TX2 execute");
+
+    // TX2 should fail, but with a proper ChangeTrust failure (not TxNotSupported)
+    assert!(
+        !result2.success,
+        "TX2 should fail because trustline was already deleted"
+    );
+
+    // The failure should NOT be NotSupported (which would indicate the internal error
+    // from negative subentry count). It should be a normal op failure.
+    assert_ne!(
+        result2.failure,
+        Some(ExecutionFailure::NotSupported),
+        "TX2 should NOT return NotSupported (which indicates the deleted trustline was reloaded from snapshot)"
+    );
+
+    // The op result should be ChangeTrust::InvalidLimit (trustline doesn't exist)
+    match result2.operation_results.get(0) {
+        Some(OperationResult::OpInner(OperationResultTr::ChangeTrust(
+            ChangeTrustResult::InvalidLimit,
+        ))) => {
+            // Expected: trustline not found, limit=0 is invalid
+        }
+        other => panic!(
+            "TX2 should return ChangeTrust::InvalidLimit, got: {:?}",
+            other
+        ),
+    }
+
+    // Verify num_sub_entries is still 0 (not decremented to -1/underflow)
+    let account = executor.state().get_account(&source_id).expect("source account");
+    assert_eq!(
+        account.num_sub_entries, 0,
+        "num_sub_entries should remain 0 (not underflow)"
+    );
 }
