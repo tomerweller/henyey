@@ -40,7 +40,7 @@ use std::sync::{Arc, OnceLock};
 use memmap2::Mmap;
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr};
+use stellar_xdr::curr::{LedgerKey, Limits, ReadXdr};
 
 use stellar_core_common::Hash256;
 
@@ -83,13 +83,12 @@ pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 /// This is critical for performance on mainnet where thousands of
 /// lookups per ledger are needed.
 ///
-/// # Lazy Initialization
+/// # Index Construction
 ///
-/// The index and mmap can be lazily initialized. During catchup, we only
-/// need Pass 1 (count + hash) since lookups aren't needed until live
-/// operation begins. Pass 2 (index building) and mmap creation are deferred
-/// until the first `get()` call. This dramatically reduces memory usage
-/// during catchup — from O(index_size × num_buckets) to essentially zero.
+/// The index is built eagerly via streaming I/O when loading a bucket
+/// from disk. The `OnceLock` wrapper provides thread-safe initialization
+/// and supports the `from_prebuilt` path where a persisted index is
+/// loaded directly.
 #[derive(Clone)]
 pub struct DiskBucket {
     /// The SHA-256 hash of this bucket's contents (for verification).
@@ -98,12 +97,11 @@ pub struct DiskBucket {
     file_path: PathBuf,
     /// Total number of entries in this bucket.
     entry_count: usize,
-    /// Bloom filter seed used for index construction (needed for lazy init).
+    /// Bloom filter seed used for index construction.
     bloom_seed: HashSeed,
-    /// Index for key lookups, lazily initialized on first get().
-    /// Using OnceLock for thread-safe lazy initialization without external locking.
+    /// Index for key lookups (eagerly built, stored in OnceLock for thread safety).
     index: OnceLock<Box<LiveBucketIndex>>,
-    /// Memory-mapped file for lock-free reads, lazily initialized on first get().
+    /// Memory-mapped file for lock-free reads.
     mmap: OnceLock<Arc<Mmap>>,
 }
 
@@ -189,14 +187,18 @@ impl DiskBucket {
         Ok(Arc::new(mmap))
     }
 
-    /// Ensure the index is initialized, building it lazily if needed.
+    /// Ensure the index is initialized.
+    ///
+    /// The index is always built eagerly during construction, so this simply
+    /// returns the existing index. The `get_or_init` closure is a safety net
+    /// that should never execute in practice.
     fn ensure_index(&self) -> &LiveBucketIndex {
         self.index.get_or_init(|| {
-            tracing::info!(
+            tracing::warn!(
                 hash = %self.hash.to_hex(),
                 entry_count = self.entry_count,
                 file = ?self.file_path,
-                "Lazily building disk bucket index on first access"
+                "Building disk bucket index on first access (should have been built eagerly)"
             );
             let file_len = std::fs::metadata(&self.file_path)
                 .expect("bucket file must exist for index build")
@@ -208,31 +210,17 @@ impl DiskBucket {
             tracing::debug!(
                 hash = %self.hash.to_hex(),
                 index_type = if live_index.is_in_memory() { "InMemory" } else { "DiskIndex" },
-                "Lazy index construction complete"
+                "Index construction complete"
             );
 
             Box::new(live_index)
         })
     }
 
-    /// Ensure the mmap is initialized, creating it lazily if needed.
+    /// Ensure the mmap is initialized, creating it if needed.
     fn ensure_mmap(&self) -> &Arc<Mmap> {
         self.mmap
             .get_or_init(|| Self::create_mmap(&self.file_path).expect("failed to mmap bucket file"))
-    }
-
-    /// Create a disk bucket from an XDR file.
-    ///
-    /// This streams the file to build the index without keeping entries in memory.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_file_streaming_with_seed(path, DEFAULT_BLOOM_SEED)
-    }
-
-    /// Create a disk bucket from an XDR file with a custom bloom filter seed.
-    ///
-    /// This streams the file to build the index without keeping entries in memory.
-    pub fn from_file_with_seed(path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
-        Self::from_file_streaming_with_seed(path, bloom_seed)
     }
 
     /// Create a disk bucket from an uncompressed XDR file using streaming I/O.
@@ -293,45 +281,6 @@ impl DiskBucket {
             bloom_seed,
             index,
             mmap,
-        })
-    }
-
-    /// Create a disk bucket with **lazy** index and mmap construction.
-    ///
-    /// This performs only Pass 1 (count entries + compute hash), deferring
-    /// the expensive Pass 2 (index building) and mmap creation until the first
-    /// `get()` call. This is ideal during catchup where we need to build the
-    /// bucket list structure but don't need lookups until live operation begins.
-    ///
-    /// Memory savings: for mainnet with ~60M entries across ~30 buckets, this
-    /// avoids allocating ~200+ MB of bloom filters, page indexes, and mmap
-    /// virtual address space until they're actually needed.
-    pub fn from_file_lazy(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_file_lazy_with_seed(path, DEFAULT_BLOOM_SEED)
-    }
-
-    /// Create a disk bucket with lazy index/mmap, using a custom bloom filter seed.
-    pub fn from_file_lazy_with_seed(path: impl AsRef<Path>, bloom_seed: HashSeed) -> Result<Self> {
-        let path = path.as_ref();
-        let file_len = std::fs::metadata(path)?.len();
-
-        // Pass 1 only: count entries and compute hash
-        let (entry_count, hash) = Self::count_and_hash(path, file_len)?;
-
-        tracing::debug!(
-            entry_count,
-            file_size = file_len,
-            hash = %hash.to_hex(),
-            "Created lazy disk bucket (index deferred)"
-        );
-
-        Ok(Self {
-            hash,
-            file_path: path.to_path_buf(),
-            entry_count,
-            bloom_seed,
-            index: OnceLock::new(),
-            mmap: OnceLock::new(),
         })
     }
 
@@ -647,16 +596,6 @@ impl DiskBucket {
         }
 
         Ok(None)
-    }
-
-    /// Look up a ledger entry by key.
-    pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        match self.get(key)? {
-            Some(BucketEntry::Live(entry)) | Some(BucketEntry::Init(entry)) => Ok(Some(entry)),
-            Some(BucketEntry::Dead(_)) => Ok(None),
-            Some(BucketEntry::Metadata(_)) => Ok(None),
-            None => Ok(None),
-        }
     }
 
     /// Iterate over all entries in this bucket.

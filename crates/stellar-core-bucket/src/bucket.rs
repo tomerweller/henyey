@@ -42,7 +42,7 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 use stellar_core_common::Hash256;
 
 use crate::disk_bucket::DiskBucket;
-use crate::entry::{compare_entries, compare_keys, BucketEntry};
+use crate::entry::{compare_entries, BucketEntry};
 use crate::{BucketError, Result};
 
 /// Internal storage mode for bucket entries.
@@ -347,14 +347,6 @@ impl Bucket {
         Ok(bucket)
     }
 
-    /// Create a bucket from uncompressed XDR bytes without building the key index.
-    ///
-    /// **Note**: This still loads all entries into memory. For memory-efficient
-    /// loading during catchup, use `from_xdr_bytes_disk_backed()` instead.
-    pub fn from_xdr_bytes_without_index(bytes: &[u8]) -> Result<Self> {
-        Self::from_xdr_bytes_internal(bytes, false)
-    }
-
     /// Create a disk-backed bucket from uncompressed XDR bytes.
     ///
     /// This is the most memory-efficient way to load large buckets. Instead of
@@ -393,28 +385,6 @@ impl Bucket {
     /// that would exceed available memory if loaded entirely.
     pub fn from_xdr_file_disk_backed(path: impl AsRef<Path>) -> Result<Self> {
         let disk_bucket = DiskBucket::from_file_streaming(path)?;
-        let hash = disk_bucket.hash();
-
-        Ok(Self {
-            hash,
-            storage: BucketStorage::DiskBacked {
-                disk_bucket: Arc::new(disk_bucket),
-            },
-            level_zero_state: LevelZeroState::None,
-        })
-    }
-
-    /// Create a DiskBacked bucket with **lazy** index and mmap construction.
-    ///
-    /// This performs only Pass 1 (count entries + compute hash), deferring
-    /// Pass 2 (index building) and mmap creation until the first lookup.
-    /// This is ideal for catchup where we need bucket hashes for verification
-    /// but don't need lookups until live operation begins.
-    ///
-    /// Memory savings: avoids allocating bloom filters, page indexes, and mmap
-    /// virtual address space for all buckets simultaneously during catchup.
-    pub fn from_xdr_file_lazy(path: impl AsRef<Path>) -> Result<Self> {
-        let disk_bucket = DiskBucket::from_file_lazy(path)?;
         let hash = disk_bucket.hash();
 
         Ok(Self {
@@ -903,26 +873,6 @@ impl Bucket {
             Some(BucketEntry::Dead(_)) => Ok(None), // Entry is deleted
             Some(BucketEntry::Metadata(_)) => Ok(None),
             None => Ok(None),
-        }
-    }
-
-    /// Binary search for an entry by key.
-    ///
-    /// Returns the index of the entry if found, or None.
-    ///
-    /// **Note**: Only works for in-memory buckets. Returns None for disk-backed.
-    pub fn binary_search(&self, key: &LedgerKey) -> Option<usize> {
-        match &self.storage {
-            BucketStorage::InMemory { entries, .. } => {
-                let result = entries.binary_search_by(|entry| {
-                    match entry.key() {
-                        Some(entry_key) => compare_keys(&entry_key, key),
-                        None => std::cmp::Ordering::Less, // Metadata sorts first
-                    }
-                });
-                result.ok()
-            }
-            BucketStorage::DiskBacked { .. } => None,
         }
     }
 

@@ -68,7 +68,7 @@ use stellar_core_herder::{
 };
 use stellar_core_history::{
     is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupMode,
-    CatchupOutput, CheckpointData, HistoryArchive, HistoryArchiveState,
+    CatchupOutput, CheckpointData, ExistingBucketState, HistoryArchive, HistoryArchiveState,
     GENESIS_LEDGER_SEQ, CHECKPOINT_FREQUENCY,
     build_history_archive_state,
 };
@@ -105,7 +105,7 @@ use crate::logging::CatchupProgress;
 use crate::meta_stream::{MetaStreamError, MetaStreamManager};
 use crate::survey::{SurveyDataManager, SurveyMessageLimiter, SurveyPhase};
 use stellar_core_ledger::{
-    close_time as ledger_close_time, compute_header_hash, verify_header_chain, verify_skip_list,
+    close_time as ledger_close_time, compute_header_hash, verify_header_chain,
 };
 use stellar_xdr::curr::TransactionEnvelope;
 
@@ -927,7 +927,6 @@ impl App {
 
         let mut current_seq = latest;
         let mut checked = 0u32;
-        let mut has_gap = false;
         while current_seq > 0 && checked < VERIFY_DEPTH {
             let current = db
                 .get_ledger_header(current_seq)?
@@ -939,7 +938,6 @@ impl App {
                     latest_seq = latest,
                     "Ledger header chain has a gap; skipping deeper integrity checks"
                 );
-                has_gap = true;
                 break;
             };
             let prev_hash = compute_header_hash(&prev)?;
@@ -948,21 +946,10 @@ impl App {
             checked += 1;
         }
 
-        // Skip list verification is only meaningful when we have a contiguous
-        // header chain.  After catchup with gaps the skip list may reference
-        // ledger sequences that were stored in a different catchup epoch,
-        // producing false mismatches.
-        if !has_gap {
-            let latest_header = db
-                .get_ledger_header(latest)?
-                .ok_or_else(|| anyhow::anyhow!("Missing latest ledger header at {}", latest))?;
-            verify_skip_list(&latest_header, |seq| {
-                db.get_ledger_header(seq)
-                    .ok()
-                    .flatten()
-                    .and_then(|header| compute_header_hash(&header).ok())
-            })?;
-        }
+        // NOTE: Skip list entries store bucket_list_hash values (not header
+        // hashes), so they cannot be verified by comparing against stored
+        // header hashes.  C++ stellar-core does not perform skip list
+        // verification on startup either.
 
         Ok(())
     }
@@ -1686,69 +1673,10 @@ impl App {
             }
         }
 
-        // Step 6: Reconstruct live BucketList from persisted HAS
-        let live_hash_pairs = has.bucket_hash_pairs();
-        let live_next_states: Vec<HasNextState> = has
-            .live_next_states()
-            .into_iter()
-            .map(|s| HasNextState {
-                state: s.state,
-                output: s.output,
-                input_curr: s.input_curr,
-                input_snap: s.input_snap,
-            })
-            .collect();
+        // Step 6: Reconstruct bucket lists from HAS using shared helper
+        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq)?;
 
-        let bucket_manager = self.bucket_manager.clone();
-        let load_bucket = |hash: &stellar_core_common::Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::Bucket> {
-            let arc = bucket_manager.load_bucket(hash)?;
-            // Unwrap the Arc — restore_from_has stores it in its own Arc
-            Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
-        };
-
-        let mut bucket_list = BucketList::restore_from_has(
-            &live_hash_pairs,
-            &live_next_states,
-            load_bucket,
-        ).map_err(|e| anyhow::anyhow!("Failed to restore live bucket list from disk: {}", e))?;
-
-        // Set bucket directory for future merges
-        let bucket_dir = self.config.database.path
-            .parent()
-            .unwrap_or(&self.config.database.path)
-            .join("buckets");
-        bucket_list.set_bucket_dir(bucket_dir);
-        bucket_list.set_ledger_seq(lcl_seq);
-
-        // Step 7: Reconstruct hot archive BucketList (or create empty)
-        let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
-            let hot_next_states: Vec<HasNextState> = has
-                .hot_archive_next_states()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| HasNextState {
-                    state: s.state,
-                    output: s.output,
-                    input_curr: s.input_curr,
-                    input_snap: s.input_snap,
-                })
-                .collect();
-
-            let bucket_manager = self.bucket_manager.clone();
-            let load_hot = |hash: &stellar_core_common::Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::HotArchiveBucket> {
-                bucket_manager.load_hot_archive_bucket(hash)
-            };
-
-            HotArchiveBucketList::restore_from_has(
-                &hot_hash_pairs,
-                &hot_next_states,
-                load_hot,
-            ).map_err(|e| anyhow::anyhow!("Failed to restore hot archive from disk: {}", e))?
-        } else {
-            HotArchiveBucketList::default()
-        };
-
-        // Step 8: Initialize LedgerManager
+        // Step 7: Initialize LedgerManager
         if self.ledger_manager.is_initialized() {
             self.ledger_manager.reset();
         }
@@ -1764,6 +1692,183 @@ impl App {
         );
 
         Ok(true)
+    }
+
+    /// Reconstruct both live and hot archive bucket lists from a parsed HAS,
+    /// including restarting any pending merges from saved input/output hashes.
+    ///
+    /// Shared helper used by both `load_last_known_ledger` (startup restore)
+    /// and `rebuild_bucket_lists_from_has` (Case 1 replay).
+    fn reconstruct_bucket_lists(
+        &self,
+        has: &HistoryArchiveState,
+        header: &stellar_xdr::curr::LedgerHeader,
+        lcl_seq: u32,
+    ) -> anyhow::Result<(BucketList, HotArchiveBucketList)> {
+        // Reconstruct live BucketList
+        let live_hash_pairs = has.bucket_hash_pairs();
+        let live_next_states: Vec<HasNextState> = has
+            .live_next_states()
+            .into_iter()
+            .map(|s| HasNextState {
+                state: s.state,
+                output: s.output,
+                input_curr: s.input_curr,
+                input_snap: s.input_snap,
+            })
+            .collect();
+
+        let bucket_manager = self.bucket_manager.clone();
+        let load_bucket = |hash: &Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::Bucket> {
+            let arc = bucket_manager.load_bucket(hash)?;
+            Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
+        };
+
+        let mut bucket_list = BucketList::restore_from_has(
+            &live_hash_pairs,
+            &live_next_states,
+            load_bucket,
+        ).map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
+
+        let bucket_dir = self.config.database.path
+            .parent()
+            .unwrap_or(&self.config.database.path)
+            .join("buckets");
+        bucket_list.set_bucket_dir(bucket_dir.clone());
+        bucket_list.set_ledger_seq(lcl_seq);
+
+        // Restart pending merges from HAS state.
+        // This matches C++ loadLastKnownLedgerInternal() which calls
+        // AssumeStateWork -> assumeState() -> restartMerges().
+        {
+            let protocol_version = header.ledger_version;
+            let load_bucket_for_merge = |hash: &Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::Bucket> {
+                if hash.is_zero() {
+                    return Ok(stellar_core_bucket::Bucket::empty());
+                }
+                let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                if bucket_path.exists() {
+                    stellar_core_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
+                } else {
+                    let catchup_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                    if catchup_path.exists() {
+                        stellar_core_bucket::Bucket::from_xdr_file_disk_backed(&catchup_path)
+                    } else {
+                        Err(stellar_core_bucket::BucketError::NotFound(format!(
+                            "bucket {} not found on disk", hash.to_hex()
+                        )))
+                    }
+                }
+            };
+            bucket_list
+                .restart_merges_from_has(
+                    lcl_seq,
+                    protocol_version,
+                    &live_next_states,
+                    load_bucket_for_merge,
+                    true,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to restart bucket merges: {}", e))?;
+            tracing::info!(
+                bucket_list_hash = %bucket_list.hash().to_hex(),
+                "Restarted pending merges from HAS"
+            );
+        }
+
+        // Reconstruct hot archive BucketList (or create empty)
+        let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
+            let hot_next_states: Vec<HasNextState> = has
+                .hot_archive_next_states()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| HasNextState {
+                    state: s.state,
+                    output: s.output,
+                    input_curr: s.input_curr,
+                    input_snap: s.input_snap,
+                })
+                .collect();
+
+            let bucket_manager = self.bucket_manager.clone();
+            let load_hot = |hash: &Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::HotArchiveBucket> {
+                bucket_manager.load_hot_archive_bucket(hash)
+            };
+
+            let mut hot_bl = HotArchiveBucketList::restore_from_has(
+                &hot_hash_pairs,
+                &hot_next_states,
+                load_hot,
+            ).map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
+
+            {
+                let protocol_version = header.ledger_version;
+                let bucket_manager = self.bucket_manager.clone();
+                let load_hot_for_merge = move |hash: &Hash256| -> stellar_core_bucket::Result<stellar_core_bucket::HotArchiveBucket> {
+                    bucket_manager.load_hot_archive_bucket(hash)
+                };
+                hot_bl
+                    .restart_merges_from_has(
+                        lcl_seq,
+                        protocol_version,
+                        &hot_next_states,
+                        load_hot_for_merge,
+                        true,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to restart hot archive merges: {}", e))?;
+                tracing::info!(
+                    hot_archive_hash = %hot_bl.hash().to_hex(),
+                    "Restarted hot archive pending merges from HAS"
+                );
+            }
+
+            hot_bl
+        } else {
+            HotArchiveBucketList::default()
+        };
+
+        Ok((bucket_list, hot_archive))
+    }
+
+    /// Rebuild bucket lists from the persisted HAS in the database.
+    ///
+    /// This reads the `HistoryArchiveState` from the database (saved on every
+    /// ledger close), reconstructs the bucket lists from it, and calls
+    /// `restart_merges_from_has` to deterministically reconstitute any pending
+    /// merges from saved input/output hashes.
+    ///
+    /// This matches C++ stellar-core's approach for Case 1 catchup: the
+    /// persisted HAS is the source of truth, not the live bucket list objects.
+    fn rebuild_bucket_lists_from_has(&self) -> anyhow::Result<ExistingBucketState> {
+        // Read persisted HAS from DB
+        let has_json = self.db.with_connection(|conn| {
+            conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)
+        })?;
+        let has_json = has_json.ok_or_else(|| anyhow::anyhow!("No persisted HAS in database"))?;
+        let has = HistoryArchiveState::from_json(&has_json)
+            .map_err(|e| anyhow::anyhow!("Failed to parse persisted HAS: {}", e))?;
+
+        let lcl_seq = has.current_ledger;
+
+        let header = self.db.get_ledger_header(lcl_seq)?
+            .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
+
+        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq)?;
+
+        let network_id = NetworkId(self.network_id());
+
+        tracing::info!(
+            lcl_seq,
+            bucket_list_hash = %bucket_list.hash().to_hex(),
+            hot_archive_hash = %hot_archive.hash().to_hex(),
+            "Rebuilt bucket lists from persisted HAS for Case 1 replay"
+        );
+
+        Ok(ExistingBucketState {
+            bucket_list,
+            hot_archive_bucket_list: hot_archive,
+            header,
+            network_id,
+        })
     }
 
     pub async fn survey_report(&self) -> SurveyReport {
@@ -2217,10 +2322,92 @@ impl App {
             });
         }
 
+        // For replay-only catchup (Case 1: LCL > genesis), rebuild bucket lists
+        // from the persisted HAS in the database. This matches C++ stellar-core's
+        // approach: the HAS is the source of truth for bucket list state.
+        //
+        // We do NOT take bucket lists from the live ledger manager because:
+        // 1. Live bucket lists may have in-flight async pending merges that
+        //    don't serialize/restore deterministically
+        // 2. The persisted HAS captures pending merge state as hash records
+        //    (FB_HASH_INPUTS/FB_HASH_OUTPUT) which can be deterministically
+        //    reconstituted via restart_merges_from_has
+        // 3. This matches C++ loadLastKnownLedgerInternal() -> assumeState()
+        //    -> restartMerges() flow
+        let (existing_state, override_lcl) =
+            if current > GENESIS_LEDGER_SEQ {
+                match self.rebuild_bucket_lists_from_has() {
+                    Ok(state) => {
+                        tracing::info!(
+                            current_lcl = current,
+                            target_ledger,
+                            "Rebuilt bucket lists from persisted HAS for replay-only catchup (Case 1)"
+                        );
+                        // Reset ledger manager since we'll re-initialize after catchup
+                        if self.ledger_manager.is_initialized() {
+                            self.ledger_manager.reset();
+                        }
+                        (Some(state), Some(current))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to rebuild bucket lists from HAS, falling back to full catchup"
+                        );
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
         // Run catchup work
         let output = self
-            .run_catchup_work(target_ledger, mode, progress.clone())
+            .run_catchup_work(
+                target_ledger,
+                mode,
+                progress.clone(),
+                existing_state,
+                override_lcl,
+            )
             .await?;
+
+        // Persist the HAS and LCL to DB BEFORE initialize() consumes the output.
+        // This is critical: if a second catchup triggers before any ledger close
+        // happens (e.g., when LCL+1 is missing from the buffer), rebuild_bucket_lists_from_has()
+        // will read the HAS from the database. Without this persistence, it would
+        // read stale HAS from before the first catchup, producing wrong bucket list
+        // hashes on replay.
+        //
+        // This matches C++ stellar-core's CatchupWork.cpp which calls
+        // setLastClosedLedger() (persisting both LCL and HAS) after bucket apply.
+        {
+            let has = build_history_archive_state(
+                output.header.ledger_seq,
+                &output.bucket_list,
+                Some(&output.hot_archive_bucket_list),
+                Some(self.config.network.passphrase.clone()),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to build HAS after catchup: {}", e))?;
+            let has_json = has
+                .to_json()
+                .map_err(|e| anyhow::anyhow!("Failed to serialize HAS after catchup: {}", e))?;
+            let header_xdr = output
+                .header
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .map_err(|e| anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e))?;
+
+            self.db.transaction(|conn| {
+                conn.store_ledger_header(&output.header, &header_xdr)?;
+                conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+                conn.set_last_closed_ledger(output.header.ledger_seq)?;
+                Ok(())
+            })?;
+
+            tracing::info!(
+                ledger_seq = output.header.ledger_seq,
+                "Persisted HAS and LCL to DB after catchup"
+            );
+        }
 
         // Initialize ledger manager with catchup results.
         // This validates that the bucket list hash matches the ledger header.
@@ -2229,34 +2416,29 @@ impl App {
         // If caches are already warm from a prior catchup cycle, use the differential
         // update path which only scans changed bucket levels (~2-5s) instead of
         // rebuilding all caches from scratch (~120s on mainnet).
-        if self.ledger_manager.is_initialized() {
-            if self.ledger_manager.has_warm_caches() {
-                tracing::info!("Re-catchup with warm caches: using differential cache update");
+        //
+        // Note: After rebuild_bucket_lists_from_has(), the ledger manager is reset
+        // so is_initialized() is false, but has_warm_caches() may still be true.
+        // We check warm caches independently.
+        if self.ledger_manager.has_warm_caches() {
+            tracing::info!("Re-catchup with warm caches: using differential cache update");
+            if self.ledger_manager.is_initialized() {
                 self.ledger_manager.reset_for_recatchup();
-                self.ledger_manager
-                    .initialize_warm(
-                        output.bucket_list,
-                        output.hot_archive_bucket_list,
-                        output.header,
-                        output.header_hash,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to initialize ledger manager (warm): {}", e)
-                    })?;
-            } else {
-                self.ledger_manager.reset();
-                self.ledger_manager
-                    .initialize(
-                        output.bucket_list,
-                        output.hot_archive_bucket_list,
-                        output.header,
-                        output.header_hash,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to initialize ledger manager: {}", e)
-                    })?;
             }
+            self.ledger_manager
+                .initialize_warm(
+                    output.bucket_list,
+                    output.hot_archive_bucket_list,
+                    output.header,
+                    output.header_hash,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to initialize ledger manager (warm): {}", e)
+                })?;
         } else {
+            if self.ledger_manager.is_initialized() {
+                self.ledger_manager.reset();
+            }
             self.ledger_manager
                 .initialize(
                     output.bucket_list,
@@ -2264,7 +2446,9 @@ impl App {
                     output.header,
                     output.header_hash,
                 )
-                .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager: {}", e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to initialize ledger manager: {}", e)
+                })?;
         }
 
         tracing::info!(
@@ -2469,6 +2653,8 @@ impl App {
         target_ledger: u32,
         mode: CatchupMode,
         progress: Arc<CatchupProgress>,
+        existing_state: Option<ExistingBucketState>,
+        override_lcl: Option<u32>,
     ) -> anyhow::Result<CatchupOutput> {
         use crate::logging::CatchupPhase;
 
@@ -2506,9 +2692,11 @@ impl App {
 
         let archives_arc: Vec<Arc<HistoryArchive>> = archives.into_iter().map(Arc::new).collect();
 
-        // Only use historywork for Minimal mode - other modes require mode-aware catchup
-        // which handles downloading from different checkpoints and replay
-        let checkpoint_data = if mode == CatchupMode::Minimal {
+        // Only use historywork for Minimal mode WITHOUT existing bucket state.
+        // When we have existing bucket state (Case 1: replay from LCL), skip historywork
+        // entirely — it would unnecessarily download all buckets when we only need
+        // transaction history for replay.
+        let checkpoint_data = if mode == CatchupMode::Minimal && existing_state.is_none() {
             if let Some(primary) = archives_arc.first() {
                 match self
                     .download_checkpoint_with_historywork(Arc::clone(primary), checkpoint_seq)
@@ -2548,11 +2736,17 @@ impl App {
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
 
-        // Get current LCL for mode calculation
-        // Use GENESIS_LEDGER_SEQ when there's no state (get_current_ledger returns 0 or Err)
-        let lcl = match self.get_current_ledger().await {
-            Ok(seq) if seq >= GENESIS_LEDGER_SEQ => seq,
-            _ => GENESIS_LEDGER_SEQ,
+        // Get current LCL for mode calculation.
+        // When an override is provided (e.g., after rebuild_bucket_lists_from_has
+        // which resets the ledger manager), use it directly.
+        // Otherwise, query the ledger manager.
+        let lcl = if let Some(lcl_override) = override_lcl {
+            lcl_override
+        } else {
+            match self.get_current_ledger().await {
+                Ok(seq) if seq >= GENESIS_LEDGER_SEQ => seq,
+                _ => GENESIS_LEDGER_SEQ,
+            }
         };
 
         let output = match checkpoint_data {
@@ -2565,7 +2759,7 @@ impl App {
             None => {
                 // Use mode-aware catchup
                 catchup_manager
-                    .catchup_to_ledger_with_mode(target_ledger, mode, lcl)
+                    .catchup_to_ledger_with_mode(target_ledger, mode, lcl, existing_state)
                     .await
             }
         }
@@ -3449,7 +3643,7 @@ impl App {
                                 // Record this externalized slot so we can apply it after catchup
                                 self.herder.scp_driver().record_externalized(slot, value);
                                 recorded_externalized += 1;
-                                tracing::info!(
+                                tracing::debug!(
                                     slot,
                                     "Recorded externalized slot during catchup"
                                 );
@@ -3720,7 +3914,7 @@ impl App {
                     stellar_xdr::curr::MessageType::ScpQuorumset
                 );
                 if is_tx_set {
-                    tracing::info!(
+                    tracing::debug!(
                         peer = %msg.from_peer,
                         hash = hex::encode(dont_have.req_hash.0),
                         "Peer reported DontHave for TxSet"
@@ -3827,7 +4021,7 @@ impl App {
                 let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(&gen_tx_set, stellar_xdr::curr::Limits::none())
                     .unwrap_or_default();
                 let computed_hash = stellar_core_common::Hash256::hash(&xdr_bytes);
-                tracing::info!(
+                tracing::debug!(
                     peer = %msg.from_peer,
                     computed_hash = %computed_hash,
                     "APP: Received GeneralizedTxSet from overlay"
@@ -4168,13 +4362,17 @@ impl App {
 
         let tx_set = close_info.tx_set.clone().expect("tx set present");
         let our_header_hash = self.ledger_manager.current_header_hash();
-        tracing::info!(
-            ledger_seq = next_seq,
-            our_header_hash = %our_header_hash.to_hex(),
-            network_prev_hash = %tx_set.previous_ledger_hash.to_hex(),
-            matches = our_header_hash == tx_set.previous_ledger_hash,
-            "Pre-close hash comparison"
-        );
+        if our_header_hash != tx_set.previous_ledger_hash {
+            tracing::error!(
+                ledger_seq = next_seq,
+                our_header_hash = %our_header_hash.to_hex(),
+                network_prev_hash = %tx_set.previous_ledger_hash.to_hex(),
+                "FATAL: pre-close hash mismatch — our header hash does not match \
+                 the network's previous ledger hash. This means our ledger state \
+                 has diverged from the network. Shutting down."
+            );
+            std::process::exit(1);
+        }
         if tx_set.hash != close_info.tx_set_hash {
             tracing::error!(
                 ledger_seq = next_seq,
@@ -4424,11 +4622,6 @@ impl App {
         true
     }
 
-    // NOTE: trigger_catchup_due_to_missing_txset was removed.
-    // We now rely on slot eviction (out_of_sync_recovery) instead of triggering catchup
-    // when all peers report DontHave. This matches C++ stellar-core behavior and avoids
-    // catchup loops that occur when catchup targets checkpoints, leaving gaps.
-
     async fn maybe_start_buffered_catchup(&self) {
         // Early cooldown check: if we recently completed or skipped catchup,
         // skip re-evaluating. This prevents log spam and avoids re-triggering
@@ -4502,17 +4695,10 @@ impl App {
         // the initial catchup because the network advances while catchup runs.
         // Triggering on gap size alone caused unnecessary second catchup cycles
         // (see: "Buffered gap exceeds checkpoint; starting catchup" log spam).
-        let _gap = first_buffered.saturating_sub(current_ledger);
-
-        let can_trigger_immediate = if Self::is_first_ledger_in_checkpoint(first_buffered)
-            && first_buffered < last_buffered
-        {
-            // First buffered is checkpoint boundary AND we have multiple buffered ledgers.
-            // This matches upstream: catchup to first_buffered - 1.
-            true
-        } else {
-            false
-        };
+        // First buffered is checkpoint boundary AND we have multiple buffered ledgers.
+        // This matches upstream: catchup to first_buffered - 1.
+        let can_trigger_immediate =
+            Self::is_first_ledger_in_checkpoint(first_buffered) && first_buffered < last_buffered;
 
         // If we can't trigger immediate catchup, check if we should wait for trigger
         // or if we're stuck and need timeout-based catchup
@@ -4564,10 +4750,11 @@ impl App {
                                 .await
                                 .is_some_and(|t| t.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS);
 
-                            // When recently caught up, never trigger catchup from stuck
-                            // timeout. Only do recovery. This matches C++ behavior where
-                            // gaps are filled by waiting for SCP, not by re-catching up.
-                            if recently_caught_up {
+                            // When recently caught up, prefer recovery over catchup.
+                            // However, if recovery has failed (peers can't fill the
+                            // gap via SCP/tx_set requests), allow catchup. Case 1
+                            // replay is fast and doesn't re-download from archives.
+                            if recently_caught_up && !recovery_failed {
                                 if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
                                     state.last_recovery_attempt = now;
                                     state.recovery_attempts += 1;
@@ -4801,20 +4988,29 @@ impl App {
 
         self.catchup_in_progress.store(false, Ordering::SeqCst);
 
+        self.handle_catchup_result(catchup_result, true, "Buffered").await;
+    }
+
+    /// Process the result of a catchup operation: update state, bootstrap herder,
+    /// and apply buffered ledgers. Shared by buffered and externalized catchup paths.
+    async fn handle_catchup_result(
+        &self,
+        catchup_result: anyhow::Result<CatchupResult>,
+        reset_stuck_state: bool,
+        label: &str,
+    ) {
         match catchup_result {
             Ok(result) => {
-                // Check if catchup was skipped (already at target) vs actually performed work
                 let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
 
                 if catchup_did_work {
-                    // Reset stuck state - catchup made progress, so we're no longer stuck
-                    *self.consensus_stuck_state.write().await = None;
-                    
+                    if reset_stuck_state {
+                        *self.consensus_stuck_state.write().await = None;
+                    }
                     *self.current_ledger.write().await = result.ledger_seq;
                     *self.last_processed_slot.write().await = result.ledger_seq as u64;
                     self.clear_tx_advert_history(result.ledger_seq).await;
                     self.herder.bootstrap(result.ledger_seq);
-                    // Purge old externalized slots to prevent matching new tx_sets to old slots
                     self.herder.purge_slots_below(result.ledger_seq as u64);
                     let cleaned = self
                         .herder
@@ -4825,31 +5021,25 @@ impl App {
                             "Dropped stale pending tx set requests after catchup"
                         );
                     }
-                    // Reset tx_set tracking to give pending requests a fresh chance
-                    // Only do this when catchup actually did work - if it skipped,
-                    // we should preserve pending tx_set requests so they can be matched
                     self.reset_tx_set_tracking_after_catchup().await;
                     if self.is_validator {
                         self.set_state(AppState::Validating).await;
                     } else {
                         self.set_state(AppState::Synced).await;
                     }
-                    tracing::info!(ledger_seq = result.ledger_seq, "Buffered catchup complete");
+                    tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
                     self.try_apply_buffered_ledgers().await;
                 } else {
-                    // Catchup was skipped (already at or past target)
-                    // Don't reset tx_set tracking - preserve pending requests
-                    // Don't reset stuck_state - we're still stuck, just waiting for next checkpoint
                     tracing::info!(
                         ledger_seq = result.ledger_seq,
-                        "Buffered catchup skipped (already at target); preserving tx_set tracking"
+                        "{} catchup skipped (already at target); preserving tx_set tracking",
+                        label
                     );
                 }
-                // Record catchup completion time for cooldown (always, even if skipped)
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
             }
             Err(err) => {
-                tracing::error!(error = %err, "Buffered catchup failed");
+                tracing::error!(error = %err, "{} catchup failed", label);
             }
         }
     }
@@ -4898,56 +5088,7 @@ impl App {
 
         self.catchup_in_progress.store(false, Ordering::SeqCst);
 
-        match catchup_result {
-            Ok(result) => {
-                // Check if catchup was skipped (already at target) vs actually performed work
-                let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
-
-                if catchup_did_work {
-                    *self.current_ledger.write().await = result.ledger_seq;
-                    *self.last_processed_slot.write().await = result.ledger_seq as u64;
-                    self.clear_tx_advert_history(result.ledger_seq).await;
-                    self.herder.bootstrap(result.ledger_seq);
-                    // Purge old externalized slots to prevent matching new tx_sets to old slots
-                    self.herder.purge_slots_below(result.ledger_seq as u64);
-                    let cleaned = self
-                        .herder
-                        .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
-                    if cleaned > 0 {
-                        tracing::info!(
-                            cleaned,
-                            "Dropped stale pending tx set requests after catchup"
-                        );
-                    }
-                    // Reset tx_set tracking to give pending requests a fresh chance
-                    // Only do this when catchup actually did work - if it skipped,
-                    // we should preserve pending tx_set requests so they can be matched
-                    self.reset_tx_set_tracking_after_catchup().await;
-                    if self.is_validator {
-                        self.set_state(AppState::Validating).await;
-                    } else {
-                        self.set_state(AppState::Synced).await;
-                    }
-                    tracing::info!(
-                        ledger_seq = result.ledger_seq,
-                        "Externalized catchup complete"
-                    );
-                    self.try_apply_buffered_ledgers().await;
-                } else {
-                    // Catchup was skipped (already at or past target)
-                    // Don't reset tx_set tracking - preserve pending requests
-                    tracing::info!(
-                        ledger_seq = result.ledger_seq,
-                        "Externalized catchup skipped (already at target); preserving tx_set tracking"
-                    );
-                }
-                // Record catchup completion time for cooldown (always, even if skipped)
-                *self.last_catchup_completed_at.write().await = Some(Instant::now());
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "Externalized catchup failed");
-            }
-        }
+        self.handle_catchup_result(catchup_result, false, "Externalized").await;
     }
 
     fn buffered_catchup_target(
@@ -4961,10 +5102,10 @@ impl App {
 
         let gap = first_buffered.saturating_sub(current_ledger);
         if gap >= CHECKPOINT_FREQUENCY {
-            // Cap catchup target at the latest checkpoint to avoid replaying individual
-            // ledgers past a checkpoint. Replaying without TransactionMeta can produce
-            // different bucket list state due to transaction re-execution parity issues.
-            // By stopping at a checkpoint, we restore state directly from the archive.
+            // When the gap is large enough to span a checkpoint boundary, target
+            // the latest checkpoint before first_buffered. This ensures we catch
+            // up to a known-good checkpoint state from the archive rather than
+            // trying to replay a large number of ledgers.
             let target =
                 latest_checkpoint_before_or_at(first_buffered.saturating_sub(1)).unwrap_or(0);
             return if target == 0 { None } else { Some(target) };
@@ -4989,6 +5130,8 @@ impl App {
 
     /// Compute a catchup target when we're stuck waiting for buffered ledgers.
     /// This targets the checkpoint boundary that will allow us to apply buffered ledgers.
+    /// Returns None if no published checkpoint is ahead of current_ledger, meaning
+    /// the caller should either wait or query the archive for the latest checkpoint.
     fn compute_catchup_target_for_timeout(
         last_buffered: u32,
         first_buffered: u32,
@@ -5018,10 +5161,19 @@ impl App {
                 return Some(alt_target);
             }
 
-            // We cannot target non-checkpoint ledgers because replaying individual ledgers
-            // past a checkpoint causes bucket list hash mismatches due to transaction
-            // re-execution parity differences with C++ stellar-core.
-            // Return None to wait for more buffered ledgers or the next checkpoint.
+            // No checkpoint target ahead of current_ledger.
+            // For tiny gaps (e.g., LCL=922751, first_buffered=922753), target
+            // first_buffered - 1 directly. This produces a Case 1 replay that
+            // bridges the gap (e.g., replay 1 ledger from 922751 to 922752),
+            // then the buffer starting at 922753 can drain.
+            let direct_target = first_buffered.saturating_sub(1);
+            if direct_target > current_ledger {
+                return Some(direct_target);
+            }
+
+            // Truly no target ahead. Return None so the caller falls through
+            // to CatchupTarget::Current, which queries the archive for the
+            // latest published checkpoint.
             return None;
         }
 
@@ -8245,13 +8397,14 @@ mod tests {
         let target = App::compute_catchup_target_for_timeout(150, 100, 70);
         assert_eq!(target, Some(127));
 
-        // Test case 4: current_ledger past all checkpoint targets, return None
+        // Test case 4: current_ledger past all checkpoint targets but before first_buffered
         // first_buffered=100, last_buffered=110, current=95
         // first_buffered checkpoint start=64, target=63 (but 63 < 95)
         // last_buffered checkpoint start=64, alt_target=63 (but 63 < 95)
-        // Cannot target non-checkpoint ledgers, so return None
+        // direct_target = first_buffered - 1 = 99 > 95, so return Some(99)
+        // This bridges the tiny gap with a Case 1 replay (95 -> 99)
         let target = App::compute_catchup_target_for_timeout(110, 100, 95);
-        assert!(target.is_none());
+        assert_eq!(target, Some(99));
 
         // Test case 5: current_ledger already at or past first_buffered, return None
         // This happens when we've caught up but buffered ledgers haven't been processed
@@ -8267,10 +8420,19 @@ mod tests {
 
         // Test case 7: edge case with very small ledgers
         let target = App::compute_catchup_target_for_timeout(5, 3, 0);
-        // first_buffered=3, checkpoint start=0, target=0 (saturating_sub)
-        // 0 <= 0, so try last_buffered=5, checkpoint start=0, alt_target=0
-        // 0 <= 0, so try bridge_target = 3 - 1 = 2 > 0, return 2
+        // first_buffered=3, checkpoint start=0, target=first_buffered-1=2
+        // 2 > current_ledger(0), so return Some(2)
         assert_eq!(target, Some(2));
+
+        // Test case 8: tiny gap at checkpoint boundary (the stuck-after-catchup bug)
+        // LCL=922751 (which is a checkpoint boundary: (922751+1)%64==0)
+        // first_buffered=922753 (gap of 1 slot at 922752)
+        // first_buffered checkpoint start=922752, target=922751 (== current_ledger)
+        // last_buffered checkpoint start=922752, alt_target=922751 (== current_ledger)
+        // direct_target = 922752 > 922751, so return Some(922752)
+        // This bridges the 1-slot gap with a Case 1 replay
+        let target = App::compute_catchup_target_for_timeout(922753, 922753, 922751);
+        assert_eq!(target, Some(922752));
     }
 
     #[test]

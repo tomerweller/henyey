@@ -720,11 +720,11 @@ impl OverlayManager {
                 match tokio::time::timeout(Duration::from_secs(2), peer_lock.recv()).await {
                     Ok(Ok(Some(msg))) => msg,
                     Ok(Ok(None)) => {
-                        info!("Peer {} connection closed cleanly by remote", peer_id);
+                        debug!("Peer {} connection closed cleanly by remote", peer_id);
                         break;
                     }
                     Ok(Err(e)) => {
-                        info!("Peer {} recv error: {}", peer_id, e);
+                        debug!("Peer {} recv error: {}", peer_id, e);
                         break;
                     }
                     Err(_) => {
@@ -736,7 +736,7 @@ impl OverlayManager {
 
             // Process message
             let msg_type = helpers::message_type_name(&message);
-            info!("Processing {} from {}", msg_type, peer_id);
+            trace!("Processing {} from {}", msg_type, peer_id);
 
             // Log ERROR messages
             if let stellar_xdr::curr::StellarMessage::ErrorMsg(ref err) = message {
@@ -795,7 +795,7 @@ impl OverlayManager {
                 // Log fetch messages for debugging tx_set issues
                 match &message {
                     StellarMessage::TxSet(ts) => {
-                        info!(
+                        debug!(
                             "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
                             peer_id,
                             hex::encode(sha2::Sha256::digest(
@@ -808,7 +808,7 @@ impl OverlayManager {
                         // Compute hash once for logging, dedup, and callback
                         let hash = stellar_core_common::Hash256::hash_xdr(ts)
                             .unwrap_or(stellar_core_common::Hash256::ZERO);
-                        info!(
+                        debug!(
                             "OVERLAY: Received GeneralizedTxSet from {} hash={}",
                             peer_id,
                             hash
@@ -819,7 +819,7 @@ impl OverlayManager {
                         if let Some(ref callback) = tx_set_callback {
                             if !processed_tx_sets.contains_key(&hash) {
                                 processed_tx_sets.insert(hash, std::time::Instant::now());
-                                info!("OVERLAY: Invoking direct tx_set callback for hash={}", hash);
+                                debug!("OVERLAY: Invoking direct tx_set callback for hash={}", hash);
                                 callback(peer_id.clone(), hash, ts.clone());
                             } else {
                                 debug!("OVERLAY: Skipping duplicate tx_set callback for hash={}", hash);
@@ -830,7 +830,7 @@ impl OverlayManager {
                         // Compute hash using XDR serialization (same as stellar_core_scp::hash_quorum_set)
                         let hash = stellar_core_common::Hash256::hash_xdr(qs)
                             .unwrap_or(stellar_core_common::Hash256::ZERO);
-                        info!(
+                        debug!(
                             "OVERLAY: Received ScpQuorumset from {} hash={}",
                             peer_id,
                             hash
@@ -841,7 +841,7 @@ impl OverlayManager {
                         if let Some(ref callback) = quorum_set_callback {
                             if !processed_quorum_sets.contains_key(&hash) {
                                 processed_quorum_sets.insert(hash, std::time::Instant::now());
-                                info!("OVERLAY: Invoking direct quorum_set callback for hash={}", hash);
+                                debug!("OVERLAY: Invoking direct quorum_set callback for hash={}", hash);
                                 callback(peer_id.clone(), hash, qs.clone());
                             } else {
                                 debug!("OVERLAY: Skipping duplicate quorum_set callback for hash={}", hash);
@@ -849,7 +849,7 @@ impl OverlayManager {
                         }
                     }
                     StellarMessage::DontHave(dh) => {
-                        info!(
+                        debug!(
                             "OVERLAY: Received DontHave from {} type={:?} hash={}",
                             peer_id,
                             dh.type_,
@@ -857,7 +857,7 @@ impl OverlayManager {
                         );
                     }
                     StellarMessage::GetTxSet(hash) => {
-                        info!(
+                        debug!(
                             "OVERLAY: Received GetTxSet from {} hash={}",
                             peer_id,
                             hex::encode(hash.0)
@@ -898,7 +898,7 @@ impl OverlayManager {
         // Close peer
         let mut peer_lock = peer.lock().await;
         peer_lock.close().await;
-        info!("Peer {} disconnected", peer_id);
+        debug!("Peer {} disconnected", peer_id);
     }
 
     /// Connect to a specific peer.

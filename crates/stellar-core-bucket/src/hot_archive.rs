@@ -64,8 +64,7 @@ enum HotArchiveStorage {
         /// Path to the uncompressed `.bucket.xdr` file.
         path: PathBuf,
         /// Index mapping key XDR bytes → file offset of the record mark.
-        /// Wrapped in OnceLock for lazy initialization — during catchup we only
-        /// need hash + entry_count, the index is built on first lookup.
+        /// Wrapped in OnceLock for thread-safe initialization.
         index: OnceLock<BTreeMap<Vec<u8>, u64>>,
         /// Number of entries in the bucket (including metadata).
         entry_count: usize,
@@ -129,7 +128,7 @@ impl HotArchiveBucket {
         index
     }
 
-    /// Ensure the disk-backed index is built, building it lazily if needed.
+    /// Ensure the disk-backed index is built, building it if needed.
     ///
     /// Returns a reference to the index. For non-DiskBacked storage, panics.
     fn ensure_index(&self) -> &BTreeMap<Vec<u8>, u64> {
@@ -642,67 +641,6 @@ impl HotArchiveBucket {
             storage: HotArchiveStorage::DiskBacked {
                 path,
                 index,
-                entry_count,
-            },
-            hash,
-        })
-    }
-
-    /// Create a disk-backed hot archive bucket lazily from an existing uncompressed XDR file.
-    ///
-    /// Only performs Pass 1: counts entries and computes the SHA-256 hash.
-    /// The BTreeMap index (needed for lookups) is deferred until the first `get()` call.
-    /// This saves memory during catchup when we load ~22 hot archive buckets but don't
-    /// need lookups until live operation begins.
-    pub fn from_xdr_file_lazy(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let file = std::fs::File::open(&path)?;
-        let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
-
-        let mut hasher = Sha256::new();
-        let mut entry_count = 0;
-        let mut position: u64 = 0;
-
-        while position + 4 <= file_len {
-            // Read record mark
-            let mut mark_bytes = [0u8; 4];
-            reader.read_exact(&mut mark_bytes)?;
-            let record_mark = u32::from_be_bytes(mark_bytes);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
-
-            if position + 4 + record_len as u64 > file_len {
-                return Err(BucketError::Serialization(format!(
-                    "Record length {} exceeds remaining data at offset {}",
-                    record_len, position
-                )));
-            }
-
-            // Read entry data (need to hash it, but skip parsing/indexing)
-            let mut data = vec![0u8; record_len];
-            reader.read_exact(&mut data)?;
-
-            // Hash: include record mark + data
-            hasher.update(mark_bytes);
-            hasher.update(&data);
-
-            entry_count += 1;
-            position += 4 + record_len as u64;
-        }
-
-        let result = hasher.finalize();
-        let mut hash_bytes = [0u8; 32];
-        hash_bytes.copy_from_slice(&result);
-        let hash = if entry_count == 0 {
-            Hash256::from_bytes([0u8; 32])
-        } else {
-            Hash256::from_bytes(hash_bytes)
-        };
-
-        Ok(Self {
-            storage: HotArchiveStorage::DiskBacked {
-                path,
-                index: OnceLock::new(), // Deferred — built on first get()
                 entry_count,
             },
             hash,

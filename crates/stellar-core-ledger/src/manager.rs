@@ -49,7 +49,7 @@ use stellar_core_tx::soroban::PersistentModuleCache;
 use stellar_core_tx::state::AssetKey;
 use stellar_core_tx::{ClassicEventConfig, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
+    AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
     EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet, Hash, LedgerCloseMeta,
     LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
@@ -621,6 +621,7 @@ impl LedgerManager {
         let warm_start = std::time::Instant::now();
 
         // Compute and validate bucket list hash (same as initialize())
+        let validate = self.config.validate_bucket_hash;
         let live_hash = bucket_list.hash();
         let computed_hash =
             if header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
@@ -638,7 +639,7 @@ impl LedgerManager {
             };
 
         let expected_hash = Hash256::from(header.bucket_list_hash.0);
-        if self.config.validate_bucket_hash && computed_hash != expected_hash {
+        if validate && computed_hash != expected_hash {
             return Err(LedgerError::HashMismatch {
                 expected: expected_hash.to_hex(),
                 actual: computed_hash.to_hex(),
@@ -1617,38 +1618,7 @@ struct LedgerCloseContext<'a> {
     runtime_handle: Option<tokio::runtime::Handle>,
 }
 
-#[allow(dead_code)]
 impl<'a> LedgerCloseContext<'a> {
-    /// Get the ledger sequence being closed.
-    fn ledger_seq(&self) -> u32 {
-        self.close_data.ledger_seq
-    }
-
-    /// Get the close time.
-    fn close_time(&self) -> u64 {
-        self.close_data.close_time
-    }
-
-    /// Get the snapshot for reading state.
-    fn snapshot(&self) -> &SnapshotHandle {
-        &self.snapshot
-    }
-
-    /// Get the delta for recording changes.
-    fn delta(&self) -> &LedgerDelta {
-        &self.delta
-    }
-
-    /// Get a mutable reference to the delta.
-    fn delta_mut(&mut self) -> &mut LedgerDelta {
-        &mut self.delta
-    }
-
-    /// Get the stats.
-    fn stats(&self) -> &LedgerCloseStats {
-        &self.stats
-    }
-
     /// Load an entry from the snapshot.
     fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // First check if we have a pending change
@@ -1658,21 +1628,6 @@ impl<'a> LedgerCloseContext<'a> {
 
         // Otherwise read from snapshot
         self.snapshot.get_entry(key)
-    }
-
-    /// Load an account from the snapshot.
-    fn load_account(&self, id: &AccountId) -> Result<Option<AccountEntry>> {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: id.clone(),
-        });
-
-        if let Some(entry) = self.load_entry(&key)? {
-            if let LedgerEntryData::Account(account) = entry.data {
-                return Ok(Some(account));
-            }
-        }
-
-        Ok(None)
     }
 
     /// Load StateArchivalSettings from the delta (for upgraded values) falling back to snapshot.
@@ -1903,26 +1858,6 @@ impl<'a> LedgerCloseContext<'a> {
             tx_max_instructions,
             tx_max_memory_bytes,
         })
-    }
-
-    /// Record creation of a new entry.
-    fn record_create(&mut self, entry: LedgerEntry) -> Result<()> {
-        self.delta.record_create(entry)
-    }
-
-    /// Record update of an existing entry.
-    fn record_update(&mut self, previous: LedgerEntry, current: LedgerEntry) -> Result<()> {
-        self.delta.record_update(previous, current)
-    }
-
-    /// Record deletion of an entry.
-    fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
-        self.delta.record_delete(entry)
-    }
-
-    /// Add an upgrade to apply.
-    fn add_upgrade(&mut self, upgrade: stellar_xdr::curr::LedgerUpgrade) {
-        self.upgrade_ctx.add_upgrade(upgrade);
     }
 
     /// Apply transactions from the transaction set.
@@ -2507,10 +2442,8 @@ impl<'a> LedgerCloseContext<'a> {
                         .collect();
 
                     let bytes_scanned = eviction_result.bytes_scanned;
-                    let resolved = eviction_result.resolve(
-                        eviction_settings.max_entries_to_archive,
-                        &modified_ttl_keys,
-                    );
+                    let resolved = eviction_result
+                        .resolve(eviction_settings.max_entries_to_archive, &modified_ttl_keys);
 
                     dead_entries.extend(resolved.evicted_keys);
                     archived_entries = resolved.archived_entries;
@@ -2520,8 +2453,7 @@ impl<'a> LedgerCloseContext<'a> {
                         last_modified_ledger_seq: self.close_data.ledger_seq,
                         data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
                             XdrEvictionIterator {
-                                bucket_file_offset: resolved.end_iterator.bucket_file_offset
-                                    as u64,
+                                bucket_file_offset: resolved.end_iterator.bucket_file_offset as u64,
                                 bucket_list_level: resolved.end_iterator.bucket_list_level,
                                 is_curr_bucket: resolved.end_iterator.is_curr_bucket,
                             },
@@ -2965,15 +2897,6 @@ impl<'a> LedgerCloseContext<'a> {
         Ok(LedgerCloseResult::new(new_header, header_hash)
             .with_tx_results(self.tx_results)
             .with_meta(meta))
-    }
-
-    /// Abort the ledger close without committing.
-    fn abort(self) {
-        debug!(
-            ledger_seq = self.close_data.ledger_seq,
-            "Ledger close aborted"
-        );
-        // Delta is dropped, no changes are committed
     }
 }
 

@@ -314,12 +314,6 @@ impl AsyncMergeHandle {
         }
     }
 
-    /// Check if the merge is complete without blocking.
-    #[allow(dead_code)]
-    pub fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
     /// Resolve the merge, blocking until complete if necessary.
     ///
     /// After calling this, the result is cached and can be retrieved multiple times.

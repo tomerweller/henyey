@@ -444,7 +444,7 @@ impl Peer {
         }
 
         let msg_type = helpers::message_type_name(&message);
-        info!("SEND {} to {}", msg_type, self.info.peer_id);
+        trace!("SEND {} to {}", msg_type, self.info.peer_id);
 
         let size = message_len(&message);
         let auth_msg = self.auth.wrap_message(message)?;

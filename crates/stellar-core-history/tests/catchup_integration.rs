@@ -8,7 +8,8 @@ use axum::{
     Router,
 };
 use flate2::{write::GzEncoder, Compression};
-use stellar_core_bucket::{Bucket, BucketList};
+use sha2::{Digest, Sha256};
+use stellar_core_bucket::{Bucket, BucketList, HotArchiveBucketList};
 use stellar_core_common::Hash256;
 use stellar_core_db::Database;
 use stellar_core_history::{
@@ -83,9 +84,10 @@ fn make_bucket_list_with_hash(bucket_hash: Hash256) -> BucketList {
         }
     }
 
+    let empty_bucket_hash = Hash256::hash(&[]);
     let bucket_data: Vec<u8> = Vec::new();
     let load_bucket = move |hash: &Hash256| -> stellar_core_bucket::Result<Bucket> {
-        if hash.is_zero() {
+        if hash.is_zero() || *hash == empty_bucket_hash {
             return Ok(Bucket::empty());
         }
         Bucket::from_xdr_bytes(&bucket_data)
@@ -102,7 +104,19 @@ async fn test_catchup_against_local_archive_checkpoint() {
     let bucket_list = make_bucket_list_with_hash(bucket_hash);
     let bucket_list_hash = bucket_list.hash();
 
-    let header = make_test_header(checkpoint, bucket_list_hash);
+    // The header's bucket_list_hash is SHA256(live_hash || hot_archive_hash),
+    // not just the live bucket list hash.
+    let hot_archive = HotArchiveBucketList::new();
+    let hot_archive_hash = hot_archive.hash();
+    let mut hasher = Sha256::new();
+    hasher.update(bucket_list_hash.as_bytes());
+    hasher.update(hot_archive_hash.as_bytes());
+    let result = hasher.finalize();
+    let mut combined_bytes = [0u8; 32];
+    combined_bytes.copy_from_slice(&result);
+    let combined_hash = Hash256::from_bytes(combined_bytes);
+
+    let header = make_test_header(checkpoint, combined_hash);
     let header_entry = LedgerHeaderHistoryEntry {
         hash: Hash([0u8; 32]),
         header,

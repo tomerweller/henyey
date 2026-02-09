@@ -123,7 +123,8 @@ pub mod error;
 pub use archive::HistoryArchive;
 pub use archive_state::HistoryArchiveState;
 pub use catchup::{
-    CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData, LedgerData,
+    CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData,
+    ExistingBucketState, LedgerData,
 };
 pub use catchup_range::{CatchupMode, CatchupRange, LedgerRange, GENESIS_LEDGER_SEQ};
 pub use cdp::{

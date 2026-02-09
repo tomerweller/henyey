@@ -65,7 +65,7 @@ use stellar_core_tx::TransactionFrame;
 use stellar_xdr::curr::{
     GeneralizedTransactionSet, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
     ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
-    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionMeta,
+    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
     TransactionResultPair, TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
 };
 use tracing::{debug, info, warn};
@@ -217,6 +217,24 @@ pub struct CheckpointData {
 /// # }
 /// ```
 ///
+/// Existing bucket list state for replay-only catchup (Case 1).
+///
+/// When the LCL is past genesis (e.g., after a prior catchup), the node already
+/// has valid bucket lists in memory. Instead of re-downloading all buckets from
+/// the archive, we can replay ledger transactions against the existing state.
+/// This reduces catchup time from ~60s (27s bucket download + 31s cache rebuild)
+/// to just a few seconds (download tx history + replay).
+pub struct ExistingBucketState {
+    /// The live bucket list at the current LCL.
+    pub bucket_list: BucketList,
+    /// The hot archive bucket list at the current LCL.
+    pub hot_archive_bucket_list: HotArchiveBucketList,
+    /// The ledger header at the current LCL (needed for `id_pool`).
+    pub header: LedgerHeader,
+    /// The network ID for transaction verification.
+    pub network_id: NetworkId,
+}
+
 /// # Thread Safety
 ///
 /// The `CatchupManager` is not `Send` or `Sync` due to its mutable progress
@@ -466,13 +484,8 @@ impl CatchupManager {
         };
 
         // Verify the final state matches expected bucket list hash
-        if let Err(e) =
-            self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)
-        {
-            warn!("Final state verification warning: {}", e);
-            // Don't fail on verification mismatch during catchup
-            // as the bucket list may not be fully updated yet
-        }
+        // Verify final state - bucket list hash must match the header
+        self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)?;
 
         self.persist_ledger_history(&ledger_data, &network_id)?;
         if ledger_data.is_empty() {
@@ -511,6 +524,9 @@ impl CatchupManager {
     /// * `target` - The target ledger sequence to catch up to
     /// * `mode` - The catchup mode determining history depth
     /// * `lcl` - The current Last Closed Ledger (use GENESIS_LEDGER_SEQ if starting fresh)
+    /// * `existing_state` - If provided, contains the existing bucket lists and header
+    ///   for replay-only catchup (Case 1: LCL > genesis). When `None`, Case 1 will
+    ///   return an error (bucket lists are required for replay without re-downloading).
     ///
     /// # Returns
     ///
@@ -520,6 +536,7 @@ impl CatchupManager {
         target: u32,
         mode: CatchupMode,
         lcl: u32,
+        existing_state: Option<ExistingBucketState>,
     ) -> Result<CatchupOutput> {
         info!(
             "Starting catchup to ledger {} with mode {:?}, lcl={}",
@@ -536,6 +553,11 @@ impl CatchupManager {
             range.replay_first(),
             range.replay_count()
         );
+
+        // Track whether this is a Case 1 replay-from-existing-state (LCL > genesis, no buckets)
+        let is_replay_from_existing = !range.apply_buckets() && existing_state.is_some();
+        // Extract the LCL header's id_pool before consuming existing_state
+        let existing_id_pool = existing_state.as_ref().map(|s| s.header.id_pool);
 
         let (mut bucket_list, mut hot_archive_bucket_list, checkpoint_seq, network_id) =
             if range.apply_buckets() {
@@ -636,9 +658,23 @@ impl CatchupManager {
             } else {
                 // No bucket application - we're replaying from current state
                 // This only happens when LCL > genesis (case 1)
-                return Err(HistoryError::CatchupFailed(
-                    "Catchup from LCL > genesis not yet supported (requires existing bucket list)".to_string()
-                ));
+                match existing_state {
+                    Some(state) => {
+                        info!(
+                            "Case 1 replay: using existing bucket lists from LCL {} to replay to target {}",
+                            lcl, target
+                        );
+                        // The checkpoint_seq is the LCL itself - bucket lists are at LCL state
+                        (state.bucket_list, state.hot_archive_bucket_list, lcl, state.network_id)
+                    }
+                    None => {
+                        return Err(HistoryError::CatchupFailed(
+                            "Catchup from LCL > genesis requires existing bucket lists \
+                             (pass ExistingBucketState for replay-only catchup)"
+                                .to_string(),
+                        ));
+                    }
+                }
             };
 
         // Download ledger data for replay range
@@ -671,10 +707,16 @@ impl CatchupManager {
             self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
             self.verify_downloaded_data(&ledger_data)?;
 
-            // Get the starting id_pool from the checkpoint before replaying
-            let (checkpoint_header, _) =
-                self.download_checkpoint_header(download_from_checkpoint).await?;
-            let checkpoint_id_pool = checkpoint_header.id_pool;
+            // Get the starting id_pool from the checkpoint before replaying.
+            // For Case 1 (replay from existing state), we already have the LCL header
+            // and don't need to download it again from the archive.
+            let checkpoint_id_pool = if is_replay_from_existing {
+                existing_id_pool.unwrap_or(0)
+            } else {
+                let (checkpoint_header, _) =
+                    self.download_checkpoint_header(download_from_checkpoint).await?;
+                checkpoint_header.id_pool
+            };
 
             // Replay ledgers
             self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
@@ -708,12 +750,8 @@ impl CatchupManager {
             (final_header, final_hash, replay_count)
         };
 
-        // Verify final state
-        if let Err(e) =
-            self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)
-        {
-            warn!("Final state verification warning: {}", e);
-        }
+        // Verify final state - bucket list hash must match the header
+        self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)?;
 
         if replay_count == 0 {
             self.persist_header_only(&final_header)?;
@@ -881,7 +919,7 @@ impl CatchupManager {
 
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
 
-        // Step 5: Build ledger data from checkpoint files
+        // Step 6: Build ledger data from checkpoint files
         self.update_progress(
             CatchupStatus::DownloadingLedgers,
             4,
@@ -962,11 +1000,8 @@ impl CatchupManager {
             (final_header, final_hash, ledgers_applied)
         };
 
-        if let Err(e) =
-            self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)
-        {
-            warn!("Final state verification warning: {}", e);
-        }
+        // Verify final state - bucket list hash must match the header
+        self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)?;
 
         self.persist_ledger_history(&ledger_data, &network_id)?;
         if ledger_data.is_empty() {
@@ -1170,9 +1205,7 @@ impl CatchupManager {
         Vec<HasNextState>,
         Vec<HasNextState>,
     )> {
-        use std::collections::HashMap;
         use std::sync::Mutex;
-        use stellar_core_bucket::Bucket;
 
         if let Some(mb) = rss_mb() {
             info!("apply_buckets START — RSS {} MB", mb);
@@ -1218,12 +1251,12 @@ impl CatchupManager {
             let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
 
             // Check if bucket already exists on disk as an XDR file.
-            // Use lazy initialization to defer index building and mmap creation
-            // until the first lookup. During catchup we only need hashes for
-            // verification — lookups aren't needed until live operation begins.
+            // Build the index eagerly so it's ready for lookups during live
+            // ledger closing — deferring index construction to the first get()
+            // would cause multi-second stalls when closing the first few ledgers.
             if bucket_path.exists() {
-                debug!("Loading existing bucket {} from disk (lazy)", hash);
-                let bucket = Bucket::from_xdr_file_lazy(&bucket_path)?;
+                debug!("Loading existing bucket {} from disk", hash);
+                let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
                 let mut cache = bucket_cache.lock().unwrap();
                 cache.insert(*hash, bucket.clone());
                 return Ok(bucket);
@@ -1314,7 +1347,7 @@ impl CatchupManager {
             // Drop the in-memory XDR data before building the index to free memory
             drop(xdr_data);
 
-            let bucket = Bucket::from_xdr_file_lazy(&bucket_path)?;
+            let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
 
             // Verify hash matches
             if bucket.hash() != *hash {
@@ -1530,10 +1563,9 @@ impl CatchupManager {
                         })?;
                     }
 
-                    // Load hot archive bucket from disk lazily — only computes hash + entry count.
-                    // The BTreeMap index is deferred until the first get() call,
-                    // which saves memory during catchup.
-                    let bucket = HotArchiveBucket::from_xdr_file_lazy(&bucket_path)?;
+                    // Load hot archive bucket from disk eagerly — builds the index
+                    // immediately so it's ready for lookups during live operation.
+                    let bucket = HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)?;
 
                     // Cache for reuse (same hash can appear at multiple levels)
                     {
@@ -1694,12 +1726,10 @@ impl CatchupManager {
                 .map(|entry| entry.tx_result_set.results.iter().cloned().collect())
                 .unwrap_or_else(Vec::new);
 
-            let tx_metas = Vec::new();
             data.push(LedgerData {
                 header,
                 tx_set,
                 tx_results,
-                tx_metas,
                 tx_history_entry,
                 tx_result_entry,
             });
@@ -1809,6 +1839,14 @@ impl CatchupManager {
         bucket_list: &BucketList,
         hot_archive_bucket_list: &HotArchiveBucketList,
     ) -> Result<()> {
+        if !self.replay_config.verify_bucket_list {
+            info!(
+                ledger_seq = header.ledger_seq,
+                "Skipping final state verification (bucket verification disabled)"
+            );
+            return Ok(());
+        }
+
         use sha2::{Digest, Sha256};
 
         let live_hash = bucket_list.hash();
@@ -2227,8 +2265,6 @@ pub struct LedgerData {
     pub tx_set: TransactionSetVariant,
     /// Transaction results.
     pub tx_results: Vec<TransactionResultPair>,
-    /// Transaction metadata.
-    pub tx_metas: Vec<TransactionMeta>,
     /// Transaction history entry (tx set) when available.
     pub tx_history_entry: Option<TransactionHistoryEntry>,
     /// Transaction result history entry when available.
@@ -2238,16 +2274,10 @@ pub struct LedgerData {
 /// Options for catchup operations.
 #[derive(Debug, Clone)]
 pub struct CatchupOptions {
-    /// Maximum number of retries per archive.
-    pub max_retries: u32,
-    /// Timeout for individual downloads (in seconds).
-    pub download_timeout_secs: u64,
     /// Whether to verify bucket hashes.
     pub verify_buckets: bool,
     /// Whether to verify header chain.
     pub verify_headers: bool,
-    /// Number of parallel bucket downloads.
-    pub parallel_downloads: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2260,11 +2290,8 @@ struct CheckpointLedgerData {
 impl Default for CatchupOptions {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            download_timeout_secs: 300,
             verify_buckets: true,
             verify_headers: true,
-            parallel_downloads: 4,
         }
     }
 }
@@ -2618,11 +2645,8 @@ mod tests {
     #[test]
     fn test_catchup_options_default() {
         let options = CatchupOptions::default();
-        assert_eq!(options.max_retries, 3);
-        assert_eq!(options.download_timeout_secs, 300);
         assert!(options.verify_buckets);
         assert!(options.verify_headers);
-        assert_eq!(options.parallel_downloads, 4);
     }
 
     #[test]
@@ -2638,7 +2662,4 @@ mod tests {
         assert_eq!(CatchupStatus::Pending, CatchupStatus::Pending);
         assert_ne!(CatchupStatus::Pending, CatchupStatus::Completed);
     }
-
-    // Note: Full integration tests would require mock archives
-    // and more infrastructure, which would be in a separate test module
 }
